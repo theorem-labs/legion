@@ -43,7 +43,7 @@ type Config struct {
 	OwnersFormat string `yaml:"owners_format"`
 	// Repo is the repository's name in the ledger.
 	Repo string `yaml:"repo"`
-	// Librarian is the command that hands a near match to the librarian (the proposal and verdict on stdin).
+	// Librarian is the command that receives each near match with --id, --proposer and --proposal arguments.
 	Librarian []string `yaml:"librarian"`
 }
 

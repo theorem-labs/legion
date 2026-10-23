@@ -1,14 +1,9 @@
 // Package conceptgate keeps a project's registry of shared concepts and the similarity gate in front of its
-// librarian. The registry is a YAML file in the project's git: for each shared concept one name (a Lean
-// declaration), one home file, a meaning in one sentence, the concept it extends if any, and the forms that state
-// its fact. The gate compares a proposed concept with the registry, by statement hash and by compiled statement:
-// it refuses an exact duplicate and names the existing concept, sends a near match to the librarian, and adds the
-// rest to the registry.
+// librarian.
 package conceptgate
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,41 +15,52 @@ import (
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
-// RegistryVersion is the registry file's format version.
-const RegistryVersion = 1
+// RegistryVersion is the registry directory's format version.
+const RegistryVersion = 2
 
 // Concept is one registered shared concept.
 type Concept struct {
-	// Name is the concept's Lean declaration (or the name it will have when its home file declares it).
-	Name string `yaml:"name" json:"name"`
-	// Home is the file that declares it, relative to the project's root.
-	Home string `yaml:"home" json:"home"`
-	// Meaning says what it is, in one sentence.
-	Meaning string `yaml:"meaning" json:"meaning"`
-	// Extends names the registered concept it extends, if any.
-	Extends string `yaml:"extends,omitempty" json:"extends,omitempty"`
-	// Forms are the ways to state its fact, Lean lambda terms whose binders are pattern variables. With none,
-	// its declaration's body is its form.
-	Forms []string `yaml:"forms,omitempty" json:"forms,omitempty"`
-	// Proposal is the proposal that added it, when the gate added it.
-	Proposal string `yaml:"proposal,omitempty" json:"proposal,omitempty"`
-	// CompiledHash is the compiled statement hash the gate read when it added the concept, so that a copy is
-	// refused before the concept lands and the index has it.
-	CompiledHash string `yaml:"compiled_hash,omitempty" json:"compiled_hash,omitempty"`
+	Name         string   `yaml:"name" json:"name"`
+	Home         string   `yaml:"home" json:"home"`
+	Meaning      string   `yaml:"meaning" json:"meaning"`
+	Extends      string   `yaml:"extends,omitempty" json:"extends,omitempty"`
+	Forms        []string `yaml:"forms,omitempty" json:"forms,omitempty"`
+	Proposal     string   `yaml:"proposal,omitempty" json:"proposal,omitempty"`
+	Proposer     string   `yaml:"proposer,omitempty" json:"proposer,omitempty"`
+	CompiledHash string   `yaml:"compiled_hash,omitempty" json:"compiled_hash,omitempty"`
+	AcceptedBy   string   `yaml:"accepted_by,omitempty" json:"accepted_by,omitempty"`
+	AcceptedNear []string `yaml:"accepted_near,omitempty" json:"accepted_near,omitempty"`
+	Source       string   `yaml:"source,omitempty" json:"source,omitempty"`
 }
 
-// Registry is the registry file.
+// Registry is the registry directory's registry.yaml and its concept files.
 type Registry struct {
-	Version int `yaml:"version"`
-	// Imports are the modules the forms need; Opens the namespaces they are written in.
-	Imports  []string  `yaml:"imports,omitempty"`
-	Opens    []string  `yaml:"opens,omitempty"`
-	Concepts []Concept `yaml:"concepts"`
+	Version int      `yaml:"version"`
+	Imports []string `yaml:"imports,omitempty"`
+	Opens   []string `yaml:"opens,omitempty"`
+
+	Concepts []Concept `yaml:"-" json:"-"`
+}
+
+// Defect is a registry inconsistency that does not prevent the gate or refresh from using the registry.
+type Defect struct {
+	Path    string `json:"path"`
+	Message string `json:"message"`
+}
+
+func (d Defect) Error() string {
+	if d.Path == "" {
+		return d.Message
+	}
+	return d.Path + ": " + d.Message
 }
 
 // sentenceBreak finds the end of a sentence before the end of the text: a full stop, question or exclamation
 // mark followed by a space and a capital letter.
-var sentenceBreak = regexp.MustCompile(`[.!?]\s+\p{Lu}`)
+var (
+	sentenceBreak = regexp.MustCompile(`[.!?]\s+\p{Lu}`)
+	statementHash = regexp.MustCompile(`^[0-9a-f]{32}$`)
+)
 
 func (c Concept) check() error {
 	switch {
@@ -66,67 +72,120 @@ func (c Concept) check() error {
 		return fmt.Errorf("concept %s has no meaning", c.Name)
 	case strings.Contains(c.Meaning, "\n") || sentenceBreak.MatchString(c.Meaning):
 		return fmt.Errorf("concept %s: its meaning is one sentence", c.Name)
+	case c.CompiledHash != "" && !statementHash.MatchString(c.CompiledHash):
+		return fmt.Errorf("concept %s: compiled hash is not 32 lowercase hexadecimal characters", c.Name)
 	}
 	return nil
 }
 
-// Check refuses an invalid registry: a concept without a name, home or one-sentence meaning, a name twice, an
-// extends that names no registered concept, or a form that is not one lambda term.
-func (r Registry) Check() error {
-	if r.Version != RegistryVersion {
-		return fmt.Errorf("registry version %d; this gate reads version %d", r.Version, RegistryVersion)
+// Key is the name of a concept's file without its concepts/ prefix or .yaml suffix.
+func Key(c Concept) string {
+	if c.CompiledHash != "" {
+		return c.CompiledHash
 	}
-	seen := map[string]bool{}
-	for _, c := range r.Concepts {
-		if err := c.check(); err != nil {
-			return err
-		}
-		if seen[c.Name] {
-			return fmt.Errorf("concept %s is registered twice", c.Name)
-		}
-		seen[c.Name] = true
-	}
-	for _, c := range r.Concepts {
-		if c.Extends != "" && !seen[c.Extends] {
-			return fmt.Errorf("concept %s extends %s, which is not registered", c.Name, c.Extends)
-		}
-	}
-	return r.FormsModule().Check()
+	return c.Name
 }
 
-// registryFile resolves the configured registry directory to its registry file. T0 keeps format 1 for
-// compatibility; Task R changes the directory's format to one concept file per entry.
-func registryFile(path string) (string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", err
+// Render returns the canonical YAML for one concept file.
+func Render(c Concept) ([]byte, error) {
+	if err := c.check(); err != nil {
+		return nil, err
 	}
-	if info.IsDir() {
-		return filepath.Join(path, "registry.yaml"), nil
+	if err := (declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}).Check(); err != nil {
+		return nil, err
 	}
-	return path, nil
+	return yaml.Marshal(c)
 }
 
-// Load reads and checks a registry file, or registry.yaml in a configured registry directory.
-func Load(path string) (Registry, error) {
-	file, err := registryFile(path)
+// Load reads a format-2 registry directory. Defects describe duplicate concepts, invalid file keys, and unknown
+// extensions; they do not stop callers from checking the valid entries.
+func Load(dir string) (Registry, []Defect, error) {
+	info, err := os.Stat(dir)
 	if err != nil {
-		return Registry{}, err
+		return Registry{}, nil, err
 	}
-	raw, err := os.ReadFile(file)
+	if !info.IsDir() {
+		return Registry{}, nil, fmt.Errorf("%s: registry format %d is a directory", dir, RegistryVersion)
+	}
+	root := filepath.Join(dir, "registry.yaml")
+	raw, err := os.ReadFile(root)
 	if err != nil {
-		return Registry{}, err
+		return Registry{}, nil, err
+	}
+	var header struct {
+		Version int `yaml:"version"`
+	}
+	if err := yaml.Unmarshal(raw, &header); err != nil {
+		return Registry{}, nil, fmt.Errorf("%s: %w", root, err)
+	}
+	if header.Version != RegistryVersion {
+		return Registry{}, nil, fmt.Errorf("%s: registry format %d; this gate reads format %d", root, header.Version, RegistryVersion)
 	}
 	var r Registry
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(&r); err != nil {
-		return Registry{}, fmt.Errorf("%s: %w", file, err)
+		return Registry{}, nil, fmt.Errorf("%s: %w", root, err)
 	}
-	if err := r.Check(); err != nil {
-		return Registry{}, fmt.Errorf("%s: %w", file, err)
+	concepts := filepath.Join(dir, "concepts")
+	entries, err := os.ReadDir(concepts)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return r, nil, nil
+		}
+		return Registry{}, nil, err
 	}
-	return r, nil
+	var defects []Defect
+	names := map[string]string{}
+	hashes := map[string]string{}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yaml" {
+			continue
+		}
+		path := filepath.Join(concepts, entry.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return Registry{}, nil, err
+		}
+		var c Concept
+		dec := yaml.NewDecoder(bytes.NewReader(raw))
+		dec.KnownFields(true)
+		if err := dec.Decode(&c); err != nil {
+			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if err := c.check(); err != nil {
+			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if err := (declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}).Check(); err != nil {
+			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
+		}
+		relative := filepath.ToSlash(filepath.Join("concepts", entry.Name()))
+		expected := filepath.ToSlash(filepath.Join("concepts", Key(c)+".yaml"))
+		if relative != expected {
+			defects = append(defects, Defect{Path: relative, Message: "file is named " + relative + ", want " + expected})
+		}
+		if previous, ok := names[c.Name]; ok {
+			defects = append(defects, Defect{Path: relative, Message: "concept " + c.Name + " is also in " + previous})
+		} else {
+			names[c.Name] = relative
+		}
+		if c.CompiledHash != "" {
+			if previous, ok := hashes[c.CompiledHash]; ok {
+				defects = append(defects, Defect{Path: relative, Message: "compiled hash " + c.CompiledHash + " is also in " + previous})
+			} else {
+				hashes[c.CompiledHash] = relative
+			}
+		}
+		r.Concepts = append(r.Concepts, c)
+	}
+	for _, c := range r.Concepts {
+		if c.Extends != "" {
+			if _, ok := names[c.Extends]; !ok {
+				defects = append(defects, Defect{Path: filepath.ToSlash(filepath.Join("concepts", Key(c)+".yaml")), Message: "concept " + c.Name + " extends " + c.Extends + ", which is not registered"})
+			}
+		}
+	}
+	return r, defects, nil
 }
 
 // Find gives the concept of a name.
@@ -139,64 +198,12 @@ func (r Registry) Find(name string) (Concept, bool) {
 	return Concept{}, false
 }
 
-// FormsModule is the Lean module that the index compiles to match the registry's forms.
+// FormsModule is the Lean module that the index compiles to match the registry's forms. Stored proposal source
+// never enters this module.
 func (r Registry) FormsModule() declindex.FormsModule {
 	fm := declindex.FormsModule{Imports: r.Imports, Opens: r.Opens}
 	for _, c := range r.Concepts {
 		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
 	}
 	return fm
-}
-
-// ErrExists says that the registry already has a concept of the name.
-var ErrExists = errors.New("already registered")
-
-// Add appends a concept to the registry file. The existing text, comments included, stays as it is: the new
-// entry is appended to the concepts list, which must be the file's last key.
-func Add(path string, c Concept) error {
-	file, err := registryFile(path)
-	if err != nil {
-		return err
-	}
-	r, err := Load(file)
-	if err != nil {
-		return err
-	}
-	if _, ok := r.Find(c.Name); ok {
-		return fmt.Errorf("concept %s: %w", c.Name, ErrExists)
-	}
-	r.Concepts = append(r.Concepts, c)
-	if err := r.Check(); err != nil {
-		return err
-	}
-	entry, err := yaml.Marshal([]Concept{c})
-	if err != nil {
-		return err
-	}
-	raw, err := os.ReadFile(file)
-	if err != nil {
-		return err
-	}
-	text := string(raw)
-	if !strings.HasSuffix(text, "\n") {
-		text += "\n"
-	}
-	var b strings.Builder
-	b.WriteString(text)
-	for _, line := range strings.Split(strings.TrimSuffix(string(entry), "\n"), "\n") {
-		b.WriteString("  " + line + "\n")
-	}
-	tmp := file + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
-		return err
-	}
-	if _, err := Load(tmp); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("the registry's concepts list is not its last key, so a concept cannot be appended: %w", err)
-	}
-	if got, _ := Load(tmp); len(got.Concepts) != len(r.Concepts) {
-		_ = os.Remove(tmp)
-		return errors.New("the registry's concepts list is not its last key, so a concept cannot be appended")
-	}
-	return os.Rename(tmp, file)
 }
