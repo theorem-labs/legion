@@ -165,6 +165,7 @@ func TestL4ContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 		owner      string
 		proof      string
 		reviews    []ledger.Review
+		reviewed   string
 		upstream   string
 		wantChange any
 	}{
@@ -184,6 +185,26 @@ func TestL4ContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 			reviews:   []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-1"}},
 			wantChange: map[string]any{
 				"review": map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"},
+			},
+		},
+		{
+			name:      "reviewed head shorthand",
+			migration: "M-reviewed-head",
+			owner:     "alice",
+			reviewed:  "head-1",
+			wantChange: map[string]any{
+				"review": map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"},
+			},
+		},
+		{
+			name:      "upstream reviewed head shorthand",
+			migration: "M-upstream-reviewed-head",
+			owner:     "upstream",
+			reviewed:  "head-1",
+			upstream:  "upstream-commit",
+			wantChange: map[string]any{
+				"upstream": "upstream-commit",
+				"reviews":  []any{map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
 			},
 		},
 		{
@@ -210,7 +231,7 @@ func TestL4ContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 			request := ledger.LandRequest{
 				Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-1",
 				ChangedPaths: []string{"a.lean"}, Current: map[string]string{"C": "hash-1"}, ChangedContracts: map[string]string{"C": "hash-2"},
-				Head: "head-1", CompatibilityProof: test.proof, Reviews: test.reviews, Upstream: test.upstream,
+				Head: "head-1", CompatibilityProof: test.proof, Reviews: test.reviews, ReviewedHead: test.reviewed, Upstream: test.upstream,
 			}
 			if _, err := s.Land(ctx, request); err != nil {
 				t.Fatal(err)

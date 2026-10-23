@@ -65,6 +65,16 @@ func TestL4ContractListShowsProofReviewAndUpstreamRecords(t *testing.T) {
 	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream", "--generation", "1", "--commit", "commit-upstream",
 		"--path", "c.lean", "--current", "Upstream=hash-1", "--changed-contract", "Upstream=hash-2", "--head", "head-upstream", "--review", "Upstream=alice@head-upstream", "--upstream", "upstream-commit")
 
+	mustL4Code(t, call, 0, "contract", "register", "r", "ReviewedHead", "alice", "hash-1", "false")
+	mustL4Code(t, call, 0, "open", "r", "M-reviewed-head", "alice", "base", "branch", "--write", "d.lean", "--read", "ReviewedHead=hash-1")
+	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-reviewed-head", "--generation", "1", "--commit", "commit-reviewed-head",
+		"--path", "d.lean", "--current", "ReviewedHead=hash-1", "--changed-contract", "ReviewedHead=hash-2", "--head", "head-reviewed-head", "--reviewed-head", "head-reviewed-head")
+
+	mustL4Code(t, call, 0, "contract", "register", "r", "UpstreamReviewedHead", "alice", "hash-1", "false")
+	mustL4Code(t, call, 0, "open", "r", "M-upstream-reviewed-head", "upstream", "base", "branch", "--write", "e.lean", "--read", "UpstreamReviewedHead=hash-1")
+	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream-reviewed-head", "--generation", "1", "--commit", "commit-upstream-reviewed-head",
+		"--path", "e.lean", "--current", "UpstreamReviewedHead=hash-1", "--changed-contract", "UpstreamReviewedHead=hash-2", "--head", "head-upstream-reviewed-head", "--reviewed-head", "head-upstream-reviewed-head", "--upstream", "upstream-commit")
+
 	code, stdout, stderr := call("--json", "contract", "list", "r")
 	if code != 0 {
 		t.Fatalf("contract list: code=%d stderr=%q", code, stderr)
@@ -85,9 +95,11 @@ func TestL4ContractListShowsProofReviewAndUpstreamRecords(t *testing.T) {
 		got[contract.Name] = change
 	}
 	want := map[string]any{
-		"Proof":    map[string]any{"proof": "Spec.Proof.compat"},
-		"Review":   map[string]any{"review": map[string]any{"contract": "Review", "reviewer": "alice", "head": "head-review"}},
-		"Upstream": map[string]any{"upstream": "upstream-commit", "reviews": []any{map[string]any{"contract": "Upstream", "reviewer": "alice", "head": "head-upstream"}}},
+		"Proof":                map[string]any{"proof": "Spec.Proof.compat"},
+		"Review":               map[string]any{"review": map[string]any{"contract": "Review", "reviewer": "alice", "head": "head-review"}},
+		"Upstream":             map[string]any{"upstream": "upstream-commit", "reviews": []any{map[string]any{"contract": "Upstream", "reviewer": "alice", "head": "head-upstream"}}},
+		"ReviewedHead":         map[string]any{"review": map[string]any{"contract": "ReviewedHead", "reviewer": "alice", "head": "head-reviewed-head"}},
+		"UpstreamReviewedHead": map[string]any{"upstream": "upstream-commit", "reviews": []any{map[string]any{"contract": "UpstreamReviewedHead", "reviewer": "alice", "head": "head-upstream-reviewed-head"}}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("contract list changes %#v, want %#v", got, want)

@@ -424,35 +424,47 @@ func statementViolations(ctx context.Context, q querier, m Migration, req CheckR
 	return []Violation{{Kind: ViolationStatementUnreviewed, Name: missing[0], Message: why}}, nil
 }
 
-type recordedReview struct {
-	Contract string `json:"contract,omitempty"`
-	Reviewer string `json:"reviewer,omitempty"`
-	Head     string `json:"head"`
+func lastChangeReview(req LandRequest, contract Contract) (Review, bool) {
+	for _, review := range req.Reviews {
+		if reviewClears(review, contract, req.Head) {
+			return review, true
+		}
+	}
+	if req.ReviewedHead != "" {
+		return Review{Contract: contract.Name, Reviewer: contract.Owner, Head: req.ReviewedHead}, true
+	}
+	return Review{}, false
 }
 
 func contractLastChange(req LandRequest, contract Contract) (LastChange, error) {
-	if req.Upstream != "" {
-		record := struct {
-			Upstream string   `json:"upstream"`
-			Reviews  []Review `json:"reviews"`
-		}{Upstream: req.Upstream, Reviews: req.Reviews}
-		return marshalLastChange(record)
-	}
 	if req.CompatibilityProof != "" {
+		if req.Upstream != "" {
+			return marshalLastChange(struct {
+				Upstream string `json:"upstream"`
+				Proof    string `json:"proof"`
+			}{Upstream: req.Upstream, Proof: req.CompatibilityProof})
+		}
 		return marshalLastChange(struct {
 			Proof string `json:"proof"`
 		}{Proof: req.CompatibilityProof})
 	}
-	for _, review := range req.Reviews {
-		if reviewClears(review, contract, req.Head) {
-			return marshalLastChange(struct {
-				Review recordedReview `json:"review"`
-			}{Review: recordedReview{Contract: review.Contract, Reviewer: review.Reviewer, Head: review.Head}})
+	review, reviewed := lastChangeReview(req, contract)
+	if !reviewed {
+		return "", invalid("changed contract %s has no review record", contract.Name)
+	}
+	if req.Upstream != "" {
+		reviews := req.Reviews
+		if len(reviews) == 0 {
+			reviews = []Review{review}
 		}
+		return marshalLastChange(struct {
+			Upstream string   `json:"upstream"`
+			Reviews  []Review `json:"reviews"`
+		}{Upstream: req.Upstream, Reviews: reviews})
 	}
 	return marshalLastChange(struct {
-		Review recordedReview `json:"review"`
-	}{Review: recordedReview{Head: req.ReviewedHead}})
+		Review Review `json:"review"`
+	}{Review: review})
 }
 
 func marshalLastChange(record any) (LastChange, error) {
