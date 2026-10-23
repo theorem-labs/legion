@@ -253,3 +253,26 @@ def test_a_compressed_add_derives_the_address_and_a_store_lets_it_escape(image: 
     compressed_add = (0b1001 << 12) | (A2 << 7) | (A3 << 2) | 0b10
     code = struct.pack("<IIHII", _u(0x17, A3, high), _addi(A3, A3, low), compressed_add, _store(A2, SP, 0), RET)
     assert ("pair_a", "addi_address") in _operations(image.decode("synthetic", code, start))
+
+
+def test_code_after_ebreak_keeps_its_registers(image: Image) -> None:
+    """A WARN's ebreak resumes: the load after it still has the address formed before."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack("<5I", _u(0x17, S1, high), _addi(S1, S1, low), 0x00100073, _load(A1, S1, 8), RET)
+    assert _operations(image.decode("synthetic", code, start)) == {("pair_b", "load_or_store")}
+
+
+def test_an_address_in_an_argument_the_callee_does_not_take_does_not_escape(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    callee = image.functions["box_weight"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    jal = _jal(RA, callee - (start + 8))
+    code = struct.pack("<5I", _u(0x17, A1, high), _addi(A1, A1, low), jal, _load(A2, S1, 0), RET)
+    image.arity = {"box_weight": 0}
+    try:
+        assert ("pair_a", "addi_address") not in _operations(image.decode("synthetic", code, start))
+        image.arity = {"box_weight": 2}
+        assert ("pair_a", "addi_address") in _operations(image.decode("synthetic", code, start))
+    finally:
+        image.arity = {}

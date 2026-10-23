@@ -1320,6 +1320,8 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             "line": cursor.location.line,
             "static": cursor.linkage == ci.LinkageKind.INTERNAL,
             "weak": _is_weak(extractor, cursor),
+            # Registers a0..a7 carry the first eight integer arguments; a variadic one may take all.
+            "parameters": 8 if cursor.type.is_function_variadic() else min(8, len(list(cursor.get_arguments() or []))),
             "main_file": _main_file(cursor, main),
             "returns": walk.returns(),
             "events": walk.events,

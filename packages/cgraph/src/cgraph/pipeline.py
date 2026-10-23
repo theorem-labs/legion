@@ -97,6 +97,12 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
             cache.store(source, arguments[source], digest, unit, contents)
     cache.save()
     image = Image(inputs.image, inputs.system_map, config.image)
+    image.arity = {
+        name: function["parameters"]
+        for unit in facts.values()
+        for name, function in unit["functions"].items()
+        if "parameters" in function
+    }
     try:
         contracts = ContractGraph.load(inputs.contract_graph, config.contract_function_prefix)
         recorded = {

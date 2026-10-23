@@ -31,7 +31,8 @@ _BRANCHES = {
     "beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez", "blez", "bgez", "bltz", "bgtz", "bgt", "ble",
     "bgtu", "bleu", "c.beqz", "c.bnez",
 }  # fmt: skip
-_ENDS = {"ret", "jr", "c.jr", "ebreak", "c.ebreak", "unimp", "c.unimp", "mret", "sret"}
+# Instructions after which control does not continue. ebreak is not one: a WARN resumes after it.
+_ENDS = {"ret", "jr", "c.jr", "unimp", "c.unimp", "mret", "sret"}
 # Constants beyond this many bytes are addresses or masks, not field offsets.
 _OFFSET_LIMIT = 1 << 24
 # An addi this large on a base the code does not know is the first half of a split displacement.
@@ -352,6 +353,9 @@ class Image:
         self.decoder.detail = True
         self.cache: dict[int, FunctionFacts] = {}
         self.section_data: dict[str, bytes] = {}
+        # The number of parameters of each function the C defines, for the argument registers a
+        # call passes; set by the caller before facts are read, eight where unknown.
+        self.arity: dict[str, int] = {}
 
     def close(self) -> None:
         self.handle.close()
@@ -395,17 +399,36 @@ class Image:
         facts = FunctionFacts()
         instructions = list(self.decoder.disasm(code, address))
         successors = _flow(self.decoder, instructions)
-        for index, state in self._block_states(instructions, successors):
+        states = self._block_states(instructions, successors)
+        before = dict(states)
+        for index, state in states:
             instruction = instructions[index]
-            escapes = instruction.mnemonic not in _ADDI or self._escapes(instructions, successors, index)
+            escapes = instruction.mnemonic not in _ADDI or self._escapes(instructions, successors, before, index)
             self._step(name, instruction, state, facts, escapes)
         return facts
 
-    def _escapes(self, instructions: list[Any], successors: list[list[int]], index: int, limit: int = 256) -> bool:
+    def _arguments(self, instruction: Any, operands: list[Any]) -> set[str]:
+        """The argument registers a call or a tail jump passes: as many as the callee's C takes."""
+        count = 8
+        if instruction.mnemonic in {"jal", "c.jal", "j", "c.j"} and operands and operands[-1].type == CS_OP_IMM:
+            callee = self.text_at.get((instruction.address + operands[-1].imm) & _MASK)
+            if callee is not None:
+                count = self.arity.get(callee, 8)
+        return {f"a{position}" for position in range(count)}
+
+    def _escapes(
+        self,
+        instructions: list[Any],
+        successors: list[list[int]],
+        before: dict[int, _State],
+        index: int,
+        limit: int = 256,
+    ) -> bool:
         """Whether the address an ``addi`` sets is used, on some path, other than as the base of loads
-        and stores: passed to a call, returned, stored, compared or computed with. Registers derived
-        from it by ``addi``, ``mv`` or ``add`` are followed, and callee-saved registers survive calls.
-        Only an escaping address is itself an access; a base gives the accesses of its loads and stores."""
+        and stores whose state still holds it: passed to a call (in an argument the callee takes),
+        returned, stored, compared or computed with. Registers derived from it by ``addi``, ``mv`` or
+        ``add`` are followed, and callee-saved registers survive calls. Only an escaping address is
+        itself an access; a base gives the accesses of its loads and stores."""
         operands = list(instructions[index].operands)
         if not operands or operands[0].type != CS_OP_REG:
             return True
@@ -420,22 +443,33 @@ class Image:
             instruction = instructions[position]
             mnemonic = instruction.mnemonic
             current = list(instruction.operands)
-            _, reads = _reads(instruction, current)
+            bases, reads = _reads(instruction, current)
+            state = before.get(position)
+            for base in bases & tracked:
+                held = state is not None and (
+                    state.address(base) is not None or base in state.anchored or base in state.relative
+                )
+                if not held:
+                    # The state at this load lost the address (a join), so only the addi shows it.
+                    return True
             written = frozenset(_written_registers(instruction, current))
             used = reads & tracked
             if used and not (mnemonic in _DERIVES and written):
                 return True
             names = {self.decoder.reg_name(register) for register in tracked}
             calls = mnemonic in {"jal", "c.jal"} or (mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, current))
-            if calls or mnemonic in {"jr", "c.jr"}:
-                # An argument register reaches the callee; across a call only callee-saved registers live.
-                if any(name.startswith("a") for name in names):
+            tail = mnemonic in {"j", "c.j"} and not successors[position]
+            indirect = mnemonic in {"jr", "c.jr"} and not (current and self.decoder.reg_name(current[0].reg) == "ra")
+            if calls or tail or indirect:
+                # An argument register the callee takes reaches it; across a call only callee-saved
+                # registers keep their values.
+                if names & self._arguments(instruction, current):
                     return True
                 tracked = frozenset(
                     register for register in tracked if self.decoder.reg_name(register).startswith(("s", "sp", "gp"))
                 )
-            if mnemonic in _ENDS:
-                if "a0" in names:
+            if mnemonic in _ENDS or tail:
+                if names & {"a0", "a1"} and not indirect:
                     return True
                 continue
             # A derived register holds the address plus something; any other write ends the address there.
@@ -448,8 +482,8 @@ class Image:
         """Each instruction's index with the register state before it, from a forward must-analysis
         over the function's basic blocks: a register holds a value at a block's start only when every
         path into the block gives it that value, so an address formed before a branch and used after
-        a join is followed, and one formed on only one path is not. Blocks reached only through an
-        indirect jump (a jump table) start from the state the indirect jumps leave."""
+        a join is followed, and one formed on only one path is not. Blocks no instruction leads to are
+        reached through an indirect jump (a jump table): they start from the state those jumps leave."""
         if not instructions:
             return []
         leaders = {0}
@@ -458,6 +492,7 @@ class Image:
                 leaders.update(following)
                 if index + 1 < len(instructions):
                     leaders.add(index + 1)
+        reached = {successor for following in successors for successor in following}
         starts = sorted(leaders)
         ends = {start: (starts[position + 1] if position + 1 < len(starts) else len(instructions))
                 for position, start in enumerate(starts)}  # fmt: skip
@@ -476,7 +511,10 @@ class Image:
                 for index in range(start, ends[start]):
                     self._step("", instructions[index], state, None)
                 last = instructions[ends[start] - 1]
-                if last.mnemonic in {"jr", "c.jr"}:
+                operands = list(last.operands)
+                if last.mnemonic in {"jr", "c.jr"} and not (
+                    operands and self.decoder.reg_name(operands[0].reg) == "ra"
+                ):
                     indirect.append(state.copy())
                 for successor in successors[ends[start] - 1]:
                     known = entry.get(successor)
@@ -486,14 +524,14 @@ class Image:
                         pending.append(successor)
 
         settle([0])
-        unreached = [start for start in starts if entry[start] is None]
-        if unreached and indirect:
+        orphans = [start for start in starts if entry[start] is None and start not in reached]
+        if orphans and indirect:
             seed = indirect[0]
             for state in indirect[1:]:
                 seed = seed.meet(state)
-            for start in unreached:
+            for start in orphans:
                 entry[start] = seed.copy()
-            settle(list(reversed(unreached)))
+            settle(list(reversed(orphans)))
         result = []
         for start in starts:
             state = (entry[start] or _State()).copy()
@@ -529,17 +567,22 @@ class Image:
                         "provenance": [{"source": "image", "address": _hex(instruction)}],
                     }
                 )
+                if zero_size and address == start:
+                    # A code marker (_sinittext, _stext) at a function's start: the C may name either.
+                    resolved = (zero_size[0], address, section[2])
+                else:
+                    return
+            else:
+                facts.outside.append(
+                    {
+                        "function": function,
+                        "address": _hex(address),
+                        "section": section[2],
+                        "operation": operation,
+                        "provenance": [{"source": "image", "address": _hex(instruction)}],
+                    }
+                )
                 return
-            facts.outside.append(
-                {
-                    "function": function,
-                    "address": _hex(address),
-                    "section": section[2],
-                    "operation": operation,
-                    "provenance": [{"source": "image", "address": _hex(instruction)}],
-                }
-            )
-            return
         symbol, start, section_name = resolved
         name = source_name(symbol)
         entry = {
