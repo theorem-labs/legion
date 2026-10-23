@@ -208,3 +208,11 @@ def test_a_zero_size_name_at_an_objects_address_is_an_alias(image: Image) -> Non
     code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _load(A1, A5, 0), 0x00008067)
     (entry,) = [item for item in image.decode("synthetic", code, start).globals if item["global"] == "pair_a"]
     assert entry["aliases"] == ["pair_alias"]
+
+
+def test_a_displacement_split_into_addi_2047_and_a_load(image: Image) -> None:
+    """``addi s3, a0, 2047; ld a1, 481(s3)``: the field at 2528 bytes from a0."""
+    s3 = 19
+    code = struct.pack("<3I", _addi(s3, A0, 2047), _load(A1, s3, 481), 0x00008067)
+    offsets = image.decode("synthetic", code, 0x11000).memory_offsets
+    assert 2528 in offsets and 481 in offsets

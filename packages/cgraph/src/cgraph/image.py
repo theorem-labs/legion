@@ -34,6 +34,10 @@ _BRANCHES = {
 _ENDS = {"ret", "jr", "c.jr", "ebreak", "c.ebreak", "unimp", "c.unimp", "mret", "sret"}
 # Constants beyond this many bytes are addresses or masks, not field offsets.
 _OFFSET_LIMIT = 1 << 24
+# An addi this large on a base the code does not know is the first half of a split displacement.
+_SPLIT_OFFSET = 1024
+# Displacements a single load or store can reach; a sum beyond them comes from a split offset.
+_DISPLACEMENT_REACH = 2048
 
 
 @dataclass
@@ -130,6 +134,14 @@ def _relative_value(
         return None
     if mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in relative:
         return operands[0].reg, relative[operands[1].reg] + operands[2].imm
+    if (
+        mnemonic == "addi"
+        and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM]
+        and operands[1].reg not in values
+        and abs(operands[2].imm) >= _SPLIT_OFFSET
+    ):
+        # addi s3, s2, 2047 before ld 481(s3): a field beyond the 12-bit displacement, split in two.
+        return operands[0].reg, operands[2].imm
     if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in relative:
         return operands[0].reg, relative[operands[0].reg] + operands[1].imm
     if mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in relative:
@@ -501,9 +513,9 @@ class Image:
                     self._record_address(
                         function, (anchored[base] + displacement) & _MASK, instruction.address, "indexed_access", facts
                     )
-                elif base in relative:
-                    # A base register plus a constant the code formed with lui (a field beyond the
-                    # 12-bit displacement of a load or store).
+                elif base in relative and abs(relative[base] + displacement) >= _DISPLACEMENT_REACH:
+                    # A base register plus a constant beyond the 12-bit displacement of a load or
+                    # store, formed with lui+add or a split addi.
                     facts.memory_offsets.add(relative[base] + displacement)
             if mnemonic in _DIRECT_CALLS and operands and operands[-1].type == CS_OP_IMM:
                 self._call(
