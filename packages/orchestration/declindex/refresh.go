@@ -38,6 +38,8 @@ type RefreshOptions struct {
 	Commit string
 	// PreviousCommit is the index commit that this refresh replaces after a landed synchronisation.
 	PreviousCommit string
+	// CheckLandedCoverage makes RefreshAt compare Commit with the persisted index before it runs a landed sync.
+	CheckLandedCoverage bool
 	// Jobs bounds the parallel readers; zero is min(48, CPUs).
 	Jobs int
 	// Compiled turns on the compiled part (types, compiled hashes, atoms, facts); nil skips it.
@@ -209,6 +211,22 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 		return RefreshStats{}, err
 	}
 	defer unlock()
+	if sync != nil && opt.CheckLandedCoverage {
+		dirty, err := trackedChanges(ctx, tree.Source)
+		if err != nil {
+			return RefreshStats{}, err
+		}
+		if dirty {
+			return RefreshStats{}, errors.New("the tree has tracked changes")
+		}
+		covered, err := s.indexCoversLandedCommit(ctx, tree.Source, opt.Commit)
+		if err != nil {
+			return RefreshStats{}, err
+		}
+		if covered {
+			return RefreshStats{}, ErrAlreadyPast
+		}
+	}
 	if sync != nil {
 		if err := sync(ctx); err != nil {
 			return RefreshStats{}, err

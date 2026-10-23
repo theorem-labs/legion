@@ -50,16 +50,6 @@ func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error 
 		if !has {
 			return fmt.Errorf("the tree lacks %s", commit)
 		}
-		past, err := commitIsAncestor(ctx, cfg.Tree, commit, "HEAD")
-		if err != nil {
-			return err
-		}
-		if past {
-			if log != nil {
-				fmt.Fprintf(log, "declindex: index already covers %s\n", commit)
-			}
-			return ErrAlreadyPast
-		}
 		if err := runGit(ctx, cfg.Tree, log, "checkout", "--detach", "--quiet", commit); err != nil {
 			return fmt.Errorf("checkout %s: %w", commit, err)
 		}
@@ -68,6 +58,37 @@ func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error 
 		}
 		return runBuild(ctx, cfg.Tree, cfg.Build, cfg.BuildTimeout, log)
 	}
+}
+
+// indexCoversLandedCommit reports whether the complete persisted index has already read commit or a descendant.
+// RefreshAt calls it while holding its writer lock, so a retry never mistakes a tree left at a failed build for an
+// advanced index.
+func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string) (bool, error) {
+	indexed, err := s.Meta(ctx, "commit")
+	if err != nil {
+		return false, err
+	}
+	if indexed == "" {
+		return false, nil
+	}
+	indexErrors, err := s.Meta(ctx, "errors")
+	if err != nil {
+		return false, err
+	}
+	if indexErrors != "0" {
+		return false, nil
+	}
+	if indexed == commit {
+		return true, nil
+	}
+	has, err := hasCommit(ctx, tree, commit)
+	if err != nil {
+		return false, err
+	}
+	if !has {
+		return false, nil
+	}
+	return commitIsAncestor(ctx, tree, commit, indexed)
 }
 
 func trackedChanges(ctx context.Context, tree string) (bool, error) {

@@ -241,7 +241,7 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 		if err != nil {
 			return fail(e.stderr, &unableError{err})
 		}
-		opt.Commit, opt.PreviousCommit = commit, previous
+		opt.Commit, opt.PreviousCommit, opt.CheckLandedCoverage = commit, previous, true
 		sync = declindex.Sync(e.cfg, commit, e.stderr)
 	}
 	st, err := e.store.RefreshAt(ctx, tree, opt, sync)

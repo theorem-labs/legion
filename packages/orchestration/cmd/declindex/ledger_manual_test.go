@@ -120,6 +120,31 @@ func TestLedgerManualContractResults(t *testing.T) {
 			t.Fatalf("ambiguous ledger: %+v", r)
 		}
 	})
+	t.Run("reports exact-name ambiguity outside the rule", func(t *testing.T) {
+		tail := "contracts:\n  paths: [\"NoContracts/**\"]\n  kinds: [def]\n"
+		config, dsn, _, l := manualLedgerFixture(t, tail, "")
+		found := declarationForLedger(t, config, "Gold.Box")
+		if _, err := l.RegisterContract(context.Background(), "r", found.Name, "function:frame_at", found.StmtHash, false); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := declindex.LoadConfig(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", cfg.DB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.Exec(`INSERT INTO decls (name, short, module, kind, line, stmt_hash)
+			VALUES (?, ?, ?, ?, ?, ?)`, found.Name, "Box", "Other.Module", found.Kind, 1, found.StmtHash); err != nil {
+			t.Fatal(err)
+		}
+		if r := invokeLedger(t, config, dsn, ""); r.code != 1 || !strings.Contains(r.out, `"ambiguous": [`) ||
+			!strings.Contains(r.out, found.Name) {
+			t.Fatalf("exact-name ambiguous ledger: %+v", r)
+		}
+	})
 	for _, test := range []struct {
 		name, contract, hash string
 		code                 int
