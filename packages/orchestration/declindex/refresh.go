@@ -36,6 +36,8 @@ type Tree struct {
 type RefreshOptions struct {
 	// Commit is the source commit the build is of; it is recorded as the index's commit.
 	Commit string
+	// PreviousCommit is the index commit that this refresh replaces after a landed synchronisation.
+	PreviousCommit string
 	// Jobs bounds the parallel readers; zero is min(48, CPUs).
 	Jobs int
 	// Compiled turns on the compiled part (types, compiled hashes, atoms, facts); nil skips it.
@@ -348,6 +350,9 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	}
 	if opt.Commit != previousCommit {
 		meta["prev_commit"] = previousCommit
+	}
+	if opt.PreviousCommit != "" {
+		meta["prev_commit"] = opt.PreviousCommit
 	}
 	// The graph file is written after the commit. A new generation token marks it out of date until a graph of
 	// this generation is written, so a failed write is repaired by the next refresh and never read meanwhile.

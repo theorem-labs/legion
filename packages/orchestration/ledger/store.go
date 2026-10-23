@@ -20,9 +20,37 @@ import (
 //go:embed schema/*.sql
 var schemaFS embed.FS
 
+// ledgerTables is every table the embedded ledger schema needs. Add a table here with the migration that creates it
+// so OpenExisting rejects a database whose version record survived a damaged table.
+var ledgerTables = []string{
+	"repositories",
+	"work_items",
+	"migrations",
+	"migration_writes",
+	"migration_reads",
+	"contracts",
+	"agreements",
+	"agreement_reads",
+	"events",
+}
+
 // Store is a connection pool to one ledger database.
 type Store struct {
 	pool *pgxpool.Pool
+}
+
+// SchemaError means an existing ledger database lacks an embedded schema version or a required ledger table.
+// OpenExisting returns it without applying any migration.
+type SchemaError struct {
+	Missing []int
+	Tables  []string
+}
+
+func (e *SchemaError) Error() string {
+	if len(e.Tables) != 0 {
+		return fmt.Sprintf("ledger schema is missing versions %v or tables %v", e.Missing, e.Tables)
+	}
+	return fmt.Sprintf("ledger schema is missing versions %v", e.Missing)
 }
 
 // Open connects to the database and applies any schema versions it lacks.
@@ -43,6 +71,25 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	return s, nil
 }
 
+// OpenExisting connects to an existing ledger database and verifies that it has every schema version embedded in
+// this binary. It never applies a migration.
+func OpenExisting(ctx context.Context, dsn string) (*Store, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse DSN: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	s := &Store{pool: pool}
+	if err := s.checkSchema(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
 // Close releases the pool.
 func (s *Store) Close() { s.pool.Close() }
 
@@ -53,13 +100,87 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 	return v, err
 }
 
-// migrate applies schema/NNNN_*.sql files in order, each once, under an advisory lock so concurrent starts agree.
-func (s *Store) migrate(ctx context.Context) error {
+func schemaFiles() ([]string, error) {
 	files, err := fs.Glob(schemaFS, "schema/*.sql")
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func schemaFileVersion(file string) (int, error) {
+	base := strings.TrimPrefix(file, "schema/")
+	n, err := strconv.Atoi(strings.SplitN(base, "_", 2)[0])
+	if err != nil {
+		return 0, fmt.Errorf("schema file %s: name must start with a version number", base)
+	}
+	return n, nil
+}
+
+func (s *Store) checkSchema(ctx context.Context) error {
+	files, err := schemaFiles()
 	if err != nil {
 		return err
 	}
-	sort.Strings(files)
+	want := make([]int, len(files))
+	for i, file := range files {
+		if want[i], err = schemaFileVersion(file); err != nil {
+			return err
+		}
+	}
+	rows, err := s.pool.Query(ctx, `SELECT version FROM schema_versions`)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+			return &SchemaError{Missing: want}
+		}
+		return fmt.Errorf("read schema versions: %w", err)
+	}
+	defer rows.Close()
+	have := make(map[int]bool, len(want))
+	for rows.Next() {
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			return err
+		}
+		have[version] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var missing []int
+	for _, version := range want {
+		if !have[version] {
+			missing = append(missing, version)
+		}
+	}
+	if len(missing) != 0 {
+		return &SchemaError{Missing: missing}
+	}
+	var missingTables []string
+	for _, table := range ledgerTables {
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
+			return fmt.Errorf("check ledger table %s: %w", table, err)
+		}
+		if !exists {
+			missingTables = append(missingTables, table)
+		}
+	}
+	if len(missingTables) != 0 {
+		return &SchemaError{Missing: want, Tables: missingTables}
+	}
+	return nil
+}
+
+// migrate applies schema/NNNN_*.sql files in order, each once, under an advisory lock so concurrent starts agree.
+
+func (s *Store) migrate(ctx context.Context) error {
+	files, err := schemaFiles()
+	if err != nil {
+		return err
+	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7243100109)`); err != nil {
 			return err
@@ -70,9 +191,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		for _, f := range files {
 			base := strings.TrimPrefix(f, "schema/")
-			n, err := strconv.Atoi(strings.SplitN(base, "_", 2)[0])
+			n, err := schemaFileVersion(f)
 			if err != nil {
-				return fmt.Errorf("schema file %s: name must start with a version number", base)
+				return err
 			}
 			var done bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_versions WHERE version = $1)`, n).Scan(&done); err != nil {

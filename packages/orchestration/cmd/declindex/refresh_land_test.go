@@ -1,0 +1,185 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+
+	"github.com/sjawhar/legion/orchestration/declindex"
+)
+
+type landingFixture struct {
+	config, tree, first, second string
+}
+
+func newLandingFixture(t *testing.T) landingFixture {
+	t.Helper()
+	config := fixture(t)
+	root := filepath.Dir(config)
+	seed := filepath.Join(root, "tree")
+	git(t, seed, "init", "-q")
+	git(t, seed, "add", "-A")
+	git(t, seed, "commit", "-q", "-m", "first")
+	first := git(t, seed, "rev-parse", "HEAD")
+	remote := filepath.Join(root, "remote.git")
+	git(t, root, "clone", "-q", "--bare", seed, remote)
+	tree := filepath.Join(root, "landing-tree")
+	git(t, root, "clone", "-q", remote, tree)
+	if err := os.WriteFile(filepath.Join(seed, "landing.txt"), []byte("second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, seed, "add", "landing.txt")
+	git(t, seed, "commit", "-q", "-m", "second")
+	second := git(t, seed, "rev-parse", "HEAD")
+	git(t, seed, "push", "-q", remote, "HEAD:refs/heads/master")
+	body, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(strings.Replace(string(body), "tree: tree\n", "tree: landing-tree\n", 1) + "remote: " + remote + "\nbuild: [\"true\"]\nbuild_timeout: 1s\n")
+	if err := os.WriteFile(config, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("initial refresh: %+v", r)
+	}
+	return landingFixture{config: config, tree: tree, first: first, second: second}
+}
+
+func (f landingFixture) refreshAt(t *testing.T, commit string) result {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"--config", f.config, "refresh"}, func(key string) string {
+		if key == "LAND_COMMIT" {
+			return commit
+		}
+		return ""
+	}, &out, &errOut)
+	return result{code, out.String(), errOut.String()}
+}
+
+func TestRefreshAtLandedCommit(t *testing.T) {
+	t.Run("fetches builds and records the previous index commit", func(t *testing.T) {
+		f := newLandingFixture(t)
+		if r := f.refreshAt(t, f.second); r.code != 0 {
+			t.Fatalf("refresh: %+v", r)
+		}
+		if got := git(t, f.tree, "rev-parse", "HEAD"); got != f.second {
+			t.Fatalf("tree HEAD %s, want landed commit %s", got, f.second)
+		}
+		cfg, err := declindex.LoadConfig(f.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := declindex.Open(cfg.DB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		commit, err := s.Meta(context.Background(), "commit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		previous, err := s.Meta(context.Background(), "prev_commit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if commit != f.second || previous != f.first {
+			t.Fatalf("index commit %q, prev_commit %q; want %q, %q", commit, previous, f.second, f.first)
+		}
+	})
+	t.Run("refuses a dirty tracked tree", func(t *testing.T) {
+		f := newLandingFixture(t)
+		if err := os.WriteFile(filepath.Join(f.tree, "Golden.lean"), []byte("dirty\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 3 {
+			t.Fatalf("dirty refresh: %+v", r)
+		}
+		if got := git(t, f.tree, "rev-parse", "HEAD"); got != f.first {
+			t.Fatalf("tree moved to %s after dirty refresh", got)
+		}
+	})
+	t.Run("classifies a missing remote as temporary", func(t *testing.T) {
+		f := newLandingFixture(t)
+		body, err := os.ReadFile(f.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "remote: "+filepath.Join(filepath.Dir(f.config), "remote.git"), "remote: /does-not-exist", 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 75 {
+			t.Fatalf("missing-remote refresh: %+v", r)
+		}
+	})
+	t.Run("refuses a missing commit without a remote", func(t *testing.T) {
+		f := newLandingFixture(t)
+		body, err := os.ReadFile(f.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "remote: "+filepath.Join(filepath.Dir(f.config), "remote.git")+"\n", "", 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 3 {
+			t.Fatalf("missing-commit refresh: %+v", r)
+		}
+	})
+	t.Run("reports a failed build as unable", func(t *testing.T) {
+		f := newLandingFixture(t)
+		body, err := os.ReadFile(f.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", "build: [\"false\"]", 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 3 {
+			t.Fatalf("failed-build refresh: %+v", r)
+		}
+	})
+	t.Run("kills a timed-out build process group", func(t *testing.T) {
+		f := newLandingFixture(t)
+		body, err := os.ReadFile(f.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		build := "build:\n  - sh\n  - -c\n  - 'sleep 30 & echo $! > pid; wait'"
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", build, 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 75 {
+			t.Fatalf("timed-out build: %+v", r)
+		}
+		raw, err := os.ReadFile(filepath.Join(f.tree, "pid"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("timed-out build process %d still exists: %v", pid, err)
+		}
+	})
+	t.Run("leaves an already covered ancestor in place", func(t *testing.T) {
+		f := newLandingFixture(t)
+		if r := f.refreshAt(t, f.second); r.code != 0 {
+			t.Fatalf("refresh to second commit: %+v", r)
+		}
+		if r := f.refreshAt(t, f.first); r.code != 0 {
+			t.Fatalf("ancestor refresh: %+v", r)
+		}
+		if got := git(t, f.tree, "rev-parse", "HEAD"); got != f.second {
+			t.Fatalf("tree moved to ancestor %s", got)
+		}
+	})
+}

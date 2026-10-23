@@ -35,7 +35,7 @@ func TestQueriesRefuseAnIndexWithUnreadableModules(t *testing.T) {
 	}
 }
 
-// The ledger check writes only to an existing ledger: it never creates the ledger's schema.
+// OpenExisting refuses a database that lacks the ledger schema without creating it.
 func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 	dsn := testpg.Database(t, "declindex_noschema")
 	config := fixture(t)
@@ -54,7 +54,7 @@ func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 		}
 		return ""
 	}, &out, &errOut)
-	if code != 3 {
+	if code != 3 || !strings.Contains(errOut.String(), "ledger schema is missing versions") {
 		t.Fatalf("ledger on an empty database exited %d: %s %s", code, out.String(), errOut.String())
 	}
 	conn, err := pgx.Connect(context.Background(), dsn)
