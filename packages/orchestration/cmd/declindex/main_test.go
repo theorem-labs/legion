@@ -62,6 +62,18 @@ func TestHelpStartsWithOneLineUsage(t *testing.T) {
 	}
 }
 
+func TestHelpListsRefreshAndLedgerExitCodes(t *testing.T) {
+	r := invoke(t, "--help")
+	for _, want := range []string{
+		"refresh: 0 read; 2 usage; 3 unable; 75 retry",
+		"ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry",
+	} {
+		if !strings.Contains(r.out, want) {
+			t.Errorf("help does not list %q:\n%s", want, r.out)
+		}
+	}
+}
+
 func TestUsageErrorsExitTwo(t *testing.T) {
 	config := fixture(t)
 	for _, args := range [][]string{

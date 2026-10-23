@@ -142,24 +142,61 @@ type LedgerDefect struct {
 
 // LedgerReport is what one check of the ledger against the index found.
 type LedgerReport struct {
-	Commit     string         `json:"commit"`
+	Commit     string         `json:"-"`
 	Contracts  int            `json:"contracts"`
 	Registered []string       `json:"registered"`
 	Matching   int            `json:"matching"`
 	Unowned    []string       `json:"unowned"`
 	Ambiguous  []string       `json:"ambiguous"`
 	Defects    []LedgerDefect `json:"defects"`
-	// Gone are contracts of the ledger that the rule no longer selects in the index: removed, renamed or moved
-	// by a landing that did not retire them.
+	// Gone are Lean-named ledger contracts that the index no longer declares at any module.
 	Gone []string `json:"gone"`
 }
 
+// Defective reports whether the contract portion of a ledger check found a condition that makes the command exit 1.
+func (r LedgerReport) Defective() bool {
+	return len(r.Defects) != 0 || len(r.Gone) != 0 || len(r.Unowned) != 0 || len(r.Ambiguous) != 0
+}
+
+type ledgerDeclaration struct {
+	module string
+	hash   string
+}
+
+func (s *Store) ledgerDeclarations(ctx context.Context, names []string) (map[string][]ledgerDeclaration, error) {
+	out := make(map[string][]ledgerDeclaration, len(names))
+	for i := 0; i < len(names); i += 500 {
+		chunk := names[i:min(i+500, len(names))]
+		rows, err := s.db.QueryContext(ctx, `SELECT name, module, stmt_hash FROM decls WHERE name IN (`+
+			placeholders(len(chunk))+`)`, anys(chunk)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var name string
+			var declaration ledgerDeclaration
+			if err := rows.Scan(&name, &declaration.module, &declaration.hash); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[name] = append(out[name], declaration)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 // CheckLedger runs after a landing, on the index of the landed build. It registers every contract the rule
-// selects that the ledger lacks and that has an owner, at version 1 with the index's statement hash, and reports
-// every registered contract whose ledger hash differs from the index's, and every ledger contract the index no
-// longer declares. It never advances a contract: only a landing does. The hash is the statement hash
-// (StatementHash), the hash a change lock records for its reads. The ledger is read in one call, so the check
-// costs one round trip plus one per contract it registers.
+// selects that the ledger lacks and that has an owner, at version 1 with the index's statement hash. It then
+// checks every Lean-named ledger contract against declarations of that exact name in the index. It never advances
+// a contract: only a landing does. The hash is the statement hash (StatementHash), the hash a change lock records
+// for its reads.
 func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, rule ContractRule, owners Owners) (LedgerReport, error) {
 	var r LedgerReport
 	var err error
@@ -182,6 +219,7 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 	for _, c := range contracts {
 		count[c.Name]++
 	}
+	selected := make(map[string]Found, len(contracts))
 	for _, c := range contracts {
 		if count[c.Name] > 1 {
 			// One ledger record per name: a name declared twice cannot be told apart there.
@@ -189,33 +227,56 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 			continue
 		}
 		r.Contracts++
-		cur, ok := inLedger[c.Name]
-		switch {
-		case !ok:
-			owner := owners[dirOf(c.Path)]
-			if owner == "" {
-				r.Unowned = append(r.Unowned, c.Name)
+		selected[c.Name] = c
+		if _, ok := inLedger[c.Name]; ok {
+			continue
+		}
+		owner := owners[dirOf(c.Path)]
+		if owner == "" {
+			r.Unowned = append(r.Unowned, c.Name)
+			continue
+		}
+		if c.StmtHash == "" {
+			return r, fmt.Errorf("contract %s has no statement hash: its source file is missing or newer than its build", c.Name)
+		}
+		if _, err := l.RegisterContract(ctx, repo, c.Name, owner, c.StmtHash, false); err != nil {
+			return r, fmt.Errorf("register %s: %w", c.Name, err)
+		}
+		r.Registered = append(r.Registered, c.Name)
+	}
+	names := make([]string, 0, len(all))
+	for _, c := range all {
+		if !strings.Contains(c.Name, ":") {
+			names = append(names, c.Name)
+		}
+	}
+	declarations, err := s.ledgerDeclarations(ctx, names)
+	if err != nil {
+		return r, err
+	}
+	for _, c := range all {
+		if strings.Contains(c.Name, ":") {
+			continue
+		}
+		declarations := declarations[c.Name]
+		switch len(declarations) {
+		case 0:
+			r.Gone = append(r.Gone, c.Name)
+		case 1:
+			if c.StatementHash == declarations[0].hash {
+				r.Matching++
 				continue
 			}
-			if c.StmtHash == "" {
-				return r, fmt.Errorf("contract %s has no statement hash: its source file is missing or newer than its build", c.Name)
+			at := sourcePath("", declarations[0].module)
+			if found, ok := selected[c.Name]; ok {
+				at = found.At()
 			}
-			if _, err := l.RegisterContract(ctx, repo, c.Name, owner, c.StmtHash, false); err != nil {
-				return r, fmt.Errorf("register %s: %w", c.Name, err)
-			}
-			r.Registered = append(r.Registered, c.Name)
-		case cur.StatementHash == c.StmtHash:
-			r.Matching++
+			r.Defects = append(r.Defects, LedgerDefect{Contract: c.Name, At: at, LedgerHash: c.StatementHash,
+				Version: c.Version, IndexHash: declarations[0].hash})
 		default:
-			r.Defects = append(r.Defects, LedgerDefect{Contract: c.Name, At: c.At(), LedgerHash: cur.StatementHash,
-				Version: cur.Version, IndexHash: c.StmtHash})
+			r.Ambiguous = append(r.Ambiguous, c.Name)
 		}
 	}
 	sort.Strings(r.Ambiguous)
-	for _, c := range all {
-		if count[c.Name] == 0 {
-			r.Gone = append(r.Gone, c.Name)
-		}
-	}
 	return r, nil
 }

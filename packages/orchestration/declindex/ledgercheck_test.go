@@ -2,9 +2,11 @@ package declindex
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
@@ -108,5 +110,81 @@ func TestCheckLedgerRegistersChecksAndReportsDefects(t *testing.T) {
 	gone, err := s.CheckLedger(ctx, l, "r", rule, owners)
 	if err != nil || !reflect.DeepEqual(gone.Gone, []string{"Gold.Removed"}) {
 		t.Fatalf("a ledger contract the index no longer declares: %+v %v", gone.Gone, err)
+	}
+}
+
+// Ledger contracts need not be selected by this index's contract rule. Every Lean-named contract is still checked
+// against the declarations of that exact name, while metadata contracts with a colon are skipped.
+func TestCheckLedgerChecksEveryLeanNamedLedgerContract(t *testing.T) {
+	ctx := context.Background()
+	l, err := ledger.Open(ctx, testpg.Database(t, "declindex_all_ledger_contracts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Close)
+	if _, err := l.EnsureRepo(ctx, "r", 3); err != nil {
+		t.Fatal(err)
+	}
+	s := refreshed(t, goldenTree(t))
+	matching, err := s.Resolve(ctx, "Gold2.FrameAt")
+	if err != nil || len(matching) != 1 {
+		t.Fatalf("matching declaration: %+v %v", matching, err)
+	}
+	wrong, err := s.Resolve(ctx, "Gold.Box")
+	if err != nil || len(wrong) != 1 {
+		t.Fatalf("wrong-hash declaration: %+v %v", wrong, err)
+	}
+	for _, c := range []struct {
+		name, hash string
+	}{
+		{matching[0].Name, matching[0].StmtHash},
+		{wrong[0].Name, "different"},
+		{"spec:function:open_file", "metadata"},
+	} {
+		if _, err := l.RegisterContract(ctx, "r", c.name, "function:frame_at", c.hash, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rule := ContractRule{Paths: []string{"NoContracts/**"}, Kinds: []string{"def", "structure"}}
+	r, err := s.CheckLedger(ctx, l, "r", rule, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []LedgerDefect{{Contract: wrong[0].Name, At: sourcePath("", wrong[0].Module), LedgerHash: "different", Version: 1, IndexHash: wrong[0].StmtHash}}
+	if r.Matching != 1 || !reflect.DeepEqual(r.Defects, want) || r.Gone != nil || !r.Defective() {
+		t.Fatalf("ledger report %+v, want one matching, one exact-name defect, no gone contracts", r)
+	}
+}
+
+func TestOwnerMapsOfTheGraphTool(t *testing.T) {
+	raw := os.Getenv("DECLINDEX_OWNER_MAPS")
+	if raw == "" {
+		t.Skip("DECLINDEX_OWNER_MAPS is unset")
+	}
+	nodeID := regexp.MustCompile(`^(?:(?:function|struct|global|percpu|subsystem):\S+|[a-z][a-z0-9-]*)$`)
+	for _, path := range filepath.SplitList(raw) {
+		if _, err := LoadOwners(path, "cgraph/owners/v1"); err != nil {
+			t.Errorf("load %s: %v", path, err)
+			continue
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("read %s: %v", path, err)
+			continue
+		}
+		var ownerMap struct {
+			Owners []struct {
+				ID string `json:"id"`
+			} `json:"owners"`
+		}
+		if err := json.Unmarshal(body, &ownerMap); err != nil {
+			t.Errorf("parse %s: %v", path, err)
+			continue
+		}
+		for _, owner := range ownerMap.Owners {
+			if !nodeID.MatchString(owner.ID) {
+				t.Errorf("%s has owner id %q outside contract 1's patterns", path, owner.ID)
+			}
+		}
 	}
 }

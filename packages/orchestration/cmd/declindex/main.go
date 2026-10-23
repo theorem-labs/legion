@@ -23,7 +23,8 @@ const usage = "usage: declindex --config FILE [--db FILE] [--json] <refresh|stat
 const help = usage + `
 
 Commands:
-  refresh                      bring the index to the tree's build (re-reads only what the build changed)
+  refresh                      bring the index to the tree's build; with LAND_COMMIT, fetch, check out and build
+                               that landed commit before reading it
   status                       the index's commit, build time and size, and the tree's commit
   where NAME...                where each declaration is: name, kind, module, path:line
   users [--lines] [--why] [--limit N] NAME...
@@ -33,17 +34,27 @@ Commands:
   states CONCEPT...            the statements that state a registered concept's fact: directly, through a
                                definition they apply (via:<definition>), or by using the concept (uses)
   same NAME...                 the declarations whose statements share a relation atom with NAME's statement
-  gate PROPOSAL.json           the similarity gate: refuse an exact duplicate (exit 1), send a near match to
-                               the librarian (exit 4), refuse a name already taken (exit 5), or add the
-                               concept to the registry (exit 0); JSON
+  gate PROPOSAL.json           the similarity gate: refuse an exact duplicate, send a near match to the librarian,
+                               refuse a taken name, or print an addition; JSON
                                {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>}
-  ledger [--dsn-file PATH]     after a landing: register new contracts in the ledger (LEDGER_DSN), and report
-                               each contract whose ledger hash is not the index's (exit 1)
+  ledger [--dsn-file PATH | --contracts-file FILE --emit FILE]
+                               check the ledger after a landing; the file mode emits operations for the landing
+                               program and never connects to the ledger
   land-hash                    the landing program's hasher: LAND_TREE and LAND_NAMES (a JSON array) in,
-                               name<TAB>hash out; exit 3 when any name cannot be answered at LAND_TREE
+                               name<TAB>hash out
 
 NAME is a full name or any dotted suffix of one. A name declared twice is answered once per declaration.
-Exit codes: 0 answered, 1 a name not found, 2 usage, 3 unable to check (no index, unreadable configuration).`
+Exit codes:
+  refresh: 0 read; 2 usage; 3 unable; 75 retry
+  status: 0 answered; 2 usage; 3 unable
+  where: 0 answered; 1 name not found; 2 usage; 3 unable
+  users: 0 answered; 1 name not found; 2 usage; 3 unable
+  hash: 0 answered; 1 name not found; 2 usage; 3 unable
+  states: 0 answered; 1 name not found; 2 usage; 3 unable
+  same: 0 answered; 1 name not found; 2 usage; 3 unable
+  gate: 0 added; 1 duplicate; 2 usage; 3 unable; 4 near; 5 name taken
+  ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry
+  land-hash: 0 answered; 2 usage; 3 unable`
 
 type usageError struct{ msg string }
 
@@ -180,12 +191,15 @@ func fail(w io.Writer, err error) int {
 	fmt.Fprintln(w, "declindex: "+err.Error())
 	var u *usageError
 	var nf *declindex.NotFoundError
+	var temporary *declindex.TempError
 	switch {
 	case errors.As(err, &u):
 		fmt.Fprintln(w, usage)
 		return 2
 	case errors.As(err, &nf):
 		return 1
+	case errors.As(err, &temporary):
+		return 75
 	default:
 		return 3
 	}
@@ -218,7 +232,22 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	defer e.close()
 	tree := e.cfg.TreeSpec()
 	opt := declindex.RefreshOptions{Commit: treeHead(e.cfg.Tree), Jobs: e.cfg.Jobs, Log: e.stderr}
-	st, err := e.store.Refresh(ctx, tree, opt)
+	var sync func(context.Context) error
+	if commit := e.getenv("LAND_COMMIT"); commit != "" {
+		if !isCommitID(commit) {
+			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 hexadecimal characters"})
+		}
+		previous, err := e.store.Meta(ctx, "commit")
+		if err != nil {
+			return fail(e.stderr, &unableError{err})
+		}
+		opt.Commit, opt.PreviousCommit = commit, previous
+		sync = declindex.Sync(e.cfg, commit, e.stderr)
+	}
+	st, err := e.store.RefreshAt(ctx, tree, opt, sync)
+	if errors.Is(err, declindex.ErrAlreadyPast) {
+		return 0
+	}
 	if err == nil && e.cfg.Lean.Export {
 		// The forms module imports the registered concepts' modules, which the index knows only once the
 		// reference files are read: the compiled part runs second.
@@ -242,6 +271,18 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 		return e.printJSON(st)
 	}
 	return 0
+}
+
+func isCommitID(commit string) bool {
+	if len(commit) != 40 {
+		return false
+	}
+	for _, r := range commit {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 type status struct {
