@@ -3,4 +3,5 @@ go 1.27.1
 use (
 	./packages/daemon
 	./packages/envoy
+	./packages/orchestration
 )
