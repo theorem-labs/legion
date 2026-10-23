@@ -202,7 +202,15 @@ func extractRegistryArchive(archive io.Reader, root, rel string) error {
 		if !filepath.IsLocal(name) {
 			return fmt.Errorf("git archive returned unsafe registry path: %s", header.Name)
 		}
-		if slash := filepath.ToSlash(name); slash != prefix && !strings.HasPrefix(slash, prefix+"/") {
+		slash := filepath.ToSlash(name)
+		if header.Typeflag == tar.TypeDir && strings.HasPrefix(prefix, slash+"/") {
+			// `git archive` also lists the directories that lead to a nested registry.
+			if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if slash != prefix && !strings.HasPrefix(slash, prefix+"/") {
 			return fmt.Errorf("git archive returned path outside registry: %s", header.Name)
 		}
 		target := filepath.Join(root, name)

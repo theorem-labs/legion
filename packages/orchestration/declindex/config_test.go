@@ -44,6 +44,19 @@ func TestConfigResolvesPathsAgainstItsDirectory(t *testing.T) {
 	}
 }
 
+func TestConfigGivesAbsolutePathsForARelativeConfigPath(t *testing.T) {
+	p := writeConfig(t, "tree: ../tree\ndb: state/index.sqlite\nroots: [A]\nregistry: registry\n")
+	t.Chdir(filepath.Dir(filepath.Dir(p)))
+	c, err := LoadConfig(filepath.Join("conf", "index.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(filepath.Dir(filepath.Dir(p)), "tree")
+	if c.Tree != want || !filepath.IsAbs(c.DB) || c.Registry != filepath.Join(want, "registry") {
+		t.Fatalf("relative config gave tree %q, db %q, registry %q; want tree %q and absolute paths", c.Tree, c.DB, c.Registry, want)
+	}
+}
+
 func TestConfigRefusesMissingTreeAndRoots(t *testing.T) {
 	for _, body := range []string{"roots: [A]\n", "tree: x\n", "tree: x\nroots: [A]\nunknown_key: 1\n"} {
 		if _, err := LoadConfig(writeConfig(t, body)); err == nil {

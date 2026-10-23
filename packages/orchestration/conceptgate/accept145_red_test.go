@@ -25,10 +25,9 @@ func TestRequiredSandboxRunsTheGateTests(t *testing.T) {
 
 // Accept145 (INFRA-145 acceptance, E2): a librarian concept with forms and no stored source states its fact through
 // its forms; the index need not declare its name (README: "A concept with no form is matched by its declaration's
-// body", so one with forms is not). Forms keeps only concepts the index declares, so the copy's
-// LinuxMmu.SK.SpAligned (18 forms, declared nowhere) leaves an empty forms module and `declindex states
-// LinuxMmu.SK.SpAligned` finds 0 of the 1,824 files at d2672b5c5 (v1, format 1: 1,789). Run
-// infra145-e2-20261023T2236Z on linux28-poc-build.
+// body", so one with forms is not). Forms kept only concepts the index declares, so a librarian concept with 18
+// forms that no module declares left an empty forms module, and `declindex states` for it found 0 of the 1,824
+// files that state its fact (1,789 with the format-1 registry). Run infra145-e2-20261023T2236Z.
 func TestFormsKeepsUndeclaredConceptsForms(t *testing.T) {
 	reg, defects, err := Load(filepath.Join("testdata", "registry"))
 	if err != nil || len(defects) != 0 {

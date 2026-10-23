@@ -80,9 +80,10 @@ func TestFreshClassifiesLakeBuildOutputs(t *testing.T) {
 	}
 
 	writeLakeFile(t, base+".ilean", "{}")
+	ileanOut := LakeTextHash([]byte("{}")) + ".ilean"
 	trace := func(synthetic bool, sourceHash string) string {
-		return fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[[%q,%q]],"synthetic":%t}`,
-			sourcePath, sourceHash, synthetic)
+		return fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[[%q,%q]],"outputs":{"i":%q},"synthetic":%t}`,
+			sourcePath, sourceHash, ileanOut, synthetic)
 	}
 	writeLakeFile(t, base+".trace", trace(false, hash))
 	fresh, err := Fresh(root, libRel, rel, []byte(source))
@@ -93,23 +94,38 @@ func TestFreshClassifiesLakeBuildOutputs(t *testing.T) {
 		t.Fatalf("matching build trace = %+v, want fresh", fresh)
 	}
 
+	stale := func(what string) {
+		t.Helper()
+		got, err := Fresh(root, libRel, rel, []byte(source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != FreshnessStale || got.Reason == "" {
+			t.Fatalf("%s = %+v, want stale with reason", what, got)
+		}
+	}
 	writeLakeFile(t, base+".trace", trace(false, "0000000000000000"))
-	wrongHash, err := Fresh(root, libRel, rel, []byte(source))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if wrongHash.State != FreshnessStale || wrongHash.Reason == "" {
-		t.Fatalf("wrong build hash = %+v, want stale with reason", wrongHash)
-	}
+	stale("wrong build hash")
 
 	writeLakeFile(t, base+".trace", `{"schemaVersion":"next","inputs":[],"synthetic":false}`)
-	unknownSchema, err := Fresh(root, libRel, rel, []byte(source))
-	if err != nil {
+	stale("unknown schema")
+
+	// The plan's E5 control: the build directory's source rewritten after the build, its trace unchanged.
+	writeLakeFile(t, base+".trace", trace(false, hash))
+	writeLakeFile(t, sourcePath, "one\ntwo rewritten\n")
+	stale("rewritten built source")
+	if err := os.Remove(sourcePath); err != nil {
 		t.Fatal(err)
 	}
-	if unknownSchema.State != FreshnessStale || unknownSchema.Reason == "" {
-		t.Fatalf("unknown schema = %+v, want stale with reason", unknownSchema)
-	}
+	stale("missing built source")
+	writeLakeFile(t, sourcePath, source)
+
+	// Another build's .ilean copied over this one: the trace records a different output.
+	writeLakeFile(t, base+".ilean", `{"decls":{}}`)
+	stale("copied .ilean")
+	writeLakeFile(t, base+".ilean", "{}")
+	writeLakeFile(t, base+".trace", fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[[%q,%q]],"synthetic":false}`, sourcePath, hash))
+	stale("trace without outputs")
 }
 
 func TestFreshChecksFetchedSourceAgeAndBytes(t *testing.T) {
@@ -124,7 +140,8 @@ func TestFreshChecksFetchedSourceAgeAndBytes(t *testing.T) {
 	writeLakeFile(t, sourcePath, source)
 	writeLakeFile(t, base+".ilean", "{}")
 	tracePath := base + ".trace"
-	writeLakeFile(t, tracePath, `{"schemaVersion":"2025-09-10","inputs":[],"synthetic":true}`)
+	fetch := fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[],"outputs":{"i":%q},"synthetic":true}`, LakeTextHash([]byte("{}"))+".ilean")
+	writeLakeFile(t, tracePath, fetch)
 
 	fresh, err := Fresh(root, libRel, rel, []byte(source))
 	if err != nil {
@@ -156,5 +173,17 @@ func TestFreshChecksFetchedSourceAgeAndBytes(t *testing.T) {
 	}
 	if differentSource.State != FreshnessStale || differentSource.Reason == "" {
 		t.Fatalf("different fetched source = %+v, want stale with reason", differentSource)
+	}
+
+	// A fetch trace binds the outputs: an .ilean that is not the recorded output is stale.
+	writeLakeFile(t, sourcePath, source)
+	writeLakeFile(t, tracePath, fetch)
+	writeLakeFile(t, base+".ilean", `{"decls":{}}`)
+	copied, err := Fresh(root, libRel, rel, []byte(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied.State != FreshnessStale || copied.Reason == "" {
+		t.Fatalf("fetch trace with another .ilean = %+v, want stale with reason", copied)
 	}
 }

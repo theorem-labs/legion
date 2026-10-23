@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
@@ -67,10 +68,18 @@ func (l Lean) env(searchPath []string, home string) []string {
 	return env
 }
 
+// inGroup makes cmd the leader of a new process group and has a cancelled context kill that whole group, so the
+// programs it starts (Lake's `lean` and compiler processes) do not outlive the command.
+func inGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+}
+
 func run(ctx context.Context, dir string, env []string, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	cmd.Env = env
+	inGroup(cmd)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil {
@@ -413,6 +422,7 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 		}
 		c := exec.CommandContext(ctx, x.Bin, path)
 		c.Env = x.Lean.env(x.SearchPath, tmp)
+		inGroup(c)
 		c.Stderr = &stderr
 		cmd = c
 	}

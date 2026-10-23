@@ -329,4 +329,26 @@ func TestExtractRegistryArchiveRefusesEntriesOutsideTheRegistry(t *testing.T) {
 	if got := written(t, dir); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("extracted %v, want %v", got, want)
 	}
+
+	// A nested registry: `git archive` lists the directories that lead to it, and nothing else outside it.
+	nested := t.TempDir()
+	if err := extractRegistryArchive(archive(t,
+		tar.Header{Name: "docs/", Typeflag: tar.TypeDir},
+		tar.Header{Name: "docs/lx/", Typeflag: tar.TypeDir},
+		tar.Header{Name: "docs/lx/registry/", Typeflag: tar.TypeDir},
+		tar.Header{Name: "docs/lx/registry/registry.yaml", Typeflag: tar.TypeReg},
+	), nested, "docs/lx/registry"); err != nil {
+		t.Fatal(err)
+	}
+	if got := written(t, nested); len(got) != 1 || got[0] != filepath.Join(nested, "docs", "lx", "registry", "registry.yaml") {
+		t.Fatalf("nested registry extracted %v", got)
+	}
+	for _, outside := range []tar.Header{
+		{Name: "docs/other.yaml", Typeflag: tar.TypeReg},
+		{Name: "docs/other/", Typeflag: tar.TypeDir},
+	} {
+		if err := extractRegistryArchive(archive(t, outside), t.TempDir(), "docs/lx/registry"); err == nil {
+			t.Errorf("entry %s beside a nested registry was accepted", outside.Name)
+		}
+	}
 }

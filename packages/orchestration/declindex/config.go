@@ -126,7 +126,11 @@ func LoadConfig(path string) (Config, error) {
 			return Config{}, fmt.Errorf("%s: build_timeout %q: %w", path, y.BuildTimeout, err)
 		}
 	}
-	dir := filepath.Dir(path)
+	// Every path is absolute, so that a relative --config gives paths that filepath.Rel can compare.
+	dir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return Config{}, err
+	}
 	rel := func(base, p string) string {
 		if p == "" || filepath.IsAbs(p) {
 			return p

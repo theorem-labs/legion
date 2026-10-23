@@ -109,8 +109,9 @@ type Gate struct {
 const ProposalModule = "DeclIndexProposal"
 
 // Forms gives the registry's forms module, importing the module of each registered concept that the index has.
-// A source-bearing concept that the index does not yet declare is pending; only the gate compiles it, in a
-// sandbox, and then adds it to the forms module for that one decision.
+// A concept with forms and no stored source states its fact through those forms, so it is kept whether or not the
+// index declares its name. A source-bearing concept that the index does not yet declare is pending; only the gate
+// compiles it, in a sandbox, and then adds it to the forms module for that one decision.
 func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.FormsModule, error) {
 	fm := declindex.FormsModule{Imports: append([]string(nil), r.Imports...), Opens: append([]string(nil), r.Opens...)}
 	seen := map[string]bool{}
@@ -133,7 +134,7 @@ func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.Forms
 				fm.Imports = append(fm.Imports, f.Module)
 			}
 		}
-		if declared {
+		if declared || (c.Source == "" && len(c.Forms) > 0) {
 			fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
 		}
 	}

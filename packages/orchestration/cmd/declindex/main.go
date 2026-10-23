@@ -11,9 +11,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
@@ -67,8 +70,13 @@ type unableError struct{ err error }
 func (e *unableError) Error() string { return e.err.Error() }
 func (e *unableError) Unwrap() error { return e.err }
 
+// main cancels the command on SIGTERM, SIGINT or SIGHUP, so that the build and the toolchain processes it started
+// are killed with their process groups before it exits, rather than left running without it.
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	code := run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
 type globals struct {
@@ -125,7 +133,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		cfg.DB = g.db
 	}
 	if g.tree != "" {
-		cfg.Tree = g.tree
+		if cfg.Tree, err = filepath.Abs(g.tree); err != nil {
+			return fail(stderr, &unableError{err})
+		}
 	}
 	if cfg.DB == "" {
 		return fail(stderr, &usageError{declindex.ErrNoDB.Error()})

@@ -26,6 +26,8 @@ registry/
 
 `registry.yaml` contains `version: 2` and optional imports and opens for the forms module. Each concept file has one name, home file, one-sentence meaning, optional `extends` and forms, and, for gate additions, the proposal ID, proposer, compiled hash, accepted-by decision, accepted near matches, and stored source. A concept with a compiled hash is keyed as `concepts/<compiled_hash>.yaml`; a librarian-written concept without one is keyed as `concepts/<name>.yaml`.
 
+A concept with forms and no stored source is matched through its forms, whether or not the index declares its name. A concept with no form is matched through its own declaration's body, so it is matched only once the index declares it. A gate addition that has not landed is compiled from its stored source by the gate alone.
+
 One concept per file lets an owner open a change lock on only the proposed addition. The gate writes no registry file. `addition.path` is relative to the repository root and slash-separated, for example `registry/concepts/<compiled_hash>.yaml`, so it names the same file in every worktree. The owner writes the returned `addition.content` to that path in its own worktree, opens or extends its migration with `ledger open --write <addition.path>`, and lands it normally.
 
 The loader reports duplicate names, duplicate compiled hashes, wrongly keyed files, and missing `extends` targets as registry defects. `refresh` and `gate` report those defects as notes and continue. `ledger` reports them in its registry result and exits 1. A format-1 registry is not accepted.
@@ -75,9 +77,18 @@ Without that sandbox, the source is not compiled and the relevant operation exit
 
 ### Landing containers
 
-The landing program runs `refresh`, `ledger` and `land-hash` in containers with `--network=none`, no credentials, the tree read-only and one scratch directory; only `refresh` gets the index directory read-write. The image is the one `e2e/Dockerfile` builds: its Lean toolchain is copied from the worker-lean image pinned by digest (`LEAN_IMAGE`; [e2e/README.md](e2e/README.md)).
+The landing program's container contract decides each container's mounts and network. Besides `TMPDIR`, where sandboxed and toolchain runs make their scratch directories, `declindex` needs these writable places and nothing else:
 
-Deployment requirement: the identity that pulls the worker-lean image on the landing machine needs read access (`roles/artifactregistry.reader`) to the Artifact Registry repository that holds it. Without that access the pull fails with HTTP 403, as it does for the build machine's Compute Engine default service account at the time of writing. Grant the access, or copy the image by digest to a registry that identity can read, before the landing program runs these containers.
+| Command | Writes |
+| --- | --- |
+| `refresh` with `LAND_COMMIT` | The tree (fetch from `remote`, checkout, `build`) and the index directory. |
+| `ledger` | The index directory, for its registry snapshot, and the `--emit` file. |
+| `gate` | The index directory: its state and proposal work. |
+| `land-hash` | Nothing. It reads `LAND_GIT_DIR` and `LAND_BUILD_DIR`. |
+
+The configuration's absolute paths, such as the toolchain, `lean.cc`, `remote` and the owner map, must exist at the same paths inside the container. A container image with the pinned toolchain copies it from the worker-lean image pinned by digest, as `e2e/Dockerfile` does (`LEAN_IMAGE`; [e2e/README.md](e2e/README.md)).
+
+Deployment requirement: the identity that pulls the worker-lean image on the landing machine needs read access (`roles/artifactregistry.reader`) to the Artifact Registry repository that holds it. Without that access the pull fails with HTTP 403, as it does for the build machine's Compute Engine default service account at the time of writing. Grant the access, or copy the image by digest to a registry that identity can read, before the landing program builds these containers.
 
 ### `refresh`
 
@@ -97,6 +108,14 @@ The landing program calls `declindex land-hash` twice for every registered contr
 
 1. At the base tree, with the index at that tree. Unchanged declarations are answered from the index; no candidate build directory is needed.
 2. At the built candidate tree. For each source blob that differs from the indexed `sources` blob, `LAND_BUILD_DIR` must hold a fresh Lake `.ilean` and trace for that tree. The candidate answer gives the changed contract's candidate hash and path; unchanged declarations keep the indexed answer.
+
+A changed module's build output is fresh only when all of these hold:
+
+- `LAND_BUILD_DIR` holds that module's source with exactly the candidate blob's bytes.
+- Its `.ilean` is the output its Lake trace records: Lake's hash of the file equals the trace's `outputs.i`.
+- A build trace's source input hash equals the blob's. A fetch trace, which Lake writes when its artifact cache serves the module, has no source input. It binds the outputs only, and the source only by being newer than it. A cache hit is still a legitimate result, because Lake serves one only when the key it computed from the module's inputs in that build matches.
+
+So for a fetch trace, nothing in the build directory ties the outputs to the candidate's source. What keeps another build's `.ilean`, copied in together with its matching fetch trace, out of the answer is the landing program's contract: it builds the candidate in a fresh container that no agent can write. Any other output that fails these checks exits 3.
 
 The command takes no positional arguments. Its environment is:
 

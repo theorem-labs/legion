@@ -107,11 +107,16 @@ const lakeTraceSchemaVersion = "2025-09-10"
 type lakeTraceMetadata struct {
 	SchemaVersion string            `json:"schemaVersion"`
 	Inputs        []json.RawMessage `json:"inputs"`
-	Synthetic     *bool             `json:"synthetic"`
+	Outputs       *struct {
+		ILean string `json:"i"`
+	} `json:"outputs"`
+	Synthetic *bool `json:"synthetic"`
 }
 
 // Fresh reports whether the .ilean at root/libRel/rel came from blob. A module with no candidate output is not
-// built; malformed, missing, or mismatched Lake metadata is stale with its reason.
+// built; malformed, missing, or mismatched Lake metadata is stale with its reason. The build directory's own
+// source must be blob, and the .ilean must be the output its trace records. A build trace also binds that source
+// by its hash; a fetch trace (an artifact-cache hit) binds the outputs only, and the source by age.
 func Fresh(root, libRel, rel string, blob []byte) (Freshness, error) {
 	base := filepath.Join(root, filepath.FromSlash(libRel), filepath.FromSlash(rel))
 	ilean, err := fileExists(base + ".ilean")
@@ -153,17 +158,27 @@ func Fresh(root, libRel, rel string, blob []byte) (Freshness, error) {
 		return staleFreshness("missing synthetic flag"), nil
 	}
 	sourcePath := filepath.Join(root, filepath.FromSlash(rel)+".lean")
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return staleFreshness("missing built source " + rel + ".lean"), nil
+		}
+		return Freshness{}, err
+	}
+	if !bytes.Equal(source, blob) {
+		return staleFreshness("built source " + rel + ".lean differs from the candidate blob"), nil
+	}
+	if metadata.Outputs == nil || metadata.Outputs.ILean == "" {
+		return staleFreshness("build trace records no .ilean output for " + rel), nil
+	}
+	ileanData, err := os.ReadFile(base + ".ilean")
+	if err != nil {
+		return Freshness{}, err
+	}
+	if metadata.Outputs.ILean != LakeTextHash(ileanData)+".ilean" {
+		return staleFreshness(rel + ".ilean is not the output its build trace records"), nil
+	}
 	if *metadata.Synthetic {
-		source, err := os.ReadFile(sourcePath)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return staleFreshness("missing fetched source " + rel + ".lean"), nil
-			}
-			return Freshness{}, err
-		}
-		if !bytes.Equal(source, blob) {
-			return staleFreshness("fetched source differs from the candidate blob"), nil
-		}
 		traceInfo, err := os.Stat(base + ".trace")
 		if err != nil {
 			return Freshness{}, err

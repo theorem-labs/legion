@@ -85,8 +85,8 @@ func TestLandHashUsesAFreshCandidateBuild(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(build, "Golden.ilean"), ilean, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	trace := fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[[%q,%q]],"synthetic":false}`,
-		filepath.Join(build, "Golden.lean"), declindex.LakeTextHash([]byte(candidate)))
+	trace := fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[[%q,%q]],"outputs":{"i":%q},"synthetic":false}`,
+		filepath.Join(build, "Golden.lean"), declindex.LakeTextHash([]byte(candidate)), declindex.LakeTextHash(ilean)+".ilean")
 	if err := os.WriteFile(filepath.Join(build, "Golden.trace"), []byte(trace), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -166,6 +166,7 @@ func writeLandBuild(t *testing.T, build, rel string, source, ilean []byte, synth
 	trace, err := json.Marshal(map[string]any{
 		"schemaVersion": "2025-09-10",
 		"inputs":        inputs,
+		"outputs":       map[string]any{"i": declindex.LakeTextHash(ilean) + ".ilean"},
 		"synthetic":     synthetic,
 	})
 	if err != nil {
