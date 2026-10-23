@@ -66,6 +66,7 @@ github_apps:
 #   repository: example/repository    # the ledger repository whose work items wake these owners
 #   max_running: 2                    # at most this many owner launches or live owners at once
 #   budget_usd: 20                    # every attempt reserves its owner's maximum cost before launch
+#   ledger_timeout_seconds: 5         # each ledger call owner admission makes (connect, schema check, read); default 5
 #   owners:
 #     - name: proof-a                 # lowercase letters, digits and hyphens; becomes the owner queue key
 #       prompt_file: ./prompts/proof-a.md

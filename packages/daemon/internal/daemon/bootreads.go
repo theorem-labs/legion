@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 
 	"github.com/sjawhar/legion/daemon/internal/claim"
 	"github.com/sjawhar/legion/daemon/internal/config"
@@ -105,6 +107,12 @@ func readStandingOwnerFiles(cfg config.Config) error {
 	for _, owner := range cfg.StandingOwners.Owners {
 		if _, err := os.ReadFile(owner.PromptFile); err != nil {
 			return fmt.Errorf("standing_owners owner %s prompt_file %s could not be read: %w", owner.Name, owner.PromptFile, err)
+		}
+	}
+	for _, kind := range slices.Sorted(maps.Keys(cfg.StandingOwners.Templates)) {
+		template := cfg.StandingOwners.Templates[kind]
+		if _, err := os.ReadFile(template.PromptFile); err != nil {
+			return fmt.Errorf("standing_owners template %s prompt_file %s could not be read: %w", kind, template.PromptFile, err)
 		}
 	}
 	return nil

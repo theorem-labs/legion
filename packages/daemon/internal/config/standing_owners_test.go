@@ -53,6 +53,68 @@ func TestLoadReadsStandingOwners(t *testing.T) {
 	}
 }
 
+// Node owners come from the ledger, so they are configured by node kind, not by name: one template
+// per kind (the prefix before the colon of a node id), and the static list holds only named roles.
+// The slow reconciliation sweep is configurable, five minutes by default.
+func TestStandingOwnerTemplatesAreConfiguredPerNodeKind(t *testing.T) {
+	path := writeConfigFile(t, minimalFile+`standing_owners:
+  ledger_dsn_file: credentials/ledger-dsn
+  repository: example/repository
+  max_running: 4
+  budget_usd: 100
+  reconcile_seconds: 60
+  templates:
+    function:
+      prompt_file: prompts/function.md
+      harness: omp
+      max_cost_usd: 2
+    struct:
+      prompt_file: /srv/prompts/struct.md
+      harness: omp
+      max_cost_usd: 3
+`)
+	cfg, err := Load(path, noEnv)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	owners := cfg.StandingOwners
+	if owners == nil || len(owners.Owners) != 0 || owners.Reconcile != time.Minute || len(owners.Templates) != 2 {
+		t.Fatalf("StandingOwners = %+v", owners)
+	}
+	if got := owners.Templates["function"]; got.PromptFile != filepath.Join(filepath.Dir(path), "prompts/function.md") ||
+		got.Harness != runtime.BackendOmp || got.MaxCostUSD != 2 {
+		t.Errorf("function template = %+v", got)
+	}
+	if got := owners.Templates["struct"]; got.PromptFile != "/srv/prompts/struct.md" || got.MaxCostUSD != 3 {
+		t.Errorf("struct template = %+v", got)
+	}
+	def, err := Load(writeConfigFile(t, minimalFile+standingOwnersYAML("1", "1", "owner-a")), noEnv)
+	if err != nil || def.StandingOwners.Reconcile != 5*time.Minute {
+		t.Fatalf("default reconcile = %v, %v", def.StandingOwners, err)
+	}
+}
+
+func TestStandingOwnerConfigurationRefusesWhatCannotRun(t *testing.T) {
+	head := minimalFile + "standing_owners:\n  ledger_dsn_file: d\n  repository: r\n  max_running: 1\n  budget_usd: 1\n"
+	template := func(kind string) string {
+		return "  templates:\n    " + kind + ":\n      prompt_file: p\n      harness: omp\n      max_cost_usd: 1\n"
+	}
+	for name, body := range map[string]string{
+		"neither owners nor templates":       head,
+		"a template kind with a colon":       head + template(`"function:x"`),
+		"an uppercase template kind":         head + template("Function"),
+		"a named owner shaped like a node":   head + "  owners:\n    - name: function:get_mountpoint\n      prompt_file: p\n      harness: omp\n      max_cost_usd: 1\n",
+		"a zero reconciliation":              head + template("function") + "  reconcile_seconds: 0\n",
+		"a named owner outside the alphabet": head + "  owners:\n    - name: Owner_A\n      prompt_file: p\n      harness: omp\n      max_cost_usd: 1\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfigFile(t, body), noEnv); err == nil {
+				t.Fatal("Load accepted it")
+			}
+		})
+	}
+}
+
 func TestStandingOwnersLedgerTimeoutIsConfigurable(t *testing.T) {
 	body := strings.Replace(standingOwnersYAML("1", "1", "owner-a"), "  max_running: 1\n",
 		"  max_running: 1\n  ledger_timeout_seconds: 2\n", 1)
