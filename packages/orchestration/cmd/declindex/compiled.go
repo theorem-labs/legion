@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -17,9 +18,12 @@ import (
 func compiledOptions(ctx context.Context, e *env) (*declindex.CompiledOptions, error) {
 	var forms declindex.FormsModule
 	if e.cfg.Registry != "" {
-		r, err := conceptgate.Load(e.cfg.Registry)
+		r, defects, err := conceptgate.Load(e.cfg.Registry)
 		if err != nil {
 			return nil, err
+		}
+		for _, defect := range defects {
+			fmt.Fprintf(e.stderr, "declindex: registry defect: %s\n", defect)
 		}
 		if forms, err = conceptgate.Forms(ctx, e.store, r); err != nil {
 			return nil, err
@@ -114,10 +118,38 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 	return rc
 }
 
+var gateSandboxAvailable = confine.Available
+
 // cmdGate decides one proposal. Exit codes: 0 added, 1 refused (an exact duplicate), 4 near (sent to the
 // librarian), 5 the name is taken, 3 unable to decide.
 func cmdGate(ctx context.Context, e *env, args []string) int {
-	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+	var proposer, acceptedBy string
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		if len(args) < 2 {
+			return fail(e.stderr, &usageError{args[0] + " needs a value"})
+		}
+		switch args[0] {
+		case "--proposer":
+			proposer = args[1]
+		case "--accepted-by":
+			acceptedBy = args[1]
+		default:
+			return fail(e.stderr, &usageError{"unknown gate option " + args[0]})
+		}
+		args = args[2:]
+	}
+	if proposer == "" {
+		return fail(e.stderr, &usageError{"gate requires --proposer <owner id>"})
+	}
+	if err := conceptgate.ValidateOwnerID(proposer); err != nil {
+		return fail(e.stderr, &usageError{err.Error()})
+	}
+	if acceptedBy != "" {
+		if err := conceptgate.ValidateOwnerID(acceptedBy); err != nil {
+			return fail(e.stderr, &usageError{err.Error()})
+		}
+	}
+	if len(args) != 1 {
 		return fail(e.stderr, &usageError{"gate takes one PROPOSAL.json"})
 	}
 	if e.cfg.Registry == "" {
@@ -125,8 +157,28 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	}
 	// The gate compiles untrusted text only in the sandbox: where there is none, it starts nothing (no toolchain
 	// lookup, no exporter build) and cannot decide.
-	if err := confine.Available(); err != nil {
+	if err := gateSandboxAvailable(); err != nil {
 		return fail(e.stderr, &unableError{fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)})
+	}
+	if err := e.open(true); err != nil {
+		return fail(e.stderr, err)
+	}
+	defer e.close()
+	commit, err := e.store.Meta(ctx, "commit")
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	if head := treeHead(e.cfg.Tree); head != commit {
+		return fail(e.stderr, &unableError{fmt.Errorf("the tree HEAD %s differs from the index commit %s", head, commit)})
+	}
+	if rel, err := filepath.Rel(e.cfg.Tree, e.cfg.Registry); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		status, err := exec.Command("git", "-C", e.cfg.Tree, "status", "--porcelain", "--untracked-files=all", "--", rel).Output()
+		if err != nil {
+			return fail(e.stderr, &unableError{fmt.Errorf("check registry changes: %w", err)})
+		}
+		if len(status) != 0 {
+			return fail(e.stderr, &unableError{fmt.Errorf("the registry has local changes")})
+		}
 	}
 	raw, err := os.ReadFile(args[0])
 	if err != nil {
@@ -136,18 +188,15 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fail(e.stderr, &usageError{fmt.Sprintf("%s: %v", args[0], err)})
 	}
-	if err := e.open(true); err != nil {
-		return fail(e.stderr, err)
-	}
-	defer e.close()
 	e.staleNote(ctx)
 	co, err := compiledOptions(ctx, e)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
+	work := filepath.Join(filepath.Dir(e.cfg.DB), "proposals")
 	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, Compiled: co,
-		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian}, WorkDir: filepath.Join(filepath.Dir(e.cfg.DB), "proposals")}
-	v, err := g.Decide(ctx, p)
+		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: work}, WorkDir: work}
+	v, err := g.Decide(ctx, p, conceptgate.DecideOptions{Proposer: proposer, AcceptedBy: acceptedBy, ProposalBytes: raw})
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}

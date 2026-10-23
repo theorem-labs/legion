@@ -1,13 +1,15 @@
 package conceptgate
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -30,7 +32,7 @@ const (
 	Refused Outcome = "refused"
 	// Near: the proposal restates a registered concept's fact; the librarian decides.
 	Near Outcome = "near"
-	// Added: nothing in the registry or the index states it; it is appended to the registry.
+	// Added: nothing in the registry or the index states it; the gate returns a canonical addition.
 	Added Outcome = "added"
 	// NameTaken: the name is a registered concept's or an existing declaration's. The statement may be new; the
 	// proposal needs another name. Existing names the holder.
@@ -44,44 +46,45 @@ type Match struct {
 	Declaration string `json:"declaration"`
 }
 
+// Addition is the one file that an owner writes and lands after an added verdict.
+type Addition struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+	Base    string `json:"base"`
+}
+
 // Verdict is the gate's answer to one proposal.
 type Verdict struct {
-	Proposal     string  `json:"proposal"`
-	Name         string  `json:"name"`
-	Outcome      Outcome `json:"outcome"`
-	Existing     string  `json:"existing,omitempty"`
-	ExistingAt   string  `json:"existing_at,omitempty"`
-	Reason       string  `json:"reason"`
-	Matches      []Match `json:"matches,omitempty"`
-	CompiledHash string  `json:"compiled_hash,omitempty"`
+	Proposal     string    `json:"proposal"`
+	Name         string    `json:"name"`
+	Outcome      Outcome   `json:"outcome"`
+	Existing     string    `json:"existing,omitempty"`
+	ExistingAt   string    `json:"existing_at,omitempty"`
+	Reason       string    `json:"reason"`
+	Matches      []Match   `json:"matches,omitempty"`
+	CompiledHash string    `json:"compiled_hash,omitempty"`
+	VerdictID    string    `json:"verdict_id"`
+	Addition     *Addition `json:"addition,omitempty"`
 }
 
-// Librarian receives the near matches, and only them.
-type Librarian interface {
-	Review(ctx context.Context, v Verdict, p Proposal) error
+// DecideOptions are the identity and source bytes that bind a decision to the command invocation.
+type DecideOptions struct {
+	Proposer      string
+	AcceptedBy    string
+	ProposalBytes []byte
 }
 
-// CommandLibrarian hands a near match to a command (the deployment's message to the librarian): it runs Command
-// with {"verdict":…,"proposal":…} on its standard input.
-type CommandLibrarian struct{ Command []string }
+var (
+	nodeOwnerID = regexp.MustCompile(`^(function|struct|global|percpu|subsystem):\S+$`)
+	roleOwnerID = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+)
 
-// Review runs the command.
-func (c CommandLibrarian) Review(ctx context.Context, v Verdict, p Proposal) error {
-	if len(c.Command) == 0 {
-		return fmt.Errorf("no librarian command is configured, so near match %s cannot reach the librarian", p.ID)
+// ValidateOwnerID accepts the supervisor's node identifiers and role names.
+func ValidateOwnerID(id string) error {
+	if nodeOwnerID.MatchString(id) || roleOwnerID.MatchString(id) {
+		return nil
 	}
-	body, err := json.Marshal(map[string]any{"verdict": v, "proposal": p})
-	if err != nil {
-		return err
-	}
-	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
-	cmd.Stdin = bytes.NewReader(body)
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("librarian command: %w: %s", err, strings.TrimSpace(out.String()))
-	}
-	return nil
+	return fmt.Errorf("owner id %q matches neither a node id nor a role name", id)
 }
 
 // Gate is the similarity gate in front of the librarian.
@@ -92,7 +95,7 @@ type Gate struct {
 	// Compiled reads the proposal; its Forms are replaced by the registry's at each decision.
 	Compiled  *declindex.CompiledOptions
 	Librarian Librarian
-	// WorkDir holds the compiled proposals.
+	// WorkDir holds the compiled proposals and librarian request files.
 	WorkDir string
 	// CheckSandbox is declindex.CheckSandbox, unless a test replaces it.
 	CheckSandbox func(context.Context, declindex.Lean) error
@@ -102,8 +105,10 @@ type Gate struct {
 const ProposalModule = "DeclIndexProposal"
 
 // Forms gives the registry's forms module, importing the module of each registered concept that the index has.
+// A source-bearing concept that the index does not yet declare is pending; only the gate compiles it, in a
+// sandbox, and then adds it to the forms module for that one decision.
 func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.FormsModule, error) {
-	fm := r.FormsModule()
+	fm := declindex.FormsModule{Imports: append([]string(nil), r.Imports...), Opens: append([]string(nil), r.Opens...)}
 	seen := map[string]bool{}
 	for _, i := range fm.Imports {
 		seen[i] = true
@@ -113,21 +118,45 @@ func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.Forms
 		if err != nil {
 			return fm, err
 		}
+		declared := false
 		for _, f := range found {
-			if f.Name == c.Name && !seen[f.Module] {
+			if f.Name != c.Name {
+				continue
+			}
+			declared = true
+			if !seen[f.Module] {
 				seen[f.Module] = true
 				fm.Imports = append(fm.Imports, f.Module)
 			}
+		}
+		if declared {
+			fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
 		}
 	}
 	return fm, nil
 }
 
-// Decide compares a proposal with the registry and the index: it refuses an exact duplicate and names the
-// existing concept, sends a near match to the librarian, and adds anything else to the registry. An error means
-// the gate could not decide: the proposal is neither refused nor added.
-func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
-	v := Verdict{Proposal: p.ID, Name: p.Concept.Name}
+// Decide compares a proposal with the registry and the index. An added verdict carries a canonical file; the
+// gate never writes to the registry.
+func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (Verdict, error) {
+	bytes := options.ProposalBytes
+	if bytes == nil {
+		var err error
+		bytes, err = json.Marshal(p)
+		if err != nil {
+			return Verdict{}, err
+		}
+	}
+	digest := sha256.Sum256(bytes)
+	v := Verdict{Proposal: p.ID, Name: p.Concept.Name, VerdictID: "near-" + hex.EncodeToString(digest[:8])}
+	if err := ValidateOwnerID(options.Proposer); err != nil {
+		return v, err
+	}
+	if options.AcceptedBy != "" {
+		if err := ValidateOwnerID(options.AcceptedBy); err != nil {
+			return v, err
+		}
+	}
 	if strings.TrimSpace(p.ID) == "" || strings.TrimSpace(p.Source) == "" {
 		return v, fmt.Errorf("a proposal needs an id and a Lean source that declares it")
 	}
@@ -137,7 +166,6 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 	if len(p.Concept.Forms) > 0 {
 		return v, fmt.Errorf("a proposal carries no forms: the librarian writes a concept's forms")
 	}
-	// A fast first refusal; the Lean parser check and the sandbox below are what hold.
 	if err := checkProposalSource(p.Source); err != nil {
 		return v, err
 	}
@@ -153,7 +181,11 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 	} else if d == "" {
 		return v, fmt.Errorf("the index was read without its compiled part, so the gate has no compiled statements to compare")
 	}
-	reg, err := Load(g.Registry)
+	base, err := g.Index.Meta(ctx, "commit")
+	if err != nil {
+		return v, err
+	}
+	reg, _, err := Load(g.Registry)
 	if err != nil {
 		return v, err
 	}
@@ -203,9 +235,6 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 		}
 	}
 	v.CompiledHash = decl.Hash
-	// Exact duplicates: a registered concept first, by its compiled statement in the index or, before it lands,
-	// the one the gate saved when it added it; then any declaration of the project. A concept with neither and no
-	// form cannot be compared.
 	var unknown []string
 	for _, c := range reg.Concepts {
 		rc, err := g.Index.Constant(ctx, c.Name)
@@ -219,7 +248,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 		if (rc.Hash != "" && rc.Hash == decl.Hash) || (c.CompiledHash != "" && c.CompiledHash == decl.Hash) {
 			return refuse(c.Name, c.Home, "the compiled statement equals the registered concept's")
 		}
-		if rc.Hash == "" && c.CompiledHash == "" && len(c.Forms) == 0 {
+		if rc.Hash == "" && c.CompiledHash == "" && len(c.Forms) == 0 && c.Source == "" {
 			unknown = append(unknown, c.Name)
 		}
 	}
@@ -230,10 +259,6 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 	if len(same) > 0 {
 		return refuse(same[0].Name, same[0].At(), "the compiled statement equals an existing declaration's")
 	}
-	// Near matches: a registered fact that the proposal's own text states, directly or through a definition the
-	// proposal declares. Applying a registered concept or an existing definition reuses it. A definition of the
-	// proposal that only wraps a registered concept is also routed to the librarian: the matcher cannot tell its
-	// template from a restatement, and a false near costs a review, never a duplicate.
 	for _, c := range consts {
 		for _, f := range c.Facts {
 			if f.How == "direct" || (strings.HasPrefix(f.How, "via:") && own[strings.TrimPrefix(f.How, "via:")]) {
@@ -246,24 +271,101 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 			a, b := v.Matches[i], v.Matches[j]
 			return a.Concept+a.Declaration+a.How < b.Concept+b.Declaration+b.How
 		})
-		v.Outcome, v.Reason = Near, "the proposal restates a registered concept's fact"
-		if len(v.Matches) == 0 {
-			v.Reason = "the gate cannot compare the proposal with " + strings.Join(unknown, ", ") +
-				": registered, not declared in the index, with no form and no compiled hash"
+		if options.AcceptedBy == "" {
+			v.Outcome, v.Reason = Near, "the proposal restates a registered concept's fact"
+			if len(v.Matches) == 0 {
+				v.Reason = "the gate cannot compare the proposal with " + strings.Join(unknown, ", ") +
+					": registered, not declared in the index, with no form and no compiled hash"
+			}
+			if g.Librarian == nil {
+				return v, errors.New("no librarian is configured")
+			}
+			if err := g.Librarian.Review(ctx, ReviewRequest{ID: v.VerdictID, Proposer: options.Proposer, Kind: "near", Verdict: v, Proposal: p}); err != nil {
+				return v, err
+			}
+			return v, nil
 		}
-		if err := g.Librarian.Review(ctx, v, p); err != nil {
-			return v, err
-		}
-		return v, nil
 	}
 	c := p.Concept
 	c.Proposal = p.ID
+	c.Proposer = options.Proposer
 	c.CompiledHash = decl.Hash
-	if err := Add(g.Registry, c); err != nil {
+	c.Source = p.Source
+	c.AcceptedBy = options.AcceptedBy
+	if options.AcceptedBy != "" {
+		seen := map[string]bool{}
+		for _, m := range v.Matches {
+			seen[m.Concept] = true
+		}
+		for name := range seen {
+			c.AcceptedNear = append(c.AcceptedNear, name)
+		}
+		sort.Strings(c.AcceptedNear)
+	}
+	content, err := Render(c)
+	if err != nil {
 		return v, err
 	}
 	v.Outcome, v.Reason = Added, "no registered concept or existing declaration states it"
+	v.Addition = &Addition{Path: filepath.Join(g.Registry, "concepts", Key(c)+".yaml"), Content: string(content), Base: base}
 	return v, nil
+}
+
+// pendingForms compiles the sources of registry concepts that are not yet declared by the index. It runs only
+// from the gate's confined export path; refresh and FormsModule never receive those source bytes.
+func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exporter, run, exclude string) (declindex.FormsModule, error) {
+	fm, err := Forms(ctx, g.Index, reg)
+	if err != nil {
+		return fm, err
+	}
+	seenImports := map[string]bool{}
+	for _, i := range fm.Imports {
+		seenImports[i] = true
+	}
+	for _, c := range reg.Concepts {
+		if c.Name == exclude {
+			continue
+		}
+		compiled, err := g.Index.Constant(ctx, c.Name)
+		var nf *declindex.NotFoundError
+		if err != nil && !errors.As(err, &nf) {
+			return fm, err
+		}
+		if err == nil && compiled.Hash != "" {
+			continue
+		}
+		if c.Source == "" {
+			continue
+		}
+		if c.CompiledHash == "" {
+			return fm, fmt.Errorf("pending concept %s has source but no compiled hash", c.Name)
+		}
+		if err := checkProposalSource(c.Source); err != nil {
+			return fm, fmt.Errorf("pending concept %s: %w", c.Name, err)
+		}
+		check, err := declindex.NewScratch(run)
+		if err != nil {
+			return fm, err
+		}
+		if err := ex.CheckSource(ctx, []byte(c.Source), ex.SearchPath, check); err != nil {
+			return fm, fmt.Errorf("check pending concept %s: %w", c.Name, err)
+		}
+		dir, err := declindex.NewScratch(run)
+		if err != nil {
+			return fm, err
+		}
+		module := "DeclIndexPending" + c.CompiledHash
+		if err := declindex.CompileConfined(ctx, ex.Lean, ex.SearchPath, dir, module, []byte(c.Source)); err != nil {
+			return fm, fmt.Errorf("compile pending concept %s: %w", c.Name, err)
+		}
+		ex.SearchPath = append(ex.SearchPath, dir)
+		if !seenImports[module] {
+			seenImports[module] = true
+			fm.Imports = append(fm.Imports, module)
+		}
+		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
+	}
+	return fm, nil
 }
 
 // export checks the proposal, compiles it against the build and reads it with the registry's forms, each step in
@@ -281,7 +383,7 @@ func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declinde
 	ex.ScratchDir, ex.Confined = run, true
 	co := *g.Compiled
 	co.Exporter, co.Confined = &ex, true
-	if co.Forms, err = Forms(ctx, g.Index, reg); err != nil {
+	if co.Forms, err = g.pendingForms(ctx, reg, &ex, run, p.Concept.Name); err != nil {
 		return nil, err
 	}
 	check, err := declindex.NewScratch(run)

@@ -163,7 +163,7 @@ func TestGateStartsNoLeanWithoutASandbox(t *testing.T) {
 		}
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	r := invoke(t, "--config", config, "gate", proposal)
+	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
 	if r.code != 3 || !strings.Contains(r.errOut, "sandbox") {
 		t.Fatalf("gate without a sandbox: %+v", r)
 	}
