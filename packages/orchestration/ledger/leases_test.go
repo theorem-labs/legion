@@ -313,9 +313,11 @@ func TestExpireLocksThenRechecksLeaseLiveness(t *testing.T) {
 	}
 }
 
-func TestClaimRejectsNonPositiveOrSubMicrosecondTTL(t *testing.T) {
+// A lease length of zero is a supervised lease (TestSupervisedLeaseNeverExpires); a negative length,
+// or one that rounds to no microsecond, is invalid.
+func TestClaimRejectsNegativeOrSubMicrosecondTTL(t *testing.T) {
 	s := newStore(t)
-	for _, ttl := range []time.Duration{0, 500 * time.Nanosecond, -time.Second} {
+	for _, ttl := range []time.Duration{500 * time.Nanosecond, -time.Second} {
 		_, err := s.Claim(context.Background(), "r", "item", "alice", ttl)
 		var inv *ledger.InvalidError
 		if !errors.As(err, &inv) {

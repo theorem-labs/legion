@@ -193,6 +193,119 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 	}
 }
 
+// enqueue, owners, a supervised claim and release-holder round-trip through the command line: the
+// owner is the exact node id, the stored item and its item.enqueued event say so, and the exit codes
+// are 0 for an enqueue or a repeat, 1 for an item another owner holds, and 2 for usage errors.
+func TestOwnerCommandsRoundTrip(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		code := run(context.Background(), args, getenv, &out, &err)
+		return code, out.String(), err.String()
+	}
+	invoke := func(args ...string) string {
+		t.Helper()
+		code, out, errOut := call(args...)
+		if code != 0 {
+			t.Fatalf("%v exited %d: %s", args, code, errOut)
+		}
+		return out
+	}
+	invoke("repo", "ensure", "r", "3")
+	invoke("enqueue", "r", "item-1", "function:get_mountpoint")
+	invoke("enqueue", "r", "item-1", "function:get_mountpoint")
+	invoke("enqueue", "r", "item-2", "struct:mount")
+
+	var item struct {
+		Owner string `json:"owner"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &item); err != nil ||
+		item.Owner != "function:get_mountpoint" || item.State != "open" {
+		t.Fatalf("enqueued item: %v %+v", err, item)
+	}
+	var log []struct {
+		Kind    string `json:"kind"`
+		Subject string `json:"subject"`
+		Data    struct {
+			Owner string `json:"owner"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "events", "r", "0", "item-1")), &log); err != nil {
+		t.Fatal(err)
+	}
+	enqueued := 0
+	for _, e := range log {
+		if e.Kind == "item.enqueued" {
+			enqueued++
+			if e.Data.Owner != "function:get_mountpoint" {
+				t.Fatalf("enqueue event: %+v", e)
+			}
+		}
+	}
+	if enqueued != 1 {
+		t.Fatalf("%d item.enqueued events for item-1, want 1: %+v", enqueued, log)
+	}
+
+	var owners []string
+	if err := json.Unmarshal([]byte(invoke("--json", "owners", "r")), &owners); err != nil ||
+		len(owners) != 2 || owners[0] != "function:get_mountpoint" || owners[1] != "struct:mount" {
+		t.Fatalf("open owners: %v %v", err, owners)
+	}
+
+	if code, out, _ := call("--json", "enqueue", "r", "item-1", "struct:mount"); code != 1 || !strings.Contains(out, `"reason":"exists"`) {
+		t.Fatalf("enqueue for another owner: code %d output %q", code, out)
+	}
+	for _, usage := range [][]string{{"enqueue", "r", "item-1"}, {"enqueue", "r", "", "struct:mount"}, {"owners"}, {"release-holder", "r", "x"}} {
+		if code, _, _ := call(usage...); code != 2 {
+			t.Fatalf("%v exited %d, want 2", usage, code)
+		}
+	}
+
+	invoke("claim", "r", "item-1", "function:get_mountpoint", "0")
+	var held struct {
+		Holder    string     `json:"holder"`
+		ExpiresAt *time.Time `json:"expires_at"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &held); err != nil ||
+		held.Holder != "function:get_mountpoint" || held.ExpiresAt != nil {
+		t.Fatalf("supervised claim: %v %+v", err, held)
+	}
+	var freed []struct {
+		ID         string `json:"id"`
+		Generation int64  `json:"generation"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "release-holder", "r", "function:get_mountpoint", "pane gone")), &freed); err != nil ||
+		len(freed) != 1 || freed[0].ID != "item-1" || freed[0].Generation != 1 {
+		t.Fatalf("released holder: %v %+v", err, freed)
+	}
+	if code, _, _ := call("complete", "r", "item-1", "function:get_mountpoint", "1", "late"); code != 1 {
+		t.Fatalf("late result exited %d, want the refusal's 1", code)
+	}
+	var after struct {
+		Holder string `json:"holder"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &after); err != nil || after.Holder != "" {
+		t.Fatalf("item after release-holder: %v %+v", err, after)
+	}
+	invoke("claim", "r", "item-2", "struct:mount", "0")
+	invoke("complete", "r", "item-2", "struct:mount", "1", "done")
+	if err := json.Unmarshal([]byte(invoke("--json", "owners", "r")), &owners); err != nil ||
+		len(owners) != 1 || owners[0] != "function:get_mountpoint" {
+		t.Fatalf("open owners after a completion: %v %v", err, owners)
+	}
+	if code, _, _ := call("--json", "enqueue", "r", "item-2", "struct:mount"); code != 1 {
+		t.Fatalf("enqueue of a done item exited %d, want 1", code)
+	}
+}
+
 func TestCommandExitCodes(t *testing.T) {
 	dsn := testpg.Database(t, "ledger_command")
 	getenv := func(key string) string {
