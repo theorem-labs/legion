@@ -16,29 +16,47 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
 - **The C source**, parsed with libclang per translation unit, with the flags of a compilation
   database (`compile_commands.json`) or of `c.flags`. It gives accesses (read, write, lock, unlock,
   alloc, free), direct calls, calls through function-pointer fields, function addresses passed as
-  arguments, callback tables, record layouts, and list or hash insertions. What the compiler does not
-  evaluate is left out and kept with a reason: `sizeof` and `_Alignof` operands, the unselected
-  associations of `_Generic`, `typeof` and cast types, branches whose condition folds to a constant,
-  and const scalar globals.
-- **The image** (ELF and `System.map`), decoded with capstone. Calls come from `jal`, `j`, and `jalr`
-  through an `auipc`-set register. Data addresses come from `auipc`-based arithmetic, shared anchors
-  and compressed loads included, and count only inside the declared size of an object symbol that
-  `System.map` names. Thread-pointer accesses are per-CPU state.
+  arguments, callback tables, record layouts, and list or hash insertions. A field reached through
+  `->` or `*` belongs to the struct it points to; anonymous members are flattened.
+- **What the compiler removes is left out**, and kept with a reason: `sizeof`/`_Alignof` operands,
+  `typeof` and cast types, const scalars, the unselected associations of `_Generic` (their types are
+  read from the macro bodies that write them), branches whose condition folds to a constant (also
+  through inline helpers that return one truth value and locals that keep their initializer), the
+  right operand of a decided `&&` or `||`, and statements after a `return`, `goto` or noreturn
+  builtin. Branches of `__builtin_constant_p` and `__builtin_object_size` are left to the machine
+  code: their calls and global accesses stay only where the image has them.
+- **Implied calls**: a local of a cleanup class (`c.cleanup.class_type`) calls its destructor with
+  the constructor's arguments; a local with any other cleanup attribute calls the function it names
+  (`c.cleanup.attribute_macros` maps macros such as `__free(x)` to that function).
+- **The image** (ELF and `System.map`), decoded with capstone. Calls come from `jal`/`j` and from
+  `auipc`+`jalr`, named by the ELF function symbol at the target (`image.call_aliases` maps a library
+  call the compiler substitutes, such as `bcmp`, to the one C names). Data addresses come from
+  `auipc` arithmetic, shared anchors and compressed loads included, and count only inside the
+  declared size of an object symbol that `System.map` names. Thread-pointer accesses are per-CPU
+  state. Globals the machine code addresses but the C does not name become nodes with image-only
+  access edges.
 - **The contract graph** (optional): the proof's own graph. It maps functions to contracts, confirms
   callback tables a C initializer also names, and gives the interfaces the measures map onto groups.
 
 A helper defined in a header or a file is folded into a caller where the caller's machine code does
 not call it, so the C layer sees what the compiler inlined. A helper the image calls stays a call and
-becomes a function of the part.
+becomes a function of the part; its calls that the caller's machine code also makes are the caller's
+too (the helper is inlined at another site).
 
 ## Nodes and ids
 
-`function:<name>`, `struct:<name>`, `global:<name>` (a function-local static is `<function>.<name>`),
-`percpu:<name>` and `subsystem:<name>`. A name with two definitions gets `@<file>` (and `:<line>` if
-one file has both). Embedding and list or hash membership join data structures into groups. A value
-type (no pointer at any depth, or listed in `c.value_types`) and a base that at least
-`c.base_type_min_containers` types embed do not join. A group of two or more is a subsystem, named
-from its largest struct by clang's size.
+Ids follow linkage, never a collision: `function:<name>` and `global:<name>` for external linkage,
+`function:<name>@<file>` and `global:<name>@<file>` for a static (a function-local static is
+`global:<function>.<name>@<file>`), `struct:<name>` for a header's struct and `struct:<name>@<file>`
+for one a C file defines, `percpu:` for per-CPU state, `subsystem:<name>`. A definition that appears
+later never renames an existing node. Of a weak and a strong definition of one name, the strong one is
+the node and the weak one is listed in its `weak_definitions`; a weak definition a macro generates is
+recognized through the macros it expands.
+
+Embedding and list or hash membership join data structures into groups. A value type (no pointer at
+any depth, or listed in `c.value_types`) and a base that at least `c.base_type_min_containers` types
+embed do not join. A group of two or more is a subsystem, named from its largest struct by clang's
+size.
 
 ## Owners and topics
 
@@ -52,13 +70,23 @@ topic, the id has every character outside `[A-Za-z0-9_:-]` percent-encoded, so i
 
 ## Checks
 
-Each run writes `checks.json`: C calls against image calls, C accesses to globals against image
-addresses, embeddings against clang's layout, and field offsets against the image's displacements
-and constants. The hard checks fail the run: a parse error; a function of the part's files that the
-image holds (by its symbols, or by the contract graph) but the graph lacks; a global the part's code
-addresses but the graph lacks; an edge without provenance; an embedding without a layout; a
-membership without a C site; no field offset that matches; an invalid or repeated id; a node without
-exactly one owner; an invalid topic.
+Each run writes `checks.json`: C calls against image calls (disagreements classified: a callback the
+compiler devirtualized, a caller with a weak alternate, a tail call), state accesses against image
+addresses, embeddings against clang's layout, and field accesses against the machine code. A field
+matches at its displacement from the base register (the sum of offsets along a `.` chain, less the
+member offset a `container_of` subtracts), as a load or store displacement, an `addi` constant or its
+negative, a global's address offset, a narrower access inside the field, or a bitfield's storage
+unit; accesses to objects on the stack or in registers, and functions whose machine code makes no
+memory access, are counted apart.
+
+The hard checks fail the run (exit 1), each with a test that makes it fail alone: a parse error; a
+function of the part's files that the image holds but the graph lacks; a global the part's code
+addresses but the graph lacks; a node or edge without provenance; an embedding without a layout; a
+membership without a C site; an invalid or repeated id; a node that must have one owner (read from
+the graph) without exactly one; an owner without topics or with an invalid one; an absolute path in
+any output; and call agreement (|both| / |either|), state access agreement, and field-offset matches
+(over all candidates and over the first 50) below the thresholds of `[checks]` or of the part's own
+`checks` table. Set the thresholds just below what a reviewed build measured, so a regression fails.
 
 ## Incremental builds
 
@@ -81,6 +109,12 @@ contract_source = "proofs"           # optional: where the contract graph's file
 
 [parts.core]
 files = ["lib/a.c", "lib/b.c"]       # or "all": every C file of compile_commands
+checks = { min_call_agreement = 0.98 }  # this part's thresholds, over [checks]
+
+[checks]                             # the least agreement a run must reach, each from 0 to 1
+min_call_agreement = 0.9
+min_access_agreement = 0.7
+min_field_offsets = 0.85
 
 [c]
 flags = ["-I{c_tree}/include", "--target=riscv64-unknown-elf"]  # {c_tree}, {module}, {stem}
@@ -110,11 +144,13 @@ hash = ["hash_insert"]
 [c.cleanup]                          # a local of this type calls the destructor at scope end
 class_type = "^class_(.+)_t$"
 destructor = "class_{name}_destructor"
+attribute_macros = { "__free" = "__free_{arg}" }  # a macro that puts a cleanup attribute on a local
 
 [image]
 arch = "riscv64"
 thread_pointer = "current_ctx"
 percpu_sections = []
+call_aliases = { bcmp = "memcmp" }   # an image callee that stands for the C function named
 [image.symbol_classes]               # data symbols that are not state
 compiler_symbol = "^__key$"
 
