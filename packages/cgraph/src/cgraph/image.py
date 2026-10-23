@@ -10,6 +10,7 @@ through the thread pointer is an access to the per-CPU state the configuration n
 from __future__ import annotations
 
 import bisect
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,15 @@ class FunctionFacts:
 
 def _hex(value: int) -> str:
     return f"0x{value:x}"
+
+
+_COMPILER_SUFFIX = re.compile(r"\.\d+$")
+
+
+def source_name(symbol: str) -> str:
+    """The C name of a data symbol: the compiler appends ``.<n>`` when it renames a static copy
+    (``func.var.3``) or splits a global (``files_stat.0``)."""
+    return _COMPILER_SUFFIX.sub("", symbol)
 
 
 def read_system_map(path: Path) -> list[tuple[int, str, str]]:
@@ -211,11 +221,13 @@ class Image:
                 }
             )
             return
-        name, start, section_name = resolved
+        symbol, start, section_name = resolved
+        name = source_name(symbol)
         facts.globals.append(
             {
                 "function": function,
                 "global": name,
+                "symbol": symbol,
                 "symbol_address": _hex(start),
                 "offset": address - start,
                 "section": section_name,
@@ -269,6 +281,10 @@ class Image:
                     and self.decoder.reg_name(operands[0].reg) == "zero"
                 )
                 self._call(function, instruction.address, target, tail, facts)
+        if mnemonic in {"j", "c.j", "ret", "jr", "c.jr"}:
+            # Code after an unconditional jump is reached from somewhere else, with other values.
+            values.clear()
+            return
         if mnemonic in _DIRECT_CALLS or mnemonic in _REGISTER_CALLS:
             for register in tuple(values):
                 name = self.decoder.reg_name(register)
@@ -296,20 +312,18 @@ class Image:
             )
 
 
+# Instructions whose first register operand is read, not written: stores, branches, and jumps
+# through a register. Everything else (sub, sll, sext.w, seqz, sc.d, ...) writes its first operand.
+_NO_DESTINATION = {
+    "sb", "sh", "sw", "sd", "fsw", "fsd", "c.sw", "c.sd", "c.swsp", "c.sdsp", "c.fsd", "c.fsdsp",
+    "beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez", "blez", "bgez", "bltz", "bgtz", "bgt", "ble",
+    "bgtu", "bleu", "c.beqz", "c.bnez", "ret", "ecall", "ebreak", "fence", "fence.i", "jr", "c.jr",
+}  # fmt: skip
+
+
 def _written_registers(instruction: Any, operands: list[Any]) -> tuple[int, ...]:
     """Capstone's RISC-V binding lacks regs_access; the destination is the first register operand."""
-    mnemonic = instruction.mnemonic
-    if not operands or operands[0].type != CS_OP_REG:
-        return ()
-    if mnemonic.startswith(("b", "c.b", "s", "fs", "c.s")) or mnemonic in {
-        "ret",
-        "ecall",
-        "ebreak",
-        "fence",
-        "fence.i",
-        "jr",
-        "c.jr",
-    }:
+    if not operands or operands[0].type != CS_OP_REG or instruction.mnemonic in _NO_DESTINATION:
         return ()
     return (operands[0].reg,)
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from conftest import FIXTURE, build, read
 
-from cgraph import cli
+from cgraph import checks, cli
 
 OUTPUTS = ("graph.json", "checks.json", "owners.json", "topics.json", "measures.json", "report.md")
 
@@ -94,14 +94,21 @@ def test_cli_exit_status(copy: Path, tmp_path: Path, capsys: object) -> None:
     assert cli.main(["build", "--config", str(copy / "cgraph.toml"), "--part", "store", "--out", str(out)]) == 3
 
 
-def test_a_function_the_image_holds_but_the_graph_lacks_fails_the_run(copy: Path, tmp_path: Path) -> None:
+def test_an_assembly_function_of_a_part_file_is_reported_not_a_node(copy: Path, tmp_path: Path) -> None:
     contracts = json.loads((copy / "contracts.json").read_text())
     contracts["nodes"].append(
         {"id": "Prog/src/store/AnchorPair", "kind": "fn", "syms": ["anchor_pair"], "addr": "", "in_image": True}
     )
     (copy / "contracts.json").write_text(json.dumps(contracts))
     out = tmp_path / "out"
-    assert cli.main(["build", "--config", str(copy / "cgraph.toml"), "--part", "store", "--out", str(out)]) == 1
-    failed = [item for item in read(out, "checks.json")["hard_checks"] if not item["ok"]]
+    assert cli.main(["build", "--config", str(copy / "cgraph.toml"), "--part", "store", "--out", str(out)]) == 0
+    assert read(out, "graph.json")["analysis"]["contract_functions_without_c"] == ["function:anchor_pair"]
+
+
+def test_a_function_the_image_holds_but_the_graph_lacks_fails_the_hard_check(built: Path) -> None:
+    graph = read(built, "graph.json")
+    graph["analysis"]["expected_functions"].append("function:missing_one")
+    owners, topics = read(built, "owners.json"), read(built, "topics.json")
+    failed = [item for item in checks.hard(graph, owners, topics, checks.structure(graph)) if not item["ok"]]
     assert [item["name"] for item in failed] == ["every function of the part's files that the image holds is a node"]
-    assert "function:anchor_pair" in failed[0]["detail"]
+    assert "function:missing_one" in failed[0]["detail"]

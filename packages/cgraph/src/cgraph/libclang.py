@@ -56,6 +56,11 @@ def is_increment(cursor: ci.Cursor) -> bool:
     return int(_lib().clang_getCursorUnaryOperatorKind(cursor)) in _INCREMENT_OPERATORS
 
 
+def is_address_of(cursor: ci.Cursor) -> bool:
+    """``&expr``: CXUnaryOperator_AddrOf is 5."""
+    return int(_lib().clang_getCursorUnaryOperatorKind(cursor)) == 5
+
+
 def constant_int(cursor: ci.Cursor) -> int | None:
     """The integer value clang folds an expression to, or None when it is not a constant."""
     result = _lib().clang_Cursor_Evaluate(cursor)

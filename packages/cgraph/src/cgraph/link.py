@@ -332,7 +332,7 @@ def build(
     roots: dict[str, Definition] = {}
     for tu in sorted(linker.part_files):
         for name, function in linker.tus[tu]["functions"].items():
-            if function["main_file"]:
+            if _owned(function):
                 definition = linker.visible(tu, name)
                 if definition is not None and linker.symbols(definition):
                     roots[definition.id] = definition
@@ -504,6 +504,16 @@ def build(
             )
             if unit["kind"] == "global":
                 targets[unit["name"]] = "per_cpu" if target.startswith("percpu:") else _c_class(config, unit["name"])
+        # Globals the function's machine code addresses that its C (after folding) does not name:
+        # the access a compiler moved here by inlining, or one written in assembly.
+        for fact in facts:
+            for item in fact.globals:
+                if item["target_class"] not in ("state", "per_cpu") or item["global"] in targets:
+                    continue
+                unit = {"kind": "global", "name": item["global"], "def": None, "field": None, "lock": False}
+                image_state = state_node(unit, item["provenance"])
+                if image_state is not None:
+                    builder.edge("access", identity, image_state, item["provenance"], access="image", image_only=True)
         for item in result.unevaluated:
             if item.get("unit") is not None:
                 analysis["unevaluated"].append(
@@ -564,11 +574,13 @@ def build(
     nodes, edges = builder.finalize()
     image_names = {identity: sorted(names) for identity, names in image_globals.items()}
     witnesses = [witness for tu in sorted(linker.part_files) for witness in linker.tus[tu]["witnesses"]]
+    expected_functions, contract_without_c = _expected_functions(linker)
     analysis.update(
         {
             "part_functions": sorted(functions),
             "roots": sorted(roots),
-            "expected_functions": _expected_functions(linker),
+            "expected_functions": expected_functions,
+            "contract_functions_without_c": contract_without_c,
             "c_calls": [
                 {"source": source, "target": target, "sites": sites}
                 for (source, target), sites in sorted(c_calls.items())
@@ -695,31 +707,47 @@ def _image_analysis(
     }
 
 
-def _expected_functions(linker: Linker) -> list[str]:
+def _owned(function: dict[str, Any]) -> bool:
+    """A function belongs to the unit that defines it in its own file or in a C file it includes
+    (a unit such as a scheduler's build file includes several .c files); a header's does not."""
+    return bool(function["main_file"] or function["file"].endswith(".c"))
+
+
+def _expected_functions(linker: Linker) -> tuple[list[str], list[str]]:
     """Functions of the part's files that the image holds, from sources other than the root search:
-    the contract graph's functions of those files with an image address, and the image's own
-    symbols (a global symbol, or a local one that follows the file's ELF FILE symbol) whose name a
-    part file defines."""
+    the image's own symbols (a global symbol, or a local one that follows the unit's ELF FILE
+    symbol) whose name a part unit defines, and the contract graph's functions of those files
+    that the image holds and C defines. The second list: contract functions of the part's files
+    that the image holds but no C file defines (assembly)."""
     expected: set[str] = set()
     for source in sorted(linker.part_files):
         base = os.path.basename(source)
         for name, function in linker.tus[source]["functions"].items():
-            if not function["main_file"]:
+            if not _owned(function):
                 continue
             symbols = linker.image.functions.get(name, [])
             if any(
-                (symbol.local and symbol.file == base) or (not symbol.local and not function["static"])
+                (symbol.local and symbol.file in (base, os.path.basename(function["file"])))
+                or (not symbol.local and not function["static"])
                 for symbol in symbols
             ):
                 definition = linker.visible(source, name)
                 assert definition is not None
                 expected.add(definition.id)
+    without_c: set[str] = set()
     for (source, name), node in sorted(linker.contracts.functions.items()):
         if (
             source in linker.part_files
             and (node.get("in_image") or node.get("addr"))
             and name in linker.image.functions
         ):
-            definitions = [item for item in linker.by_name.get(name, []) if item.file == source]
-            expected.add(definitions[0].id if definitions else f"function:{name}")
-    return sorted(expected)
+            definitions = [
+                item
+                for item in linker.by_name.get(name, [])
+                if item.file == source or (item.tu == source and item.file.endswith(".c"))
+            ]
+            if definitions:
+                expected.add(definitions[0].id)
+            else:
+                without_c.add(f"function:{name}")
+    return sorted(expected), sorted(without_c)

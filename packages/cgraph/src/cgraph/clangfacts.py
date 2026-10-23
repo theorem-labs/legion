@@ -81,6 +81,11 @@ def _children(cursor: ci.Cursor) -> list[ci.Cursor]:
     return list(cursor.get_children())
 
 
+def _is_unnamed_member(field: ci.Cursor) -> bool:
+    """An anonymous struct or union member: libclang spells it ``(anonymous ...)`` or not at all."""
+    return not field.spelling or "(anonymous" in field.spelling or "(unnamed" in field.spelling
+
+
 _SCALAR_KINDS = (
     TK.BOOL,
     TK.CHAR_U,
@@ -176,10 +181,9 @@ class _Extractor:
             "lock": lock,
         }
         if field is not None:
-            try:
-                unit["offset"] = field.get_field_offsetof() // 8
-            except Exception:
-                unit["offset"] = -1
+            # The offset in the named struct, through any anonymous struct or union on the way.
+            offset = record.type.get_offset(field.spelling)
+            unit["offset"] = offset // 8 if offset >= 0 else -1
         return unit
 
     def global_unit(self, referenced: ci.Cursor) -> Unit:
@@ -201,17 +205,35 @@ class _Extractor:
         }
 
     def global_from_ref(self, cursor: ci.Cursor) -> Unit | None:
-        for child in cursor.walk_preorder():
-            if child.kind == K.DECL_REF_EXPR and _is_global_var(child.referenced):
-                return self.global_unit(child.referenced)
-        return None
+        """The global whose own storage an expression names, through ``.``, ``[]`` on an array and
+        ``&``; a ``->`` or a ``*`` leaves the global for the object it points to."""
+        node = cursor
+        while True:
+            children = _children(node)
+            if node.kind == K.DECL_REF_EXPR:
+                return self.global_unit(node.referenced) if _is_global_var(node.referenced) else None
+            if node.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR) and children:
+                if children[0].type.get_canonical().kind == TK.POINTER:
+                    return None
+                node = children[0]
+            elif (node.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len(children) == 1) or (
+                node.kind == K.UNARY_OPERATOR and children and libclang.is_address_of(node)
+            ):
+                node = children[0]
+            else:
+                return None
 
     def unit_from_ref(self, cursor: ci.Cursor) -> Unit | None:
         """The state an expression names: a global (with its field) or a field of a struct type."""
         root = self.global_from_ref(cursor)
         for child in cursor.walk_preorder():
             referenced = child.referenced
-            if child.kind == K.MEMBER_REF_EXPR and referenced is not None and referenced.kind == K.FIELD_DECL:
+            if (
+                child.kind == K.MEMBER_REF_EXPR
+                and referenced is not None
+                and referenced.kind == K.FIELD_DECL
+                and not _is_unnamed_member(referenced)
+            ):
                 if root is not None:
                     root["field"] = referenced.spelling
                     return root
@@ -256,21 +278,19 @@ class _Extractor:
     # Records -------------------------------------------------------------------------------
 
     def record_fields(self, record: ci.Cursor) -> list[ci.Cursor]:
+        """The named fields of a record, each once; the fields of an anonymous struct or union
+        member are the record's own (C11), and the unnamed member itself is not a field."""
         fields: list[ci.Cursor] = []
 
         def descend(node: ci.Cursor) -> None:
             for child in node.get_children():
-                if child.kind == K.FIELD_DECL:
+                if child.kind != K.FIELD_DECL:
+                    continue
+                inner = child.type.get_canonical().get_declaration()
+                if _is_unnamed_member(child) and inner is not None and inner.kind in _RECORD_KINDS:
+                    descend(inner)
+                else:
                     fields.append(child)
-                    inner = child.type.get_canonical().get_declaration()
-                    if (
-                        inner is not None
-                        and inner.kind in _RECORD_KINDS
-                        and (not inner.spelling or inner.is_anonymous())
-                    ):
-                        descend(inner)
-                elif child.kind in _RECORD_KINDS and (not child.spelling or child.is_anonymous()):
-                    descend(child)
 
         descend(record)
         return fields
@@ -302,14 +322,15 @@ class _Extractor:
         fields = []
         for field in self.record_fields(record):
             child, pointer, array = _canonical_record(field.type)
-            try:
-                offset = field.get_field_offsetof() // 8
-            except Exception:
-                offset = -1
+            # The offset in this record, through any anonymous member on the way.
+            offset = record.type.get_offset(field.spelling)
+            offset = offset // 8 if offset >= 0 else -1
             try:
                 field_size = field.type.get_size()
             except Exception:
                 field_size = -1
+            if field_size < 0 and field.type.get_canonical().kind == TK.INCOMPLETEARRAY:
+                field_size = 0  # a flexible array member: it starts at its offset and has no fixed size
             entry: dict[str, Any] = {
                 "name": field.spelling,
                 "offset": offset,
@@ -608,7 +629,7 @@ class _FunctionWalk:
             if unit is not None and _is_constant_scalar(referenced):
                 # A const scalar with an initializer is a value the compiler folds, not state.
                 reason = reason or "constant"
-        elif node.kind == K.MEMBER_REF_EXPR and referenced.kind == K.FIELD_DECL:
+        elif node.kind == K.MEMBER_REF_EXPR and referenced.kind == K.FIELD_DECL and not _is_unnamed_member(referenced):
             unit = self.x.unit_from_ref(node)
         else:
             return

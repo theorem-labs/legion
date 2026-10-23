@@ -8,7 +8,7 @@ import pytest
 from conftest import FIXTURE
 
 from cgraph import config
-from cgraph.image import FunctionFacts, Image, resolve_sized
+from cgraph.image import FunctionFacts, Image, resolve_sized, source_name
 
 
 @pytest.fixture(scope="module")
@@ -95,3 +95,9 @@ def test_backward_auipc_data_address(image: Image) -> None:
     """bags_dup takes the address of ext_check, which lies before it: a negative auipc immediate."""
     (symbol,) = image.functions["bags_dup"]
     assert [item["target"] for item in image.facts(symbol).function_addresses] == ["ext_check"]
+
+
+def test_compiler_suffix_gives_the_c_name() -> None:
+    assert source_name("create_worker.__already_done.78") == "create_worker.__already_done"
+    assert source_name("files_stat.0") == "files_stat"
+    assert source_name("box_count") == "box_count"
