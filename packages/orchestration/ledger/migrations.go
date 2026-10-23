@@ -498,14 +498,19 @@ func lockOpenAt(ctx context.Context, tx pgx.Tx, repo, id string, gen int64) (Mig
 	if err != nil {
 		return m, err
 	}
+	return m, requireOpenAt(m, gen)
+}
+
+// requireOpenAt refuses migration m unless it is open at generation gen.
+func requireOpenAt(m Migration, gen int64) error {
 	if m.State != StateOpen {
-		return m, refuse(ReasonNotOpen, "migration %s is %s", id, m.State)
+		return refuse(ReasonNotOpen, "migration %s is %s", m.ID, m.State)
 	}
 	if gen != m.Generation {
-		return m, refuse(ReasonStaleGeneration, "migration %s is at generation %d (owner %s), not %d",
-			id, m.Generation, m.Owner, gen)
+		return refuse(ReasonStaleGeneration, "migration %s is at generation %d (owner %s), not %d",
+			m.ID, m.Generation, m.Owner, gen)
 	}
-	return m, nil
+	return nil
 }
 
 // clearReady removes every stored ready field and reports whether a ready record was present.
@@ -964,12 +969,8 @@ func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, e
 			return err
 		}
 
-		if cur.State != StateOpen {
-			return refuse(ReasonNotOpen, "migration %s is %s", req.ID, cur.State)
-		}
-		if req.Generation != cur.Generation {
-			return refuse(ReasonStaleGeneration, "migration %s is at generation %d (owner %s), not %d",
-				req.ID, cur.Generation, cur.Owner, req.Generation)
+		if err := requireOpenAt(cur, req.Generation); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key, generation, reason, batch)
 			VALUES ($1, $2, $3, $4, $5, $6)`, req.Repo, req.ID, req.Key, req.Generation, req.Reason, req.Batch); err != nil {

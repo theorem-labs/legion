@@ -219,6 +219,56 @@ func TestRecordRoundRequiresKey(t *testing.T) {
 	}
 }
 
+// TestRecordRoundAfterCloseReplaysAndRefusesNewKey catches a round counted on a closed migration: after a landing or
+// an abandonment, a retried key replays the closed migration with no change and no event, a new key is refused
+// not_open, and the retried key with another reason is refused round_key_conflict.
+func TestRecordRoundAfterCloseReplaysAndRefusesNewKey(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		state string
+		close func(context.Context, *ledger.Store) error
+	}{
+		{"land", ledger.StateLanded, func(ctx context.Context, s *ledger.Store) error {
+			_, err := s.Land(ctx, ledger.LandRequest{
+				Repo: "r", Migration: "M-1", Generation: 1, Commit: "commit-1", ChangedPaths: []string{"a.lean"},
+			})
+			return err
+		}},
+		{"abandon", ledger.StateAbandoned, func(ctx context.Context, s *ledger.Store) error {
+			_, err := s.Abandon(ctx, "r", "M-1", 1, "superseded")
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newStore(t)
+			ctx := context.Background()
+			must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+			request := roundRequest(1, "round-1", "build failed")
+			must(s.RecordRound(ctx, request))
+			if err := test.close(ctx, s); err != nil {
+				t.Fatal(err)
+			}
+			before := len(must(s.Events(ctx, "r", 0, "M-1")))
+
+			replay := must(s.RecordRound(ctx, request))
+			if replay.State != test.state || replay.LandingRounds != 1 {
+				t.Fatalf("replay after %s: %+v", test.name, replay)
+			}
+			_, err := s.RecordRound(ctx, roundRequest(1, "round-2", "build failed"))
+			wantRefusal(t, err, ledger.ReasonNotOpen)
+			_, err = s.RecordRound(ctx, roundRequest(1, "round-1", "test failed"))
+			wantRefusal(t, err, ledger.ReasonRoundKeyConflict)
+
+			if migration := must(s.Migration(ctx, "r", "M-1")); migration.State != test.state || migration.LandingRounds != 1 {
+				t.Fatalf("migration after rounds on a closed migration: %+v", migration)
+			}
+			if after := len(must(s.Events(ctx, "r", 0, "M-1"))); after != before {
+				t.Fatalf("rounds on a closed migration appended %d events", after-before)
+			}
+		})
+	}
+}
+
 func TestRecordRoundEventHoldsEveryField(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
