@@ -331,6 +331,11 @@ func TestLandHashNamesFileAndInputValidation(t *testing.T) {
 	if r := invokeLandHash(t, config, both); r.code != 0 || r.out != want {
 		t.Fatalf("equal names inputs = %+v, want %q", r, want)
 	}
+	whitespace := landValues(tree, treeID, " ", "")
+	whitespace["LAND_NAMES_FILE"] = file
+	if r := invokeLandHash(t, config, whitespace); r.code != 3 || r.out != "" {
+		t.Fatalf("whitespace LAND_NAMES plus file = %+v, want exit 3 and no stdout", r)
+	}
 	missingFile := landValues(tree, treeID, namesJSON(t, "Gold.frame_lo"), "")
 	missingFile["LAND_NAMES_FILE"] = filepath.Join(t.TempDir(), "missing.json")
 	if r := invokeLandHash(t, config, missingFile); r.code != 3 || r.out != "" {
@@ -426,5 +431,47 @@ func TestLandHashReadsOneSnapshotWhileRefreshWaits(t *testing.T) {
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestLandHashRefreshReparsesAChangedBlobWithRestoredMtime catches a refresh that records a new source blob next
+// to declaration rows parsed from the old bytes, making land-hash return a stale index hash as unchanged.
+func TestLandHashRefreshReparsesAChangedBlobWithRestoredMtime(t *testing.T) {
+	config, tree, _ := landBase(t)
+	sourcePath := filepath.Join(tree, "Golden.lean")
+	before, err := os.Stat(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := strings.Replace(string(source), "sp.toNat ≥ 16 := by", "sp.toNat ≥ 32 := by", 1)
+	if candidate == string(source) || len(candidate) != len(source) {
+		t.Fatal("fixture no longer has a same-length statement change")
+	}
+	if err := os.WriteFile(sourcePath, []byte(candidate), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(sourcePath, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != after.Size() || before.ModTime().UnixNano() != after.ModTime().UnixNano() {
+		t.Fatalf("test setup changed source key: before=%d/%d after=%d/%d", before.Size(), before.ModTime().UnixNano(),
+			after.Size(), after.ModTime().UnixNano())
+	}
+	git(t, tree, "commit", "-q", "-am", "same source key, changed blob")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh changed blob: %+v", r)
+	}
+	r := invokeLandHash(t, config, landValues(tree, git(t, tree, "rev-parse", "HEAD^{tree}"), namesJSON(t, "Gold.frame_lo"), ""))
+	const want = "Gold.frame_lo\tdd801c6f96a0e63c\tGolden.lean\n"
+	if r.code != 0 || r.out != want {
+		t.Fatalf("land-hash after changed blob refresh = %+v, want %q", r, want)
 	}
 }

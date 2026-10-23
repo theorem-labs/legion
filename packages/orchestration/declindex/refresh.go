@@ -168,6 +168,23 @@ func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) storedSources(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var path, blob string
+		if err := rows.Scan(&path, &blob); err != nil {
+			return nil, err
+		}
+		out[path] = blob
+	}
+	return out, rows.Err()
+}
+
 func logf(w io.Writer, format string, args ...any) {
 	if w != nil {
 		fmt.Fprintf(w, format+"\n", args...)
@@ -218,11 +235,16 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	if err != nil {
 		return st, err
 	}
+	storedSourceBlobs, err := s.storedSources(ctx)
+	if err != nil {
+		return st, err
+	}
 	seen := map[string]bool{}
 	var changed []moduleFile
 	for _, f := range files {
 		seen[f.rel] = true
-		if o, ok := old[f.rel]; !ok || o.ileanKey != f.ileanKey {
+		sourceChanged := sourceBlobs != nil && sourceBlobs[f.rel+".lean"] != storedSourceBlobs[f.rel+".lean"]
+		if o, ok := old[f.rel]; !ok || o.ileanKey != f.ileanKey || sourceChanged {
 			changed = append(changed, f)
 		}
 	}
