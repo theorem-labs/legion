@@ -320,7 +320,7 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &unableError{err})
 	}
 	work := filepath.Join(filepath.Dir(state), "proposals")
-	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, Compiled: co,
+	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, AdditionRoot: registry, Compiled: co,
 		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: work}, WorkDir: work}
 	v, err := g.Decide(ctx, p, conceptgate.DecideOptions{Proposer: proposer, AcceptedBy: acceptedBy, ProposalBytes: raw})
 	if err != nil {
