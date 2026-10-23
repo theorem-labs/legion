@@ -135,6 +135,8 @@ int bag_weight(void);
 #define weight_of(x) _Generic((x), struct box *: box_weight(), struct bag *: bag_weight())
 #define size_of(x) _Generic((x), struct box *: ((struct box *)(void *)(x))->size, \
 	struct bag *: (long)((struct bag *)(void *)(x))->n)
+#define inner_weight(x) _Generic((x), struct box *: box_weight(), struct bag *: bag_weight())
+#define outer_weight(x) inner_weight(x)
 
 /* Cleanup attributes outside the class convention: a free helper and a plain cleanup function. */
 #define __cleanup(func) __attribute__((__cleanup__(func)))

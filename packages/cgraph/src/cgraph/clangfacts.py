@@ -26,6 +26,7 @@ from clang.cindex import TypeKind as TK
 
 from . import libclang
 from .config import Vocabulary
+from .errors import ExtractionError
 
 FORMAT = "cgraph/tu-facts/v1"
 Facts = dict[str, Any]
@@ -33,6 +34,71 @@ Unit = dict[str, Any]
 
 _RECORD_KINDS = (K.STRUCT_DECL, K.UNION_DECL)
 _TABLE_ENTRY = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)")
+_INCLUDE_DIRECTIVE = re.compile(r'(?m)^\s*#\s*include(?:_next)?\s*(?:"([^"]+)"|<([^>]+)>)')
+_HAS_INCLUDE = re.compile(r'__has_include(?:_next)?\s*\(\s*(?:"([^"]+)"|<([^>]+)>)\s*\)')
+_INCLUDE_DIR_FLAGS = ("-iquote", "-I", "-isystem", "-idirafter")
+
+_LAYOUT_ERRORS = {
+    -1: "invalid",
+    -2: "incomplete",
+    -3: "dependent",
+    -4: "not_constant_size",
+    -5: "invalid_field_name",
+    -6: "undeduced",
+}
+
+
+def _layout_error(size: int) -> str | None:
+    return _LAYOUT_ERRORS.get(size)
+
+
+def _include_spellings(text: str) -> list[tuple[str, bool]]:
+    """Literal include spellings and whether each has quoted-header search semantics."""
+    result: list[tuple[str, bool]] = []
+    for pattern in (_INCLUDE_DIRECTIVE, _HAS_INCLUDE):
+        for match in pattern.finditer(text):
+            quoted, angled = match.groups()
+            result.append((quoted or angled, quoted is not None))
+    return result
+
+
+def _include_directories(arguments: list[str], c_tree: Path) -> list[Path]:
+    """Search directories in the preprocessor's quoted-header order."""
+    grouped: dict[str, list[str]] = {flag: [] for flag in _INCLUDE_DIR_FLAGS}
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in grouped and index + 1 < len(arguments):
+            grouped[argument].append(arguments[index + 1])
+            index += 2
+            continue
+        flag = next(
+            (candidate for candidate in _INCLUDE_DIR_FLAGS if argument.startswith(candidate) and argument != candidate),
+            None,
+        )
+        if flag is not None:
+            grouped[flag].append(argument[len(flag) :])
+        index += 1
+    return [
+        (c_tree / directory).resolve() if not Path(directory).is_absolute() else Path(directory).resolve()
+        for flag in _INCLUDE_DIR_FLAGS
+        for directory in grouped[flag]
+    ]
+
+
+def _include_probes(tu: ci.TranslationUnit, main: Path, arguments: list[str], extractor: _Extractor) -> list[str]:
+    """Every location libclang could consult for literal include and ``__has_include`` spellings."""
+    directories = _include_directories(arguments, extractor.tree)
+    files = {main, *(Path(include.include.name) for include in tu.get_includes())}
+    probes: set[str] = set()
+    for file in files:
+        if not file.is_file():
+            continue
+        for spelling, quoted in _include_spellings(file.read_text(encoding="utf-8", errors="replace")):
+            candidates = [file.parent / spelling] if quoted else []
+            candidates.extend(directory / spelling for directory in directories)
+            probes.update(extractor.relative(str(candidate)) for candidate in candidates)
+    return sorted(probes)
 
 
 def _named_struct(cursor: ci.Cursor | None) -> ci.Cursor | None:
@@ -221,6 +287,9 @@ class _Extractor:
         location = self.location(cursor)
         return f"{location['file']}:{location['line']}"
 
+    def token_error(self, cursor: ci.Cursor, error: RuntimeError) -> ExtractionError:
+        return ExtractionError(f"{self.source}: {self.where(cursor)}: cannot read tokens: {error}")
+
     # State units ---------------------------------------------------------------------------
 
     def is_lock_type(self, typ: ci.Type) -> bool:
@@ -383,20 +452,16 @@ class _Extractor:
         return result
 
     def record_facts(self, record: ci.Cursor) -> dict[str, Any]:
-        try:
-            size = record.type.get_size()
-        except Exception:
-            size = -1
+        size = record.type.get_size()
+        layout_error = _layout_error(size)
         fields = []
         for field in self.record_fields(record):
             child, pointer, array = _canonical_record(field.type)
             # The offset in this record, through any anonymous member on the way.
             offset = record.type.get_offset(field.spelling)
             offset = offset // 8 if offset >= 0 else -1
-            try:
-                field_size = field.type.get_size()
-            except Exception:
-                field_size = -1
+            field_size = field.type.get_size()
+            field_layout_error = _layout_error(field_size)
             if field_size < 0 and field.type.get_canonical().kind == TK.INCOMPLETEARRAY:
                 field_size = 0  # a flexible array member: it starts at its offset and has no fixed size
             entry: dict[str, Any] = {
@@ -409,19 +474,24 @@ class _Extractor:
                 "function_pointer": _is_function_pointer(field.type),
                 "lock": self.is_lock_type(field.type),
             }
+            if field_layout_error is not None:
+                entry["layout_error"] = field_layout_error
             if child is not None and child.spelling:
                 definition = child.get_definition() or child
                 entry["record"] = child.spelling
                 entry["record_def"] = self.where(definition)
                 entry["record_plain"] = self.is_plain(definition) if child.get_definition() is not None else False
             fields.append(entry)
-        return {
+        result: dict[str, Any] = {
             "name": record.spelling,
             "def": self.where(record),
             "size": size,
             "plain": self.is_plain(record),
             "fields": fields,
         }
+        if layout_error is not None:
+            result["layout_error"] = layout_error
+        return result
 
     # Macros --------------------------------------------------------------------------------
 
@@ -465,8 +535,8 @@ class _Extractor:
                     break
                 written.append(spelling)
             return written
-        except Exception:
-            return []
+        except RuntimeError as error:
+            raise self.token_error(cursor, error) from error
 
     def expansion_bodies(
         self, cursor: ci.Cursor, bound: ci.Cursor, limit: int = 256
@@ -532,7 +602,7 @@ class _Extractor:
             return self.ignored_cache[name]
         definition = self.evaluator.definitions.get(name)
         result: frozenset[int] = frozenset()
-        if definition is not None and definition.is_definition() and _is_inline(definition):
+        if definition is not None and definition.is_definition() and _is_inline(self, definition):
             parameters = list(definition.get_arguments() or [])
             used = {
                 node.referenced.hash
@@ -648,12 +718,12 @@ def _mentions(cursor: ci.Cursor, names: frozenset[str]) -> bool:
     )
 
 
-def _is_inline(definition: ci.Cursor) -> bool:
+def _is_inline(extractor: _Extractor, definition: ci.Cursor) -> bool:
     """A definition written ``inline`` (``static inline``, ``__always_inline``) before its name."""
     try:
-        tokens = [token.spelling for token in definition.translation_unit.get_tokens(extent=definition.extent)]
-    except Exception:
-        return False
+        tokens = [token.spelling for token in extractor.tu.get_tokens(extent=definition.extent)]
+    except RuntimeError as error:
+        raise extractor.token_error(definition, error) from error
     head = tokens[: tokens.index(definition.spelling)] if definition.spelling in tokens else tokens
     return any(token in ("inline", "__inline", "__inline__", "__always_inline") for token in head)
 
@@ -667,13 +737,18 @@ def _exits_under_builtin(statement: ci.Cursor, evaluator: _Evaluator) -> bool:
     return len(parts) >= 2 and _mentions(parts[0], _IMAGE_DECIDES) and evaluator.exits(parts[1])
 
 
-def _pure(expression: ci.Cursor, definitions: dict[str, ci.Cursor], depth: int = 0) -> bool:
+def _pure(expression: ci.Cursor, definitions: dict[str, ci.Cursor], extractor: _Extractor, depth: int = 0) -> bool:
     """No assignment, no asm and no call except to an inline helper that is itself pure (get_current()
     returns the thread pointer): dropping the expression changes nothing but its value."""
     for node in expression.walk_preorder():
         if node.kind == K.CALL_EXPR:
             callee = definitions.get(node.spelling)
-            if callee is None or depth > 2 or not _is_inline(callee) or not _pure(callee, definitions, depth + 1):
+            if (
+                callee is None
+                or depth > 2
+                or not _is_inline(extractor, callee)
+                or not _pure(callee, definitions, extractor, depth + 1)
+            ):
                 return False
         elif (
             node.kind in (K.COMPOUND_ASSIGNMENT_OPERATOR, K.ASM_STMT)
@@ -862,27 +937,30 @@ class _FunctionWalk:
         self.events["accesses"].append(item)
         if unit["kind"] == "struct" and unit.get("field") is not None:
             displacement, base = _displacement(where) if where.kind == K.MEMBER_REF_EXPR else (-1, "unknown")
+            if displacement < 0 and unit.get("offset", -1) >= 0:
+                # Libclang's member expression can name the anonymous union that promotes a field,
+                # while the unit has already resolved that field against its enclosing named record.
+                displacement, base = unit["offset"], "pointer"
             field = where.referenced if where.kind == K.MEMBER_REF_EXPR else None
-            try:
-                size = field.type.get_size() if field is not None else -1
-            except Exception:
-                size = -1
-            self.events["field_accesses"].append(
-                {
-                    "struct": unit["name"],
-                    "def": unit["def"],
-                    "field": unit["field"],
-                    "offset": unit.get("offset", -1),
-                    # What the machine code adds to its base register: the field's offset plus the
-                    # offsets of the members a "." chain passes through (c->box.size), less the
-                    # member offset a container_of subtracts.
-                    "displacement": displacement,
-                    "base": base,
-                    "size": size,
-                    "bitfield": bool(field is not None and field.is_bitfield()),
-                    "provenance": provenance,
-                }
-            )
+            size = field.type.get_size() if field is not None else -1
+            layout_error = _layout_error(size)
+            access = {
+                "struct": unit["name"],
+                "def": unit["def"],
+                "field": unit["field"],
+                "offset": unit.get("offset", -1),
+                # What the machine code adds to its base register: the field's offset plus the
+                # offsets of the members a "." chain passes through (c->box.size), less the
+                # member offset a container_of subtracts.
+                "displacement": displacement,
+                "base": base,
+                "size": size,
+                "bitfield": bool(field is not None and field.is_bitfield()),
+                "provenance": provenance,
+            }
+            if layout_error is not None:
+                access["layout_error"] = layout_error
+            self.events["field_accesses"].append(access)
 
     def mode(self, node: ci.Cursor, parent: ci.Cursor | None, index: int) -> str:
         if parent is None:
@@ -994,7 +1072,7 @@ class _FunctionWalk:
         self, node: ci.Cursor, parent: ci.Cursor | None, callee: str, action: str, arguments: list[ci.Cursor]
     ) -> None:
         rules = self.x.vocabulary.calls
-        if action == "alloc" and parent is not None and parent.kind == K.UNEXPOSED_EXPR:
+        if action == "allocate" and parent is not None and parent.kind == K.UNEXPOSED_EXPR:
             # An allocation creates an object of the type its result is converted to.
             record, pointer, _ = _canonical_record(parent.type)
             unit = self.x.record_unit(record, None) if record is not None and pointer else None
@@ -1107,8 +1185,10 @@ class _FunctionWalk:
             self.reference(node, parent, index, reason, generic)
         children = _children(node)
         if kind == K.CXX_UNARY_EXPR:
+            tokens = self.x.written_tokens(node, self.cursor)
+            unevaluated = "alignof" if any(token in {"_Alignof", "__alignof__"} for token in tokens) else "sizeof"
             for child_index, child in enumerate(children):
-                self.walk(child, node, child_index, reason or "sizeof", generic)
+                self.walk(child, node, child_index, reason or unevaluated, generic)
             return
         if kind == K.GENERIC_SELECTION_EXPR and children:
             selected = self.x.selected_associations(node, self.cursor) if reason is None else set()
@@ -1185,7 +1265,7 @@ class _FunctionWalk:
             arguments = list(node.get_arguments() or [])
             for child_index, child in enumerate(children):
                 position = next((place for place, argument in enumerate(arguments) if argument == child), None)
-                if position is not None and position in ignored and _pure(child, self.x.evaluator.definitions):
+                if position is not None and position in ignored and _pure(child, self.x.evaluator.definitions, self.x):
                     # A value only a parameter the inline callee never reads receives: not computed.
                     self.walk(child, node, child_index, "ignored_argument", generic)
                 else:
@@ -1217,7 +1297,9 @@ def _main_file(cursor: ci.Cursor, main: Path) -> bool:
     return location.file is not None and Path(location.file.name).resolve() == main
 
 
-def _tables(extractor: _Extractor, tu: ci.TranslationUnit, main: Path) -> list[dict[str, Any]]:
+def _tables(
+    extractor: _Extractor, tu: ci.TranslationUnit, main: Path, exclusions: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     tables = []
     for cursor in tu.cursor.get_children():
         if cursor.kind != K.VAR_DECL or not cursor.spelling or not _main_file(cursor, main):
@@ -1237,7 +1319,17 @@ def _tables(extractor: _Extractor, tu: ci.TranslationUnit, main: Path) -> list[d
             continue
         try:
             text = " ".join(token.spelling for token in tu.get_tokens(extent=cursor.extent))
-        except Exception:
+        except RuntimeError:
+            exclusions.append(
+                {
+                    "kind": "callback_table",
+                    "reason": "tokens_unavailable",
+                    "function": None,
+                    "target": cursor.spelling,
+                    "detail": {"table": cursor.spelling, "ops_struct": record.spelling},
+                    "provenance": [extractor.location(cursor)],
+                }
+            )
             continue
         entries = sorted({(name, target) for name, target in _TABLE_ENTRY.findall(text) if target in functions})
         if entries:
@@ -1275,16 +1367,14 @@ def _parameter_count(cursor: ci.Cursor) -> int:
     return min(8, len(list(cursor.get_arguments() or [])))
 
 
-def _result_registers(cursor: ci.Cursor) -> int:
-    """The registers the function returns in: none for void, a0 for a value of up to eight bytes, a0
-    and a1 for a larger one."""
+def _result_registers(cursor: ci.Cursor) -> tuple[int, str | None]:
+    """The registers the function returns in, plus a layout error when its result size is unknown."""
     result = cursor.result_type.get_canonical()
     if result.kind == TK.VOID:
-        return 0
-    try:
-        return 2 if result.get_size() > 8 else 1
-    except Exception:
-        return 2
+        return 0, None
+    size = result.get_size()
+    layout_error = _layout_error(size)
+    return (2 if size < 0 or size > 8 else 1), layout_error
 
 
 def _is_weak(extractor: _Extractor, cursor: ci.Cursor) -> bool:
@@ -1292,8 +1382,8 @@ def _is_weak(extractor: _Extractor, cursor: ci.Cursor) -> bool:
     the source or, for a definition a macro generates (``COND_SYSCALL(x)``), in the macros it expands."""
     try:
         tokens = [token.spelling for token in extractor.tu.get_tokens(extent=cursor.extent)]
-    except Exception:
-        return False
+    except RuntimeError as error:
+        raise extractor.token_error(cursor, error) from error
     if cursor.spelling in tokens:
         return any(token in _WEAK for token in tokens[: tokens.index(cursor.spelling)])
     return any(token in _WEAK for _, body in extractor.expansion_bodies(cursor, cursor, limit=16) for token in body)
@@ -1316,6 +1406,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
         }
     )
     includes = sorted({extractor.relative(include.include.name) for include in tu.get_includes()})
+    include_probes = _include_probes(tu, main, arguments, extractor)
     definitions = _definitions(tu)
     # The unit's own functions: those of its file and of the C files it includes.
     pending = sorted(
@@ -1324,6 +1415,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
         if _main_file(cursor, main) or extractor.relative(cursor.location.file.name).endswith(".c")
     )
     functions: dict[str, Any] = {}
+    exclusions: list[dict[str, Any]] = []
     while pending:
         name = pending.pop()
         if name in functions:
@@ -1335,6 +1427,18 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
         reached |= {pointer["target"] for pointer in walk.events["function_pointers"]}
         for event in walk.events["calls"]:
             event["visible"] = event["callee"] in definitions
+        result_registers, layout_error = _result_registers(cursor)
+        if layout_error is not None:
+            exclusions.append(
+                {
+                    "kind": "function",
+                    "reason": "result_registers_unknown",
+                    "function": name,
+                    "target": None,
+                    "detail": {"layout_error": layout_error},
+                    "provenance": [extractor.location(cursor)],
+                }
+            )
         functions[name] = {
             "name": name,
             "file": extractor.relative(cursor.location.file.name),
@@ -1344,7 +1448,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             # Registers a0..a7 carry the first eight integer arguments; a variadic one, or one declared
             # without a prototype, may take all of them.
             "parameters": _parameter_count(cursor),
-            "result_registers": _result_registers(cursor),
+            "result_registers": result_registers,
             "main_file": _main_file(cursor, main),
             "returns": walk.returns(),
             "events": walk.events,
@@ -1357,11 +1461,13 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
         if key in records:
             continue
         records[key] = extractor.record_facts(extractor.records[key])
-    tables = _tables(extractor, tu, main)
+    tables = _tables(extractor, tu, main, exclusions)
     return {
         "format": FORMAT,
         "source": source,
         "includes": includes,
+        "include_probes": include_probes,
+        "exclusions": exclusions,
         "errors": errors,
         "functions": dict(sorted(functions.items())),
         "records": dict(sorted(records.items())),

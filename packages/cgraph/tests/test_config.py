@@ -4,15 +4,21 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import FIXTURE
+from conftest import FIXTURE, build
 
-from cgraph import commands, config
+from cgraph import clangfacts, cli, commands, config
+from cgraph.errors import ExtractionError
 
 
 def write(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "cgraph.toml"
     path.write_text(text)
     return path
+
+
+def reproducible_outputs(out: Path) -> dict[str, bytes]:
+    """Build metadata records cache use; the graph outputs must not depend on it."""
+    return {path.name: path.read_bytes() for path in out.iterdir() if path.name != "build.json"}
 
 
 MINIMAL = """
@@ -122,3 +128,56 @@ def test_part_file_missing_from_the_database_is_refused(tmp_path: Path) -> None:
     loaded = config.load(write(tmp_path, MINIMAL))
     with pytest.raises(config.ConfigError, match=r"parts\.one\.files names a\.c"):
         config.part_files(loaded, "one", {"b.c": []})
+
+
+def test_allocate_rule_emits_the_allocate_access_kind(tmp_path: Path) -> None:
+    loaded = config.load(write(tmp_path, MINIMAL + '[c.calls]\nallocate = "alloc"\n'))
+    assert loaded.vocabulary.calls.action("obj_alloc") == "allocate"
+
+
+def test_legacy_alloc_rule_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(config.ConfigError, match=r"c\.calls has unknown key alloc"):
+        config.load(write(tmp_path, MINIMAL + '[c.calls]\nalloc = "alloc"\n'))
+
+
+def test_new_shadowing_header_reparses_all_units_that_include_it(copy: Path, tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    before, incremental_out, full_out = tmp_path / "before", tmp_path / "incremental", tmp_path / "full"
+    build(copy, "both", before, cache)
+    header = (copy / "include" / "mini.h").read_text()
+    (copy / "include" / "override" / "mini.h").write_text(
+        header.replace("#endif\n", "struct shadow_cache_probe {\n\tint field;\n};\n\n#endif\n")
+    )
+    incremental = build(copy, "both", incremental_out, cache)
+    full = build(copy, "both", full_out, tmp_path / "empty-cache")
+    assert incremental.parsed == ["src/bags.c", "src/store.c"]
+    assert reproducible_outputs(incremental_out) == reproducible_outputs(full_out)
+    assert full.parsed == ["src/bags.c", "src/store.c"]
+
+
+def test_bags_header_change_reparses_only_bags(copy: Path, tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    before, incremental_out, full_out = tmp_path / "before", tmp_path / "incremental", tmp_path / "full"
+    build(copy, "both", before, cache)
+    header = copy / "include" / "bags.h"
+    header.write_text(header.read_text() + "\nint bags_header_changed(void);\n")
+    incremental = build(copy, "both", incremental_out, cache)
+    full = build(copy, "both", full_out, tmp_path / "empty-cache")
+    assert incremental.parsed == ["src/bags.c"]
+    assert incremental.reused == ["src/store.c"]
+    assert reproducible_outputs(incremental_out) == reproducible_outputs(full_out)
+    assert full.parsed == ["src/bags.c", "src/store.c"]
+
+
+def test_extraction_error_exits_three_with_its_unit_name(
+    copy: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fail(source: str, *_: object) -> dict[str, object]:
+        raise ExtractionError(f"{source}: src/store.c:1: cannot read tokens")
+
+    monkeypatch.setattr(clangfacts, "extract", fail)
+    assert (
+        cli.main(["build", "--config", str(copy / "cgraph.toml"), "--part", "store", "--out", str(tmp_path / "out")])
+        == 3
+    )
+    assert "src/store.c" in capsys.readouterr().err

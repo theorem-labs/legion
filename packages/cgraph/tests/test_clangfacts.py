@@ -9,6 +9,7 @@ import pytest
 from conftest import FIXTURE
 
 from cgraph import clangfacts, commands, config
+from cgraph.errors import ExtractionError
 
 
 @pytest.fixture(scope="module")
@@ -100,6 +101,22 @@ def test_unit_facts_name_no_absolute_path(units: dict[str, dict[str, Any]]) -> N
     assert "/home/" not in json.dumps(units) and FIXTURE.as_posix() not in json.dumps(units)
 
 
+def test_include_probes_cover_main_and_included_file_search_paths(units: dict[str, dict[str, Any]]) -> None:
+    probes = set(units["src/bags.c"]["include_probes"])
+    assert {
+        "src/mini.h",
+        "src/bags.h",
+        "include/override/mini.h",
+        "include/override/bags.h",
+        "include/mini.h",
+        "include/bags.h",
+        "include/optional-bags.h",
+        "include/override/optional-bags.h",
+        "include/next-bags.h",
+        "include/override/next-bags.h",
+    } <= probes
+
+
 def test_function_local_static_uses_the_compiler_name(units: dict[str, dict[str, Any]]) -> None:
     assert ("next_id.counter", "write", None) in accesses(units, "src/store.c", "next_id")
 
@@ -123,7 +140,7 @@ def test_cleanup_local_calls_its_destructor_with_the_constructor_arguments(units
 
 
 def test_allocation_takes_the_type_of_its_result_and_free_its_argument(units: dict[str, dict[str, Any]]) -> None:
-    assert ("box", "alloc", None) in accesses(units, "src/store.c", "box_new")
+    assert ("box", "allocate", None) in accesses(units, "src/store.c", "box_new")
     assert accesses(units, "src/store.c", "box_free") == {("box", "free", None)}
 
 
@@ -156,9 +173,202 @@ def test_record_layouts_and_plain_values(units: dict[str, dict[str, Any]]) -> No
 
 
 def test_membership_witness_lines(units: dict[str, dict[str, Any]]) -> None:
-    assert [item["provenance"][0]["line"] for item in units["src/bags.c"]["witnesses"]] == [54]
+    assert [item["provenance"][0]["line"] for item in units["src/bags.c"]["witnesses"]] == [55]
 
 
 def test_const_scalar_global_is_a_constant_not_state(units: dict[str, dict[str, Any]]) -> None:
     assert not any(name == "tree_step" for name, _, _ in accesses(units, "src/store.c", "box_tree_add"))
     assert ("tree_step", "constant") in unevaluated(units, "src/store.c", "box_tree_add")
+
+
+def test_negative_record_layout_size_keeps_its_layout_error() -> None:
+    class Layout:
+        def get_size(self) -> int:
+            return -2
+
+    class Record:
+        spelling = "incomplete_record"
+        type = Layout()
+
+    extractor = object.__new__(clangfacts._Extractor)
+    extractor.record_fields = lambda _: []
+    extractor.where = lambda _: "src/test.c:1"
+    extractor.is_plain = lambda _: False
+    facts = extractor.record_facts(Record())
+
+    assert facts["size"] == -2
+    assert facts["layout_error"] == "incomplete"
+
+
+def test_negative_access_field_size_keeps_its_layout_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FieldType:
+        def get_size(self) -> int:
+            return -2
+
+    class Field:
+        type = FieldType()
+
+        def is_bitfield(self) -> bool:
+            return False
+
+    class Where:
+        kind = clangfacts.K.MEMBER_REF_EXPR
+        referenced = Field()
+
+    class Extractor:
+        def location(self, _: object) -> dict[str, object]:
+            return {"source": "c", "file": "src/test.c", "line": 1}
+
+    monkeypatch.setattr(clangfacts, "_displacement", lambda _: (4, "pointer"))
+    walk = object.__new__(clangfacts._FunctionWalk)
+    walk.x = Extractor()
+    walk.events = {"accesses": [], "field_accesses": [], "unevaluated": []}
+    walk.conditional = 0
+    walk.add_access(
+        {"kind": "struct", "name": "incomplete_record", "def": "src/test.c:1", "field": "member", "offset": 4},
+        "read",
+        Where(),
+        None,
+    )
+
+    assert walk.events["field_accesses"][0]["size"] == -2
+    assert walk.events["field_accesses"][0]["layout_error"] == "incomplete"
+
+
+def test_unknown_result_register_size_is_an_exclusion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(clangfacts, "_result_registers", lambda _: (2, "incomplete"))
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    facts = clangfacts.extract(
+        "src/store.c",
+        loaded.inputs.c_tree,
+        commands.template_arguments(loaded.flags, loaded.inputs.c_tree, "src/store.c"),
+        loaded.vocabulary,
+    )
+
+    exclusion = next(item for item in facts["exclusions"] if item["function"] == "box_new")
+    assert exclusion == {
+        "kind": "function",
+        "reason": "result_registers_unknown",
+        "function": "box_new",
+        "target": None,
+        "detail": {"layout_error": "incomplete"},
+        "provenance": [{"source": "c", "file": "src/store.c", "line": 39}],
+    }
+
+
+def test_callback_table_with_unavailable_tokens_is_an_exclusion(monkeypatch: pytest.MonkeyPatch) -> None:
+    class File:
+        name = str(FIXTURE / "src" / "store.c")
+
+    class Location:
+        file = File()
+        line = 7
+
+    class Function:
+        kind = clangfacts.K.FUNCTION_DECL
+        spelling = "box_get"
+
+    class Reference:
+        kind = clangfacts.K.DECL_REF_EXPR
+        referenced = Function()
+
+    class Initializer:
+        def walk_preorder(self) -> list[Reference]:
+            return [Reference()]
+
+    class Table:
+        kind = clangfacts.K.VAR_DECL
+        spelling = "fake_ops"
+        location = Location()
+        extent = object()
+        type = object()
+
+    class Root:
+        def get_children(self) -> list[Table]:
+            return [Table()]
+
+    class TranslationUnit:
+        cursor = Root()
+        diagnostics: tuple[object, ...] = ()
+
+        def get_includes(self) -> list[object]:
+            return []
+
+        def get_tokens(self, *, extent: object) -> list[object]:
+            raise RuntimeError("tokens unavailable")
+
+    class Index:
+        def parse(self, *_: object, **__: object) -> TranslationUnit:
+            return TranslationUnit()
+
+    class Record:
+        spelling = "ops"
+
+    monkeypatch.setattr(clangfacts.ci.Index, "create", staticmethod(Index))
+    monkeypatch.setattr(clangfacts, "_canonical_record", lambda _: (Record(), False, False))
+    monkeypatch.setattr(clangfacts.libclang, "var_initializer", lambda _: Initializer())
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    facts = clangfacts.extract(
+        "src/store.c",
+        loaded.inputs.c_tree,
+        commands.template_arguments(loaded.flags, loaded.inputs.c_tree, "src/store.c"),
+        loaded.vocabulary,
+    )
+
+    assert facts["tables"] == []
+    assert facts["exclusions"] == [
+        {
+            "kind": "callback_table",
+            "reason": "tokens_unavailable",
+            "function": None,
+            "target": "fake_ops",
+            "detail": {"table": "fake_ops", "ops_struct": "ops"},
+            "provenance": [{"source": "c", "file": "src/store.c", "line": 7}],
+        }
+    ]
+
+
+def test_unavailable_written_tokens_name_the_unit_and_location() -> None:
+    class File:
+        name = str(FIXTURE / "src" / "store.c")
+
+    class Location:
+        file = File()
+        line = 7
+        column = 1
+
+    class Cursor:
+        location = Location()
+        extent = object()
+
+    class TranslationUnit:
+        def get_tokens(self, *, extent: object) -> list[object]:
+            raise RuntimeError("tokens unavailable")
+
+    extractor = object.__new__(clangfacts._Extractor)
+    extractor.tu = TranslationUnit()
+    extractor.source = "src/store.c"
+    extractor.where = lambda _: "src/store.c:7"
+
+    with pytest.raises(ExtractionError, match=r"src/store\.c:7"):
+        extractor.written_tokens(Cursor(), Cursor())
+
+
+def test_unavailable_inline_and_weak_tokens_name_the_unit_and_location() -> None:
+    class Definition:
+        spelling = "helper"
+        extent = object()
+
+    class TranslationUnit:
+        def get_tokens(self, *, extent: object) -> list[object]:
+            raise RuntimeError("tokens unavailable")
+
+    extractor = object.__new__(clangfacts._Extractor)
+    extractor.tu = TranslationUnit()
+    extractor.source = "src/store.c"
+    extractor.where = lambda _: "src/store.c:7"
+
+    with pytest.raises(ExtractionError, match=r"src/store\.c:7"):
+        clangfacts._is_inline(extractor, Definition())
+    with pytest.raises(ExtractionError, match=r"src/store\.c:7"):
+        clangfacts._is_weak(extractor, Definition())

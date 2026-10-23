@@ -27,14 +27,19 @@ SYMBOL_CLASSES = ("compiler_symbol", "constant_data", "per_cpu")
 class CallRules:
     lock: re.Pattern[str] | None = None
     unlock: re.Pattern[str] | None = None
-    alloc: re.Pattern[str] | None = None
+    allocate: re.Pattern[str] | None = None
     free: re.Pattern[str] | None = None
     # A free whose callee matches this takes the cache first and the object second.
     free_object_after_first: re.Pattern[str] | None = None
 
     def action(self, callee: str) -> str | None:
-        """The access kind a call to ``callee`` makes on its argument: unlock, lock, free or alloc."""
-        for name, pattern in (("unlock", self.unlock), ("lock", self.lock), ("free", self.free), ("alloc", self.alloc)):
+        """The access kind a call to ``callee`` makes on its argument: unlock, lock, free or allocate."""
+        for name, pattern in (
+            ("unlock", self.unlock),
+            ("lock", self.lock),
+            ("free", self.free),
+            ("allocate", self.allocate),
+        ):
             if pattern is not None and pattern.search(callee):
                 return name
         return None
@@ -70,7 +75,7 @@ class Vocabulary:
             "percpu_globals": sorted(self.percpu_globals),
             "calls": {
                 name: getattr(self.calls, name).pattern if getattr(self.calls, name) else None
-                for name in ("lock", "unlock", "alloc", "free", "free_object_after_first")
+                for name in ("lock", "unlock", "allocate", "free", "free_object_after_first")
             },
             "membership": dict(sorted(self.membership.items())),
             "membership_witness_macros": list(self.membership_witness_macros),
@@ -291,11 +296,11 @@ def load(path: Path, root: Path | None = None) -> Config:
                 f"c.argument_rewrites key {pattern} is not a valid regular expression: {error}"
             ) from error
     calls_table = _expect(c_table, "calls", dict, "c") or {}
-    _unknown(calls_table, {"lock", "unlock", "alloc", "free", "free_object_after_first"}, "c.calls")
+    _unknown(calls_table, {"lock", "unlock", "allocate", "free", "free_object_after_first"}, "c.calls")
     calls = CallRules(
         lock=_regex(calls_table, "lock", "c.calls"),
         unlock=_regex(calls_table, "unlock", "c.calls"),
-        alloc=_regex(calls_table, "alloc", "c.calls"),
+        allocate=_regex(calls_table, "allocate", "c.calls"),
         free=_regex(calls_table, "free", "c.calls"),
         free_object_after_first=_regex(calls_table, "free_object_after_first", "c.calls"),
     )

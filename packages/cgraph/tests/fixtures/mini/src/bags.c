@@ -1,4 +1,5 @@
 #include "mini.h"
+#include "bags.h"
 
 struct list_node all_bags;
 extern const struct ops box_ops;

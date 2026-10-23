@@ -12,7 +12,7 @@ from typing import Any
 from . import structure
 from .contracts import ContractGraph
 
-WRITES = ("write", "alloc", "free")
+WRITES = ("write", "allocate", "free")
 CALLS = ("call", "call_indirect")
 _TOP_LEVEL = re.compile(r"^(?:structure|class|def|abbrev|inductive|theorem|lemma|instance|namespace|end)\b")
 

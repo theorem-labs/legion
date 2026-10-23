@@ -82,3 +82,89 @@ int flow_pointer(void)
 {
 	return apply(read_bags);
 }
+
+
+static inline int feature_enabled(void)
+{
+	return 1;
+}
+
+int flow_decided_or(void)
+{
+	return feature_enabled() || box_weight();
+}
+
+int flow_constant_or(void)
+{
+	return 1 || bag_weight();
+}
+
+int flow_after_goto(struct box *b)
+{
+	goto done;
+	obj_free(b);
+done:
+	return 0;
+}
+
+int flow_after_trap(struct box *b)
+{
+	__builtin_trap();
+	obj_free(b);
+	return 0;
+}
+
+static int box_count;
+
+int flow_alignof(void)
+{
+	return __alignof__(box_count);
+}
+
+struct anonymous_holder {
+	union {
+		struct {
+			int ignored;
+			int b;
+		};
+	};
+};
+
+int flow_anonymous_member(struct anonymous_holder *s)
+{
+	return s->b;
+}
+
+static int partial_helper(void)
+{
+	all_bags.next = all_bags.prev;
+	return all_bags.next != NULL;
+}
+
+int flow_partial_inline(void)
+{
+	[[clang::always_inline]] partial_helper();
+	[[clang::noinline]] return partial_helper();
+}
+
+int flow_percpu __attribute__((section(".data..percpu"))) = 1;
+
+int flow_percpu_global(void)
+{
+	return flow_percpu++;
+}
+
+struct percpu_box {
+	int value;
+};
+
+int flow_percpu_struct(struct percpu_box *value)
+{
+	return value->value;
+}
+
+
+int flow_nested_generic(struct box *value)
+{
+	return outer_weight(value);
+}

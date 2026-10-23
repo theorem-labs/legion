@@ -8,7 +8,7 @@ CLANG="${CLANG:-clang}"
 LLD="${LLD:-ld.lld}"
 NM="${NM:-llvm-nm}"
 FLAGS=(--target=riscv64-unknown-elf -march=rv64imac -mabi=lp64 -mcmodel=medany -O2 -ffreestanding
-	-nostdinc -fno-builtin -Iinclude -std=gnu11)
+	-nostdinc -fno-builtin -Iinclude -std=gnu2x)
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 for source in src/store.c src/bags.c src/flow.c src/anchor.S; do
@@ -26,6 +26,6 @@ void obj_free(void *p) { (void)p; }
 void _start(void) { for (;;) ; }
 EOF
 "$CLANG" "${FLAGS[@]}" -c "$work/stubs.c" -o "$work/stubs.o"
-"$LLD" -o image/mini.elf --build-id=none "$work/store.c.o" "$work/bags.c.o" "$work/flow.c.o" "$work/anchor.S.o" "$work/stubs.o"
+"$LLD" -o image/mini.elf --build-id=none -Tpercpu.ld "$work/store.c.o" "$work/bags.c.o" "$work/flow.c.o" "$work/anchor.S.o" "$work/stubs.o"
 # Like the kernel's System.map, the map leaves out assembler-local labels (.L...).
 "$NM" -n image/mini.elf | awk 'NF == 3 && $3 !~ /^\.L/' >image/System.map

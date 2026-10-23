@@ -16,21 +16,21 @@ files = ["src/bags.c", "src/store.c"]
 files = ["src/flow.c"]
 
 [c]
-flags = ["-nostdinc", "-I{c_tree}/include", "--target=riscv64-unknown-elf", "-march=rv64imac", "-mabi=lp64",
-         "-std=gnu11", "-ffreestanding", "-DMODULE={stem}"]
+flags = ["-nostdinc", "-I{c_tree}/include/override", "-I{c_tree}/include", "--target=riscv64-unknown-elf",
+         "-march=rv64imac", "-mabi=lp64", "-std=gnu2x", "-ffreestanding", "-DMODULE={stem}"]
 kit_types = ["list_node"]
 value_types = []
 lock_types = ["spin", "rwsem", "seqlk"]
 lock_type_words = []
 percpu_globals = ["current_box"]
-percpu_structs = []
+percpu_structs = ["percpu_box"]
 membership_witness_macros = ["for_each_box"]
 base_type_min_containers = 2
 
 [c.calls]
 unlock = "unlock|^up_"
 lock = "^(?!.*unlock)(?:.*lock|down_)"
-alloc = "alloc"
+allocate = "alloc"
 free = "free"
 
 [c.membership]
@@ -52,6 +52,7 @@ min_field_offsets = 0.9
 [image]
 arch = "riscv64"
 thread_pointer = "current_box"
+percpu_sections = [".data..percpu"]
 
 [image.symbol_classes]
 compiler_symbol = "^__key$"
