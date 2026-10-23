@@ -74,26 +74,26 @@ const (
 
 // Member is the frozen identity of one proposed migration.
 type Member struct {
-	Migration      string
-	Generation     int64
-	Head           string
-	Changed        []string
-	ReadNames      []string
-	ChangedHashes  map[string]string
-	ApprovedPinned []string
+	Migration      string            `json:"migration"`
+	Generation     int64             `json:"generation"`
+	Head           string            `json:"head"`
+	Changed        []string          `json:"changed"`
+	ReadNames      []string          `json:"readNames"`
+	ChangedHashes  map[string]string `json:"changedHashes"`
+	ApprovedPinned []string          `json:"approvedPinned"`
 }
 
 // DroppedMember records why a frozen member left the candidate.
 type DroppedMember struct {
-	Migration string
-	Reason    string
+	Migration string `json:"migration"`
+	Reason    string `json:"reason"`
 }
 
 // CheckVerdict is a configured check's final result for the current candidate.
 type CheckVerdict struct {
-	Name    string
-	Verdict string
-	Reason  string
+	Name    string `json:"name"`
+	Verdict string `json:"verdict"`
+	Reason  string `json:"reason"`
 }
 
 // Receipt binds a green candidate to its policy and evidence.
@@ -114,33 +114,33 @@ func (r Receipt) JSON() ([]byte, error) {
 // Batch persists an immutable input set independently from members eventually
 // landed after a publisher confirms the merge.
 type Batch struct {
-	ID              string
-	Repository      string
-	Base            string
-	BaseBranch      string
-	Branch          string
-	Candidate       gitx.Result
-	FrozenMembers   []Member
-	ActiveMembers   []Member
-	LandedMembers   []Member
-	NotifiedMembers []string
-	Dropped         []DroppedMember
-	State           State
-	Reason          string
-	Round           int
-	Checks          []CheckVerdict
-	Score           CheckVerdict
-	PullRequest     PullRequest
-	Receipt         *Receipt
+	ID              string          `json:"id"`
+	Repository      string          `json:"repository"`
+	Base            string          `json:"base"`
+	BaseBranch      string          `json:"baseBranch"`
+	Branch          string          `json:"branch"`
+	Candidate       gitx.Result     `json:"candidate"`
+	FrozenMembers   []Member        `json:"frozenMembers"`
+	ActiveMembers   []Member        `json:"activeMembers"`
+	LandedMembers   []Member        `json:"landedMembers"`
+	NotifiedMembers []string        `json:"notifiedMembers"`
+	Dropped         []DroppedMember `json:"dropped"`
+	State           State           `json:"state"`
+	Reason          string          `json:"reason"`
+	Round           int             `json:"round"`
+	Checks          []CheckVerdict  `json:"checks"`
+	Score           CheckVerdict    `json:"score"`
+	PullRequest     PullRequest     `json:"pullRequest"`
+	Receipt         *Receipt        `json:"receipt"`
 }
 
 // Input starts one frozen batch.
 type Input struct {
-	ID         string
-	Repository string
-	Base       string
-	BaseBranch string
-	Members    []Member
+	ID         string   `json:"id"`
+	Repository string   `json:"repository"`
+	Base       string   `json:"base"`
+	BaseBranch string   `json:"baseBranch"`
+	Members    []Member `json:"members"`
 }
 
 // BatchStore persists each state transition before its following side effect.

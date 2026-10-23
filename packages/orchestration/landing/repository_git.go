@@ -11,16 +11,19 @@ import (
 )
 
 // RepositoryGit implements Git by invoking the repository's git binary without
-// creating or changing a working copy.
-type RepositoryGit struct{}
+// creating or changing a working copy. Path, when set, is the local repository
+// path while callers may keep a distinct repository identity in batch records.
+type RepositoryGit struct {
+	Path string
+}
 
 // Candidate builds an in-memory candidate commit.
-func (RepositoryGit) Candidate(ctx context.Context, repository, base string, members []Member) (gitx.Result, error) {
+func (g RepositoryGit) Candidate(ctx context.Context, repository, base string, members []Member) (gitx.Result, error) {
 	inputs := make([]gitx.Member, len(members))
 	for index, member := range members {
 		inputs[index] = gitx.Member{ID: member.Migration, Head: member.Head}
 	}
-	result, err := gitx.Candidate(ctx, repository, base, inputs)
+	result, err := gitx.Candidate(ctx, g.path(repository), base, inputs)
 	if err != nil {
 		return gitx.Result{}, fmt.Errorf("build candidate: %w", err)
 	}
@@ -28,8 +31,8 @@ func (RepositoryGit) Candidate(ctx context.Context, repository, base string, mem
 }
 
 // ChangeSet returns a member's merge-base diff against the candidate base.
-func (RepositoryGit) ChangeSet(ctx context.Context, repository, base string, member Member) (gitx.Change, error) {
-	change, err := gitx.ChangeSet(ctx, repository, base, gitx.Member{ID: member.Migration, Head: member.Head})
+func (g RepositoryGit) ChangeSet(ctx context.Context, repository, base string, member Member) (gitx.Change, error) {
+	change, err := gitx.ChangeSet(ctx, g.path(repository), base, gitx.Member{ID: member.Migration, Head: member.Head})
 	if err != nil {
 		return gitx.Change{}, fmt.Errorf("read change set: %w", err)
 	}
@@ -37,7 +40,8 @@ func (RepositoryGit) ChangeSet(ctx context.Context, repository, base string, mem
 }
 
 // Diff returns a zero-context diff for a member's merge-base range.
-func (RepositoryGit) Diff(ctx context.Context, repository, base string, member Member) (string, error) {
+func (g RepositoryGit) Diff(ctx context.Context, repository, base string, member Member) (string, error) {
+	repository = g.path(repository)
 	mergeBase, err := repositoryGit(ctx, repository, "merge-base", base, member.Head)
 	if err != nil {
 		return "", fmt.Errorf("find merge base for %q: %w", member.Migration, err)
@@ -50,7 +54,8 @@ func (RepositoryGit) Diff(ctx context.Context, repository, base string, member M
 }
 
 // DeclarationLines returns lines in a tree that mention a declaration name.
-func (RepositoryGit) DeclarationLines(ctx context.Context, repository string, tree Tree, name string) ([]string, error) {
+func (g RepositoryGit) DeclarationLines(ctx context.Context, repository string, tree Tree, name string) ([]string, error) {
+	repository = g.path(repository)
 	command := exec.CommandContext(ctx, "git", "-C", repository, "grep", "-h", "-I", "-F", name, string(tree), "--")
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -65,6 +70,13 @@ func (RepositoryGit) DeclarationLines(ctx context.Context, repository string, tr
 		return nil, nil
 	}
 	return strings.Split(text, "\n"), nil
+}
+
+func (g RepositoryGit) path(repository string) string {
+	if g.Path != "" {
+		return g.Path
+	}
+	return repository
 }
 
 func repositoryGit(ctx context.Context, repository string, args ...string) (string, error) {

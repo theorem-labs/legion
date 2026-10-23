@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,7 +14,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/sjawhar/legion/orchestration/landing"
 	"github.com/sjawhar/legion/orchestration/landing/blame"
 	"github.com/sjawhar/legion/orchestration/landing/gitx"
 )
@@ -33,26 +36,190 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	case "blame":
 		return runBlame(ctx, args[1:], output)
 	case "run", "serve", "status":
-		return runBatchCommand(args[0], args[1:])
+		return runBatchCommand(ctx, args[0], args[1:], output)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-func runBatchCommand(command string, args []string) error {
+func runBatchCommand(ctx context.Context, command string, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	config := flags.String("config", "", "path to the repository configuration")
+	configPath := flags.String("config", "", "path to the repository configuration")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *config == "" {
+	if *configPath == "" {
 		return fmt.Errorf("--config is required")
 	}
-	if _, err := os.ReadFile(*config); err != nil {
-		return fmt.Errorf("read configuration: %w", err)
+	config, err := readConfig(*configPath)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("ledger integration is not configured")
+	runner, input, store, err := config.runner()
+	if err != nil {
+		return err
+	}
+	switch command {
+	case "run":
+		batch, err := runner.Run(ctx, input)
+		if err != nil {
+			return err
+		}
+		return writeJSON(output, batch)
+	case "status":
+		batches, err := store.List(ctx)
+		if err != nil {
+			return err
+		}
+		return writeJSON(output, batches)
+	case "serve":
+		return serve(ctx, runner, input, store, config.Interval, output)
+	default:
+		return fmt.Errorf("unknown batch command %q", command)
+	}
+}
+
+type config struct {
+	BatchID        string           `json:"batchId"`
+	Repository     string           `json:"repository"`
+	RepositoryPath string           `json:"repositoryPath"`
+	Base           string           `json:"base"`
+	BaseBranch     string           `json:"baseBranch"`
+	StatePath      string           `json:"statePath"`
+	Members        []landing.Member `json:"members"`
+	Build          []string         `json:"build"`
+	Checks         []checkConfig    `json:"checks"`
+	Ledger         ledgerConfig     `json:"ledger"`
+	Toolchain      []string         `json:"toolchain"`
+	ModuleRoots    []string         `json:"moduleRoots"`
+	MaxRounds      int              `json:"maxRounds"`
+	InfraRetries   int              `json:"infraRetries"`
+	Interval       time.Duration    `json:"interval"`
+	GitHub         githubConfig     `json:"github"`
+}
+
+type checkConfig struct {
+	Name    string   `json:"name"`
+	Command []string `json:"command"`
+}
+
+type ledgerConfig struct {
+	Check  []string `json:"check"`
+	Land   []string `json:"land"`
+	Return []string `json:"return"`
+}
+
+type githubConfig struct {
+	Remote       string        `json:"remote"`
+	Executable   string        `json:"executable"`
+	PollInterval time.Duration `json:"pollInterval"`
+}
+
+func readConfig(path string) (config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return config{}, fmt.Errorf("open configuration: %w", err)
+	}
+	defer file.Close()
+	var cfg config
+	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
+		return config{}, fmt.Errorf("decode configuration: %w", err)
+	}
+	return cfg, nil
+}
+
+func (c config) runner() (landing.Runner, landing.Input, *landing.JSONStore, error) {
+	if c.BatchID == "" {
+		c.BatchID = "batch"
+	}
+	if c.Repository == "" || c.RepositoryPath == "" || c.Base == "" || c.BaseBranch == "" || c.StatePath == "" {
+		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("repository, repositoryPath, base, baseBranch, and statePath are required")
+	}
+	if len(c.Build) == 0 || len(c.Ledger.Check) == 0 || len(c.Ledger.Land) == 0 || len(c.Ledger.Return) == 0 {
+		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build and every ledger command are required")
+	}
+	store := &landing.JSONStore{Path: c.StatePath}
+	runner := landing.Runner{
+		Store:        store,
+		Ledger:       landing.CommandLedger{Directory: c.RepositoryPath, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return},
+		Builder:      landing.CommandBuilder{RepositoryPath: c.RepositoryPath, Command: c.Build},
+		Hasher:       landing.CommandHasher{RepositoryPath: c.RepositoryPath},
+		Git:          landing.RepositoryGit{Path: c.RepositoryPath},
+		ModuleRoots:  append([]string(nil), c.ModuleRoots...),
+		MaxRounds:    c.MaxRounds,
+		InfraRetries: c.InfraRetries,
+		Toolchain:    commandToolchain(c.RepositoryPath, c.Toolchain),
+	}
+	for _, check := range c.Checks {
+		runner.Checks = append(runner.Checks, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: c.RepositoryPath})
+	}
+	if c.GitHub.Remote != "" || c.GitHub.Executable != "" {
+		runner.GitHub = landing.GitHubCLI{RepositoryPath: c.RepositoryPath, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
+	}
+	return runner, landing.Input{ID: c.BatchID, Repository: c.Repository, Base: c.Base, BaseBranch: c.BaseBranch, Members: c.Members}, store, nil
+}
+
+func commandToolchain(directory string, command []string) func(context.Context) (string, error) {
+	if len(command) == 0 {
+		return nil
+	}
+	return func(ctx context.Context) (string, error) {
+		process := exec.CommandContext(ctx, command[0], command[1:]...)
+		process.Dir = directory
+		output, err := process.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("run toolchain command: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		return string(output), nil
+	}
+}
+
+func serve(ctx context.Context, runner landing.Runner, input landing.Input, store *landing.JSONStore, interval time.Duration, output io.Writer) error {
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	for {
+		batches, err := runner.Reconcile(ctx)
+		if err != nil {
+			return err
+		}
+		if len(batches) == 0 {
+			batch, err := runner.Run(ctx, input)
+			if err != nil {
+				return err
+			}
+			batches = []landing.Batch{batch}
+		}
+		for index := range batches {
+			if batches[index].State == landing.Green && runner.GitHub != nil {
+				batch, err := runner.Publish(ctx, batches[index])
+				if err != nil {
+					return err
+				}
+				batches[index] = batch
+			}
+		}
+		if err := writeJSON(output, batches); err != nil {
+			return err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func writeJSON(output io.Writer, value any) error {
+	if err := json.NewEncoder(output).Encode(value); err != nil {
+		return fmt.Errorf("write output: %w", err)
+	}
+	return nil
 }
 
 func runBlame(ctx context.Context, args []string, output io.Writer) error {

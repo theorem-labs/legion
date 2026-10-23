@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,6 +66,49 @@ func TestBlameCommandExcludesListedMembers(t *testing.T) {
 	}
 	if got := output.String(); got != "" {
 		t.Fatalf("blame output = %q, want excluded member omitted", got)
+	}
+}
+
+func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
+	repo := t.TempDir()
+	command(t, repo, "init", "-q")
+	command(t, repo, "config", "user.email", "test@example.invalid")
+	command(t, repo, "config", "user.name", "Test")
+	write(t, filepath.Join(repo, "Alpha.lean"), "def base := 0\n")
+	command(t, repo, "add", "Alpha.lean")
+	command(t, repo, "commit", "-qm", "base")
+	base := command(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "Alpha.lean"), "def member := 0\n")
+	command(t, repo, "add", "Alpha.lean")
+	command(t, repo, "commit", "-qm", "member")
+	head := command(t, repo, "rev-parse", "HEAD")
+
+	config := filepath.Join(t.TempDir(), "config.json")
+	raw, err := json.Marshal(map[string]any{
+		"repository":     "owner/repo",
+		"repositoryPath": repo,
+		"base":           base,
+		"baseBranch":     "trunk",
+		"statePath":      filepath.Join(t.TempDir(), "state.json"),
+		"members":        []map[string]any{{"migration": "one", "generation": 1, "head": head}},
+		"build":          []string{"sh", "-c", "exit 0"},
+		"ledger": map[string]any{
+			"check":  []string{"sh", "-c", "exit 0"},
+			"return": []string{"sh", "-c", "exit 0"},
+			"land":   []string{"sh", "-c", "exit 0"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, config, string(raw))
+	var output bytes.Buffer
+
+	if err := run(context.Background(), []string{"run", "--config", config}, &output); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if got := output.String(); !strings.Contains(got, `"state":"green"`) {
+		t.Fatalf("run output = %q, want green batch", got)
 	}
 }
 
