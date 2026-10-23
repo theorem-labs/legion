@@ -95,9 +95,9 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 		t.Fatalf("completed item: %+v", completed)
 	}
 
-	invoke("open", "r", "M-1", "alice", "base", "branch", "a.lean")
-	invoke("extend", "r", "M-1", "1", "b.lean")
-	check := invoke("--json", "check", "r", "M-1", "1", "a.lean,b.lean")
+	invoke("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+	invoke("extend", "r", "M-1", "1", "--write", "b.lean")
+	check := invoke("--json", "check", "r", "M-1", "1", "--path", "a.lean", "--path", "b.lean")
 	var checked struct {
 		Pass bool `json:"pass"`
 	}
@@ -137,10 +137,10 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 	if err := json.Unmarshal([]byte(contract), &shown); err != nil || shown.Owner != "bob" {
 		t.Fatalf("transferred contract: %v %+v", err, shown)
 	}
-	invoke("agree", "r", "A-1", "bob", "C=1")
-	invoke("open", "r", "M-2", "bob", "base", "branch", "c.lean", "C=hash-1")
+	invoke("agree", "r", "A-1", "--party", "bob", "--read", "C=1")
+	invoke("open", "r", "M-2", "bob", "base", "branch", "--write", "c.lean", "--read", "C=hash-1")
 	invoke("land", "--repo", "r", "--migration", "M-2", "--generation", "1", "--commit", "commit-1",
-		"--changed-paths", "c.lean", "--current", "C=hash-1", "--changed-contracts", "C=hash-2")
+		"--path", "c.lean", "--current", "C=hash-1", "--changed-contract", "C=hash-2")
 	stale := invoke("--json", "stale", "r")
 	var staleAgreements []struct {
 		ID string `json:"id"`
@@ -246,10 +246,10 @@ func TestCheckRefusalExitsOneWithJSONResult(t *testing.T) {
 	if code, _, stderr := call("repo", "ensure", "r", "0"); code != 0 {
 		t.Fatalf("ensure exit=%d stderr=%s", code, stderr)
 	}
-	if code, _, stderr := call("open", "r", "M-1", "alice", "base", "branch", "owned.lean"); code != 0 {
+	if code, _, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "owned.lean"); code != 0 {
 		t.Fatalf("open exit=%d stderr=%s", code, stderr)
 	}
-	code, stdout, stderr := call("--json", "check", "r", "M-1", "1", "outside.lean")
+	code, stdout, stderr := call("--json", "check", "r", "M-1", "1", "--path", "outside.lean")
 	if code != 1 {
 		t.Fatalf("refused check exit=%d stdout=%s stderr=%s; want 1", code, stdout, stderr)
 	}
@@ -284,11 +284,69 @@ func TestLandReadsJSONRequestFile(t *testing.T) {
 	}
 	invoke("repo", "ensure", "r", "0")
 	invoke("contract", "register", "r", "C", "alice", "hash-1", "false")
-	invoke("open", "r", "M-1", "alice", "base", "branch", "a.lean", "C=hash-1")
+	invoke("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1")
 	request := `{"repo":"r","migration":"M-1","generation":1,"commit":"commit-1","changed_paths":["a.lean"],"current":{"C":"hash-1"},"changed_contracts":{"C":"hash-2"}}`
 	file := filepath.Join(t.TempDir(), "land.json")
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	invoke("land", "--request-file", file)
+}
+
+func TestLandJSONRequestRequiresChangedPaths(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		return run(context.Background(), args, getenv, &out, &err), err.String()
+	}
+	if code, stderr := call("repo", "ensure", "r", "0"); code != 0 {
+		t.Fatalf("ensure: code=%d stderr=%s", code, stderr)
+	}
+	if code, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean"); code != 0 {
+		t.Fatalf("open: code=%d stderr=%s", code, stderr)
+	}
+	file := filepath.Join(t.TempDir(), "land.json")
+	request := `{"repo":"r","migration":"M-1","generation":1,"commit":"commit-1","current":{},"changed_contracts":{}}`
+	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, stderr := call("land", "--request-file", file); code != 2 || !strings.Contains(stderr, "changed paths") {
+		t.Fatalf("missing changed_paths: code=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestRepeatableListFlagsPreserveCommaPaths(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	invoke := func(args ...string) string {
+		t.Helper()
+		var out, err bytes.Buffer
+		if code := run(context.Background(), args, getenv, &out, &err); code != 0 {
+			t.Fatalf("%v exited %d: %s", args, code, err.String())
+		}
+		return out.String()
+	}
+	invoke("repo", "ensure", "r", "0")
+	invoke("open", "r", "M-1", "alice", "base", "branch",
+		"--write", "a,b.lean", "--read", "X=hash")
+	result := invoke("--json", "check", "r", "M-1", "1",
+		"--path", "a,b.lean", "--current", "X=hash")
+	var check struct {
+		Pass bool `json:"pass"`
+	}
+	if err := json.Unmarshal([]byte(result), &check); err != nil || !check.Pass {
+		t.Fatalf("comma path check: %v %q", err, result)
+	}
 }

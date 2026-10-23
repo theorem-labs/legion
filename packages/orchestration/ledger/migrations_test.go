@@ -517,6 +517,16 @@ func TestEventCursorDoesNotSkipAcrossOutOfOrderCommits(t *testing.T) {
 		second <- err
 	}()
 	waitForBlockedConnections(t, observer, 2)
+	inFlight := must(s.Events(ctx, "r", 0, ""))
+	if len(inFlight) < 2 {
+		t.Fatalf("reader while writers blocked saw %+v, want the committed setup events", inFlight)
+	}
+	for _, event := range inFlight {
+		if event.Kind == "migration.taken_over" {
+			t.Fatalf("reader while writers blocked saw an unblocked writer event: %+v", event)
+		}
+	}
+	readerCursor := inFlight[len(inFlight)-1].ID
 
 	if err := block.Commit(ctx); err != nil {
 		t.Fatal(err)
@@ -546,6 +556,13 @@ func TestEventCursorDoesNotSkipAcrossOutOfOrderCommits(t *testing.T) {
 	}
 	if a.ID >= b.ID {
 		t.Fatalf("event IDs are not commit-ordered: A=%d B=%d", a.ID, b.ID)
+	}
+	readerContinuation := must(s.Events(ctx, "r", readerCursor, ""))
+	if len(readerContinuation) != 2 {
+		t.Fatalf("reader continuation after %d: %+v", readerCursor, readerContinuation)
+	}
+	if readerContinuation[0].ID != a.ID || readerContinuation[1].ID != b.ID {
+		t.Fatalf("reader continuation after %d: %+v; want A=%d then B=%d", readerCursor, readerContinuation, a.ID, b.ID)
 	}
 	after := must(s.Events(ctx, "r", a.ID, ""))
 	if len(after) != 1 || after[0].ID != b.ID {

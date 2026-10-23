@@ -171,35 +171,35 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		value, err := s.Item(ctx, args[0], args[1])
 		return value, true, err
 	case "open":
-		if len(args) < 6 || len(args) > 7 {
-			return nil, false, usagef("open <repo> <id> <owner> <base> <branch> <writes> [reads]")
+		if len(args) < 5 {
+			return nil, false, usagef("open <repo> <id> <owner> <base> <branch> --write <path> [--write <path>] [--read <name=hash>]")
 		}
-		writes := list(args[5])
-		reads := map[string]string{}
-		if len(args) == 7 {
-			var err error
-			reads, err = stringMap(args[6], false)
-			if err != nil {
-				return nil, false, err
-			}
+		writes, reads, err := parseWritesAndReads(args[5:])
+		if err != nil {
+			return nil, false, err
 		}
-		return mutation(s.OpenMigration(ctx, ledger.OpenRequest{Repo: args[0], ID: args[1], Owner: args[2], BaseCommit: args[3], Branch: args[4], Writes: writes, Reads: reads}))
+		if len(writes) == 0 {
+			return nil, false, usagef("open needs at least one --write")
+		}
+		return mutation(s.OpenMigration(ctx, ledger.OpenRequest{
+			Repo: args[0], ID: args[1], Owner: args[2], BaseCommit: args[3], Branch: args[4], Writes: writes, Reads: reads,
+		}))
 	case "extend":
-		if len(args) < 4 || len(args) > 5 {
-			return nil, false, usagef("extend <repo> <id> <generation> <writes> [reads]")
+		if len(args) < 3 {
+			return nil, false, usagef("extend <repo> <id> <generation> [--write <path>] [--read <name=hash>]")
 		}
 		generation, err := integer(args[2])
 		if err != nil {
 			return nil, false, err
 		}
-		reads := map[string]string{}
-		if len(args) == 5 {
-			reads, err = stringMap(args[4], false)
-			if err != nil {
-				return nil, false, err
-			}
+		writes, reads, err := parseWritesAndReads(args[3:])
+		if err != nil {
+			return nil, false, err
 		}
-		return mutation(s.ExtendMigration(ctx, args[0], args[1], generation, list(args[3]), reads))
+		if len(writes) == 0 && len(reads) == 0 {
+			return nil, false, usagef("extend needs --write or --read")
+		}
+		return mutation(s.ExtendMigration(ctx, args[0], args[1], generation, writes, reads))
 	case "takeover":
 		if len(args) != 4 {
 			return nil, false, usagef("takeover <repo> <id> <owner> <generation>")
@@ -210,21 +210,18 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		return mutation(s.TakeOver(ctx, args[0], args[1], args[2], generation))
 	case "check":
-		if len(args) < 4 || len(args) > 5 {
-			return nil, true, usagef("check <repo> <id> <generation> <changed> [current]")
+		if len(args) < 3 {
+			return nil, true, usagef("check <repo> <id> <generation> [--path <path>] [--current <name=hash>]")
 		}
 		generation, err := integer(args[2])
 		if err != nil {
 			return nil, true, err
 		}
-		current := map[string]string{}
-		if len(args) == 5 {
-			current, err = stringMap(args[4], true)
-			if err != nil {
-				return nil, true, err
-			}
+		paths, current, err := parsePathsAndCurrent(args[3:])
+		if err != nil {
+			return nil, true, err
 		}
-		value, err := s.Check(ctx, ledger.CheckRequest{Repo: args[0], ID: args[1], Generation: generation, Changed: list(args[3]), Current: current})
+		value, err := s.Check(ctx, ledger.CheckRequest{Repo: args[0], ID: args[1], Generation: generation, Changed: paths, Current: current})
 		if err != nil {
 			return value, true, err
 		}
@@ -259,14 +256,17 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 	case "contract":
 		return contractCommand(ctx, s, args)
 	case "agree":
-		if len(args) != 4 {
-			return nil, false, usagef("agree <repo> <id> <parties> <reads>")
+		if len(args) < 2 {
+			return nil, false, usagef("agree <repo> <id> --party <party> [--party <party>] --read <contract=version>")
 		}
-		reads, err := versionMap(args[3])
+		parties, reads, err := parseAgreement(args[2:])
 		if err != nil {
 			return nil, false, err
 		}
-		return mutation(s.RecordAgreement(ctx, args[0], args[1], list(args[2]), reads))
+		if len(parties) == 0 {
+			return nil, false, usagef("agree needs at least one --party")
+		}
+		return mutation(s.RecordAgreement(ctx, args[0], args[1], parties, reads))
 	case "stale":
 		if len(args) != 1 {
 			return nil, true, usagef("stale <repo>")
@@ -368,40 +368,91 @@ func duration(value string) (time.Duration, error) {
 	}
 	return d, nil
 }
-func list(value string) []string {
-	if value == "" {
-		return nil
+func parsePair(value string, allowEmpty bool) (string, string, error) {
+	name, content, ok := strings.Cut(value, "=")
+	if !ok || name == "" || (!allowEmpty && content == "") {
+		return "", "", usagef("invalid name=value %q", value)
 	}
-	return strings.Split(value, ",")
+	return name, content, nil
 }
-func stringMap(value string, allowEmpty bool) (map[string]string, error) {
-	out := map[string]string{}
-	if value == "" {
-		return out, nil
-	}
-	for _, pair := range strings.Split(value, ",") {
-		name, content, ok := strings.Cut(pair, "=")
-		if !ok || name == "" || (!allowEmpty && content == "") {
-			return nil, usagef("invalid name=value list %q", value)
+
+func parseWritesAndReads(args []string) ([]string, map[string]string, error) {
+	writes := []string{}
+	reads := map[string]string{}
+	for len(args) > 0 {
+		if len(args) < 2 {
+			return nil, nil, usagef("list flags need values")
 		}
-		out[name] = content
+		flag, value := args[0], args[1]
+		args = args[2:]
+		switch flag {
+		case "--write":
+			writes = append(writes, value)
+		case "--read":
+			name, hash, err := parsePair(value, false)
+			if err != nil {
+				return nil, nil, err
+			}
+			reads[name] = hash
+		default:
+			return nil, nil, usagef("unknown list flag %q", flag)
+		}
 	}
-	return out, nil
+	return writes, reads, nil
 }
-func versionMap(value string) (map[string]int64, error) {
-	values, err := stringMap(value, false)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]int64, len(values))
-	for name, text := range values {
-		version, err := integer(text)
-		if err != nil {
-			return nil, err
+
+func parsePathsAndCurrent(args []string) ([]string, map[string]string, error) {
+	paths := []string{}
+	current := map[string]string{}
+	for len(args) > 0 {
+		if len(args) < 2 {
+			return nil, nil, usagef("list flags need values")
 		}
-		out[name] = version
+		flag, value := args[0], args[1]
+		args = args[2:]
+		switch flag {
+		case "--path":
+			paths = append(paths, value)
+		case "--current":
+			name, hash, err := parsePair(value, true)
+			if err != nil {
+				return nil, nil, err
+			}
+			current[name] = hash
+		default:
+			return nil, nil, usagef("unknown list flag %q", flag)
+		}
 	}
-	return out, nil
+	return paths, current, nil
+}
+
+func parseAgreement(args []string) ([]string, map[string]int64, error) {
+	parties := []string{}
+	reads := map[string]int64{}
+	for len(args) > 0 {
+		if len(args) < 2 {
+			return nil, nil, usagef("list flags need values")
+		}
+		flag, value := args[0], args[1]
+		args = args[2:]
+		switch flag {
+		case "--party":
+			parties = append(parties, value)
+		case "--read":
+			name, versionText, err := parsePair(value, false)
+			if err != nil {
+				return nil, nil, err
+			}
+			version, err := integer(versionText)
+			if err != nil {
+				return nil, nil, err
+			}
+			reads[name] = version
+		default:
+			return nil, nil, usagef("unknown list flag %q", flag)
+		}
+	}
+	return parties, reads, nil
 }
 
 func mutation[T any](value T, err error) (any, bool, error) { return value, false, err }
@@ -419,10 +470,10 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 		return request, nil
 	}
 	request := ledger.LandRequest{
+		ChangedPaths:     []string{},
 		Current:          map[string]string{},
 		ChangedContracts: map[string]string{},
 	}
-	var hasPaths, hasCurrent bool
 	for len(args) > 0 {
 		if len(args) < 2 {
 			return ledger.LandRequest{}, usagef("land flags need values")
@@ -442,30 +493,28 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 			request.Generation = generation
 		case "--commit":
 			request.Commit = value
-		case "--changed-paths":
-			request.ChangedPaths = list(value)
-			hasPaths = true
+		case "--path":
+			request.ChangedPaths = append(request.ChangedPaths, value)
 		case "--current":
-			current, err := stringMap(value, true)
+			name, hash, err := parsePair(value, true)
 			if err != nil {
 				return ledger.LandRequest{}, err
 			}
-			request.Current = current
-			hasCurrent = true
-		case "--changed-contracts":
-			contracts, err := stringMap(value, false)
+			request.Current[name] = hash
+		case "--changed-contract":
+			name, hash, err := parsePair(value, false)
 			if err != nil {
 				return ledger.LandRequest{}, err
 			}
-			request.ChangedContracts = contracts
+			request.ChangedContracts[name] = hash
 		case "--approved-pinned":
-			request.ApprovedPinned = list(value)
+			request.ApprovedPinned = append(request.ApprovedPinned, value)
 		default:
 			return ledger.LandRequest{}, usagef("unknown land flag %q", flag)
 		}
 	}
-	if request.Repo == "" || request.Migration == "" || request.Commit == "" || !hasPaths || !hasCurrent {
-		return ledger.LandRequest{}, usagef("land needs --repo, --migration, --commit, --changed-paths and --current")
+	if request.Repo == "" || request.Migration == "" || request.Commit == "" {
+		return ledger.LandRequest{}, usagef("land needs --repo, --migration and --commit")
 	}
 	return request, nil
 }

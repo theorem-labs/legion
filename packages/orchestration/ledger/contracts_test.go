@@ -373,3 +373,46 @@ func TestLandRejectsInvalidCurrentHashForRegisteredRead(t *testing.T) {
 		})
 	}
 }
+
+func TestLandRequiresChangedPathsPresenceAndConsistency(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	missing := must(open(t, s, "M-missing", "alice", []string{"a.lean"}, nil))
+	_, err := s.Land(ctx, ledger.LandRequest{
+		Repo:       "r",
+		Migration:  missing.ID,
+		Generation: missing.Generation,
+		Commit:     "missing-commit",
+		Current:    map[string]string{},
+	})
+	var invalid *ledger.InvalidError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("missing changed paths: want invalid, got %v", err)
+	}
+	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
+	changed := must(open(t, s, "M-changed", "alice", []string{"b.lean"}, map[string]string{"C": "hash-1"}))
+	_, err = s.Land(ctx, ledger.LandRequest{
+		Repo:             "r",
+		Migration:        changed.ID,
+		Generation:       changed.Generation,
+		Commit:           "changed-commit",
+		ChangedPaths:     []string{},
+		Current:          map[string]string{"C": "hash-1"},
+		ChangedContracts: map[string]string{"C": "hash-2"},
+	})
+	if !errors.As(err, &invalid) {
+		t.Fatalf("empty changed paths with changed contract: want invalid, got %v", err)
+	}
+	empty := must(open(t, s, "M-empty", "alice", []string{"c.lean"}, nil))
+	landed := must(s.Land(ctx, ledger.LandRequest{
+		Repo:         "r",
+		Migration:    empty.ID,
+		Generation:   empty.Generation,
+		Commit:       "empty-commit",
+		ChangedPaths: []string{},
+		Current:      map[string]string{},
+	}))
+	if landed.State != ledger.StateLanded {
+		t.Fatalf("empty candidate did not land: %+v", landed)
+	}
+}

@@ -299,6 +299,12 @@ func contractReadsAtVersions(ctx context.Context, tx pgx.Tx, repo string, migrat
 // Land validates a complete candidate, advances its changed contracts, makes dependent agreements stale, and closes
 // the migration at the supplied commit. It holds the repository, migration and contract locks through every step.
 func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
+	if req.ChangedPaths == nil {
+		return Migration{}, invalid("missing changed paths")
+	}
+	if len(req.ChangedPaths) == 0 && len(req.ChangedContracts) > 0 {
+		return Migration{}, invalid("changed contracts need at least one changed path")
+	}
 	if strings.TrimSpace(req.Commit) == "" {
 		return Migration{}, invalid("empty landed commit")
 	}

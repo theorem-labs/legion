@@ -159,6 +159,64 @@ func TestExpireSweepsOnlyExpiredLeases(t *testing.T) {
 	}
 }
 
+func TestStatusReadsLeaseAndMigrationFromOneSnapshot(t *testing.T) {
+	s, dsn := newStoreDSN(t)
+	ctx := context.Background()
+	must(s.Claim(ctx, "r", "item", "alice", time.Hour))
+	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+
+	locker := must(pgx.Connect(ctx, dsn))
+	defer locker.Close(ctx)
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	lock := must(locker.Begin(ctx))
+	locked := true
+	defer func() {
+		if locked {
+			_ = lock.Rollback(ctx)
+		}
+	}()
+	must(lock.Exec(ctx, `LOCK TABLE migration_writes IN ACCESS EXCLUSIVE MODE`))
+
+	statuses := make(chan struct {
+		status ledger.Status
+		err    error
+	}, 1)
+	go func() {
+		status, err := s.Status(ctx, "r")
+		statuses <- struct {
+			status ledger.Status
+			err    error
+		}{status, err}
+	}()
+	waitForBlockedConnections(t, observer, 1)
+
+	changer := must(pgx.Connect(ctx, dsn))
+	defer changer.Close(ctx)
+	change := must(changer.Begin(ctx))
+	must(change.Exec(ctx, `UPDATE work_items SET holder = NULL, lease_expires_at = NULL WHERE repo = $1 AND id = $2`, "r", "item"))
+	must(change.Exec(ctx, `UPDATE migrations SET state = 'abandoned', closed_at = clock_timestamp(), close_reason = 'sweep'
+		WHERE repo = $1 AND id = $2`, "r", "M-1"))
+	if err := change.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+
+	got := <-statuses
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	before := len(got.status.Leases) == 1 && got.status.Leases[0].ID == "item" &&
+		len(got.status.Migrations) == 1 && got.status.Migrations[0].ID == "M-1"
+	after := len(got.status.Leases) == 0 && len(got.status.Migrations) == 0
+	if !before && !after {
+		t.Fatalf("torn status snapshot: %+v", got.status)
+	}
+}
+
 func TestExpireLocksThenRechecksLeaseLiveness(t *testing.T) {
 	tests := []struct {
 		name string
