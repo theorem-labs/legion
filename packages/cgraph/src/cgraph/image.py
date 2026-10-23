@@ -42,6 +42,10 @@ _OFFSET_LIMIT = 1 << 24
 _SPLIT_OFFSET = 1024
 # Displacements a single load or store can reach; a sum beyond them comes from a split offset.
 _DISPLACEMENT_REACH = 2048
+# What a call passes and a function returns where the C does not say: every argument register, and
+# a0 and a1.
+_DEFAULT_ARGUMENTS = 8
+_DEFAULT_RESULTS = 2
 
 
 @dataclass
@@ -234,15 +238,33 @@ class FunctionFacts:
     exclusions: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts:
+_RECORD_FIELDS = ("calls", "globals", "function_addresses", "outside", "exclusions")
+_NUMBER_FIELDS = ("memory_offsets", "addi_constants")
+
+
+def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts | None:
+    """The facts a cache entry holds, or None when it does not have their shape."""
+    if set(value) != {*_RECORD_FIELDS, *_NUMBER_FIELDS}:
+        return None
+    records = [value[name] for name in _RECORD_FIELDS]
+    numbers = [value[name] for name in _NUMBER_FIELDS]
+    if not all(isinstance(items, list) and all(isinstance(item, dict) for item in items) for items in records):
+        return None
+    if not all(
+        isinstance(items, list) and all(isinstance(item, int) and not isinstance(item, bool) for item in items)
+        for items in numbers
+    ):
+        return None
+    calls, globals_, function_addresses, outside, exclusions = records
+    memory_offsets, addi_constants = numbers
     return FunctionFacts(
-        calls=value["calls"],
-        globals=value["globals"],
-        function_addresses=value["function_addresses"],
-        outside=value["outside"],
-        memory_offsets=set(value["memory_offsets"]),
-        addi_constants=set(value["addi_constants"]),
-        exclusions=value.get("exclusions", []),
+        calls=calls,
+        globals=globals_,
+        function_addresses=function_addresses,
+        outside=outside,
+        memory_offsets=set(memory_offsets),
+        addi_constants=set(addi_constants),
+        exclusions=exclusions,
     )
 
 
@@ -328,7 +350,7 @@ class Image:
         self.section_data: dict[str, bytes] = {}
         # The number of parameters of each function the C defines, for the argument registers a
         # call passes, and the registers it returns in; set by the caller before facts are read.
-        # Where unknown: eight arguments, two result registers.
+        # Where unknown: _DEFAULT_ARGUMENTS arguments, _DEFAULT_RESULTS result registers.
         self.arity: dict[str, int] = {}
         self.results: dict[str, int] = {}
         self.image_cache = ImageCache(cache_directory, image, system_map, rules, Path(__file__))
@@ -425,15 +447,24 @@ class Image:
         cached = self.cache.get(symbol.address)
         if cached is not None:
             return cached
-        payload = self.image_cache.load(symbol.name, symbol.address, symbol.size, self.arity, self.results)
-        if payload is not None:
-            self.cache[symbol.address] = _facts_from_cache(payload)
-            return self.cache[symbol.address]
         facts = FunctionFacts()
         self.cache[symbol.address] = facts
         section = self.section_of(symbol.address)
         if section is None or not section[3]:
             return facts
+        symbol_key = ""
+        if self.image_cache.enabled:
+            symbol_key = self.image_cache.symbol_key(symbol.name, symbol.address, symbol.size)
+            callees = self.image_cache.callees(symbol_key)
+            if callees is not None:
+                facts_key = self._facts_key(symbol_key, symbol.name, callees)
+                payload = self.image_cache.load(facts_key)
+                if payload is not None:
+                    loaded = _facts_from_cache(payload)
+                    if loaded is None:
+                        raise self.image_cache.malformed(facts_key)
+                    self.cache[symbol.address] = loaded
+                    return loaded
         data = self.section_data.get(section[2])
         if data is None:
             elf_section = self.elf.get_section_by_name(section[2])
@@ -441,25 +472,48 @@ class Image:
             self.section_data[section[2]] = data
         start = symbol.address - section[0]
         code = data[start : start + max(0, self._end(symbol) - symbol.address)]
-        self.cache[symbol.address] = self.decode(symbol.name, code, symbol.address)
-        self.image_cache.store(
-            symbol.name,
-            symbol.address,
-            symbol.size,
-            self.arity,
-            self.results,
-            _facts_for_cache(self.cache[symbol.address]),
+        instructions = list(self.decoder.disasm(code, symbol.address))
+        facts = self._decode(symbol.name, instructions)
+        self.cache[symbol.address] = facts
+        if self.image_cache.enabled:
+            callees = self._direct_callees(instructions)
+            self.image_cache.store_callees(symbol_key, callees)
+            self.image_cache.store(self._facts_key(symbol_key, symbol.name, callees), _facts_for_cache(facts))
+        return facts
+
+    def _facts_key(self, symbol_key: str, name: str, callees: list[str]) -> str:
+        """The key of a function's facts: the only C facts its decoding reads are its own result
+        registers and the parameter counts of the functions it calls or jumps to directly."""
+        return self.image_cache.facts_key(
+            symbol_key,
+            self.results.get(name, _DEFAULT_RESULTS),
+            {callee: self.arity.get(callee, _DEFAULT_ARGUMENTS) for callee in callees},
         )
-        return self.cache[symbol.address]
+
+    def _direct_callees(self, instructions: list[Any]) -> list[str]:
+        """The text functions ``_arguments`` may read the arity of: every direct jump target."""
+        return sorted(
+            {
+                name
+                for instruction in instructions
+                if instruction.mnemonic in _DIRECT_CALLS
+                for operands in [list(instruction.operands)]
+                if operands and operands[-1].type == CS_OP_IMM
+                for name in [self.text_at.get((instruction.address + operands[-1].imm) & _MASK)]
+                if name is not None
+            }
+        )
 
     def decode(self, name: str, code: bytes, address: int) -> FunctionFacts:
         """The facts of a function's machine code that starts at ``address``."""
+        return self._decode(name, list(self.decoder.disasm(code, address)))
+
+    def _decode(self, name: str, instructions: list[Any]) -> FunctionFacts:
         facts = FunctionFacts()
-        instructions = list(self.decoder.disasm(code, address))
         successors = _flow(self.decoder, instructions)
         states = self._block_states(instructions, successors)
         before = dict(states)
-        returned = {f"a{position}" for position in range(self.results.get(name, 2))}
+        returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
         for index, state in states:
             instruction = instructions[index]
             escapes = instruction.mnemonic not in _ADDI or self._escapes(
@@ -470,11 +524,11 @@ class Image:
 
     def _arguments(self, instruction: Any, operands: list[Any]) -> set[str]:
         """The argument registers a call or a tail jump passes: as many as the callee's C takes."""
-        count = 8
-        if instruction.mnemonic in {"jal", "c.jal", "j", "c.j"} and operands and operands[-1].type == CS_OP_IMM:
+        count = _DEFAULT_ARGUMENTS
+        if instruction.mnemonic in _DIRECT_CALLS and operands and operands[-1].type == CS_OP_IMM:
             callee = self.text_at.get((instruction.address + operands[-1].imm) & _MASK)
             if callee is not None:
-                count = self.arity.get(callee, 8)
+                count = self.arity.get(callee, _DEFAULT_ARGUMENTS)
         return {f"a{position}" for position in range(count)}
 
     def _escapes(

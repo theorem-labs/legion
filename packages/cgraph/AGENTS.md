@@ -24,6 +24,7 @@ CI runs the same steps in the `cgraph` job of `.github/workflows/pr-and-main.yam
 | `src/cgraph/clangfacts.py`, `libclang.py` | One translation unit to JSON facts; the libclang C calls the binding lacks. |
 | `src/cgraph/cache.py` | Per-unit facts keyed by the hash of the code, the vocabulary, the arguments and every included file. |
 | `src/cgraph/image.py` | ELF symbols, System.map and capstone: calls, data addresses, offsets. |
+| `src/cgraph/imagecache.py` | Per-function image facts keyed by the image inputs, the symbol, and the only C facts decoding reads (own result registers, direct callees' parameter counts). |
 | `src/cgraph/contracts.py` | The contract graph (functions, callback tables, interfaces). |
 | `src/cgraph/link.py`, `structure.py` | Folding, ids, nodes and edges; structure links and subsystems. |
 | `src/cgraph/checks.py`, `owners.py`, `measures.py`, `report.py` | Layer and hard checks, owners and topics, numbers, the Markdown report. |

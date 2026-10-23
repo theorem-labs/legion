@@ -95,6 +95,13 @@ arguments and the contents of every file it included. A later build parses only 
 changed, so after a landing it parses the changed files (and every unit including a changed header)
 and gives the same bytes as a full build.
 
+The same directory keeps each image function's decoded facts under `image/`. An entry's key covers
+the image, `System.map`, the `[image]` table, the decoder's source and the capstone and pyelftools
+versions, the function's symbol, its own result registers, and the parameter count of each function
+it calls or jumps to directly: the only C facts its decoding reads. A change to another function's
+signature leaves the entry in use. An entry that cannot be read or is malformed stops the run with
+exit status 3 and names the cache directory to remove.
+
 ## Configuration
 
 ```toml

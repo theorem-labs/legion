@@ -13,6 +13,7 @@ import pytest
 from conftest import FIXTURE, build, read
 
 from cgraph import cli, pipeline
+from cgraph import image as image_module
 
 OUTPUTS = (
     "graph.json",
@@ -256,6 +257,55 @@ def test_manifest_entry_without_includes_refuses_without_changing_existing_outpu
     manifest_path.write_text(json.dumps(manifest))
 
     assert cli_build(copy, out, cache) == 3
+    assert output_bytes(out) == before
+
+
+class _RefusingDisassembler:
+    detail = True
+
+    def __init__(self, *_arguments: object) -> None:
+        pass
+
+    def disasm(self, *_arguments: object) -> list[object]:
+        raise AssertionError("a warm image cache disassembles nothing")
+
+
+def test_warm_image_cache_gives_the_bytes_of_a_cold_build_without_decoding(
+    copy: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache"
+    build(copy, "both", tmp_path / "uncached")
+    build(copy, "both", tmp_path / "cold", cache)
+    assert sorted((cache / "image").glob("*.json")) and sorted((cache / "image" / "callees").glob("*.json"))
+    monkeypatch.setattr(image_module, "Cs", _RefusingDisassembler)
+    warm = build(copy, "both", tmp_path / "warm", cache)
+    assert warm.parsed == []
+    assert stable_output_bytes(tmp_path / "warm") == stable_output_bytes(tmp_path / "cold")
+    assert stable_output_bytes(tmp_path / "cold") == stable_output_bytes(tmp_path / "uncached")
+
+
+@pytest.mark.parametrize(
+    ("entries", "contents"),
+    [("facts", "{"), ("facts", '{"calls": 1}'), ("callees", "{"), ("callees", '{"callees": [1]}')],
+)
+def test_corrupt_image_cache_entry_refuses_without_changing_existing_outputs(
+    copy: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], entries: str, contents: str
+) -> None:
+    cache, out = tmp_path / "cache", tmp_path / "out"
+    assert cli_build(copy, out, cache) == 0
+    before = output_bytes(out)
+    directory = cache / "image" / "callees" if entries == "callees" else cache / "image"
+    paths = sorted(directory.glob("*.json"))
+    assert paths
+    for path in paths:
+        path.write_text(contents)
+    capsys.readouterr()
+
+    assert cli_build(copy, out, cache) == 3
+
+    error = capsys.readouterr().err
+    assert "image cache" in error and "remove the cache directory" in error
+    assert "internal error" not in error
     assert output_bytes(out) == before
 
 

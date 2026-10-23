@@ -36,33 +36,87 @@ def test_malformed_elf_is_an_input_error(tmp_path: Path) -> None:
         Image(image_path, system_map, config.ImageRules())
 
 
-def test_image_cache_reuses_every_function_without_decoding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+class _RefusingDisassembler:
+    """A decoder whose use fails the test: a warm image cache must not disassemble anything."""
+
+    detail = True
+
+    def disasm(self, *_arguments: object) -> list[object]:
+        raise AssertionError("warm image facts must be read from the cache")
+
+
+def _all_facts(image: Image) -> dict[tuple[str, int], FunctionFacts]:
+    return {
+        (symbol.name, symbol.address): image.facts(symbol) for copies in image.functions.values() for symbol in copies
+    }
+
+
+def _cache_bytes(cache: Path) -> dict[str, bytes]:
+    images = cache / "image"
+    return {str(path.relative_to(images)): path.read_bytes() for path in sorted(images.rglob("*.json"))}
+
+
+def test_image_cache_reuses_every_function_without_decoding(tmp_path: Path) -> None:
     loaded = config.load(FIXTURE / "cgraph.toml")
     cache = tmp_path / "cache"
     cold = Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image, cache)
     try:
-        expected = {
-            (symbol.name, symbol.address): cold.facts(symbol) for copies in cold.functions.values() for symbol in copies
-        }
+        expected = _all_facts(cold)
     finally:
         cold.close()
-    image_cache = cache / "image"
-    cold_bytes = {path.name: path.read_bytes() for path in sorted(image_cache.glob("*.json"))}
-    assert cold_bytes
+    cold_bytes = _cache_bytes(cache)
+    assert any(name.startswith("callees/") for name in cold_bytes)
+    assert any("/" not in name for name in cold_bytes)
 
     warm = Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image, cache)
     try:
-
-        def fail_decode(*_arguments: object) -> FunctionFacts:
-            raise AssertionError("warm image facts must be read from the cache")
-
-        monkeypatch.setattr(warm, "decode", fail_decode)
-        assert {
-            (symbol.name, symbol.address): warm.facts(symbol) for copies in warm.functions.values() for symbol in copies
-        } == expected
+        warm.decoder = _RefusingDisassembler()
+        assert _all_facts(warm) == expected
     finally:
         warm.close()
-    assert {path.name: path.read_bytes() for path in sorted(image_cache.glob("*.json"))} == cold_bytes
+    assert _cache_bytes(cache) == cold_bytes
+
+
+def _decodes(
+    cache: Path, name: str, arity: dict[str, int], results: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> int:
+    """How many functions ``Image.facts`` disassembles for ``name`` with these C signatures."""
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    image = Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image, cache)
+    count = 0
+    disassemble = image.decoder.disasm
+
+    def counting(*arguments: object) -> object:
+        nonlocal count
+        count += 1
+        return disassemble(*arguments)
+
+    monkeypatch.setattr(image.decoder, "disasm", counting)
+    image.arity, image.results = arity, results
+    try:
+        (symbol,) = image.functions[name]
+        image.facts(symbol)
+    finally:
+        image.close()
+    return count
+
+
+def test_image_cache_keys_a_function_on_its_own_results_and_its_direct_callees_arity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """bag_count calls walk and run_get directly: their arity decides which argument registers a call
+    passes, so it decides bag_count's facts. obj_free's arity and box_new's results do not."""
+    cache = tmp_path / "cache"
+    arity = {"walk": 2, "run_get": 1, "obj_free": 1}
+    results = {"bag_count": 1, "box_new": 1}
+    assert _decodes(cache, "bag_count", arity, results, monkeypatch) == 1
+    assert _decodes(cache, "bag_count", arity, results, monkeypatch) == 0
+    assert _decodes(cache, "bag_count", {**arity, "obj_free": 3}, {**results, "box_new": 2}, monkeypatch) == 0
+    assert _decodes(cache, "bag_count", {**arity, "walk": 3}, results, monkeypatch) == 1
+    assert _decodes(cache, "bag_count", arity, {**results, "bag_count": 0}, monkeypatch) == 1
+    # A function C does not describe takes the defaults: eight arguments and two result registers.
+    assert _decodes(cache, "bag_count", {**arity, "walk": 8}, {**results, "bag_count": 2}, monkeypatch) == 1
+    assert _decodes(cache, "bag_count", {"run_get": 1}, {}, monkeypatch) == 0
 
 
 def test_image_cache_key_covers_each_decoder_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -80,12 +134,11 @@ def test_image_cache_key_covers_each_decoder_input(tmp_path: Path, monkeypatch: 
         name: str = "function",
         address: int = 1,
         size: int = 2,
-        arity: dict[str, int] | None = None,
-        results: dict[str, int] | None = None,
+        results: int = 1,
+        arities: dict[str, int] | None = None,
     ) -> str:
-        return ImageCache(tmp_path / "cache", image, map_path, rules, decoder_source).key(
-            name, address, size, arity or {"function": 1}, results or {"function": 1}
-        )
+        cache = ImageCache(tmp_path / "cache", image, map_path, rules, decoder_source)
+        return cache.facts_key(cache.symbol_key(name, address, size), results, arities or {"callee": 1})
 
     changed_image = tmp_path / "image"
     changed_image.write_bytes(image_path.read_bytes() + b"changed")
@@ -102,19 +155,24 @@ def test_image_cache_key_covers_each_decoder_input(tmp_path: Path, monkeypatch: 
         key(name="other"),
         key(address=2),
         key(size=3),
-        key(arity={"function": 2}),
-        key(results={"function": 2}),
+        key(results=2),
+        key(arities={"callee": 2}),
+        key(arities={"other": 1}),
     }
     monkeypatch.setattr(imagecache.capstone, "__version__", "changed")
     keys.add(key())
-    assert len(keys) == 11
+    monkeypatch.undo()
+    monkeypatch.setattr(imagecache.elftools, "__version__", "changed")
+    keys.add(key())
+    assert len(keys) == 13
 
 
 def test_disabled_image_cache_does_not_read_inputs(tmp_path: Path) -> None:
     cache = ImageCache(
         None, tmp_path / "missing-image", tmp_path / "missing-map", config.ImageRules(), tmp_path / "missing-source"
     )
-    assert cache.load("function", 1, 2, {}, {}) is None
+    assert not cache.enabled
+    assert cache.callees("function") is None
 
 
 def globals_of(image: Image, name: str) -> set[str]:
