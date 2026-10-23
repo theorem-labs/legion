@@ -3,6 +3,7 @@ package replay
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -53,8 +54,16 @@ func Load(path string) (Manifest, error) {
 	defer file.Close()
 
 	var manifest Manifest
-	if err := json.NewDecoder(file).Decode(&manifest); err != nil {
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&manifest); err != nil {
 		return Manifest{}, fmt.Errorf("decode manifest: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return Manifest{}, fmt.Errorf("decode manifest: unexpected trailing JSON value")
+		}
+		return Manifest{}, fmt.Errorf("decode manifest trailing data: %w", err)
 	}
 	if err := manifest.validate(filepath.Dir(path)); err != nil {
 		return Manifest{}, err
@@ -63,6 +72,10 @@ func Load(path string) (Manifest, error) {
 }
 
 func (m Manifest) validate(dir string) error {
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return fmt.Errorf("resolve manifest directory: %w", err)
+	}
 	if m.Format != Format {
 		return fmt.Errorf("manifest format %q, want %q", m.Format, Format)
 	}
@@ -95,12 +108,37 @@ func (m Manifest) validate(dir string) error {
 				return fmt.Errorf("manifest build round %d records a kick for unknown member %q", round.Round, kick.Member)
 			}
 		}
-		log := filepath.Clean(round.Log)
-		if filepath.IsAbs(round.Log) || log == "." || log == ".." || strings.HasPrefix(log, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("manifest build round %d log %q is not relative to the manifest", round.Round, round.Log)
-		}
-		if _, err := os.Stat(filepath.Join(dir, log)); err != nil {
+		if err := validateLog(root, round.Log); err != nil {
 			return fmt.Errorf("manifest build round %d log %q: %w", round.Round, round.Log, err)
+		}
+	}
+	return nil
+}
+
+func validateLog(root, log string) error {
+	log = filepath.Clean(log)
+	if filepath.IsAbs(log) || log == "." || log == ".." || strings.HasPrefix(log, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("is not relative to the manifest")
+	}
+	parts := strings.Split(log, string(filepath.Separator))
+	current := root
+	for i, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("contains a symbolic link")
+		}
+		if i < len(parts)-1 {
+			if !info.IsDir() {
+				return fmt.Errorf("has a non-directory path component")
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("is not a regular file")
 		}
 	}
 	return nil
