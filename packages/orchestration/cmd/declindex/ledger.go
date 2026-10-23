@@ -8,8 +8,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/declindex"
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
@@ -39,9 +42,28 @@ func (l *contractsFileLedger) RegisterContract(_ context.Context, _ string, name
 }
 
 type ledgerCommandReport struct {
-	Commit    string                 `json:"commit"`
-	Contracts declindex.LedgerReport `json:"contracts"`
-	Registry  any                    `json:"registry"`
+	Commit    string                        `json:"commit"`
+	Contracts declindex.LedgerReport        `json:"contracts"`
+	Registry  *ledgerRegistryCommandReport `json:"registry"`
+}
+
+type ledgerRegistryCommandReport struct {
+	Added   []string                  `json:"added"`
+	Defects []conceptgate.Defect      `json:"defects"`
+	Near    []conceptgate.RecheckNear `json:"near"`
+	Unable  string                    `json:"unable"`
+}
+
+func newLedgerRegistryCommandReport() *ledgerRegistryCommandReport {
+	return &ledgerRegistryCommandReport{
+		Added:   []string{},
+		Defects: []conceptgate.Defect{},
+		Near:    []conceptgate.RecheckNear{},
+	}
+}
+
+func (r *ledgerRegistryCommandReport) Defective() bool {
+	return len(r.Defects) != 0 || len(r.Near) != 0
 }
 
 // cmdLedger runs after a landing. With a contracts file, it emits the registrations that the landing program
@@ -143,15 +165,107 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 			return fail(e.stderr, &unableError{err})
 		}
 	}
-	if c := e.printJSON(ledgerCommandReport{Commit: r.Commit, Contracts: r, Registry: nil}); c != 0 {
+	registry := recheckLedgerRegistry(ctx, e, r.Commit)
+	if c := e.printJSON(ledgerCommandReport{Commit: r.Commit, Contracts: r, Registry: registry}); c != 0 {
 		return c
 	}
-	fmt.Fprintf(e.stderr, "declindex ledger at %s: %d contracts, %d registered, %d defects, %d gone, %d unowned, %d ambiguous; registry: 0 added, 0 near, 0 defects\n",
-		r.Commit, r.Contracts, len(r.Registered), len(r.Defects), len(r.Gone), len(r.Unowned), len(r.Ambiguous))
-	if r.Defective() {
+	if registry != nil && registry.Unable != "" {
+		fmt.Fprintf(e.stderr, "declindex: registry recheck unavailable: %s\n", registry.Unable)
+	}
+	added, near, defects := 0, 0, 0
+	if registry != nil {
+		added, near, defects = len(registry.Added), len(registry.Near), len(registry.Defects)
+	}
+	fmt.Fprintf(e.stderr, "declindex ledger at %s: %d contracts, %d registered, %d defects, %d gone, %d unowned, %d ambiguous; registry: %d added, %d near, %d defects\n",
+		r.Commit, r.Contracts, len(r.Registered), len(r.Defects), len(r.Gone), len(r.Unowned), len(r.Ambiguous), added, near, defects)
+	if r.Defective() || registry != nil && registry.Defective() {
 		return 1
 	}
+	if registry != nil && registry.Unable != "" {
+		return 3
+	}
 	return 0
+}
+
+func recheckLedgerRegistry(ctx context.Context, e *env, commit string) *ledgerRegistryCommandReport {
+	if e.cfg.Registry == "" {
+		return nil
+	}
+	report := newLedgerRegistryCommandReport()
+	registry, err := e.cfg.GateRegistryDir()
+	if err != nil {
+		report.Unable = err.Error()
+		return report
+	}
+	previous, err := e.store.Meta(ctx, "prev_commit")
+	if err != nil {
+		report.Unable = fmt.Sprintf("read prev_commit: %v", err)
+		return report
+	}
+	added, err := addedRegistryConcepts(ctx, e.cfg.Tree, registry, previous, commit)
+	if err != nil {
+		report.Unable = err.Error()
+		return report
+	}
+	report.Added = added
+	reg, defects, err := conceptgate.Load(registry)
+	if err != nil {
+		report.Unable = fmt.Sprintf("load registry: %v", err)
+		return report
+	}
+	report.Defects = append(report.Defects, defects...)
+	if len(added) == 0 {
+		return report
+	}
+	recheckEnv := *e
+	recheckEnv.cfg.Registry = registry
+	compiled, err := compiledOptions(ctx, &recheckEnv)
+	if err != nil {
+		report.Unable = fmt.Sprintf("prepare registry recheck: %v", err)
+		return report
+	}
+	gate := &conceptgate.Gate{
+		Index:     e.store,
+		Tree:      e.cfg.TreeSpec(),
+		Registry:  registry,
+		Compiled:  compiled,
+		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: filepath.Join(filepath.Dir(e.cfg.DB), "proposals")},
+		WorkDir:   filepath.Join(filepath.Dir(e.cfg.DB), "proposals"),
+	}
+	rechecked, err := conceptgate.Recheck(ctx, gate, reg, added)
+	report.Defects = append(report.Defects, rechecked.Defects...)
+	report.Near = append(report.Near, rechecked.Near...)
+	if err != nil {
+		report.Unable = err.Error()
+	}
+	return report
+}
+
+func addedRegistryConcepts(ctx context.Context, tree, registry, previous, commit string) ([]string, error) {
+	if previous == "" || commit == "" {
+		return []string{}, nil
+	}
+	relative, err := filepath.Rel(tree, registry)
+	if err != nil {
+		return nil, fmt.Errorf("find registry relative to tree: %w", err)
+	}
+	relative = filepath.Clean(relative)
+	if relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("registry %s is outside tree %s", registry, tree)
+	}
+	pathspec := filepath.ToSlash(filepath.Join(relative, "concepts"))
+	raw, err := exec.CommandContext(ctx, "git", "-C", tree, "diff", "--name-only", "--diff-filter=A", "-z", previous, commit, "--", pathspec).Output()
+	if err != nil {
+		return nil, fmt.Errorf("list registry additions from %s to %s: %w", previous, commit, err)
+	}
+	var added []string
+	for _, path := range strings.Split(string(raw), "\x00") {
+		if path != "" {
+			added = append(added, path)
+		}
+	}
+	sort.Strings(added)
+	return added, nil
 }
 
 func ledgerCommitCovers(ctx context.Context, tree, landed, indexed string) (bool, error) {

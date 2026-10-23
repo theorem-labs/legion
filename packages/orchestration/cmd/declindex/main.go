@@ -34,14 +34,15 @@ Commands:
   states CONCEPT...            the statements that state a registered concept's fact: directly, through a
                                definition they apply (via:<definition>), or by using the concept (uses)
   same NAME...                 the declarations whose statements share a relation atom with NAME's statement
-  gate PROPOSAL.json           the similarity gate: refuse an exact duplicate, send a near match to the librarian,
-                               refuse a taken name, or print an addition; JSON
+  gate --proposer OWNER [--accepted-by OWNER] PROPOSAL.json
+                               the similarity gate: refuse an exact duplicate, send a near match to the librarian,
+                               refuse a taken name, or print an addition; the proposal is JSON
                                {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>}
   ledger [--dsn-file PATH | --contracts-file FILE --emit FILE]
-                               check the ledger after a landing; the file mode emits operations for the landing
-                               program and never connects to the ledger
-  land-hash                    the landing program's hasher: LAND_TREE and LAND_NAMES (a JSON array) in,
-                               name<TAB>hash out
+                               check the ledger and newly landed registry concepts; file mode emits registrations
+                               for the landing program and never connects to the ledger
+  land-hash                    the landing program's hasher: LAND_TREE, LAND_GIT_DIR, LAND_NAMES or LAND_NAMES_FILE
+                               (a matching JSON array) in; name<TAB>hash<TAB>path out
 
 NAME is a full name or any dotted suffix of one. A name declared twice is answered once per declaration.
 Exit codes:
