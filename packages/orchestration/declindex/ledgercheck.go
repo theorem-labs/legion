@@ -24,8 +24,9 @@ type ContractLedger interface {
 // Owners maps a contract's directory to its owner key (a graph node id such as function:open_file).
 type Owners map[string]string
 
-// LoadOwners reads an owner map: {"format": F, "owners": [{"id": <owner key>, "contract": <directory>|null}, …]}.
-// format is the F the deployment expects (its graph tool's format name); empty accepts any.
+// LoadOwners reads an owner map: {"format": F, "owners": [{"id": <owner key>, "contract": <directory>|[<directory>,
+// …]|null}, …]}. A list names every directory of one owner, such as a header helper's directory under each file
+// that includes it. format is the F the deployment expects (its graph tool's format name); empty accepts any.
 func LoadOwners(path, format string) (Owners, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -34,8 +35,8 @@ func LoadOwners(path, format string) (Owners, error) {
 	var f struct {
 		Format string `json:"format"`
 		Owners []struct {
-			ID       string  `json:"id"`
-			Contract *string `json:"contract"`
+			ID       string          `json:"id"`
+			Contract json.RawMessage `json:"contract"`
 		} `json:"owners"`
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
@@ -46,15 +47,42 @@ func LoadOwners(path, format string) (Owners, error) {
 	}
 	out := Owners{}
 	for _, o := range f.Owners {
-		if o.Contract == nil || *o.Contract == "" {
-			continue
+		dirs, err := contractDirs(o.Contract)
+		if err != nil {
+			return nil, fmt.Errorf("%s: owner %s: %w", path, o.ID, err)
 		}
-		if prev, ok := out[*o.Contract]; ok && prev != o.ID {
-			return nil, fmt.Errorf("%s: directory %s has two owners, %s and %s", path, *o.Contract, prev, o.ID)
+		for _, dir := range dirs {
+			if prev, ok := out[dir]; ok && prev != o.ID {
+				return nil, fmt.Errorf("%s: directory %s has two owners, %s and %s", path, dir, prev, o.ID)
+			}
+			out[dir] = o.ID
 		}
-		out[*o.Contract] = o.ID
 	}
 	return out, nil
+}
+
+// contractDirs reads an owner's contract field: null, one directory, or a list of directories.
+func contractDirs(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		if one == "" {
+			return nil, nil
+		}
+		return []string{one}, nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return nil, fmt.Errorf("contract must be a directory, a list of directories, or null: %s", raw)
+	}
+	for _, dir := range many {
+		if dir == "" {
+			return nil, errors.New("contract list has an empty directory")
+		}
+	}
+	return many, nil
 }
 
 // globRegexp turns a path glob into a regular expression: `**/` matches any number of directories, `*` any
