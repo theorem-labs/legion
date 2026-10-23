@@ -13,6 +13,7 @@ import (
 
 	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/declindex/confine"
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
@@ -125,6 +126,11 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	}
 	if e.cfg.Registry == "" {
 		return fail(e.stderr, &usageError{"the configuration names no registry"})
+	}
+	// The gate compiles untrusted text only in the sandbox: where there is none, it starts nothing (no toolchain
+	// lookup, no exporter build) and cannot decide.
+	if err := confine.Available(); err != nil {
+		return fail(e.stderr, &unableError{fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)})
 	}
 	raw, err := os.ReadFile(args[0])
 	if err != nil {

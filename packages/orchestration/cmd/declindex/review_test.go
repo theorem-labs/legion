@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/sjawhar/legion/orchestration/declindex/confine"
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
@@ -122,5 +123,54 @@ func TestAModuleNewerThanItsBuildStopsQueriesAndTheLedger(t *testing.T) {
 	}, &out, &errOut)
 	if code != 3 || out.Len() != 0 {
 		t.Fatalf("ledger: exit %d, %q %q", code, out.String(), errOut.String())
+	}
+}
+
+// On a machine whose sandbox is unavailable (here Landlock ABI 2, which does not govern truncation), the gate is
+// unable to decide before it starts anything: no Lean process, no exporter build, even with nothing cached.
+func TestGateStartsNoLeanWithoutASandbox(t *testing.T) {
+	restore := confine.SetLandlockABIForTest(2, nil)
+	defer restore()
+	config := fixture(t)
+	dir := filepath.Dir(config)
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	registry := "version: 1\nconcepts:\n  - name: Gold.Aligned\n    home: Golden.lean\n    meaning: A word is 8-aligned.\n"
+	if err := os.WriteFile(filepath.Join(dir, "tree", "registry.yaml"), []byte(registry), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(config)
+	body = append(body, []byte("registry: registry.yaml\n")...)
+	if err := os.WriteFile(config, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	proposal := filepath.Join(dir, "proposal.json")
+	p := `{"id":"p1","concept":{"name":"Fresh","home":"New.lean","meaning":"A fresh concept."},` +
+		`"source":"def Fresh (x : Nat) : Prop := x < 3\n"}`
+	if err := os.WriteFile(proposal, []byte(p), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Fake toolchain programs on PATH record any start.
+	bin, marker := filepath.Join(dir, "fakebin"), filepath.Join(dir, "started")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"lean", "lake", "elan"} {
+		script := "#!/bin/sh\necho " + name + " >> " + marker + "\nexit 1\n"
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	r := invoke(t, "--config", config, "gate", proposal)
+	if r.code != 3 || !strings.Contains(r.errOut, "sandbox") {
+		t.Fatalf("gate without a sandbox: %+v", r)
+	}
+	if started, err := os.ReadFile(marker); err == nil {
+		t.Fatalf("the gate started %q before it found the sandbox unavailable", strings.Fields(string(started)))
+	}
+	if _, err := os.Stat(filepath.Join(dir, "state", "exporter")); err == nil {
+		t.Fatal("the gate began an exporter build before it found the sandbox unavailable")
 	}
 }
