@@ -424,47 +424,51 @@ func statementViolations(ctx context.Context, q querier, m Migration, req CheckR
 	return []Violation{{Kind: ViolationStatementUnreviewed, Name: missing[0], Message: why}}, nil
 }
 
-func lastChangeReview(req LandRequest, contract Contract) (Review, bool) {
-	for _, review := range req.Reviews {
-		if reviewClears(review, contract, req.Head) {
-			return review, true
+// clearingRecord returns the one record that cleared an advanced contract, in priority order: the compatibility
+// proof, then an explicit review naming the contract with its owner and the head, then the reviewed head as that
+// owner's review. contract is the row Land read under its lock, so its owner is the one the review rule checked.
+func clearingRecord(req LandRequest, contract Contract) (proof string, review Review, ok bool) {
+	if req.CompatibilityProof != "" {
+		return req.CompatibilityProof, Review{}, true
+	}
+	for _, candidate := range req.Reviews {
+		if reviewClears(candidate, contract, req.Head) {
+			return "", candidate, true
 		}
 	}
-	if req.ReviewedHead != "" {
-		return Review{Contract: contract.Name, Reviewer: contract.Owner, Head: req.ReviewedHead}, true
+	if req.Head != "" && req.ReviewedHead == req.Head {
+		return "", Review{Contract: contract.Name, Reviewer: contract.Owner, Head: req.ReviewedHead}, true
 	}
-	return Review{}, false
+	return "", Review{}, false
 }
 
+// contractLastChange is the last_change record of an advanced contract: the record that cleared it, with the
+// upstream commit beside it when the landing carries upstream provenance.
 func contractLastChange(req LandRequest, contract Contract) (LastChange, error) {
-	if req.CompatibilityProof != "" {
-		if req.Upstream != "" {
-			return marshalLastChange(struct {
-				Upstream string `json:"upstream"`
-				Proof    string `json:"proof"`
-			}{Upstream: req.Upstream, Proof: req.CompatibilityProof})
-		}
+	proof, review, ok := clearingRecord(req, contract)
+	if !ok {
+		return "", invalid("changed contract %s has no clearing record", contract.Name)
+	}
+	switch {
+	case req.Upstream != "" && proof != "":
 		return marshalLastChange(struct {
-			Proof string `json:"proof"`
-		}{Proof: req.CompatibilityProof})
-	}
-	review, reviewed := lastChangeReview(req, contract)
-	if !reviewed {
-		return "", invalid("changed contract %s has no review record", contract.Name)
-	}
-	if req.Upstream != "" {
-		reviews := req.Reviews
-		if len(reviews) == 0 {
-			reviews = []Review{review}
-		}
+			Upstream string `json:"upstream"`
+			Proof    string `json:"proof"`
+		}{Upstream: req.Upstream, Proof: proof})
+	case req.Upstream != "":
 		return marshalLastChange(struct {
 			Upstream string   `json:"upstream"`
 			Reviews  []Review `json:"reviews"`
-		}{Upstream: req.Upstream, Reviews: reviews})
+		}{Upstream: req.Upstream, Reviews: []Review{review}})
+	case proof != "":
+		return marshalLastChange(struct {
+			Proof string `json:"proof"`
+		}{Proof: proof})
+	default:
+		return marshalLastChange(struct {
+			Review Review `json:"review"`
+		}{Review: review})
 	}
-	return marshalLastChange(struct {
-		Review Review `json:"review"`
-	}{Review: review})
 }
 
 func marshalLastChange(record any) (LastChange, error) {

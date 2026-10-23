@@ -218,6 +218,55 @@ func TestL4ContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 				"reviews":  []any{map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
 			},
 		},
+		{
+			name:      "upstream reviewed head with an unrelated review",
+			migration: "M-upstream-unrelated",
+			owner:     "upstream",
+			reviews:   []ledger.Review{{Contract: "Other", Reviewer: "bob", Head: "head-1"}},
+			reviewed:  "head-1",
+			upstream:  "upstream-commit",
+			wantChange: map[string]any{
+				"upstream": "upstream-commit",
+				"reviews":  []any{map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
+			},
+		},
+		{
+			name:      "upstream explicit review wins over the reviewed head",
+			migration: "M-upstream-explicit",
+			owner:     "upstream",
+			reviews: []ledger.Review{
+				{Contract: "Other", Reviewer: "bob", Head: "head-1"},
+				{Contract: "C", Reviewer: "alice", Head: "head-1"},
+			},
+			reviewed: "head-1",
+			upstream: "upstream-commit",
+			wantChange: map[string]any{
+				"upstream": "upstream-commit",
+				"reviews":  []any{map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
+			},
+		},
+		{
+			name:      "explicit review wins over the reviewed head",
+			migration: "M-explicit",
+			owner:     "alice",
+			reviews:   []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-1"}},
+			reviewed:  "head-1",
+			wantChange: map[string]any{
+				"review": map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"},
+			},
+		},
+		{
+			name:      "upstream proof",
+			migration: "M-upstream-proof",
+			owner:     "upstream",
+			proof:     "Spec.C.compat",
+			reviews:   []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-1"}},
+			upstream:  "upstream-commit",
+			wantChange: map[string]any{
+				"upstream": "upstream-commit",
+				"proof":    "Spec.C.compat",
+			},
+		},
 	}
 
 	for _, test := range tests {
