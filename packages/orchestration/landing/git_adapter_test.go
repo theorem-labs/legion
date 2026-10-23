@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/landing/blame"
 )
 
-func TestRepositoryGitReadsMemberDiff(t *testing.T) {
+func TestRepositoryGitIndexesMemberDeclarations(t *testing.T) {
 	repo := t.TempDir()
 	gitRun(t, repo, "init", "-q")
 	gitRun(t, repo, "config", "user.email", "test@example.invalid")
@@ -23,12 +25,15 @@ func TestRepositoryGitReadsMemberDiff(t *testing.T) {
 	gitRun(t, repo, "commit", "-qm", "member")
 	head := gitRun(t, repo, "rev-parse", "HEAD")
 
-	diff, err := (RepositoryGit{}).Diff(context.Background(), repo, base, Member{Migration: "one", Head: head})
+	evidence, err := (RepositoryGit{}).DeclarationEvidence(context.Background(), repo, base, Member{Migration: "one", Head: head})
 	if err != nil {
-		t.Fatalf("Diff() error = %v", err)
+		t.Fatalf("DeclarationEvidence() error = %v", err)
 	}
-	if !strings.Contains(diff, "-def Target := 0") || !strings.Contains(diff, "+def Replacement := 0") {
-		t.Fatalf("Diff() = %q, want declaration diff", diff)
+	if strength, label := blame.EvidenceFor(blame.Name{Value: "Target", Kind: blame.Unknown}, evidence); strength != 3 || label != "removed" {
+		t.Fatalf("Target evidence = (%d, %q), want (3, removed)", strength, label)
+	}
+	if strength, label := blame.EvidenceFor(blame.Name{Value: "Replacement", Kind: blame.Added}, evidence); strength != 3 || label != "added" {
+		t.Fatalf("Replacement evidence = (%d, %q), want (3, added)", strength, label)
 	}
 	change, err := (RepositoryGit{}).ChangeSet(context.Background(), repo, base, Member{Migration: "one", Head: head})
 	if err != nil {

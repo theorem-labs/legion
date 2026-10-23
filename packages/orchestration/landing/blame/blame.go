@@ -71,8 +71,6 @@ var (
 	importRE       = regexp.MustCompile(`\bimport (\S+) failed`)
 	blockEndRE     = regexp.MustCompile(`^(?:error:|warning:|info:|trace:|✔|✖|⚠|\[|-- build round|Build completed|Some required|Some builds)`)
 	identifier     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.'!?-]*$`)
-	declarationRE  = regexp.MustCompile(`^\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*(?:def|theorem|lemma|structure|class|inductive|abbrev|instance|axiom|opaque|notation|macro|syntax|macro_rules|elab|alias)\s+([^\s(:{\[⟨]+)`)
-	namespaceRE    = regexp.MustCompile(`^\s*(?:namespace|end)\s+([A-Za-z_][A-Za-z0-9_.'«»-]*)\s*$`)
 	fieldRE        = regexp.MustCompile(`^\s+([A-Za-z_][A-Za-z0-9_']*)\s*:`)
 	hunkRE         = regexp.MustCompile(`^@@ [^@]*@@ ?(.*)$`)
 	unknownRE      = regexp.MustCompile("(?i)(?:unknown identifier|unknown constant|the environment does not contain|unknown namespace)\\s*[`']([^`']+)[`']")
@@ -217,16 +215,20 @@ func addName(names *[]Name, value string, kind Kind) {
 	*names = append(*names, Name{Value: value, Kind: kind})
 }
 
-// Evidence describes declaration-level changes in a unified zero-context diff.
+// declarationSet retains each declaration's complete source identity.
+type declarationSet map[DeclarationID]Declaration
+
+// Evidence describes declaration-level changes in a member's sources.
 type Evidence struct {
-	Removed       map[string]struct{}
-	Added         map[string]struct{}
-	Private       map[string]struct{}
-	Inside        map[string]struct{}
-	Namespaces    map[string]struct{}
+	Removed       declarationSet
+	Added         declarationSet
+	Private       declarationSet
+	Inside        declarationSet
+	Namespaces    declarationSet
 	FieldsAdded   map[string]struct{}
 	FieldsRemoved map[string]struct{}
-	Lines         map[string][]Line
+	Lines         map[DeclarationID][]Line
+	Declarations  declarationSet
 }
 
 // Line is one normalised declaration line added to or removed from a diff.
@@ -235,41 +237,79 @@ type Line struct {
 	Text string
 }
 
-// IndexDiff extracts evidence from a unified zero-context diff.
+// IndexDeclarations records how the declarations in one member's changed
+// files differ between its merge base and head.
+func IndexDeclarations(before, after []Declaration) Evidence {
+	evidence := newEvidence()
+	beforeByID := make(declarationSet, len(before))
+	for _, declaration := range before {
+		beforeByID[declaration.ID()] = declaration
+	}
+	afterByID := make(declarationSet, len(after))
+	for _, declaration := range after {
+		afterByID[declaration.ID()] = declaration
+	}
+	for id, declaration := range beforeByID {
+		candidate, found := afterByID[id]
+		if !found || normaliseLine(declaration.Text) != normaliseLine(candidate.Text) {
+			evidence.addDeclaration(declaration, "-")
+		}
+	}
+	for id, declaration := range afterByID {
+		base, found := beforeByID[id]
+		if !found || normaliseLine(base.Text) != normaliseLine(declaration.Text) {
+			evidence.addDeclaration(declaration, "+")
+		}
+	}
+	return evidence
+}
+
+// IndexDiff extracts evidence from a unified diff. Production callers index
+// complete source declarations with IndexDeclarations; this keeps the compact
+// diff form useful for direct evidence tests.
 func IndexDiff(diff string) Evidence {
 	evidence := newEvidence()
-	scope := ""
+	added, removed := scanner{}, scanner{}
+	var scope Declaration
 	for _, line := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "--- "):
+			removed = scanner{file: diffPath(strings.TrimPrefix(line, "--- "), "a/")}
+			scope = Declaration{}
+			continue
+		case strings.HasPrefix(line, "+++ "):
+			added = scanner{file: diffPath(strings.TrimPrefix(line, "+++ "), "b/")}
+			scope = Declaration{}
+			continue
+		}
 		if match := hunkRE.FindStringSubmatch(line); match != nil {
-			scope = declarationName(match[1])
-			if scope != "" {
-				evidence.Inside[scope] = struct{}{}
+			if name := added.declared(match[1]); name != "" {
+				scope = Declaration{File: added.file, Name: name}
+				evidence.Inside[scope.ID()] = scope
 			}
 			continue
 		}
-		if len(line) == 0 || (line[0] != '+' && line[0] != '-') || strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
+		if len(line) == 0 || (line[0] != '+' && line[0] != '-') {
 			continue
 		}
-		sign, body := line[:1], stripComment(line[1:])
-		if declaration := declarationName(body); declaration != "" {
-			evidence.Lines[declaration] = append(evidence.Lines[declaration], Line{Sign: sign, Text: normaliseLine(body)})
-			if sign == "+" {
-				evidence.Added[declaration] = struct{}{}
-				if strings.Contains(strings.Fields(body)[0], "private") || strings.HasPrefix(strings.TrimSpace(body), "private ") {
-					evidence.Private[declaration] = struct{}{}
-				}
-			} else {
-				evidence.Removed[declaration] = struct{}{}
-			}
-			scope = declaration
+		sign, body := line[:1], line[1:]
+		source := &added
+		if sign == "-" {
+			source = &removed
+		}
+		result := source.scan(body)
+		if result.kind == declarationLine {
+			evidence.addDeclaration(result.declaration, sign)
+			scope = result.declaration
 			continue
 		}
-		if match := namespaceRE.FindStringSubmatch(body); match != nil && sign == "-" {
-			evidence.Namespaces[match[1]] = struct{}{}
+		if result.kind == namespaceLine && sign == "-" {
+			namespace := Declaration{File: source.file, Name: result.namespace}
+			evidence.Namespaces[namespace.ID()] = namespace
 			continue
 		}
-		if match := fieldRE.FindStringSubmatch(body); match != nil && scope != "" {
-			field := scope + "." + match[1]
+		if match := fieldRE.FindStringSubmatch(result.code); match != nil && scope.Name != "" {
+			field := scope.Name + "." + match[1]
 			if sign == "+" {
 				evidence.FieldsAdded[field] = struct{}{}
 			} else {
@@ -282,32 +322,54 @@ func IndexDiff(diff string) Evidence {
 
 func newEvidence() Evidence {
 	return Evidence{
-		Removed: map[string]struct{}{}, Added: map[string]struct{}{}, Private: map[string]struct{}{}, Inside: map[string]struct{}{}, Namespaces: map[string]struct{}{}, FieldsAdded: map[string]struct{}{}, FieldsRemoved: map[string]struct{}{}, Lines: map[string][]Line{},
+		Removed:       declarationSet{},
+		Added:         declarationSet{},
+		Private:       declarationSet{},
+		Inside:        declarationSet{},
+		Namespaces:    declarationSet{},
+		FieldsAdded:   map[string]struct{}{},
+		FieldsRemoved: map[string]struct{}{},
+		Lines:         map[DeclarationID][]Line{},
+		Declarations:  declarationSet{},
 	}
 }
 
+func (e Evidence) addDeclaration(declaration Declaration, sign string) {
+	id := declaration.ID()
+	e.Declarations[id] = declaration
+	e.Lines[id] = append(e.Lines[id], Line{Sign: sign, Text: normaliseLine(declaration.Text)})
+	if sign == "+" {
+		e.Added[id] = declaration
+		if declaration.Private {
+			e.Private[id] = declaration
+		}
+		return
+	}
+	e.Removed[id] = declaration
+}
+
 func declarationName(line string) string {
-	match := declarationRE.FindStringSubmatch(stripComment(line))
-	if match == nil {
+	result := (&scanner{}).scan(line)
+	if result.kind != declarationLine {
 		return ""
 	}
-	return normaliseModule(match[1])
+	return result.declaration.Name
 }
 
 // EvidenceFor scores one member's evidence for a diagnostic name.
 func EvidenceFor(name Name, evidence Evidence) (int, string) {
-	removed := containsMatch(evidence.Removed, name.Value)
-	added := containsMatch(evidence.Added, name.Value)
-	private := containsMatch(evidence.Private, name.Value)
-	inside := containsMatch(evidence.Inside, name.Value)
+	removed := matchesDeclarations(evidence.Removed, name.Value)
+	added := matchesDeclarations(evidence.Added, name.Value)
+	private := matchesDeclarations(evidence.Private, name.Value)
+	inside := matchesDeclarations(evidence.Inside, name.Value)
 	namespace := false
-	for value := range evidence.Namespaces {
-		if nameMatches(name.Value, value) || strings.HasPrefix(name.Value, value+".") {
+	for _, value := range evidence.Namespaces {
+		if refersToNamespace(name.Value, value.Name) {
 			namespace = true
 			break
 		}
 	}
-	field := containsMatch(evidence.FieldsAdded, name.Value) || containsMatch(evidence.FieldsRemoved, name.Value)
+	field := containsName(evidence.FieldsAdded, name.Value) || containsName(evidence.FieldsRemoved, name.Value)
 	switch name.Kind {
 	case Unknown:
 		switch {
@@ -363,7 +425,16 @@ func EvidenceFor(name Name, evidence Evidence) (int, string) {
 	return 0, ""
 }
 
-func containsMatch(values map[string]struct{}, name string) bool {
+func matchesDeclarations(values declarationSet, name string) bool {
+	for _, declaration := range values {
+		if Refers(name, declaration) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsName(values map[string]struct{}, name string) bool {
 	for value := range values {
 		if nameMatches(name, value) {
 			return true
@@ -420,10 +491,12 @@ func Pick(rows []Row) Selection {
 }
 
 // AgainstTree removes stale restatements and promotes additions that changed the
-// candidate relative to its base.
-func AgainstTree(name string, rows []Row, evidence map[string]Evidence, baseLines, candidateLines []string) []Row {
-	newLines := difference(candidateLines, baseLines)
-	base := lineSet(baseLines)
+// candidate relative to its base. Each line includes its source file and fully
+// qualified declaration name, so equal text in another declaration cannot
+// suppress a real change.
+func AgainstTree(name string, rows []Row, evidence map[string]Evidence, baseDeclarations, candidateDeclarations []Declaration) []Row {
+	newLines := difference(declarationLineSet(name, candidateDeclarations), declarationLineSet(name, baseDeclarations))
+	base := declarationLineSet(name, baseDeclarations)
 	out := make([]Row, 0, len(rows))
 	for _, row := range rows {
 		memberEvidence, found := evidence[row.Member]
@@ -431,7 +504,7 @@ func AgainstTree(name string, rows []Row, evidence map[string]Evidence, baseLine
 			out = append(out, row)
 			continue
 		}
-		added, removed := declarationLines(memberEvidence, name)
+		added, removed := evidenceDeclarationLines(memberEvidence, name)
 		if hasIntersection(added, newLines) {
 			out = append(out, Row{Member: row.Member, Strength: 3, Label: "changed in candidate"})
 			continue
@@ -444,17 +517,27 @@ func AgainstTree(name string, rows []Row, evidence map[string]Evidence, baseLine
 	return out
 }
 
-func declarationLines(evidence Evidence, name string) (map[string]struct{}, map[string]struct{}) {
-	added, removed := map[string]struct{}{}, map[string]struct{}{}
-	for declaration, lines := range evidence.Lines {
-		if !nameMatches(name, declaration) {
+type treeDeclarationLine struct {
+	ID   DeclarationID
+	Text string
+}
+
+func evidenceDeclarationLines(evidence Evidence, name string) (map[treeDeclarationLine]struct{}, map[treeDeclarationLine]struct{}) {
+	added, removed := map[treeDeclarationLine]struct{}{}, map[treeDeclarationLine]struct{}{}
+	for id, lines := range evidence.Lines {
+		declaration, found := evidence.Declarations[id]
+		if !found {
+			declaration = Declaration{File: id.File, Name: id.Name}
+		}
+		if !Refers(name, declaration) {
 			continue
 		}
 		for _, line := range lines {
+			key := treeDeclarationLine{ID: id, Text: line.Text}
 			if line.Sign == "+" {
-				added[line.Text] = struct{}{}
+				added[key] = struct{}{}
 			} else {
-				removed[line.Text] = struct{}{}
+				removed[key] = struct{}{}
 			}
 		}
 	}
@@ -465,23 +548,27 @@ func isRestatement(label string) bool {
 	return label == "added" || label == "restated" || label == "signature changed" || label == "renamed or restated"
 }
 
-func lineSet(lines []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(lines))
-	for _, line := range lines {
-		set[normaliseLine(line)] = struct{}{}
+func declarationLineSet(name string, declarations []Declaration) map[treeDeclarationLine]struct{} {
+	set := make(map[treeDeclarationLine]struct{}, len(declarations))
+	for _, declaration := range declarations {
+		if Refers(name, declaration) {
+			set[treeDeclarationLine{ID: declaration.ID(), Text: normaliseLine(declaration.Text)}] = struct{}{}
+		}
 	}
 	return set
 }
 
-func difference(lines []string, base []string) map[string]struct{} {
-	all := lineSet(lines)
-	for line := range lineSet(base) {
-		delete(all, line)
+func difference(lines, base map[treeDeclarationLine]struct{}) map[treeDeclarationLine]struct{} {
+	out := make(map[treeDeclarationLine]struct{}, len(lines))
+	for line := range lines {
+		if _, found := base[line]; !found {
+			out[line] = struct{}{}
+		}
 	}
-	return all
+	return out
 }
 
-func hasIntersection(left, right map[string]struct{}) bool {
+func hasIntersection(left, right map[treeDeclarationLine]struct{}) bool {
 	for value := range left {
 		if _, found := right[value]; found {
 			return true
@@ -490,7 +577,7 @@ func hasIntersection(left, right map[string]struct{}) bool {
 	return false
 }
 
-func subset(left, right map[string]struct{}) bool {
+func subset(left, right map[treeDeclarationLine]struct{}) bool {
 	for value := range left {
 		if _, found := right[value]; !found {
 			return false
@@ -499,7 +586,7 @@ func subset(left, right map[string]struct{}) bool {
 	return true
 }
 
-func anyOutside(left, right map[string]struct{}) bool {
+func anyOutside(left, right map[treeDeclarationLine]struct{}) bool {
 	for value := range left {
 		if _, found := right[value]; !found {
 			return true
@@ -508,10 +595,11 @@ func anyOutside(left, right map[string]struct{}) bool {
 	return false
 }
 
-// TreeLines gives declaration lines at the frozen base and candidate tree.
-type TreeLines struct {
-	Base      []string
-	Candidate []string
+// TreeDeclarations gives matching declarations at the frozen base and
+// candidate tree.
+type TreeDeclarations struct {
+	Base      []Declaration
+	Candidate []Declaration
 }
 
 // Attribution is one evidence-backed selection for a module diagnostic.
@@ -524,16 +612,17 @@ type Attribution struct {
 	Evidence string
 }
 
-// Identify returns the unique members selected by IdentifyDetailed. The line
-// slices apply to every name for compatibility with callers that have one pair.
-func Identify(report Report, evidence map[string]Evidence, baseLines, candidateLines []string) []string {
-	lines := make(map[string]TreeLines)
+// Identify returns the unique members selected by IdentifyDetailed. The
+// declaration slices apply to every name for compatibility with callers that
+// have one pair.
+func Identify(report Report, evidence map[string]Evidence, baseDeclarations, candidateDeclarations []Declaration) []string {
+	declarations := make(map[string]TreeDeclarations)
 	for _, block := range report.Blocks {
 		for _, name := range Names(block.Message) {
-			lines[name.Value] = TreeLines{Base: baseLines, Candidate: candidateLines}
+			declarations[name.Value] = TreeDeclarations{Base: baseDeclarations, Candidate: candidateDeclarations}
 		}
 	}
-	attributions := IdentifyDetailed(report, evidence, lines)
+	attributions := IdentifyDetailed(report, evidence, declarations)
 	members := make(map[string]struct{}, len(attributions))
 	for _, attribution := range attributions {
 		members[attribution.Member] = struct{}{}
@@ -548,7 +637,7 @@ func Identify(report Report, evidence map[string]Evidence, baseLines, candidateL
 
 // IdentifyDetailed attributes each module independently and retains exact
 // diagnostic evidence for every selected member.
-func IdentifyDetailed(report Report, evidence map[string]Evidence, lines map[string]TreeLines) []Attribution {
+func IdentifyDetailed(report Report, evidence map[string]Evidence, declarations map[string]TreeDeclarations) []Attribution {
 	byModule := make(map[string][]Name)
 	for _, block := range report.Blocks {
 		seen := make(map[string]struct{}, len(byModule[block.Module]))
@@ -581,8 +670,8 @@ func IdentifyDetailed(report Report, evidence map[string]Evidence, lines map[str
 					rows = append(rows, Row{Member: member, Strength: strength, Label: label})
 				}
 			}
-			treeLines := lines[name.Value]
-			rows = AgainstTree(name.Value, rows, evidence, treeLines.Base, treeLines.Candidate)
+			treeDeclarations := declarations[name.Value]
+			rows = AgainstTree(name.Value, rows, evidence, treeDeclarations.Base, treeDeclarations.Candidate)
 			selection := Pick(rows)
 			selections[index] = selection
 			if selection.Strength != 0 && primary(name.Kind) {
@@ -619,19 +708,6 @@ func IdentifyDetailed(report Report, evidence map[string]Evidence, lines map[str
 
 func primary(kind Kind) bool {
 	return kind == Unknown || kind == Added || kind == Changed
-}
-
-// DeclarationLinesFor keeps only declaration lines that name the requested
-// declaration, filtering arbitrary matches before tree comparison.
-func DeclarationLinesFor(name string, lines []string) []string {
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		declaration := declarationName(line)
-		if declaration != "" && nameMatches(name, declaration) {
-			out = append(out, normaliseLine(line))
-		}
-	}
-	return out
 }
 
 // Confirmation is the result of building named members alone or isolating a
@@ -797,15 +873,8 @@ func normaliseModule(value string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(value, "«", ""), "»", ""), "/", ".")
 }
 
-func stripComment(line string) string {
-	if index := strings.Index(line, "--"); index >= 0 {
-		return line[:index]
-	}
-	return line
-}
-
 func normaliseLine(line string) string {
-	return strings.Join(strings.Fields(stripComment(line)), " ")
+	return strings.Join(strings.Fields(line), " ")
 }
 
 func nameMatches(left, right string) bool {

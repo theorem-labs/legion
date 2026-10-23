@@ -391,41 +391,41 @@ func withoutExcluded(members []blame.Member, excluded map[string]struct{}) []bla
 
 func collectEvidence(ctx context.Context, repository, base string, members []blame.Member) (map[string]blame.Evidence, error) {
 	evidence := make(map[string]blame.Evidence, len(members))
+	git := landing.RepositoryGit{}
 	for _, member := range members {
-		mergeBase, err := git(ctx, repository, "merge-base", base, member.Head)
+		memberEvidence, err := git.DeclarationEvidence(ctx, repository, base, landing.Member{Migration: member.ID, Head: member.Head})
 		if err != nil {
-			return nil, fmt.Errorf("find merge base for %q: %w", member.ID, err)
+			return nil, fmt.Errorf("read declaration evidence for %q: %w", member.ID, err)
 		}
-		diff, err := git(ctx, repository, "diff", "-U0", "--no-color", mergeBase, member.Head)
-		if err != nil {
-			return nil, fmt.Errorf("read diff for %q: %w", member.ID, err)
-		}
-		evidence[member.ID] = blame.IndexDiff(diff)
+		evidence[member.ID] = memberEvidence
 	}
 	return evidence, nil
 }
 
-func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, error) {
+func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeDeclarations, error) {
+	git := landing.RepositoryGit{}
+	baseDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(base))
+	if err != nil {
+		return nil, fmt.Errorf("read declarations at base: %w", err)
+	}
+	candidateDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(candidate))
+	if err != nil {
+		return nil, fmt.Errorf("read declarations at candidate: %w", err)
+	}
 	names := make(map[string]struct{})
 	for _, block := range report.Blocks {
 		for _, name := range blame.Names(block.Message) {
 			names[name.Value] = struct{}{}
 		}
 	}
-	git := landing.RepositoryGit{}
-	lines := make(map[string]blame.TreeLines, len(names))
+	declarations := make(map[string]blame.TreeDeclarations, len(names))
 	for name := range names {
-		baseLines, err := git.DeclarationLines(ctx, repository, base, name)
-		if err != nil {
-			return nil, fmt.Errorf("read base declaration %q: %w", name, err)
+		declarations[name] = blame.TreeDeclarations{
+			Base:      blame.DeclarationsFor(name, baseDeclarations),
+			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}
-		candidateLines, err := git.DeclarationLines(ctx, repository, candidate, name)
-		if err != nil {
-			return nil, fmt.Errorf("read candidate declaration %q: %w", name, err)
-		}
-		lines[name] = blame.TreeLines{Base: baseLines, Candidate: candidateLines}
 	}
-	return lines, nil
+	return declarations, nil
 }
 
 func confirmAttributions(ctx context.Context, repository, base string, members []blame.Member, modules []string, attributions []blame.Attribution, command string) ([]blame.Attribution, error) {

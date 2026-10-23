@@ -65,8 +65,7 @@ func TestRunConfirmsEvidenceBackedCulpritAndRebuilds(t *testing.T) {
 		"tree-keep":     {Green: true},
 	}}
 	runner := testRunner(ledger, builder)
-	runner.ModuleRoots = []string{"Alpha"}
-	runner.Git.(*gitFake).diffs["bad"] = "-def gone := 0\n"
+	runner.Git.(*gitFake).evidence["bad"] = blame.IndexDiff("-def gone := 0\n")
 
 	batch, err := runner.Run(context.Background(), Input{
 		ID: "batch", Repository: "repo", Base: "base", Members: []Member{member("bad"), member("keep")},
@@ -304,13 +303,13 @@ func (f checkerFake) Check(_ context.Context, tree Tree) ([]Finding, error) {
 
 type gitFake struct {
 	changes     map[string]gitx.Change
-	diffs       map[string]string
+	evidence    map[string]blame.Evidence
 	conflicts   map[string]bool
 	changeBases []string
 }
 
 func newGitFake() *gitFake {
-	return &gitFake{changes: map[string]gitx.Change{}, diffs: map[string]string{}, conflicts: map[string]bool{}}
+	return &gitFake{changes: map[string]gitx.Change{}, evidence: map[string]blame.Evidence{}, conflicts: map[string]bool{}}
 }
 
 func (f *gitFake) Resolve(_ context.Context, _ string, rev string) (string, error) {
@@ -348,11 +347,11 @@ func (f *gitFake) ChangeSet(_ context.Context, _ string, base string, member Mem
 	return f.changes[member.Migration], nil
 }
 
-func (f *gitFake) Diff(_ context.Context, _ string, _ string, member Member) (string, error) {
-	return f.diffs[member.Migration], nil
+func (f *gitFake) DeclarationEvidence(_ context.Context, _ string, _ string, member Member) (blame.Evidence, error) {
+	return f.evidence[member.Migration], nil
 }
 
-func (f *gitFake) DeclarationLines(context.Context, string, Tree, string) ([]string, error) {
+func (f *gitFake) TreeDeclarations(context.Context, string, Tree) ([]blame.Declaration, error) {
 	return nil, nil
 }
 

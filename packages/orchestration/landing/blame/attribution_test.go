@@ -17,7 +17,7 @@ func TestReviewIdentifyDetailedCarriesActualMemberEvidence(t *testing.T) {
 func TestReviewIdentifyDetailedSuppressesStaleRestatementAtRuntime(t *testing.T) {
 	report := Report{Blocks: []Block{{Module: "Alpha.Mod", Message: "environment already contains 'Shared'"}}}
 	evidence := map[string]Evidence{"old": IndexDiff("+def Shared := 0\n")}
-	lines := map[string]TreeLines{"Shared": {Base: []string{"def Shared := 0"}, Candidate: []string{"def Shared := 0"}}}
+	lines := map[string]TreeDeclarations{"Shared": {Base: []Declaration{{Name: "Shared", Text: "def Shared := 0"}}, Candidate: []Declaration{{Name: "Shared", Text: "def Shared := 0"}}}}
 
 	if got := IdentifyDetailed(report, evidence, lines); len(got) != 0 {
 		t.Fatalf("attributions = %#v, want stale restatement suppressed", got)

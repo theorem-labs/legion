@@ -130,7 +130,7 @@ func TestDossierCase12CapsBroadEvidenceAndIgnoresBaseRestatements(t *testing.T) 
 		"stale":   IndexDiff("+def Shared := 0"),
 		"changed": IndexDiff("+def Shared := 1"),
 	}
-	got := AgainstTree("Shared", rows, evidence, []string{"def Shared := 0"}, []string{"def Shared := 1"})
+	got := AgainstTree("Shared", rows, evidence, []Declaration{{Name: "Shared", Text: "def Shared := 0"}}, []Declaration{{Name: "Shared", Text: "def Shared := 1"}})
 	if want := []Row{{Member: "changed", Strength: 3, Label: "changed in candidate"}}; !sameRows(got, want) {
 		t.Fatalf("AgainstTree() = %#v, want %#v", got, want)
 	}

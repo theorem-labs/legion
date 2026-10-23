@@ -58,14 +58,14 @@ type Hasher interface {
 	Hashes(context.Context, Tree, []string) (map[string]string, error)
 }
 
-// Git creates candidate commits and exposes their declaration evidence.
+// Git creates candidate commits and exposes declaration evidence.
 type Git interface {
 	Resolve(context.Context, string, string) (string, error)
 	Candidate(context.Context, string, string, []Member) (gitx.Result, error)
 	Rebuild(context.Context, string, string, []Member, map[string]struct{}) (gitx.Result, error)
 	ChangeSet(context.Context, string, string, Member) (gitx.Change, error)
-	Diff(context.Context, string, string, Member) (string, error)
-	DeclarationLines(context.Context, string, Tree, string) ([]string, error)
+	DeclarationEvidence(context.Context, string, string, Member) (blame.Evidence, error)
+	TreeDeclarations(context.Context, string, Tree) ([]blame.Declaration, error)
 }
 
 // Checker reports paths that a configured policy rejects in a candidate tree.
@@ -757,11 +757,11 @@ func (r Runner) blame(ctx context.Context, batch *Batch, output string) (bool, m
 		if comparisonBase == "" {
 			comparisonBase = batch.Base
 		}
-		diff, err := r.Git.Diff(ctx, batch.Repository, comparisonBase, member)
+		memberEvidence, err := r.Git.DeclarationEvidence(ctx, batch.Repository, comparisonBase, member)
 		if err != nil {
-			return false, nil, fmt.Errorf("read diff for %q: %w", member.Migration, err)
+			return false, nil, fmt.Errorf("read declaration evidence for %q: %w", member.Migration, err)
 		}
-		evidence[member.Migration] = blame.IndexDiff(diff)
+		evidence[member.Migration] = memberEvidence
 	}
 	report := blame.Parse(output, r.ModuleRoots)
 	lines, err := r.declarationLines(ctx, batch, Tree(base.Tree), report)
@@ -812,26 +812,29 @@ func (r Runner) blame(ctx context.Context, batch *Batch, output string) (bool, m
 	return false, culprits, nil
 }
 
-func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, report blame.Report) (map[string]blame.TreeLines, error) {
+func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, report blame.Report) (map[string]blame.TreeDeclarations, error) {
+	baseDeclarations, err := r.Git.TreeDeclarations(ctx, batch.Repository, base)
+	if err != nil {
+		return nil, fmt.Errorf("read declarations at base: %w", err)
+	}
+	candidateDeclarations, err := r.Git.TreeDeclarations(ctx, batch.Repository, Tree(batch.Candidate.Tree))
+	if err != nil {
+		return nil, fmt.Errorf("read declarations at candidate: %w", err)
+	}
 	names := make(map[string]struct{})
 	for _, block := range report.Blocks {
 		for _, name := range blame.Names(block.Message) {
 			names[name.Value] = struct{}{}
 		}
 	}
-	lines := make(map[string]blame.TreeLines, len(names))
+	declarations := make(map[string]blame.TreeDeclarations, len(names))
 	for name := range names {
-		baseLines, err := r.Git.DeclarationLines(ctx, batch.Repository, base, name)
-		if err != nil {
-			return nil, fmt.Errorf("read base declaration %q: %w", name, err)
+		declarations[name] = blame.TreeDeclarations{
+			Base:      blame.DeclarationsFor(name, baseDeclarations),
+			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}
-		candidateLines, err := r.Git.DeclarationLines(ctx, batch.Repository, Tree(batch.Candidate.Tree), name)
-		if err != nil {
-			return nil, fmt.Errorf("read candidate declaration %q: %w", name, err)
-		}
-		lines[name] = blame.TreeLines{Base: baseLines, Candidate: candidateLines}
 	}
-	return lines, nil
+	return declarations, nil
 }
 
 func (r Runner) receipt(ctx context.Context, batch Batch, output string) (Receipt, error) {

@@ -2,7 +2,6 @@ package landing
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -63,42 +62,76 @@ func (g RepositoryGit) ChangeSet(ctx context.Context, repository, base string, m
 	return change, nil
 }
 
-// Diff returns a zero-context diff for a member's merge-base range.
-func (g RepositoryGit) Diff(ctx context.Context, repository, base string, member Member) (string, error) {
+// DeclarationEvidence indexes a member's changed Lean declarations from its
+// merge base to its head. Both sides are scanned from complete source files so
+// each change carries its file and fully qualified Lean name.
+func (g RepositoryGit) DeclarationEvidence(ctx context.Context, repository, base string, member Member) (blame.Evidence, error) {
 	repository = g.path(repository)
 	mergeBase, err := repositoryGit(ctx, repository, "merge-base", base, member.Head)
 	if err != nil {
-		return "", fmt.Errorf("find merge base for %q: %w", member.Migration, err)
+		return blame.Evidence{}, fmt.Errorf("find merge base for %q: %w", member.Migration, err)
 	}
-	diff, err := repositoryGit(ctx, repository, "diff", "-U0", "--no-color", mergeBase, member.Head)
+	paths, err := repositoryGitLines(ctx, repository, "diff", "--name-only", mergeBase, member.Head)
 	if err != nil {
-		return "", fmt.Errorf("read diff for %q: %w", member.Migration, err)
+		return blame.Evidence{}, fmt.Errorf("list changed files for %q: %w", member.Migration, err)
 	}
-	return diff, nil
+	changed := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if strings.HasSuffix(path, ".lean") {
+			changed[path] = struct{}{}
+		}
+	}
+	before, err := g.declarationsAt(ctx, repository, mergeBase, changed)
+	if err != nil {
+		return blame.Evidence{}, fmt.Errorf("read base declarations for %q: %w", member.Migration, err)
+	}
+	after, err := g.declarationsAt(ctx, repository, member.Head, changed)
+	if err != nil {
+		return blame.Evidence{}, fmt.Errorf("read member declarations for %q: %w", member.Migration, err)
+	}
+	return blame.IndexDeclarations(before, after), nil
 }
 
-// DeclarationLines resolves a diagnostic name by its final component, then
-// filters exact declaration names with the original suffix-match rule.
-func (g RepositoryGit) DeclarationLines(ctx context.Context, repository string, tree Tree, name string) ([]string, error) {
-	repository = g.path(repository)
-	search := name
-	if index := strings.LastIndex(search, "."); index >= 0 {
-		search = search[index+1:]
-	}
-	command := exec.CommandContext(ctx, "git", "-C", repository, "grep", "-h", "-I", "-F", search, string(tree), "--")
-	output, err := command.CombinedOutput()
+// TreeDeclarations scans every Lean declaration in one immutable tree. Callers
+// with several diagnostic names scan once and filter the resulting identities
+// in memory.
+func (g RepositoryGit) TreeDeclarations(ctx context.Context, repository string, tree Tree) ([]blame.Declaration, error) {
+	return g.declarationsAt(ctx, g.path(repository), string(tree), nil)
+}
+
+// Declarations finds the declarations a diagnostic can name in one immutable
+// tree. It is a convenience for one-name callers; evidence paths use
+// TreeDeclarations to avoid rescanning the tree.
+func (g RepositoryGit) Declarations(ctx context.Context, repository string, tree Tree, name string) ([]blame.Declaration, error) {
+	declarations, err := g.TreeDeclarations(ctx, repository, tree)
 	if err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) && exit.ExitCode() == 1 {
-			return nil, nil
+		return nil, err
+	}
+	return blame.DeclarationsFor(name, declarations), nil
+}
+
+func (g RepositoryGit) declarationsAt(ctx context.Context, repository, revision string, only map[string]struct{}) ([]blame.Declaration, error) {
+	paths, err := repositoryGitLines(ctx, repository, "ls-tree", "-r", "--name-only", revision)
+	if err != nil {
+		return nil, fmt.Errorf("list files at %q: %w", revision, err)
+	}
+	var declarations []blame.Declaration
+	for _, path := range paths {
+		if !strings.HasSuffix(path, ".lean") {
+			continue
 		}
-		return nil, fmt.Errorf("git grep %q: %w: %s", name, err, strings.TrimSpace(string(output)))
+		if only != nil {
+			if _, changed := only[path]; !changed {
+				continue
+			}
+		}
+		source, err := repositoryGitSource(ctx, repository, revision, path)
+		if err != nil {
+			return nil, err
+		}
+		declarations = append(declarations, blame.ScanDeclarations(path, source)...)
 	}
-	text := strings.TrimSpace(string(output))
-	if text == "" {
-		return nil, nil
-	}
-	return blame.DeclarationLinesFor(name, strings.Split(text, "\n")), nil
+	return declarations, nil
 }
 
 func (g RepositoryGit) path(repository string) string {
@@ -115,4 +148,21 @@ func repositoryGit(ctx context.Context, repository string, args ...string) (stri
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func repositoryGitLines(ctx context.Context, repository string, args ...string) ([]string, error) {
+	output, err := repositoryGit(ctx, repository, args...)
+	if err != nil || output == "" {
+		return nil, err
+	}
+	return strings.Split(output, "\n"), nil
+}
+
+func repositoryGitSource(ctx context.Context, repository, revision, path string) (string, error) {
+	command := exec.CommandContext(ctx, "git", "-C", repository, "show", revision+":"+path)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("read %q at %q: %w: %s", path, revision, err, strings.TrimSpace(string(output)))
+	}
+	return string(output), nil
 }
