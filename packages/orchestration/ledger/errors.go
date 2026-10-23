@@ -23,6 +23,8 @@ const (
 	ReasonEscalated          = "escalated"           // the migration awaits a steward's decision
 	ReasonUndeclaredWrite    = "undeclared_write"    // the candidate writes a path outside the migration lock
 	ReasonUndeclaredContract = "undeclared_contract" // the migration did not declare the changed contract as a read
+	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.
+	ReasonStatementUnreviewed = "statement_unreviewed"
 )
 
 // Refusal is a declined request.
