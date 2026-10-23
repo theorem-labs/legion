@@ -168,10 +168,27 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
         "hard_checks": hard,
         "passes": passes,
     }
+    parsed_sources = sorted(job[0] for job in pending)
+    reused_sources = sorted(set(files) - set(parsed_sources))
+    counts = {
+        "nodes": len(graph["nodes"]),
+        "edges": len(graph["edges"]),
+        "owners": len(owner_list["owners"]),
+        "files": len(files),
+    }
+    build_document = {
+        "format": "cgraph/build/v1",
+        "part": part,
+        "passes": passes,
+        "parsed": parsed_sources,
+        "reused": reused_sources,
+        "counts": counts,
+    }
     outputs = {
         "graph.json": graph,
         "checks.json": check_document,
         "exclusions.json": exclusions,
+        "build.json": build_document,
         "owners.json": owner_list,
         "topics.json": topics,
         "measures.json": numbers,
@@ -179,18 +196,11 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
     rendered = {name: jsonio.dumps(value) for name, value in outputs.items()}
     rendered["report.md"] = report.render(graph, check_document, owner_list, topics, numbers, exclusions)
     _write_outputs(out, rendered)
-    parsed_sources = sorted(job[0] for job in pending)
-    counts = {
-        "nodes": len(graph["nodes"]),
-        "edges": len(graph["edges"]),
-        "owners": len(owner_list["owners"]),
-        "files": len(files),
-    }
     return Result(
         passes=passes,
         hard_checks=hard,
         parsed=parsed_sources,
-        reused=sorted(set(files) - set(parsed_sources)),
+        reused=reused_sources,
         outputs={name: str(out / name) for name in rendered},
         counts=counts,
     )

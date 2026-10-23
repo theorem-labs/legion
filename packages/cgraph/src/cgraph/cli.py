@@ -51,8 +51,8 @@ def main(argv: list[str] | None = None) -> int:
     summary = {
         "passes": result.passes,
         "counts": result.counts,
-        "parsed": len(result.parsed),
-        "reused": len(result.reused),
+        "parsed": result.parsed,
+        "reused": result.reused,
         "hard_checks": [
             {
                 "name": item["name"],

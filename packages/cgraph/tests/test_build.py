@@ -14,15 +14,30 @@ from conftest import FIXTURE, build, read
 
 from cgraph import cli, pipeline
 
-OUTPUTS = ("graph.json", "checks.json", "exclusions.json", "owners.json", "topics.json", "measures.json", "report.md")
+OUTPUTS = (
+    "graph.json",
+    "checks.json",
+    "exclusions.json",
+    "build.json",
+    "owners.json",
+    "topics.json",
+    "measures.json",
+    "report.md",
+)
+
+STABLE_OUTPUTS = tuple(name for name in OUTPUTS if name != "build.json")
 
 
 def digests(out: Path) -> dict[str, str]:
-    return {name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in OUTPUTS}
+    return {name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in STABLE_OUTPUTS}
 
 
 def output_bytes(out: Path) -> dict[str, bytes]:
     return {str(path.relative_to(out)): path.read_bytes() for path in sorted(out.rglob("*")) if path.is_file()}
+
+
+def stable_output_bytes(out: Path) -> dict[str, bytes]:
+    return {name: (out / name).read_bytes() for name in STABLE_OUTPUTS}
 
 
 def cli_arguments(copy: Path, out: Path, cache: Path | None = None, jobs: int = 1, part: str = "store") -> list[str]:
@@ -156,10 +171,50 @@ def test_json_summary_omits_hard_check_items(
         "counts": {"edges": 2, "files": 3, "nodes": 3, "owners": 1},
         "hard_checks": [{"count": 2, "detail": "two items", "name": "check", "ok": False}],
         "outputs": {"graph.json": str(tmp_path / "out" / "graph.json")},
-        "parsed": 2,
+        "parsed": ["src/one.c", "src/two.c"],
         "passes": False,
-        "reused": 1,
+        "reused": ["src/three.c"],
     }
+
+
+def test_cli_json_and_build_document_list_sorted_translation_units(
+    copy: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cache, out = tmp_path / "cache", tmp_path / "out"
+    arguments = [*cli_arguments(copy, out, cache, part="both"), "--root", str(copy), "--json"]
+
+    assert cli.main(arguments) == 0
+
+    first = json.loads(capsys.readouterr().out)
+    assert first["parsed"] == ["src/bags.c", "src/store.c"]
+    assert first["reused"] == []
+    assert read(out, "build.json") == {
+        "format": "cgraph/build/v1",
+        "part": "both",
+        "passes": True,
+        "parsed": ["src/bags.c", "src/store.c"],
+        "reused": [],
+        "counts": first["counts"],
+    }
+
+    assert cli.main(arguments) == 0
+
+    second = json.loads(capsys.readouterr().out)
+    assert second["parsed"] == []
+    assert second["reused"] == ["src/bags.c", "src/store.c"]
+    assert read(out, "build.json")["parsed"] == second["parsed"]
+    assert read(out, "build.json")["reused"] == second["reused"]
+
+
+def test_input_error_preserves_existing_build_document(copy: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    assert cli.main(cli_arguments(copy, out)) == 0
+    before = (out / "build.json").read_bytes()
+    (copy / "contracts.json").write_text("{")
+
+    assert cli.main(cli_arguments(copy, out)) == 3
+
+    assert (out / "build.json").read_bytes() == before
 
 
 def test_corrupt_cache_manifest_refuses_without_changing_existing_outputs(
@@ -337,7 +392,7 @@ def test_concurrent_cli_builds_share_a_valid_cache(copy: Path, tmp_path: Path) -
     with get_context("fork").Pool(2) as workers:
         assert workers.map(cli.main, arguments) == [0, 0]
 
-    assert output_bytes(first) == output_bytes(second)
+    assert stable_output_bytes(first) == stable_output_bytes(second)
     manifest = json.loads((cache / "manifest.json").read_text())
     assert set(manifest) == {"src/store.c"}
 
