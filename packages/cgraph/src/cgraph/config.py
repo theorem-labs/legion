@@ -122,8 +122,8 @@ class Thresholds:
     field_offsets: float = 0.0
 
 
-def _thresholds(table: dict[str, Any]) -> Thresholds:
-    _unknown(table, {"min_call_agreement", "min_access_agreement", "min_field_offsets"}, "checks")
+def _thresholds(table: dict[str, Any], where: str) -> Thresholds:
+    _unknown(table, {"min_call_agreement", "min_access_agreement", "min_field_offsets"}, where)
     values = {}
     for key, name in (
         ("min_call_agreement", "call_agreement"),
@@ -132,7 +132,7 @@ def _thresholds(table: dict[str, Any]) -> Thresholds:
     ):
         value = table.get(key, 0.0)
         if not isinstance(value, int | float) or not 0 <= value <= 1:
-            raise ConfigError(f"checks.{key} must be a number from 0 to 1")
+            raise ConfigError(f"{where}.{key} must be a number from 0 to 1")
         values[name] = float(value)
     return Thresholds(**values)
 
@@ -142,6 +142,8 @@ class Config:
     path: Path
     inputs: Inputs
     parts: dict[str, list[str] | str]
+    # A part's own thresholds, over the configuration's [checks].
+    part_thresholds: dict[str, Thresholds]
     flags: tuple[str, ...]
     # (pattern, replacement) for compile arguments the parser does not accept; "" drops the argument.
     argument_rewrites: tuple[tuple[re.Pattern[str], str], ...]
@@ -235,11 +237,13 @@ def load(path: Path, root: Path | None = None) -> Config:
 
     parts_table = _expect(data, "parts", dict, "configuration", required=True)
     parts: dict[str, list[str] | str] = {}
+    part_checks: dict[str, dict[str, Any]] = {}
     for name, part in sorted(parts_table.items()):
         where = f"parts.{name}"
         if not isinstance(part, dict):
             raise ConfigError(f"{where} must be a table")
-        _unknown(part, {"files"}, where)
+        _unknown(part, {"files", "checks"}, where)
+        part_checks[name] = _expect(part, "checks", dict, where) or {}
         files = _expect(part, "files", (list, str), where, required=True)
         if isinstance(files, str):
             if files != "all":
@@ -374,18 +378,22 @@ def load(path: Path, root: Path | None = None) -> Config:
     topic_prefix = _expect(topics_table, "prefix", str, "topics") or ""
     if topic_prefix and not topic_prefix.endswith("."):
         raise ConfigError("topics.prefix must end with a dot")
+    defaults = _expect(data, "checks", dict, "configuration") or {}
 
     return Config(
         path=path,
         inputs=inputs,
         parts=parts,
+        part_thresholds={
+            name: _thresholds({**defaults, **table}, f"parts.{name}.checks") for name, table in part_checks.items()
+        },
         flags=flags,
         argument_rewrites=tuple(rewrites),
         vocabulary=vocabulary,
         image=image_rules,
         contract_function_prefix=prefix,
         topic_prefix=topic_prefix,
-        thresholds=_thresholds(_expect(data, "checks", dict, "configuration") or {}),
+        thresholds=_thresholds(defaults, "checks"),
     )
 
 

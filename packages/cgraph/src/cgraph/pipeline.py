@@ -125,7 +125,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
         "access_layer": checks.accesses(graph),
         "structure_layer": checks.structure(graph),
     }
-    hard = checks.hard(graph, owner_list, topics, layers, config.thresholds)
+    hard = checks.hard(graph, owner_list, topics, layers, config.part_thresholds.get(part, config.thresholds))
     passes = all(item["ok"] for item in hard)
     check_document = {"format": "cgraph/checks/v1", "part": part, **layers, "hard_checks": hard, "passes": passes}
     outputs = {

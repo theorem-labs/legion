@@ -66,3 +66,8 @@ __attribute__((noinline)) int bag_weight(void)
 {
 	return 3;
 }
+
+int stub_open(void)
+{
+	return bag_weight();
+}

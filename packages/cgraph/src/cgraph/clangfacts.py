@@ -1189,14 +1189,19 @@ def _witnesses(source: str, main: Path, vocabulary: Vocabulary) -> list[dict[str
     return witnesses
 
 
-def _is_weak(tu: ci.TranslationUnit, cursor: ci.Cursor) -> bool:
-    """A definition marked weak (``__weak`` or ``__attribute__((weak))`` before its name)."""
+_WEAK = frozenset({"__weak", "weak", "__weak__"})
+
+
+def _is_weak(extractor: _Extractor, cursor: ci.Cursor) -> bool:
+    """A definition marked weak: ``__weak`` or ``__attribute__((weak))`` before its name, written in
+    the source or, for a definition a macro generates (``COND_SYSCALL(x)``), in the macros it expands."""
     try:
-        tokens = [token.spelling for token in tu.get_tokens(extent=cursor.extent)]
+        tokens = [token.spelling for token in extractor.tu.get_tokens(extent=cursor.extent)]
     except Exception:
         return False
-    head = tokens[: tokens.index(cursor.spelling)] if cursor.spelling in tokens else tokens
-    return any(token in ("__weak", "weak", "__weak__") for token in head)
+    if cursor.spelling in tokens:
+        return any(token in _WEAK for token in tokens[: tokens.index(cursor.spelling)])
+    return any(token in _WEAK for _, body in extractor.expansion_bodies(cursor, cursor, limit=16) for token in body)
 
 
 def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabulary) -> Facts:
@@ -1240,7 +1245,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             "file": extractor.relative(cursor.location.file.name),
             "line": cursor.location.line,
             "static": cursor.linkage == ci.LinkageKind.INTERNAL,
-            "weak": _is_weak(tu, cursor),
+            "weak": _is_weak(extractor, cursor),
             "main_file": _main_file(cursor, main),
             "returns": walk.returns(),
             "events": walk.events,

@@ -148,3 +148,15 @@ def test_thresholds_are_read_and_checked(tmp_path: Path) -> None:
     )
     with pytest.raises(config.ConfigError, match=r"checks\.min_call_agreement must be a number from 0 to 1"):
         config.load(path)
+
+
+def test_a_part_overrides_the_default_thresholds(tmp_path: Path) -> None:
+    path = tmp_path / "cgraph.toml"
+    path.write_text(
+        '[inputs]\nc_tree = "t"\nimage = "i"\nsystem_map = "m"\n'
+        '[parts.small]\nfiles = ["a.c"]\nchecks = { min_call_agreement = 0.99 }\n[parts.big]\nfiles = ["b.c"]\n'
+        '[c]\nflags = ["-x"]\n[checks]\nmin_call_agreement = 0.9\nmin_field_offsets = 0.8\n'
+    )
+    loaded = config.load(path)
+    assert loaded.part_thresholds["small"] == config.Thresholds(call_agreement=0.99, field_offsets=0.8)
+    assert loaded.part_thresholds["big"] == config.Thresholds(call_agreement=0.9, field_offsets=0.8)

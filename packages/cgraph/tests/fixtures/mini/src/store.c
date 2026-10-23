@@ -90,9 +90,11 @@ __attribute__((weak)) int arch_hook(void)
 	return 0;
 }
 
+COND_STUB(open)
+
 int use_hook(void)
 {
-	return arch_hook();
+	return arch_hook() + stub_open();
 }
 
 __attribute__((noinline)) int box_weight(void)

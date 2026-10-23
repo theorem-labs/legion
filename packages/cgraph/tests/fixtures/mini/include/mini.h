@@ -148,6 +148,10 @@ void tree_unlock(struct rwsem **s);
 
 /* A default the architecture may replace: the strong definition in bags.c wins at link time. */
 int arch_hook(void);
+/* A weak stub a macro generates, as a table of optional system calls does. */
+#define __weak __attribute__((__weak__))
+#define COND_STUB(name) int __weak stub_##name(void) { return -1; }
+int stub_open(void);
 #define CHECK_VALUE(e) ((void)sizeof(e))
 #define FEATURE_X 0
 

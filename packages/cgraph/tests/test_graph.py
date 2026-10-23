@@ -69,7 +69,7 @@ def test_cleanup_attribute_locals_call_their_destructor(graph: dict[str, Any]) -
 def test_strong_definition_is_the_node_and_the_weak_one_is_recorded(graph: dict[str, Any]) -> None:
     hook = node(graph, "function:arch_hook")
     assert hook["c_file"] == "src/bags.c" and hook["weak_definitions"] == ["src/store.c:88"]
-    assert targets(graph, "call", "function:use_hook") == {"function:arch_hook"}
+    assert targets(graph, "call", "function:use_hook") == {"function:arch_hook", "function:stub_open"}
     assert graph["analysis"]["alternate_definitions"]["function:arch_hook"]["others"] == [
         {"definition": "src/store.c:88", "weak": True}
     ]
@@ -214,3 +214,11 @@ def test_parameter_accesses_bind_to_the_callers_argument() -> None:
     assert [item["unit"]["name"] for item in link._bind(child, [argument]).accesses] == ["big_lock"]
     assert link._bind(child, [{"unit": None, "param": 2}]).accesses[0]["param"] == 2
     assert link._bind(child, [{"unit": None, "param": None}]).unbound == 1
+
+
+def test_a_weak_stub_a_macro_generates_gives_way_to_the_strong_definition(graph: dict[str, Any]) -> None:
+    stub = node(graph, "function:stub_open")
+    assert stub["c_file"] == "src/bags.c" and stub["weak_definitions"]
+    # The strong definition's body is the node's: it calls bag_weight, which the compiler folded.
+    folds = {fold["helper"] for fold in graph["analysis"]["folds"] if fold["image_caller"] == "function:stub_open"}
+    assert folds == {"function:bag_weight"}
