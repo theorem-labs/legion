@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -23,14 +24,32 @@ type Builder = blame.Builder
 // Ledger is the landing-facing contract with the durable ledger.
 type Ledger interface {
 	Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error)
-	Land(context.Context, string, string, int64, string, map[string]string, []string) error
+	Land(context.Context, LandRequest) error
 	ReturnMember(context.Context, string, string, int64, string) error
+}
+
+// LandRequest matches the ledger's complete landing transaction input.
+type LandRequest struct {
+	Repo             string            `json:"repo"`
+	Migration        string            `json:"migration"`
+	Generation       int64             `json:"generation"`
+	Commit           string            `json:"commit"`
+	ChangedPaths     []string          `json:"changedPaths"`
+	Current          map[string]string `json:"current"`
+	ChangedContracts map[string]string `json:"changedContracts"`
+	ApprovedPinned   []string          `json:"approvedPinned"`
 }
 
 // CheckResult describes one ledger decision.
 type CheckResult struct {
 	Refused bool
 	Reason  string
+}
+
+// OperationStatus lets an external dependency confirm a durable operation
+// after a crash between the call and its local completion checkpoint.
+type OperationStatus interface {
+	OperationComplete(context.Context, Operation) (bool, error)
 }
 
 // Hasher gives declaration hashes at a tree.
@@ -40,7 +59,9 @@ type Hasher interface {
 
 // Git creates candidate commits and exposes their declaration evidence.
 type Git interface {
+	Resolve(context.Context, string, string) (string, error)
 	Candidate(context.Context, string, string, []Member) (gitx.Result, error)
+	Rebuild(context.Context, string, string, []Member, map[string]struct{}) (gitx.Result, error)
 	ChangeSet(context.Context, string, string, Member) (gitx.Change, error)
 	Diff(context.Context, string, string, Member) (string, error)
 	DeclarationLines(context.Context, string, Tree, string) ([]string, error)
@@ -74,13 +95,15 @@ const (
 
 // Member is the frozen identity of one proposed migration.
 type Member struct {
-	Migration      string            `json:"migration"`
-	Generation     int64             `json:"generation"`
-	Head           string            `json:"head"`
-	Changed        []string          `json:"changed"`
-	ReadNames      []string          `json:"readNames"`
-	ChangedHashes  map[string]string `json:"changedHashes"`
-	ApprovedPinned []string          `json:"approvedPinned"`
+	Migration        string            `json:"migration"`
+	Generation       int64             `json:"generation"`
+	Head             string            `json:"head"`
+	ComparisonBase   string            `json:"comparisonBase"`
+	Changed          []string          `json:"changed"`
+	ReadNames        []string          `json:"readNames"`
+	CurrentHashes    map[string]string `json:"currentHashes"`
+	ChangedContracts map[string]string `json:"changedContracts"`
+	ApprovedPinned   []string          `json:"approvedPinned"`
 }
 
 // DroppedMember records why a frozen member left the candidate.
@@ -111,27 +134,49 @@ func (r Receipt) JSON() ([]byte, error) {
 	return json.Marshal(r)
 }
 
+// OperationState tracks a durable intent before an external side effect and its
+// completion only after that effect returns.
+type OperationState string
+
+const (
+	OperationPending  OperationState = "pending"
+	OperationComplete OperationState = "complete"
+)
+
+// Operation is the idempotency record for one member or batch side effect.
+type Operation struct {
+	Key    string         `json:"key"`
+	Kind   string         `json:"kind"`
+	Member string         `json:"member"`
+	Commit string         `json:"commit"`
+	Reason string         `json:"reason"`
+	State  OperationState `json:"state"`
+}
+
 // Batch persists an immutable input set independently from members eventually
 // landed after a publisher confirms the merge.
 type Batch struct {
-	ID              string          `json:"id"`
-	Repository      string          `json:"repository"`
-	Base            string          `json:"base"`
-	BaseBranch      string          `json:"baseBranch"`
-	Branch          string          `json:"branch"`
-	Candidate       gitx.Result     `json:"candidate"`
-	FrozenMembers   []Member        `json:"frozenMembers"`
-	ActiveMembers   []Member        `json:"activeMembers"`
-	LandedMembers   []Member        `json:"landedMembers"`
-	NotifiedMembers []string        `json:"notifiedMembers"`
-	Dropped         []DroppedMember `json:"dropped"`
-	State           State           `json:"state"`
-	Reason          string          `json:"reason"`
-	Round           int             `json:"round"`
-	Checks          []CheckVerdict  `json:"checks"`
-	Score           CheckVerdict    `json:"score"`
-	PullRequest     PullRequest     `json:"pullRequest"`
-	Receipt         *Receipt        `json:"receipt"`
+	ID               string               `json:"id"`
+	Repository       string               `json:"repository"`
+	Base             string               `json:"base"`
+	BaseBranch       string               `json:"baseBranch"`
+	Branch           string               `json:"branch"`
+	Candidate        gitx.Result          `json:"candidate"`
+	InitialCandidate gitx.Result          `json:"initialCandidate"`
+	CheckedTree      string               `json:"checkedTree"`
+	FrozenMembers    []Member             `json:"frozenMembers"`
+	ActiveMembers    []Member             `json:"activeMembers"`
+	LandedMembers    []Member             `json:"landedMembers"`
+	NotifiedMembers  []string             `json:"notifiedMembers"`
+	Dropped          []DroppedMember      `json:"dropped"`
+	Operations       map[string]Operation `json:"operations"`
+	State            State                `json:"state"`
+	Reason           string               `json:"reason"`
+	Round            int                  `json:"round"`
+	Checks           []CheckVerdict       `json:"checks"`
+	Score            CheckVerdict         `json:"score"`
+	PullRequest      PullRequest          `json:"pullRequest"`
+	Receipt          *Receipt             `json:"receipt"`
 }
 
 // Input starts one frozen batch.
@@ -145,6 +190,7 @@ type Input struct {
 
 // BatchStore persists each state transition before its following side effect.
 type BatchStore interface {
+	Create(context.Context, Batch) (bool, error)
 	Save(context.Context, Batch) error
 	Load(context.Context, string) (Batch, bool, error)
 	ListActive(context.Context) ([]Batch, error)
@@ -166,13 +212,26 @@ type Runner struct {
 	MaxRounds    int
 	InfraRetries int
 	ConfigDigest string
-	Toolchain    func(context.Context) (string, error)
+	Toolchain    func(context.Context, Tree) (string, error)
 }
 
 // Run freezes, checks, builds and attributes one batch until it is green or failed.
 func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 	if err := r.valid(); err != nil {
 		return Batch{}, err
+	}
+	frozenInput, err := r.freezeInput(ctx, input)
+	if err != nil {
+		return Batch{}, err
+	}
+	input = frozenInput
+	if existing, found, err := r.Store.Load(ctx, input.ID); err != nil {
+		return Batch{}, fmt.Errorf("load batch %q: %w", input.ID, err)
+	} else if found {
+		if !sameInput(existing, input) {
+			return Batch{}, fmt.Errorf("batch %q already has a different immutable input", input.ID)
+		}
+		return existing, nil
 	}
 	batch := Batch{
 		ID:            input.ID,
@@ -181,14 +240,28 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 		BaseBranch:    input.BaseBranch,
 		FrozenMembers: cloneMembers(input.Members),
 		ActiveMembers: cloneMembers(input.Members),
+		Operations:    make(map[string]Operation),
 	}
 	candidate, err := r.candidate(ctx, batch.Repository, batch.Base, batch.ActiveMembers)
 	if err != nil {
 		return Batch{}, fmt.Errorf("freeze candidate: %w", err)
 	}
 	batch.Candidate = candidate
-	if err := r.transition(ctx, &batch, Frozen, ""); err != nil {
-		return Batch{}, err
+	batch.InitialCandidate = candidate
+	batch.State = Frozen
+	created, err := r.Store.Create(ctx, batch)
+	if err != nil {
+		return Batch{}, fmt.Errorf("create batch %q: %w", batch.ID, err)
+	}
+	if !created {
+		existing, found, err := r.Store.Load(ctx, batch.ID)
+		if err != nil {
+			return Batch{}, fmt.Errorf("load raced batch %q: %w", batch.ID, err)
+		}
+		if !found || !sameInput(existing, input) {
+			return Batch{}, fmt.Errorf("batch %q already has a different immutable input", batch.ID)
+		}
+		return existing, nil
 	}
 	if err := r.applyCandidateDrops(ctx, &batch); err != nil {
 		return Batch{}, err
@@ -249,6 +322,10 @@ func (r Runner) drive(ctx context.Context, batch *Batch, checkBeforeBuild bool) 
 		}
 		baseBroken, culprits, err := r.blame(ctx, batch, result.Output)
 		if err != nil {
+			var infraFailure InfrastructureError
+			if errors.As(err, &infraFailure) {
+				return r.fail(ctx, batch, "infra")
+			}
 			return r.fail(ctx, batch, "blame")
 		}
 		if baseBroken || len(culprits) == 0 {
@@ -286,20 +363,30 @@ func (r Runner) candidate(ctx context.Context, repository, base string, members 
 
 func (r Runner) collectChanges(ctx context.Context, batch *Batch) error {
 	for index := range batch.ActiveMembers {
-		change, err := r.Git.ChangeSet(ctx, batch.Repository, batch.Base, batch.ActiveMembers[index])
-		if err != nil {
-			return fmt.Errorf("read changed files for %q: %w", batch.ActiveMembers[index].Migration, err)
+		member := &batch.ActiveMembers[index]
+		comparisonBase := member.ComparisonBase
+		if comparisonBase == "" {
+			comparisonBase = batch.Base
 		}
-		batch.ActiveMembers[index].Changed = append([]string(nil), change.Files...)
+		change, err := r.Git.ChangeSet(ctx, batch.Repository, comparisonBase, *member)
+		if err != nil {
+			return fmt.Errorf("read changed files for %q: %w", member.Migration, err)
+		}
+		member.Changed = append([]string(nil), change.Files...)
 	}
 	return r.Store.Save(ctx, *batch)
 }
 
 func (r Runner) checkLedger(ctx context.Context, batch *Batch) error {
-	for _, member := range append([]Member(nil), batch.ActiveMembers...) {
+	for index := range batch.ActiveMembers {
+		member := &batch.ActiveMembers[index]
 		hashes, err := r.Hasher.Hashes(ctx, Tree(batch.Candidate.Tree), member.ReadNames)
 		if err != nil {
 			return fmt.Errorf("hash reads for %q: %w", member.Migration, err)
+		}
+		member.CurrentHashes = cloneHashes(hashes)
+		if err := r.Store.Save(ctx, *batch); err != nil {
+			return fmt.Errorf("record current hashes for %q: %w", member.Migration, err)
 		}
 		result, err := r.Ledger.Check(ctx, batch.Repository, member.Migration, member.Generation, member.Changed, hashes)
 		if err != nil {
@@ -346,23 +433,39 @@ func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reaso
 	if !found {
 		return nil
 	}
+	key := "return/" + migration
+	if operation, found := batch.operation(key); found && operation.State == OperationComplete {
+		return nil
+	}
 	batch.ActiveMembers = withoutMember(batch.ActiveMembers, migration)
-	batch.Dropped = append(batch.Dropped, DroppedMember{Migration: migration, Reason: reason})
+	if !containsDropped(batch.Dropped, migration) {
+		batch.Dropped = append(batch.Dropped, DroppedMember{Migration: migration, Reason: reason})
+	}
+	batch.startOperation(Operation{Key: key, Kind: "return", Member: migration, Reason: reason})
 	if err := r.Store.Save(ctx, *batch); err != nil {
-		return fmt.Errorf("record return of %q: %w", migration, err)
+		return fmt.Errorf("record return intent for %q: %w", migration, err)
 	}
 	if err := r.Ledger.ReturnMember(ctx, batch.Repository, member.Migration, member.Generation, reason); err != nil {
 		return fmt.Errorf("return %q: %w", migration, err)
+	}
+	batch.completeOperation(key)
+	if err := r.Store.Save(ctx, *batch); err != nil {
+		return fmt.Errorf("record returned member %q: %w", migration, err)
 	}
 	return nil
 }
 
 func (r Runner) rebuild(ctx context.Context, batch *Batch) error {
-	candidate, err := r.candidate(ctx, batch.Repository, batch.Base, batch.ActiveMembers)
+	without := make(map[string]struct{}, len(batch.Dropped))
+	for _, dropped := range batch.Dropped {
+		without[dropped.Migration] = struct{}{}
+	}
+	candidate, err := r.Git.Rebuild(ctx, batch.Repository, batch.Base, batch.FrozenMembers, without)
 	if err != nil {
 		return fmt.Errorf("rebuild candidate: %w", err)
 	}
 	batch.Candidate = candidate
+	batch.CheckedTree = ""
 	if err := r.Store.Save(ctx, *batch); err != nil {
 		return fmt.Errorf("record rebuilt candidate: %w", err)
 	}
@@ -410,10 +513,39 @@ func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 		}
 		return false, nil
 	}
+	batch.CheckedTree = batch.Candidate.Tree
 	if err := r.Store.Save(ctx, *batch); err != nil {
 		return false, fmt.Errorf("record checks: %w", err)
 	}
 	return true, nil
+}
+
+func containsDropped(dropped []DroppedMember, migration string) bool {
+	for _, member := range dropped {
+		if member.Migration == migration {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Batch) operation(key string) (Operation, bool) {
+	operation, found := b.Operations[key]
+	return operation, found
+}
+
+func (b *Batch) startOperation(operation Operation) {
+	if b.Operations == nil {
+		b.Operations = make(map[string]Operation)
+	}
+	operation.State = OperationPending
+	b.Operations[operation.Key] = operation
+}
+
+func (b *Batch) completeOperation(key string) {
+	operation := b.Operations[key]
+	operation.State = OperationComplete
+	b.Operations[key] = operation
 }
 
 func (r Runner) build(ctx context.Context, batch *Batch) (blame.BuildResult, bool, error) {
@@ -438,31 +570,72 @@ func (r Runner) build(ctx context.Context, batch *Batch) (blame.BuildResult, boo
 	return blame.BuildResult{}, true, nil
 }
 
+// InfrastructureError says a builder did not reach a source verdict.
+type InfrastructureError struct {
+	Class string
+}
+
+func (e InfrastructureError) Error() string {
+	return "infrastructure failure: " + e.Class
+}
+
+func (r Runner) buildTree(ctx context.Context, tree Tree, modules []string) (blame.BuildResult, error) {
+	var lastClass string
+	for attempt := 0; attempt <= r.infraLimit(); attempt++ {
+		result, err := r.Builder.Build(ctx, tree, modules)
+		if err != nil {
+			lastClass = "launch"
+		} else if result.InfraClass != "" {
+			lastClass = result.InfraClass
+		} else {
+			return result, nil
+		}
+	}
+	return blame.BuildResult{}, InfrastructureError{Class: lastClass}
+}
+
+type retryingBuilder struct {
+	runner Runner
+}
+
+func (b retryingBuilder) Build(ctx context.Context, tree blame.Tree, modules []string) (blame.BuildResult, error) {
+	return b.runner.buildTree(ctx, Tree(tree), modules)
+}
+
 func (r Runner) blame(ctx context.Context, batch *Batch, output string) (bool, map[string]string, error) {
 	base, err := r.candidate(ctx, batch.Repository, batch.Base, nil)
 	if err != nil {
 		return false, nil, fmt.Errorf("build base candidate: %w", err)
 	}
-	baseResult, err := r.Builder.Build(ctx, Tree(base.Tree), nil)
+	baseResult, err := r.buildTree(ctx, Tree(base.Tree), nil)
 	if err != nil {
 		return false, nil, fmt.Errorf("build base: %w", err)
-	}
-	if baseResult.InfraClass != "" {
-		return false, nil, fmt.Errorf("build base infrastructure failure: %s", baseResult.InfraClass)
 	}
 	if !baseResult.Green {
 		return true, nil, nil
 	}
 	evidence := make(map[string]blame.Evidence, len(batch.ActiveMembers))
 	for _, member := range batch.ActiveMembers {
-		diff, err := r.Git.Diff(ctx, batch.Repository, batch.Base, member)
+		comparisonBase := member.ComparisonBase
+		if comparisonBase == "" {
+			comparisonBase = batch.Base
+		}
+		diff, err := r.Git.Diff(ctx, batch.Repository, comparisonBase, member)
 		if err != nil {
 			return false, nil, fmt.Errorf("read diff for %q: %w", member.Migration, err)
 		}
 		evidence[member.Migration] = blame.IndexDiff(diff)
 	}
 	report := blame.Parse(output, r.ModuleRoots)
-	named := blame.Identify(report, evidence, nil, nil)
+	lines, err := r.declarationLines(ctx, batch, Tree(base.Tree), report)
+	if err != nil {
+		return false, nil, err
+	}
+	attributions := blame.IdentifyDetailed(report, evidence, lines)
+	suspects := make(map[string][]string)
+	for _, attribution := range attributions {
+		suspects[attribution.Module] = append(suspects[attribution.Module], attribution.Member)
+	}
 	members := make([]blame.Member, 0, len(batch.ActiveMembers))
 	for _, member := range batch.ActiveMembers {
 		members = append(members, blame.Member{ID: member.Migration, Head: member.Head})
@@ -482,28 +655,74 @@ func (r Runner) blame(ctx context.Context, batch *Batch, output string) (bool, m
 		}
 		return blame.Tree(result.Tree), nil
 	}
-	confirmation, err := blame.Confirm(ctx, batch.Base, report.RedModules, members, named, candidate, r.Builder)
+	confirmation, err := blame.ConfirmModules(ctx, batch.Base, report.RedModules, members, suspects, candidate, retryingBuilder{runner: r})
 	if err != nil {
 		return false, nil, err
 	}
-	culprits := make(map[string]string, len(confirmation.Confirmed)+len(confirmation.Bisected))
-	for _, member := range confirmation.Confirmed {
-		culprits[member] = "build: evidence"
+	if len(confirmation.BaseBroken) != 0 {
+		return true, nil, nil
 	}
-	for _, member := range confirmation.Bisected {
-		culprits[member] = "build: bisect"
+	culprits := make(map[string]string, len(confirmation.Confirmed)+len(confirmation.Bisected))
+	for _, moduleCulprits := range confirmation.ByModule {
+		for _, culprit := range moduleCulprits {
+			if culprit.Kind == "evidence" {
+				culprits[culprit.Member] = "build: evidence"
+			} else {
+				culprits[culprit.Member] = "build: bisect"
+			}
+		}
 	}
 	return false, culprits, nil
 }
 
-func (r Runner) receipt(ctx context.Context, batch Batch, output string) (Receipt, error) {
-	toolchain := ""
-	if r.Toolchain != nil {
-		value, err := r.Toolchain(ctx)
-		if err != nil {
-			return Receipt{}, fmt.Errorf("read toolchain: %w", err)
+func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, report blame.Report) (map[string]blame.TreeLines, error) {
+	names := make(map[string]struct{})
+	for _, block := range report.Blocks {
+		for _, name := range blame.Names(block.Message) {
+			names[name.Value] = struct{}{}
 		}
-		toolchain = value
+	}
+	lines := make(map[string]blame.TreeLines, len(names))
+	for name := range names {
+		baseLines, err := r.Git.DeclarationLines(ctx, batch.Repository, base, name)
+		if err != nil {
+			return nil, fmt.Errorf("read base declaration %q: %w", name, err)
+		}
+		candidateLines, err := r.Git.DeclarationLines(ctx, batch.Repository, Tree(batch.Candidate.Tree), name)
+		if err != nil {
+			return nil, fmt.Errorf("read candidate declaration %q: %w", name, err)
+		}
+		lines[name] = blame.TreeLines{Base: baseLines, Candidate: candidateLines}
+	}
+	return lines, nil
+}
+
+func attributionMembers(attributions []blame.Attribution) []string {
+	members := make(map[string]struct{}, len(attributions))
+	for _, attribution := range attributions {
+		members[attribution.Member] = struct{}{}
+	}
+	out := make([]string, 0, len(members))
+	for member := range members {
+		out = append(out, member)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (r Runner) receipt(ctx context.Context, batch Batch, output string) (Receipt, error) {
+	if r.Toolchain == nil {
+		return Receipt{}, fmt.Errorf("toolchain identity is required")
+	}
+	toolchain, err := r.Toolchain(ctx, Tree(batch.Candidate.Tree))
+	if err != nil {
+		return Receipt{}, fmt.Errorf("read toolchain: %w", err)
+	}
+	if toolchain == "" {
+		return Receipt{}, fmt.Errorf("toolchain identity is empty")
+	}
+	if r.ConfigDigest == "" {
+		return Receipt{}, fmt.Errorf("configuration hash is required")
 	}
 	digest := sha256.Sum256([]byte(output))
 	return Receipt{
@@ -514,6 +733,30 @@ func (r Runner) receipt(ctx context.Context, batch Batch, output string) (Receip
 		Members:           cloneMembers(batch.ActiveMembers),
 		BuildLogDigest:    hex.EncodeToString(digest[:]),
 	}, nil
+}
+
+func (r Runner) freezeInput(ctx context.Context, input Input) (Input, error) {
+	base, err := r.Git.Resolve(ctx, input.Repository, input.Base)
+	if err != nil {
+		return Input{}, fmt.Errorf("resolve base: %w", err)
+	}
+	input.Base = base
+	input.Members = cloneMembers(input.Members)
+	for index := range input.Members {
+		head, err := r.Git.Resolve(ctx, input.Repository, input.Members[index].Head)
+		if err != nil {
+			return Input{}, fmt.Errorf("resolve member %q: %w", input.Members[index].Migration, err)
+		}
+		input.Members[index].Head = head
+		if input.Members[index].ComparisonBase != "" {
+			comparisonBase, err := r.Git.Resolve(ctx, input.Repository, input.Members[index].ComparisonBase)
+			if err != nil {
+				return Input{}, fmt.Errorf("resolve comparison base for %q: %w", input.Members[index].Migration, err)
+			}
+			input.Members[index].ComparisonBase = comparisonBase
+		}
+	}
+	return input, nil
 }
 
 func (r Runner) fail(ctx context.Context, batch *Batch, reason string) (Batch, error) {
@@ -556,6 +799,19 @@ func (b *Batch) setCheck(verdict CheckVerdict) {
 	b.Checks = append(b.Checks, verdict)
 }
 
+func sameInput(batch Batch, input Input) bool {
+	if batch.ID != input.ID || batch.Repository != input.Repository || batch.Base != input.Base || batch.BaseBranch != input.BaseBranch || len(batch.FrozenMembers) != len(input.Members) {
+		return false
+	}
+	for index, member := range batch.FrozenMembers {
+		other := input.Members[index]
+		if member.Migration != other.Migration || member.Generation != other.Generation || member.Head != other.Head || member.ComparisonBase != other.ComparisonBase {
+			return false
+		}
+	}
+	return true
+}
+
 func findMember(members []Member, migration string) (Member, bool) {
 	for _, member := range members {
 		if member.Migration == migration {
@@ -591,12 +847,29 @@ func cloneMembers(members []Member) []Member {
 		out[index].Changed = append([]string(nil), member.Changed...)
 		out[index].ReadNames = append([]string(nil), member.ReadNames...)
 		out[index].ApprovedPinned = append([]string(nil), member.ApprovedPinned...)
-		if member.ChangedHashes != nil {
-			out[index].ChangedHashes = make(map[string]string, len(member.ChangedHashes))
-			for name, hash := range member.ChangedHashes {
-				out[index].ChangedHashes[name] = hash
+		if member.CurrentHashes != nil {
+			out[index].CurrentHashes = make(map[string]string, len(member.CurrentHashes))
+			for name, hash := range member.CurrentHashes {
+				out[index].CurrentHashes[name] = hash
 			}
 		}
+		if member.ChangedContracts != nil {
+			out[index].ChangedContracts = make(map[string]string, len(member.ChangedContracts))
+			for name, hash := range member.ChangedContracts {
+				out[index].ChangedContracts[name] = hash
+			}
+		}
+	}
+	return out
+}
+
+func cloneHashes(hashes map[string]string) map[string]string {
+	if hashes == nil {
+		return nil
+	}
+	out := make(map[string]string, len(hashes))
+	for name, hash := range hashes {
+		out[name] = hash
 	}
 	return out
 }
@@ -605,6 +878,20 @@ func cloneMembers(members []Member) []Member {
 type MemoryStore struct {
 	mu      sync.Mutex
 	batches map[string]Batch
+}
+
+// Create stores a batch only when its identity is not already present.
+func (s *MemoryStore) Create(_ context.Context, batch Batch) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.batches == nil {
+		s.batches = make(map[string]Batch)
+	}
+	if _, found := s.batches[batch.ID]; found {
+		return false, nil
+	}
+	s.batches[batch.ID] = cloneBatch(batch)
+	return true, nil
 }
 
 // Save writes a deep copy of a batch.
@@ -647,6 +934,13 @@ func cloneBatch(batch Batch) Batch {
 	batch.NotifiedMembers = append([]string(nil), batch.NotifiedMembers...)
 	batch.Dropped = append([]DroppedMember(nil), batch.Dropped...)
 	batch.Checks = append([]CheckVerdict(nil), batch.Checks...)
+	if batch.Operations != nil {
+		operations := make(map[string]Operation, len(batch.Operations))
+		for key, operation := range batch.Operations {
+			operations[key] = operation
+		}
+		batch.Operations = operations
+	}
 	if batch.Receipt != nil {
 		receipt := *batch.Receipt
 		receipt.Members = cloneMembers(receipt.Members)

@@ -121,8 +121,8 @@ func TestDossierCase12CapsBroadEvidenceAndIgnoresBaseRestatements(t *testing.T) 
 		{Member: "three", Strength: 1, Label: "added"},
 		{Member: "four", Strength: 1, Label: "added"},
 	}
-	if got := Pick(weak); len(got.Members) != 0 {
-		t.Fatalf("Pick() broad weak evidence = %#v, want no members", got)
+	if got, want := Pick(weak).Members, []Row{{Member: "one", Strength: 2, Label: "edited"}, {Member: "two", Strength: 2, Label: "edited"}, {Member: "four", Strength: 1, Label: "added"}}; !sameRows(got, want) {
+		t.Fatalf("Pick() weak evidence = %#v, want %#v", got, want)
 	}
 
 	rows := []Row{{Member: "stale", Strength: 3, Label: "added"}, {Member: "changed", Strength: 3, Label: "added"}}

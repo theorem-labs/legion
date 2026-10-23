@@ -34,8 +34,8 @@ func TestBlameCommandPrintsEvidenceBackedMember(t *testing.T) {
 	if err := run(context.Background(), []string{"blame", "--repo", repo, "--base", base, "--members", members, "--log", log}, &output); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
-	if got := output.String(); !strings.Contains(got, "one\tident:gone") {
-		t.Fatalf("blame output = %q, want evidence for one", got)
+	if got := output.String(); !strings.Contains(got, "one\tAlpha\tgone\tunknown\t3\tremoved") {
+		t.Fatalf("blame output = %q, want structured evidence for one", got)
 	}
 }
 
@@ -85,6 +85,7 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 
 	config := filepath.Join(t.TempDir(), "config.json")
 	raw, err := json.Marshal(map[string]any{
+		"batchId":        "batch",
 		"repository":     "owner/repo",
 		"repositoryPath": repo,
 		"base":           base,
@@ -92,10 +93,13 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 		"statePath":      filepath.Join(t.TempDir(), "state.json"),
 		"members":        []map[string]any{{"migration": "one", "generation": 1, "head": head}},
 		"build":          []string{"sh", "-c", "exit 0"},
+		"hasher":         []string{"sh", "-c", "exit 0"},
+		"toolchain":      []string{"sh", "-c", "printf tool"},
 		"ledger": map[string]any{
-			"check":  []string{"sh", "-c", "exit 0"},
+			"check":  []string{"sh", "-c", "printf '{\"pass\":true}\\n'"},
 			"return": []string{"sh", "-c", "exit 0"},
 			"land":   []string{"sh", "-c", "exit 0"},
+			"status": []string{"sh", "-c", "printf '{\"complete\":false}\\n'"},
 		},
 	})
 	if err != nil {
@@ -107,8 +111,15 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 	if err := run(context.Background(), []string{"run", "--config", config}, &output); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
-	if got := output.String(); !strings.Contains(got, `"state":"green"`) {
-		t.Fatalf("run output = %q, want green batch", got)
+	if got := output.String(); !strings.Contains(got, `"state":"green"`) || strings.Contains(got, `"configurationHash":""`) || strings.Contains(got, `"toolchain":""`) {
+		t.Fatalf("run output = %q, want bound green receipt", got)
+	}
+	output.Reset()
+	if err := run(context.Background(), []string{"status", "--config", config}, &output); err != nil {
+		t.Fatalf("status error = %v", err)
+	}
+	if got := output.String(); !strings.Contains(got, `"id":"batch"`) {
+		t.Fatalf("status output = %q, want stored batch", got)
 	}
 }
 

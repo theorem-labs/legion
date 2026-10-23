@@ -219,7 +219,7 @@ func testRunner(ledger *ledgerFake, builder *builderFake) Runner {
 		MaxRounds:    4,
 		InfraRetries: 2,
 		ConfigDigest: "digest",
-		Toolchain: func(context.Context) (string, error) {
+		Toolchain: func(context.Context, Tree) (string, error) {
 			return "tool", nil
 		},
 	}
@@ -244,8 +244,8 @@ func (f *ledgerFake) Check(_ context.Context, _ string, migration string, _ int6
 	return CheckResult{Reason: f.refusals[migration]}, nil
 }
 
-func (f *ledgerFake) Land(_ context.Context, _ string, migration string, _ int64, _ string, _ map[string]string, _ []string) error {
-	f.landed = append(f.landed, migration)
+func (f *ledgerFake) Land(_ context.Context, request LandRequest) error {
+	f.landed = append(f.landed, request.Migration)
 	return nil
 }
 
@@ -271,7 +271,7 @@ func (f *builderFake) Build(_ context.Context, tree blame.Tree, _ []string) (bla
 type hasherFake struct{}
 
 func (hasherFake) Hashes(context.Context, Tree, []string) (map[string]string, error) {
-	return map[string]string{}, nil
+	return nil, nil
 }
 
 type checkerFake struct {
@@ -291,12 +291,17 @@ func (f checkerFake) Check(_ context.Context, tree Tree) ([]Finding, error) {
 }
 
 type gitFake struct {
-	changes map[string]gitx.Change
-	diffs   map[string]string
+	changes     map[string]gitx.Change
+	diffs       map[string]string
+	changeBases []string
 }
 
 func newGitFake() *gitFake {
 	return &gitFake{changes: map[string]gitx.Change{}, diffs: map[string]string{}}
+}
+
+func (f *gitFake) Resolve(_ context.Context, _ string, rev string) (string, error) {
+	return rev, nil
 }
 
 func (f *gitFake) Candidate(_ context.Context, _ string, base string, members []Member) (gitx.Result, error) {
@@ -310,7 +315,18 @@ func (f *gitFake) Candidate(_ context.Context, _ string, base string, members []
 	return gitx.Result{Tree: "tree-" + strings.Join(ids, "+"), Commit: strings.Join(ids, "+")}, nil
 }
 
-func (f *gitFake) ChangeSet(_ context.Context, _ string, _ string, member Member) (gitx.Change, error) {
+func (f *gitFake) Rebuild(ctx context.Context, repository, base string, members []Member, without map[string]struct{}) (gitx.Result, error) {
+	kept := make([]Member, 0, len(members))
+	for _, member := range members {
+		if _, excluded := without[member.Migration]; !excluded {
+			kept = append(kept, member)
+		}
+	}
+	return f.Candidate(ctx, repository, base, kept)
+}
+
+func (f *gitFake) ChangeSet(_ context.Context, _ string, base string, member Member) (gitx.Change, error) {
+	f.changeBases = append(f.changeBases, base)
 	return f.changes[member.Migration], nil
 }
 
@@ -333,6 +349,9 @@ func (f *storeFake) Save(_ context.Context, batch Batch) error {
 
 func (f *storeFake) Load(context.Context, string) (Batch, bool, error) { return Batch{}, false, nil }
 
+func (f *storeFake) Create(ctx context.Context, batch Batch) (bool, error) {
+	return true, f.Save(ctx, batch)
+}
 func (f *storeFake) ListActive(context.Context) ([]Batch, error) { return nil, nil }
 
 func (f *storeFake) seen(want State) bool {

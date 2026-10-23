@@ -1,0 +1,60 @@
+package landing
+
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+func TestReviewRestartDoesNotRepeatObservedLedgerLand(t *testing.T) {
+	ledger := &observedLedger{}
+	store := &landCrashStore{}
+	runner := Runner{
+		Store:   store,
+		Ledger:  ledger,
+		Builder: &builderFake{},
+		Hasher:  hasherFake{},
+		Git:     newGitFake(),
+		GitHub:  &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+	}
+
+	if _, err := runner.Publish(context.Background(), greenBatch()); err == nil {
+		t.Fatal("Publish() error = nil, want checkpoint failure after Land")
+	}
+	resumed, err := runner.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if got, want := resumed[0].State, Landed; got != want {
+		t.Fatalf("state = %q, want %q", got, want)
+	}
+	if got, want := ledger.lands, 1; got != want {
+		t.Fatalf("Land calls = %d, want %d", got, want)
+	}
+}
+
+type observedLedger struct{ lands int }
+
+func (l *observedLedger) Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error) {
+	return CheckResult{}, nil
+}
+func (l *observedLedger) Land(context.Context, LandRequest) error { l.lands++; return nil }
+func (l *observedLedger) ReturnMember(context.Context, string, string, int64, string) error {
+	return nil
+}
+func (l *observedLedger) OperationComplete(_ context.Context, operation Operation) (bool, error) {
+	return operation.Kind == "land" && l.lands == 1, nil
+}
+
+type landCrashStore struct {
+	MemoryStore
+	failed bool
+}
+
+func (s *landCrashStore) Save(ctx context.Context, batch Batch) error {
+	if operation, found := batch.Operations["land/one"]; found && operation.State == OperationComplete && !s.failed {
+		s.failed = true
+		return errors.New("injected checkpoint failure")
+	}
+	return s.MemoryStore.Save(ctx, batch)
+}

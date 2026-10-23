@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/sjawhar/legion/orchestration/landing/blame"
 	"github.com/sjawhar/legion/orchestration/landing/gitx"
 )
 
@@ -15,6 +16,15 @@ import (
 // path while callers may keep a distinct repository identity in batch records.
 type RepositoryGit struct {
 	Path string
+}
+
+// Resolve freezes a ref as an immutable commit ID.
+func (g RepositoryGit) Resolve(ctx context.Context, repository, rev string) (string, error) {
+	resolved, err := repositoryGit(ctx, g.path(repository), "rev-parse", "--verify", rev+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w", rev, err)
+	}
+	return resolved, nil
 }
 
 // Candidate builds an in-memory candidate commit.
@@ -26,6 +36,20 @@ func (g RepositoryGit) Candidate(ctx context.Context, repository, base string, m
 	result, err := gitx.Candidate(ctx, g.path(repository), base, inputs)
 	if err != nil {
 		return gitx.Result{}, fmt.Errorf("build candidate: %w", err)
+	}
+	return result, nil
+}
+
+// Rebuild recreates a candidate from every frozen member while retaining the
+// excluded heads required to reject carriers.
+func (g RepositoryGit) Rebuild(ctx context.Context, repository, base string, members []Member, without map[string]struct{}) (gitx.Result, error) {
+	inputs := make([]gitx.Member, len(members))
+	for index, member := range members {
+		inputs[index] = gitx.Member{ID: member.Migration, Head: member.Head}
+	}
+	result, err := gitx.Rebuild(ctx, g.path(repository), base, inputs, without)
+	if err != nil {
+		return gitx.Result{}, fmt.Errorf("rebuild candidate: %w", err)
 	}
 	return result, nil
 }
@@ -69,7 +93,7 @@ func (g RepositoryGit) DeclarationLines(ctx context.Context, repository string, 
 	if text == "" {
 		return nil, nil
 	}
-	return strings.Split(text, "\n"), nil
+	return blame.DeclarationLinesFor(name, strings.Split(text, "\n")), nil
 }
 
 func (g RepositoryGit) path(repository string) string {

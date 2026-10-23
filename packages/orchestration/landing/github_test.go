@@ -22,7 +22,10 @@ func TestGitHubCLIPushesCandidateBranchOnly(t *testing.T) {
 }
 
 func TestGitHubCLIFindsQueueRemoval(t *testing.T) {
-	executor := &commandExecutorFake{outputs: []string{`[{"number":7,"headRefOid":"candidate","state":"OPEN","mergeStateStatus":"DIRTY","isInMergeQueue":false}]`}}
+	executor := &commandExecutorFake{outputs: []string{
+		`[{"number":7,"headRefOid":"candidate","state":"OPEN","mergeStateStatus":"DIRTY"}]`,
+		`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null,"mergeCommit":null}}}}`,
+	}}
 	client := GitHubCLI{Executor: executor}
 
 	pull, found, err := client.FindPullRequest(context.Background(), "owner/repo", "land/batch")
@@ -38,7 +41,10 @@ func TestGitHubCLIFindsQueueRemoval(t *testing.T) {
 }
 
 func TestGitHubCLIWaitsForMergedHead(t *testing.T) {
-	executor := &commandExecutorFake{outputs: []string{`{"number":7,"headRefOid":"candidate","state":"MERGED"}`}}
+	executor := &commandExecutorFake{outputs: []string{
+		`{"number":7,"headRefOid":"candidate","state":"MERGED","mergeStateStatus":"CLEAN"}`,
+		`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null,"mergeCommit":{"oid":"merged"}}}}}`,
+	}}
 	client := GitHubCLI{Executor: executor, PollInterval: time.Nanosecond}
 
 	pull, err := client.Wait(context.Background(), "owner/repo", 7, "candidate")

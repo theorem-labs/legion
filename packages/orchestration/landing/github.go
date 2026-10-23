@@ -37,7 +37,7 @@ func (c GitHubCLI) Push(ctx context.Context, _ string, branch, commit string) er
 
 // FindPullRequest finds the pull request whose head is branch.
 func (c GitHubCLI) FindPullRequest(ctx context.Context, repository, branch string) (PullRequest, bool, error) {
-	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "pr", "list", "--repo", repository, "--head", branch, "--state", "all", "--limit", "1", "--json", "number,headRefOid,state,mergeStateStatus,isInMergeQueue")
+	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "pr", "list", "--repo", repository, "--head", branch, "--state", "all", "--limit", "1", "--json", "number,headRefOid,state,mergeStateStatus")
 	if err != nil {
 		return PullRequest{}, false, fmt.Errorf("find pull request: %w", err)
 	}
@@ -48,12 +48,16 @@ func (c GitHubCLI) FindPullRequest(ctx context.Context, repository, branch strin
 	if len(pulls) == 0 {
 		return PullRequest{}, false, nil
 	}
-	return pulls[0].pullRequest(), true, nil
+	pull, err := c.enrich(ctx, repository, pulls[0])
+	if err != nil {
+		return PullRequest{}, false, err
+	}
+	return pull, true, nil
 }
 
 // Open creates one pull request and reads its durable identity back from GitHub.
 func (c GitHubCLI) Open(ctx context.Context, repository, base, branch, body string) (PullRequest, error) {
-	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "pr", "create", "--repo", repository, "--base", base, "--head", branch, "--body", body)
+	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "pr", "create", "--repo", repository, "--base", base, "--head", branch, "--title", "Landing "+branch, "--body", body)
 	if err != nil {
 		return PullRequest{}, fmt.Errorf("open pull request: %w", err)
 	}
@@ -103,18 +107,55 @@ type pullRequestWire struct {
 	Head             string `json:"headRefOid"`
 	State            string `json:"state"`
 	MergeStateStatus string `json:"mergeStateStatus"`
-	InMergeQueue     bool   `json:"isInMergeQueue"`
 }
 
-func (p pullRequestWire) pullRequest() PullRequest {
-	result := PullRequest{Number: p.Number, Head: p.Head}
-	switch strings.ToUpper(p.State) {
+type pullRequestDetails struct {
+	Data struct {
+		Repository struct {
+			PullRequest struct {
+				MergeQueueEntry *struct {
+					State string `json:"state"`
+				} `json:"mergeQueueEntry"`
+				MergeCommit *struct {
+					OID string `json:"oid"`
+				} `json:"mergeCommit"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	} `json:"data"`
+}
+
+func (c GitHubCLI) enrich(ctx context.Context, repository string, wire pullRequestWire) (PullRequest, error) {
+	owner, name, found := strings.Cut(repository, "/")
+	if !found || owner == "" || name == "" {
+		return PullRequest{}, fmt.Errorf("repository %q is not owner/name", repository)
+	}
+	query := `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{state} mergeCommit{oid}}}}`
+	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "api", "graphql", "-f", "query="+query, "-F", "owner="+owner, "-F", "name="+name, "-F", fmt.Sprintf("number=%d", wire.Number))
+	if err != nil {
+		return PullRequest{}, fmt.Errorf("read pull request queue state: %w", err)
+	}
+	var details pullRequestDetails
+	if err := json.Unmarshal([]byte(output), &details); err != nil {
+		return PullRequest{}, fmt.Errorf("decode pull request queue state: %w", err)
+	}
+	result := PullRequest{Number: wire.Number, Head: wire.Head}
+	if details.Data.Repository.PullRequest.MergeCommit != nil {
+		result.MergedCommit = details.Data.Repository.PullRequest.MergeCommit.OID
+	}
+	queueState := ""
+	if details.Data.Repository.PullRequest.MergeQueueEntry != nil {
+		queueState = details.Data.Repository.PullRequest.MergeQueueEntry.State
+	}
+	switch strings.ToUpper(wire.State) {
 	case "MERGED":
+		if result.MergedCommit == "" {
+			return PullRequest{}, fmt.Errorf("merged pull request %d has no merge commit", wire.Number)
+		}
 		result.State = PullRequestMerged
 	case "CLOSED":
 		result.State = PullRequestClosed
 	case "OPEN":
-		if strings.EqualFold(p.MergeStateStatus, "DIRTY") && !p.InMergeQueue {
+		if queueState == "FAILED" || (queueState == "" && strings.EqualFold(wire.MergeStateStatus, "DIRTY")) {
 			result.State = PullRequestRemoved
 			result.Reason = "checks failed"
 		} else {
@@ -122,13 +163,13 @@ func (p pullRequestWire) pullRequest() PullRequest {
 		}
 	default:
 		result.State = PullRequestRemoved
-		result.Reason = strings.ToLower(p.State)
+		result.Reason = strings.ToLower(wire.State)
 	}
-	return result
+	return result, nil
 }
 
 func (c GitHubCLI) view(ctx context.Context, repository, selector string) (PullRequest, error) {
-	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "pr", "view", selector, "--repo", repository, "--json", "number,headRefOid,state,mergeStateStatus,isInMergeQueue")
+	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "pr", "view", selector, "--repo", repository, "--json", "number,headRefOid,state,mergeStateStatus")
 	if err != nil {
 		return PullRequest{}, fmt.Errorf("read pull request: %w", err)
 	}
@@ -136,7 +177,7 @@ func (c GitHubCLI) view(ctx context.Context, repository, selector string) (PullR
 	if err := json.Unmarshal([]byte(output), &pull); err != nil {
 		return PullRequest{}, fmt.Errorf("decode pull request: %w", err)
 	}
-	return pull.pullRequest(), nil
+	return c.enrich(ctx, repository, pull)
 }
 
 func (c GitHubCLI) gh() string {

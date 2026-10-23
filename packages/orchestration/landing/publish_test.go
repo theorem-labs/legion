@@ -10,7 +10,7 @@ import (
 
 func TestPublishLandsMergedCandidateAfterQueueConfirmation(t *testing.T) {
 	ledger := &ledgerFake{}
-	github := &githubFake{wait: PullRequest{Number: 7, Head: "candidate", State: PullRequestMerged}}
+	github := &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}}
 	score := &scoreFake{output: "score"}
 	events := &eventsFake{}
 	runner := Runner{Store: &storeFake{}, Ledger: ledger, GitHub: github, Score: score, Events: events}
@@ -127,10 +127,14 @@ func (f *scoreFake) Commit(context.Context, string, string, string, string) erro
 	return nil
 }
 
-type eventsFake struct{ members []string }
+type eventsFake struct {
+	members []string
+	commits []string
+}
 
 func (f *eventsFake) Publish(_ context.Context, event LandingEvent) error {
 	f.members = append(f.members, event.Member)
+	f.commits = append(f.commits, event.Commit)
 	return nil
 }
 

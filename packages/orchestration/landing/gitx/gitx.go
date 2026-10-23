@@ -43,6 +43,10 @@ type Change struct {
 // Candidate merges members in order onto base. It records conflicting members and
 // members carrying a rejected head without modifying the repository worktree.
 func Candidate(ctx context.Context, repo, base string, members []Member) (Result, error) {
+	return candidate(ctx, repo, base, members, nil)
+}
+
+func candidate(ctx context.Context, repo, base string, members []Member, excludedHeads []string) (Result, error) {
 	base, err := revision(ctx, repo, base)
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve base: %w", err)
@@ -53,7 +57,7 @@ func Candidate(ctx context.Context, repo, base string, members []Member) (Result
 	}
 	result := Result{Tree: tree, Commit: base}
 	seen := make(map[string]struct{}, len(members))
-	var rejected []string
+	rejected := append([]string(nil), excludedHeads...)
 	for _, member := range members {
 		head, err := revision(ctx, repo, member.Head)
 		if err != nil {
@@ -98,12 +102,19 @@ func Candidate(ctx context.Context, repo, base string, members []Member) (Result
 // Rebuild creates the candidate without the members whose identifiers are in without.
 func Rebuild(ctx context.Context, repo, base string, members []Member, without map[string]struct{}) (Result, error) {
 	kept := make([]Member, 0, len(members))
+	excludedHeads := make([]string, 0, len(without))
 	for _, member := range members {
-		if _, excluded := without[member.ID]; !excluded {
-			kept = append(kept, member)
+		if _, excluded := without[member.ID]; excluded {
+			head, err := revision(ctx, repo, member.Head)
+			if err != nil {
+				return Result{}, fmt.Errorf("resolve excluded member %q: %w", member.ID, err)
+			}
+			excludedHeads = append(excludedHeads, head)
+			continue
 		}
+		kept = append(kept, member)
 	}
-	return Candidate(ctx, repo, base, kept)
+	return candidate(ctx, repo, base, kept, excludedHeads)
 }
 
 // ChangeSet returns the files and merge-base range that a member contributes.

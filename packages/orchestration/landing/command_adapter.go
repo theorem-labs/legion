@@ -4,8 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +24,7 @@ type CommandLedger struct {
 	CheckCommand  []string
 	LandCommand   []string
 	ReturnCommand []string
+	StatusCommand []string
 }
 
 func (l CommandLedger) Check(ctx context.Context, repository, migration string, generation int64, changed []string, hashes map[string]string) (CheckResult, error) {
@@ -33,24 +32,31 @@ func (l CommandLedger) Check(ctx context.Context, repository, migration string, 
 	if err != nil {
 		return CheckResult{}, fmt.Errorf("run ledger check: %w", err)
 	}
-	if strings.TrimSpace(output) == "" {
-		return CheckResult{}, nil
+	var wire struct {
+		Pass   *bool  `json:"pass"`
+		Reason string `json:"reason"`
 	}
-	var result CheckResult
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		return CheckResult{}, fmt.Errorf("decode ledger check: %w", err)
+	if err := json.Unmarshal([]byte(output), &wire); err != nil || wire.Pass == nil {
+		if err != nil {
+			return CheckResult{}, fmt.Errorf("decode ledger check: %w", err)
+		}
+		return CheckResult{}, fmt.Errorf("decode ledger check: missing pass decision")
 	}
-	return result, nil
+	return CheckResult{Refused: !*wire.Pass, Reason: wire.Reason}, nil
 }
 
-func (l CommandLedger) Land(ctx context.Context, repository, migration string, generation int64, commit string, changed map[string]string, approved []string) error {
-	env := ledgerEnvironment(repository, migration, generation, nil, changed)
-	env = append(env, "LAND_COMMIT="+commit)
-	approvedJSON, err := json.Marshal(approved)
+func (l CommandLedger) Land(ctx context.Context, request LandRequest) error {
+	env := ledgerEnvironment(request.Repo, request.Migration, request.Generation, request.ChangedPaths, request.Current)
+	env = append(env, "LAND_COMMIT="+request.Commit)
+	changedContracts, err := json.Marshal(request.ChangedContracts)
+	if err != nil {
+		return fmt.Errorf("encode changed contracts: %w", err)
+	}
+	approvedJSON, err := json.Marshal(request.ApprovedPinned)
 	if err != nil {
 		return fmt.Errorf("encode approvals: %w", err)
 	}
-	env = append(env, "LAND_APPROVED_PINNED="+string(approvedJSON))
+	env = append(env, "LAND_CHANGED_CONTRACTS="+string(changedContracts), "LAND_APPROVED_PINNED="+string(approvedJSON))
 	if _, err := runLandingCommand(ctx, l.Directory, l.LandCommand, env); err != nil {
 		return fmt.Errorf("run ledger land: %w", err)
 	}
@@ -64,6 +70,31 @@ func (l CommandLedger) ReturnMember(ctx context.Context, repository, migration s
 		return fmt.Errorf("run ledger return: %w", err)
 	}
 	return nil
+}
+
+func (l CommandLedger) OperationComplete(ctx context.Context, operation Operation) (bool, error) {
+	if len(l.StatusCommand) == 0 {
+		return false, nil
+	}
+	output, err := runLandingCommand(ctx, l.Directory, l.StatusCommand, []string{
+		"LAND_OPERATION=" + operation.Key,
+		"LAND_OPERATION_KIND=" + operation.Kind,
+		"LAND_MEMBER=" + operation.Member,
+		"LAND_COMMIT=" + operation.Commit,
+	})
+	if err != nil {
+		return false, fmt.Errorf("read operation status: %w", err)
+	}
+	var wire struct {
+		Complete *bool `json:"complete"`
+	}
+	if err := json.Unmarshal([]byte(output), &wire); err != nil || wire.Complete == nil {
+		if err != nil {
+			return false, fmt.Errorf("decode operation status: %w", err)
+		}
+		return false, fmt.Errorf("decode operation status: missing complete decision")
+	}
+	return *wire.Complete, nil
 }
 
 func ledgerEnvironment(repository, migration string, generation int64, changed []string, hashes map[string]string) []string {
@@ -106,33 +137,143 @@ func (b CommandBuilder) Build(ctx context.Context, tree Tree, modules []string) 
 		"LAND_MODULES=" + strings.Join(modules, " "),
 	})
 	if err != nil {
-		return blame.BuildResult{Green: false, Output: commandOutput(err)}, nil
+		result := blame.BuildResult{Green: false, Output: commandOutput(err)}
+		result.InfraClass = classifyInfrastructure(ctx, err)
+		return result, nil
 	}
 	return blame.BuildResult{Green: true, Output: output}, nil
 }
 
-// CommandHasher hashes every configured declaration's matching source lines at
-// an immutable tree.
+// CommandHasher delegates exact statement hashing to a configured repository command.
+// The command receives LAND_TREE and LAND_NAMES JSON and prints name<TAB>hash lines.
 type CommandHasher struct {
-	RepositoryPath string
+	Command   []string
+	Directory string
 }
 
 func (h CommandHasher) Hashes(ctx context.Context, tree Tree, names []string) (map[string]string, error) {
-	hashes := make(map[string]string, len(names))
+	namesJSON, err := json.Marshal(names)
+	if err != nil {
+		return nil, fmt.Errorf("encode declaration names: %w", err)
+	}
+	output, err := runLandingCommand(ctx, h.Directory, h.Command, []string{
+		"LAND_TREE=" + string(tree),
+		"LAND_NAMES=" + string(namesJSON),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("run statement hasher: %w", err)
+	}
+	wanted := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		command := exec.CommandContext(ctx, "git", "-C", h.RepositoryPath, "grep", "-h", "-I", "-F", name, string(tree), "--")
-		output, err := command.CombinedOutput()
-		if err != nil {
-			var exit *exec.ExitError
-			if !errors.As(err, &exit) || exit.ExitCode() != 1 {
-				return nil, fmt.Errorf("read declaration %q: %w", name, err)
-			}
-			output = nil
+		wanted[name] = struct{}{}
+	}
+	hashes := make(map[string]string, len(names))
+	for lineNumber, line := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
+		if line == "" {
+			continue
 		}
-		digest := sha256.Sum256(output)
-		hashes[name] = hex.EncodeToString(digest[:])
+		name, hash, found := strings.Cut(line, "\t")
+		if !found || name == "" || hash == "" {
+			return nil, fmt.Errorf("statement hasher line %d is not name and hash", lineNumber+1)
+		}
+		if _, wanted := wanted[name]; !wanted {
+			return nil, fmt.Errorf("statement hasher returned undeclared name %q", name)
+		}
+		if _, duplicate := hashes[name]; duplicate {
+			return nil, fmt.Errorf("statement hasher returned %q more than once", name)
+		}
+		hashes[name] = hash
+	}
+	for _, name := range names {
+		if hashes[name] == "" {
+			return nil, fmt.Errorf("statement hasher omitted %q", name)
+		}
 	}
 	return hashes, nil
+}
+
+// CommandScorer runs configured score and score-commit commands.
+type CommandScorer struct {
+	Directory     string
+	ScoreCommand  []string
+	CommitCommand []string
+	StatusCommand []string
+}
+
+func (s CommandScorer) Score(ctx context.Context, commit, part string) (string, error) {
+	output, err := runLandingCommand(ctx, s.Directory, s.ScoreCommand, []string{
+		"LAND_COMMIT=" + commit,
+		"LAND_PART=" + part,
+	})
+	if err != nil {
+		return "", fmt.Errorf("run score: %w", err)
+	}
+	return strings.TrimSpace(output), nil
+}
+
+func (s CommandScorer) Commit(ctx context.Context, repository, commit, path, output string) error {
+	_, err := runLandingCommand(ctx, s.Directory, s.CommitCommand, []string{
+		"LAND_REPOSITORY=" + repository,
+		"LAND_COMMIT=" + commit,
+		"LAND_SCORE_PATH=" + path,
+		"LAND_SCORE_OUTPUT=" + output,
+	})
+	if err != nil {
+		return fmt.Errorf("commit score: %w", err)
+	}
+	return nil
+}
+
+func (s CommandScorer) OperationComplete(ctx context.Context, operation Operation) (bool, error) {
+	return commandOperationComplete(ctx, s.Directory, s.StatusCommand, operation)
+}
+
+// CommandEvents publishes configured member events after a durable merge.
+type CommandEvents struct {
+	Directory     string
+	Command       []string
+	StatusCommand []string
+}
+
+func (e CommandEvents) Publish(ctx context.Context, event LandingEvent) error {
+	_, err := runLandingCommand(ctx, e.Directory, e.Command, []string{
+		"LAND_BATCH=" + event.Batch,
+		"LAND_MEMBER=" + event.Member,
+		"LAND_COMMIT=" + event.Commit,
+	})
+	if err != nil {
+		return fmt.Errorf("publish event: %w", err)
+	}
+	return nil
+}
+
+func (e CommandEvents) OperationComplete(ctx context.Context, operation Operation) (bool, error) {
+	return commandOperationComplete(ctx, e.Directory, e.StatusCommand, operation)
+}
+
+func commandOperationComplete(ctx context.Context, directory string, command []string, operation Operation) (bool, error) {
+	if len(command) == 0 {
+		return false, nil
+	}
+	output, err := runLandingCommand(ctx, directory, command, []string{
+		"LAND_OPERATION=" + operation.Key,
+		"LAND_OPERATION_KIND=" + operation.Kind,
+		"LAND_MEMBER=" + operation.Member,
+		"LAND_COMMIT=" + operation.Commit,
+	})
+	if err != nil {
+		return false, err
+	}
+	var wire struct {
+		Complete *bool `json:"complete"`
+	}
+	if err := json.Unmarshal([]byte(output), &wire); err != nil || wire.Complete == nil {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("operation status has no complete decision")
+	}
+	return *wire.Complete, nil
 }
 
 func runLandingCommand(ctx context.Context, directory string, command, environment []string) (string, error) {
@@ -168,6 +309,26 @@ func commandOutput(err error) string {
 	return err.Error()
 }
 
+func classifyInfrastructure(ctx context.Context, err error) string {
+	if ctx.Err() != nil {
+		return "timeout"
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		return "launch"
+	}
+	switch exit.ExitCode() {
+	case -1:
+		return "killed"
+	case 124:
+		return "timeout"
+	case 125, 137:
+		return "resource-kill"
+	default:
+		return ""
+	}
+}
+
 func extractCandidateTar(directory string, archive []byte) error {
 	reader := tar.NewReader(bytes.NewReader(archive))
 	for {
@@ -183,6 +344,8 @@ func extractCandidateTar(directory string, archive []byte) error {
 			return fmt.Errorf("candidate archive path escapes destination")
 		}
 		switch header.Typeflag {
+		case tar.TypeXGlobalHeader, tar.TypeXHeader:
+			continue
 		case tar.TypeDir:
 			if err := os.MkdirAll(path, os.FileMode(header.Mode)); err != nil {
 				return fmt.Errorf("create candidate directory: %w", err)
@@ -203,6 +366,22 @@ func extractCandidateTar(directory string, archive []byte) error {
 			if closeErr != nil {
 				return fmt.Errorf("close candidate file: %w", closeErr)
 			}
+		case tar.TypeSymlink:
+			if filepath.IsAbs(header.Linkname) {
+				return fmt.Errorf("candidate archive has absolute symlink %q", header.Name)
+			}
+			target := filepath.Clean(filepath.Join(filepath.Dir(path), header.Linkname))
+			if !strings.HasPrefix(target, directory+string(os.PathSeparator)) {
+				return fmt.Errorf("candidate archive symlink escapes destination")
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return fmt.Errorf("create candidate symlink parent: %w", err)
+			}
+			if err := os.Symlink(header.Linkname, path); err != nil {
+				return fmt.Errorf("create candidate symlink: %w", err)
+			}
+		default:
+			return fmt.Errorf("candidate archive has unsupported entry %q", header.Name)
 		}
 	}
 }

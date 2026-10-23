@@ -16,6 +16,24 @@ type JSONStore struct {
 	mu   sync.Mutex
 }
 
+// Create writes a batch only when its identity is absent.
+func (s *JSONStore) Create(_ context.Context, batch Batch) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batches, err := s.read()
+	if err != nil {
+		return false, err
+	}
+	if _, found := batches[batch.ID]; found {
+		return false, nil
+	}
+	batches[batch.ID] = cloneBatch(batch)
+	if err := s.write(batches); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Save writes the complete batch set atomically.
 func (s *JSONStore) Save(_ context.Context, batch Batch) error {
 	s.mu.Lock()

@@ -65,12 +65,12 @@ type Report struct {
 }
 
 var (
-	buildingRE     = regexp.MustCompile(`^✖ \[[0-9]+/[0-9]+\] (?:Building|Running|Compiling) (\S+)$`)
+	buildingRE     = regexp.MustCompile(`^✖ \[[0-9]+/[0-9]+\] (?:Building|Running|Compiling) (\S+)`)
 	errorRE        = regexp.MustCompile(`^error: (?:\./)?([^:\s]+\.lean):[0-9]+:[0-9]+: ?(.*)$`)
 	importRE       = regexp.MustCompile(`\bimport (\S+) failed`)
 	blockEndRE     = regexp.MustCompile(`^(?:error:|warning:|info:|trace:|✔|✖|⚠|\[|-- build round|Build completed|Some required|Some builds)`)
 	identifier     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.'!?-]*$`)
-	declarationRE  = regexp.MustCompile(`^\s*(?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*(?:def|theorem|lemma|structure|class|inductive|abbrev|instance|axiom|opaque|notation|macro|syntax|macro_rules|elab|alias)\s+([^\s(:{\[⟨]+)`)
+	declarationRE  = regexp.MustCompile(`^\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*(?:def|theorem|lemma|structure|class|inductive|abbrev|instance|axiom|opaque|notation|macro|syntax|macro_rules|elab|alias)\s+([^\s(:{\[⟨]+)`)
 	namespaceRE    = regexp.MustCompile(`^\s*(?:namespace|end)\s+([A-Za-z_][A-Za-z0-9_.'«»-]*)\s*$`)
 	fieldRE        = regexp.MustCompile(`^\s+([A-Za-z_][A-Za-z0-9_']*)\s*:`)
 	hunkRE         = regexp.MustCompile(`^@@ [^@]*@@ ?(.*)$`)
@@ -82,6 +82,7 @@ var (
 	applicationRE  = regexp.MustCompile("(?s)(?:in the application|type expected, got)\\s*\\n\\s*\\(?@?([A-Za-z_][A-Za-z0-9_.'!?-]*)")
 	weakTypeRE     = regexp.MustCompile("(?s)(?:has type|expected to have type)\\s*\\n\\s*\\(?@?([A-Z][A-Za-z0-9_.'!?-]*)")
 	fieldsMissing  = regexp.MustCompile("Fields missing: ((?:`[^`]+`(?:, )?)+)")
+	privateCtorRE  = regexp.MustCompile("(?i)(?:Constructor for|from structure) `_private\\.[^`]*?\\.0\\.([^`]+)` is private|Constructor for `_private\\.[^`]*?\\.0\\.([^`]+)` is marked as private")
 )
 
 var noise = map[string]struct{}{
@@ -127,6 +128,9 @@ func Parse(log string, roots []string) Report {
 			flush()
 			module := moduleOfPath(match[1])
 			addRed(module)
+			for _, importMatch := range importRE.FindAllStringSubmatch(match[2], -1) {
+				addRed(importMatch[1])
+			}
 			if underRoots(module, rootSet) {
 				current = &Block{Module: module, Path: match[1], Message: match[2]}
 			}
@@ -159,6 +163,13 @@ func Names(block string) []Name {
 		}
 	}
 	addAll(unknownRE.FindAllStringSubmatch(block, -1), Unknown)
+	for _, match := range privateCtorRE.FindAllStringSubmatch(block, -1) {
+		for _, value := range match[1:] {
+			if value != "" {
+				addName(&found, value, Unknown)
+			}
+		}
+	}
 	addAll(addedRE.FindAllStringSubmatch(block, -1), Added)
 	addAll(fieldOfRE.FindAllStringSubmatch(block, -1), Changed)
 	addAll(invalidFieldRE.FindAllStringSubmatch(block, -1), Changed)
@@ -226,6 +237,9 @@ func IndexDiff(diff string) Evidence {
 	for _, line := range strings.Split(diff, "\n") {
 		if match := hunkRE.FindStringSubmatch(line); match != nil {
 			scope = declarationName(match[1])
+			if scope != "" {
+				evidence.Inside[scope] = struct{}{}
+			}
 			continue
 		}
 		if len(line) == 0 || (line[0] != '+' && line[0] != '-') || strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
@@ -385,7 +399,7 @@ func Pick(rows []Row) Selection {
 		sort.Slice(strong, func(i, j int) bool { return strong[i].Member < strong[j].Member })
 		return Selection{Strength: 3, Members: strong}
 	}
-	if len(rows) > 3 {
+	if len(rows) > 5 {
 		return Selection{Note: "too many weak matches"}
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -394,6 +408,9 @@ func Pick(rows []Row) Selection {
 		}
 		return rows[i].Member < rows[j].Member
 	})
+	if len(rows) > 3 {
+		rows = rows[:3]
+	}
 	return Selection{Strength: rows[0].Strength, Members: rows}
 }
 
@@ -486,15 +503,72 @@ func anyOutside(left, right map[string]struct{}) bool {
 	return false
 }
 
-// Identify returns evidence-backed members only. It deliberately has no import
-// closure input: touching a failed module's closure is never enough to blame a member.
+// TreeLines gives declaration lines at the frozen base and candidate tree.
+type TreeLines struct {
+	Base      []string
+	Candidate []string
+}
+
+// Attribution is one evidence-backed selection for a module diagnostic.
+type Attribution struct {
+	Module   string
+	Name     string
+	Kind     Kind
+	Member   string
+	Strength int
+	Evidence string
+}
+
+// Identify returns the unique members selected by IdentifyDetailed. The line
+// slices apply to every name for compatibility with callers that have one pair.
 func Identify(report Report, evidence map[string]Evidence, baseLines, candidateLines []string) []string {
-	culprits := map[string]struct{}{}
+	lines := make(map[string]TreeLines)
 	for _, block := range report.Blocks {
-		names := Names(block.Message)
-		selections := make([]Selection, 0, len(names))
+		for _, name := range Names(block.Message) {
+			lines[name.Value] = TreeLines{Base: baseLines, Candidate: candidateLines}
+		}
+	}
+	attributions := IdentifyDetailed(report, evidence, lines)
+	members := make(map[string]struct{}, len(attributions))
+	for _, attribution := range attributions {
+		members[attribution.Member] = struct{}{}
+	}
+	out := make([]string, 0, len(members))
+	for member := range members {
+		out = append(out, member)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// IdentifyDetailed attributes each module independently and retains exact
+// diagnostic evidence for every selected member.
+func IdentifyDetailed(report Report, evidence map[string]Evidence, lines map[string]TreeLines) []Attribution {
+	byModule := make(map[string][]Name)
+	for _, block := range report.Blocks {
+		seen := make(map[string]struct{}, len(byModule[block.Module]))
+		for _, name := range byModule[block.Module] {
+			seen[name.Value] = struct{}{}
+		}
+		for _, name := range Names(block.Message) {
+			if _, found := seen[name.Value]; found {
+				continue
+			}
+			seen[name.Value] = struct{}{}
+			byModule[block.Module] = append(byModule[block.Module], name)
+		}
+	}
+	modules := make([]string, 0, len(byModule))
+	for module := range byModule {
+		modules = append(modules, module)
+	}
+	sort.Strings(modules)
+	var out []Attribution
+	for _, module := range modules {
+		names := byModule[module]
+		selections := make([]Selection, len(names))
 		hasPrimary := false
-		for _, name := range names {
+		for index, name := range names {
 			rows := make([]Row, 0, len(evidence))
 			for member, memberEvidence := range evidence {
 				strength, label := EvidenceFor(name, memberEvidence)
@@ -502,87 +576,175 @@ func Identify(report Report, evidence map[string]Evidence, baseLines, candidateL
 					rows = append(rows, Row{Member: member, Strength: strength, Label: label})
 				}
 			}
-			rows = AgainstTree(name.Value, rows, evidence, baseLines, candidateLines)
+			treeLines := lines[name.Value]
+			rows = AgainstTree(name.Value, rows, evidence, treeLines.Base, treeLines.Candidate)
 			selection := Pick(rows)
-			if selection.Strength != 0 && name.Kind != Weak && name.Kind != Field {
+			selections[index] = selection
+			if selection.Strength != 0 && primary(name.Kind) {
 				hasPrimary = true
 			}
-			selections = append(selections, selection)
 		}
 		for index, selection := range selections {
-			if hasPrimary && (names[index].Kind == Weak || names[index].Kind == Field) {
+			if hasPrimary && !primary(names[index].Kind) {
 				continue
 			}
 			for _, row := range selection.Members {
-				culprits[row.Member] = struct{}{}
+				out = append(out, Attribution{
+					Module:   module,
+					Name:     names[index].Value,
+					Kind:     names[index].Kind,
+					Member:   row.Member,
+					Strength: row.Strength,
+					Evidence: row.Label,
+				})
 			}
 		}
 	}
-	out := make([]string, 0, len(culprits))
-	for member := range culprits {
-		out = append(out, member)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Member != out[j].Member {
+			return out[i].Member < out[j].Member
+		}
+		if out[i].Module != out[j].Module {
+			return out[i].Module < out[j].Module
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func primary(kind Kind) bool {
+	return kind == Unknown || kind == Added || kind == Changed
+}
+
+// DeclarationLinesFor keeps only declaration lines that name the requested
+// declaration, filtering arbitrary matches before tree comparison.
+func DeclarationLinesFor(name string, lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		declaration := declarationName(line)
+		if declaration != "" && nameMatches(name, declaration) {
+			out = append(out, normaliseLine(line))
+		}
 	}
-	sort.Strings(out)
 	return out
 }
 
 // Confirmation is the result of building named members alone or isolating a
 // prefix failure when none of the named members fails alone.
 type Confirmation struct {
-	Confirmed []string
-	Bisected  []string
+	Confirmed  []string
+	Bisected   []string
+	ByModule   map[string][]Culprit
+	BaseBroken []string
 }
 
-// Confirm builds each named member on the base and confirms only red members.
-// If no member is confirmed, it locates the first red prefix member.
+// Culprit records how confirmation identified a member for one module.
+type Culprit struct {
+	Member string
+	Kind   string
+}
+
+// Confirm preserves the original aggregate API. New callers should use
+// ConfirmModules so every red module is independently resolved.
 func Confirm(ctx context.Context, base string, modules []string, members []Member, named []string, candidate Candidate, builder Builder) (Confirmation, error) {
+	suspects := make(map[string][]string, len(modules))
+	for _, module := range modules {
+		suspects[module] = append([]string(nil), named...)
+	}
+	return ConfirmModules(ctx, base, modules, members, suspects, candidate, builder)
+}
+
+// ConfirmModules checks the base, red-alone suspects, and prefix bisection for
+// every red module. A confirmation in one module never hides another module.
+func ConfirmModules(ctx context.Context, base string, modules []string, members []Member, suspects map[string][]string, candidate Candidate, builder Builder) (Confirmation, error) {
 	byID := make(map[string]Member, len(members))
 	for _, member := range members {
 		byID[member.ID] = member
 	}
-	confirmation := Confirmation{}
-	for _, id := range named {
-		member, found := byID[id]
-		if !found {
+	out := Confirmation{ByModule: make(map[string][]Culprit)}
+	for _, module := range modules {
+		baseTree, err := candidate(ctx, base, nil)
+		if err != nil {
+			return Confirmation{}, fmt.Errorf("build base for %q: %w", module, err)
+		}
+		baseRed, err := isRed(ctx, builder, baseTree, []string{module})
+		if err != nil {
+			return Confirmation{}, fmt.Errorf("check base for %q: %w", module, err)
+		}
+		if baseRed {
+			out.BaseBroken = append(out.BaseBroken, module)
 			continue
 		}
-		tree, err := candidate(ctx, base, []Member{member})
-		if err != nil {
-			return Confirmation{}, fmt.Errorf("build candidate for %q: %w", id, err)
+		for _, id := range suspects[module] {
+			member, found := byID[id]
+			if !found {
+				continue
+			}
+			tree, err := candidate(ctx, base, []Member{member})
+			if err != nil {
+				return Confirmation{}, fmt.Errorf("build candidate for %q in %q: %w", id, module, err)
+			}
+			red, err := isRed(ctx, builder, tree, []string{module})
+			if err != nil {
+				return Confirmation{}, fmt.Errorf("confirm %q in %q: %w", id, module, err)
+			}
+			if red {
+				out.ByModule[module] = append(out.ByModule[module], Culprit{Member: id, Kind: "evidence"})
+			}
 		}
-		red, err := isRed(ctx, builder, tree, modules)
-		if err != nil {
-			return Confirmation{}, fmt.Errorf("confirm %q: %w", id, err)
+		if len(out.ByModule[module]) != 0 {
+			continue
 		}
-		if red {
-			confirmation.Confirmed = append(confirmation.Confirmed, id)
+		culprit, found, err := bisectModule(ctx, base, module, members, candidate, builder)
+		if err != nil {
+			return Confirmation{}, err
+		}
+		if found {
+			out.ByModule[module] = append(out.ByModule[module], Culprit{Member: culprit, Kind: "bisect"})
 		}
 	}
-	if len(confirmation.Confirmed) != 0 {
-		sort.Strings(confirmation.Confirmed)
-		return confirmation, nil
+	for module, culprits := range out.ByModule {
+		sort.Slice(culprits, func(i, j int) bool { return culprits[i].Member < culprits[j].Member })
+		out.ByModule[module] = culprits
+		for _, culprit := range culprits {
+			if culprit.Kind == "evidence" {
+				out.Confirmed = append(out.Confirmed, culprit.Member)
+			} else {
+				out.Bisected = append(out.Bisected, culprit.Member)
+			}
+		}
+	}
+	sort.Strings(out.Confirmed)
+	sort.Strings(out.Bisected)
+	sort.Strings(out.BaseBroken)
+	return out, nil
+}
+
+func bisectModule(ctx context.Context, base, module string, members []Member, candidate Candidate, builder Builder) (string, bool, error) {
+	if len(members) == 0 {
+		return "", false, nil
 	}
 	allTree, err := candidate(ctx, base, members)
 	if err != nil {
-		return Confirmation{}, fmt.Errorf("build full candidate: %w", err)
+		return "", false, fmt.Errorf("build full candidate for %q: %w", module, err)
 	}
-	red, err := isRed(ctx, builder, allTree, modules)
+	red, err := isRed(ctx, builder, allTree, []string{module})
 	if err != nil {
-		return Confirmation{}, fmt.Errorf("check full candidate: %w", err)
+		return "", false, fmt.Errorf("check full candidate for %q: %w", module, err)
 	}
-	if !red || len(members) == 0 {
-		return confirmation, nil
+	if !red {
+		return "", false, nil
 	}
 	lower, upper := 0, len(members)
 	for upper-lower > 1 {
 		middle := (lower + upper) / 2
 		tree, err := candidate(ctx, base, members[:middle])
 		if err != nil {
-			return Confirmation{}, fmt.Errorf("build prefix %d: %w", middle, err)
+			return "", false, fmt.Errorf("build prefix %d for %q: %w", middle, module, err)
 		}
-		red, err := isRed(ctx, builder, tree, modules)
+		red, err := isRed(ctx, builder, tree, []string{module})
 		if err != nil {
-			return Confirmation{}, fmt.Errorf("check prefix %d: %w", middle, err)
+			return "", false, fmt.Errorf("check prefix %d for %q: %w", middle, module, err)
 		}
 		if red {
 			upper = middle
@@ -590,8 +752,7 @@ func Confirm(ctx context.Context, base string, modules []string, members []Membe
 			lower = middle
 		}
 	}
-	confirmation.Bisected = []string{members[upper-1].ID}
-	return confirmation, nil
+	return members[upper-1].ID, true, nil
 }
 
 func isRed(ctx context.Context, builder Builder, tree Tree, modules []string) (bool, error) {
