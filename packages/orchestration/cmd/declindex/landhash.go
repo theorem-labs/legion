@@ -161,7 +161,7 @@ func validTreeID(tree string) bool {
 func landNames(getenv func(string) string) ([]string, error) {
 	fromEnv := []byte(getenv("LAND_NAMES"))
 	file := strings.TrimSpace(getenv("LAND_NAMES_FILE"))
-	hasEnv := len(bytes.TrimSpace(fromEnv)) != 0
+	hasEnv := len(fromEnv) != 0
 	hasFile := file != ""
 	if !hasEnv && !hasFile {
 		return nil, fmt.Errorf("one of LAND_NAMES or LAND_NAMES_FILE is required")
