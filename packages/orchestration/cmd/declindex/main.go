@@ -18,7 +18,7 @@ import (
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
-const usage = "usage: declindex --config FILE [--db FILE] [--json] <refresh|status|where|users|hash|states|same> ..."
+const usage = "usage: declindex --config FILE [--db FILE] [--json] <refresh|status|where|users|hash|states|same|gate|ledger> ..."
 
 const help = usage + `
 
@@ -33,6 +33,11 @@ Commands:
   states CONCEPT...            the statements that state a registered concept's fact: directly, through a
                                definition they apply (via:<definition>), or by using the concept (uses)
   same NAME...                 the declarations whose statements share a relation atom with NAME's statement
+  gate PROPOSAL.json           the similarity gate: refuse an exact duplicate (exit 1), send a near match to
+                               the librarian (exit 4), or add the concept to the registry (exit 0); JSON
+                               {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>}
+  ledger [--dsn-file PATH]     after a landing: register new contracts in the ledger (LEDGER_DSN), and report
+                               each contract whose ledger hash is not the index's (exit 1)
 
 NAME is a full name or any dotted suffix of one. A name declared twice is answered once per declaration.
 Exit codes: 0 answered, 1 a name not found, 2 usage, 3 unable to check (no index, unreadable configuration).`
@@ -110,7 +115,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if cfg.DB == "" {
 		return fail(stderr, &usageError{declindex.ErrNoDB.Error()})
 	}
-	return commands[cmd](ctx, &env{g: g, cfg: cfg, stdout: stdout, stderr: stderr}, rest)
+	return commands[cmd](ctx, &env{g: g, cfg: cfg, stdout: stdout, stderr: stderr, getenv: getenv}, rest)
 }
 
 type env struct {
@@ -118,6 +123,7 @@ type env struct {
 	cfg    declindex.Config
 	stdout io.Writer
 	stderr io.Writer
+	getenv func(string) string
 	store  *declindex.Store
 }
 
@@ -156,6 +162,8 @@ func init() {
 		"hash":    cmdHash,
 		"states":  cmdStates,
 		"same":    cmdSame,
+		"gate":    cmdGate,
+		"ledger":  cmdLedger,
 	}
 }
 

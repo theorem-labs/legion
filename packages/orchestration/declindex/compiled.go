@@ -62,6 +62,54 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 	return &x, m, src, nil
 }
 
+// Export reads the given compiled modules with the registry's forms: the gate's view of a proposal. extra lists
+// further library directories (the proposal's) and roots the project's roots plus the proposal's.
+func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, extra []string) ([]Constant, error) {
+	x, m, _, err := co.prepare(ctx, roots)
+	if err != nil {
+		return nil, err
+	}
+	x.SearchPath = append(append([]string(nil), x.SearchPath...), extra...)
+	m.Modules = modules
+	return x.Run(ctx, m)
+}
+
+// SameCompiled lists the declarations (generated constants counted as their declaration) whose compiled
+// statement hash is hash: exact restatements.
+func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM consts WHERE cstmt = ? ORDER BY name`, hash)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	o := &owners{s: s, cache: map[string]Found{}}
+	seen := map[string]bool{}
+	var out []Found
+	for _, n := range names {
+		f, err := o.of(ctx, n)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[f.Name] {
+			seen[f.Name] = true
+			out = append(out, f)
+		}
+	}
+	return out, nil
+}
+
 // refreshCompiled re-reads the compiled modules whose .olean changed (all of them when the exporter or the
 // forms changed), then the statements that a changed definition reaches, since a definition's facts pass to
 // every statement that applies it.

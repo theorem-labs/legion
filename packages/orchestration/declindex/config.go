@@ -32,6 +32,8 @@ type Config struct {
 	Owners    string       `yaml:"owners"`
 	// Repo is the repository's name in the ledger.
 	Repo string `yaml:"repo"`
+	// Librarian is the command that hands a near match to the librarian (the proposal and verdict on stdin).
+	Librarian []string `yaml:"librarian"`
 }
 
 // LeanConfig says how to build and run the exporter.
@@ -122,8 +124,10 @@ func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) 
 		return nil, err
 	}
 	search := append([]string{c.Lib}, c.Lean.SearchPath...)
-	deps, _ := filepath.Glob(filepath.Join(c.Tree, ".lake", "packages", "*", ".lake", "build", "lib", "lean"))
-	search = append(search, deps...)
+	for _, pattern := range []string{"*", "*/*"} {
+		deps, _ := filepath.Glob(filepath.Join(c.Tree, ".lake", "packages", pattern, ".lake", "build", "lib", "lean"))
+		search = append(search, deps...)
+	}
 	jobs := c.Lean.Jobs
 	if jobs == 0 {
 		jobs = c.Jobs

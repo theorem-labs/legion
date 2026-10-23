@@ -117,8 +117,13 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 			targets = append(targets, "+"+m+":c.o.export")
 		}
 	}
+	// Lake compiles with its own bundled compiler and flags unless a compiler is configured (a toolchain built from
+	// source has none bundled).
+	env := l.env(nil)
+	if cc != "" {
+		env = append(env, "LEAN_CC="+cc)
+	}
 	cc = linker(l, cc)
-	env := append(l.env(nil), "LEAN_CC="+cc)
 	if err := run(ctx, dir, env, l.bin("lake"), append([]string{"build"}, targets...)...); err != nil {
 		return "", fmt.Errorf("build the exporter: %w", err)
 	}
@@ -263,12 +268,16 @@ func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
 	results := make([][]Constant, len(chunks))
 	errs := make([]error, len(chunks))
 	var mu sync.Mutex
+	done := 0
 	parallel(len(chunks), max(1, x.Jobs), func(i int) {
 		mm := m
 		mm.Modules = chunks[i]
 		results[i], errs[i] = x.runOne(ctx, mm)
 		mu.Lock()
-		logf(x.Log, "exporter: %d of %d module groups read", countDone(results), len(chunks))
+		done++
+		if errs[i] == nil && (done%10 == 0 || done == len(chunks)) {
+			logf(x.Log, "exporter: %d of %d module groups done", done, len(chunks))
+		}
 		mu.Unlock()
 	})
 	if err := errors.Join(errs...); err != nil {
@@ -279,16 +288,6 @@ func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
 		out = append(out, r...)
 	}
 	return out, nil
-}
-
-func countDone(rs [][]Constant) int {
-	n := 0
-	for _, r := range rs {
-		if r != nil {
-			n++
-		}
-	}
-	return n
 }
 
 func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {

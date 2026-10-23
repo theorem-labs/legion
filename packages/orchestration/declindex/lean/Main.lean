@@ -22,7 +22,19 @@ structure Manifest where
   budget : Nat := 3000000
   deriving FromJson
 
-def toName (s : String) : Name := (s.splitOn ".").foldl (fun n p => Name.mkStr n p) .anonymous
+/-- A dotted name as Lean prints it: a component in `«…»` may hold dots and other characters. -/
+def toName (s : String) : Name := Id.run do
+  let mut n : Name := .anonymous
+  let mut cur := ""
+  let mut quoted := false
+  for c in s.toList do
+    if c == '«' then quoted := true
+    else if c == '»' then quoted := false
+    else if c == '.' && !quoted then
+      n := Name.mkStr n cur
+      cur := ""
+    else cur := cur.push c
+  return Name.mkStr n cur
 
 def kindOf : ConstantInfo → String
   | .defnInfo _ => "def" | .thmInfo _ => "theorem" | .inductInfo _ => "inductive" | .ctorInfo _ => "ctor"

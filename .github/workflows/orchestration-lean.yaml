@@ -1,0 +1,56 @@
+name: orchestration-lean
+
+# The declaration index's Lean exporter and the similarity gate: their tests compile Lean fixtures, so they run
+# where a Lean toolchain is installed. The rest of packages/orchestration is tested by pr-and-main.yaml, where these
+# tests skip for want of lake.
+on:
+  pull_request:
+    paths:
+      - "packages/orchestration/**"
+      - ".github/workflows/orchestration-lean.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/orchestration/**"
+      - ".github/workflows/orchestration-lean.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  lean:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:17
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      LEGION_TEST_PG_DSN: postgres://postgres:ci@localhost:5432/postgres?sslmode=disable
+      LEAN_TOOLCHAIN: leanprover/lean4:v4.35.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/orchestration/go.mod
+          cache-dependency-path: packages/orchestration/go.sum
+      - name: Install Lean
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --no-modify-path --default-toolchain "$LEAN_TOOLCHAIN"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Test the declaration index and the similarity gate with Lean
+        working-directory: packages/orchestration
+        run: |
+          lean --version
+          go test -count=1 ./declindex/... ./conceptgate/... ./cmd/declindex/...
