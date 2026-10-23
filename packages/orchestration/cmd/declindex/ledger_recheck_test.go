@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,6 +44,10 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(registry, "registry.yaml"), []byte("version: 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configuredTree := filepath.Join(dir, "tree-link")
+	if err := os.Symlink(tree, configuredTree); err != nil {
 		t.Fatal(err)
 	}
 
@@ -100,10 +105,22 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(registry, "concepts", "README.md"), []byte("support file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(registry, "concepts", "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(registry, "concepts", "archive", "ignored.yaml"), []byte("name: ignored\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	git(t, tree, "add", "registry")
 	git(t, tree, "commit", "-qm", "add nearby concepts")
 	if result := invoke(t, "--config", config, "refresh"); result.code != 0 {
 		t.Fatalf("refresh additions: %+v", result)
+	}
+	if err := os.WriteFile(config, []byte(strings.Replace(body, "tree: tree\n", "tree: tree-link\n", 1)), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	contracts := filepath.Join(dir, "contracts.json")
@@ -111,34 +128,68 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 		t.Fatal(err)
 	}
 	emit := filepath.Join(dir, "operations.jsonl")
-	result := invoke(t, "--config", config, "ledger", "--contracts-file", contracts, "--emit", emit)
-	if result.code != 1 {
-		t.Fatalf("ledger exit code %d, want 1: %+v", result.code, result)
+	check := func() {
+		t.Helper()
+		result := invoke(t, "--config", config, "ledger", "--contracts-file", contracts, "--emit", emit)
+		if result.code != 1 {
+			t.Fatalf("ledger exit code %d, want 1: %+v", result.code, result)
+		}
+		var report struct {
+			Registry *struct {
+				Added []string `json:"added"`
+				Near  []struct {
+					ID string `json:"id"`
+				} `json:"near"`
+				Defects []struct {
+					Path    string `json:"path"`
+					Message string `json:"message"`
+				} `json:"defects"`
+				Unable string `json:"unable"`
+			} `json:"registry"`
+		}
+		if err := json.Unmarshal([]byte(result.out), &report); err != nil {
+			t.Fatal(err)
+		}
+		wantAdded := []string{
+			filepath.ToSlash(filepath.Join("registry", "concepts", filepath.Base(first.Path))),
+			filepath.ToSlash(filepath.Join("registry", "concepts", filepath.Base(second.Path))),
+		}
+		sort.Strings(wantAdded)
+		if report.Registry == nil || strings.Join(report.Registry.Added, "\x00") != strings.Join(wantAdded, "\x00") ||
+			len(report.Registry.Defects) != 0 || report.Registry.Unable != "" || len(report.Registry.Near) != 1 {
+			t.Fatalf("registry report %+v, want additions %v", report.Registry, wantAdded)
+		}
+		got, err := os.ReadFile(invocations)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ids := strings.Fields(string(got)); len(ids) != 1 || ids[0] != report.Registry.Near[0].ID {
+			t.Fatalf("librarian invocations %q, want %q once", got, report.Registry.Near[0].ID)
+		}
 	}
-	var report struct {
-		Registry *struct {
-			Added []string `json:"added"`
-			Near  []struct {
-				ID string `json:"id"`
-			} `json:"near"`
-			Defects []struct {
-				Path    string `json:"path"`
-				Message string `json:"message"`
-			} `json:"defects"`
-			Unable string `json:"unable"`
-		} `json:"registry"`
-	}
-	if err := json.Unmarshal([]byte(result.out), &report); err != nil {
+	check()
+
+	if err := os.WriteFile(invocations, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if report.Registry == nil || len(report.Registry.Added) != 2 || len(report.Registry.Defects) != 0 || report.Registry.Unable != "" || len(report.Registry.Near) != 1 {
-		t.Fatalf("registry report %+v", report.Registry)
+	reg, defects, err := conceptgate.Load(registry)
+	if err != nil || len(defects) != 0 {
+		t.Fatalf("load mutable registry: %v, defects %v", err, defects)
 	}
-	got, err := os.ReadFile(invocations)
-	if err != nil {
-		t.Fatal(err)
+	for _, concept := range reg.Concepts {
+		if concept.Name != "Fx.First" {
+			continue
+		}
+		concept.Source = "def Fx.First (x : Nat) : Prop := x < 4\n"
+		body, err := conceptgate.Render(concept)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(first.Path, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		check()
+		return
 	}
-	if ids := strings.Fields(string(got)); len(ids) != 1 || ids[0] != report.Registry.Near[0].ID {
-		t.Fatalf("librarian invocations %q, want %q once", got, report.Registry.Near[0].ID)
-	}
+	t.Fatal("Fx.First is absent from the mutable registry")
 }

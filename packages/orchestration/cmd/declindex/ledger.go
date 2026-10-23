@@ -42,8 +42,8 @@ func (l *contractsFileLedger) RegisterContract(_ context.Context, _ string, name
 }
 
 type ledgerCommandReport struct {
-	Commit    string                        `json:"commit"`
-	Contracts declindex.LedgerReport        `json:"contracts"`
+	Commit    string                       `json:"commit"`
+	Contracts declindex.LedgerReport       `json:"contracts"`
 	Registry  *ledgerRegistryCommandReport `json:"registry"`
 }
 
@@ -192,7 +192,17 @@ func recheckLedgerRegistry(ctx context.Context, e *env, commit string) *ledgerRe
 		return nil
 	}
 	report := newLedgerRegistryCommandReport()
+	tree, err := filepath.EvalSymlinks(e.cfg.Tree)
+	if err != nil {
+		report.Unable = fmt.Sprintf("resolve tree: %v", err)
+		return report
+	}
 	registry, err := e.cfg.GateRegistryDir()
+	if err != nil {
+		report.Unable = err.Error()
+		return report
+	}
+	relative, err := registryPathRelativeToTree(tree, registry)
 	if err != nil {
 		report.Unable = err.Error()
 		return report
@@ -202,13 +212,19 @@ func recheckLedgerRegistry(ctx context.Context, e *env, commit string) *ledgerRe
 		report.Unable = fmt.Sprintf("read prev_commit: %v", err)
 		return report
 	}
-	added, err := addedRegistryConcepts(ctx, e.cfg.Tree, registry, previous, commit)
+	added, err := addedRegistryConcepts(ctx, tree, relative, previous, commit)
 	if err != nil {
 		report.Unable = err.Error()
 		return report
 	}
 	report.Added = added
-	reg, defects, err := conceptgate.Load(registry)
+	snapshot, cleanup, err := snapshotGateRegistry(ctx, tree, commit, relative, filepath.Dir(e.cfg.DB))
+	if err != nil {
+		report.Unable = fmt.Sprintf("snapshot registry: %v", err)
+		return report
+	}
+	defer cleanup()
+	reg, defects, err := conceptgate.Load(snapshot)
 	if err != nil {
 		report.Unable = fmt.Sprintf("load registry: %v", err)
 		return report
@@ -218,7 +234,7 @@ func recheckLedgerRegistry(ctx context.Context, e *env, commit string) *ledgerRe
 		return report
 	}
 	recheckEnv := *e
-	recheckEnv.cfg.Registry = registry
+	recheckEnv.cfg.Tree, recheckEnv.cfg.Registry = tree, snapshot
 	compiled, err := compiledOptions(ctx, &recheckEnv)
 	if err != nil {
 		report.Unable = fmt.Sprintf("prepare registry recheck: %v", err)
@@ -226,8 +242,8 @@ func recheckLedgerRegistry(ctx context.Context, e *env, commit string) *ledgerRe
 	}
 	gate := &conceptgate.Gate{
 		Index:     e.store,
-		Tree:      e.cfg.TreeSpec(),
-		Registry:  registry,
+		Tree:      recheckEnv.cfg.TreeSpec(),
+		Registry:  snapshot,
 		Compiled:  compiled,
 		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: filepath.Join(filepath.Dir(e.cfg.DB), "proposals")},
 		WorkDir:   filepath.Join(filepath.Dir(e.cfg.DB), "proposals"),
@@ -241,28 +257,38 @@ func recheckLedgerRegistry(ctx context.Context, e *env, commit string) *ledgerRe
 	return report
 }
 
+func registryPathRelativeToTree(tree, registry string) (string, error) {
+	relative, err := filepath.Rel(tree, registry)
+	if err != nil {
+		return "", fmt.Errorf("find registry relative to tree: %w", err)
+	}
+	relative = filepath.Clean(relative)
+	if relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("registry %s is outside tree %s", registry, tree)
+	}
+	return filepath.ToSlash(relative), nil
+}
+
 func addedRegistryConcepts(ctx context.Context, tree, registry, previous, commit string) ([]string, error) {
 	if previous == "" || commit == "" {
 		return []string{}, nil
 	}
-	relative, err := filepath.Rel(tree, registry)
-	if err != nil {
-		return nil, fmt.Errorf("find registry relative to tree: %w", err)
-	}
-	relative = filepath.Clean(relative)
-	if relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return nil, fmt.Errorf("registry %s is outside tree %s", registry, tree)
-	}
-	pathspec := filepath.ToSlash(filepath.Join(relative, "concepts"))
-	raw, err := exec.CommandContext(ctx, "git", "-C", tree, "diff", "--name-only", "--diff-filter=A", "-z", previous, commit, "--", pathspec).Output()
+	concepts := filepath.ToSlash(filepath.Join(registry, "concepts"))
+	raw, err := exec.CommandContext(ctx, "git", "-C", tree, "diff", "--name-only", "--diff-filter=A", "-z", previous, commit, "--", concepts).Output()
 	if err != nil {
 		return nil, fmt.Errorf("list registry additions from %s to %s: %w", previous, commit, err)
 	}
+	prefix := concepts + "/"
 	var added []string
 	for _, path := range strings.Split(string(raw), "\x00") {
-		if path != "" {
-			added = append(added, path)
+		if !strings.HasPrefix(path, prefix) {
+			continue
 		}
+		name := strings.TrimPrefix(path, prefix)
+		if strings.Contains(name, "/") || filepath.Ext(name) != ".yaml" {
+			continue
+		}
+		added = append(added, path)
 	}
 	sort.Strings(added)
 	return added, nil
