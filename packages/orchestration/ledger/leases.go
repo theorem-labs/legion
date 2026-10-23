@@ -366,7 +366,7 @@ func (s *Store) ReleaseHolder(ctx context.Context, repo, holder, reason string) 
 	var out []Item
 	err := s.tx(ctx, func(tx pgx.Tx) error {
 		out = []Item{}
-		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+		if _, err := lockRepo(ctx, tx, repo, true); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, `SELECT id, owner, state, holder, generation, lease_expires_at

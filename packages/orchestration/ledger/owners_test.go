@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
@@ -164,6 +166,82 @@ func TestOwnerWakesNameTheOwnersOfReopenedWork(t *testing.T) {
 	owners, again := must2(s.OwnerWakes(ctx, "r", last))
 	if len(owners) != 0 || again != last {
 		t.Fatalf("wakes after the cursor = %v at %d, want none at %d", owners, again, last)
+	}
+}
+
+// TestReleaseHolderSerializesClaimsForStoppedHolder catches a new claim escaping the stopped-holder
+// release after its work-item scan has started.
+func TestReleaseHolderSerializesClaimsForStoppedHolder(t *testing.T) {
+	s, dsn := newStoreDSN(t)
+	ctx := context.Background()
+	const holder = "struct:mount"
+	must(s.EnsureRepo(ctx, "held", 3))
+	if err := s.Enqueue(ctx, "held", "held", holder); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(ctx, "held", "available", holder); err != nil {
+		t.Fatal(err)
+	}
+	must(s.Claim(ctx, "held", "held", holder, 0))
+	cursor := must(s.LatestEventID(ctx, "held"))
+
+	locker := must(pgx.Connect(ctx, dsn))
+	defer locker.Close(ctx)
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	lock := must(locker.Begin(ctx))
+	locked := true
+	defer func() {
+		if locked {
+			_ = lock.Rollback(ctx)
+		}
+	}()
+	must(lock.Exec(ctx, `SELECT 1 FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`, "held", "held"))
+
+	type released struct {
+		items []ledger.Item
+		err   error
+	}
+	releasing := make(chan released, 1)
+	go func() {
+		items, err := s.ReleaseHolder(ctx, "held", holder, "process stopped")
+		releasing <- released{items, err}
+	}()
+	waitForBlockedConnections(t, observer, 1)
+
+	type claimed struct {
+		lease ledger.Lease
+		err   error
+	}
+	claiming := make(chan claimed, 1)
+	go func() {
+		lease, err := s.Claim(ctx, "held", "available", holder, 0)
+		claiming <- claimed{lease, err}
+	}()
+	// The release owns the repository lock before its work-item query waits, so this claim is
+	// blocked too. It can run only after the release's holder_stopped event commits.
+	waitForBlockedConnections(t, observer, 2)
+
+	if err := lock.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	gotRelease := <-releasing
+	if gotRelease.err != nil {
+		t.Fatal(gotRelease.err)
+	}
+	if len(gotRelease.items) != 1 || gotRelease.items[0].ID != "held" {
+		t.Fatalf("released items = %+v, want held", gotRelease.items)
+	}
+	gotClaim := <-claiming
+	if gotClaim.err != nil || gotClaim.lease.ID != "available" || gotClaim.lease.Holder != holder {
+		t.Fatalf("claim after holder release = %+v, %v", gotClaim.lease, gotClaim.err)
+	}
+
+	events := must(s.Events(ctx, "held", cursor, ""))
+	if len(events) != 2 || events[0].Kind != "item.holder_stopped" || events[0].Subject != "held" ||
+		events[1].Kind != "item.claimed" || events[1].Subject != "available" {
+		t.Fatalf("events after holder release = %+v, want holder_stopped then claimed", events)
 	}
 }
 
