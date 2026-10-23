@@ -1,6 +1,6 @@
 # The declaration index and the similarity gate
 
-`cmd/declindex` answers questions about a built Lean project and protects the concept registry that its owners share. The command's help is the short command reference; this document describes the persisted data and the landing contracts. This branch does not include the container acceptance driver; do not substitute a devbox-host sandbox run.
+`cmd/declindex` answers questions about a built Lean project and protects the concept registry that its owners share. The command's help is the short command reference; this document describes the persisted data and the landing contracts. The container acceptance drivers are in [e2e/README.md](e2e/README.md); do not substitute a devbox-host sandbox run.
 
 ## Index data and storage
 
@@ -26,7 +26,7 @@ registry/
 
 `registry.yaml` contains `version: 2` and optional imports and opens for the forms module. Each concept file has one name, home file, one-sentence meaning, optional `extends` and forms, and, for gate additions, the proposal ID, proposer, compiled hash, accepted-by decision, accepted near matches, and stored source. A concept with a compiled hash is keyed as `concepts/<compiled_hash>.yaml`; a librarian-written concept without one is keyed as `concepts/<name>.yaml`.
 
-One concept per file lets an owner open a change lock on only the proposed addition. The gate writes no registry file. The owner writes the returned `addition.content` to `addition.path`, opens or extends its migration with `ledger open --write <addition.path>`, and lands it normally.
+One concept per file lets an owner open a change lock on only the proposed addition. The gate writes no registry file. `addition.path` is relative to the repository root and slash-separated, for example `registry/concepts/<compiled_hash>.yaml`, so it names the same file in every worktree. The owner writes the returned `addition.content` to that path in its own worktree, opens or extends its migration with `ledger open --write <addition.path>`, and lands it normally.
 
 The loader reports duplicate names, duplicate compiled hashes, wrongly keyed files, and missing `extends` targets as registry defects. `refresh` and `gate` report those defects as notes and continue. `ledger` reports them in its registry result and exits 1. A format-1 registry is not accepted.
 
@@ -69,9 +69,15 @@ The gate and recheck apply three controls before accepting a stored or proposed 
 2. Lean's parser allow-list admits declarations and limited surrounding syntax, and refuses forms that execute during elaboration.
 3. `confine` runs checking, compilation, and export in a fresh Landlock and seccomp sandbox. It requires Landlock ABI 3 or later, allows writes only to fresh scratch directories, permits only the launched process, and blocks later `execve`, forks, sockets, mounts, namespace operations, and other privileged interfaces.
 
-Without that sandbox, the source is not compiled and the relevant operation exits 3. This branch does not include the container driver or its detailed controls; a sandbox test runs in a container when that driver is available.
+Without that sandbox, the source is not compiled and the relevant operation exits 3. The sandbox controls are tested in containers by `e2e/sandbox-e2e.sh` ([e2e/README.md](e2e/README.md)), and by the gate's Lean tests where `DECLINDEX_SANDBOX_TEST=1` (a disposable container or CI runner).
 
 ## Landing interfaces
+
+### Landing containers
+
+The landing program runs `refresh`, `ledger` and `land-hash` in containers with `--network=none`, no credentials, the tree read-only and one scratch directory; only `refresh` gets the index directory read-write. The image is the one `e2e/Dockerfile` builds: its Lean toolchain is copied from the worker-lean image pinned by digest (`LEAN_IMAGE`; [e2e/README.md](e2e/README.md)).
+
+Deployment requirement: the identity that pulls the worker-lean image on the landing machine needs read access (`roles/artifactregistry.reader`) to the Artifact Registry repository that holds it. Without that access the pull fails with HTTP 403, as it does for the build machine's Compute Engine default service account at the time of writing. Grant the access, or copy the image by digest to a registry that identity can read, before the landing program runs these containers.
 
 ### `refresh`
 
