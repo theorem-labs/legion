@@ -34,6 +34,20 @@ const (
 	ViolationStatementUnreviewed = "statement_unreviewed"
 )
 
+var violationKinds = [...]string{
+	ViolationNotOpen,
+	ViolationStaleGeneration,
+	ViolationEscalated,
+	ViolationInvalidCandidate,
+	ViolationUndeclaredWrite,
+	ViolationStaleRead,
+	ViolationUnverifiedRead,
+	ViolationOverlap,
+	ViolationUndeclaredContract,
+	ViolationPinned,
+	ViolationStatementUnreviewed,
+}
+
 // Check outcomes classify a complete pass, a refusal, or a pre-build check with deferred reads.
 const (
 	CheckOutcomePass       = "pass"

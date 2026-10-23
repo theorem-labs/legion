@@ -291,7 +291,7 @@ func TestLandRevalidatesCandidatePathsAndReadOnlyDependencies(t *testing.T) {
 		Commit:       "external-commit",
 		ChangedPaths: []string{"external.lean"},
 	})
-	wantRefusal(t, err, ledger.ReasonStaleRead)
+	wantRefusal(t, err, ledger.ReasonUnverifiedRead)
 	landed := must(s.Land(ctx, ledger.LandRequest{
 		Repo:         "r",
 		Migration:    external.ID,
@@ -399,10 +399,11 @@ func TestLandRejectsInvalidCurrentHashForRegisteredRead(t *testing.T) {
 	tests := []struct {
 		name    string
 		current map[string]string
+		reason  string
 	}{
-		{name: "changed", current: map[string]string{"C": "hash-2"}},
-		{name: "vanished", current: map[string]string{"C": ""}},
-		{name: "missing", current: map[string]string{}},
+		{name: "changed", current: map[string]string{"C": "hash-2"}, reason: ledger.ReasonStaleRead},
+		{name: "vanished", current: map[string]string{"C": ""}, reason: ledger.ReasonStaleRead},
+		{name: "missing", current: map[string]string{}, reason: ledger.ReasonUnverifiedRead},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -418,7 +419,7 @@ func TestLandRejectsInvalidCurrentHashForRegisteredRead(t *testing.T) {
 				ChangedPaths: []string{"a.lean"},
 				Current:      test.current,
 			})
-			wantRefusal(t, err, ledger.ReasonStaleRead)
+			wantRefusal(t, err, test.reason)
 			if got := must(s.Migration(ctx, "r", migration.ID)); got.State != ledger.StateOpen {
 				t.Fatalf("refused landing closed migration: %+v", got)
 			}

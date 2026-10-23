@@ -19,6 +19,7 @@ const (
 	ReasonImportConflict     = "import_conflict"     // a pilot record disagrees with the ledger's copy
 	ReasonNotOwner           = "not_owner"           // the caller does not own the contract
 	ReasonStaleRead          = "stale_read"          // a recorded contract hash is no longer current
+	ReasonUnverifiedRead     = "unverified_read"     // the caller did not supply a current hash for a declared read
 	ReasonStaleVersion       = "stale_version"       // an agreement did not read the current contract version
 	ReasonPinned             = "pinned"              // a person must approve the pinned contract's change
 	ReasonEscalated          = "escalated"           // the migration awaits a steward's decision

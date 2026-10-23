@@ -367,7 +367,7 @@ func statementViolations(ctx context.Context, q querier, m Migration, req CheckR
 	return violations, nil
 }
 
-func refusalForViolation(v Violation) *Refusal {
+func refusalForViolation(v Violation) error {
 	switch v.Kind {
 	case ViolationNotOpen:
 		return refuse(ReasonNotOpen, "%s", v.Message)
@@ -379,8 +379,10 @@ func refusalForViolation(v Violation) *Refusal {
 		return refuse(ReasonInvalidCandidate, "%s", v.Message)
 	case ViolationUndeclaredWrite:
 		return refuse(ReasonUndeclaredWrite, "%s", v.Message)
-	case ViolationStaleRead, ViolationUnverifiedRead:
+	case ViolationStaleRead:
 		return refuse(ReasonStaleRead, "%s", v.Message)
+	case ViolationUnverifiedRead:
+		return refuse(ReasonUnverifiedRead, "%s", v.Message)
 	case ViolationOverlap:
 		return refuse(ReasonOverlap, "%s", v.Message)
 	case ViolationUndeclaredContract:
@@ -390,7 +392,7 @@ func refusalForViolation(v Violation) *Refusal {
 	case ViolationStatementUnreviewed:
 		return refuse(ReasonStatementUnreviewed, "%s", v.Message)
 	default:
-		return refuse(ReasonStaleRead, "%s", v.Message)
+		return fmt.Errorf("unmapped violation kind %q", v.Kind)
 	}
 }
 

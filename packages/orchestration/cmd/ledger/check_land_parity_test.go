@@ -141,6 +141,16 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			},
 		},
 		{
+			name: "declared read has no current hash",
+			kind: ledger.ReasonUnverifiedRead,
+			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
+				candidate.check.Current = map[string]string{}
+				candidate.land.Current = map[string]string{}
+				return candidate
+			},
+		},
+		{
 			name: "contract version is stale even when the hash returned to its old value",
 			kind: ledger.ReasonStaleRead,
 			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
