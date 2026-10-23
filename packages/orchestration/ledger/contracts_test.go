@@ -11,13 +11,14 @@ import (
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
-func landRequest(m ledger.Migration, commit string, paths []string, changes map[string]string, approved []string) ledger.LandRequest {
+func landRequest(m ledger.Migration, commit string, paths []string, current, changes map[string]string, approved []string) ledger.LandRequest {
 	return ledger.LandRequest{
 		Repo:             "r",
 		Migration:        m.ID,
 		Generation:       m.Generation,
 		Commit:           commit,
 		ChangedPaths:     paths,
+		Current:          current,
 		ChangedContracts: changes,
 		ApprovedPinned:   approved,
 	}
@@ -75,7 +76,7 @@ func TestRecordAgreementRefusesASupersededVersion(t *testing.T) {
 	ctx := context.Background()
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 	migration := must(open(t, s, "M-1", "alice", []string{"a.lean"}, map[string]string{"C": "hash-1"}))
-	must(s.Land(ctx, landRequest(migration, "commit-1", []string{"a.lean"}, map[string]string{"C": "hash-2"}, nil)))
+	must(s.Land(ctx, landRequest(migration, "commit-1", []string{"a.lean"}, map[string]string{"C": "hash-1"}, map[string]string{"C": "hash-2"}, nil)))
 	_, err := s.RecordAgreement(ctx, "r", "A-old", []string{"alice"}, map[string]int64{"C": 1})
 	wantRefusal(t, err, ledger.ReasonStaleVersion)
 }
@@ -88,7 +89,7 @@ func TestLandAdvancesAContractAndStalesExactlyOlderAgreements(t *testing.T) {
 	must(s.RecordAgreement(ctx, "r", "A-old", []string{"alice"}, map[string]int64{"C": 1}))
 	must(s.RecordAgreement(ctx, "r", "A-unrelated", []string{"bob"}, map[string]int64{"D": 1}))
 	m := must(open(t, s, "M-1", "alice", []string{"a.lean"}, map[string]string{"C": "hash-1"}))
-	landed := must(s.Land(ctx, landRequest(m, "commit-1", []string{"a.lean"}, map[string]string{"C": "hash-2"}, nil)))
+	landed := must(s.Land(ctx, landRequest(m, "commit-1", []string{"a.lean"}, map[string]string{"C": "hash-1"}, map[string]string{"C": "hash-2"}, nil)))
 	if landed.State != ledger.StateLanded || landed.LandedCommit != "commit-1" {
 		t.Fatalf("landed migration: %+v", landed)
 	}
@@ -105,7 +106,7 @@ func TestLandAdvancesAContractAndStalesExactlyOlderAgreements(t *testing.T) {
 		t.Fatalf("stale agreements after current read: %+v", stale)
 	}
 
-	advanced, staled := false, false
+	advanced, staled := 0, 0
 	for _, event := range must(s.Events(ctx, "r", 0, "")) {
 		var data struct {
 			Version int64 `json:"version"`
@@ -113,15 +114,21 @@ func TestLandAdvancesAContractAndStalesExactlyOlderAgreements(t *testing.T) {
 		if err := json.Unmarshal(event.Data, &data); err != nil {
 			t.Fatal(err)
 		}
-		switch {
-		case event.Kind == "contract.advanced" && event.Subject == "C":
-			advanced = data.Version == 2
-		case event.Kind == "agreement.staled" && event.Subject == "A-old":
-			staled = data.Version == 2
+		switch event.Kind {
+		case "contract.advanced":
+			if event.Subject != "C" || data.Version != 2 {
+				t.Fatalf("unexpected contract advance: %+v", event)
+			}
+			advanced++
+		case "agreement.staled":
+			if event.Subject != "A-old" || data.Version != 2 {
+				t.Fatalf("unexpected stale-agreement event: %+v", event)
+			}
+			staled++
 		}
 	}
-	if !advanced || !staled {
-		t.Fatalf("landing events: contract.advanced=%t agreement.staled=%t", advanced, staled)
+	if advanced != 1 || staled != 1 {
+		t.Fatalf("landing event counts: contract.advanced=%d agreement.staled=%d", advanced, staled)
 	}
 }
 
@@ -130,7 +137,7 @@ func TestLandRefusesAPinnedContractWithoutPersonApproval(t *testing.T) {
 	ctx := context.Background()
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", true))
 	m := must(open(t, s, "M-1", "alice", []string{"a.lean"}, map[string]string{"C": "hash-1"}))
-	_, err := s.Land(ctx, landRequest(m, "commit-1", []string{"a.lean"}, map[string]string{"C": "hash-2"}, nil))
+	_, err := s.Land(ctx, landRequest(m, "commit-1", []string{"a.lean"}, map[string]string{"C": "hash-1"}, map[string]string{"C": "hash-2"}, nil))
 	r := wantRefusal(t, err, ledger.ReasonPinned)
 	if !strings.Contains(r.Message, "C") || !strings.Contains(r.Message, "person must approve") {
 		t.Fatalf("pinned refusal: %+v", r)
@@ -167,7 +174,7 @@ func TestConcurrentLandsFromOneContractVersionGrantOne(t *testing.T) {
 			defer wg.Done()
 			<-start
 			_, err := s.Land(ctx, landRequest(attempt.migration, "commit-1", []string{attempt.migration.Writes[0]},
-				map[string]string{"C": attempt.hash}, nil))
+				map[string]string{"C": "hash-1"}, map[string]string{"C": attempt.hash}, nil))
 			mu.Lock()
 			defer mu.Unlock()
 			var r *ledger.Refusal
@@ -200,6 +207,7 @@ func TestLandRevalidatesCandidatePathsAndReadOnlyDependencies(t *testing.T) {
 		Generation:       writer.Generation,
 		Commit:           "writer-commit",
 		ChangedPaths:     []string{"writer.lean"},
+		Current:          map[string]string{"C": "hash-1"},
 		ChangedContracts: map[string]string{"C": "hash-2"},
 	}))
 	_, err := s.Land(ctx, ledger.LandRequest{
@@ -208,6 +216,7 @@ func TestLandRevalidatesCandidatePathsAndReadOnlyDependencies(t *testing.T) {
 		Generation:   reader.Generation,
 		Commit:       "reader-commit",
 		ChangedPaths: []string{"reader.lean"},
+		Current:      map[string]string{"C": "hash-2"},
 	})
 	wantRefusal(t, err, ledger.ReasonStaleRead)
 
@@ -218,6 +227,7 @@ func TestLandRevalidatesCandidatePathsAndReadOnlyDependencies(t *testing.T) {
 		Generation:   plain.Generation,
 		Commit:       "plain-commit",
 		ChangedPaths: []string{"outside.lean"},
+		Current:      map[string]string{},
 	})
 	wantRefusal(t, err, ledger.ReasonUndeclaredWrite)
 
@@ -261,6 +271,7 @@ func TestLandRejectsContractVersionABAAndUndeclaredContract(t *testing.T) {
 			Generation:       migration.Generation,
 			Commit:           migration.ID + "-commit",
 			ChangedPaths:     []string{change.path},
+			Current:          map[string]string{"C": change.before},
 			ChangedContracts: map[string]string{"C": change.after},
 		}))
 	}
@@ -270,6 +281,7 @@ func TestLandRejectsContractVersionABAAndUndeclaredContract(t *testing.T) {
 		Generation:       old.Generation,
 		Commit:           "old-commit",
 		ChangedPaths:     []string{"old.lean"},
+		Current:          map[string]string{"C": "hash-1"},
 		ChangedContracts: map[string]string{"C": "hash-3"},
 	})
 	wantRefusal(t, err, ledger.ReasonStaleRead)
@@ -281,6 +293,7 @@ func TestLandRejectsContractVersionABAAndUndeclaredContract(t *testing.T) {
 		Generation:       undeclared.Generation,
 		Commit:           "undeclared-commit",
 		ChangedPaths:     []string{"undeclared.lean"},
+		Current:          map[string]string{},
 		ChangedContracts: map[string]string{"C": "hash-4"},
 	})
 	wantRefusal(t, err, ledger.ReasonUndeclaredContract)
@@ -298,7 +311,7 @@ func TestConcurrentLandsFromOneVersionRejectsAnUnchangedHash(t *testing.T) {
 		go func() {
 			<-start
 			_, err := s.Land(ctx, landRequest(migration, migration.ID+"-commit", []string{migration.Writes[0]},
-				map[string]string{"C": "hash-1"}, nil))
+				map[string]string{"C": "hash-1"}, map[string]string{"C": "hash-1"}, nil))
 			results <- err
 		}()
 	}
@@ -321,5 +334,42 @@ func TestConcurrentLandsFromOneVersionRejectsAnUnchangedHash(t *testing.T) {
 	}
 	if contract := must(s.Contract(ctx, "r", "C")); contract.Version != 2 {
 		t.Fatalf("contract after unchanged-hash landing: %+v", contract)
+	}
+}
+
+func TestLandRejectsInvalidCurrentHashForRegisteredRead(t *testing.T) {
+	tests := []struct {
+		name    string
+		current map[string]string
+	}{
+		{name: "changed", current: map[string]string{"C": "hash-2"}},
+		{name: "vanished", current: map[string]string{"C": ""}},
+		{name: "missing", current: map[string]string{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := newStore(t)
+			ctx := context.Background()
+			must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
+			migration := must(open(t, s, "M-1", "alice", []string{"a.lean"}, map[string]string{"C": "hash-1"}))
+			_, err := s.Land(ctx, ledger.LandRequest{
+				Repo:         "r",
+				Migration:    migration.ID,
+				Generation:   migration.Generation,
+				Commit:       "commit-1",
+				ChangedPaths: []string{"a.lean"},
+				Current:      test.current,
+			})
+			wantRefusal(t, err, ledger.ReasonStaleRead)
+			if got := must(s.Migration(ctx, "r", migration.ID)); got.State != ledger.StateOpen {
+				t.Fatalf("refused landing closed migration: %+v", got)
+			}
+			for _, event := range must(s.Events(ctx, "r", 0, "")) {
+				switch event.Kind {
+				case "migration.landed", "contract.advanced", "agreement.staled":
+					t.Fatalf("refused landing appended %s: %+v", event.Kind, event)
+				}
+			}
+		})
 	}
 }

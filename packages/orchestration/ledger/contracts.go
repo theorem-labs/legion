@@ -236,7 +236,7 @@ func (s *Store) StaleAgreements(ctx context.Context, repo string) ([]Agreement, 
 }
 
 // LandRequest is the candidate that Land validates and closes. ChangedPaths and Current are the same candidate
-// inputs Check receives. Current supplies every read that was not a registered contract when the migration recorded it.
+// inputs Check receives. Current supplies every declared read; registered contracts also receive a version fence.
 type LandRequest struct {
 	Repo             string            `json:"repo"`
 	Migration        string            `json:"migration"`
@@ -327,7 +327,7 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 		if err != nil {
 			return err
 		}
-		violations, err := checkViolations(ctx, tx, migration, candidate, true)
+		violations, err := checkViolations(ctx, tx, migration, candidate)
 		if err != nil {
 			return err
 		}

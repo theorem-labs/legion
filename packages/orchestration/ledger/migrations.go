@@ -424,9 +424,8 @@ func cleanCheckRequest(req CheckRequest) (CheckRequest, error) {
 	return req, nil
 }
 
-// checkViolations evaluates every candidate check against a migration locked by the caller. When externalOnly is
-// true, contract reads are checked against their locked versions by Land instead of a caller-provided hash.
-func checkViolations(ctx context.Context, q querier, m Migration, req CheckRequest, externalOnly bool) ([]Violation, error) {
+// checkViolations evaluates every candidate check against a migration locked by the caller.
+func checkViolations(ctx context.Context, q querier, m Migration, req CheckRequest) ([]Violation, error) {
 	var violations []Violation
 	add := func(v Violation) { violations = append(violations, v) }
 	if m.State != StateOpen {
@@ -463,9 +462,6 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 	}
 	names := sortedNames(m.Reads)
 	for _, name := range names {
-		if externalOnly && m.ReadVersions[name] != nil {
-			continue
-		}
 		recorded := m.Reads[name]
 		current, ok := req.Current[name]
 		switch {
@@ -514,7 +510,7 @@ func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error
 		if err != nil {
 			return err
 		}
-		res.Violations, err = checkViolations(ctx, tx, migration, cleaned, false)
+		res.Violations, err = checkViolations(ctx, tx, migration, cleaned)
 		if err != nil {
 			return err
 		}

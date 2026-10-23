@@ -208,12 +208,15 @@ func TestLeaseLivenessIsEvaluatedAfterTheItemRowLock(t *testing.T) {
 			lease := must(s.Claim(ctx, "r", "item", "alice", 100*time.Millisecond))
 			locker := must(pgx.Connect(ctx, dsn))
 			defer locker.Close(ctx)
+			observer := must(pgx.Connect(ctx, dsn))
+			defer observer.Close(ctx)
 			lock := must(locker.Begin(ctx))
 			must(lock.Exec(ctx, `SELECT 1 FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`, "r", "item"))
 
 			done := make(chan error, 1)
 			go func() { done <- test.operate(ctx, s, lease) }()
-			waitForDatabaseExpiry(t, locker, lease.ExpiresAt)
+			waitForBlockedConnections(t, observer, 1)
+			waitForDatabaseExpiry(t, observer, lease.ExpiresAt)
 			if err := lock.Rollback(ctx); err != nil {
 				t.Fatal(err)
 			}

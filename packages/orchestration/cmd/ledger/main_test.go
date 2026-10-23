@@ -42,7 +42,28 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 	invoke("repo", "ensure", "r", "3")
 	invoke("claim", "r", "item", "alice", "1m")
 	invoke("renew", "r", "item", "alice", "1", "1m")
+	renewed := invoke("--json", "item", "r", "item")
+	var held struct {
+		State      string  `json:"state"`
+		Holder     string  `json:"holder"`
+		Generation int64   `json:"generation"`
+		ExpiresAt  *string `json:"expires_at"`
+	}
+	if err := json.Unmarshal([]byte(renewed), &held); err != nil || held.State != "open" || held.Holder != "alice" ||
+		held.Generation != 1 || held.ExpiresAt == nil {
+		t.Fatalf("renewed item: %v %+v", err, held)
+	}
 	invoke("release", "r", "item", "alice", "1")
+	released := invoke("--json", "item", "r", "item")
+	held = struct {
+		State      string  `json:"state"`
+		Holder     string  `json:"holder"`
+		Generation int64   `json:"generation"`
+		ExpiresAt  *string `json:"expires_at"`
+	}{}
+	if err := json.Unmarshal([]byte(released), &held); err != nil || held.Holder != "" || held.ExpiresAt != nil {
+		t.Fatalf("released item: %v %+v", err, held)
+	}
 	invoke("claim", "r", "done", "alice", "1m")
 	invoke("complete", "r", "done", "alice", "1", "result")
 	invoke("expire", "r")
@@ -70,6 +91,20 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 	}
 	invoke("takeover", "r", "M-1", "bob", "1")
 	invoke("round", "r", "M-1", "2", "failed")
+	roundStatus := invoke("--json", "status", "r")
+	var openStatus struct {
+		Migrations []struct {
+			ID            string `json:"id"`
+			Owner         string `json:"owner"`
+			Generation    int64  `json:"generation"`
+			LandingRounds int    `json:"landing_rounds"`
+		} `json:"Migrations"`
+	}
+	if err := json.Unmarshal([]byte(roundStatus), &openStatus); err != nil || len(openStatus.Migrations) != 1 ||
+		openStatus.Migrations[0].ID != "M-1" || openStatus.Migrations[0].Owner != "bob" ||
+		openStatus.Migrations[0].Generation != 2 || openStatus.Migrations[0].LandingRounds != 1 {
+		t.Fatalf("migration after round: %v %+v", err, openStatus)
+	}
 	invoke("abandon", "r", "M-1", "2", "stopped")
 
 	invoke("contract", "register", "r", "C", "alice", "hash-1", "false")
@@ -90,7 +125,7 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 	invoke("agree", "r", "A-1", "bob", "C=1")
 	invoke("open", "r", "M-2", "bob", "base", "branch", "c.lean", "C=hash-1")
 	invoke("land", "--repo", "r", "--migration", "M-2", "--generation", "1", "--commit", "commit-1",
-		"--changed-paths", "c.lean", "--current", "", "--changed-contracts", "C=hash-2")
+		"--changed-paths", "c.lean", "--current", "C=hash-1", "--changed-contracts", "C=hash-2")
 	stale := invoke("--json", "stale", "r")
 	var staleAgreements []struct {
 		ID string `json:"id"`
@@ -99,24 +134,44 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 		t.Fatalf("stale agreements: %v %+v", err, staleAgreements)
 	}
 	status := invoke("--json", "status", "r")
-	if !json.Valid([]byte(status)) {
-		t.Fatalf("status JSON %q", status)
+	if err := json.Unmarshal([]byte(status), &openStatus); err != nil || len(openStatus.Migrations) != 0 {
+		t.Fatalf("open migrations after abandon and land: %v %+v", err, openStatus)
 	}
 	events := invoke("--json", "events", "r", "0")
 	var log []struct {
-		Kind    string `json:"kind"`
-		Subject string `json:"subject"`
+		Kind    string          `json:"kind"`
+		Subject string          `json:"subject"`
+		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(events), &log); err != nil {
 		t.Fatalf("event JSON: %v: %q", err, events)
 	}
-	advanced, staled := false, false
+	advanced, staled := 0, 0
 	for _, event := range log {
-		advanced = advanced || event.Kind == "contract.advanced" && event.Subject == "C"
-		staled = staled || event.Kind == "agreement.staled" && event.Subject == "A-1"
+		var data struct {
+			Version int64 `json:"version"`
+		}
+		if err := json.Unmarshal(event.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case event.Kind == "contract.advanced" && event.Subject == "C":
+			advanced++
+			if data.Version != 2 {
+				t.Fatalf("contract advance: %+v", event)
+			}
+		case event.Kind == "agreement.staled":
+			if event.Subject != "A-1" {
+				t.Fatalf("unexpected stale-agreement event: %+v", event)
+			}
+			staled++
+			if data.Version != 2 {
+				t.Fatalf("agreement stale: %+v", event)
+			}
+		}
 	}
-	if !advanced || !staled {
-		t.Fatalf("landing events: %+v", log)
+	if advanced != 1 || staled != 1 {
+		t.Fatalf("landing event counts: contract.advanced=%d agreement.staled=%d log=%+v", advanced, staled, log)
 	}
 }
 
@@ -215,7 +270,7 @@ func TestLandReadsJSONRequestFile(t *testing.T) {
 	invoke("repo", "ensure", "r", "0")
 	invoke("contract", "register", "r", "C", "alice", "hash-1", "false")
 	invoke("open", "r", "M-1", "alice", "base", "branch", "a.lean", "C=hash-1")
-	request := `{"repo":"r","migration":"M-1","generation":1,"commit":"commit-1","changed_paths":["a.lean"],"current":{},"changed_contracts":{"C":"hash-2"}}`
+	request := `{"repo":"r","migration":"M-1","generation":1,"commit":"commit-1","changed_paths":["a.lean"],"current":{"C":"hash-1"},"changed_contracts":{"C":"hash-2"}}`
 	file := filepath.Join(t.TempDir(), "land.json")
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
