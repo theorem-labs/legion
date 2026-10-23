@@ -157,9 +157,9 @@ Do not treat the baseline numbers as acceptance results. The end-to-end drivers 
 | Acceptance row | Run | Outcome |
 | --- | --- | --- |
 | E1 parity | `infra145-e1-20261023T2222Z` | Pass: 55 of 55 declarations have the reference tool's direct users and every per-directory and file-kind count. Reach differs for 4: for 3, the extra directories are reached only through an `example`; the fourth has the same directory sets and 6 extra proofs, not yet traced. `users` took 0.195 seconds median and 0.571 seconds worst per name, process included. |
-| E2 recall and exact duplicates | none yet | |
+| E2 recall and exact duplicates | `infra145-e2-20261023T2236Z` | Exact duplicates pass: 20 of 20 seeded copies are refused, each naming the copied declaration, with no librarian request; a copy with one constant changed is near. Recall did not run: `Forms` dropped the forms of a concept that no module declares. That is fixed in `ba8cb011`, and recall must run again. |
 | E3 gate and librarian route | none yet | |
 | E4 sandbox controls | `infra145-e4-20261023T2229Z` | Pass: 5 of 5 cases in containers. |
-| E5 `land-hash` | none yet | |
+| E5 `land-hash` | `infra145-e5-20261023T2244Z` | Pass: the base and candidate calls differ only in the changed contract's hash. A candidate without `LAND_BUILD_DIR`, and another tree with this build directory, both exit 3. Rewriting the built source after the build exited 0 until `ba8cb011`, which also refuses an `.ilean` that is not its trace's output. Both controls must run again. |
 
 The records, not this README, are the evidence for the baseline-scale claims and the acceptance outcomes.
