@@ -188,3 +188,25 @@ def test_the_name_index_matches_the_whole_name_rule_for_every_name_shape() -> No
         }
         tokens = {token for line in body for token in measures._IDENTIFIER.findall(line)}
         assert index.groups(tokens, body) == expected, body
+
+
+def test_a_function_with_several_contracts_takes_the_interfaces_each_binds(tmp_path: Path) -> None:
+    source = _tree(tmp_path)
+    graph = _graph()
+    graph["nodes"][0]["contract"] = ["Prog/f", "Prog/g"]
+    contracts = ContractGraph(
+        nodes={
+            "if:A": {"id": "if:A", "kind": "iface", "file": "Lean/A.lean:2"},
+            "if:C": {"id": "if:C", "kind": "iface", "file": "Lean/B.lean:1"},
+        },
+        edges=[
+            {"kind": "binds", "src": "Prog/f", "dst": "if:A"},
+            {"kind": "binds", "src": "Prog/g", "dst": "if:C"},
+        ],
+    )
+    result = measures._interfaces(graph, contracts, source, GROUPS, None)
+    assert result is not None
+    assert {item["interface"]: item["functions"] for item in result["mappings"]} == {
+        "A": ["function:f"],
+        "C": ["function:f"],
+    }

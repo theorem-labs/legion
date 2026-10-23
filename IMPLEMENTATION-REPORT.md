@@ -123,10 +123,81 @@ Records: `/theorem/linux-graph/cgraph-u3-final/status` and `status2`, one line p
 
 - Disk: a core for `all` is 158.7 MB, and one is kept per part.
 - The remaining 51 s is U1's `cache.lookup`: re-hashing the include probes of 432 units. It is outside U3.
-- The coordinator's next directive, the `contract` field as a list for a header helper, is a separate
-  follow-up commit.
+- The contract-list follow-up is the next commit; see below.
 - Writes outside this workspace: only the VM scratch trees `/theorem/linux-graph/cgraph-u3-perf`,
-  `/theorem/linux-graph/cgraph-u3-final`, `/theorem/linux-graph/out/all-u3-profile-baseline*` and
+  `/theorem/linux-graph/cgraph-u3-final`, `/theorem/linux-graph/cgraph-u3-contract`,
+  `/theorem/linux-graph/out/all-u3-profile-baseline*` and
   `/theorem/linux-graph/out/all-u3-baseline-plain*`. The live cache, the outputs and the deployment were
   not modified; every run used a copy of the cache.
 - Hardening ledger: none.
+
+# Follow-up commit: a function's contract is every contract node the contract graph maps to it
+
+The contract graph names a function by the C file it is compiled into. So a header helper, or a
+function of a C file another includes, appears once per including file, and a weak default appears
+beside the definition that replaced it.
+
+## Change (`link.py`, `measures.py`, `README.md`)
+
+- `link._contract_owners` maps each contract function node `(source, symbol)` to one definition. That
+  is the definition the source's unit sees; when the unit sees none, it is the definition in that
+  file. The node is that definition's: the strong one of a weak pair. So each contract node has
+  exactly one owner.
+- That one mapping serves three places:
+  - the node's `contract` field and its provenance;
+  - the callback-table resolution;
+  - the contract-function exclusions.
+- A part function's `contract` is its contract id, a sorted list when there are several, or absent
+  when there are none. `owners.json` `contract` is therefore string, list of strings, or null.
+- A contract whose C function is no part function is the new C3 item `contract_function` /
+  `definition_not_a_part_function`, with that function's id. Before, a header helper's contract was
+  `no_c_file`, which was wrong: it has a C definition.
+- Outside the part (a unit not parsed) nothing maps. On the slice, only the slice units' copies are
+  attached.
+- `measures._interfaces` reads a list-valued `contract`.
+- INFRA-145 is told (agent Infra145Index). Its `LoadOwners` now accepts string, list or null:
+  legion `declaration-index` `0b72a8cb`.
+
+## Tests (red first)
+
+- `test_graph.py`:
+  - a header helper visible from two including files carries both contracts as a list, owners.json
+    the same, and no contract is claimed twice;
+  - a weak default's contract goes to the node that replaced it;
+  - an inlined-everywhere header helper's contract is `definition_not_a_part_function`.
+- `test_measures.py`: a two-contract function takes the interfaces each contract binds.
+- Red runs:
+  - `KeyError: 'contract'` on the header node;
+  - `'Prog/src/bags/ArchHook' != [...]` for the weak pair;
+  - `[] != [item]` for the missing exclusion;
+  - `unhashable type: 'list'` in `_interfaces`.
+- Fixture: every output of parts `store`, `both` and `flow` is byte-equal to the performance commit.
+  The committed fixture's contracts are all same-file.
+
+## Real data (VM, against the performance commit's outputs)
+
+- `all`:
+  - 472 function nodes gain a contract that they lacked: 80 header helpers and 397 functions of
+    included C files, such as `kernel/sched/pelt.c` through `build_policy.c`. There are also 2
+    weak-default contracts.
+  - 8 owners carry a list of 2, such as `function:pte_unmap@include/linux/pgtable.h`. No contract is
+    claimed twice.
+  - `contract_function` goes from `no_c_file` 129 to `no_c_file` 48 plus
+    `definition_not_a_part_function` 1 (`Linux/fs/dcache/RuntimeFixupPtr_`).
+  - Hard checks pass. Calls agree 19,769 and callback-table edges 3,017, both unchanged; edges
+    84,860 and nodes 11,683, both unchanged.
+  - `callback` exclusions are reclassified, and there are more of them:
+    `target_without_c_definition` goes from 1,371 to 299, `no_c_initializer` from 1,216 to 2,908, and
+    `kind_not_read` from 608 to 619.
+  - The added items are contract edges from part functions that newly map. Before, those were dropped
+    with no record (source unmapped).
+  - The first run takes 124.8 s. It rebuilds the core because the code changed.
+- `slice`:
+  - 2 nodes gain a contract: `class_fd_prepare_destructor@include/linux/file.h` and
+    `refcount_inc_not_zero@include/linux/refcount.h`.
+  - `contract_function` `no_c_file` goes from 2 to 0.
+  - Callback tables stay at 22, and the section 4.2 baseline is unchanged. Hard checks pass.
+- VM lane on this tree: ruff, format, mypy and pytest exit 0; 219 passed. Container lane: the same,
+  219 passed.
+
+Record: `/theorem/linux-graph/cgraph-u3-contract/status`.

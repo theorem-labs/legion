@@ -62,7 +62,12 @@ size.
 
 `owners.json` lists one owner per function of the part, per data structure that a part function
 accesses or a structure link joins, per per-CPU state, and per subsystem. The owner's key is the node
-id; `contract` is the contract graph's node, if any. `topics.json` gives each owner's subscriptions
+id. `contract` is the contract graph's function node, `null` when there is none, or a list of node ids
+when the contract graph names the function more than once. It names a function by the C file it is
+compiled into, so a header helper (or a function of a C file another includes) appears once per
+including file of the part, and a weak default appears beside the definition that replaced it. Each
+contract node belongs to exactly one owner; one whose C function is no part function is excluded as
+`contract_function`/`definition_not_a_part_function`. `topics.json` gives each owner's subscriptions
 under `topics.prefix`: `node.<id>.needs` and `all` for everyone; `node.<callee>.callers`,
 `node.<caller>.callees` and `node.<data>.users` for a function; `node.<linked>.linked` for a data
 structure or a subsystem; `node.<neighbour>.neighbors` for every neighbour in the three layers. In a

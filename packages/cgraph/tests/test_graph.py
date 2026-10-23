@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
-from conftest import FIXTURE, build, edges, node
+from conftest import FIXTURE, build, edges, node, read
 
 from cgraph import clangfacts, commands, config, contracts, image, jsonio, link, structure
 
@@ -356,6 +357,7 @@ def test_every_contract_callback_drop_has_a_c3_classification() -> None:
             [table for unit in facts.values() for table in unit["tables"]],
             {source.id: source},
             exclusions,
+            link._contract_owners(linker),
         )
     finally:
         linked_image.close()
@@ -457,3 +459,80 @@ def test_structure_drops_are_written_as_c3_items() -> None:
     )
     assert embedding_drops[0]["reason"] == "record_not_a_node"
     assert {item["reason"] for item in membership_drops} == {"arguments_unresolved", "end_not_a_node"}
+
+
+def _add_contract_functions(copy: Path, *functions: tuple[str, str, bool]) -> None:
+    path = copy / "contracts.json"
+    graph = json.loads(path.read_text())
+    graph["nodes"] += [
+        {"id": identity, "kind": "fn", "syms": [symbol], "addr": "", "in_image": in_image}
+        for identity, symbol, in_image in functions
+    ]
+    path.write_text(json.dumps(graph))
+
+
+def _claimed(owners: list[dict[str, Any]]) -> list[str]:
+    claimed: list[str] = []
+    for owner in owners:
+        contract = owner["contract"]
+        claimed += [contract] if isinstance(contract, str) else contract or []
+    return claimed
+
+
+def test_a_header_function_carries_the_contract_of_every_including_file(copy: Path, tmp_path: Path) -> None:
+    """The contract graph names a function by the C file it is compiled into: a header helper is
+    one node, and it carries each including file's contract, a list when there are several."""
+    bags = copy / "src" / "bags.c"
+    bags.write_text(bags.read_text() + "\nlong bag_box_size(struct box *b)\n{\n\treturn box_size(b);\n}\n")
+    _add_contract_functions(
+        copy, ("Prog/src/store/BoxSize", "box_size", True), ("Prog/src/bags/BoxSize", "box_size", False)
+    )
+    out = tmp_path / "out"
+    result = build(copy, "both", out)
+    assert result.passes, result.hard_checks
+    graph = read(out, "graph.json")
+    helper = node(graph, "function:box_size@include/mini.h")
+    assert helper["contract"] == ["Prog/src/bags/BoxSize", "Prog/src/store/BoxSize"]
+    assert {"source": "contract_graph", "id": "Prog/src/bags/BoxSize"} in helper["provenance"]
+    assert {"source": "contract_graph", "id": "Prog/src/store/BoxSize"} in helper["provenance"]
+    assert node(graph, "function:box_new")["contract"] == "Prog/src/store/BoxNew"
+    owners = read(out, "owners.json")["owners"]
+    by_id = {owner["id"]: owner for owner in owners}
+    assert by_id["function:box_size@include/mini.h"]["contract"] == ["Prog/src/bags/BoxSize", "Prog/src/store/BoxSize"]
+    assert by_id["function:box_new"]["contract"] == "Prog/src/store/BoxNew"
+    # Each contract directory has exactly one owner.
+    claimed = _claimed(owners)
+    assert len(claimed) == len(set(claimed))
+    assert not any(
+        item["kind"] == "contract_function" and item["target"] in {"Prog/src/store/BoxSize", "Prog/src/bags/BoxSize"}
+        for item in read(out, "exclusions.json")["items"]
+    )
+
+
+def test_a_weak_default_s_contract_belongs_to_the_node_that_replaced_it(copy: Path, tmp_path: Path) -> None:
+    _add_contract_functions(
+        copy, ("Prog/src/bags/ArchHook", "arch_hook", True), ("Prog/src/store/ArchHook", "arch_hook", True)
+    )
+    out = tmp_path / "out"
+    assert build(copy, "both", out).passes
+    hook = node(read(out, "graph.json"), "function:arch_hook")
+    assert hook["contract"] == ["Prog/src/bags/ArchHook", "Prog/src/store/ArchHook"]
+
+
+def test_a_contract_whose_c_function_is_no_part_function_is_an_exclusion(copy: Path, tmp_path: Path) -> None:
+    """list_insert, a header helper the image inlines everywhere, is no node: its contract has no owner."""
+    _add_contract_functions(copy, ("Prog/src/store/ListInsert", "list_insert", False))
+    out = tmp_path / "out"
+    assert build(copy, "both", out).passes
+    items = [item for item in read(out, "exclusions.json")["items"] if item["target"] == "Prog/src/store/ListInsert"]
+    assert items == [
+        {
+            "kind": "contract_function",
+            "reason": "definition_not_a_part_function",
+            "function": "function:list_insert@include/mini.h",
+            "target": "Prog/src/store/ListInsert",
+            "detail": {"source": "src/store.c", "symbol": "list_insert"},
+            "provenance": [{"source": "contract_graph", "id": "Prog/src/store/ListInsert"}],
+        }
+    ]
+    assert "Prog/src/store/ListInsert" not in _claimed(read(out, "owners.json")["owners"])

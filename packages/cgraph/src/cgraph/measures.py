@@ -320,14 +320,14 @@ def _interfaces(
     if source is None:
         return None
     by_id = {node["id"]: node for node in graph["nodes"]}
-    contract_to_function = {
-        node["contract"]: node["id"]
-        for node in graph["nodes"]
-        if node["kind"] == "function" and node.get("contract") and node.get("part")
-    }
+    contract_to_function: dict[str, str] = {}
+    for node in graph["nodes"]:
+        contract = node.get("contract") if node["kind"] == "function" and node.get("part") else None
+        for contract_id in [contract] if isinstance(contract, str) else contract or []:
+            contract_to_function[contract_id] = node["id"]
     taken: dict[str, set[str]] = collections.defaultdict(set)
     for edge in contracts.binds():
-        function = contract_to_function.get(edge.get("src"))
+        function = contract_to_function.get(str(edge.get("src")))
         if function is not None:
             taken[edge["dst"].removeprefix("if:")].add(function)
     index = _NameIndex({position: {by_id[member]["name"] for member in group} for position, group in enumerate(groups)})
