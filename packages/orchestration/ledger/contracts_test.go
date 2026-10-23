@@ -443,10 +443,7 @@ func TestLandRequiresChangedPathsPresenceAndConsistency(t *testing.T) {
 		Commit:     "missing-commit",
 		Current:    map[string]string{},
 	})
-	var invalid *ledger.InvalidError
-	if !errors.As(err, &invalid) {
-		t.Fatalf("missing changed paths: want invalid, got %v", err)
-	}
+	wantRefusal(t, err, ledger.ReasonInvalidCandidate)
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 	changed := must(open(t, s, "M-changed", "alice", []string{"b.lean"}, map[string]string{"C": "hash-1"}))
 	_, err = s.Land(ctx, ledger.LandRequest{
@@ -458,9 +455,7 @@ func TestLandRequiresChangedPathsPresenceAndConsistency(t *testing.T) {
 		Current:          map[string]string{"C": "hash-1"},
 		ChangedContracts: map[string]string{"C": "hash-2"},
 	})
-	if !errors.As(err, &invalid) {
-		t.Fatalf("empty changed paths with changed contract: want invalid, got %v", err)
-	}
+	wantRefusal(t, err, ledger.ReasonInvalidCandidate)
 	empty := must(open(t, s, "M-empty", "alice", []string{"c.lean"}, nil))
 	landed := must(s.Land(ctx, ledger.LandRequest{
 		Repo:         "r",
@@ -640,6 +635,10 @@ func TestLandRequiresTheHeadOfAStatementChange(t *testing.T) {
 		statementLand(m, "head-1", "", "head-1 ", nil),
 	} {
 		_, err := s.Land(ctx, request)
+		if request.Head == "" {
+			wantRefusal(t, err, ledger.ReasonInvalidCandidate)
+			continue
+		}
 		var invalid *ledger.InvalidError
 		if !errors.As(err, &invalid) {
 			t.Errorf("head %q, proof %q, reviewed head %q: want invalid, got %v",
@@ -732,7 +731,7 @@ func TestCheckReportsAStatementChangeWithNeitherRecordBeforeLand(t *testing.T) {
 	check := func(changes map[string]string, head, proof, reviewed string) ledger.CheckResult {
 		t.Helper()
 		return must(s.Check(ctx, ledger.CheckRequest{
-			Repo: "r", ID: m.ID, Generation: m.Generation, Changed: []string{"a.lean"},
+			Repo: "r", ID: m.ID, Generation: m.Generation, Commit: "candidate", Changed: []string{"a.lean"},
 			Current:          map[string]string{"C": "hash-1", "X.external": "x1"},
 			ChangedContracts: changes, Head: head, CompatibilityProof: proof, ReviewedHead: reviewed,
 		}))
@@ -740,9 +739,7 @@ func TestCheckReportsAStatementChangeWithNeitherRecordBeforeLand(t *testing.T) {
 	changeC := map[string]string{"C": "hash-2"}
 	for _, unreviewed := range []struct{ name, head, reviewed, names string }{
 		{"no record", "head-1", "", "head-1"},
-		{"no record and no head", "", "", "no review"},
 		{"a review at another head", "head-1", "head-0", "head-0"},
-		{"a review with no head to compare", "", "head-1", "head-1"},
 	} {
 		res := check(changeC, unreviewed.head, "", unreviewed.reviewed)
 		if res.Pass || len(res.Violations) != 1 {
@@ -759,6 +756,17 @@ func TestCheckReportsAStatementChangeWithNeitherRecordBeforeLand(t *testing.T) {
 			}
 		}
 	}
+	for _, noHead := range []struct {
+		proof, reviewed string
+	}{
+		{"", ""},
+		{"Spec.C_compat", ""},
+		{"", "head-1"},
+	} {
+		if res := check(changeC, "", noHead.proof, noHead.reviewed); !hasViolation(res, ledger.ViolationInvalidCandidate) {
+			t.Errorf("missing head with proof %q and review %q: %+v", noHead.proof, noHead.reviewed, res)
+		}
+	}
 	for _, passing := range []struct {
 		name                  string
 		changes               map[string]string
@@ -766,7 +774,6 @@ func TestCheckReportsAStatementChangeWithNeitherRecordBeforeLand(t *testing.T) {
 	}{
 		{"proofs only", nil, "", "", ""},
 		{"a compatibility proof", changeC, "head-1", "Spec.C_compat", ""},
-		{"a compatibility proof with no head", changeC, "", "Spec.C_compat", ""},
 		{"a review at its head", changeC, "head-1", "", "head-1"},
 	} {
 		if res := check(passing.changes, passing.head, passing.proof, passing.reviewed); !res.Pass {
@@ -810,7 +817,7 @@ func TestCheckRejectsMalformedStatementRecords(t *testing.T) {
 		{Head: "head-1", ChangedContracts: map[string]string{"C": " "}},
 		{Head: "head-1", ChangedContracts: map[string]string{"": "hash-2"}},
 	} {
-		request.Repo, request.ID, request.Generation = "r", m.ID, m.Generation
+		request.Repo, request.ID, request.Generation, request.Commit = "r", m.ID, m.Generation, "candidate"
 		request.Changed, request.Current = []string{"a.lean"}, map[string]string{"C": "hash-1"}
 		_, err := s.Check(ctx, request)
 		var invalid *ledger.InvalidError

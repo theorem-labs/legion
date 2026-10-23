@@ -375,10 +375,20 @@ func refusalForViolation(v Violation) *Refusal {
 		return refuse(ReasonStaleGeneration, "%s", v.Message)
 	case ViolationEscalated:
 		return refuse(ReasonEscalated, "%s", v.Message)
+	case ViolationInvalidCandidate:
+		return refuse(ReasonInvalidCandidate, "%s", v.Message)
 	case ViolationUndeclaredWrite:
 		return refuse(ReasonUndeclaredWrite, "%s", v.Message)
+	case ViolationStaleRead, ViolationUnverifiedRead:
+		return refuse(ReasonStaleRead, "%s", v.Message)
 	case ViolationOverlap:
 		return refuse(ReasonOverlap, "%s", v.Message)
+	case ViolationUndeclaredContract:
+		return refuse(ReasonUndeclaredContract, "%s", v.Message)
+	case ViolationPinned:
+		return refuse(ReasonPinned, "%s", v.Message)
+	case ViolationStatementUnreviewed:
+		return refuse(ReasonStatementUnreviewed, "%s", v.Message)
 	default:
 		return refuse(ReasonStaleRead, "%s", v.Message)
 	}
@@ -415,6 +425,70 @@ func contractReadsAtVersions(ctx context.Context, tx pgx.Tx, repo string, migrat
 	return contracts, nil
 }
 
+// checkContractViolations runs Land's version, declaration, pinned and statement checks without changing contracts.
+func checkContractViolations(ctx context.Context, tx pgx.Tx, migration Migration, req CheckRequest) ([]Violation, error) {
+	approved := make(map[string]struct{}, len(req.ApprovedPinned))
+	for _, name := range req.ApprovedPinned {
+		approved[name] = struct{}{}
+	}
+	var contracts map[string]Contract
+	if !req.DeferReads {
+		var err error
+		contracts, err = contractReadsAtVersions(ctx, tx, req.Repo, migration)
+		if err != nil {
+			var refusal *Refusal
+			if errors.As(err, &refusal) && refusal.Reason == ReasonStaleRead {
+				return []Violation{{Kind: ViolationStaleRead, Message: refusal.Message}}, nil
+			}
+			return nil, err
+		}
+	}
+	var violations []Violation
+	for _, name := range sortedNames(req.ChangedContracts) {
+		recorded, declared := migration.ReadVersions[name]
+		if !declared {
+			violations = append(violations, Violation{Kind: ViolationUndeclaredContract, Name: name,
+				Message: fmt.Sprintf("migration %s did not declare contract %s as a read", migration.ID, name)})
+			continue
+		}
+		var current Contract
+		if req.DeferReads {
+			var err error
+			current, err = loadContract(ctx, tx, req.Repo, name, false)
+			if err != nil {
+				var missing *NotFoundError
+				if errors.As(err, &missing) {
+					continue
+				}
+				return nil, err
+			}
+		} else {
+			if recorded == nil {
+				violations = append(violations, Violation{Kind: ViolationStaleRead, Name: name,
+					Message: fmt.Sprintf("migration %s did not record a contract version for %s", migration.ID, name)})
+				continue
+			}
+			current = contracts[name]
+			if current.Name == "" {
+				violations = append(violations, Violation{Kind: ViolationStaleRead, Name: name,
+					Message: fmt.Sprintf("migration %s did not read current contract %s", migration.ID, name)})
+				continue
+			}
+		}
+		if current.Pinned {
+			if _, ok := approved[name]; !ok {
+				violations = append(violations, Violation{Kind: ViolationPinned, Name: name,
+					Message: fmt.Sprintf("contract %s is pinned; a person must approve its change", name)})
+			}
+		}
+	}
+	statement, err := statementViolations(ctx, tx, migration, req)
+	if err != nil {
+		return nil, err
+	}
+	return append(violations, statement...), nil
+}
+
 // Land validates a complete candidate, advances its changed contracts, makes dependent agreements stale, and closes
 // the migration at the supplied commit. It holds the repository, migration and contract locks through every step.
 //
@@ -425,25 +499,17 @@ func contractReadsAtVersions(ctx context.Context, tx pgx.Tx, repo string, migrat
 // the proof declaration or confirm that the review happened. It keeps them in the migration.landed event, so the
 // record shows which way each landing took.
 func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
-	if req.ChangedPaths == nil {
-		return Migration{}, invalid("missing changed paths")
+	candidateRequest := CheckRequest{
+		Repo: req.Repo, ID: req.Migration, Generation: req.Generation, Commit: req.Commit, Changed: req.ChangedPaths,
+		Current: req.Current, ApprovedPinned: req.ApprovedPinned, ChangedContracts: req.ChangedContracts, Head: req.Head,
+		CompatibilityProof: req.CompatibilityProof, ReviewedHead: req.ReviewedHead,
 	}
-	if len(req.ChangedPaths) == 0 && len(req.ChangedContracts) > 0 {
-		return Migration{}, invalid("changed contracts need at least one changed path")
+	if precondition, ok := candidatePrecondition(candidateRequest); ok {
+		return Migration{}, refusalForViolation(precondition)
 	}
-	if strings.TrimSpace(req.Commit) == "" {
-		return Migration{}, invalid("empty landed commit")
-	}
-	candidate, err := cleanCheckRequest(CheckRequest{
-		Repo: req.Repo, ID: req.Migration, Generation: req.Generation, Changed: req.ChangedPaths, Current: req.Current,
-		ChangedContracts: req.ChangedContracts, Head: req.Head, CompatibilityProof: req.CompatibilityProof,
-		ReviewedHead: req.ReviewedHead,
-	})
+	candidate, err := cleanCheckRequest(candidateRequest)
 	if err != nil {
 		return Migration{}, err
-	}
-	if len(req.ChangedContracts) > 0 && req.Head == "" {
-		return Migration{}, invalid("changed contracts need the head that the landing program built")
 	}
 	names := sortedNames(req.ChangedContracts)
 	approved := make(map[string]struct{}, len(req.ApprovedPinned))

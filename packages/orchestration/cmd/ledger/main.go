@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,9 +21,12 @@ type usageError struct{ message string }
 
 func (e *usageError) Error() string { return e.message }
 
-type checkRefusal struct{ result ledger.CheckResult }
+type checkResultError struct {
+	result ledger.CheckResult
+	exit   int
+}
 
-func (e *checkRefusal) Error() string { return "candidate check refused" }
+func (e *checkResultError) Error() string { return "candidate check did not pass" }
 
 func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
@@ -71,7 +75,7 @@ parsed:
 
 	value, read, err := dispatch(ctx, store, args)
 	if err != nil {
-		var check *checkRefusal
+		var check *checkResultError
 		if errors.As(err, &check) {
 			if jsonOutput || read {
 				if encodeErr := json.NewEncoder(stdout).Encode(check.result); encodeErr != nil {
@@ -81,7 +85,7 @@ parsed:
 			} else {
 				fmt.Fprintln(stdout, check.result)
 			}
-			return 1
+			return check.exit
 		}
 		var refusal *ledger.Refusal
 		if jsonOutput && errors.As(err, &refusal) {
@@ -246,8 +250,9 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			request = decoded
 		} else {
 			if len(args) < 3 {
-				return nil, true, usagef("check <repo> <id> <generation> [--path <path>] [--current <name=hash>] " +
-					"[--changed-contract <name=hash>] [--head <commit>] [--compatibility-proof <name>] [--reviewed-head <commit>]")
+				return nil, true, usagef("check <repo> <id> <generation> [--path <path>|--no-paths] [--current <name=hash>] " +
+					"[--commit <sha>] [--approved-pinned <name>] [--defer-reads] [--changed-contract <name=hash>] " +
+					"[--head <commit>] [--compatibility-proof <name>] [--reviewed-head <commit>]")
 			}
 			generation, err := integer(args[2])
 			if err != nil {
@@ -263,10 +268,14 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if err != nil {
 			return value, true, err
 		}
-		if !value.Pass {
-			return value, true, &checkRefusal{result: value}
+		switch value.Outcome {
+		case ledger.CheckOutcomeRefused:
+			return value, true, &checkResultError{result: value, exit: 1}
+		case ledger.CheckOutcomeIncomplete:
+			return value, true, &checkResultError{result: value, exit: 5}
+		default:
+			return value, true, nil
 		}
-		return value, true, nil
 	case "land":
 		request, err := parseLandRequest(args)
 		if err != nil {
@@ -464,8 +473,13 @@ func requestFile[T any](args []string) (T, bool, error) {
 	if err != nil {
 		return request, true, fmt.Errorf("read request file: %w", err)
 	}
-	if err := json.Unmarshal(contents, &request); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
 		return request, true, usagef("invalid request JSON: %v", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return request, true, usagef("invalid request JSON: request file must contain one JSON value")
 	}
 	return request, true, nil
 }
@@ -508,15 +522,27 @@ func parseWritesAndReads(args []string) ([]string, map[string]string, error) {
 // parseCheckFlags reads a check's candidate: its changed paths, current read hashes, changed contracts and statement
 // records. The records are single values, kept verbatim as --path keeps its value.
 func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
-	request := ledger.CheckRequest{Changed: []string{}, Current: map[string]string{}, ChangedContracts: map[string]string{}}
+	request := ledger.CheckRequest{Current: map[string]string{}, ChangedContracts: map[string]string{}}
+	sawPath, noPaths := false, false
 	for len(args) > 0 {
+		switch args[0] {
+		case "--no-paths":
+			noPaths = true
+			args = args[1:]
+			continue
+		case "--defer-reads":
+			request.DeferReads = true
+			args = args[1:]
+			continue
+		}
 		if len(args) < 2 {
-			return ledger.CheckRequest{}, usagef("list flags need values")
+			return ledger.CheckRequest{}, usagef("check flags need values")
 		}
 		flag, value := args[0], args[1]
 		args = args[2:]
 		switch flag {
 		case "--path":
+			sawPath = true
 			request.Changed = append(request.Changed, value)
 		case "--current":
 			name, hash, err := parsePair(value, true)
@@ -524,6 +550,10 @@ func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
 				return ledger.CheckRequest{}, err
 			}
 			request.Current[name] = hash
+		case "--commit":
+			request.Commit = value
+		case "--approved-pinned":
+			request.ApprovedPinned = append(request.ApprovedPinned, value)
 		case "--changed-contract":
 			name, hash, err := parsePair(value, false)
 			if err != nil {
@@ -537,8 +567,14 @@ func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
 		case "--reviewed-head":
 			request.ReviewedHead = value
 		default:
-			return ledger.CheckRequest{}, usagef("unknown list flag %q", flag)
+			return ledger.CheckRequest{}, usagef("unknown check flag %q", flag)
 		}
+	}
+	if sawPath && noPaths {
+		return ledger.CheckRequest{}, usagef("check takes --path or --no-paths, not both")
+	}
+	if noPaths {
+		request.Changed = []string{}
 	}
 	return request, nil
 }
@@ -575,23 +611,14 @@ func parseAgreement(args []string) ([]string, map[string]int64, error) {
 func mutation[T any](value T, err error) (any, bool, error) { return value, false, err }
 
 func parseLandRequest(args []string) (ledger.LandRequest, error) {
-	if len(args) == 2 && args[0] == "--request-file" {
-		contents, err := os.ReadFile(args[1])
-		if err != nil {
-			return ledger.LandRequest{}, fmt.Errorf("read land request: %w", err)
-		}
-		var request ledger.LandRequest
-		if err := json.Unmarshal(contents, &request); err != nil {
-			return ledger.LandRequest{}, usagef("invalid land request JSON: %v", err)
-		}
-		return request, nil
+	if request, jsonInput, err := requestFile[ledger.LandRequest](args); jsonInput {
+		return request, err
 	}
 	request := ledger.LandRequest{
-		ChangedPaths:     []string{},
 		Current:          map[string]string{},
 		ChangedContracts: map[string]string{},
 	}
-	// A candidate that changes nothing must say so: an omitted path list is never read as an empty one.
+	// --no-paths distinguishes an empty candidate from an omitted changed-path list.
 	sawPath, noPaths := false, false
 	for len(args) > 0 {
 		if args[0] == "--no-paths" {
@@ -644,14 +671,14 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 			return ledger.LandRequest{}, usagef("unknown land flag %q", flag)
 		}
 	}
-	if request.Repo == "" || request.Migration == "" || request.Commit == "" {
-		return ledger.LandRequest{}, usagef("land needs --repo, --migration and --commit")
+	if request.Repo == "" || request.Migration == "" {
+		return ledger.LandRequest{}, usagef("land needs --repo and --migration")
 	}
-	switch {
-	case sawPath && noPaths:
+	if sawPath && noPaths {
 		return ledger.LandRequest{}, usagef("land takes --path or --no-paths, not both")
-	case !sawPath && !noPaths:
-		return ledger.LandRequest{}, usagef("land needs the candidate's changed files: one --path for each, or --no-paths when it changes none")
+	}
+	if noPaths {
+		request.ChangedPaths = []string{}
 	}
 	return request, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -126,7 +127,7 @@ func TestTakeoverRefusesTheOldOwnersGeneration(t *testing.T) {
 	_, err := s.TakeOver(ctx, "r", "M-1", "carol", 1)
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 
-	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1,
+	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Commit: "candidate",
 		Changed: []string{"a.lean"}, Current: map[string]string{"X.foo": "h1"}}))
 	if res.Pass || !hasViolation(res, ledger.ViolationStaleGeneration) {
 		t.Fatalf("old generation check: %+v", res)
@@ -138,7 +139,7 @@ func TestTakeoverRefusesTheOldOwnersGeneration(t *testing.T) {
 	_, err = s.Abandon(ctx, "r", "M-1", 1, "")
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 
-	res = must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 2,
+	res = must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 2, Commit: "candidate",
 		Changed: []string{"a.lean"}, Current: map[string]string{"X.foo": "h1"}}))
 	if !res.Pass {
 		t.Fatalf("current generation check: %+v", res)
@@ -179,7 +180,7 @@ func TestCheckNeverPassesOldGenerationWhenTakeoverIsQueued(t *testing.T) {
 	checked := make(chan checkOutcome, 1)
 	go func() {
 		result, err := s.Check(ctx, ledger.CheckRequest{
-			Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"},
+			Repo: "r", ID: "M-1", Generation: 1, Commit: "candidate", Changed: []string{"a.lean"},
 		})
 		checked <- checkOutcome{result: result, err: err}
 	}()
@@ -249,7 +250,7 @@ func TestCheckFlagsUndeclaredWritesAndChangedReadsAndPassesACleanChange(t *testi
 	ctx := context.Background()
 	must(open(t, s, "M-1", "alice", []string{"src/a.lean", "src/new/"}, map[string]string{"X.foo": "h1", "X.bar": "h2"}))
 	check := func(changed []string, current map[string]string) ledger.CheckResult {
-		return must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: changed, Current: current}))
+		return must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Commit: "candidate", Changed: changed, Current: current}))
 	}
 	clean := map[string]string{"X.foo": "h1", "X.bar": "h2"}
 
@@ -296,18 +297,55 @@ func TestCheckFlagsUndeclaredWritesAndChangedReadsAndPassesACleanChange(t *testi
 
 }
 
+func TestCheckReportsMissingCommitAsInvalidCandidate(t *testing.T) {
+	s := newStore(t)
+	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+
+	res := must(s.Check(context.Background(), ledger.CheckRequest{
+		Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"},
+	}))
+	if res.Pass || res.Outcome != "refused" || !hasViolation(res, ledger.ViolationInvalidCandidate) {
+		t.Fatalf("missing commit: %+v", res)
+	}
+}
+
+func TestDeferredCheckNeverPasses(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		reads    map[string]string
+		deferred []string
+	}{
+		{name: "declared read", reads: map[string]string{"C": "hash-1"}, deferred: []string{"C"}},
+		{name: "no declared reads", reads: nil, deferred: []string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newStore(t)
+			must(open(t, s, "M-1", "alice", []string{"a.lean"}, test.reads))
+
+			res := must(s.Check(context.Background(), ledger.CheckRequest{
+				Repo: "r", ID: "M-1", Generation: 1, Commit: "candidate", Changed: []string{"a.lean"},
+				DeferReads: true,
+			}))
+			if res.Pass || res.Outcome != "incomplete" || len(res.Violations) != 0 ||
+				!slices.Equal(res.Deferred, test.deferred) {
+				t.Fatalf("deferred check: %+v; want deferred %v", res, test.deferred)
+			}
+		})
+	}
+}
+
 func TestCheckOfAClosedOrUnknownMigration(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
 	must(s.Abandon(ctx, "r", "M-1", 1, ""))
-	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"}}))
+	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Commit: "candidate", Changed: []string{"a.lean"}}))
 	if res.Pass || !hasViolation(res, ledger.ViolationNotOpen) {
 		t.Fatalf("closed migration: %+v", res)
 	}
 	_, err := s.Abandon(ctx, "r", "M-1", 1, "")
 	wantRefusal(t, err, ledger.ReasonNotOpen)
-	_, err = s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-nope", Generation: 1})
+	_, err = s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-nope", Generation: 1, Commit: "candidate", Changed: []string{}})
 	var nf *ledger.NotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("unknown migration: %v", err)
@@ -345,7 +383,7 @@ func TestOpenAndCheckRejectPathsWithLeadingOrTrailingWhitespace(t *testing.T) {
 	}
 	must(open(t, s, "M-good", "alice", []string{"owned.lean"}, nil))
 	for _, candidate := range []string{" owned.lean", "owned.lean "} {
-		_, err := s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-good", Generation: 1, Changed: []string{candidate}})
+		_, err := s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-good", Generation: 1, Commit: "candidate", Changed: []string{candidate}})
 		var invalid *ledger.InvalidError
 		if !errors.As(err, &invalid) {
 			t.Errorf("candidate path %q: want invalid, got %v", candidate, err)
@@ -395,7 +433,7 @@ func TestExtendAddsPathsUnlessTheyOverlap(t *testing.T) {
 	if len(m.Writes) != 2 || m.Reads["X.b"] != "2" || m.Reads["X.a"] != "1" {
 		t.Fatalf("after extend: %+v", m)
 	}
-	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1,
+	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Commit: "candidate",
 		Changed: []string{"a.lean", "b.lean"}, Current: map[string]string{"X.a": "1", "X.b": "2"}}))
 	if !res.Pass {
 		t.Fatalf("check after extend: %+v", res)
@@ -424,7 +462,7 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	if len(st.Escalated) != 1 || st.Escalated[0].ID != "M-1" {
 		t.Fatalf("status escalated: %+v", st.Escalated)
 	}
-	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"}}))
+	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Commit: "candidate", Changed: []string{"a.lean"}}))
 	if res.Pass || !hasViolation(res, ledger.ViolationEscalated) {
 		t.Fatalf("an escalated migration must wait for the steward: %+v", res)
 	}
@@ -433,7 +471,7 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	if m.EscalatedAt != nil || m.LandingRounds != 0 {
 		t.Fatalf("after retry: %+v", m)
 	}
-	if res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"}})); !res.Pass {
+	if res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Commit: "candidate", Changed: []string{"a.lean"}})); !res.Pass {
 		t.Fatalf("after retry: %+v", res)
 	}
 	_, err = s.Retry(ctx, "r", "M-1")

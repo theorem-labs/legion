@@ -22,6 +22,7 @@ const (
 	ReasonStaleVersion       = "stale_version"       // an agreement did not read the current contract version
 	ReasonPinned             = "pinned"              // a person must approve the pinned contract's change
 	ReasonEscalated          = "escalated"           // the migration awaits a steward's decision
+	ReasonInvalidCandidate   = "invalid_candidate"   // candidate metadata cannot describe a complete landing
 	ReasonUndeclaredWrite    = "undeclared_write"    // the candidate writes a path outside the migration lock
 	ReasonUndeclaredContract = "undeclared_contract" // the migration did not declare the changed contract as a read
 	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.
