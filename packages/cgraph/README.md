@@ -102,6 +102,19 @@ it calls or jumps to directly: the only C facts its decoding reads. A change to 
 signature leaves the entry in use. An entry that cannot be read or is malformed stops the run with
 exit status 3 and names the cache directory to remove.
 
+It keeps two more layers, each reused only while every input it reads is unchanged:
+
+- `link/<part>/<key>.json`, the link's core, one per part (a new core replaces the part's earlier one):
+  the nodes, edges, exclusions and analysis that the unit facts, the image and the configuration
+  decide. Its key covers the package's code, the configuration's rules, the part's files, each unit's
+  facts key, the image's and `System.map`'s SHA-256, and the image copy the contract graph's addresses
+  pin. The contract layer (each function's contract, the callback-table edges, the contract functions
+  of the part) is linked again on every build, so a landing that changes only the contract graph reuses
+  the core and gives the same bytes as a full link.
+- `interfaces/<sha256>.json`, the top-level lines and identifier runs of each Lean module an interface
+  is declared in, keyed by the module's contents and the rules that read it, so only a changed module
+  is read into tokens again. A declaration that cannot be read is an input error (exit 3).
+
 ## Configuration
 
 ```toml

@@ -7,20 +7,157 @@ the same graph as a full build.
 
 from __future__ import annotations
 
+import bisect
 import collections
+import dataclasses
+import functools
+import hashlib
+import importlib.metadata
+import json
 import os
+import re
+import sys
+import tempfile
+from collections.abc import Collection
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+import capstone
 
 from . import jsonio, structure
 from .config import Config
 from .contracts import ContractGraph, c_file
+from .errors import CacheError
 from .image import FunctionFacts, Image, Symbol
 
 Facts = dict[str, Any]
 Unit = dict[str, Any]
 _EVENT_LISTS = ("accesses", "unevaluated", "list_calls", "indirect", "function_pointers", "field_accesses")
 _FIELD_KEYS = ("struct", "field", "offset", "displacement", "base", "size", "bitfield")
+_CORE_FORMAT = "cgraph/link-core/v1"
+
+
+@functools.cache
+def _code_digest() -> str:
+    """Every source file of the package, and the interpreter and libraries that decode the image."""
+    hashed = hashlib.sha256(
+        jsonio.canonical([sys.version, capstone.__version__, importlib.metadata.version("pyelftools")]).encode()
+    )
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        hashed.update(path.name.encode())
+        hashed.update(path.read_bytes())
+    return hashed.hexdigest()
+
+
+def _plain(value: Any) -> Any:
+    """A configuration value as JSON: patterns by their text, sets sorted, dataclasses by field."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {item.name: _plain(getattr(value, item.name)) for item in dataclasses.fields(value)}
+    if isinstance(value, re.Pattern):
+        return value.pattern
+    if isinstance(value, frozenset | set):
+        return sorted(_plain(item) for item in value)
+    if isinstance(value, list | tuple):
+        return [_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    return value
+
+
+@dataclass(frozen=True)
+class LinkCache:
+    """The latest link core of each part, at ``<cache>/link/<part>/<key>.json``: a part's directory is
+    named by the SHA-256 of its files, and storing a core removes that part's earlier ones, so the
+    cache holds one core per part. ``inputs`` names the unit facts (by their facts-cache keys) and
+    the image and System.map (by SHA-256); the key adds the code, the configuration's rules, the
+    part's files and the image copy the contract graph pins."""
+
+    directory: Path
+    inputs: dict[str, Any]
+
+    def key(self, config: Config, part_files: list[str], pins: list[list[Any]]) -> str:
+        payload = {
+            "format": _CORE_FORMAT,
+            "code": _code_digest(),
+            "vocabulary": _plain(config.vocabulary),
+            "image_rules": _plain(config.image),
+            "part_files": sorted(part_files),
+            "inputs": self.inputs,
+            "pins": pins,
+        }
+        return hashlib.sha256(jsonio.canonical(payload).encode()).hexdigest()
+
+    def _path(self, part_files: list[str], key: str) -> Path:
+        part = hashlib.sha256(jsonio.canonical(sorted(part_files)).encode()).hexdigest()
+        return self.directory / "link" / part / f"{key}.json"
+
+    def load(self, part_files: list[str], key: str) -> dict[str, Any] | None:
+        path = self._path(part_files, key)
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise self._error(path) from error
+        try:
+            core = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise self._error(path) from error
+        if (
+            not isinstance(core, dict)
+            or core.get("format") != _CORE_FORMAT
+            or not all(isinstance(core.get(name), list) for name in ("nodes", "edges", "exclusions"))
+            or not isinstance(core.get("analysis"), dict)
+            or not isinstance(core["analysis"].get("part_functions"), list)
+            or not isinstance(core.get("image_facts"), str)
+        ):
+            raise self._error(path)
+        return core
+
+    def store(self, part_files: list[str], key: str, core: dict[str, Any]) -> None:
+        path = self._path(part_files, key)
+        temporary: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{key}.", suffix=".tmp", dir=path.parent)
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(core, stream, separators=(",", ":"), ensure_ascii=False)
+            os.replace(temporary, path)
+            for earlier in path.parent.glob("*.json"):
+                if earlier != path:
+                    earlier.unlink(missing_ok=True)
+        except OSError as error:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise CacheError(f"cannot write link core {path}: {error}") from error
+
+    def _error(self, path: Path) -> CacheError:
+        return CacheError(f"link core {path} is malformed; remove the cache directory {self.directory}")
+
+
+def _pins(linker: Linker) -> list[list[Any]]:
+    """Each definition whose image copy the contract graph's address selects, with that address."""
+    pins = []
+    for (name, file, line), _ in sorted(linker.definitions.items()):
+        contract = linker.contracts.function(file, name)
+        address = contract.get("addr") if contract else None
+        if address and any(symbol.address == int(address, 16) for symbol in linker.image.functions.get(name, [])):
+            pins.append([name, file, line, int(address, 16)])
+    return pins
+
+
+def _image_digest(linker: Linker, identities: list[str]) -> str:
+    """The SHA-256 of the image facts of each function the core decoded, read through the image
+    cache, so a reused core is checked against the facts it was built from, and a malformed image
+    cache entry stops the run as it does without a core."""
+    hashed = hashlib.sha256()
+    for identity in identities:
+        for symbol in linker.symbols(linker.primary[identity]):
+            facts = _plain(linker.image.facts(symbol))
+            hashed.update(jsonio.canonical([identity, symbol.address, facts]).encode())
+    return hashed.hexdigest()
 
 
 @dataclass
@@ -433,9 +570,32 @@ def build(
     image: Image,
     contracts: ContractGraph,
     inputs: dict[str, Any],
+    cache: LinkCache | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The graph and C3 exclusions of one part."""
+    """The graph and C3 exclusions of one part.
+
+    The link has two layers. The core is everything the unit facts, the image and the configuration
+    decide, with the image copy the contract graph pins for each definition; the contract layer is
+    the contract each function node names, the callback-table edges and the contract functions of
+    the part. With a cache, a core is reused while every input it reads is unchanged, so a landing
+    that changes only the contract graph links only the contract layer again."""
     linker = Linker(config, part_files, tus, image, contracts)
+    core: dict[str, Any] | None = None
+    key = cache.key(config, part_files, _pins(linker)) if cache is not None else None
+    if cache is not None and key is not None:
+        core = cache.load(part_files, key)
+        if core is not None and core["image_facts"] != _image_digest(linker, core["analysis"]["part_functions"]):
+            core = None
+    if core is None:
+        core = _link_core(linker, config, part_files)
+        if cache is not None and key is not None:
+            cache.store(part_files, key, core)
+    return _assemble(core, linker, contracts, part, part_files, inputs)
+
+
+def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[str, Any]:
+    """Nodes, edges, exclusions and analysis from the unit facts, the image and the configuration."""
+    image = linker.image
     roots: dict[str, Definition] = {}
     for tu in sorted(linker.part_files):
         for name, function in linker.tus[tu]["functions"].items():
@@ -519,11 +679,8 @@ def build(
             for name in (entry["global"], *entry.get("aliases", []))
         }
         symbols = linker.symbols(definition)
-        contract = contracts.function(definition.file, definition.name)
         provenance = [{"source": "c", "file": definition.file, "line": definition.line}]
         provenance += [{"source": "image", "address": _hex(symbol.address)} for symbol in symbols]
-        if contract is not None:
-            provenance.append({"source": "contract_graph", "id": contract["id"]})
         builder.node(
             identity,
             "function",
@@ -532,7 +689,6 @@ def build(
             c_file=definition.file,
             line=definition.line,
             image_addresses=sorted(_hex(symbol.address) for symbol in symbols),
-            contract=contract["id"] if contract else None,
             weak_definitions=[f"{item.file}:{item.line}" for item in linker.alternates.get(identity, [])] or None,
         )
         builder.provenance(identity, provenance)
@@ -771,7 +927,6 @@ def build(
         (table for unit_facts in linker.tus.values() for table in unit_facts["tables"]),
         key=jsonio.canonical,
     )
-    callbacks = _callback_edges(builder, linker, contracts, tables, functions, exclusions)
     excluded, structure_drops = structure.layout_edges(builder, linker.records, config.vocabulary)
     exclusions.extend(structure_drops)
     exclusions.extend(structure.membership_edges(builder, linker, list_calls))
@@ -792,14 +947,10 @@ def build(
     nodes, edges = builder.finalize()
     image_names = {identity: sorted(names) for identity, names in image_globals.items()}
     witnesses = [witness for tu in sorted(linker.part_files) for witness in linker.tus[tu]["witnesses"]]
-    expected_functions, contract_drops = _expected_functions(linker)
-    exclusions.extend(contract_drops)
-    exclusion_document = jsonio.exclusion_document(part, exclusions)
     analysis.update(
         {
             "part_functions": sorted(functions),
             "roots": sorted(roots),
-            "expected_functions": expected_functions,
             "c_calls": [
                 {"source": source, "target": target, "sites": sites}
                 for (source, target), sites in sorted(c_calls.items())
@@ -808,7 +959,6 @@ def build(
             "field_accesses": field_accesses,
             "image": _image_analysis(linker, functions, image_names, image_pairs),
             "callback_tables": tables,
-            "resolved_callbacks": callbacks,
             "excluded_embedding_bases": excluded,
             "membership_witnesses": sorted(witnesses, key=jsonio.canonical),
             "generic_selections": {
@@ -818,19 +968,85 @@ def build(
             "parse_errors": {
                 tu: linker.tus[tu]["errors"] for tu in sorted(linker.part_files) if linker.tus[tu]["errors"]
             },
-            "contract_mapping_duplicates": _contract_mapping_duplicates(linker),
-            "excluded": exclusion_document["counts"],
         }
     )
     for key in ("folds", "indirect_slots"):
         analysis[key] = sorted(analysis[key], key=jsonio.canonical)
+    return {
+        "format": _CORE_FORMAT,
+        "nodes": nodes,
+        "edges": edges,
+        "exclusions": exclusions,
+        "analysis": analysis,
+        "image_facts": _image_digest(linker, analysis["part_functions"]),
+    }
+
+
+def _unique_sorted(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique = {jsonio.canonical(item): item for item in items}
+    return [unique[key] for key in sorted(unique)]
+
+
+def _assemble(
+    core: dict[str, Any],
+    linker: Linker,
+    contracts: ContractGraph,
+    part: str,
+    part_files: list[str],
+    inputs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The contract layer over a core: the same graph a link of both layers at once gives."""
+    nodes: dict[str, dict[str, Any]] = {node["id"]: node for node in core["nodes"]}
+    analysis = dict(core["analysis"])
+    for identity in analysis["part_functions"]:
+        definition = linker.primary[identity]
+        contract = contracts.function(definition.file, definition.name)
+        if contract is not None:
+            node = nodes[identity]
+            node["contract"] = contract["id"]
+            node["provenance"] = _unique_sorted(
+                [*node["provenance"], {"source": "contract_graph", "id": contract["id"]}]
+            )
+    core_ids = set(nodes)
+    builder = GraphBuilder()
+    builder.nodes = nodes
+    exclusions = list(core["exclusions"])
+    callbacks = _callback_edges(
+        builder, linker, contracts, analysis["callback_tables"], analysis["part_functions"], exclusions
+    )
+    for identity, node in nodes.items():
+        if identity not in core_ids:
+            node["provenance"] = _unique_sorted(node["provenance"])
+    added = sorted(
+        ({**edge, "provenance": _unique_sorted(edge["provenance"])} for edge in builder.edges.values()),
+        key=jsonio.canonical,
+    )
+    edges: list[dict[str, Any]] = []
+    previous = 0
+    for edge in added:
+        position = bisect.bisect_left(core["edges"], jsonio.canonical(edge), lo=previous, key=jsonio.canonical)
+        edges += core["edges"][previous:position]
+        edges.append(edge)
+        previous = position
+    edges += core["edges"][previous:]
+    expected_functions, contract_drops = _expected_functions(linker)
+    exclusions.extend(contract_drops)
+    exclusion_document = jsonio.exclusion_document(part, exclusions)
+    analysis.update(
+        {
+            "expected_functions": expected_functions,
+            "resolved_callbacks": callbacks,
+            "contract_mapping_duplicates": _contract_mapping_duplicates(linker),
+            "excluded": exclusion_document["counts"],
+        }
+    )
     return (
         {
             "format": "cgraph/graph/v1",
             "part": part,
             "files": sorted(part_files),
             "inputs": inputs,
-            "nodes": nodes,
+            "nodes": [nodes[identity] for identity in sorted(nodes)],
             "edges": edges,
             "analysis": analysis,
         },
@@ -848,7 +1064,7 @@ def _callback_edges(
     linker: Linker,
     contracts: ContractGraph,
     tables: list[dict[str, Any]],
-    functions: dict[str, Definition],
+    functions: Collection[str],
     exclusions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Callback edges with every contract edge from a part function either linked or excluded."""

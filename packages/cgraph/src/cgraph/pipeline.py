@@ -148,11 +148,23 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
             or None,
             "vocabulary": digest,
         }
-        graph, exclusions = link.build(config, part, files, facts, image, contracts, recorded)
+        link_cache = (
+            link.LinkCache(
+                cache_directory,
+                {
+                    "facts": {source: cache.manifest[source]["key"] for source in files},
+                    "image": recorded["image"],
+                    "system_map": recorded["system_map"],
+                },
+            )
+            if cache_directory is not None
+            else None
+        )
+        graph, exclusions = link.build(config, part, files, facts, image, contracts, recorded, link_cache)
     finally:
         image.close()
     owner_list, topics = owners.build(graph, config.topic_prefix)
-    numbers = measures.build(graph, contracts, inputs.contract_source)
+    numbers = measures.build(graph, contracts, inputs.contract_source, cache_directory)
     layers = {
         "call_layer": checks.calls(graph),
         "access_layer": checks.accesses(graph),
