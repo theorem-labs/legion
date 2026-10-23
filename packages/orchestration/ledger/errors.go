@@ -15,8 +15,12 @@ const (
 	ReasonExists          = "exists"           // a migration with that name already exists
 	ReasonBelowLimit      = "below_limit"      // the migration has not used up its landing rounds
 	ReasonNotEscalated    = "not_escalated"    // retry of a migration that is not escalated
-	ReasonAttemptEnded    = "attempt_ended"    // the attempt already has an exit
 	ReasonImportConflict  = "import_conflict"  // a pilot record disagrees with the ledger's copy
+	ReasonNotOwner        = "not_owner"        // the caller does not own the contract
+	ReasonStaleRead       = "stale_read"       // a recorded contract hash is no longer current
+	ReasonStaleVersion    = "stale_version"    // an agreement did not read the current contract version
+	ReasonPinned          = "pinned"           // a person must approve the pinned contract's change
+	ReasonEscalated       = "escalated"        // the migration awaits a steward's decision
 )
 
 // Refusal is a declined request.
@@ -34,7 +38,7 @@ func refuse(reason, format string, args ...any) *Refusal {
 	return &Refusal{Reason: reason, Message: fmt.Sprintf(format, args...)}
 }
 
-// NotFoundError names a repository, item, migration or attempt that does not exist.
+// NotFoundError names a repository, item, migration, contract or agreement that does not exist.
 type NotFoundError struct {
 	What string `json:"what"`
 	ID   string `json:"id"`

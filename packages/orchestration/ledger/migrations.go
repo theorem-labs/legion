@@ -55,6 +55,7 @@ type Migration struct {
 	OpenedAt         time.Time         `json:"opened_at"`
 	ClosedAt         *time.Time        `json:"closed_at,omitempty"`
 	CloseReason      string            `json:"close_reason,omitempty"`
+	LandedCommit     string            `json:"landed_commit,omitempty"`
 	Writes           []string          `json:"writes"`
 	Reads            map[string]string `json:"reads"`
 }
@@ -96,12 +97,12 @@ type querier interface {
 }
 
 const migrationColumns = `id, owner, base_commit, branch, state, generation, landing_rounds, escalated_at,
-	coalesce(escalation_reason, ''), opened_at, closed_at, coalesce(close_reason, '')`
+	coalesce(escalation_reason, ''), opened_at, closed_at, coalesce(close_reason, ''), coalesce(landed_commit, '')`
 
 func scanMigration(row pgx.Row) (Migration, error) {
 	var m Migration
 	err := row.Scan(&m.ID, &m.Owner, &m.BaseCommit, &m.Branch, &m.State, &m.Generation, &m.LandingRounds,
-		&m.EscalatedAt, &m.EscalationReason, &m.OpenedAt, &m.ClosedAt, &m.CloseReason)
+		&m.EscalatedAt, &m.EscalationReason, &m.OpenedAt, &m.ClosedAt, &m.CloseReason, &m.LandedCommit)
 	return m, err
 }
 
@@ -649,12 +650,9 @@ func (s *Store) Retry(ctx context.Context, repo, id string) (Migration, error) {
 	return m, err
 }
 
-// CloseMigration ends an open migration as landed or abandoned, releasing all its declared writes at once.
-// The declared writes and reads stay on the record as history.
-func (s *Store) CloseMigration(ctx context.Context, repo, id string, gen int64, outcome, reason string) (Migration, error) {
-	if outcome != StateLanded && outcome != StateAbandoned {
-		return Migration{}, invalid("close outcome %q must be %s or %s", outcome, StateLanded, StateAbandoned)
-	}
+// Abandon ends an open migration without landing it, releasing all its declared writes at once. The declarations
+// stay on the record as history.
+func (s *Store) Abandon(ctx context.Context, repo, id string, gen int64, reason string) (Migration, error) {
 	var m Migration
 	err := s.tx(ctx, func(tx pgx.Tx) error {
 		if _, err := lockRepo(ctx, tx, repo, true); err != nil {
@@ -665,10 +663,10 @@ func (s *Store) CloseMigration(ctx context.Context, repo, id string, gen int64, 
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE migrations SET state = $3, closed_at = clock_timestamp(), close_reason = $4
-			WHERE repo = $1 AND id = $2`, repo, id, outcome, reason); err != nil {
+			WHERE repo = $1 AND id = $2`, repo, id, StateAbandoned, reason); err != nil {
 			return err
 		}
-		if err := event(ctx, tx, repo, "migration."+outcome, id, cur.Owner, map[string]any{
+		if err := event(ctx, tx, repo, "migration.abandoned", id, cur.Owner, map[string]any{
 			"generation": gen, "reason": reason, "released": cur.Writes,
 		}); err != nil {
 			return err

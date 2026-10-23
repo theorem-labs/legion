@@ -135,7 +135,7 @@ func TestTakeoverRefusesTheOldOwnersGeneration(t *testing.T) {
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 	_, err = s.ExtendMigration(ctx, "r", "M-1", 1, []string{"b.lean"}, nil)
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
-	_, err = s.CloseMigration(ctx, "r", "M-1", 1, ledger.StateLanded, "")
+	_, err = s.Abandon(ctx, "r", "M-1", 1, "")
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 
 	res = must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 2,
@@ -143,7 +143,7 @@ func TestTakeoverRefusesTheOldOwnersGeneration(t *testing.T) {
 	if !res.Pass {
 		t.Fatalf("current generation check: %+v", res)
 	}
-	must(s.CloseMigration(ctx, "r", "M-1", 2, ledger.StateLanded, "landed"))
+	must(s.Abandon(ctx, "r", "M-1", 2, "done"))
 }
 
 func TestCheckNeverPassesOldGenerationWhenTakeoverIsQueued(t *testing.T) {
@@ -300,12 +300,12 @@ func TestCheckOfAClosedOrUnknownMigration(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
-	must(s.CloseMigration(ctx, "r", "M-1", 1, ledger.StateLanded, ""))
+	must(s.Abandon(ctx, "r", "M-1", 1, ""))
 	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"}}))
 	if res.Pass || !hasViolation(res, ledger.ViolationNotOpen) {
 		t.Fatalf("closed migration: %+v", res)
 	}
-	_, err := s.CloseMigration(ctx, "r", "M-1", 1, ledger.StateAbandoned, "")
+	_, err := s.Abandon(ctx, "r", "M-1", 1, "")
 	wantRefusal(t, err, ledger.ReasonNotOpen)
 	_, err = s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-nope", Generation: 1})
 	var nf *ledger.NotFoundError
@@ -322,7 +322,7 @@ func TestAbandonReleasesEveryPathSoABlockedOpenSucceeds(t *testing.T) {
 		_, err := open(t, s, "M-small", "bob", w, nil)
 		wantRefusal(t, err, ledger.ReasonOverlap)
 	}
-	m := must(s.CloseMigration(ctx, "r", "M-big", 1, ledger.StateAbandoned, "split into smaller migrations"))
+	m := must(s.Abandon(ctx, "r", "M-big", 1, "split into smaller migrations"))
 	if m.State != ledger.StateAbandoned || m.ClosedAt == nil {
 		t.Fatalf("after abandon: %+v", m)
 	}
@@ -410,7 +410,7 @@ func TestEventLogRecordsChangesAndRefusesEdits(t *testing.T) {
 	ctx := context.Background()
 	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
 	must(s.TakeOver(ctx, "r", "M-1", "bob", 1))
-	must(s.CloseMigration(ctx, "r", "M-1", 2, ledger.StateAbandoned, "x"))
+	must(s.Abandon(ctx, "r", "M-1", 2, "x"))
 	evs := must(s.Events(ctx, "r", 0, "M-1"))
 	var kinds []string
 	for _, e := range evs {

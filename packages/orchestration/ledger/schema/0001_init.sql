@@ -1,4 +1,4 @@
--- The orchestration ledger: work-item leases, migrations with their change locks, attempt records and the event log.
+-- The orchestration ledger: work-item leases, migrations with their change locks, contracts, agreements and the event log.
 -- All times come from the database clock, so every host agrees on when a lease ends.
 
 CREATE TABLE repositories (
@@ -40,8 +40,10 @@ CREATE TABLE migrations (
     opened_at         timestamptz NOT NULL DEFAULT now(),
     closed_at         timestamptz,
     close_reason      text,
+    landed_commit     text,
     PRIMARY KEY (repo, id),
-    CHECK ((state = 'open') = (closed_at IS NULL))
+    CHECK ((state = 'open') = (closed_at IS NULL)),
+    CHECK ((state = 'landed') = (landed_commit IS NOT NULL))
 );
 
 -- Declared writes. is_prefix marks a directory: it covers every path below it, new files included.
@@ -65,27 +67,41 @@ CREATE TABLE migration_reads (
     FOREIGN KEY (repo, migration) REFERENCES migrations(repo, id)
 );
 
--- One attempt to run a logical owner (a role) on a host. The row is written, as intent, before the process starts.
-CREATE TABLE attempts (
-    id                bigserial PRIMARY KEY,
-    repo              text NOT NULL REFERENCES repositories(name),
-    logical_owner     text NOT NULL,
-    host              text NOT NULL,
-    generation        bigint NOT NULL,
-    desired_state     text NOT NULL CHECK (desired_state IN ('running', 'stopped')),
-    observed_state    text NOT NULL CHECK (observed_state IN ('pending', 'running', 'exited', 'lost')),
-    checkpoint_branch text NOT NULL DEFAULT '',
-    budget_usd        numeric(12, 2) NOT NULL DEFAULT 0 CHECK (budget_usd >= 0),
-    created_at        timestamptz NOT NULL DEFAULT now(),
-    started_at        timestamptz,
-    ended_at          timestamptz,
-    exit_reason       text CHECK (exit_reason IN ('completed', 'refused', 'transient_error', 'credential_expired',
-                                                  'quota_exhausted', 'budget_exhausted', 'superseded', 'crashed',
-                                                  'killed', 'lost')),
-    exit_detail       text,
-    UNIQUE (repo, logical_owner, generation),
-    CHECK ((ended_at IS NULL) = (exit_reason IS NULL))
+-- A named statement, its owner and its current versioned hash. Pinned statements can land only with a person's
+-- explicit approval.
+CREATE TABLE contracts (
+    repo           text NOT NULL REFERENCES repositories(name),
+    name           text NOT NULL,
+    owner          text NOT NULL,
+    statement_hash text NOT NULL,
+    version        bigint NOT NULL DEFAULT 1 CHECK (version >= 1),
+    pinned         boolean NOT NULL DEFAULT false,
+    updated_at     timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (repo, name)
 );
+
+-- An agreement has the versions of every contract its parties read. A landing moves agreements that read an older
+-- version to stale exactly once.
+CREATE TABLE agreements (
+    repo      text NOT NULL REFERENCES repositories(name),
+    id        text NOT NULL,
+    parties   text[] NOT NULL,
+    state     text NOT NULL DEFAULT 'agreed' CHECK (state IN ('agreed', 'stale')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    staled_at timestamptz,
+    PRIMARY KEY (repo, id),
+    CHECK ((state = 'stale') = (staled_at IS NOT NULL))
+);
+CREATE TABLE agreement_reads (
+    repo      text NOT NULL,
+    agreement text NOT NULL,
+    contract  text NOT NULL,
+    version   bigint NOT NULL CHECK (version >= 1),
+    PRIMARY KEY (repo, agreement, contract),
+    FOREIGN KEY (repo, agreement) REFERENCES agreements(repo, id),
+    FOREIGN KEY (repo, contract) REFERENCES contracts(repo, name)
+);
+
 
 -- Every change, in order. Rows are never updated or deleted.
 CREATE TABLE events (

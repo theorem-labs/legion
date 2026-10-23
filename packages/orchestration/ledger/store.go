@@ -1,5 +1,5 @@
-// Package ledger is the orchestration ledger: work-item leases, migrations and their change locks, attempt records and
-// an append-only event log, all in Postgres. Every operation runs in one transaction.
+// Package ledger is the orchestration ledger: work-item leases, migrations and their change locks, the contract
+// ledger and an append-only event log, all in Postgres. Every operation runs in one transaction.
 package ledger
 
 import (

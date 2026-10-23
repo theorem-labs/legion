@@ -34,3 +34,23 @@ type PathClash struct {
 	Ours   string `json:"ours"`
 	Theirs string `json:"theirs"`
 }
+
+// Contract records who owns a statement and the version of its current hash.
+type Contract struct {
+	Name          string    `json:"name"`
+	Owner         string    `json:"owner"`
+	StatementHash string    `json:"statement_hash"`
+	Version       int64     `json:"version"`
+	Pinned        bool      `json:"pinned"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// Agreement records the versions of contracts that its parties agreed to use.
+type Agreement struct {
+	ID        string           `json:"id"`
+	Parties   []string         `json:"parties"`
+	State     string           `json:"state"`
+	CreatedAt time.Time        `json:"created_at"`
+	StaledAt  *time.Time       `json:"staled_at,omitempty"`
+	Reads     map[string]int64 `json:"reads"`
+}
