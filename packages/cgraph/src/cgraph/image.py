@@ -354,8 +354,10 @@ class Image:
         self.cache: dict[int, FunctionFacts] = {}
         self.section_data: dict[str, bytes] = {}
         # The number of parameters of each function the C defines, for the argument registers a
-        # call passes; set by the caller before facts are read, eight where unknown.
+        # call passes, and the registers it returns in; set by the caller before facts are read.
+        # Where unknown: eight arguments, two result registers.
         self.arity: dict[str, int] = {}
+        self.results: dict[str, int] = {}
 
     def close(self) -> None:
         self.handle.close()
@@ -401,9 +403,12 @@ class Image:
         successors = _flow(self.decoder, instructions)
         states = self._block_states(instructions, successors)
         before = dict(states)
+        returned = {f"a{position}" for position in range(self.results.get(name, 2))}
         for index, state in states:
             instruction = instructions[index]
-            escapes = instruction.mnemonic not in _ADDI or self._escapes(instructions, successors, before, index)
+            escapes = instruction.mnemonic not in _ADDI or self._escapes(
+                instructions, successors, before, index, returned
+            )
             self._step(name, instruction, state, facts, escapes)
         return facts
 
@@ -422,13 +427,16 @@ class Image:
         successors: list[list[int]],
         before: dict[int, _State],
         index: int,
+        returned: set[str],
         limit: int = 256,
     ) -> bool:
         """Whether the address an ``addi`` sets is used, on some path, other than as the base of loads
         and stores whose state still holds it: passed to a call (in an argument the callee takes),
-        returned, stored, compared or computed with. Registers derived from it by ``addi``, ``mv`` or
-        ``add`` are followed, and callee-saved registers survive calls. Only an escaping address is
-        itself an access; a base gives the accesses of its loads and stores."""
+        returned (in a register the function's C result uses), stored, compared or computed with.
+        Registers that hold the same address (``mv``) or the address plus an index (``add``) are
+        followed; an ``addi`` of it forms another address, judged at that ``addi``. Callee-saved
+        registers survive calls. Only an escaping address is itself an access; a base gives the
+        accesses of its loads and stores."""
         operands = list(instructions[index].operands)
         if not operands or operands[0].type != CS_OP_REG:
             return True
@@ -469,11 +477,15 @@ class Image:
                     register for register in tracked if self.decoder.reg_name(register).startswith(("s", "sp", "gp"))
                 )
             if mnemonic in _ENDS or tail:
-                if names & {"a0", "a1"} and not indirect:
+                if names & returned and not indirect:
                     return True
                 continue
-            # A derived register holds the address plus something; any other write ends the address there.
-            tracked = (tracked | written) if used else (tracked - written)
+            if used and mnemonic in _ADDI:
+                # address + k is another address: its own addi decides whether it is an access.
+                tracked = tracked - written
+            else:
+                # mv and add keep the address (plus an index); any other write ends it there.
+                tracked = (tracked | written) if used else (tracked - written)
             if tracked:
                 pending += [(following, tracked) for following in successors[position]]
         return bool(pending)
@@ -685,6 +697,9 @@ class Image:
                 self._record_address(function, value, instruction.address, "addi_address", facts)
         elif indexed is not None:
             anchored[indexed[0]] = indexed[1]
+            if facts is not None and mnemonic in _ADDI and escapes:
+                # A per-CPU or indexed address plus a field offset that escapes: the object it names.
+                self._record_address(function, indexed[1], instruction.address, "indexed_address", facts)
         elif derived is not None:
             relative[derived[0]] = derived[1]
 

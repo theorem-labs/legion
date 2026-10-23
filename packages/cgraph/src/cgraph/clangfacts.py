@@ -1275,6 +1275,18 @@ def _parameter_count(cursor: ci.Cursor) -> int:
     return min(8, len(list(cursor.get_arguments() or [])))
 
 
+def _result_registers(cursor: ci.Cursor) -> int:
+    """The registers the function returns in: none for void, a0 for a value of up to eight bytes, a0
+    and a1 for a larger one."""
+    result = cursor.result_type.get_canonical()
+    if result.kind == TK.VOID:
+        return 0
+    try:
+        return 2 if result.get_size() > 8 else 1
+    except Exception:
+        return 2
+
+
 def _is_weak(extractor: _Extractor, cursor: ci.Cursor) -> bool:
     """A definition marked weak: ``__weak`` or ``__attribute__((weak))`` before its name, written in
     the source or, for a definition a macro generates (``COND_SYSCALL(x)``), in the macros it expands."""
@@ -1332,6 +1344,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             # Registers a0..a7 carry the first eight integer arguments; a variadic one, or one declared
             # without a prototype, may take all of them.
             "parameters": _parameter_count(cursor),
+            "result_registers": _result_registers(cursor),
             "main_file": _main_file(cursor, main),
             "returns": walk.returns(),
             "events": walk.events,

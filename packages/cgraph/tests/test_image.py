@@ -276,3 +276,23 @@ def test_an_address_in_an_argument_the_callee_does_not_take_does_not_escape(imag
         assert ("pair_a", "addi_address") in _operations(image.decode("synthetic", code, start))
     finally:
         image.arity = {}
+
+
+def test_a_void_function_returns_no_register(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
+    image.results = {"synthetic": 0}
+    try:
+        assert image.decode("synthetic", code, start).globals == []
+    finally:
+        image.results = {}
+    assert ("pair_a", "addi_address") in _operations(image.decode("synthetic", code, start))
+
+
+def test_an_address_plus_a_field_offset_that_escapes_names_the_object_there(image: Image) -> None:
+    """``a5 = &pair_a; a0 = a5 + 8; ret a0``: the returned address is pair_b, not pair_a."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _addi(A0, A5, 8), RET)
+    assert _operations(image.decode("synthetic", code, start)) == {("pair_b", "addi_address")}
