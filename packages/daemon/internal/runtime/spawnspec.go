@@ -204,8 +204,7 @@ func validateStandingOwnerShape(spec SpawnSpec, refuse func(string, ...any) erro
 	if !claim.IsStandingOwner(spec.Role, spec.Issue, spec.Tree) {
 		return refuse("the standing owner's claim is on no issue and no tree (issue %q, tree %q)", spec.Issue, spec.Tree)
 	}
-	owner, ok := spec.Claim.OwnerName(spec.Project)
-	if !ok || owner == "" {
+	if _, ok := spec.Claim.OwnerKey(spec.Project); !ok {
 		return refuse("the standing owner's claim token is not an owner token of project %s", spec.Project)
 	}
 	if !spec.Repository.IsZero() {

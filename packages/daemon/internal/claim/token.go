@@ -13,7 +13,8 @@ var (
 	projectToken = regexp.MustCompile(`^[a-z0-9]+$`)
 	// notAlphanumeric is everything ProjectToken drops.
 	notAlphanumeric = regexp.MustCompile(`[^a-z0-9]`)
-	ownerName       = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	// envoyRoleToken is the shape of every Envoy role token (legion-roles.ts ENVOY_ROLE_TOKEN).
+	envoyRoleToken = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 )
 
 // Roles are the six roles a claim can be on, in the order the workflow reaches them.
@@ -79,42 +80,50 @@ func (t Token) Cut() (issue string, role Role, ok bool) {
 // (legion-roles.ts:66-69). project is already a ProjectToken.
 func ControllerToken(project string) Token { return Token("legion-" + project + "-controller") }
 
-// OwnerToken is the standing owner's token. owner must be a lowercase, hyphen-separated name so
-// the token stays one unambiguous Envoy role topic.
-func OwnerToken(project, owner string) (Token, error) {
+// OwnerToken is the standing owner's token, `legion-<project>-owner-<EncodeOwnerName(key)>`, where
+// key is the owner's ledger key: a graph node id such as `function:get_mountpoint`, or a named role
+// such as `librarian`. The encoding is reversible (Token.OwnerKey), so two keys never share a token.
+// project is already a ProjectToken.
+func OwnerToken(project, key string) (Token, error) {
 	if !projectToken.MatchString(project) {
 		return "", fmt.Errorf("owner token: project %q is not a project token", project)
 	}
-	if !ownerName.MatchString(owner) {
-		return "", fmt.Errorf("owner token: owner %q must be lowercase letters, digits, and hyphens", owner)
+	name, err := EncodeOwnerName(key)
+	if err != nil {
+		return "", fmt.Errorf("owner token: %w", err)
 	}
-	return Token(fmt.Sprintf("legion-%s-owner-%s", project, owner)), nil
+	token := Token("legion-" + project + "-owner-" + name)
+	if len(token) > MaxOwnerTokenLength {
+		return "", fmt.Errorf("owner token: %q is %d bytes, past the %d an owner token may be", token, len(token), MaxOwnerTokenLength)
+	}
+	return token, nil
 }
 
-// OwnerName is the configured owner name encoded in an owner token.
-func (t Token) OwnerName(project string) (string, bool) {
-	prefix := "legion-" + project + "-owner-"
-	name, ok := strings.CutPrefix(string(t), prefix)
-	return name, ok && ownerName.MatchString(name)
+// OwnerKey is the ledger key an owner token of project encodes.
+func (t Token) OwnerKey(project string) (string, bool) {
+	name, ok := strings.CutPrefix(string(t), "legion-"+project+"-owner-")
+	if !ok {
+		return "", false
+	}
+	key, err := DecodeOwnerName(name)
+	return key, err == nil
 }
 
-// Role is the role t names: the workflow role it ends in, or one of the two tree-independent
-// roles (controller and owner).
+// Role is the role t names: one of the two tree-independent roles (owner and controller), or the
+// workflow role it ends in. An owner token is read first: an owner key starts with a lowercase
+// letter, and a workflow token's issue part after `owner-` would start with its number.
 func (t Token) Role() (role Role, ok bool) {
-	if _, role, ok := t.Cut(); ok {
-		return role, true
-	}
-	project, prefixed := strings.CutPrefix(string(t), "legion-")
-	project, suffixed := strings.CutSuffix(project, "-"+string(RoleController))
-	if prefixed && suffixed && projectToken.MatchString(project) {
-		return RoleController, true
-	}
-	parts := strings.Split(string(t), "-owner-")
-	if len(parts) == 2 {
-		project, prefixed := strings.CutPrefix(parts[0], "legion-")
-		if prefixed && projectToken.MatchString(project) && ownerName.MatchString(parts[1]) {
+	project, rest, prefixed := strings.Cut(strings.TrimPrefix(string(t), "legion-"), "-")
+	if strings.HasPrefix(string(t), "legion-") && prefixed && projectToken.MatchString(project) {
+		if _, isOwner := t.OwnerKey(project); isOwner && strings.HasPrefix(rest, "owner-") {
 			return RoleOwner, true
 		}
+		if rest == string(RoleController) {
+			return RoleController, true
+		}
+	}
+	if _, role, ok := t.Cut(); ok {
+		return role, true
 	}
 	return "", false
 }

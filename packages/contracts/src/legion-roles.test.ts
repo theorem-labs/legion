@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import ownerTokens from "../fixtures/owner-tokens.json";
 import projectTokens from "../fixtures/project-tokens.json";
 import {
   controllerToken,
@@ -8,6 +9,7 @@ import {
   roleToken,
   roleTopic,
   sanitizeToken,
+  standingOwnerToken,
 } from "./legion-roles";
 
 const ENVOY_ROLE_TOKEN = /^[a-z0-9][a-z0-9_-]*$/;
@@ -64,6 +66,29 @@ describe("role token grammar", () => {
   test("rejects a token for another project or an unknown role", () => {
     expect(parseRoleToken("other", controllerToken("omp"))).toBeUndefined();
     expect(parseRoleToken("omp", "legion-omp-legion-42-operator")).toBeUndefined();
+  });
+});
+
+// The Go daemon's claim.OwnerToken reads the same fixture: an owner's agent claims the role the
+// daemon launched it under.
+describe("standingOwnerToken", () => {
+  test("spells every owner key as fixtures/owner-tokens.json does", () => {
+    for (const [key, token] of Object.entries(ownerTokens.tokens)) {
+      expect(standingOwnerToken(ownerTokens.project, key)).toBe(token);
+      expect(token).toMatch(ENVOY_ROLE_TOKEN);
+    }
+  });
+
+  test("refuses a key outside the owner-key alphabet", () => {
+    for (const key of ownerTokens.refused) {
+      expect(() => standingOwnerToken(ownerTokens.project, key)).toThrow("Invalid standing owner");
+    }
+  });
+
+  test("refuses a token past the length a state-directory file name allows", () => {
+    const limit = 200 - "legion-p-owner-".length;
+    expect(standingOwnerToken("p", "a".repeat(limit))).toHaveLength(200);
+    expect(() => standingOwnerToken("p", "a".repeat(limit + 1))).toThrow("Invalid standing owner");
   });
 });
 

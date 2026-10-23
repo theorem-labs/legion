@@ -63,6 +63,9 @@ type OperatorClaim struct {
 	// PluginContract is the contract the claim's current registration declared, 0 when none
 	// recorded, always emitted.
 	PluginContract int `json:"pluginContract"`
+	// OwnerKey is a standing owner's ledger key, the graph node id (`function:get_mountpoint`) or
+	// named role its token encodes; absent for every other claim.
+	OwnerKey string `json:"ownerKey,omitempty"`
 }
 
 // BudgetsView is the claim's retry counters (`supervise.Budgets`).
@@ -127,6 +130,7 @@ func operatorView(c supervise.Claim) OperatorClaim {
 		SuspendedBy:     string(c.SuspendedBy),
 		SuspensionHeld:  c.SuspensionHeld,
 		PluginContract:  c.PluginContract,
+		OwnerKey:        ownerKeyOf(c),
 	}
 	if p := c.Pending; p != nil {
 		view.Pending = &DeliveryView{
@@ -135,6 +139,13 @@ func operatorView(c supervise.Claim) OperatorClaim {
 		}
 	}
 	return view
+}
+
+// ownerKeyOf is a standing owner's ledger key, the one its claim records or its token encodes, and
+// "" for every other claim.
+func ownerKeyOf(c supervise.Claim) string {
+	key, _ := c.StandingOwnerKey()
+	return key
 }
 
 // instant is a time that may not have happened yet: the zero time is absent on the wire.

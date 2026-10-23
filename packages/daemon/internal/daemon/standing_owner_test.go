@@ -57,8 +57,8 @@ func standingOwnerConfig(t *testing.T, cfg *config.Config, queue *ledger.Store, 
 		t.Fatalf("write owner prompt: %v", err)
 	}
 	cfg.StandingOwners = &config.StandingOwners{LedgerDSNFile: dsnFile, Repository: repo, MaxRunning: 1, BudgetUSD: 10,
-		LedgerTimeout: 5 * time.Second,
-		Owners:        []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: "omp", MaxCostUSD: 1}}}
+		LedgerTimeout: 5 * time.Second, Reconcile: time.Minute,
+		Owners: []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: "omp", MaxCostUSD: 1}}}
 }
 
 func standingOwnerClaim(t *testing.T, cfg config.Config, state supervise.ClaimState, locator *runtime.Locator) supervise.Claim {
@@ -386,7 +386,7 @@ func TestStandingOwnerLedgerOutageLeavesDaemonServing(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.StandingOwners = &config.StandingOwners{
-		LedgerDSNFile: dsnFile, Repository: "example/repository", MaxRunning: 1, BudgetUSD: 1, LedgerTimeout: 5 * time.Second,
+		LedgerDSNFile: dsnFile, Repository: "example/repository", MaxRunning: 1, BudgetUSD: 1, LedgerTimeout: 5 * time.Second, Reconcile: time.Minute,
 		Owners: []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: runtime.BackendOmp, MaxCostUSD: 1}},
 	}
 	rt := fake.NewRuntime()

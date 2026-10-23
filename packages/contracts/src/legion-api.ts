@@ -536,6 +536,9 @@ export const LegionOperatorClaimResponse = z.strictObject({
   suspensionHeld: z.literal(true).optional(),
   /** 0 = no contract recorded. */
   pluginContract: z.number().int().nonnegative(),
+  /** A standing owner's ledger key, the graph node id (`function:get_mountpoint`) or named role it
+   * owns; absent for every other claim. */
+  ownerKey: nonEmptyString.optional(),
 });
 
 export type LegionOperatorClaim = z.output<typeof LegionOperatorClaimResponse>;

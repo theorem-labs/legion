@@ -16,6 +16,7 @@ import (
 	"github.com/sjawhar/legion/daemon/internal/ghconfig"
 	"github.com/sjawhar/legion/daemon/internal/phase"
 	"github.com/sjawhar/legion/daemon/internal/runtime"
+	"github.com/sjawhar/legion/daemon/internal/supervise"
 )
 
 var updateGolden = flag.Bool("update", false, "rewrite the golden fixtures this package pins")
@@ -625,7 +626,8 @@ func TestOperatorClaimGolden(t *testing.T) {
 	golden(t, "operator-claim.json", operatorClaim())
 }
 
-// What the list route answers: a queued claim carries no locator and no delivery yet.
+// What the list route answers: a queued claim carries no locator and no delivery yet; a standing
+// owner names no tree or issue, and carries the ledger key it owns.
 func TestOperatorClaimsGolden(t *testing.T) {
 	golden(t, "operator-claims.json", OperatorClaims{Claims: []OperatorClaim{
 		{
@@ -637,7 +639,37 @@ func TestOperatorClaimsGolden(t *testing.T) {
 			State:      "queued",
 		},
 		operatorClaim(),
+		operatorView(supervise.Claim{
+			Token:    "legion-legion-owner-function_cget__mountpoint",
+			Project:  "legion",
+			Role:     claim.RoleOwner,
+			OwnerKey: "function:get_mountpoint",
+			State:    supervise.StateQueued,
+		}),
 	}})
+}
+
+// The operator sees an owner by the key it owns: the one its claim records, or for a claim recorded
+// before keys were, the one its token encodes. Every other claim shows none.
+func TestOperatorViewNamesAStandingOwnersKey(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		c    supervise.Claim
+		want string
+	}{
+		{"a recorded key", supervise.Claim{Token: "legion-legion-owner-function_cget__mountpoint", Project: "legion",
+			Role: claim.RoleOwner, OwnerKey: "function:get_mountpoint"}, "function:get_mountpoint"},
+		{"a key only the token encodes", supervise.Claim{Token: "legion-legion-owner-struct_cmount", Project: "legion",
+			Role: claim.RoleOwner}, "struct:mount"},
+		{"a workflow role", supervise.Claim{Token: "legion-legion-legion-208-architect", Project: "legion",
+			Tree: "LEGION-208", Issue: "LEGION-208", Role: claim.RoleArchitect}, ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := operatorView(testCase.c).OwnerKey; got != testCase.want {
+				t.Fatalf("OwnerKey = %q, want %q", got, testCase.want)
+			}
+		})
+	}
 }
 
 // An issue the daemon has admitted but not yet given a worker still has to answer the plugin's

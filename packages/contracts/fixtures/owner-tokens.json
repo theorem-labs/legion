@@ -1,0 +1,14 @@
+{
+  "project": "sjawharlegion",
+  "tokens": {
+    "function:get_mountpoint": "legion-sjawharlegion-owner-function_cget__mountpoint",
+    "struct:mount": "legion-sjawharlegion-owner-struct_cmount",
+    "global:mount_lock": "legion-sjawharlegion-owner-global_cmount__lock",
+    "subsystem:vfs.core": "legion-sjawharlegion-owner-subsystem_cvfs_dcore",
+    "function:Get_MountPoint": "legion-sjawharlegion-owner-function_c_uget___umount_upoint",
+    "function:a-b": "legion-sjawharlegion-owner-function_ca-b",
+    "librarian": "legion-sjawharlegion-owner-librarian",
+    "owner-a": "legion-sjawharlegion-owner-owner-a"
+  },
+  "refused": ["", ":x", "-x", "4x", "Function:x", "function:a b", "function:a/b", "function:é"]
+}

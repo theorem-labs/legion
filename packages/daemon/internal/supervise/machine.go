@@ -138,6 +138,11 @@ type Claim struct {
 	BootTokenHash   []byte
 	CapabilityHash  []byte
 	UncertainStreak int
+	// OwnerKey is a standing owner's ledger key — the graph node id (`function:get_mountpoint`) or
+	// named role (`librarian`) whose queue it serves, and the holder name it takes leases as — and
+	// "" for every other claim. The token encodes it (claim.OwnerToken); the claim records it so a
+	// log line and the operator endpoint show the key itself.
+	OwnerKey string
 	// OwnerRetryRevision is the ledger work revision a standing owner's current failure budget is
 	// spent on, bound when that budget starts. Zero means no budget is bound yet.
 	OwnerRetryRevision int64
@@ -220,8 +225,8 @@ type Store interface {
 	RetireDelivery(ctx context.Context, c Claim, deliveryID string) error
 }
 
-// WorkQueue answers whether a configured standing owner has open work and the revision of the
-// queue changes that last affected that owner.
+// WorkQueue answers whether a standing owner, named by its ledger key, has open work and the
+// revision of the queue changes that last affected it.
 type WorkQueue interface {
 	HasWork(ctx context.Context, owner string) (bool, error)
 	WorkRevision(ctx context.Context, owner string) (int64, error)
@@ -302,6 +307,11 @@ type Deps struct {
 	VolumeLost func(c Claim)
 	// WorkQueue reads a standing owner's ledger queue after its process ends.
 	WorkQueue WorkQueue
+	// HolderStopped is told, without waiting, that a standing owner's process was let go — it died,
+	// was stopped, or a restart found its launch unrecorded — so the ledger frees every lease the
+	// owner holds under its key. It must not block: the machine calls it under its own lock. nil
+	// tells no one.
+	HolderStopped func(owner, reason string)
 	// PhaseHolds says whether issue is still in phase: the workflow enqueues a task for the phase
 	// its issue was in, and the outbox refuses to start a role for a phase the issue has left
 	// (daemon/outbox.go), so a delivery queued before the phase moved on is that same staleness
@@ -502,7 +512,7 @@ func NewMachine(ctx context.Context, deps Deps, c Claim) (*Machine, error) {
 	m := &Machine{
 		ctx:    ctx,
 		deps:   deps,
-		log:    deps.Log.With("claim", string(c.Token)),
+		log:    deps.Log.With(claimLogAttrs(c)...),
 		claim:  copyClaim(c),
 		timers: map[TimerKind]armed{},
 		stale:  map[string]bool{},
@@ -595,7 +605,38 @@ func (m *Machine) ReleaseUncertainLaunch(ctx context.Context) (bool, error) {
 		m.claim.State = StateLaunchUncertain
 		return false, err
 	}
+	// The launch the previous daemon began records no process; the boot reconciliation that let
+	// this release run reaped any pane it opened, so an owner's leases are its holder's no longer.
+	m.holderStopped("the previous daemon's unrecorded launch was reaped or never started")
 	return true, nil
+}
+
+// claimLogAttrs are the attributes every line of a claim's machine carries: its token, and a
+// standing owner's key.
+func claimLogAttrs(c Claim) []any {
+	if c.OwnerKey != "" {
+		return []any{"claim", string(c.Token), "owner", c.OwnerKey}
+	}
+	return []any{"claim", string(c.Token)}
+}
+
+// StandingOwnerKey is a standing owner's ledger key: the one its claim records, or the one its token
+// encodes for a claim recorded before the key was. ok is false for every other claim.
+func (c Claim) StandingOwnerKey() (key string, ok bool) {
+	if !claim.IsStandingOwner(c.Role, c.Issue, c.Tree) {
+		return "", false
+	}
+	if c.OwnerKey != "" {
+		return c.OwnerKey, true
+	}
+	return c.Token.OwnerKey(c.Project)
+}
+
+// holderStopped tells the daemon a standing owner's process is gone (Deps.HolderStopped).
+func (m *Machine) holderStopped(reason string) {
+	if key, ok := m.claim.StandingOwnerKey(); ok && m.deps.HolderStopped != nil {
+		m.deps.HolderStopped(key, reason)
+	}
 }
 
 // ReleasedLaunch is whether a stored claim is an uncertain launch ReleaseUncertainLaunch released
@@ -1040,13 +1081,15 @@ func (m *Machine) died(ctx context.Context, observation runtime.Observation) err
 		if m.deps.WorkQueue == nil {
 			return errors.New("supervise: no standing-owner work queue")
 		}
-		owner, ok := m.claim.Token.OwnerName(m.claim.Project)
+		owner, ok := m.claim.StandingOwnerKey()
 		if !ok {
 			return fmt.Errorf("supervise: standing owner %s has an invalid token", m.claim.Token)
 		}
 		hasWork, err := m.deps.WorkQueue.HasWork(ctx, owner)
 		if err != nil {
-			return fmt.Errorf("read queued work for standing owner %s: %w", owner, err)
+			m.letGo()
+			m.claim.State = StateQueued
+			return errors.Join(fmt.Errorf("read queued work for standing owner %s: %w", owner, err), m.persist(ctx))
 		}
 		if !hasWork {
 			m.sleepWithoutWork()
@@ -1086,7 +1129,7 @@ func (m *Machine) bindOwnerWorkRevision(ctx context.Context) error {
 	if m.deps.WorkQueue == nil {
 		return ErrStandingOwnerWorkUnavailable
 	}
-	owner, ok := m.claim.Token.OwnerName(m.claim.Project)
+	owner, ok := m.claim.StandingOwnerKey()
 	if !ok {
 		return fmt.Errorf("supervise: standing owner %s has an invalid token", m.claim.Token)
 	}
@@ -1206,7 +1249,9 @@ func (m *Machine) retire(ctx context.Context) error {
 // on one (relaunchLater), no send talks to it, no suspension is held for its turn and no turn of it
 // is interrupted any more (the interrupt's start finds it over, quiesced), and the process the
 // claim records, when it records one, moves into previous — the claim no longer runs it (it was
-// stopped, found dead, or left behind), and the next launch of the same session waits it out.
+// stopped, found dead, or left behind), and the next launch of the same session waits it out. A
+// standing owner's recorded process let go is its holder stopped, told once per process
+// (holderStopped).
 func (m *Machine) letGo() {
 	m.disarmAll()
 	m.relaunch = nil
@@ -1219,6 +1264,7 @@ func (m *Machine) letGo() {
 	m.identity, m.enrollmentSent = nil, false
 	if m.claim.Locator != nil {
 		m.previous, m.claim.Locator = m.claim.Locator, nil
+		m.holderStopped("the supervisor let its process " + m.previous.Incarnation + " go")
 	}
 }
 

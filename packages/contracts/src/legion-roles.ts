@@ -90,13 +90,32 @@ export function controllerToken(project: string): string {
   return `legion-${project}-controller`;
 }
 
-/** The Envoy role token of a tree-independent standing owner. */
+/** An owner's ledger key: a graph node id (`function:get_mountpoint`) or a named role
+ * (`librarian`) — the Go daemon's `claim.ownerKey`. */
+const OWNER_KEY = /^[a-z][A-Za-z0-9_.:-]*$/;
+/** Each key character an Envoy role token cannot hold, as `_` and one letter. */
+const OWNER_ESCAPES: Record<string, string> = { _: "__", ".": "_d", ":": "_c" };
+/** An owner token names files in the daemon's state directory, so it stays under NAME_MAX with
+ * room for their suffixes — the Go daemon's `claim.MaxOwnerTokenLength`. */
+const MAX_OWNER_TOKEN_LENGTH = 200;
+
+/** The Envoy role token of a tree-independent standing owner, `legion-<project>-owner-<name>`,
+ * byte for byte the Go daemon's `claim.OwnerToken`: name is the key with `_` as `__`, `.` as
+ * `_d`, `:` as `_c` and an uppercase letter as `_u` and the letter lowercased, so two keys never
+ * share a token. */
 export function standingOwnerToken(project: string, owner: string): string {
   assertLegionProjectToken(project);
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(owner)) {
+  if (!OWNER_KEY.test(owner)) {
     throw new Error(`Invalid standing owner: ${owner}`);
   }
-  return `legion-${project}-owner-${owner}`;
+  const name = owner.replace(/[A-Z_.:]/g, (c) => OWNER_ESCAPES[c] ?? `_u${c.toLowerCase()}`);
+  const token = `legion-${project}-owner-${name}`;
+  if (token.length > MAX_OWNER_TOKEN_LENGTH) {
+    throw new Error(
+      `Invalid standing owner: ${owner} makes a ${token.length}-byte token, past ${MAX_OWNER_TOKEN_LENGTH}`
+    );
+  }
+  return token;
 }
 
 export function roleTopic(token: string): string {

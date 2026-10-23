@@ -65,8 +65,9 @@ type specs struct {
 	// backend is the backend a role runs on (config.Config.BackendFor); nil runs every role on Oh
 	// My Pi.
 	backend func(claim.Role) runtime.Backend
-	// owners maps each configured standing-owner claim to its launch shape.
-	owners map[claim.Token]config.StandingOwner
+	// ownerLaunch is how a standing owner of a ledger key launches: its named entry, or its graph
+	// node kind's template.
+	ownerLaunch func(string) (config.OwnerTemplate, bool)
 }
 
 // rolePromptPath is where a claim's role prompt is kept for every launch of it.
@@ -221,17 +222,27 @@ func (s specs) controllerSpawnSpec() (runtime.SpawnSpec, error) {
 	}, nil
 }
 
+// standingOwnerSpawnSpec is an owner's launch: its prompt, harness and deployment instructions,
+// the launch secrets, and LEGION_OWNER, the ledger key it serves its queue as — the holder name
+// every lease it takes must use, so that the supervisor's release of a stopped owner frees them.
 func (s specs) standingOwnerSpawnSpec(c supervise.Claim) (runtime.SpawnSpec, error) {
-	owner, ok := s.owners[c.Token]
+	key, ok := c.StandingOwnerKey()
 	if !ok {
-		return runtime.SpawnSpec{}, fmt.Errorf("no standing-owner configuration for %s", c.Token)
+		return runtime.SpawnSpec{}, fmt.Errorf("standing owner %s names no owner key", c.Token)
+	}
+	var launch config.OwnerTemplate
+	if s.ownerLaunch != nil {
+		launch, ok = s.ownerLaunch(key)
+	}
+	if !ok {
+		return runtime.SpawnSpec{}, fmt.Errorf("no standing-owner configuration for %s", key)
 	}
 	return runtime.SpawnSpec{
-		Backend: owner.Harness,
-		Env:     map[string]string{},
+		Backend: launch.Harness,
+		Env:     map[string]string{"LEGION_OWNER": key},
 		Secrets: maps.Clone(s.secrets),
 		Prompt: runtime.PromptParts{
-			RolePromptPaths:            []string{owner.PromptFile},
+			RolePromptPaths:            []string{launch.PromptFile},
 			DeploymentInstructionsPath: s.instructions,
 		},
 	}, nil
