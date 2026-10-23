@@ -10,6 +10,7 @@ const (
 	ReasonNotHolder          = "not_holder"          // the item is held by someone else
 	ReasonLeaseHeld          = "lease_held"          // the item has a live lease
 	ReasonLeaseExpired       = "lease_expired"       // the caller's lease ended
+	ReasonSupervisedLease    = "supervised_lease"    // the lease has no end: its supervisor frees it
 	ReasonDone               = "done"                // the item already has a result
 	ReasonNotOpen            = "not_open"            // the migration has landed or been abandoned
 	ReasonExists             = "exists"              // a migration with that name already exists

@@ -119,15 +119,31 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			return nil, false, err
 		}
 		return mutation(s.EnsureRepo(ctx, args[1], limit))
+	case "enqueue":
+		if len(args) != 3 || args[0] == "" || args[1] == "" || args[2] == "" {
+			return nil, false, usagef("enqueue <repo> <item> <owner>")
+		}
+		return nil, false, s.Enqueue(ctx, args[0], args[1], args[2])
+	case "owners":
+		if len(args) != 1 {
+			return nil, true, usagef("owners <repo>")
+		}
+		value, err := s.OpenOwners(ctx, args[0])
+		return value, true, err
 	case "claim":
 		if len(args) != 4 {
-			return nil, false, usagef("claim <repo> <item> <holder> <ttl>")
+			return nil, false, usagef("claim <repo> <item> <holder> <ttl|0>")
 		}
-		ttl, err := duration(args[3])
+		ttl, err := leaseLength(args[3])
 		if err != nil {
 			return nil, false, err
 		}
 		return mutation(s.Claim(ctx, args[0], args[1], args[2], ttl))
+	case "release-holder":
+		if len(args) != 3 {
+			return nil, false, usagef("release-holder <repo> <holder> <reason>")
+		}
+		return mutation(s.ReleaseHolder(ctx, args[0], args[1], args[2]))
 	case "renew":
 		if len(args) != 5 {
 			return nil, false, usagef("renew <repo> <item> <holder> <generation> <ttl>")
@@ -394,6 +410,15 @@ func duration(value string) (time.Duration, error) {
 		return 0, usagef("invalid duration %q", value)
 	}
 	return d, nil
+}
+
+// leaseLength is a claim's lease length: 0 is a supervised lease with no end, anything else a
+// duration.
+func leaseLength(value string) (time.Duration, error) {
+	if value == "0" {
+		return 0, nil
+	}
+	return duration(value)
 }
 
 // roundLimit parses a repository's landing-round limit into the range of the schema's integer column.

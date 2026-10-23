@@ -23,12 +23,12 @@ type Item struct {
 	Result     string     `json:"result,omitempty"`
 }
 
-// Lease is a granted or renewed lease.
+// Lease is a granted or renewed lease. ExpiresAt is zero for a supervised lease, which has no end.
 type Lease struct {
 	ID         string    `json:"id"`
 	Holder     string    `json:"holder"`
 	Generation int64     `json:"generation"`
-	ExpiresAt  time.Time `json:"expires_at"`
+	ExpiresAt  time.Time `json:"expires_at,omitzero"`
 }
 
 // PathClash is one overlap between two write sets: Ours covers or is covered by Theirs.

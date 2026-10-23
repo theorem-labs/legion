@@ -8,8 +8,14 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// event appends one row to the event log inside tx. The transaction-scoped lock makes assigned event IDs commit in
-// order within a repository, so a cursor cannot advance past an event that is still uncommitted.
+// EventsChannel is the PostgreSQL notification channel every event is announced on, with its
+// repository as the payload, when its transaction commits.
+const EventsChannel = "ledger_events"
+
+// event appends one row to the event log inside tx and announces it on EventsChannel; the
+// announcement is delivered only when tx commits. The transaction-scoped lock makes assigned event
+// IDs commit in order within a repository, so a cursor cannot advance past an event that is still
+// uncommitted.
 func event(ctx context.Context, tx pgx.Tx, repo, kind, subject, actor string, data any) error {
 	b, err := json.Marshal(data)
 	if err != nil {
@@ -18,8 +24,11 @@ func event(ctx context.Context, tx pgx.Tx, repo, kind, subject, actor string, da
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, repo); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO events (repo, kind, subject, actor, data) VALUES ($1, $2, $3, $4, $5)`,
-		repo, kind, subject, actor, b)
+	if _, err = tx.Exec(ctx, `INSERT INTO events (repo, kind, subject, actor, data) VALUES ($1, $2, $3, $4, $5)`,
+		repo, kind, subject, actor, b); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `SELECT pg_notify($1, $2)`, EventsChannel, repo)
 	return err
 }
 
