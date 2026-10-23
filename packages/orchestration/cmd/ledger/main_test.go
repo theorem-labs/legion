@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
@@ -41,25 +42,39 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 
 	invoke("repo", "ensure", "r", "3")
 	invoke("claim", "r", "item", "alice", "1m")
+	claimed := invoke("--json", "item", "r", "item")
+	var held struct {
+		State      string     `json:"state"`
+		Holder     string     `json:"holder"`
+		Generation int64      `json:"generation"`
+		ExpiresAt  *time.Time `json:"expires_at"`
+	}
+	if err := json.Unmarshal([]byte(claimed), &held); err != nil || held.ExpiresAt == nil {
+		t.Fatalf("claimed item: %v %+v", err, held)
+	}
+	claimedExpiry := *held.ExpiresAt
 	invoke("renew", "r", "item", "alice", "1", "1m")
 	renewed := invoke("--json", "item", "r", "item")
-	var held struct {
-		State      string  `json:"state"`
-		Holder     string  `json:"holder"`
-		Generation int64   `json:"generation"`
-		ExpiresAt  *string `json:"expires_at"`
-	}
+	held = struct {
+		State      string     `json:"state"`
+		Holder     string     `json:"holder"`
+		Generation int64      `json:"generation"`
+		ExpiresAt  *time.Time `json:"expires_at"`
+	}{}
 	if err := json.Unmarshal([]byte(renewed), &held); err != nil || held.State != "open" || held.Holder != "alice" ||
 		held.Generation != 1 || held.ExpiresAt == nil {
 		t.Fatalf("renewed item: %v %+v", err, held)
 	}
+	if want := claimedExpiry.Add(time.Minute); !held.ExpiresAt.Equal(want) {
+		t.Fatalf("renewed expiry %s, want %s", held.ExpiresAt, want)
+	}
 	invoke("release", "r", "item", "alice", "1")
 	released := invoke("--json", "item", "r", "item")
 	held = struct {
-		State      string  `json:"state"`
-		Holder     string  `json:"holder"`
-		Generation int64   `json:"generation"`
-		ExpiresAt  *string `json:"expires_at"`
+		State      string     `json:"state"`
+		Holder     string     `json:"holder"`
+		Generation int64      `json:"generation"`
+		ExpiresAt  *time.Time `json:"expires_at"`
 	}{}
 	if err := json.Unmarshal([]byte(released), &held); err != nil || held.Holder != "" || held.ExpiresAt != nil {
 		t.Fatalf("released item: %v %+v", err, held)
