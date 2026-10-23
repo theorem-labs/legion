@@ -494,6 +494,8 @@ def classify_run_step(step: dict) -> list[tuple[str, bool]]:
     return found
 
 NON_BUILDING_ACTIONS = {
+    # Installs uv for packages/cgraph's job; it builds no image.
+    "astral-sh/setup-uv",
     "actions/attest-build-provenance",
     "actions/cache",
     "actions/checkout",
