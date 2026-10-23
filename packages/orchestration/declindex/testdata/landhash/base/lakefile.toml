@@ -1,0 +1,5 @@
+name = "landhashfixture"
+defaultTargets = ["LandHashFixture"]
+
+[[lean_lib]]
+name = "LandHashFixture"

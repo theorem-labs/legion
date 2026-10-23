@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -201,6 +202,14 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	var st RefreshStats
+	sourceBlobs, err := readSources(tree)
+	if err != nil {
+		return st, err
+	}
+	previousCommit, err := s.Meta(ctx, "commit")
+	if err != nil {
+		return st, err
+	}
 	files, err := scan(tree, opt.jobs())
 	if err != nil {
 		return st, fmt.Errorf("scan %s: %w", tree.Lib, err)
@@ -235,6 +244,23 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		return st, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sources`); err != nil {
+		return st, err
+	}
+	sourcePaths := make([]string, 0, len(sourceBlobs))
+	for path := range sourceBlobs {
+		sourcePaths = append(sourcePaths, path)
+	}
+	sort.Strings(sourcePaths)
+	sources := newBatch(tx, "sources", 2)
+	for _, path := range sourcePaths {
+		if err := sources.add(ctx, path, sourceBlobs[path]); err != nil {
+			return st, err
+		}
+	}
+	if err := sources.flush(ctx); err != nil {
+		return st, err
+	}
 	for _, rel := range append(append([]string(nil), gone...), relsOf(changed)...) {
 		if o, ok := old[rel]; ok {
 			for _, t := range []string{"decls", "uses", "edges"} {
@@ -290,9 +316,16 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	}
 	st.Removed = len(gone)
 	meta := map[string]string{
-		"commit": opt.Commit,
-		"built":  time.Now().UTC().Format("2006-01-02T15:04Z"),
-		"errors": fmt.Sprint(st.Unreadable),
+		"commit":  opt.Commit,
+		"built":   time.Now().UTC().Format("2006-01-02T15:04Z"),
+		"errors":  fmt.Sprint(st.Unreadable),
+		"sources": "",
+	}
+	if sourceBlobs != nil {
+		meta["sources"] = "git"
+	}
+	if opt.Commit != previousCommit {
+		meta["prev_commit"] = previousCommit
 	}
 	// The graph file is written after the commit. A new generation token marks it out of date until a graph of
 	// this generation is written, so a failed write is repaired by the next refresh and never read meanwhile.
