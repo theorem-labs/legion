@@ -18,13 +18,15 @@ import (
 // registers the contracts that are new and checks the others.
 type ContractLedger interface {
 	Contract(ctx context.Context, repo, name string) (ledger.Contract, error)
+	Contracts(ctx context.Context, repo string) ([]ledger.Contract, error)
 	RegisterContract(ctx context.Context, repo, name, owner, hash string, pinned bool) (ledger.Contract, error)
 }
 
 // Owners maps a contract's directory to its owner key (a graph node id such as function:open_file).
 type Owners map[string]string
 
-// LoadOwners reads an owners/v1 file: {"format":"owners/v1","owners":[{"id":…,"contract":<directory>|null},…]}.
+// LoadOwners reads an owners file of the graph tool (format "cgraph/owners/v1", or "owners/v1"):
+// {"format":…,"owners":[{"id":…,"contract":<directory>|null},…]}.
 func LoadOwners(path string) (Owners, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -40,8 +42,8 @@ func LoadOwners(path string) (Owners, error) {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if f.Format != "owners/v1" {
-		return nil, fmt.Errorf("%s: format %q, this reader reads owners/v1", path, f.Format)
+	if f.Format != "cgraph/owners/v1" && f.Format != "owners/v1" {
+		return nil, fmt.Errorf("%s: format %q, this reader reads cgraph/owners/v1", path, f.Format)
 	}
 	out := Owners{}
 	for _, o := range f.Owners {
@@ -148,6 +150,9 @@ type LedgerReport struct {
 	Unowned    []string       `json:"unowned"`
 	Ambiguous  []string       `json:"ambiguous"`
 	Defects    []LedgerDefect `json:"defects"`
+	// Gone are contracts of the ledger that the rule no longer selects in the index: removed, renamed or moved
+	// by a landing that did not retire them.
+	Gone []string `json:"gone"`
 }
 
 // CheckLedger runs after a landing, on the index of the landed build. It registers every contract the rule
@@ -201,5 +206,18 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 		}
 	}
 	sort.Strings(r.Ambiguous)
+	selected := map[string]bool{}
+	for _, c := range contracts {
+		selected[c.Name] = true
+	}
+	all, err := l.Contracts(ctx, repo)
+	if err != nil {
+		return r, fmt.Errorf("list the ledger's contracts: %w", err)
+	}
+	for _, c := range all {
+		if !selected[c.Name] {
+			r.Gone = append(r.Gone, c.Name)
+		}
+	}
 	return r, nil
 }

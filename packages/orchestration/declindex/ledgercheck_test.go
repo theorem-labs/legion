@@ -31,7 +31,7 @@ func TestGlobRegexp(t *testing.T) {
 
 func TestLoadOwners(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "owners.json")
-	body := `{"format":"owners/v1","owners":[{"id":"function:frame_at","role":"function","contract":"Sub"},` +
+	body := `{"format":"cgraph/owners/v1","owners":[{"id":"function:frame_at","role":"function","contract":"Sub"},` +
 		`{"id":"struct:mount","role":"data_structure","contract":null}]}`
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -87,7 +87,8 @@ func TestCheckLedgerRegistersChecksAndReportsDefects(t *testing.T) {
 	}
 	if _, err := l.Land(ctx, ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "c2",
 		ChangedPaths: []string{"Sub/Wrap.lean"}, Current: map[string]string{"Gold2.FrameAt": hash},
-		ChangedContracts: map[string]string{"Gold2.FrameAt": "0000000000000000"}}); err != nil {
+		ChangedContracts: map[string]string{"Gold2.FrameAt": "0000000000000000"},
+		Head:             "c2", ReviewedHead: "c2"}); err != nil {
 		t.Fatal(err)
 	}
 	after, err := s.CheckLedger(ctx, l, "r", rule, owners)
@@ -97,5 +98,15 @@ func TestCheckLedgerRegistersChecksAndReportsDefects(t *testing.T) {
 	want := []LedgerDefect{{Contract: "Gold2.FrameAt", At: "Sub/Wrap.lean:7", LedgerHash: "0000000000000000", Version: 2, IndexHash: hash}}
 	if !reflect.DeepEqual(after.Defects, want) {
 		t.Fatalf("defects %+v, want %+v", after.Defects, want)
+	}
+	if after.Gone != nil {
+		t.Fatalf("gone %v before any contract left the index", after.Gone)
+	}
+	if _, err := l.RegisterContract(ctx, "r", "Gold.Removed", "function:frame_at", "1111111111111111", false); err != nil {
+		t.Fatal(err)
+	}
+	gone, err := s.CheckLedger(ctx, l, "r", rule, owners)
+	if err != nil || !reflect.DeepEqual(gone.Gone, []string{"Gold.Removed"}) {
+		t.Fatalf("a ledger contract the index no longer declares: %+v %v", gone.Gone, err)
 	}
 }
