@@ -212,6 +212,19 @@ class Linker:
             self.callee_cache[key] = {call["target"] for facts in self.image_facts(definition) for call in facts.calls}
         return self.callee_cache[key]
 
+    def image_globals(self, definition: Definition) -> set[str]:
+        """Every name of every global the definition's machine code addresses."""
+        return {
+            name
+            for facts in self.image_facts(definition)
+            for entry in facts.globals
+            for name in (entry["global"], *entry.get("aliases", []))
+        }
+
+    def image_address_targets(self, definition: Definition) -> set[str]:
+        """The functions whose address the definition's machine code forms."""
+        return {item["target"] for facts in self.image_facts(definition) for item in facts.function_addresses}
+
     # Folding -------------------------------------------------------------------------------
 
     def effective(self, tu: str, name: str, caller: Definition, stack: tuple[str, ...] = ()) -> Effective:
@@ -252,15 +265,58 @@ class Linker:
                 result.calls.append({**call, "tu": tu})
                 if call.get("visible") and callee in callees and callee not in stack and callee != name:
                     # The machine code calls the helper here but may inline it at another site:
-                    # its calls that the caller's machine code makes and the caller's C does not
-                    # are the inlined copy's.
+                    # its calls and accesses to globals that the caller's machine code makes and
+                    # the caller's C does not are the inlined copy's.
                     own = {item["callee"] for item in events["calls"]}
+                    own_globals = {
+                        item["unit"]["name"]
+                        for item in events["accesses"]
+                        if item.get("unit") is not None and item["unit"]["kind"] == "global"
+                    }
+                    addressed = self.image_globals(caller)
                     helper = self.visible(tu, callee)
                     assert helper is not None
                     child = self.effective(tu, callee, caller, (*stack, name))
-                    for item in _bind(child, call["arguments"]).calls:
+                    bound = _bind(child, call["arguments"])
+                    for item in bound.calls:
                         if item["callee"] in callees and item["callee"] not in own and item["callee"] != callee:
                             result.calls.append({**_with_via(item, helper.id), "partial_inline": True})
+                    for item in bound.accesses:
+                        unit = item.get("unit")
+                        if (
+                            unit is not None
+                            and unit["kind"] == "global"
+                            and unit["name"] in addressed
+                            and unit["name"] not in own_globals
+                        ):
+                            result.accesses.append({**_with_via(item, helper.id), "partial_inline": True})
+        # A function whose address the C passes, which the machine code neither calls nor forms:
+        # the compiler inlined it where the callee that takes the pointer was inlined.
+        formed = self.image_address_targets(caller)
+        kept = []
+        for pointer in result.function_pointers:
+            target = pointer["target"]
+            helper = self.visible(tu, target)
+            if (
+                helper is None
+                or target in callees
+                or target in formed
+                or target in stack
+                or target == name
+                or not self.symbols(caller)
+            ):
+                kept.append(pointer)
+                continue
+            child = self.effective(tu, target, caller, (*stack, name))
+            result.calls += [_with_via(item, helper.id) for item in child.calls]
+            for kind in _EVENT_LISTS:
+                if kind != "function_pointers":
+                    getattr(result, kind).extend(_with_via(item, helper.id) for item in getattr(child, kind))
+            kept += [_with_via(item, helper.id) for item in child.function_pointers]
+            result.folds.append({"helper": helper.id, "provenance": pointer["provenance"], "through": "pointer"})
+            result.folds += child.folds
+            result.unbound += child.unbound
+        result.function_pointers = kept
         self.effective_cache[key] = result
         return result
 
@@ -415,7 +471,9 @@ def build(
     image_globals: dict[str, set[str]] = {}
     for identity, definition in sorted(functions.items()):
         facts = linker.image_facts(definition)
-        image_globals[identity] = {item["global"] for item in (entry for fact in facts for entry in fact.globals)}
+        image_globals[identity] = {
+            name for fact in facts for entry in fact.globals for name in (entry["global"], *entry.get("aliases", []))
+        }
         symbols = linker.symbols(definition)
         contract = contracts.function(definition.file, definition.name)
         provenance = [{"source": "c", "file": definition.file, "line": definition.line}]
@@ -499,7 +557,7 @@ def build(
         return identity
 
     c_calls: collections.Counter[tuple[str, str]] = collections.Counter()
-    c_targets: dict[str, list[dict[str, str]]] = {}
+    c_targets: dict[str, list[dict[str, Any]]] = {}
     field_accesses: dict[str, list[dict[str, Any]]] = {}
     list_calls: list[tuple[str, dict[str, Any]]] = []
     image_pairs: set[tuple[str, str]] = set()
@@ -564,7 +622,9 @@ def build(
         # the access a compiler moved here by inlining, or one written in assembly.
         for fact in facts:
             for item in fact.globals:
-                if item["target_class"] not in ("state", "per_cpu") or item["global"] in targets:
+                if item["target_class"] not in ("state", "per_cpu") or {item["global"], *item.get("aliases", [])} & set(
+                    targets
+                ):
                     continue
                 symbols = image.object_symbols.get(item.get("symbol", item["global"]), [])
                 identity_hint = linker.image_global_id(item["global"], symbols[0].file if symbols else "")
@@ -600,7 +660,11 @@ def build(
         for fold in result.folds:
             analysis["folds"].append({"image_caller": identity, **fold})
         analysis["unbound_parameter_accesses"] += result.unbound
-        c_targets[identity] = [{"name": name, "target_class": kind} for name, kind in sorted(targets.items())]
+        c_targets[identity] = [
+            # Whether the image has any symbol of this name: a global the compiler removed has none.
+            {"name": name, "target_class": kind, "image_symbol": name in image.map_source_names}
+            for name, kind in sorted(targets.items())
+        ]
         field_accesses[identity] = sorted(
             {repr(item): {key: item.get(key, -1) for key in _FIELD_KEYS} for item in result.field_accesses}.values(),
             key=repr,

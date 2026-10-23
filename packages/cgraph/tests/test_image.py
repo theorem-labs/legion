@@ -8,7 +8,7 @@ import pytest
 from conftest import FIXTURE
 
 from cgraph import config
-from cgraph.image import Image, resolve_sized, source_name
+from cgraph.image import FunctionFacts, Image, resolve_sized, source_name
 
 
 @pytest.fixture(scope="module")
@@ -160,3 +160,51 @@ def test_compiler_suffix_gives_the_c_name() -> None:
     assert source_name("create_worker.__already_done.78") == "create_worker.__already_done"
     assert source_name("files_stat.0") == "files_stat"
     assert source_name("box_count") == "box_count"
+
+
+TP = 4
+
+
+def _amo(funct5: int, rd: int, rs2: int, rs1: int) -> int:
+    return (funct5 << 27) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x2F
+
+
+def _add(rd: int, rs1: int, rs2: int) -> int:
+    return (rs2 << 20) | (rs1 << 15) | (rd << 7) | 0x33
+
+
+def _operations(facts: FunctionFacts) -> set[tuple[str, str]]:
+    return {(item["global"], item["operation"]) for item in facts.globals}
+
+
+def test_the_thread_pointer_as_a_value_and_as_an_atomic_address(image: Image) -> None:
+    code = struct.pack("<II", _addi(A0, TP, 0x368), _amo(0b01100, ZERO, A0, TP))
+    assert _operations(image.decode("synthetic", code, 0x11000)) == {
+        ("current_box", "thread_pointer_value"),
+        ("current_box", "thread_pointer_access"),
+    }
+
+
+def test_a_known_address_plus_an_unknown_index(image: Image) -> None:
+    """``&pair_a + a0`` then ``ld 8(...)``: pair_b, through an index the code computed."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _add(A5, A5, A0), _load(A1, A5, 8))
+    assert ("pair_b", "indexed_access") in _operations(image.decode("synthetic", code, start))
+
+
+def test_an_address_only_used_as_a_base_is_not_itself_an_access(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    based = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _load(A1, A5, 8), 0x00008067)
+    assert _operations(image.decode("synthetic", based, start)) == {("pair_b", "load_or_store")}
+    returned = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), 0x00008067)  # ret
+    assert ("pair_a", "addi_address") in _operations(image.decode("synthetic", returned, start))
+
+
+def test_a_zero_size_name_at_an_objects_address_is_an_alias(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _load(A1, A5, 0), 0x00008067)
+    (entry,) = [item for item in image.decode("synthetic", code, start).globals if item["global"] == "pair_a"]
+    assert entry["aliases"] == ["pair_alias"]

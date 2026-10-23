@@ -13,6 +13,11 @@ anchor_pair:
 
 	.data
 	.balign	8
+	/* A zero-size name at the address of pair_a, as a linker script alias gives one. */
+	.globl	pair_alias
+	.type	pair_alias, @object
+	.size	pair_alias, 0
+pair_alias:
 	.globl	pair_a
 	.type	pair_a, @object
 	.size	pair_a, 8

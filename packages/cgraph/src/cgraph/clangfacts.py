@@ -192,6 +192,7 @@ class _Extractor:
             {cursor.spelling: cursor for cursor in tu.cursor.get_children()
              if cursor.kind == K.FUNCTION_DECL and cursor.is_definition() and cursor.spelling}
         )  # fmt: skip
+        self.ignored_cache: dict[str, frozenset[int]] = {}
 
     # Locations -----------------------------------------------------------------------------
 
@@ -522,6 +523,26 @@ class _Extractor:
         self.generic["ambiguous"] += 1
         return None
 
+    def ignored_parameters(self, callee: ci.Cursor | None) -> frozenset[int]:
+        """The parameters an inline function of the unit never reads, by position."""
+        if callee is None or callee.kind != K.FUNCTION_DECL:
+            return frozenset()
+        name = callee.spelling
+        if name in self.ignored_cache:
+            return self.ignored_cache[name]
+        definition = self.evaluator.definitions.get(name)
+        result: frozenset[int] = frozenset()
+        if definition is not None and definition.is_definition() and _is_inline(definition):
+            parameters = list(definition.get_arguments() or [])
+            used = {
+                node.referenced.hash
+                for node in definition.walk_preorder()
+                if node.kind == K.DECL_REF_EXPR and node.referenced is not None and node.referenced.kind == K.PARM_DECL
+            }
+            result = frozenset(position for position, parameter in enumerate(parameters) if parameter.hash not in used)
+        self.ignored_cache[name] = result
+        return result
+
     def cleanup_function(self, node: ci.Cursor, bound: ci.Cursor) -> str | None:
         """The function a ``cleanup`` attribute on a local names, read from the declaration as
         written and from the macros it expands (``__free(x)``, ``LOCK_MOUNT(...)``)."""
@@ -625,6 +646,37 @@ def _mentions(cursor: ci.Cursor, names: frozenset[str]) -> bool:
     return any(
         node.kind in (K.CALL_EXPR, K.DECL_REF_EXPR) and node.spelling in names for node in cursor.walk_preorder()
     )
+
+
+def _is_inline(definition: ci.Cursor) -> bool:
+    """A definition written ``inline`` (``static inline``, ``__always_inline``) before its name."""
+    try:
+        tokens = [token.spelling for token in definition.translation_unit.get_tokens(extent=definition.extent)]
+    except Exception:
+        return False
+    head = tokens[: tokens.index(definition.spelling)] if definition.spelling in tokens else tokens
+    return any(token in ("inline", "__inline", "__inline__", "__always_inline") for token in head)
+
+
+def _exits_under_builtin(statement: ci.Cursor, evaluator: _Evaluator) -> bool:
+    """An ``if`` whose condition only the compiler decides (``__builtin_constant_p``) and whose
+    branch leaves the block: what follows was compiled only when the condition was false."""
+    if statement.kind != K.IF_STMT:
+        return False
+    parts = _children(statement)
+    return len(parts) >= 2 and _mentions(parts[0], _IMAGE_DECIDES) and evaluator.exits(parts[1])
+
+
+def _pure(expression: ci.Cursor) -> bool:
+    """No call and no assignment inside: dropping the expression changes nothing but its value."""
+    for node in expression.walk_preorder():
+        if node.kind == K.CALL_EXPR or node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR:
+            return False
+        if node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node):
+            return False
+        if node.kind == K.UNARY_OPERATOR and libclang.is_increment(node):
+            return False
+    return True
 
 
 class _Evaluator:
@@ -1108,14 +1160,31 @@ class _FunctionWalk:
                 return
         if kind == K.COMPOUND_STMT and reason is None:
             # Statements after a return, a goto, a break, a continue or a noreturn call are reached
-            # only through a label or a case.
+            # only through a label or a case. After an `if (__builtin_constant_p(...)) return ...;`
+            # the machine code decides whether the rest was compiled.
             dead = False
+            builtin_exits = 0
             for child_index, child in enumerate(children):
                 if child.kind in _ENTRIES:
                     dead = False
                 self.walk(child, node, child_index, "after_exit" if dead else None, generic)
                 if not dead and self.x.evaluator.exits(child):
                     dead = True
+                elif not dead and _exits_under_builtin(child, self.x.evaluator):
+                    self.conditional += 1
+                    builtin_exits += 1
+            self.conditional -= builtin_exits
+            return
+        if kind == K.CALL_EXPR and children and reason is None:
+            ignored = self.x.ignored_parameters(node.referenced)
+            arguments = list(node.get_arguments() or [])
+            for child_index, child in enumerate(children):
+                position = next((place for place, argument in enumerate(arguments) if argument == child), None)
+                if position is not None and position in ignored and _pure(child):
+                    # A value only a parameter the inline callee never reads receives: not computed.
+                    self.walk(child, node, child_index, "ignored_argument", generic)
+                else:
+                    self.walk(child, node, child_index, reason, generic)
             return
         for child_index, child in enumerate(children):
             self.walk(child, node, child_index, reason, generic)

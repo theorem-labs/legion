@@ -42,3 +42,43 @@ int flow_container(struct list_node *n)
 {
 	return item_of(n)->value;
 }
+
+/* A value only a parameter the inline callee never reads receives: the compiler never computes it. */
+static inline void note_bag(struct list_node *n)
+{
+}
+
+int flow_ignored(void)
+{
+	note_bag(all_bags.next);
+	return 0;
+}
+
+/* After `if (__builtin_constant_p(n)) return`, the rest is compiled only for a non-constant n. */
+static inline int pick_exit(long n)
+{
+	if (__builtin_constant_p(n))
+		return (int)n;
+	return box_weight();
+}
+
+int flow_builtin_exit(void)
+{
+	return pick_exit(4);
+}
+
+/* A function passed as a pointer to an inline helper that calls it: the compiler inlines both. */
+static inline int apply(int (*fn)(void))
+{
+	return fn();
+}
+
+static int read_bags(void)
+{
+	return all_bags.next != NULL;
+}
+
+int flow_pointer(void)
+{
+	return apply(read_bags);
+}

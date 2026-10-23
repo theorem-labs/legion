@@ -115,62 +115,76 @@ def calls(graph: dict[str, Any]) -> dict[str, Any]:
 
 
 def accesses(graph: dict[str, Any]) -> dict[str, Any]:
-    """C accesses to globals against image addresses inside sized ELF objects named by System.map."""
+    """C accesses to globals against image addresses inside sized ELF objects named by System.map.
+
+    An image address with several names (a zero-size symbol at the start of another object, such as
+    jiffies at jiffies_64) matches a C access to any of them. A C global that has no symbol in the
+    image at all (the compiler removed it: an empty lock_class_key, a folded constant) is counted
+    apart, because no address can show it."""
     analysis = graph["analysis"]
     functions = sorted(_part_functions(graph))
     c_targets = {
-        function: {item["name"]: item["target_class"] for item in analysis["c_targets"].get(function, [])}
-        for function in functions
+        function: {item["name"]: item for item in analysis["c_targets"].get(function, [])} for function in functions
     }
-    image_targets: dict[str, dict[str, str]] = collections.defaultdict(dict)
+    image_entries: dict[str, dict[str, tuple[str, frozenset[str]]]] = collections.defaultdict(dict)
     for item in analysis["image"]["globals"]:
-        image_targets[item["function"]][item["global"]] = item["target_class"]
+        names = frozenset([item["global"], *item.get("aliases", [])])
+        known = image_entries[item["function"]].get(item["global"])
+        image_entries[item["function"]][item["global"]] = (item["target_class"], names | (known[1] if known else names))
     sized = set(analysis["image"]["sized_symbol_names"])
     all_c = {name for targets in c_targets.values() for name in targets}
     c_total: set[tuple[str, str]] = set()
+    matched: set[tuple[str, str]] = set()
     image_total: set[tuple[str, str]] = set()
     c_only: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
     image_only: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
+    apart: dict[str, list[tuple[str, str]]] = collections.defaultdict(list)
+    c_state: set[tuple[str, str]] = set()
+    image_only_state = 0
     for function in functions:
-        c_values, image_values = c_targets.get(function, {}), image_targets.get(function, {})
-        c_total |= {(function, name) for name in c_values}
-        image_total |= {(function, name) for name in image_values}
-        for name in sorted(set(c_values) - set(image_values)):
-            kind = c_values[name]
+        c_values, entries = c_targets.get(function, {}), image_entries.get(function, {})
+        image_names = set().union(*(names for _, names in entries.values())) if entries else set()
+        for name, item in sorted(c_values.items()):
+            pair = (function, name)
+            kind = item["target_class"]
+            if kind == "state" and not item.get("image_symbol", True):
+                apart["state_without_image_symbol"].append(pair)
+                continue
+            c_total.add(pair)
+            if kind == "state":
+                c_state.add(pair)
+            if name in image_names:
+                matched.add(pair)
+                continue
             if kind == "state":
                 kind = "state_not_addressed_by_image" if name in sized else "state_without_sized_elf_symbol"
-            c_only[kind].append((function, name))
-        for name in sorted(set(image_values) - set(c_values)):
-            kind = image_values[name]
+            c_only[kind].append(pair)
+        for primary, (kind, names) in sorted(entries.items()):
+            image_total.add((function, primary))
+            if names & set(c_values):
+                continue
             if kind == "state":
-                kind = "state_named_by_another_c_function" if name in all_c else "state_not_named_in_c"
-            image_only[kind].append((function, name))
+                image_only_state += 1
+                kind = "state_named_by_another_c_function" if names & all_c else "state_not_named_in_c"
+            image_only[kind].append((function, primary))
     outside = analysis["image"]["outside_sized_symbols"]
     outside_kinds = collections.Counter(item.get("section", "") for item in outside)
     # Agreement over state on both sides: per-CPU state, compiler symbols and constant tables are
     # named differently by C and the image by design, and are counted apart.
-    c_state = {
-        (function, name)
-        for function in functions
-        for name, kind in c_targets.get(function, {}).items()
-        if kind == "state"
-    }
-    image_state = {
-        (function, name)
-        for function in functions
-        for name, kind in image_targets.get(function, {}).items()
-        if kind == "state"
-    }
-    either = c_state | image_state
+    matched_state = len(c_state & matched)
+    either = len(c_state) + image_only_state
+    only_image = sum(len(items) for items in image_only.values())
     return {
         "method": "C state units (a field path rooted at a global is that global) against addresses inside the "
-        "declared size of an ELF object that System.map names; other addresses are counted apart.",
+        "declared size of an ELF object that System.map names (or a zero-size symbol at the address); other "
+        "addresses are counted apart.",
         "c_accesses": len(c_total),
         "image_accesses": len(image_total),
-        "agree": len(c_total & image_total),
-        "only_c": len(c_total - image_total),
-        "only_image": len(image_total - c_total),
-        "state_agreement": round(len(c_state & image_state) / len(either), 6) if either else 1.0,
+        "agree": len(matched),
+        "only_c": len(c_total - matched),
+        "only_image": only_image,
+        "state_agreement": round(matched_state / either, 6) if either else 1.0,
+        "counted_apart": {kind: len(items) for kind, items in sorted(apart.items())},
         "disagreements": {
             "only_c": {
                 kind: {"count": len(items), "examples": _pairs_examples(set(items), 3)}
@@ -192,6 +206,11 @@ def accesses(graph: dict[str, Any]) -> dict[str, Any]:
             "only_image": [
                 {"source": source, "target": target, "class": kind}
                 for kind, items in sorted(image_only.items())
+                for source, target in items
+            ],
+            "counted_apart": [
+                {"source": source, "target": target, "class": kind}
+                for kind, items in sorted(apart.items())
                 for source, target in items
             ],
         },
@@ -350,8 +369,13 @@ def hard(
     part = _part_functions(graph)
     missing_functions = sorted(set(analysis["expected_functions"]) - part)
     state_names = {node["name"] for node in graph["nodes"] if node["kind"] in ("global", "percpu")}
-    addressed = {item["global"] for item in analysis["image"]["globals"] if item["target_class"] == "state"}
-    missing_globals = sorted(addressed - state_names)
+    addressed_entries = [
+        frozenset([item["global"], *item.get("aliases", [])])
+        for item in analysis["image"]["globals"]
+        if item["target_class"] == "state"
+    ]
+    addressed = {min(names) for names in addressed_entries}
+    missing_globals = sorted({min(names) for names in addressed_entries if not names & state_names})
     no_provenance = [
         f"{item['kind']} {item.get('id') or item['source'] + '->' + item['target']}"
         for item in graph["nodes"] + graph["edges"]

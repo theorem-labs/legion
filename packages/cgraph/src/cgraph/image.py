@@ -38,19 +38,74 @@ _OFFSET_LIMIT = 1 << 24
 
 @dataclass
 class _State:
-    """Registers that hold a known value, and registers that hold an unknown base plus a known constant."""
+    """Registers that hold a known value; registers that hold an unknown base plus a known constant
+    (``relative``); and registers that hold a known address plus an unknown offset (``anchored``: a
+    per-CPU offset or an index added to the address of an object)."""
 
     values: dict[int, int] = field(default_factory=dict)
     relative: dict[int, int] = field(default_factory=dict)
+    anchored: dict[int, int] = field(default_factory=dict)
 
     def copy(self) -> _State:
-        return _State(dict(self.values), dict(self.relative))
+        return _State(dict(self.values), dict(self.relative), dict(self.anchored))
 
     def meet(self, other: _State) -> _State:
+        def same(mine: dict[int, int], theirs: dict[int, int]) -> dict[int, int]:
+            return {register: value for register, value in mine.items() if theirs.get(register) == value}
+
         return _State(
-            {register: value for register, value in self.values.items() if other.values.get(register) == value},
-            {register: value for register, value in self.relative.items() if other.relative.get(register) == value},
+            same(self.values, other.values),
+            same(self.relative, other.relative),
+            same(self.anchored, other.anchored),
         )
+
+
+_ATOMIC_PREFIXES = ("amo", "lr.", "sc.")
+
+
+def _reads(instruction: Any, operands: list[Any]) -> tuple[set[int], set[int]]:
+    """The registers an instruction reads as the base of a memory access, and those it reads as values."""
+    references = _memory_references(instruction, operands)
+    bases = {base for base, _ in references}
+    registers = [operand.reg for operand in operands if operand.type == CS_OP_REG]
+    mnemonic = instruction.mnemonic
+    if mnemonic.startswith(_ATOMIC_PREFIXES):
+        # amoadd.d rd, rs2, (rs1): rd is written, rs2 is a value, rs1 the base.
+        values = set(registers[1:-1])
+    elif mnemonic in _NO_DESTINATION:
+        values = set(registers)
+    else:
+        values = set(registers[1:])
+    if mnemonic in _COMPRESSED_MEMORY and len(operands) == 3:
+        values = {operands[0].reg} if mnemonic.startswith(("c.s", "c.fs")) else set()
+    return bases, values - bases
+
+
+def _anchored_value(
+    instruction: Any,
+    operands: list[Any],
+    values: dict[int, int],
+    anchored: dict[int, int],
+    section_of: Any,
+) -> tuple[int, int] | None:
+    """A register that becomes a known address plus an unknown offset: ``add rd, address, offset``, or
+    ``addi``/``mv`` of such a register."""
+    mnemonic = instruction.mnemonic
+    kinds = [operand.type for operand in operands]
+    if mnemonic in ("add", "c.add") and kinds and all(kind == CS_OP_REG for kind in kinds):
+        registers = [operand.reg for operand in operands]
+        left, right = (registers[1], registers[2]) if len(registers) == 3 else (registers[0], registers[1])
+        for address, offset in ((left, right), (right, left)):
+            if address in values and offset not in values and section_of(values[address]) is not None:
+                return registers[0], values[address]
+        return None
+    if mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in anchored:
+        return operands[0].reg, (anchored[operands[1].reg] + operands[2].imm) & _MASK
+    if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in anchored:
+        return operands[0].reg, (anchored[operands[0].reg] + operands[1].imm) & _MASK
+    if mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in anchored:
+        return operands[0].reg, anchored[operands[1].reg]
+    return None
 
 
 def _links(decoder: Any, operands: list[Any]) -> bool:
@@ -202,6 +257,14 @@ class Image:
         self.objects = sorted(set(objects))
         self.function_ranges = sorted(set(function_ranges))
         self.sized_object_names = sorted({name for _, size, name, _ in self.objects if size})
+        # Names an address has without storage of their own: zero-size symbols (jiffies, which the
+        # linker script makes an alias of jiffies_64; an empty lock_class_key; a section marker).
+        self.zero_size_at: dict[int, list[str]] = {}
+        for address, size, name, _ in self.objects:
+            if not size:
+                self.zero_size_at.setdefault(address, []).append(source_name(name))
+        # The C names of every data symbol System.map lists, for telling a global the compiler removed.
+        self.map_source_names = frozenset(source_name(name) for _, kind, name in self.map if kind not in text_kinds)
         self.decoder = Cs(CS_ARCH_RISCV, CS_MODE_RISCV64 | CS_MODE_RISCVC)
         self.decoder.detail = True
         self.cache: dict[int, FunctionFacts] = {}
@@ -249,8 +312,37 @@ class Image:
         facts = FunctionFacts()
         instructions = list(self.decoder.disasm(code, address))
         for index, state in self._block_states(instructions):
-            self._step(name, instructions[index], state, facts)
+            instruction = instructions[index]
+            escapes = instruction.mnemonic not in _ADDI or self._escapes(instructions, index)
+            self._step(name, instruction, state, facts, escapes)
         return facts
+
+    def _escapes(self, instructions: list[Any], index: int, limit: int = 64) -> bool:
+        """Whether the register an ``addi`` sets is used other than as the base of loads and stores
+        before it is overwritten: passed to a call, returned, stored, compared or computed with. Only
+        then is the address itself an access; a base for loads and stores gives the accesses itself."""
+        operands = list(instructions[index].operands)
+        if not operands or operands[0].type != CS_OP_REG:
+            return True
+        register = operands[0].reg
+        name = self.decoder.reg_name(register)
+        for following in instructions[index + 1 : index + 1 + limit]:
+            mnemonic = following.mnemonic
+            following_operands = list(following.operands)
+            bases, reads = _reads(following, following_operands)
+            if register in reads:
+                return True
+            calls = mnemonic in {"jal", "c.jal"} or (
+                mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, following_operands)
+            )
+            if calls or mnemonic in {"j", "c.j", "jr", "c.jr"}:
+                # An argument register reaches the callee; at a jump the use is elsewhere.
+                return bool(name.startswith("a")) or mnemonic in {"j", "c.j"}
+            if mnemonic in _ENDS:
+                return bool(name == "a0")
+            if register in _written_registers(following, following_operands) and register not in bases:
+                return False
+        return True
 
     def _block_states(self, instructions: list[Any]) -> list[tuple[int, _State]]:
         """Each instruction's index with the register state before it, from a forward must-analysis
@@ -321,6 +413,10 @@ class Image:
         if section is None:
             return
         resolved = resolve_sized(self.objects, address)
+        zero_size = sorted(set(self.zero_size_at.get(address, [])))
+        if resolved is None and zero_size:
+            # Only zero-size names at the address: an empty object, or a marker the code compares.
+            resolved = (zero_size[0], address, section[2])
         if resolved is None:
             target = resolve_sized(self.function_ranges, address)
             if target is not None:
@@ -350,23 +446,31 @@ class Image:
             return
         symbol, start, section_name = resolved
         name = source_name(symbol)
-        facts.globals.append(
-            {
-                "function": function,
-                "global": name,
-                "symbol": symbol,
-                "symbol_address": _hex(start),
-                "offset": address - start,
-                "section": section_name,
-                "target_class": self.symbol_class(name, section_name),
-                "operation": operation,
-                "provenance": [{"source": "image", "address": _hex(instruction)}],
-            }
-        )
+        entry = {
+            "function": function,
+            "global": name,
+            "symbol": symbol,
+            "symbol_address": _hex(start),
+            "offset": address - start,
+            "section": section_name,
+            "target_class": self.symbol_class(name, section_name),
+            "operation": operation,
+            "provenance": [{"source": "image", "address": _hex(instruction)}],
+        }
+        aliases = [alias for alias in zero_size if alias != name]
+        if aliases:
+            # The address cannot tell these names apart: jiffies is jiffies_64; a zero-size key
+            # shares the address of the object after it.
+            entry["aliases"] = aliases
+        facts.globals.append(entry)
 
-    def _step(self, function: str, instruction: Any, state: _State, facts: FunctionFacts | None) -> None:
-        """One instruction: its facts (when ``facts`` is given) and its effect on the register state."""
-        values, relative = state.values, state.relative
+    def _step(
+        self, function: str, instruction: Any, state: _State, facts: FunctionFacts | None, escapes: bool = True
+    ) -> None:
+        """One instruction: its facts (when ``facts`` is given) and its effect on the register state.
+
+        ``escapes`` says whether an ``addi``'s address is used other than as a load or store base."""
+        values, relative, anchored = state.values, state.relative, state.anchored
         operands = list(instruction.operands)
         mnemonic = instruction.mnemonic
         computed = _computed_value(instruction, operands, values)
@@ -376,25 +480,26 @@ class Image:
                 source = operands[-2].reg if len(operands) == 3 and operands[-2].type == CS_OP_REG else operands[0].reg
                 if source in relative:
                     facts.addi_constants.add(relative[source] + operands[-1].imm)
+            _, reads = _reads(instruction, operands)
+            if self.rules.thread_pointer and any(self.decoder.reg_name(register) == "tp" for register in reads):
+                # The thread pointer used as a value (passed, stored, offset): the current task itself.
+                facts.globals.append(self._thread_pointer(function, instruction.address, 0, "thread_pointer_value"))
             for base, displacement in _memory_references(instruction, operands):
                 facts.memory_offsets.add(displacement)
                 if self.decoder.reg_name(base) == "tp":
                     if self.rules.thread_pointer:
                         facts.globals.append(
-                            {
-                                "function": function,
-                                "global": self.rules.thread_pointer,
-                                "symbol_address": "tp",
-                                "offset": displacement,
-                                "section": "",
-                                "target_class": "per_cpu",
-                                "operation": "thread_pointer_access",
-                                "provenance": [{"source": "image", "address": _hex(instruction.address)}],
-                            }
+                            self._thread_pointer(function, instruction.address, displacement, "thread_pointer_access")
                         )
                 elif base in values:
                     self._record_address(
                         function, (values[base] + displacement) & _MASK, instruction.address, "load_or_store", facts
+                    )
+                elif base in anchored:
+                    # A known address plus a per-CPU offset or an index the code computed: the
+                    # object at the known address and the displacement.
+                    self._record_address(
+                        function, (anchored[base] + displacement) & _MASK, instruction.address, "indexed_access", facts
                     )
                 elif base in relative:
                     # A base register plus a constant the code formed with lui (a field beyond the
@@ -415,22 +520,39 @@ class Image:
                     self._call(function, instruction.address, target, tail, facts)
         if mnemonic in {"jal", "c.jal"} or (mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, operands)):
             # A call may change every caller-saved register.
-            for register in tuple(values) + tuple(relative):
+            for register in (*values, *relative, *anchored):
                 name = self.decoder.reg_name(register)
                 if name == "ra" or name.startswith(("a", "t")):
                     values.pop(register, None)
                     relative.pop(register, None)
+                    anchored.pop(register, None)
         derived = _relative_value(instruction, operands, values, relative)
+        indexed = _anchored_value(instruction, operands, values, anchored, self.section_of)
         for register in _written_registers(instruction, operands):
             values.pop(register, None)
             relative.pop(register, None)
+            anchored.pop(register, None)
         if computed is not None:
             destination, value = computed
             values[destination] = value
-            if facts is not None and mnemonic in _ADDI:
+            if facts is not None and mnemonic in _ADDI and escapes:
                 self._record_address(function, value, instruction.address, "addi_address", facts)
+        elif indexed is not None:
+            anchored[indexed[0]] = indexed[1]
         elif derived is not None:
             relative[derived[0]] = derived[1]
+
+    def _thread_pointer(self, function: str, instruction: int, offset: int, operation: str) -> dict[str, Any]:
+        return {
+            "function": function,
+            "global": self.rules.thread_pointer,
+            "symbol_address": "tp",
+            "offset": offset,
+            "section": "",
+            "target_class": "per_cpu",
+            "operation": operation,
+            "provenance": [{"source": "image", "address": _hex(instruction)}],
+        }
 
     def _call(self, function: str, instruction: int, target: int, tail: bool, facts: FunctionFacts) -> None:
         callee = self.text_at.get(target)
@@ -473,6 +595,11 @@ def _memory_references(instruction: Any, operands: list[Any]) -> list[tuple[int,
         and operands[2].type == CS_OP_REG
     ):
         references.append((operands[2].reg, operands[1].imm))
+    if not references and instruction.mnemonic.startswith(_ATOMIC_PREFIXES) and operands:
+        # Capstone gives the address of an atomic, (rs1), as a plain register operand.
+        last = operands[-1]
+        if last.type == CS_OP_REG:
+            references.append((last.reg, 0))
     return references
 
 

@@ -200,6 +200,7 @@ def test_fold_only_where_the_image_has_no_direct_call() -> None:
         linker.by_name[name] = [definition]
     linker.effective_cache = {}
     linker.callee_cache = {("caller", "a.c", 6): {"called"}}
+    linker.symbol_cache = {("caller", "a.c", 6): []}
     result = linker.effective("a.c", "caller", linker.definitions[("caller", "a.c", 6)])
     assert [call["callee"] for call in result.calls] == ["called", "external"]
     assert [fold["helper"] for fold in result.folds] == ["function:inlined"]

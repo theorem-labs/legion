@@ -160,3 +160,30 @@ def test_a_part_overrides_the_default_thresholds(tmp_path: Path) -> None:
     loaded = config.load(path)
     assert loaded.part_thresholds["small"] == config.Thresholds(call_agreement=0.99, field_offsets=0.8)
     assert loaded.part_thresholds["big"] == config.Thresholds(call_agreement=0.9, field_offsets=0.8)
+
+
+def test_a_c_global_with_no_image_symbol_is_counted_apart_and_aliases_match() -> None:
+    graph = {
+        "nodes": [{"id": "function:f", "kind": "function", "part": True, "image_addresses": ["0x1"]}],
+        "edges": [],
+        "analysis": {
+            "c_targets": {"function:f": [
+                {"name": "kept", "target_class": "state", "image_symbol": True},
+                {"name": "removed", "target_class": "state", "image_symbol": False},
+                {"name": "jiffies", "target_class": "state", "image_symbol": True},
+            ]},
+            "image": {
+                "globals": [
+                    {"function": "function:f", "global": "kept", "target_class": "state"},
+                    {"function": "function:f", "global": "jiffies_64", "aliases": ["jiffies"], "target_class": "state"},
+                ],
+                "sized_symbol_names": ["kept", "jiffies_64"],
+                "outside_sized_symbols": [],
+            },
+            "generic_unconfirmed": [],
+        },
+    }  # fmt: skip
+    result = checks.accesses(graph)
+    assert (result["agree"], result["only_c"], result["only_image"]) == (2, 0, 0)
+    assert result["counted_apart"] == {"state_without_image_symbol": 1}
+    assert result["state_agreement"] == 1.0
