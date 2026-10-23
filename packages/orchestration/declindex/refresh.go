@@ -237,7 +237,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	defer func() { _ = tx.Rollback() }()
 	for _, rel := range append(append([]string(nil), gone...), relsOf(changed)...) {
 		if o, ok := old[rel]; ok {
-			for _, t := range []string{"decls", "uses", "edges"} {
+			for _, t := range []string{"decls", "uses", "edges", "imports"} {
 				if _, err := tx.ExecContext(ctx, "DELETE FROM "+t+" WHERE module = ?", o.module); err != nil {
 					return st, err
 				}
@@ -254,6 +254,8 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	}
 	decls := newBatch(tx, "decls", 6)
 	uses := newBatch(tx, "uses", 6)
+	imports := newBatch(tx, "imports", 2)
+	imports.verb = "INSERT OR IGNORE"
 	for i, md := range results {
 		if errs[i] != nil {
 			st.Unreadable++
@@ -272,6 +274,11 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 				return st, err
 			}
 		}
+		for _, imported := range md.Imports {
+			if err := imports.add(ctx, md.Module, imported); err != nil {
+				return st, err
+			}
+		}
 		// The olean key says which compiled module the index's types and facts were read from; re-reading the
 		// reference file does not change it.
 		if _, err := tx.ExecContext(ctx, `INSERT INTO modules (rel, module, ilean_key, olean_key) VALUES (?, ?, ?, ?)`,
@@ -283,6 +290,9 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		return st, err
 	}
 	if err := uses.flush(ctx); err != nil {
+		return st, err
+	}
+	if err := imports.flush(ctx); err != nil {
 		return st, err
 	}
 	if err := insertEdges(ctx, tx, results, errs); err != nil {

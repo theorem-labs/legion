@@ -20,7 +20,7 @@ import (
 )
 
 // SchemaVersion changes when the tables change; an index of another version is rebuilt from nothing.
-const SchemaVersion = "2"
+const SchemaVersion = "3"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS modules (
     olean_key TEXT NOT NULL DEFAULT ''
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS modules_module ON modules (module);
+CREATE TABLE IF NOT EXISTS imports (
+    module   TEXT NOT NULL,
+    imported TEXT NOT NULL,
+    PRIMARY KEY (module, imported)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS imports_imported ON imports (imported);
 CREATE TABLE IF NOT EXISTS decls (
     name      TEXT NOT NULL,
     short     TEXT NOT NULL,
@@ -88,7 +94,7 @@ CREATE INDEX IF NOT EXISTS facts_name ON facts (name);
 CREATE INDEX IF NOT EXISTS facts_module ON facts (module);
 `
 
-var tables = []string{"meta", "modules", "decls", "uses", "edges", "consts", "atoms", "facts"}
+var tables = []string{"meta", "modules", "imports", "decls", "uses", "edges", "consts", "atoms", "facts"}
 
 // Store is an open index: the SQLite file at path, and the declaration graph beside it at path + ".graph".
 type Store struct {
