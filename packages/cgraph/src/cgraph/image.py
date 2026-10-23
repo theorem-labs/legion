@@ -27,6 +27,59 @@ _DIRECT_CALLS = {"jal", "j", "c.j", "c.jal"}
 _REGISTER_CALLS = {"jalr", "c.jalr", "jr", "c.jr"}
 _ADDI = {"addi", "addiw", "c.addi", "c.addiw"}
 _MASK = (1 << 64) - 1
+_BRANCHES = {
+    "beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez", "blez", "bgez", "bltz", "bgtz", "bgt", "ble",
+    "bgtu", "bleu", "c.beqz", "c.bnez",
+}  # fmt: skip
+_ENDS = {"ret", "jr", "c.jr", "ebreak", "c.ebreak", "unimp", "c.unimp", "mret", "sret"}
+# Constants beyond this many bytes are addresses or masks, not field offsets.
+_OFFSET_LIMIT = 1 << 24
+
+
+@dataclass
+class _State:
+    """Registers that hold a known value, and registers that hold an unknown base plus a known constant."""
+
+    values: dict[int, int] = field(default_factory=dict)
+    relative: dict[int, int] = field(default_factory=dict)
+
+    def copy(self) -> _State:
+        return _State(dict(self.values), dict(self.relative))
+
+    def meet(self, other: _State) -> _State:
+        return _State(
+            {register: value for register, value in self.values.items() if other.values.get(register) == value},
+            {register: value for register, value in self.relative.items() if other.relative.get(register) == value},
+        )
+
+
+def _links(decoder: Any, operands: list[Any]) -> bool:
+    """A ``jalr`` that writes a return address (a call), not one through ``zero`` (a jump)."""
+    registers = [operand.reg for operand in operands if operand.type == CS_OP_REG]
+    return len(registers) < 2 or decoder.reg_name(registers[0]) != "zero"
+
+
+def _relative_value(
+    instruction: Any, operands: list[Any], values: dict[int, int], relative: dict[int, int]
+) -> tuple[int, int] | None:
+    """A register that becomes an unknown base plus a constant: ``add rd, base, c`` where ``c`` was
+    formed with ``lui`` (and ``addi``), or ``addi``/``mv`` of such a register."""
+    mnemonic = instruction.mnemonic
+    kinds = [operand.type for operand in operands]
+    if mnemonic in ("add", "c.add") and kinds and all(kind == CS_OP_REG for kind in kinds):
+        registers = [operand.reg for operand in operands]
+        left, right = (registers[1], registers[2]) if len(registers) == 3 else (registers[0], registers[1])
+        for constant, base in ((left, right), (right, left)):
+            if constant in values and base not in values and abs(values[constant]) < _OFFSET_LIMIT:
+                return registers[0], values[constant] + relative.get(base, 0)
+        return None
+    if mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in relative:
+        return operands[0].reg, relative[operands[1].reg] + operands[2].imm
+    if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in relative:
+        return operands[0].reg, relative[operands[0].reg] + operands[1].imm
+    if mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in relative:
+        return operands[0].reg, relative[operands[1].reg]
+    return None
 
 
 @dataclass(frozen=True)
@@ -188,10 +241,78 @@ class Image:
             self.section_data[section[2]] = data
         start = symbol.address - section[0]
         code = data[start : start + max(0, self._end(symbol) - symbol.address)]
-        values: dict[int, int] = {}
-        for instruction in self.decoder.disasm(code, symbol.address):
-            self._step(symbol.name, instruction, values, facts)
+        self.cache[symbol.address] = self.decode(symbol.name, code, symbol.address)
+        return self.cache[symbol.address]
+
+    def decode(self, name: str, code: bytes, address: int) -> FunctionFacts:
+        """The facts of a function's machine code that starts at ``address``."""
+        facts = FunctionFacts()
+        instructions = list(self.decoder.disasm(code, address))
+        for index, state in self._block_states(instructions):
+            self._step(name, instructions[index], state, facts)
         return facts
+
+    def _block_states(self, instructions: list[Any]) -> list[tuple[int, _State]]:
+        """Each instruction's index with the register state before it, from a forward must-analysis
+        over the function's basic blocks: a register holds a value at a block's start only when every
+        path into the block gives it that value, so an address formed before a branch and used after
+        a join is followed, and one formed on only one path is not."""
+        if not instructions:
+            return []
+        index_of = {instruction.address: index for index, instruction in enumerate(instructions)}
+        leaders = {0}
+        successors: dict[int, list[int]] = {}
+        for index, instruction in enumerate(instructions):
+            mnemonic = instruction.mnemonic
+            operands = list(instruction.operands)
+            target = None
+            if (mnemonic in _BRANCHES or mnemonic in {"j", "c.j"}) and operands and operands[-1].type == CS_OP_IMM:
+                target = index_of.get((instruction.address + operands[-1].imm) & _MASK)
+            follows = []
+            if mnemonic in _BRANCHES:
+                follows = [index + 1] + ([target] if target is not None else [])
+            elif mnemonic in {"j", "c.j"}:
+                follows = [target] if target is not None else []
+            elif mnemonic in _ENDS or (mnemonic in {"jalr", "c.jalr"} and not _links(self.decoder, operands)):
+                follows = []
+            else:
+                continue
+            successors[index] = [item for item in follows if item is not None and item < len(instructions)]
+            leaders.update(successors[index])
+            if index + 1 < len(instructions):
+                leaders.add(index + 1)
+        starts = sorted(leaders)
+        ends = {start: (starts[position + 1] if position + 1 < len(starts) else len(instructions))
+                for position, start in enumerate(starts)}  # fmt: skip
+        block_successors = {}
+        for start, end in ends.items():
+            last = end - 1
+            block_successors[start] = successors.get(last, [end] if end < len(instructions) else [])
+        entry: dict[int, _State | None] = {start: None for start in starts}
+        entry[0] = _State()
+        pending = [0]
+        budget = 64 * len(starts)
+        while pending and budget:
+            budget -= 1
+            start = pending.pop()
+            state = entry[start]
+            assert state is not None
+            state = state.copy()
+            for index in range(start, ends[start]):
+                self._step("", instructions[index], state, None)
+            for successor in block_successors[start]:
+                known = entry.get(successor)
+                merged = state.copy() if known is None else known.meet(state)
+                if known is None or merged != known:
+                    entry[successor] = merged
+                    pending.append(successor)
+        result = []
+        for start in starts:
+            state = (entry[start] or _State()).copy()
+            for index in range(start, ends[start]):
+                result.append((index, state.copy()))
+                self._step("", instructions[index], state, None)
+        return result
 
     def _record_address(
         self, function: str, address: int, instruction: int, operation: str, facts: FunctionFacts
@@ -243,66 +364,73 @@ class Image:
             }
         )
 
-    def _step(self, function: str, instruction: Any, values: dict[int, int], facts: FunctionFacts) -> None:
+    def _step(self, function: str, instruction: Any, state: _State, facts: FunctionFacts | None) -> None:
+        """One instruction: its facts (when ``facts`` is given) and its effect on the register state."""
+        values, relative = state.values, state.relative
         operands = list(instruction.operands)
         mnemonic = instruction.mnemonic
         computed = _computed_value(instruction, operands, values)
-        if mnemonic in _ADDI and operands and operands[-1].type == CS_OP_IMM:
-            facts.addi_constants.add(operands[-1].imm)
-        for base, displacement in _memory_references(instruction, operands):
-            facts.memory_offsets.add(displacement)
-            if self.decoder.reg_name(base) == "tp":
-                if self.rules.thread_pointer:
-                    facts.globals.append(
-                        {
-                            "function": function,
-                            "global": self.rules.thread_pointer,
-                            "symbol_address": "tp",
-                            "offset": displacement,
-                            "section": "",
-                            "target_class": "per_cpu",
-                            "operation": "thread_pointer_access",
-                            "provenance": [{"source": "image", "address": _hex(instruction.address)}],
-                        }
+        if facts is not None:
+            if mnemonic in _ADDI and operands and operands[-1].type == CS_OP_IMM:
+                facts.addi_constants.add(operands[-1].imm)
+                source = operands[-2].reg if len(operands) == 3 and operands[-2].type == CS_OP_REG else operands[0].reg
+                if source in relative:
+                    facts.addi_constants.add(relative[source] + operands[-1].imm)
+            for base, displacement in _memory_references(instruction, operands):
+                facts.memory_offsets.add(displacement)
+                if self.decoder.reg_name(base) == "tp":
+                    if self.rules.thread_pointer:
+                        facts.globals.append(
+                            {
+                                "function": function,
+                                "global": self.rules.thread_pointer,
+                                "symbol_address": "tp",
+                                "offset": displacement,
+                                "section": "",
+                                "target_class": "per_cpu",
+                                "operation": "thread_pointer_access",
+                                "provenance": [{"source": "image", "address": _hex(instruction.address)}],
+                            }
+                        )
+                elif base in values:
+                    self._record_address(
+                        function, (values[base] + displacement) & _MASK, instruction.address, "load_or_store", facts
                     )
-            elif base in values:
-                self._record_address(
-                    function, (values[base] + displacement) & _MASK, instruction.address, "load_or_store", facts
+                elif base in relative:
+                    # A base register plus a constant the code formed with lui (a field beyond the
+                    # 12-bit displacement of a load or store).
+                    facts.memory_offsets.add(relative[base] + displacement)
+            if mnemonic in _DIRECT_CALLS and operands and operands[-1].type == CS_OP_IMM:
+                self._call(
+                    function,
+                    instruction.address,
+                    (instruction.address + operands[-1].imm) & _MASK,
+                    mnemonic in {"j", "c.j"},
+                    facts,
                 )
-        if mnemonic in _DIRECT_CALLS and operands and operands[-1].type == CS_OP_IMM:
-            self._call(
-                function,
-                instruction.address,
-                (instruction.address + operands[-1].imm) & _MASK,
-                mnemonic in {"j", "c.j"},
-                facts,
-            )
-        elif mnemonic in _REGISTER_CALLS:
-            target = _register_target(operands, values)
-            if target is not None:
-                tail = mnemonic in {"jr", "c.jr"} or bool(
-                    mnemonic == "jalr"
-                    and operands
-                    and operands[0].type == CS_OP_REG
-                    and self.decoder.reg_name(operands[0].reg) == "zero"
-                )
-                self._call(function, instruction.address, target, tail, facts)
-        if mnemonic in {"j", "c.j", "ret", "jr", "c.jr"}:
-            # Code after an unconditional jump is reached from somewhere else, with other values.
-            values.clear()
-            return
-        if mnemonic in _DIRECT_CALLS or mnemonic in _REGISTER_CALLS:
-            for register in tuple(values):
+            elif mnemonic in _REGISTER_CALLS:
+                target = _register_target(operands, values)
+                if target is not None:
+                    tail = mnemonic in {"jr", "c.jr"} or not _links(self.decoder, operands)
+                    self._call(function, instruction.address, target, tail, facts)
+        if mnemonic in {"jal", "c.jal"} or (mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, operands)):
+            # A call may change every caller-saved register.
+            for register in tuple(values) + tuple(relative):
                 name = self.decoder.reg_name(register)
                 if name == "ra" or name.startswith(("a", "t")):
                     values.pop(register, None)
+                    relative.pop(register, None)
+        derived = _relative_value(instruction, operands, values, relative)
         for register in _written_registers(instruction, operands):
             values.pop(register, None)
+            relative.pop(register, None)
         if computed is not None:
             destination, value = computed
             values[destination] = value
-            if mnemonic in _ADDI:
+            if facts is not None and mnemonic in _ADDI:
                 self._record_address(function, value, instruction.address, "addi_address", facts)
+        elif derived is not None:
+            relative[derived[0]] = derived[1]
 
     def _call(self, function: str, instruction: int, target: int, tail: bool, facts: FunctionFacts) -> None:
         callee = self.text_at.get(target)
@@ -375,13 +503,19 @@ def _computed(instruction: Any, operands: list[Any], values: dict[int, int]) -> 
         if upper & 0x80000:
             upper -= 0x100000
         return operands[0].reg, instruction.address + (upper << 12)
+    if mnemonic in ("lui", "c.lui") and kinds == [CS_OP_REG, CS_OP_IMM]:
+        # The upper 20 bits, sign-extended from bit 31 on RV64.
+        upper = operands[1].imm & 0xFFFFF
+        if upper & 0x80000:
+            upper -= 0x100000
+        return operands[0].reg, upper << 12
     if mnemonic in {"addi", "addiw"} and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in values:
         return operands[0].reg, values[operands[1].reg] + operands[2].imm
-    if mnemonic == "c.addi" and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in values:
+    if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in values:
         return operands[0].reg, values[operands[0].reg] + operands[1].imm
-    if mnemonic == "c.mv" and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in values:
+    if mnemonic in ("c.mv", "mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in values:
         return operands[0].reg, values[operands[1].reg]
-    if mnemonic == "c.li" and kinds == [CS_OP_REG, CS_OP_IMM]:
+    if mnemonic in ("c.li", "li") and kinds == [CS_OP_REG, CS_OP_IMM]:
         return operands[0].reg, operands[1].imm
     if (
         mnemonic == "add"

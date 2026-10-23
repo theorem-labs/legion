@@ -8,7 +8,7 @@ import pytest
 from conftest import FIXTURE
 
 from cgraph import config
-from cgraph.image import FunctionFacts, Image, resolve_sized, source_name
+from cgraph.image import Image, resolve_sized, source_name
 
 
 @pytest.fixture(scope="module")
@@ -78,17 +78,76 @@ def test_auipc_jalr_is_a_call_forward_and_backward(image: Image, caller_name: st
     The upper immediate is signed, so a callee before the caller needs a negative one."""
     (caller,) = image.functions[caller_name]
     (callee,) = image.functions[callee_name]
-    offset = callee.address - caller.address
-    high = (offset + 0x800) >> 12
-    low = offset - (high << 12)
-    auipc = ((high & 0xFFFFF) << 12) | (1 << 7) | 0x17
-    jalr = ((low & 0xFFF) << 20) | (1 << 15) | (1 << 7) | 0x67
-    code = struct.pack("<II", auipc, jalr)
-    values: dict[int, int] = {}
-    found = FunctionFacts()
-    for instruction in image.decoder.disasm(code, caller.address):
-        image._step("synthetic", instruction, values, found)
+    high, low = _split(callee.address - caller.address)
+    code = struct.pack("<II", _u(0x17, 1, high), _i(0x67, 1, 0, 1, low))
+    found = image.decode("synthetic", code, caller.address)
     assert [(call["target"], call["tail"]) for call in found.calls] == [(callee_name, False)]
+
+
+def _split(offset: int) -> tuple[int, int]:
+    high = (offset + 0x800) >> 12
+    return high, offset - (high << 12)
+
+
+def _u(opcode: int, rd: int, upper: int) -> int:
+    return ((upper & 0xFFFFF) << 12) | (rd << 7) | opcode
+
+
+def _i(opcode: int, rd: int, funct3: int, rs1: int, immediate: int) -> int:
+    return ((immediate & 0xFFF) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+
+
+def _branch(rs1: int, rs2: int, offset: int) -> int:
+    """beq rs1, rs2, offset."""
+    bits = offset & 0x1FFF
+    return (((bits >> 12) & 1) << 31 | ((bits >> 5) & 0x3F) << 25 | rs2 << 20 | rs1 << 15
+            | ((bits >> 1) & 0xF) << 8 | ((bits >> 11) & 1) << 7 | 0x63)  # fmt: skip
+
+
+def _jump(offset: int) -> int:
+    """jal zero, offset."""
+    bits = offset & 0x1FFFFF
+    return (((bits >> 20) & 1) << 31 | ((bits >> 1) & 0x3FF) << 21 | ((bits >> 11) & 1) << 20
+            | ((bits >> 12) & 0xFF) << 12 | 0x6F)  # fmt: skip
+
+
+A0, A1, A5, T0, ZERO = 10, 11, 15, 5, 0
+
+
+def _load(rd: int, base: int, offset: int) -> int:
+    return _i(0x03, rd, 3, base, offset)
+
+
+def _addi(rd: int, rs1: int, immediate: int) -> int:
+    return _i(0x13, rd, 0, rs1, immediate)
+
+
+def test_lui_add_displacement_beyond_twelve_bits(image: Image) -> None:
+    """``lui t0, 1; add t0, a0, t0; ld a1, 16(t0)``: a field at 4112 bytes from a0."""
+    add = (T0 << 20) | (A0 << 15) | (T0 << 7) | 0x33
+    code = struct.pack("<III", _u(0x37, T0, 1), add, _load(A1, T0, 16))
+    assert 4112 in image.decode("synthetic", code, 0x11000).memory_offsets
+
+
+def test_an_address_formed_before_a_jump_is_followed_at_the_join(image: Image) -> None:
+    """The address of pair_a reaches the load at the join from both paths, one through a ``j``."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack(
+        "<7I", _u(0x17, A5, high), _addi(A5, A5, low), _branch(A0, ZERO, 12), _addi(A0, A0, 1), _jump(8),
+        _addi(A0, A0, 2), _load(A1, A5, 8),
+    )  # fmt: skip
+    loads = {item["global"] for item in image.decode("synthetic", code, start).globals
+             if item["operation"] == "load_or_store"}  # fmt: skip
+    assert loads == {"pair_b"}
+
+
+def test_an_address_formed_on_one_path_only_is_not_followed(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - (start + 4))
+    code = struct.pack("<4I", _branch(A0, ZERO, 12), _u(0x17, A5, high), _addi(A5, A5, low), _load(A1, A5, 8))
+    loads = [item for item in image.decode("synthetic", code, start).globals if item["operation"] == "load_or_store"]
+    assert loads == []
 
 
 def test_backward_auipc_data_address(image: Image) -> None:
