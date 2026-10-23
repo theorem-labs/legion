@@ -1,6 +1,6 @@
 # The declaration index and the similarity gate
 
-`cmd/declindex` answers questions about a built Lean project and protects the concept registry that its owners share. The command's help is the short command reference; this document describes the persisted data and the landing contracts. For container acceptance drivers, see [the end-to-end driver](e2e/README.md).
+`cmd/declindex` answers questions about a built Lean project and protects the concept registry that its owners share. The command's help is the short command reference; this document describes the persisted data and the landing contracts. This branch does not include the container acceptance driver; do not substitute a devbox-host sandbox run.
 
 ## Index data and storage
 
@@ -69,7 +69,7 @@ The gate and recheck apply three controls before accepting a stored or proposed 
 2. Lean's parser allow-list admits declarations and limited surrounding syntax, and refuses forms that execute during elaboration.
 3. `confine` runs checking, compilation, and export in a fresh Landlock and seccomp sandbox. It requires Landlock ABI 3 or later, allows writes only to fresh scratch directories, permits only the launched process, and blocks later `execve`, forks, sockets, mounts, namespace operations, and other privileged interfaces.
 
-Without that sandbox, the source is not compiled and the relevant operation exits 3. The detailed container controls and invocation are documented in [the end-to-end driver](e2e/README.md).
+Without that sandbox, the source is not compiled and the relevant operation exits 3. This branch does not include the container driver or its detailed controls; a sandbox test runs in a container when that driver is available.
 
 ## Landing interfaces
 
@@ -113,7 +113,7 @@ The `hash` is the 16-hex text statement hash and `path` is the repository-relati
 
 The contract check registers selected, owned declarations that the ledger lacks, then compares every ledger contract whose name has no `:` with the index by exact name across every module. It reports a changed hash as a defect, no declaration as gone, and multiple declarations as ambiguous. Names with `:` are non-Lean ledger contracts and are not compared with declarations.
 
-The registry check loads format 2, lists the concept files added in `prev_commit..commit`, and recompiles each added source only in the sandbox. It records additions, loader and recheck defects, near pairs, and an inability reason in the `registry` JSON member. Every near pair runs the librarian command once unless its accepted-near record suppresses it.
+The registry check reads the registry as committed at the index's commit, never the working tree, so a local edit after `refresh` does not change what it audits. It lists the files directly under `concepts/` with a `.yaml` extension that were added in `prev_commit..commit` (the files the registry loader reads), and recompiles each added source only in the sandbox. It records additions, loader and recheck defects, near pairs, and an inability reason in the `registry` JSON member. Every near pair runs the librarian command once unless its accepted-near record suppresses it.
 
 The JSON output is:
 
