@@ -144,10 +144,8 @@ func (e *env) open(needIndex bool) error {
 		if built == "" {
 			return &unableError{fmt.Errorf("the index at %s was never refreshed: run declindex refresh", e.cfg.DB)}
 		}
-		if n, err := s.Meta(context.Background(), "errors"); err != nil {
+		if err := s.Complete(context.Background()); err != nil {
 			return &unableError{err}
-		} else if n != "0" {
-			return &unableError{fmt.Errorf("the index at %s is incomplete: %s modules' reference files could not be read", e.cfg.DB, n)}
 		}
 	}
 	return nil
