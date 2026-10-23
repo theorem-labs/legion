@@ -13,8 +13,8 @@ import (
 
 func TestGlobRegexp(t *testing.T) {
 	for glob, cases := range map[string]map[string]bool{
-		"Linux/**/Spec*.lean": {"Linux/fs/a/Spec.lean": true, "Linux/Spec.lean": true, "Linux/fs/a/SpecX.lean": true,
-			"Linux/fs/a/Link.lean": false, "Firmware/a/Spec.lean": false},
+		"Src/**/Spec*.lean": {"Src/fs/a/Spec.lean": true, "Src/Spec.lean": true, "Src/fs/a/SpecX.lean": true,
+			"Src/fs/a/Link.lean": false, "Other/a/Spec.lean": false},
 		"**/*.lean": {"Golden.lean": true, "Sub/Wrap.lean": true, "Sub/Wrap.ilean": false},
 	} {
 		re, err := globRegexp(glob)

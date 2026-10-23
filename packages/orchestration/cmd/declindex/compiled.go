@@ -191,7 +191,9 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	e.staleNote(ctx)
+	if c := e.staleNote(ctx); c != treeHead(e.cfg.Tree) {
+		return fail(e.stderr, &unableError{fmt.Errorf("the index is at %q, not the tree's commit: refresh it after the landing first", c)})
+	}
 	l, err := ledger.Open(ctx, dsn)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})

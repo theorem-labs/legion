@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -169,10 +170,23 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 	if decl == nil {
 		return v, fmt.Errorf("the proposal's source does not declare %s", p.Concept.Name)
 	}
+	for _, c := range consts {
+		if c.Truncated {
+			return v, fmt.Errorf("the walk of %s hit its node budget, so the gate cannot decide", c.Name)
+		}
+	}
 	v.CompiledHash = decl.Hash
 	// Exact duplicates: a registered concept first, then any declaration of the project.
 	for _, c := range reg.Concepts {
-		if rc, err := g.Index.Constant(ctx, c.Name); err == nil && rc.Hash == decl.Hash {
+		rc, err := g.Index.Constant(ctx, c.Name)
+		var nf *declindex.NotFoundError
+		if errors.As(err, &nf) {
+			continue
+		}
+		if err != nil {
+			return v, err
+		}
+		if rc.Hash == decl.Hash {
 			return refuse(c.Name, c.Home, "the compiled statement equals the registered concept's")
 		}
 	}
@@ -184,7 +198,9 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 		return refuse(same[0].Name, same[0].At(), "the compiled statement equals an existing declaration's")
 	}
 	// Near matches: a registered fact that the proposal's own text states, directly or through a definition the
-	// proposal declares. Applying a registered concept, or an existing definition, reuses it.
+	// proposal declares. Applying a registered concept or an existing definition reuses it. A definition of the
+	// proposal that only wraps a registered concept is also routed to the librarian: the matcher cannot tell its
+	// template from a restatement, and a false near costs a review, never a duplicate.
 	for _, c := range consts {
 		for _, f := range c.Facts {
 			if f.How == "direct" || (strings.HasPrefix(f.How, "via:") && own[strings.TrimPrefix(f.How, "via:")]) {
@@ -226,6 +242,7 @@ func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declinde
 		return nil, err
 	}
 	co := *g.Compiled
+	co.Dir = filepath.Join(dir, "forms")
 	if co.Forms, err = Forms(ctx, g.Index, reg); err != nil {
 		return nil, err
 	}

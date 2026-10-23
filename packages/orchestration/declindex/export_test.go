@@ -11,10 +11,14 @@ import (
 	"testing"
 )
 
-// leanForTest finds a Lean toolchain on PATH. The exporter tests need one (CI installs it); without it they skip.
+// leanForTest finds a Lean toolchain on PATH. The exporter tests need one: CI installs it and sets
+// DECLINDEX_REQUIRE_LEAN, which turns a missing toolchain into a failure; elsewhere they skip.
 func leanForTest(t *testing.T) Lean {
 	t.Helper()
 	if _, err := exec.LookPath("lake"); err != nil {
+		if os.Getenv("DECLINDEX_REQUIRE_LEAN") != "" {
+			t.Fatal("DECLINDEX_REQUIRE_LEAN is set and no lake is on PATH")
+		}
 		t.Skip("no lake on PATH: the exporter tests need a Lean toolchain")
 	}
 	l, err := FindLean(context.Background(), t.TempDir(), "")

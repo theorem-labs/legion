@@ -260,3 +260,29 @@ func TestReachCountsEachModulesExample(t *testing.T) {
 		t.Fatalf("reach %+v, want %+v", a.Reach.ReachCounts, want)
 	}
 }
+
+// An edit that keeps every position (a numeral changed in place) can leave the .ilean byte for byte the same;
+// the statement hash comes from the source, so the module is read again.
+func TestRefreshRereadsAModuleWhoseSourceChangedInPlace(t *testing.T) {
+	tree := goldenTree(t)
+	s := refreshed(t, tree)
+	ctx := context.Background()
+	before, _ := s.Resolve(ctx, "Gold.frame_lo")
+	p := filepath.Join(tree.Source, "Golden.lean")
+	src, _ := os.ReadFile(p)
+	edited := strings.Replace(string(src), "sp.toNat ≥ 16 := by", "sp.toNat ≥ 32 := by", 1)
+	if edited == string(src) {
+		t.Fatal("the fixture changed: no numeral to edit")
+	}
+	if err := os.WriteFile(p, []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"})
+	if err != nil || st.Reread != 1 {
+		t.Fatalf("re-read %d modules (%v), want 1", st.Reread, err)
+	}
+	after, _ := s.Resolve(ctx, "Gold.frame_lo")
+	if after[0].StmtHash == before[0].StmtHash {
+		t.Fatal("the statement hash did not change with the statement")
+	}
+}

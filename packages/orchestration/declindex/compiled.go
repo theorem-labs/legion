@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -26,9 +27,13 @@ type CompiledOptions struct {
 
 // compiledDigest names what the compiled part was read with: the exporter and the forms. When it changes, every
 // module is read again.
-func compiledDigest(co *CompiledOptions, formsSource string) string {
-	h := sha256.Sum256([]byte(co.Exporter.Bin + "\x00" + formsSource))
-	return hex.EncodeToString(h[:])
+func compiledDigest(co *CompiledOptions, m Manifest, formsSource string) (string, error) {
+	j, err := json.Marshal(m.complete())
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256([]byte(co.Exporter.Bin + "\x00" + formsSource + "\x00" + string(j)))
+	return hex.EncodeToString(h[:]), nil
 }
 
 // prepare compiles the forms module and gives the exporter and manifest that read with it.
@@ -119,7 +124,10 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	if err != nil {
 		return 0, 0, err
 	}
-	digest := compiledDigest(co, src)
+	digest, err := compiledDigest(co, m, src)
+	if err != nil {
+		return 0, 0, err
+	}
 	prev, err := s.Meta(ctx, "compiled")
 	if err != nil {
 		return 0, 0, err

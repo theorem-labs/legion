@@ -80,8 +80,12 @@ func (o RefreshOptions) jobs() int {
 	return min(48, runtime.NumCPU())
 }
 
-// scan lists the modules with a reference file below lib and their build keys, reading the keys in parallel.
-func scan(lib string, jobs int) ([]moduleFile, error) {
+// scan lists the modules with a reference file below the tree's library directory and their keys, read in
+// parallel. A module's reference key covers its .ilean and its source file: an edit that keeps every position
+// (a numeral changed in place) can leave the .ilean byte for byte the same, and the statement hash is read from
+// the source.
+func scan(tree Tree, jobs int) ([]moduleFile, error) {
+	lib := tree.Lib
 	var rels []string
 	err := filepath.WalkDir(lib, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -105,6 +109,13 @@ func scan(lib string, jobs int) ([]moduleFile, error) {
 		base := filepath.Join(lib, filepath.FromSlash(rels[i]))
 		out[i].rel = rels[i]
 		if out[i].ileanKey, errs[i] = buildKey(base + ".ilean"); errs[i] != nil {
+			return
+		}
+		src, err := os.Stat(filepath.Join(tree.Source, filepath.FromSlash(rels[i])+".lean"))
+		if err == nil {
+			out[i].ileanKey += fmt.Sprintf("|src:%d:%d", src.Size(), src.ModTime().UnixNano())
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			errs[i] = err
 			return
 		}
 		out[i].oleanKey, errs[i] = buildKey(base + ".olean")
@@ -169,7 +180,7 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 	defer unlock()
 	t0 := time.Now()
 	var st RefreshStats
-	files, err := scan(tree.Lib, opt.jobs())
+	files, err := scan(tree, opt.jobs())
 	if err != nil {
 		return st, fmt.Errorf("scan %s: %w", tree.Lib, err)
 	}
@@ -268,7 +279,7 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 	if err := tx.Commit(); err != nil {
 		return st, err
 	}
-	if _, err := os.Stat(s.path + ".graph"); st.Reread > 0 || len(gone) > 0 || err != nil {
+	if _, err := os.Stat(s.path + ".graph"); len(changed) > 0 || len(gone) > 0 || err != nil {
 		t1 := time.Now()
 		g, err := buildGraph(ctx, s.db)
 		if err != nil {

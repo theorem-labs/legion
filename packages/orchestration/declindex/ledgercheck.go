@@ -21,7 +21,7 @@ type ContractLedger interface {
 	RegisterContract(ctx context.Context, repo, name, owner, hash string, pinned bool) (ledger.Contract, error)
 }
 
-// Owners maps a contract's directory to its owner key (a graph node id such as function:do_mount_setattr).
+// Owners maps a contract's directory to its owner key (a graph node id such as function:open_file).
 type Owners map[string]string
 
 // LoadOwners reads an owners/v1 file: {"format":"owners/v1","owners":[{"id":…,"contract":<directory>|null},…]}.

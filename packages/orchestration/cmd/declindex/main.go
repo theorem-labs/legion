@@ -207,17 +207,27 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
+	tree := e.cfg.TreeSpec()
 	opt := declindex.RefreshOptions{Commit: treeHead(e.cfg.Tree), Jobs: e.cfg.Jobs, Log: e.stderr}
-	if e.cfg.Lean.Export {
-		co, err := compiledOptions(ctx, e)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
+	st, err := e.store.Refresh(ctx, tree, opt)
+	if err == nil && e.cfg.Lean.Export {
+		// The forms module imports the registered concepts' modules, which the index knows only once the
+		// reference files are read: the compiled part runs second.
+		var co *declindex.CompiledOptions
+		if co, err = compiledOptions(ctx, e); err == nil {
+			opt.Compiled = co
+			var cst declindex.RefreshStats
+			cst, err = e.store.Refresh(ctx, tree, opt)
+			st.Exported, st.Rematched, st.Elapsed = cst.Exported, cst.Rematched, st.Elapsed+cst.Elapsed
 		}
-		opt.Compiled = co
 	}
-	st, err := e.store.Refresh(ctx, e.cfg.TreeSpec(), opt)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
+	}
+	n, err := e.store.ModuleCount(ctx)
+	if err != nil || n == 0 || st.Unreadable > 0 {
+		fmt.Fprintf(e.stderr, "declindex: the index is incomplete: %d modules, %d unreadable reference files\n", n, st.Unreadable)
+		return 3
 	}
 	if e.g.json {
 		return e.printJSON(st)

@@ -62,11 +62,22 @@ def selfNames (ci : ConstantInfo) : NameSet :=
 def truncate (s : String) (n : Nat := 4000) : String :=
   if s.length ≤ n then s else toString (s.take n) ++ " …"
 
+/-- The binder names of a constructor's type: a structure's field names, which the hash otherwise erases. -/
+partial def binderNames : Expr → List String
+  | .forallE n _ b _ => n.toString :: binderNames b
+  | _ => []
+
 def record (cfg : MatchConfig) (types : Bool) (m : Name) (c : Name) (ci : ConstantInfo) : StateRefT St MetaM Json := do
   let env ← getEnv
   let exprs := statementExprs env ci
   let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci }
-  let h := hashOf hctx exprs
+  let fields : List String := match ci with
+    | .inductInfo v => v.ctors.flatMap fun k =>
+        match env.find? k with
+        | some kc => (binderNames kc.type).drop v.numParams
+        | none => []
+    | _ => []
+  let h := fields.foldl (fun h n => H.mix h (H.ofString n)) (hashOf hctx exprs)
   let mut w : Walk := {}
   for e in exprs do
     w ← walk cfg e w

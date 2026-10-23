@@ -43,6 +43,9 @@ concepts:
 func gateForTest(t *testing.T) (*Gate, *recordingLibrarian) {
 	t.Helper()
 	if _, err := exec.LookPath("lake"); err != nil {
+		if os.Getenv("DECLINDEX_REQUIRE_LEAN") != "" {
+			t.Fatal("DECLINDEX_REQUIRE_LEAN is set and no lake on PATH")
+		}
 		t.Skip("no lake on PATH: the gate tests need a Lean toolchain")
 	}
 	ctx := context.Background()
@@ -114,6 +117,7 @@ func TestGateDecidesEachKindOfProposal(t *testing.T) {
 			"def MyOuter (R : BitVec 5 → BitVec 64) : Prop := myInner (R 2#5) ∧ True"), Near, ""},
 		{proposal("p6", "UsesSp", "def UsesSp (R : BitVec 5 → BitVec 64) : Prop := Fx.SpAligned R ∧ R 3#5 = 0"), Added, ""},
 		{proposal("p7", "Fresh", "def Fresh (x : Nat) : Prop := x < 3 ∧ x ≠ 1"), Added, ""},
+		{proposal("p8", "OtherBox", "structure OtherBox (R : BitVec 5 → BitVec 64) : Prop where\n  other : R 2#5 &&& 7#64 = 0#64"), Near, ""},
 	} {
 		v, err := g.Decide(ctx, c.p)
 		if err != nil {
@@ -123,8 +127,8 @@ func TestGateDecidesEachKindOfProposal(t *testing.T) {
 			t.Errorf("%s: %s naming %q (%s, %+v), want %s naming %q", c.p.ID, v.Outcome, v.Existing, v.Reason, v.Matches, c.outcome, c.existing)
 		}
 	}
-	if len(lib.got) != 2 || lib.got[0].Proposal != "p4" || lib.got[1].Proposal != "p5" {
-		t.Fatalf("the librarian got %+v, want exactly the two near matches", lib.got)
+	if len(lib.got) != 3 || lib.got[0].Proposal != "p4" || lib.got[1].Proposal != "p5" || lib.got[2].Proposal != "p8" {
+		t.Fatalf("the librarian got %+v, want exactly the three near matches", lib.got)
 	}
 	r, err := Load(g.Registry)
 	if err != nil {
