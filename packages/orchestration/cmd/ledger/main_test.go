@@ -108,7 +108,7 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 		t.Fatalf("clean check: %v %q", err, check)
 	}
 	invoke("takeover", "r", "M-1", "bob", "1")
-	invoke("round", "r", "M-1", "2", "failed")
+	invoke("round", "r", "M-1", "2", "failed", "--key", "round-1")
 	roundStatus := invoke("--json", "status", "r")
 	var openStatus struct {
 		Migrations []struct {

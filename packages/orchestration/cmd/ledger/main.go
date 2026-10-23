@@ -341,14 +341,27 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		return mutation(s.Abandon(ctx, args[0], args[1], generation, args[3]))
 	case "round":
-		if len(args) != 4 {
-			return nil, false, usagef("round <repo> <id> <generation> <reason>")
+		var request ledger.RoundRequest
+		if decoded, jsonInput, err := requestFile[ledger.RoundRequest](args); jsonInput {
+			if err != nil {
+				return nil, false, err
+			}
+			request = decoded
+		} else {
+			if len(args) < 4 {
+				return nil, false, usagef("round <repo> <id> <generation> <reason> --key <key> [--batch <batch>] [--detail <detail>] [--log <log>]")
+			}
+			generation, err := integer(args[2])
+			if err != nil {
+				return nil, false, err
+			}
+			request, err = parseRoundFlags(args[4:])
+			if err != nil {
+				return nil, false, err
+			}
+			request.Repo, request.ID, request.Generation, request.Reason = args[0], args[1], generation, args[3]
 		}
-		generation, err := integer(args[2])
-		if err != nil {
-			return nil, false, err
-		}
-		return mutation(s.RecordRound(ctx, args[0], args[1], generation, args[3]))
+		return mutation(s.RecordRound(ctx, request))
 	case "contract":
 		return contractCommand(ctx, s, args)
 	case "agree":
@@ -632,6 +645,33 @@ func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
 	}
 	if noPaths {
 		request.Changed = []string{}
+	}
+	return request, nil
+}
+
+func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
+	var request ledger.RoundRequest
+	for len(args) > 0 {
+		if len(args) < 2 {
+			return ledger.RoundRequest{}, usagef("round flags need values")
+		}
+		flag, value := args[0], args[1]
+		args = args[2:]
+		switch flag {
+		case "--key":
+			request.Key = value
+		case "--batch":
+			request.Batch = value
+		case "--detail":
+			request.Detail = value
+		case "--log":
+			request.Log = value
+		default:
+			return ledger.RoundRequest{}, usagef("unknown round flag %q", flag)
+		}
+	}
+	if request.Key == "" {
+		return ledger.RoundRequest{}, usagef("round needs --key")
 	}
 	return request, nil
 }

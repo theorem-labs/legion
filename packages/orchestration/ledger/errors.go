@@ -24,6 +24,7 @@ const (
 	ReasonPinned             = "pinned"               // a person must approve the pinned contract's change
 	ReasonEscalated          = "escalated"            // the migration awaits a steward's decision
 	ReasonInvalidCandidate   = "invalid_candidate"    // candidate metadata cannot describe a complete landing
+	ReasonRoundKeyConflict   = "round_key_conflict"   // a repeated round key has a different generation, reason, or batch
 	ReasonUndeclaredWrite    = "undeclared_write"     // the candidate writes a path outside the migration lock
 	ReasonUndeclaredContract = "undeclared_contract"  // the migration did not declare the changed contract as a read
 	ReasonUpstreamNotAllowed = "upstream_not_allowed" // only the configured upstream owner may record provenance
