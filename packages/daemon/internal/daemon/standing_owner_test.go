@@ -521,3 +521,46 @@ func TestOperatorRetryClearsExhaustedStandingOwner(t *testing.T) {
 	}
 	testwait.Eventually(t, "operator standing owner retry", func() bool { return len(rt.CallsOf("Spawn")) == 1 })
 }
+
+func TestStandingOwnerPrebootReadsLedgerPointerAndPrompt(t *testing.T) {
+	cfg := testConfig(t)
+	dsnFile := filepath.Join(t.TempDir(), "ledger-dsn")
+	prompt := filepath.Join(t.TempDir(), "owner.md")
+	cfg.StandingOwners = &config.StandingOwners{
+		LedgerDSNFile: dsnFile,
+		Owners:        []config.StandingOwner{{Name: "owner-a", PromptFile: prompt}},
+	}
+	if err := readStandingOwnerFiles(cfg); err == nil {
+		t.Fatal("preboot accepted missing standing-owner files")
+	}
+	if err := os.WriteFile(dsnFile, []byte("postgres://postgres:test@127.0.0.1:5432/postgres\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(prompt, []byte("Wait for work."), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := readStandingOwnerFiles(cfg); err != nil {
+		t.Fatalf("preboot read standing-owner files: %v", err)
+	}
+}
+
+func TestUnfinishedOwnerLaunchSleepsWhenLedgerHasNoWork(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "unfinished-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	owner := standingOwnerClaim(t, cfg, supervise.StateLaunching, nil)
+	owner.Generation = 1
+	putStandingOwner(t, cfg, owner)
+	rt := fake.NewRuntime()
+	o := fakeRuntime(rt, &built{})
+	o.orphanSweep = 20 * time.Millisecond
+	d := startDaemon(t, cfg, o)
+	time.Sleep(3 * o.orphanSweep)
+	if got := len(rt.CallsOf("Spawn")); got != 0 {
+		t.Fatalf("unfinished owner launched %d times without work", got)
+	}
+	if got := d.claim(owner.Token); got.State != string(supervise.StateQueued) || got.Generation != 1 {
+		t.Fatalf("unfinished owner after recovery = %+v, want queued generation one", got)
+	}
+}

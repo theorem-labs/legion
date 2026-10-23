@@ -591,10 +591,10 @@ func (r *rig) spec(tree, issue string, role claim.Role) runtime.SpawnSpec {
 	}
 }
 
-func (r *rig) ownerSpec() runtime.SpawnSpec {
+func (r *rig) ownerSpec(owner string) runtime.SpawnSpec {
 	r.t.Helper()
 	spec := r.spec("LEGION-1", "LEGION-1", claim.RoleTester)
-	token, err := claim.OwnerToken(r.project, "owner-a")
+	token, err := claim.OwnerToken(r.project, owner)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -1942,7 +1942,7 @@ func TestRealTmuxStandingOwnerRegistersAndStops(t *testing.T) {
 	r := newRig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	spec := r.ownerSpec()
+	spec := r.ownerSpec("owner-a")
 	loc, err := r.rt.Spawn(ctx, spec)
 	if err != nil {
 		t.Fatalf("Spawn standing owner: %v", err)
@@ -1958,4 +1958,33 @@ func TestRealTmuxStandingOwnerRegistersAndStops(t *testing.T) {
 		t.Fatalf("Suspend standing owner: %v", err)
 	}
 	awaitGone(t, r.rt, loc, "standing owner suspension")
+}
+
+func TestRealTmuxStandingOwnerKnownProcessIsAdoptedAndOrphanIsReaped(t *testing.T) {
+	r := newRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	knownSpec := r.ownerSpec("owner-a")
+	known, err := r.rt.Spawn(ctx, knownSpec)
+	if err != nil {
+		t.Fatalf("spawn known owner: %v", err)
+	}
+	r.daemon.awaitReady(t, knownSpec.BootToken)
+	restarted := r.newRuntime()
+	if err := restarted.ReconcileOrphans(ctx, []runtime.Known{{Claim: knownSpec.Claim, Locator: &known}}, 0); err != nil {
+		t.Fatalf("reconcile known owner: %v", err)
+	}
+	if obs := probe(t, restarted, known); obs.Kind != runtime.Alive {
+		t.Fatalf("known owner after restart = %+v, want alive", obs)
+	}
+	orphanSpec := r.ownerSpec("owner-b")
+	orphan, err := r.rt.Spawn(ctx, orphanSpec)
+	if err != nil {
+		t.Fatalf("spawn orphan owner: %v", err)
+	}
+	r.daemon.awaitReady(t, orphanSpec.BootToken)
+	if err := restarted.ReconcileOrphans(ctx, []runtime.Known{{Claim: knownSpec.Claim, Locator: &known}}, 0); err != nil {
+		t.Fatalf("reconcile orphan owner: %v", err)
+	}
+	awaitGone(t, restarted, orphan, "unrecorded standing owner")
 }
