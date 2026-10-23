@@ -13,23 +13,32 @@ import (
 const EventsChannel = "ledger_events"
 
 // event appends one row to the event log inside tx and announces it on EventsChannel; the
-// announcement is delivered only when tx commits. The transaction-scoped lock makes assigned event
-// IDs commit in order within a repository, so a cursor cannot advance past an event that is still
-// uncommitted.
+// announcement is delivered only when tx commits.
 func event(ctx context.Context, tx pgx.Tx, repo, kind, subject, actor string, data any) error {
+	_, err := eventRecord(ctx, tx, repo, kind, subject, actor, data)
+	return err
+}
+
+// eventRecord appends an event and returns its immutable id and database timestamp. The transaction-scoped lock
+// makes assigned event IDs commit in order within a repository, so a cursor cannot advance past an event that is
+// still uncommitted.
+func eventRecord(ctx context.Context, tx pgx.Tx, repo, kind, subject, actor string, data any) (Event, error) {
 	b, err := json.Marshal(data)
 	if err != nil {
-		return err
+		return Event{}, err
 	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, repo); err != nil {
-		return err
+		return Event{}, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO events (repo, kind, subject, actor, data) VALUES ($1, $2, $3, $4, $5)`,
-		repo, kind, subject, actor, b); err != nil {
-		return err
+	var event Event
+	if err := tx.QueryRow(ctx, `INSERT INTO events (repo, kind, subject, actor, data)
+		VALUES ($1, $2, $3, $4, $5) RETURNING id, at`, repo, kind, subject, actor, b).Scan(&event.ID, &event.At); err != nil {
+		return Event{}, err
 	}
-	_, err = tx.Exec(ctx, `SELECT pg_notify($1, $2)`, EventsChannel, repo)
-	return err
+	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, EventsChannel, repo); err != nil {
+		return Event{}, err
+	}
+	return event, nil
 }
 
 // Event is one entry of the append-only log.

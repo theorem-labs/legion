@@ -28,6 +28,20 @@ type checkResultError struct {
 
 func (e *checkResultError) Error() string { return "candidate check did not pass" }
 
+type readyList []ledger.ReadyRecord
+
+func (records readyList) String() string {
+	var out strings.Builder
+	for i, record := range records {
+		if i > 0 {
+			out.WriteByte('\n')
+		}
+		fmt.Fprintf(&out, "%s owner=%s generation=%d head=%s ready_event=%d ready_at=%s",
+			record.ID, record.Owner, record.Generation, record.Head, record.ReadyEvent, record.ReadyAt.Format(time.RFC3339Nano))
+	}
+	return out.String()
+}
+
 func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 }
@@ -241,6 +255,36 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			return nil, false, err
 		}
 		return mutation(s.TakeOver(ctx, args[0], args[1], args[2], generation))
+	case "ready":
+		var request ledger.ReadyRequest
+		if decoded, jsonInput, err := requestFile[ledger.ReadyRequest](args); jsonInput {
+			if err != nil {
+				return nil, false, err
+			}
+			request = decoded
+		} else {
+			if len(args) < 3 {
+				return nil, false, usagef("ready <repo> <id> <generation> --head <sha> [--changed-contract <name=hash>] " +
+					"[--compatibility-proof <name>] [--reviewed-head <sha>] [--review <contract=reviewer@head>] " +
+					"[--approved-pinned <name>] [--upstream <commit>]")
+			}
+			generation, err := integer(args[2])
+			if err != nil {
+				return nil, false, err
+			}
+			request, err = parseReadyFlags(args[3:])
+			if err != nil {
+				return nil, false, err
+			}
+			request.Repo, request.ID, request.Generation = args[0], args[1], generation
+		}
+		return mutation(s.Ready(ctx, request))
+	case "ready-list":
+		if len(args) != 1 {
+			return nil, false, usagef("ready-list <repo>")
+		}
+		value, err := s.ReadyMigrations(ctx, args[0])
+		return readyList(value), false, err
 	case "check":
 		var request ledger.CheckRequest
 		if decoded, jsonInput, err := requestFile[ledger.CheckRequest](args); jsonInput {
@@ -577,6 +621,63 @@ func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
 		request.Changed = []string{}
 	}
 	return request, nil
+}
+
+func parseReadyFlags(args []string) (ledger.ReadyRequest, error) {
+	request := ledger.ReadyRequest{ChangedContracts: map[string]string{}}
+	for len(args) > 0 {
+		if len(args) < 2 {
+			return ledger.ReadyRequest{}, usagef("ready flags need values")
+		}
+		flag, value := args[0], args[1]
+		args = args[2:]
+		switch flag {
+		case "--head":
+			request.Head = value
+		case "--changed-contract":
+			name, hash, err := parsePair(value, false)
+			if err != nil {
+				return ledger.ReadyRequest{}, err
+			}
+			if strings.ContainsAny(name, "=@") {
+				return ledger.ReadyRequest{}, usagef("ambiguous name=value %q; use --request-file", value)
+			}
+			request.ChangedContracts[name] = hash
+		case "--compatibility-proof":
+			request.CompatibilityProof = value
+		case "--reviewed-head":
+			request.ReviewedHead = value
+		case "--review":
+			review, err := parseReview(value)
+			if err != nil {
+				return ledger.ReadyRequest{}, err
+			}
+			request.Reviews = append(request.Reviews, review)
+		case "--approved-pinned":
+			if value == "" || strings.ContainsAny(value, "=@") {
+				return ledger.ReadyRequest{}, usagef("ambiguous name %q; use --request-file", value)
+			}
+			request.ApprovedPinned = append(request.ApprovedPinned, value)
+		case "--upstream":
+			request.Upstream = value
+		default:
+			return ledger.ReadyRequest{}, usagef("unknown ready flag %q", flag)
+		}
+	}
+	if request.Head == "" {
+		return ledger.ReadyRequest{}, usagef("ready needs --head")
+	}
+	return request, nil
+}
+
+func parseReview(value string) (ledger.Review, error) {
+	contract, reviewerHead, contractOK := strings.Cut(value, "=")
+	reviewer, head, headOK := strings.Cut(reviewerHead, "@")
+	if !contractOK || !headOK || contract == "" || reviewer == "" || head == "" ||
+		strings.ContainsAny(contract, "=@") || strings.ContainsAny(reviewer, "=@") || strings.ContainsAny(head, "=@") {
+		return ledger.Review{}, usagef("ambiguous review %q; use --request-file", value)
+	}
+	return ledger.Review{Contract: contract, Reviewer: reviewer, Head: head}, nil
 }
 
 func parseAgreement(args []string) ([]string, map[string]int64, error) {

@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -85,6 +86,61 @@ type Migration struct {
 	Writes           []string          `json:"writes"`
 	Reads            map[string]string `json:"reads"`
 	ReadVersions     map[string]*int64 `json:"read_versions,omitempty"`
+}
+
+// Review records a reviewer’s approval of one contract at a specific head.
+type Review struct {
+	Contract string `json:"contract"`
+	Reviewer string `json:"reviewer"`
+	Head     string `json:"head"`
+}
+
+// ReadyRequest stores the exact landing records an owner offers for a migration.
+//
+// L4 validates upstream provenance and per-contract review authority. L9 settles who may provide reviews and
+// pinned approvals. Until then, Ready validates only these records' shape and stores them as given.
+type ReadyRequest struct {
+	Repo               string            `json:"repo"`
+	ID                 string            `json:"id"`
+	Generation         int64             `json:"generation"`
+	Head               string            `json:"head"`
+	ChangedContracts   map[string]string `json:"changed_contracts"`
+	CompatibilityProof string            `json:"compatibility_proof"`
+	ReviewedHead       string            `json:"reviewed_head"`
+	Reviews            []Review          `json:"reviews"`
+	ApprovedPinned     []string          `json:"approved_pinned"`
+	Upstream           string            `json:"upstream"`
+}
+
+// ReadyRecord is a ready migration's stored landing record.
+type ReadyRecord struct {
+	ID                 string            `json:"id"`
+	Owner              string            `json:"owner"`
+	Generation         int64             `json:"generation"`
+	Head               string            `json:"head"`
+	ReadyEvent         int64             `json:"ready_event"`
+	ReadyAt            time.Time         `json:"ready_at"`
+	ChangedContracts   map[string]string `json:"changed_contracts"`
+	CompatibilityProof string            `json:"compatibility_proof"`
+	ReviewedHead       string            `json:"reviewed_head"`
+	Reviews            []Review          `json:"reviews"`
+	ApprovedPinned     []string          `json:"approved_pinned"`
+	Upstream           string            `json:"upstream"`
+}
+
+type readyRecords struct {
+	CompatibilityProof string   `json:"compatibility_proof"`
+	ReviewedHead       string   `json:"reviewed_head"`
+	Reviews            []Review `json:"reviews"`
+	ApprovedPinned     []string `json:"approved_pinned"`
+	Upstream           string   `json:"upstream"`
+}
+
+type readyEventData struct {
+	Generation       int64             `json:"generation"`
+	Head             string            `json:"head"`
+	ChangedContracts map[string]string `json:"changed_contracts"`
+	readyRecords
 }
 
 // CheckRequest asks whether a candidate change may land for a migration.
@@ -259,6 +315,63 @@ func checkReads(reads map[string]string) error {
 	return nil
 }
 
+func checkReadyValue(label, value string, required bool) error {
+	trimmed := strings.TrimSpace(value)
+	if required && trimmed == "" {
+		return invalid("%s is empty", label)
+	}
+	if trimmed != value {
+		return invalid("%s %q has leading or trailing whitespace", label, value)
+	}
+	return nil
+}
+
+func checkReadyRequest(req ReadyRequest) error {
+	if err := checkReadyValue("head", req.Head, true); err != nil {
+		return err
+	}
+	for name, hash := range req.ChangedContracts {
+		if err := checkReadyValue("changed contract name", name, true); err != nil {
+			return err
+		}
+		if err := checkReadyValue("changed contract hash", hash, true); err != nil {
+			return err
+		}
+	}
+	for _, record := range []struct {
+		label string
+		value string
+	}{
+		{"compatibility proof", req.CompatibilityProof},
+		{"reviewed head", req.ReviewedHead},
+		{"upstream", req.Upstream},
+	} {
+		if err := checkReadyValue(record.label, record.value, false); err != nil {
+			return err
+		}
+	}
+	for _, review := range req.Reviews {
+		for _, field := range []struct {
+			label string
+			value string
+		}{
+			{"review contract", review.Contract},
+			{"reviewer", review.Reviewer},
+			{"review head", review.Head},
+		} {
+			if err := checkReadyValue(field.label, field.value, true); err != nil {
+				return err
+			}
+		}
+	}
+	for _, name := range req.ApprovedPinned {
+		if err := checkReadyValue("approved pinned name", name, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func insertWrites(ctx context.Context, tx pgx.Tx, repo, id string, ws []writePath) error {
 	for _, w := range ws {
 		if _, err := tx.Exec(ctx, `INSERT INTO migration_writes (repo, migration, path, is_prefix) VALUES ($1, $2, $3, $4)
@@ -378,6 +491,18 @@ func lockOpenAt(ctx context.Context, tx pgx.Tx, repo, id string, gen int64) (Mig
 	return m, nil
 }
 
+// clearReady removes every stored ready field and reports whether a ready record was present.
+// Callers invoke it from their mutation transaction before they append the event that reports the clearing.
+func clearReady(ctx context.Context, tx pgx.Tx, repo, id string) (bool, error) {
+	tag, err := tx.Exec(ctx, `UPDATE migrations
+		SET ready_head = NULL, ready_at = NULL, ready_event = NULL, ready_changed_contracts = NULL, ready_records = NULL
+		WHERE repo = $1 AND id = $2 AND ready_event IS NOT NULL`, repo, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // ExtendMigration adds declared writes and reads to an open migration, under the same overlap rule as
 // OpenMigration. A read already declared takes the new hash.
 func (s *Store) ExtendMigration(ctx context.Context, repo, id string, gen int64, writes []string, reads map[string]string) (Migration, error) {
@@ -413,8 +538,12 @@ func (s *Store) ExtendMigration(ctx context.Context, repo, id string, gen int64,
 		if err := upsertReads(ctx, tx, repo, id, reads); err != nil {
 			return err
 		}
+		readyCleared, err := clearReady(ctx, tx, repo, id)
+		if err != nil {
+			return err
+		}
 		if err := event(ctx, tx, repo, "migration.extended", id, cur.Owner, map[string]any{
-			"generation": gen, "writes": writeStrings(ws), "reads": reads,
+			"generation": gen, "writes": writeStrings(ws), "reads": reads, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}
@@ -436,12 +565,16 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 		if err != nil {
 			return err
 		}
+		readyCleared, err := clearReady(ctx, tx, repo, id)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE migrations SET owner = $3, generation = generation + 1 WHERE repo = $1 AND id = $2`,
 			repo, id, owner); err != nil {
 			return err
 		}
 		if err := event(ctx, tx, repo, "migration.taken_over", id, owner, map[string]any{
-			"from_owner": cur.Owner, "from_generation": gen, "generation": gen + 1,
+			"from_owner": cur.Owner, "from_generation": gen, "generation": gen + 1, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}
@@ -449,6 +582,112 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 		return err
 	})
 	return m, err
+}
+
+// Ready records the exact landing inputs an owner supplies for an open, current, un-escalated migration. A later
+// ready replaces the previous record and has the id of its own migration.ready event.
+func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error) {
+	if err := checkReadyRequest(req); err != nil {
+		return ReadyRecord{}, err
+	}
+	changedContracts, err := json.Marshal(req.ChangedContracts)
+	if err != nil {
+		return ReadyRecord{}, err
+	}
+	records := readyRecords{
+		CompatibilityProof: req.CompatibilityProof,
+		ReviewedHead:       req.ReviewedHead,
+		Reviews:            req.Reviews,
+		ApprovedPinned:     req.ApprovedPinned,
+		Upstream:           req.Upstream,
+	}
+	storedRecords, err := json.Marshal(records)
+	if err != nil {
+		return ReadyRecord{}, err
+	}
+	ready := ReadyRecord{
+		ID:                 req.ID,
+		Generation:         req.Generation,
+		Head:               req.Head,
+		ChangedContracts:   req.ChangedContracts,
+		CompatibilityProof: req.CompatibilityProof,
+		ReviewedHead:       req.ReviewedHead,
+		Reviews:            req.Reviews,
+		ApprovedPinned:     req.ApprovedPinned,
+		Upstream:           req.Upstream,
+	}
+	err = s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, req.Repo, true); err != nil {
+			return err
+		}
+		migration, err := lockOpenAt(ctx, tx, req.Repo, req.ID, req.Generation)
+		if err != nil {
+			return err
+		}
+		if migration.EscalatedAt != nil {
+			return refuse(ReasonEscalated, "migration %s was escalated to the steward: %s", req.ID, migration.EscalationReason)
+		}
+		event, err := eventRecord(ctx, tx, req.Repo, "migration.ready", req.ID, migration.Owner, readyEventData{
+			Generation: req.Generation, Head: req.Head, ChangedContracts: req.ChangedContracts, readyRecords: records,
+		})
+		if err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `UPDATE migrations
+			SET ready_head = $3, ready_at = $4, ready_event = $5, ready_changed_contracts = $6, ready_records = $7
+			WHERE repo = $1 AND id = $2
+			RETURNING owner`, req.Repo, req.ID, req.Head, event.At, event.ID, string(changedContracts), string(storedRecords)).
+			Scan(&ready.Owner); err != nil {
+			return err
+		}
+		ready.ReadyEvent, ready.ReadyAt = event.ID, event.At
+		return nil
+	})
+	return ready, err
+}
+
+func scanReadyRecord(row pgx.CollectableRow) (ReadyRecord, error) {
+	var ready ReadyRecord
+	var changedContracts, records []byte
+	if err := row.Scan(&ready.ID, &ready.Owner, &ready.Generation, &ready.Head, &ready.ReadyEvent, &ready.ReadyAt,
+		&changedContracts, &records); err != nil {
+		return ReadyRecord{}, err
+	}
+	if err := json.Unmarshal(changedContracts, &ready.ChangedContracts); err != nil {
+		return ReadyRecord{}, err
+	}
+	var stored readyRecords
+	if err := json.Unmarshal(records, &stored); err != nil {
+		return ReadyRecord{}, err
+	}
+	ready.CompatibilityProof = stored.CompatibilityProof
+	ready.ReviewedHead = stored.ReviewedHead
+	ready.Reviews = stored.Reviews
+	ready.ApprovedPinned = stored.ApprovedPinned
+	ready.Upstream = stored.Upstream
+	return ready, nil
+}
+
+// ReadyMigrations lists every currently open migration that has a ready record, in the order that the ready events
+// were appended.
+func (s *Store) ReadyMigrations(ctx context.Context, repo string) ([]ReadyRecord, error) {
+	ready := []ReadyRecord{}
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT id, owner, generation, ready_head, ready_event, ready_at,
+			ready_changed_contracts, ready_records
+			FROM migrations
+			WHERE repo = $1 AND state = 'open' AND ready_event IS NOT NULL
+			ORDER BY ready_event`, repo)
+		if err != nil {
+			return err
+		}
+		ready, err = pgx.CollectRows(rows, scanReadyRecord)
+		return err
+	})
+	return ready, err
 }
 
 // candidatePrecondition reports the candidate metadata that Land refuses before it checks migration state.
@@ -658,11 +897,15 @@ func (s *Store) RecordRound(ctx context.Context, repo, id string, gen int64, rea
 			return err
 		}
 		rounds := cur.LandingRounds + 1
+		readyCleared, err := clearReady(ctx, tx, repo, id)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE migrations SET landing_rounds = $3 WHERE repo = $1 AND id = $2`, repo, id, rounds); err != nil {
 			return err
 		}
 		if err := event(ctx, tx, repo, "migration.round_failed", id, "", map[string]any{
-			"generation": gen, "landing_rounds": rounds, "reason": reason,
+			"generation": gen, "landing_rounds": rounds, "reason": reason, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}
@@ -791,12 +1034,16 @@ func (s *Store) Abandon(ctx context.Context, repo, id string, gen int64, reason 
 		if err != nil {
 			return err
 		}
+		readyCleared, err := clearReady(ctx, tx, repo, id)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE migrations SET state = $3, closed_at = clock_timestamp(), close_reason = $4
 			WHERE repo = $1 AND id = $2`, repo, id, StateAbandoned, reason); err != nil {
 			return err
 		}
 		if err := event(ctx, tx, repo, "migration.abandoned", id, cur.Owner, map[string]any{
-			"generation": gen, "reason": reason, "released": cur.Writes,
+			"generation": gen, "reason": reason, "released": cur.Writes, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}
