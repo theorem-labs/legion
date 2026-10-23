@@ -156,6 +156,38 @@ func TestCheckLedgerChecksEveryLeanNamedLedgerContract(t *testing.T) {
 	}
 }
 
+func TestCheckLedgerReportsAmbiguousExactLedgerName(t *testing.T) {
+	ctx := context.Background()
+	l, err := ledger.Open(ctx, testpg.Database(t, "declindex_ambiguous_ledger_contract"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(l.Close)
+	if _, err := l.EnsureRepo(ctx, "r", 3); err != nil {
+		t.Fatal(err)
+	}
+	s := refreshed(t, goldenTree(t))
+	found, err := s.Resolve(ctx, "Gold.Box")
+	if err != nil || len(found) != 1 {
+		t.Fatalf("declaration: %+v %v", found, err)
+	}
+	if _, err := l.RegisterContract(ctx, "r", found[0].Name, "function:frame_at", found[0].StmtHash, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
+		VALUES (?, ?, ?, ?, ?, ?)`, found[0].Name, "Box", "Other.Module", found[0].Kind, 1, found[0].StmtHash); err != nil {
+		t.Fatal(err)
+	}
+	rule := ContractRule{Paths: []string{"NoContracts/**"}, Kinds: []string{"def", "structure"}}
+	r, err := s.CheckLedger(ctx, l, "r", rule, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(r.Ambiguous, []string{found[0].Name}) || !r.Defective() {
+		t.Fatalf("ledger report %+v, want the exact-name ambiguity", r)
+	}
+}
+
 func TestOwnerMapsOfTheGraphTool(t *testing.T) {
 	raw := os.Getenv("DECLINDEX_OWNER_MAPS")
 	if raw == "" {

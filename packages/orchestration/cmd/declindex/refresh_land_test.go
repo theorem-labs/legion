@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
@@ -62,6 +63,44 @@ func (f landingFixture) refreshAt(t *testing.T, commit string) result {
 		return ""
 	}, &out, &errOut)
 	return result{code, out.String(), errOut.String()}
+}
+
+func assertIndexCommit(t *testing.T, config, want string) {
+	t.Helper()
+	cfg, err := declindex.LoadConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := declindex.Open(cfg.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.Meta(context.Background(), "commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("index commit %q, want %q", got, want)
+	}
+}
+
+func assertProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed-out build process %d still exists", pid)
+		case <-tick.C:
+		}
+	}
 }
 
 func TestRefreshAtLandedCommit(t *testing.T) {
@@ -132,7 +171,7 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 			t.Fatalf("missing-commit refresh: %+v", r)
 		}
 	})
-	t.Run("reports a failed build as unable", func(t *testing.T) {
+	t.Run("retries a failed build from the stale index", func(t *testing.T) {
 		f := newLandingFixture(t)
 		body, err := os.ReadFile(f.config)
 		if err != nil {
@@ -144,8 +183,19 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		if r := f.refreshAt(t, f.second); r.code != 3 {
 			t.Fatalf("failed-build refresh: %+v", r)
 		}
+		retryBuild := "build:\n  - sh\n  - -c\n  - 'echo retry-build > retry-build'"
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 0 {
+			t.Fatalf("failed-build retry: %+v", r)
+		}
+		if _, err := os.Stat(filepath.Join(f.tree, "retry-build")); err != nil {
+			t.Fatal(err)
+		}
+		assertIndexCommit(t, f.config, f.second)
 	})
-	t.Run("kills a timed-out build process group", func(t *testing.T) {
+	t.Run("retries a timed-out build from the stale index", func(t *testing.T) {
 		f := newLandingFixture(t)
 		body, err := os.ReadFile(f.config)
 		if err != nil {
@@ -166,20 +216,54 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-			t.Fatalf("timed-out build process %d still exists: %v", pid, err)
+		assertProcessGone(t, pid)
+		retryBuild := "build:\n  - sh\n  - -c\n  - 'echo retry-timeout > retry-timeout'"
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1)), 0o644); err != nil {
+			t.Fatal(err)
 		}
+		if r := f.refreshAt(t, f.second); r.code != 0 {
+			t.Fatalf("timed-out build retry: %+v", r)
+		}
+		if _, err := os.Stat(filepath.Join(f.tree, "retry-timeout")); err != nil {
+			t.Fatal(err)
+		}
+		assertIndexCommit(t, f.config, f.second)
 	})
-	t.Run("leaves an already covered ancestor in place", func(t *testing.T) {
+	t.Run("retries a failed index refresh from the stale index", func(t *testing.T) {
+		f := newLandingFixture(t)
+		body, err := os.ReadFile(f.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "lib: .\n", "lib: missing\n", 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 3 {
+			t.Fatalf("failed index refresh: %+v", r)
+		}
+		retryBuild := "build:\n  - sh\n  - -c\n  - 'echo retry-refresh > retry-refresh'"
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 0 {
+			t.Fatalf("failed index refresh retry: %+v", r)
+		}
+		if _, err := os.Stat(filepath.Join(f.tree, "retry-refresh")); err != nil {
+			t.Fatal(err)
+		}
+		assertIndexCommit(t, f.config, f.second)
+	})
+	t.Run("leaves a clean older tree untouched when the index is already current", func(t *testing.T) {
 		f := newLandingFixture(t)
 		if r := f.refreshAt(t, f.second); r.code != 0 {
 			t.Fatalf("refresh to second commit: %+v", r)
 		}
-		if r := f.refreshAt(t, f.first); r.code != 0 {
-			t.Fatalf("ancestor refresh: %+v", r)
+		git(t, f.tree, "checkout", "-q", "--detach", f.first)
+		if r := f.refreshAt(t, f.second); r.code != 0 {
+			t.Fatalf("covered refresh: %+v", r)
 		}
-		if got := git(t, f.tree, "rev-parse", "HEAD"); got != f.second {
-			t.Fatalf("tree moved to ancestor %s", got)
+		if got := git(t, f.tree, "rev-parse", "HEAD"); got != f.first {
+			t.Fatalf("covered refresh moved the tree to %s", got)
 		}
 	})
 }
