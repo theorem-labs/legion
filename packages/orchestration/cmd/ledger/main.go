@@ -474,7 +474,14 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 		Current:          map[string]string{},
 		ChangedContracts: map[string]string{},
 	}
+	// A candidate that changes nothing must say so: an omitted path list is never read as an empty one.
+	sawPath, noPaths := false, false
 	for len(args) > 0 {
+		if args[0] == "--no-paths" {
+			noPaths = true
+			args = args[1:]
+			continue
+		}
 		if len(args) < 2 {
 			return ledger.LandRequest{}, usagef("land flags need values")
 		}
@@ -494,6 +501,7 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 		case "--commit":
 			request.Commit = value
 		case "--path":
+			sawPath = true
 			request.ChangedPaths = append(request.ChangedPaths, value)
 		case "--current":
 			name, hash, err := parsePair(value, true)
@@ -515,6 +523,12 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 	}
 	if request.Repo == "" || request.Migration == "" || request.Commit == "" {
 		return ledger.LandRequest{}, usagef("land needs --repo, --migration and --commit")
+	}
+	switch {
+	case sawPath && noPaths:
+		return ledger.LandRequest{}, usagef("land takes --path or --no-paths, not both")
+	case !sawPath && !noPaths:
+		return ledger.LandRequest{}, usagef("land needs the candidate's changed files: one --path for each, or --no-paths when it changes none")
 	}
 	return request, nil
 }

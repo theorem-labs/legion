@@ -322,6 +322,37 @@ func TestLandJSONRequestRequiresChangedPaths(t *testing.T) {
 	}
 }
 
+func TestLandFlagsRequireChangedPathsOrNoPaths(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		return run(context.Background(), args, getenv, &out, &err), err.String()
+	}
+	if code, stderr := call("repo", "ensure", "r", "0"); code != 0 {
+		t.Fatalf("ensure: code=%d stderr=%s", code, stderr)
+	}
+	if code, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean"); code != 0 {
+		t.Fatalf("open: code=%d stderr=%s", code, stderr)
+	}
+	land := []string{"land", "--repo", "r", "--migration", "M-1", "--generation", "1", "--commit", "commit-1"}
+	if code, stderr := call(land...); code != 2 || !strings.Contains(stderr, "--path") {
+		t.Fatalf("land without --path or --no-paths: code=%d stderr=%q", code, stderr)
+	}
+	if code, stderr := call(append(land, "--no-paths", "--path", "a.lean")...); code != 2 || !strings.Contains(stderr, "--no-paths") {
+		t.Fatalf("land with both --no-paths and --path: code=%d stderr=%q", code, stderr)
+	}
+	if code, stderr := call(append(land, "--no-paths")...); code != 0 {
+		t.Fatalf("land with --no-paths: code=%d stderr=%q", code, stderr)
+	}
+}
+
 func TestRepeatableListFlagsPreserveCommaPaths(t *testing.T) {
 	dsn := testpg.Database(t, "ledger_command")
 	getenv := func(key string) string {
