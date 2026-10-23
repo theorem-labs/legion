@@ -127,6 +127,31 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
+// OpenReadOnly opens an existing, initialized index without creating files, initializing the schema, or enabling
+// WAL. Gate decisions use it so their reads cannot modify a project's tree.
+func OpenReadOnly(path string) (*Store, error) {
+	if info, err := os.Stat(path); err != nil {
+		return nil, err
+	} else if info.IsDir() {
+		return nil, fmt.Errorf("index %s is a directory", path)
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(120000)")
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{db: db, path: path}
+	version, err := s.Meta(context.Background(), "schema")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open the index read-only: %w", err)
+	}
+	if version != SchemaVersion {
+		_ = db.Close()
+		return nil, fmt.Errorf("index schema %q, want %q", version, SchemaVersion)
+	}
+	return s, nil
+}
+
 func (s *Store) init(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("create the index schema: %w", err)

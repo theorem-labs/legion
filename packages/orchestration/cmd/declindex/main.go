@@ -142,24 +142,33 @@ type env struct {
 }
 
 func (e *env) open(needIndex bool) error {
-	s, err := declindex.Open(e.cfg.DB)
+	return e.openWith(needIndex, declindex.Open)
+}
+
+func (e *env) openReadOnly(needIndex bool) error {
+	return e.openWith(needIndex, declindex.OpenReadOnly)
+}
+
+func (e *env) openWith(needIndex bool, open func(string) (*declindex.Store, error)) error {
+	s, err := open(e.cfg.DB)
 	if err != nil {
 		return &unableError{err}
 	}
 	e.store = s
-	if needIndex {
-		built, err := s.Meta(context.Background(), "built")
-		if err != nil {
-			return &unableError{err}
-		}
-		if built == "" {
-			return &unableError{fmt.Errorf("the index at %s was never refreshed: run declindex refresh", e.cfg.DB)}
-		}
-		if n, err := s.Meta(context.Background(), "errors"); err != nil {
-			return &unableError{err}
-		} else if n != "0" {
-			return &unableError{fmt.Errorf("the index at %s is incomplete: %s modules' reference files could not be read", e.cfg.DB, n)}
-		}
+	if !needIndex {
+		return nil
+	}
+	built, err := s.Meta(context.Background(), "built")
+	if err != nil {
+		return &unableError{err}
+	}
+	if built == "" {
+		return &unableError{fmt.Errorf("the index at %s was never refreshed: run declindex refresh", e.cfg.DB)}
+	}
+	if n, err := s.Meta(context.Background(), "errors"); err != nil {
+		return &unableError{err}
+	} else if n != "0" {
+		return &unableError{fmt.Errorf("the index at %s is incomplete: %s modules' reference files could not be read", e.cfg.DB, n)}
 	}
 	return nil
 }

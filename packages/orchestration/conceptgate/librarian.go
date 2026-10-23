@@ -46,6 +46,9 @@ func (c CommandLibrarian) Review(ctx context.Context, r ReviewRequest) error {
 	if r.Kind == "" {
 		return fmt.Errorf("librarian request %s has no kind", r.ID)
 	}
+	if err := ValidateOwnerID(r.Proposer); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(c.WorkDir, 0o700); err != nil {
 		return err
 	}

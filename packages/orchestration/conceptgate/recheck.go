@@ -51,6 +51,10 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 			report.Defects = append(report.Defects, Defect{Path: path, Message: "added concept has no stored source"})
 			continue
 		}
+		if err := ValidateOwnerID(concept.Proposer); err != nil {
+			report.Defects = append(report.Defects, Defect{Path: path, Message: err.Error()})
+			continue
+		}
 		proposal := Proposal{ID: concept.Proposal, Concept: concept, Source: concept.Source}
 		constants, err := g.export(ctx, reg, proposal)
 		if err != nil {
