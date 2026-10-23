@@ -54,21 +54,28 @@ type itemRow struct {
 	live          bool
 }
 
-// lockItem reads an item under a row lock. live is true when it has a holder whose lease has not ended.
+// lockItem reads an item under a row lock, then decides lease liveness from a fresh database timestamp.
 func lockItem(ctx context.Context, tx pgx.Tx, repo, id string) (itemRow, error) {
 	var r itemRow
 	var result *string
-	err := tx.QueryRow(ctx, `SELECT state, holder, generation, lease_expires_at, result,
-			holder IS NOT NULL AND lease_expires_at > clock_timestamp()
+	err := tx.QueryRow(ctx, `SELECT state, holder, generation, lease_expires_at, result
 		FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`, repo, id).
-		Scan(&r.state, &r.holder, &r.generation, &r.expiresAt, &result, &r.live)
+		Scan(&r.state, &r.holder, &r.generation, &r.expiresAt, &result)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return r, &NotFoundError{What: "item", ID: id}
+	}
+	if err != nil {
+		return r, err
 	}
 	if result != nil {
 		r.result = *result
 	}
-	return r, err
+	var now time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return r, err
+	}
+	r.live = r.holder != nil && r.expiresAt != nil && r.expiresAt.After(now)
+	return r, nil
 }
 
 // Claim grants a lease on an item, creating the item if it is new. The generation rises by one on every grant.

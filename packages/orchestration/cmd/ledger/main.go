@@ -20,6 +20,10 @@ type usageError struct{ message string }
 
 func (e *usageError) Error() string { return e.message }
 
+type checkRefusal struct{ result ledger.CheckResult }
+
+func (e *checkRefusal) Error() string { return "candidate check refused" }
+
 func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 }
@@ -67,6 +71,18 @@ parsed:
 
 	value, read, err := dispatch(ctx, store, args)
 	if err != nil {
+		var check *checkRefusal
+		if errors.As(err, &check) {
+			if jsonOutput || read {
+				if encodeErr := json.NewEncoder(stdout).Encode(check.result); encodeErr != nil {
+					fmt.Fprintln(stderr, encodeErr)
+					return 4
+				}
+			} else {
+				fmt.Fprintln(stdout, check.result)
+			}
+			return 1
+		}
 		var refusal *ledger.Refusal
 		if jsonOutput && errors.As(err, &refusal) {
 			if encodeErr := json.NewEncoder(stdout).Encode(refusal); encodeErr != nil {
@@ -209,24 +225,19 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			}
 		}
 		value, err := s.Check(ctx, ledger.CheckRequest{Repo: args[0], ID: args[1], Generation: generation, Changed: list(args[3]), Current: current})
-		return value, true, err
+		if err != nil {
+			return value, true, err
+		}
+		if !value.Pass {
+			return value, true, &checkRefusal{result: value}
+		}
+		return value, true, nil
 	case "land":
-		if len(args) < 5 || len(args) > 6 {
-			return nil, false, usagef("land <repo> <id> <generation> <commit> <contracts> [approved]")
-		}
-		generation, err := integer(args[2])
+		request, err := parseLandRequest(args)
 		if err != nil {
 			return nil, false, err
 		}
-		changes, err := stringMap(args[4], false)
-		if err != nil {
-			return nil, false, err
-		}
-		approved := []string(nil)
-		if len(args) == 6 {
-			approved = list(args[5])
-		}
-		return mutation(s.Land(ctx, args[0], args[1], generation, args[3], changes, approved))
+		return mutation(s.Land(ctx, request))
 	case "abandon":
 		if len(args) != 4 {
 			return nil, false, usagef("abandon <repo> <id> <generation> <reason>")
@@ -394,3 +405,67 @@ func versionMap(value string) (map[string]int64, error) {
 }
 
 func mutation[T any](value T, err error) (any, bool, error) { return value, false, err }
+
+func parseLandRequest(args []string) (ledger.LandRequest, error) {
+	if len(args) == 2 && args[0] == "--request-file" {
+		contents, err := os.ReadFile(args[1])
+		if err != nil {
+			return ledger.LandRequest{}, fmt.Errorf("read land request: %w", err)
+		}
+		var request ledger.LandRequest
+		if err := json.Unmarshal(contents, &request); err != nil {
+			return ledger.LandRequest{}, usagef("invalid land request JSON: %v", err)
+		}
+		return request, nil
+	}
+	request := ledger.LandRequest{
+		Current:          map[string]string{},
+		ChangedContracts: map[string]string{},
+	}
+	var hasPaths, hasCurrent bool
+	for len(args) > 0 {
+		if len(args) < 2 {
+			return ledger.LandRequest{}, usagef("land flags need values")
+		}
+		flag, value := args[0], args[1]
+		args = args[2:]
+		switch flag {
+		case "--repo":
+			request.Repo = value
+		case "--migration":
+			request.Migration = value
+		case "--generation":
+			generation, err := integer(value)
+			if err != nil {
+				return ledger.LandRequest{}, err
+			}
+			request.Generation = generation
+		case "--commit":
+			request.Commit = value
+		case "--changed-paths":
+			request.ChangedPaths = list(value)
+			hasPaths = true
+		case "--current":
+			current, err := stringMap(value, true)
+			if err != nil {
+				return ledger.LandRequest{}, err
+			}
+			request.Current = current
+			hasCurrent = true
+		case "--changed-contracts":
+			contracts, err := stringMap(value, false)
+			if err != nil {
+				return ledger.LandRequest{}, err
+			}
+			request.ChangedContracts = contracts
+		case "--approved-pinned":
+			request.ApprovedPinned = list(value)
+		default:
+			return ledger.LandRequest{}, usagef("unknown land flag %q", flag)
+		}
+	}
+	if request.Repo == "" || request.Migration == "" || request.Commit == "" || !hasPaths || !hasCurrent {
+		return ledger.LandRequest{}, usagef("land needs --repo, --migration, --commit, --changed-paths and --current")
+	}
+	return request, nil
+}

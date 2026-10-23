@@ -23,9 +23,8 @@ func (w writePath) String() string {
 // parseWrite reads a declared write. A trailing "/" makes it a directory. The path must stay inside the
 // repository: no leading "/", no "..", not the repository root itself.
 func parseWrite(raw string) (writePath, error) {
-	s := strings.TrimSpace(raw)
-	prefix := strings.HasSuffix(s, "/")
-	p, err := cleanRepoPath(s)
+	prefix := strings.HasSuffix(raw, "/")
+	p, err := cleanRepoPath(raw)
 	if err != nil {
 		return writePath{}, err
 	}
@@ -34,14 +33,16 @@ func parseWrite(raw string) (writePath, error) {
 
 // cleanRepoPath cleans a repository-relative path ("./a//b/" becomes "a/b").
 func cleanRepoPath(raw string) (string, error) {
-	s := strings.TrimSpace(raw)
-	if s == "" {
+	if raw == "" {
 		return "", invalid("empty path")
 	}
-	if strings.HasPrefix(s, "/") {
+	if strings.TrimSpace(raw) != raw {
+		return "", invalid("path %q has leading or trailing whitespace", raw)
+	}
+	if strings.HasPrefix(raw, "/") {
 		return "", invalid("path %q is absolute; give it relative to the repository root", raw)
 	}
-	p := path.Clean(s)
+	p := path.Clean(raw)
 	if p == "." {
 		return "", invalid("path %q is the whole repository", raw)
 	}

@@ -58,6 +58,7 @@ type Migration struct {
 	LandedCommit     string            `json:"landed_commit,omitempty"`
 	Writes           []string          `json:"writes"`
 	Reads            map[string]string `json:"reads"`
+	ReadVersions     map[string]*int64 `json:"read_versions,omitempty"`
 }
 
 // CheckRequest asks whether a candidate change may land for a migration.
@@ -127,17 +128,20 @@ func loadMigration(ctx context.Context, q querier, repo, id string, forUpdate bo
 		m.Writes = append(m.Writes, w.String())
 	}
 	m.Reads = map[string]string{}
-	rows, err := q.Query(ctx, `SELECT name, hash FROM migration_reads WHERE repo = $1 AND migration = $2`, repo, id)
+	m.ReadVersions = map[string]*int64{}
+	rows, err := q.Query(ctx, `SELECT name, hash, version FROM migration_reads WHERE repo = $1 AND migration = $2`, repo, id)
 	if err != nil {
 		return m, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var n, h string
-		if err := rows.Scan(&n, &h); err != nil {
+		var version *int64
+		if err := rows.Scan(&n, &h, &version); err != nil {
 			return m, err
 		}
 		m.Reads[n] = h
+		m.ReadVersions[n] = version
 	}
 	return m, rows.Err()
 }
@@ -223,10 +227,27 @@ func insertWrites(ctx context.Context, tx pgx.Tx, repo, id string, ws []writePat
 	return nil
 }
 
+func contractReadVersion(ctx context.Context, tx pgx.Tx, repo, name string) (*int64, error) {
+	var version int64
+	err := tx.QueryRow(ctx, `SELECT version FROM contracts WHERE repo = $1 AND name = $2`, repo, name).Scan(&version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &version, nil
+}
+
 func upsertReads(ctx context.Context, tx pgx.Tx, repo, id string, reads map[string]string) error {
 	for n, h := range reads {
-		if _, err := tx.Exec(ctx, `INSERT INTO migration_reads (repo, migration, name, hash) VALUES ($1, $2, $3, $4)
-			ON CONFLICT (repo, migration, name) DO UPDATE SET hash = EXCLUDED.hash`, repo, id, n, h); err != nil {
+		version, err := contractReadVersion(ctx, tx, repo, n)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO migration_reads (repo, migration, name, hash, version) VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (repo, migration, name) DO UPDATE SET hash = EXCLUDED.hash, version = EXCLUDED.version`,
+			repo, id, n, h, version); err != nil {
 			return err
 		}
 	}
@@ -388,102 +409,122 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 	return m, err
 }
 
+// cleanCheckRequest validates and normalizes candidate paths before they are compared to declared writes.
+func cleanCheckRequest(req CheckRequest) (CheckRequest, error) {
+	changed := make([]string, 0, len(req.Changed))
+	for _, path := range req.Changed {
+		cleaned, err := cleanRepoPath(path)
+		if err != nil {
+			return CheckRequest{}, err
+		}
+		changed = append(changed, cleaned)
+	}
+	sort.Strings(changed)
+	req.Changed = changed
+	return req, nil
+}
+
+// checkViolations evaluates every candidate check against a migration locked by the caller. When externalOnly is
+// true, contract reads are checked against their locked versions by Land instead of a caller-provided hash.
+func checkViolations(ctx context.Context, q querier, m Migration, req CheckRequest, externalOnly bool) ([]Violation, error) {
+	var violations []Violation
+	add := func(v Violation) { violations = append(violations, v) }
+	if m.State != StateOpen {
+		add(Violation{Kind: ViolationNotOpen, Message: fmt.Sprintf("migration %s is %s", m.ID, m.State)})
+	}
+	if req.Generation != m.Generation {
+		add(Violation{Kind: ViolationStaleGeneration, Message: fmt.Sprintf(
+			"candidate is from generation %d; migration %s is at generation %d (owner %s)",
+			req.Generation, m.ID, m.Generation, m.Owner)})
+	}
+	if m.EscalatedAt != nil {
+		add(Violation{Kind: ViolationEscalated, Message: fmt.Sprintf(
+			"migration %s was escalated to the steward: %s", m.ID, m.EscalationReason)})
+	}
+	ours, err := migrationWrites(ctx, q, req.Repo, req.ID)
+	if err != nil {
+		return nil, err
+	}
+	sets, err := openWriteSets(ctx, q, req.Repo, req.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range req.Changed {
+		if coveredBy(ours, path) {
+			continue
+		}
+		v := Violation{Kind: ViolationUndeclaredWrite, Path: path,
+			Message: fmt.Sprintf("%s is outside migration %s's declared writes", path, m.ID)}
+		if other := holderOf(sets, path); other != "" {
+			v.Other = other
+			v.Message += "; open migration " + other + " declares it"
+		}
+		add(v)
+	}
+	names := sortedNames(m.Reads)
+	for _, name := range names {
+		if externalOnly && m.ReadVersions[name] != nil {
+			continue
+		}
+		recorded := m.Reads[name]
+		current, ok := req.Current[name]
+		switch {
+		case !ok:
+			add(Violation{Kind: ViolationUnverifiedRead, Name: name, Recorded: recorded,
+				Message: fmt.Sprintf("no current hash for read %s, so it cannot be checked", name)})
+		case current == "":
+			add(Violation{Kind: ViolationStaleRead, Name: name, Recorded: recorded,
+				Message: fmt.Sprintf("read %s no longer exists (recorded hash %s)", name, recorded)})
+		case current != recorded:
+			add(Violation{Kind: ViolationStaleRead, Name: name, Recorded: recorded, Current: current,
+				Message: fmt.Sprintf("read %s changed: recorded %s, now %s", name, recorded, current)})
+		}
+	}
+	if m.State == StateOpen {
+		ids := make([]string, 0, len(sets))
+		for id := range sets {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			for _, clash := range clashes(ours, sets[id]) {
+				add(Violation{Kind: ViolationOverlap, Path: clash.Ours, Other: id,
+					Message: fmt.Sprintf("declared %s overlaps open migration %s's %s", clash.Ours, id, clash.Theirs)})
+			}
+		}
+	}
+	return violations, nil
+}
+
 // Check decides whether a candidate change may land for a migration. It writes nothing but the event that
 // records its decision. A refusal of the request itself (an unknown migration, a bad path) is an error; every
 // reason the candidate must not land is a violation in the result.
 func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error) {
-	changed := make([]string, 0, len(req.Changed))
-	for _, p := range req.Changed {
-		c, err := cleanRepoPath(p)
-		if err != nil {
-			return CheckResult{}, err
-		}
-		changed = append(changed, c)
+	cleaned, err := cleanCheckRequest(req)
+	if err != nil {
+		return CheckResult{}, err
 	}
-	sort.Strings(changed)
-	res := CheckResult{Migration: req.ID, Generation: req.Generation}
-	err := s.tx(ctx, func(tx pgx.Tx) error {
+	res := CheckResult{Migration: cleaned.ID, Generation: cleaned.Generation}
+	err = s.tx(ctx, func(tx pgx.Tx) error {
 		res.Violations = nil
-		if _, err := lockRepo(ctx, tx, req.Repo, false); err != nil {
+		if _, err := lockRepo(ctx, tx, cleaned.Repo, false); err != nil {
 			return err
 		}
-		m, err := loadMigration(ctx, tx, req.Repo, req.ID, true)
+		migration, err := loadMigration(ctx, tx, cleaned.Repo, cleaned.ID, true)
 		if err != nil {
 			return err
 		}
-		add := func(v Violation) { res.Violations = append(res.Violations, v) }
-		if m.State != StateOpen {
-			add(Violation{Kind: ViolationNotOpen, Message: fmt.Sprintf("migration %s is %s", m.ID, m.State)})
-		}
-		if req.Generation != m.Generation {
-			add(Violation{Kind: ViolationStaleGeneration, Message: fmt.Sprintf(
-				"candidate is from generation %d; migration %s is at generation %d (owner %s)",
-				req.Generation, m.ID, m.Generation, m.Owner)})
-		}
-		if m.EscalatedAt != nil {
-			add(Violation{Kind: ViolationEscalated, Message: fmt.Sprintf(
-				"migration %s was escalated to the steward: %s", m.ID, m.EscalationReason)})
-		}
-		ours, err := migrationWrites(ctx, tx, req.Repo, req.ID)
+		res.Violations, err = checkViolations(ctx, tx, migration, cleaned, false)
 		if err != nil {
 			return err
-		}
-		sets, err := openWriteSets(ctx, tx, req.Repo, req.ID)
-		if err != nil {
-			return err
-		}
-		for _, p := range changed {
-			if coveredBy(ours, p) {
-				continue
-			}
-			v := Violation{Kind: ViolationUndeclaredWrite, Path: p,
-				Message: fmt.Sprintf("%s is outside migration %s's declared writes", p, m.ID)}
-			if other := holderOf(sets, p); other != "" {
-				v.Other = other
-				v.Message += "; open migration " + other + " declares it"
-			}
-			add(v)
-		}
-		names := make([]string, 0, len(m.Reads))
-		for n := range m.Reads {
-			names = append(names, n)
-		}
-		sort.Strings(names)
-		for _, n := range names {
-			rec := m.Reads[n]
-			cur, ok := req.Current[n]
-			switch {
-			case !ok:
-				add(Violation{Kind: ViolationUnverifiedRead, Name: n, Recorded: rec,
-					Message: fmt.Sprintf("no current hash for read %s, so it cannot be checked", n)})
-			case cur == "":
-				add(Violation{Kind: ViolationStaleRead, Name: n, Recorded: rec,
-					Message: fmt.Sprintf("read %s no longer exists (recorded hash %s)", n, rec)})
-			case cur != rec:
-				add(Violation{Kind: ViolationStaleRead, Name: n, Recorded: rec, Current: cur,
-					Message: fmt.Sprintf("read %s changed: recorded %s, now %s", n, rec, cur)})
-			}
-		}
-		if m.State == StateOpen {
-			ids := make([]string, 0, len(sets))
-			for id := range sets {
-				ids = append(ids, id)
-			}
-			sort.Strings(ids)
-			for _, id := range ids {
-				for _, c := range clashes(ours, sets[id]) {
-					add(Violation{Kind: ViolationOverlap, Path: c.Ours, Other: id,
-						Message: fmt.Sprintf("declared %s overlaps open migration %s's %s", c.Ours, id, c.Theirs)})
-				}
-			}
 		}
 		res.Pass = len(res.Violations) == 0
 		kinds := make([]string, 0, len(res.Violations))
-		for _, v := range res.Violations {
-			kinds = append(kinds, v.Kind)
+		for _, violation := range res.Violations {
+			kinds = append(kinds, violation.Kind)
 		}
-		return event(ctx, tx, req.Repo, "migration.checked", req.ID, "", map[string]any{
-			"generation": req.Generation, "pass": res.Pass, "changed": len(changed), "violations": kinds,
+		return event(ctx, tx, cleaned.Repo, "migration.checked", cleaned.ID, "", map[string]any{
+			"generation": cleaned.Generation, "pass": res.Pass, "changed": len(cleaned.Changed), "violations": kinds,
 		})
 	})
 	if res.Violations == nil {
@@ -677,9 +718,21 @@ func (s *Store) Abandon(ctx context.Context, repo, id string, gen int64, reason 
 	return m, err
 }
 
-// Migration reads one migration's record.
+// Migration reads one migration's record from a read-only repeatable-read snapshot.
 func (s *Store) Migration(ctx context.Context, repo, id string) (Migration, error) {
-	return loadMigration(ctx, s.pool, repo, id, false)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return Migration{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	migration, err := loadMigration(ctx, tx, repo, id, false)
+	if err != nil {
+		return Migration{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Migration{}, err
+	}
+	return migration, nil
 }
 
 // migrations lists a repository's migrations in a state, by name.

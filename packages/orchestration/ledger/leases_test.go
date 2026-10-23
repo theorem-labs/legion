@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
@@ -85,11 +87,11 @@ func TestExpiredLeaseIsRegrantedAndOldHolderIsRefusedByGeneration(t *testing.T) 
 	wantRefusal(t, err, ledger.ReasonDone)
 }
 
-func TestRenewMovesExpiryByRequestedLength(t *testing.T) {
+func TestRenewMovesAndPersistsExpiryByRequestedLength(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
-	l := must(s.Claim(ctx, "r", "item", "alice", time.Minute))
-	ttl := 2 * time.Minute
+	l := must(s.Claim(ctx, "r", "item", "alice", 100*time.Millisecond))
+	ttl := 300 * time.Millisecond
 	r := must(s.Renew(ctx, "r", "item", "alice", l.Generation, ttl))
 	if r.Generation != l.Generation {
 		t.Fatalf("renew changed the generation: %d -> %d", l.Generation, r.Generation)
@@ -97,8 +99,11 @@ func TestRenewMovesExpiryByRequestedLength(t *testing.T) {
 	if got := r.ExpiresAt.Sub(l.ExpiresAt); got != ttl {
 		t.Fatalf("renew moved expiry by %s, want %s", got, ttl)
 	}
-	_, err := s.Claim(ctx, "r", "item", "bob", time.Minute)
-	wantRefusal(t, err, ledger.ReasonLeaseHeld)
+	time.Sleep(175 * time.Millisecond)
+	item := must(s.Item(ctx, "r", "item"))
+	if item.Holder != "alice" || item.ExpiresAt == nil || !item.ExpiresAt.Equal(r.ExpiresAt) {
+		t.Fatalf("renewed expiry was not persisted: %+v; want %s", item, r.ExpiresAt)
+	}
 	if err := s.Complete(ctx, "r", "item", "alice", l.Generation, "ok"); err != nil {
 		t.Fatalf("complete within the renewed lease: %v", err)
 	}
@@ -165,5 +170,87 @@ func TestUnknownRepositoryIsNotFound(t *testing.T) {
 	var nf *ledger.NotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("want not found, got %v", err)
+	}
+}
+
+func TestLeaseLivenessIsEvaluatedAfterTheItemRowLock(t *testing.T) {
+	tests := []struct {
+		name    string
+		operate func(context.Context, *ledger.Store, ledger.Lease) error
+		success bool
+	}{
+		{
+			name: "renew",
+			operate: func(ctx context.Context, s *ledger.Store, lease ledger.Lease) error {
+				_, err := s.Renew(ctx, "r", "item", "alice", lease.Generation, time.Minute)
+				return err
+			},
+		},
+		{
+			name: "complete",
+			operate: func(ctx context.Context, s *ledger.Store, lease ledger.Lease) error {
+				return s.Complete(ctx, "r", "item", "alice", lease.Generation, "late")
+			},
+		},
+		{
+			name: "claim",
+			operate: func(ctx context.Context, s *ledger.Store, lease ledger.Lease) error {
+				_, err := s.Claim(ctx, "r", "item", "bob", time.Minute)
+				return err
+			},
+			success: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s, dsn := newStoreDSN(t)
+			ctx := context.Background()
+			lease := must(s.Claim(ctx, "r", "item", "alice", 100*time.Millisecond))
+			locker := must(pgx.Connect(ctx, dsn))
+			defer locker.Close(ctx)
+			lock := must(locker.Begin(ctx))
+			must(lock.Exec(ctx, `SELECT 1 FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`, "r", "item"))
+
+			done := make(chan error, 1)
+			go func() { done <- test.operate(ctx, s, lease) }()
+			waitForDatabaseExpiry(t, locker, lease.ExpiresAt)
+			if err := lock.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			err := <-done
+			if test.success {
+				if err != nil {
+					t.Fatal(err)
+				}
+				item := must(s.Item(ctx, "r", "item"))
+				if item.Holder != "bob" || item.Generation != lease.Generation+1 {
+					t.Fatalf("claim after expiry: %+v", item)
+				}
+				return
+			}
+			wantRefusal(t, err, ledger.ReasonLeaseExpired)
+		})
+	}
+}
+
+func waitForDatabaseExpiry(t *testing.T, conn *pgx.Conn, expiresAt time.Time) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		var expired bool
+		if err := conn.QueryRow(context.Background(), `SELECT clock_timestamp() >= $1`, expiresAt).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("timed out waiting for database lease expiry")
+		case <-tick.C:
+		}
 	}
 }

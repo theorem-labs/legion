@@ -47,37 +47,76 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 	invoke("complete", "r", "done", "alice", "1", "result")
 	invoke("expire", "r")
 	item := invoke("--json", "item", "r", "done")
-	if !json.Valid([]byte(item)) {
-		t.Fatalf("item JSON %q", item)
+	var completed struct {
+		State  string `json:"state"`
+		Holder string `json:"holder"`
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(item), &completed); err != nil {
+		t.Fatalf("item JSON: %v: %q", err, item)
+	}
+	if completed.State != "done" || completed.Holder != "" || completed.Result != "result" {
+		t.Fatalf("completed item: %+v", completed)
 	}
 
 	invoke("open", "r", "M-1", "alice", "base", "branch", "a.lean")
 	invoke("extend", "r", "M-1", "1", "b.lean")
-	invoke("check", "r", "M-1", "1", "a.lean,b.lean")
+	check := invoke("--json", "check", "r", "M-1", "1", "a.lean,b.lean")
+	var checked struct {
+		Pass bool `json:"pass"`
+	}
+	if err := json.Unmarshal([]byte(check), &checked); err != nil || !checked.Pass {
+		t.Fatalf("clean check: %v %q", err, check)
+	}
 	invoke("takeover", "r", "M-1", "bob", "1")
 	invoke("round", "r", "M-1", "2", "failed")
 	invoke("abandon", "r", "M-1", "2", "stopped")
 
 	invoke("contract", "register", "r", "C", "alice", "hash-1", "false")
 	contract := invoke("--json", "contract", "show", "r", "C")
-	if !json.Valid([]byte(contract)) {
-		t.Fatalf("contract JSON %q", contract)
+	var shown struct {
+		Owner         string `json:"owner"`
+		StatementHash string `json:"statement_hash"`
+		Version       int64  `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(contract), &shown); err != nil || shown.Owner != "alice" || shown.StatementHash != "hash-1" || shown.Version != 1 {
+		t.Fatalf("registered contract: %v %+v", err, shown)
 	}
 	invoke("contract", "transfer", "r", "C", "alice", "bob")
+	contract = invoke("--json", "contract", "show", "r", "C")
+	if err := json.Unmarshal([]byte(contract), &shown); err != nil || shown.Owner != "bob" {
+		t.Fatalf("transferred contract: %v %+v", err, shown)
+	}
 	invoke("agree", "r", "A-1", "bob", "C=1")
 	invoke("open", "r", "M-2", "bob", "base", "branch", "c.lean", "C=hash-1")
-	invoke("land", "r", "M-2", "1", "commit-1", "C=hash-2")
+	invoke("land", "--repo", "r", "--migration", "M-2", "--generation", "1", "--commit", "commit-1",
+		"--changed-paths", "c.lean", "--current", "", "--changed-contracts", "C=hash-2")
 	stale := invoke("--json", "stale", "r")
-	if !json.Valid([]byte(stale)) {
-		t.Fatalf("stale JSON %q", stale)
+	var staleAgreements []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(stale), &staleAgreements); err != nil || len(staleAgreements) != 1 || staleAgreements[0].ID != "A-1" {
+		t.Fatalf("stale agreements: %v %+v", err, staleAgreements)
 	}
 	status := invoke("--json", "status", "r")
 	if !json.Valid([]byte(status)) {
 		t.Fatalf("status JSON %q", status)
 	}
 	events := invoke("--json", "events", "r", "0")
-	if !json.Valid([]byte(events)) {
-		t.Fatalf("events JSON %q", events)
+	var log []struct {
+		Kind    string `json:"kind"`
+		Subject string `json:"subject"`
+	}
+	if err := json.Unmarshal([]byte(events), &log); err != nil {
+		t.Fatalf("event JSON: %v: %q", err, events)
+	}
+	advanced, staled := false, false
+	for _, event := range log {
+		advanced = advanced || event.Kind == "contract.advanced" && event.Subject == "C"
+		staled = staled || event.Kind == "agreement.staled" && event.Subject == "A-1"
+	}
+	if !advanced || !staled {
+		t.Fatalf("landing events: %+v", log)
 	}
 }
 
@@ -118,4 +157,68 @@ func TestCommandExitCodes(t *testing.T) {
 	if code := run(context.Background(), []string{"--dsn-file", file, "repo", "ensure", "r", "0"}, getenv, &stdout, &stderr); code != 4 {
 		t.Fatalf("database exit code %d, want 4", code)
 	}
+}
+
+func TestCheckRefusalExitsOneWithJSONResult(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		code := run(context.Background(), args, getenv, &out, &err)
+		return code, out.String(), err.String()
+	}
+	if code, _, stderr := call("repo", "ensure", "r", "0"); code != 0 {
+		t.Fatalf("ensure exit=%d stderr=%s", code, stderr)
+	}
+	if code, _, stderr := call("open", "r", "M-1", "alice", "base", "branch", "owned.lean"); code != 0 {
+		t.Fatalf("open exit=%d stderr=%s", code, stderr)
+	}
+	code, stdout, stderr := call("--json", "check", "r", "M-1", "1", "outside.lean")
+	if code != 1 {
+		t.Fatalf("refused check exit=%d stdout=%s stderr=%s; want 1", code, stdout, stderr)
+	}
+	var result struct {
+		Pass       bool `json:"pass"`
+		Violations []struct {
+			Kind string `json:"kind"`
+		} `json:"violations"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("refused check JSON: %v: %q", err, stdout)
+	}
+	if result.Pass || len(result.Violations) != 1 || result.Violations[0].Kind != "undeclared_write" {
+		t.Fatalf("refused check result: %+v", result)
+	}
+}
+
+func TestLandReadsJSONRequestFile(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	invoke := func(args ...string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		if code := run(context.Background(), args, getenv, &out, &err); code != 0 {
+			t.Fatalf("%v exited %d: %s", args, code, err.String())
+		}
+	}
+	invoke("repo", "ensure", "r", "0")
+	invoke("contract", "register", "r", "C", "alice", "hash-1", "false")
+	invoke("open", "r", "M-1", "alice", "base", "branch", "a.lean", "C=hash-1")
+	request := `{"repo":"r","migration":"M-1","generation":1,"commit":"commit-1","changed_paths":["a.lean"],"current":{},"changed_contracts":{"C":"hash-2"}}`
+	file := filepath.Join(t.TempDir(), "land.json")
+	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	invoke("land", "--request-file", file)
 }

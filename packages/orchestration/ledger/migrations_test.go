@@ -333,6 +333,26 @@ func TestAbandonReleasesEveryPathSoABlockedOpenSucceeds(t *testing.T) {
 	}
 }
 
+func TestOpenAndCheckRejectPathsWithLeadingOrTrailingWhitespace(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	for _, declared := range []string{" leading.lean", "trailing.lean ", " directory/file.lean"} {
+		_, err := open(t, s, "M-"+declared, "alice", []string{declared}, nil)
+		var invalid *ledger.InvalidError
+		if !errors.As(err, &invalid) {
+			t.Errorf("declared path %q: want invalid, got %v", declared, err)
+		}
+	}
+	must(open(t, s, "M-good", "alice", []string{"owned.lean"}, nil))
+	for _, candidate := range []string{" owned.lean", "owned.lean "} {
+		_, err := s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-good", Generation: 1, Changed: []string{candidate}})
+		var invalid *ledger.InvalidError
+		if !errors.As(err, &invalid) {
+			t.Errorf("candidate path %q: want invalid, got %v", candidate, err)
+		}
+	}
+}
+
 func TestExtendAddsPathsUnlessTheyOverlap(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

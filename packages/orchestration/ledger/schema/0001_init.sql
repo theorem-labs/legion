@@ -63,6 +63,7 @@ CREATE TABLE migration_reads (
     migration text NOT NULL,
     name      text NOT NULL,
     hash      text NOT NULL,
+    version   bigint CHECK (version IS NULL OR version >= 1),
     PRIMARY KEY (repo, migration, name),
     FOREIGN KEY (repo, migration) REFERENCES migrations(repo, id)
 );

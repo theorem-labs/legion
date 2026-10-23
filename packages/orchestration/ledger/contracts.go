@@ -235,61 +235,137 @@ func (s *Store) StaleAgreements(ctx context.Context, repo string) ([]Agreement, 
 	return out, err
 }
 
-// Land advances the contracts changed by an open migration, makes agreements that read their old versions stale,
-// and closes the migration at the supplied commit.
-func (s *Store) Land(ctx context.Context, repo, id string, generation int64, commit string, changed map[string]string,
-	approvedPinned []string) (Migration, error) {
-	if strings.TrimSpace(commit) == "" {
+// LandRequest is the candidate that Land validates and closes. ChangedPaths and Current are the same candidate
+// inputs Check receives. Current supplies every read that was not a registered contract when the migration recorded it.
+type LandRequest struct {
+	Repo             string            `json:"repo"`
+	Migration        string            `json:"migration"`
+	Generation       int64             `json:"generation"`
+	Commit           string            `json:"commit"`
+	ChangedPaths     []string          `json:"changed_paths"`
+	Current          map[string]string `json:"current"`
+	ChangedContracts map[string]string `json:"changed_contracts"`
+	ApprovedPinned   []string          `json:"approved_pinned"`
+}
+
+func refusalForViolation(v Violation) *Refusal {
+	switch v.Kind {
+	case ViolationNotOpen:
+		return refuse(ReasonNotOpen, "%s", v.Message)
+	case ViolationStaleGeneration:
+		return refuse(ReasonStaleGeneration, "%s", v.Message)
+	case ViolationEscalated:
+		return refuse(ReasonEscalated, "%s", v.Message)
+	case ViolationUndeclaredWrite:
+		return refuse(ReasonUndeclaredWrite, "%s", v.Message)
+	case ViolationOverlap:
+		return refuse(ReasonOverlap, "%s", v.Message)
+	default:
+		return refuse(ReasonStaleRead, "%s", v.Message)
+	}
+}
+
+func contractReadsAtVersions(ctx context.Context, tx pgx.Tx, repo string, migration Migration) (map[string]Contract, error) {
+	contracts := map[string]Contract{}
+	for _, name := range sortedNames(migration.ReadVersions) {
+		recorded := migration.ReadVersions[name]
+		if recorded == nil {
+			var registered bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM contracts WHERE repo = $1 AND name = $2)`, repo, name).Scan(&registered); err != nil {
+				return nil, err
+			}
+			if registered {
+				return nil, refuse(ReasonStaleRead, "migration %s did not record a version for contract %s", migration.ID, name)
+			}
+			continue
+		}
+		current, err := loadContract(ctx, tx, repo, name, true)
+		if err != nil {
+			var missing *NotFoundError
+			if errors.As(err, &missing) {
+				return nil, refuse(ReasonStaleRead, "recorded contract %s no longer exists", name)
+			}
+			return nil, err
+		}
+		if current.Version != *recorded || current.StatementHash != migration.Reads[name] {
+			return nil, refuse(ReasonStaleRead, "migration %s read contract %s at version %d hash %s, current version is %d hash %s",
+				migration.ID, name, *recorded, migration.Reads[name], current.Version, current.StatementHash)
+		}
+		contracts[name] = current
+	}
+	return contracts, nil
+}
+
+// Land validates a complete candidate, advances its changed contracts, makes dependent agreements stale, and closes
+// the migration at the supplied commit. It holds the repository, migration and contract locks through every step.
+func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
+	if strings.TrimSpace(req.Commit) == "" {
 		return Migration{}, invalid("empty landed commit")
 	}
-	for name, hash := range changed {
+	for name, hash := range req.ChangedContracts {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(hash) == "" {
 			return Migration{}, invalid("landed contracts need a name and statement hash")
 		}
 	}
-	names := sortedNames(changed)
-	approved := make(map[string]struct{}, len(approvedPinned))
-	for _, name := range approvedPinned {
+	candidate, err := cleanCheckRequest(CheckRequest{
+		Repo: req.Repo, ID: req.Migration, Generation: req.Generation, Changed: req.ChangedPaths, Current: req.Current,
+	})
+	if err != nil {
+		return Migration{}, err
+	}
+	names := sortedNames(req.ChangedContracts)
+	approved := make(map[string]struct{}, len(req.ApprovedPinned))
+	for _, name := range req.ApprovedPinned {
 		approved[name] = struct{}{}
 	}
 	var landed Migration
-	err := s.tx(ctx, func(tx pgx.Tx) error {
-		if _, err := lockRepo(ctx, tx, repo, true); err != nil {
+	err = s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, req.Repo, true); err != nil {
 			return err
 		}
-		migration, err := lockOpenAt(ctx, tx, repo, id, generation)
+		migration, err := lockOpenAt(ctx, tx, req.Repo, req.Migration, req.Generation)
 		if err != nil {
 			return err
 		}
-		if migration.EscalatedAt != nil {
-			return refuse(ReasonEscalated, "migration %s is escalated: %s", id, migration.EscalationReason)
+		violations, err := checkViolations(ctx, tx, migration, candidate, true)
+		if err != nil {
+			return err
 		}
-		contracts := make(map[string]Contract, len(names))
+		if len(violations) > 0 {
+			return refusalForViolation(violations[0])
+		}
+		contracts, err := contractReadsAtVersions(ctx, tx, req.Repo, migration)
+		if err != nil {
+			return err
+		}
 		for _, name := range names {
-			current, err := loadContract(ctx, tx, repo, name, true)
-			if err != nil {
-				return err
+			recorded, declared := migration.ReadVersions[name]
+			if !declared {
+				return refuse(ReasonUndeclaredContract, "migration %s did not declare contract %s as a read", migration.ID, name)
 			}
-			if recorded, ok := migration.Reads[name]; !ok || recorded != current.StatementHash {
-				return refuse(ReasonStaleRead, "migration %s did not read the current hash of contract %s", id, name)
+			if recorded == nil {
+				return refuse(ReasonStaleRead, "migration %s did not record a contract version for %s", migration.ID, name)
+			}
+			current := contracts[name]
+			if current.Name == "" {
+				return refuse(ReasonStaleRead, "migration %s did not read current contract %s", migration.ID, name)
 			}
 			if current.Pinned {
 				if _, ok := approved[name]; !ok {
 					return refuse(ReasonPinned, "contract %s is pinned; a person must approve its change", name)
 				}
 			}
-			contracts[name] = current
 		}
 		for _, name := range names {
 			current := contracts[name]
 			var advanced Contract
 			if err := tx.QueryRow(ctx, `UPDATE contracts SET statement_hash = $3, version = version + 1,
 				updated_at = clock_timestamp() WHERE repo = $1 AND name = $2
-				RETURNING name, owner, statement_hash, version, pinned, updated_at`, repo, name, changed[name]).
+				RETURNING name, owner, statement_hash, version, pinned, updated_at`, req.Repo, name, req.ChangedContracts[name]).
 				Scan(&advanced.Name, &advanced.Owner, &advanced.StatementHash, &advanced.Version, &advanced.Pinned, &advanced.UpdatedAt); err != nil {
 				return err
 			}
-			if err := event(ctx, tx, repo, "contract.advanced", name, migration.Owner, map[string]any{
+			if err := event(ctx, tx, req.Repo, "contract.advanced", name, migration.Owner, map[string]any{
 				"from_hash": current.StatementHash,
 				"to_hash":   advanced.StatementHash,
 				"version":   advanced.Version,
@@ -302,7 +378,7 @@ func (s *Store) Land(ctx context.Context, repo, id string, generation int64, com
 					WHERE agreement_reads.repo = agreements.repo
 						AND agreement_reads.agreement = agreements.id
 						AND contract = $2 AND version < $3
-				) RETURNING id`, repo, name, advanced.Version)
+				) RETURNING id`, req.Repo, name, advanced.Version)
 			if err != nil {
 				return err
 			}
@@ -311,7 +387,7 @@ func (s *Store) Land(ctx context.Context, repo, id string, generation int64, com
 				return err
 			}
 			for _, agreement := range ids {
-				if err := event(ctx, tx, repo, "agreement.staled", agreement, "", map[string]any{
+				if err := event(ctx, tx, req.Repo, "agreement.staled", agreement, "", map[string]any{
 					"contract": name,
 					"version":  advanced.Version,
 				}); err != nil {
@@ -320,17 +396,17 @@ func (s *Store) Land(ctx context.Context, repo, id string, generation int64, com
 			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE migrations SET state = $3, closed_at = clock_timestamp(),
-			close_reason = NULL, landed_commit = $4 WHERE repo = $1 AND id = $2`, repo, id, StateLanded, commit); err != nil {
+			close_reason = NULL, landed_commit = $4 WHERE repo = $1 AND id = $2`, req.Repo, req.Migration, StateLanded, req.Commit); err != nil {
 			return err
 		}
-		if err := event(ctx, tx, repo, "migration.landed", id, migration.Owner, map[string]any{
-			"generation": generation,
-			"commit":     commit,
+		if err := event(ctx, tx, req.Repo, "migration.landed", req.Migration, migration.Owner, map[string]any{
+			"generation": req.Generation,
+			"commit":     req.Commit,
 			"contracts":  names,
 		}); err != nil {
 			return err
 		}
-		landed, err = loadMigration(ctx, tx, repo, id, false)
+		landed, err = loadMigration(ctx, tx, req.Repo, req.Migration, false)
 		return err
 	})
 	return landed, err
