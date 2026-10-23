@@ -33,6 +33,8 @@ const (
 	ViolationPinned             = "pinned"              // a pinned contract change lacks a person's approval
 	// A changed registered contract has neither a compatibility proof nor an agent's review at the candidate's head.
 	ViolationStatementUnreviewed = "statement_unreviewed"
+	// A migration that is not owned by the configured upstream owner carries upstream provenance.
+	ViolationUpstreamNotAllowed = "upstream_not_allowed"
 )
 
 var violationKinds = [...]string{
@@ -47,6 +49,7 @@ var violationKinds = [...]string{
 	ViolationUndeclaredContract,
 	ViolationPinned,
 	ViolationStatementUnreviewed,
+	ViolationUpstreamNotAllowed,
 }
 
 // Check outcomes classify a complete pass, a refusal, or a pre-build check with deferred reads.
@@ -158,12 +161,14 @@ type CheckRequest struct {
 	ApprovedPinned []string `json:"approved_pinned"`
 	// DeferReads omits read-hash checks for a pre-build candidate. It can only produce an incomplete result.
 	DeferReads bool `json:"defer_reads"`
-	// ChangedContracts, CompatibilityProof and ReviewedHead are the statement change and its records, as Land
-	// receives them. Head is optional here: without it, only a compatibility proof can clear a statement change.
+	// ChangedContracts and its statement records are the same as Land receives. Head is optional here: without it,
+	// only a compatibility proof can clear a statement change.
 	ChangedContracts   map[string]string `json:"changed_contracts"`
 	Head               string            `json:"head"`
 	CompatibilityProof string            `json:"compatibility_proof"`
 	ReviewedHead       string            `json:"reviewed_head"`
+	Reviews            []Review          `json:"reviews"`
+	Upstream           string            `json:"upstream"`
 }
 
 // Violation is one reason a candidate must not land.
@@ -617,7 +622,8 @@ func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error
 		Upstream:           req.Upstream,
 	}
 	err = s.tx(ctx, func(tx pgx.Tx) error {
-		if _, err := lockRepo(ctx, tx, req.Repo, true); err != nil {
+		repository, err := lockRepo(ctx, tx, req.Repo, true)
+		if err != nil {
 			return err
 		}
 		migration, err := lockOpenAt(ctx, tx, req.Repo, req.ID, req.Generation)
@@ -626,6 +632,9 @@ func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error
 		}
 		if migration.EscalatedAt != nil {
 			return refuse(ReasonEscalated, "migration %s was escalated to the steward: %s", req.ID, migration.EscalationReason)
+		}
+		if upstream, blocked := upstreamViolation(repository, migration, req.Upstream); blocked {
+			return refusalForViolation(upstream)
 		}
 		event, err := eventRecord(ctx, tx, req.Repo, "migration.ready", req.ID, migration.Owner, readyEventData{
 			Generation: req.Generation, Head: req.Head, ChangedContracts: req.ChangedContracts, readyRecords: records,
@@ -712,7 +721,7 @@ func candidatePrecondition(req CheckRequest) (Violation, bool) {
 // cleanCheckRequest validates and normalizes candidate paths before they are compared to declared writes, and
 // validates the candidate's changed contracts and statement records.
 func cleanCheckRequest(req CheckRequest) (CheckRequest, error) {
-	if err := checkStatementChange(req.ChangedContracts, req.Head, req.CompatibilityProof, req.ReviewedHead); err != nil {
+	if err := checkStatementChange(req.ChangedContracts, req.Head, req.CompatibilityProof, req.ReviewedHead, req.Reviews, req.Upstream); err != nil {
 		return CheckRequest{}, err
 	}
 	changed := make([]string, 0, len(req.Changed))
@@ -798,6 +807,23 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 	return violations, nil
 }
 
+func upstreamViolation(repository Repository, migration Migration, upstream string) (Violation, bool) {
+	if upstream == "" || repository.UpstreamOwner == migration.Owner {
+		return Violation{}, false
+	}
+	if repository.UpstreamOwner == "" {
+		return Violation{
+			Kind:    ViolationUpstreamNotAllowed,
+			Message: fmt.Sprintf("repository %s has no configured upstream owner", repository.Name),
+		}, true
+	}
+	return Violation{
+		Kind: ViolationUpstreamNotAllowed,
+		Message: fmt.Sprintf("migration %s is owned by %s, not repository %s's upstream owner %s",
+			migration.ID, migration.Owner, repository.Name, repository.UpstreamOwner),
+	}, true
+}
+
 // Check decides whether a candidate change may land for a migration. It writes nothing but the event that
 // records its decision. A refusal of the request itself (an unknown migration, a bad path) is an error; every
 // reason the candidate must not land is a violation in the result.
@@ -809,7 +835,8 @@ func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error
 	}
 	res := CheckResult{Migration: cleaned.ID, Generation: cleaned.Generation, Deferred: []string{}}
 	err = s.tx(ctx, func(tx pgx.Tx) error {
-		if _, err := lockRepo(ctx, tx, cleaned.Repo, false); err != nil {
+		repository, err := lockRepo(ctx, tx, cleaned.Repo, false)
+		if err != nil {
 			return err
 		}
 		migration, err := loadMigration(ctx, tx, cleaned.Repo, cleaned.ID, true)
@@ -832,6 +859,9 @@ func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error
 			return err
 		}
 		res.Violations = append(res.Violations, contract...)
+		if upstream, blocked := upstreamViolation(repository, migration, cleaned.Upstream); blocked {
+			res.Violations = append(res.Violations, upstream)
+		}
 		switch {
 		case len(res.Violations) > 0:
 			res.Outcome = CheckOutcomeRefused

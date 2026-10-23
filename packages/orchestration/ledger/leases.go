@@ -9,28 +9,60 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// EnsureRepo creates the repository record, or updates its landing-round limit if it exists.
-func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds int) (Repository, error) {
+// EnsureRepoOption configures optional repository records.
+type EnsureRepoOption func(*ensureRepoOptions)
+
+type ensureRepoOptions struct {
+	upstreamOwner *string
+}
+
+// WithUpstreamOwner sets the migration owner allowed to attach upstream provenance. An empty owner clears it.
+func WithUpstreamOwner(owner string) EnsureRepoOption {
+	return func(options *ensureRepoOptions) {
+		options.upstreamOwner = &owner
+	}
+}
+
+// EnsureRepo creates the repository record, or updates its landing-round limit and selected configuration if it exists.
+func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds int, options ...EnsureRepoOption) (Repository, error) {
 	if name == "" {
 		return Repository{}, invalid("empty repository name")
 	}
 	if maxLandingRounds < 0 {
 		return Repository{}, invalid("max landing rounds %d is negative", maxLandingRounds)
 	}
+	config := ensureRepoOptions{}
+	for _, option := range options {
+		option(&config)
+	}
+	var configuredOwner any
+	if config.upstreamOwner != nil && *config.upstreamOwner != "" {
+		configuredOwner = *config.upstreamOwner
+	}
 	var r Repository
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		var prev *int
-		_ = tx.QueryRow(ctx, `SELECT max_landing_rounds FROM repositories WHERE name = $1 FOR UPDATE`, name).Scan(&prev)
-		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds) VALUES ($1, $2)
-			ON CONFLICT (name) DO UPDATE SET max_landing_rounds = EXCLUDED.max_landing_rounds
-			RETURNING name, max_landing_rounds, created_at`, name, maxLandingRounds).
-			Scan(&r.Name, &r.MaxLandingRounds, &r.CreatedAt); err != nil {
+		var previousRounds int
+		var previousOwner string
+		err := tx.QueryRow(ctx, `SELECT max_landing_rounds, coalesce(upstream_owner, '') FROM repositories WHERE name = $1 FOR UPDATE`, name).
+			Scan(&previousRounds, &previousOwner)
+		exists := err == nil
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		if prev != nil && *prev == maxLandingRounds {
+		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds, upstream_owner) VALUES ($1, $2, $3)
+			ON CONFLICT (name) DO UPDATE SET max_landing_rounds = EXCLUDED.max_landing_rounds,
+				upstream_owner = CASE WHEN $4 THEN EXCLUDED.upstream_owner ELSE repositories.upstream_owner END
+			RETURNING name, max_landing_rounds, coalesce(upstream_owner, ''), created_at`, name, maxLandingRounds, configuredOwner, config.upstreamOwner != nil).
+			Scan(&r.Name, &r.MaxLandingRounds, &r.UpstreamOwner, &r.CreatedAt); err != nil {
+			return err
+		}
+		if exists && previousRounds == maxLandingRounds && (config.upstreamOwner == nil || previousOwner == r.UpstreamOwner) {
 			return nil
 		}
-		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{"max_landing_rounds": maxLandingRounds})
+		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{
+			"max_landing_rounds": maxLandingRounds,
+			"upstream_owner":     r.UpstreamOwner,
+		})
 	})
 	return r, err
 }

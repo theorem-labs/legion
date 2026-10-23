@@ -24,7 +24,6 @@ func readyRequest(id string, generation int64, head string) ledger.ReadyRequest 
 			{Contract: "B.contract", Reviewer: "bob", Head: head},
 		},
 		ApprovedPinned: []string{"A.contract", "B.contract"},
-		Upstream:       "upstream-commit",
 	}
 }
 
@@ -41,7 +40,6 @@ func TestReadyRoundTripsEveryFieldOrdersByEventAndReplaces(t *testing.T) {
 	firstAgainRequest.ReviewedHead = "reviewed-2b"
 	firstAgainRequest.Reviews = []ledger.Review{{Contract: "A.contract", Reviewer: "carol", Head: "head-2b"}}
 	firstAgainRequest.ApprovedPinned = []string{"B.contract"}
-	firstAgainRequest.Upstream = "upstream-commit-2"
 	firstAgain := must(s.Ready(ctx, firstAgainRequest))
 
 	if firstAgain.ReadyEvent <= second.ReadyEvent || firstAgain.ReadyEvent == first.ReadyEvent {

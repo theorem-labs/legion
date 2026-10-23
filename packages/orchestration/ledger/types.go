@@ -8,6 +8,7 @@ type Repository struct {
 	// MaxLandingRounds is how many failed landing rounds a migration may use before it goes to the steward.
 	// Zero turns escalation off.
 	MaxLandingRounds int       `json:"max_landing_rounds"`
+	UpstreamOwner    string    `json:"upstream_owner,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 
@@ -37,14 +38,26 @@ type PathClash struct {
 	Theirs string `json:"theirs"`
 }
 
+// LastChange is the JSON record that allowed a contract's most recent statement advance.
+type LastChange string
+
+// MarshalJSON preserves the JSON object stored in Postgres instead of encoding it as a JSON string.
+func (c LastChange) MarshalJSON() ([]byte, error) {
+	if c == "" {
+		return []byte("null"), nil
+	}
+	return []byte(c), nil
+}
+
 // Contract records who owns a statement and the version of its current hash.
 type Contract struct {
-	Name          string    `json:"name"`
-	Owner         string    `json:"owner"`
-	StatementHash string    `json:"statement_hash"`
-	Version       int64     `json:"version"`
-	Pinned        bool      `json:"pinned"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	Name          string     `json:"name"`
+	Owner         string     `json:"owner"`
+	StatementHash string     `json:"statement_hash"`
+	Version       int64      `json:"version"`
+	Pinned        bool       `json:"pinned"`
+	LastChange    LastChange `json:"last_change"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // Agreement records the versions of contracts that its parties agreed to use.

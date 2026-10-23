@@ -129,14 +129,18 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 	args = args[1:]
 	switch command {
 	case "repo":
-		if len(args) != 3 || args[0] != "ensure" {
-			return nil, false, usagef("repo ensure <repo> <max-rounds>")
+		if len(args) < 3 || args[0] != "ensure" || (len(args) != 3 && (len(args) != 5 || args[3] != "--upstream-owner")) {
+			return nil, false, usagef("repo ensure <repo> <max-rounds> [--upstream-owner <name>]")
 		}
 		limit, err := roundLimit(args[2])
 		if err != nil {
 			return nil, false, err
 		}
-		return mutation(s.EnsureRepo(ctx, args[1], limit))
+		options := []ledger.EnsureRepoOption{}
+		if len(args) == 5 {
+			options = append(options, ledger.WithUpstreamOwner(args[4]))
+		}
+		return mutation(s.EnsureRepo(ctx, args[1], limit, options...))
 	case "enqueue":
 		if len(args) != 3 || args[0] == "" || args[1] == "" || args[2] == "" {
 			return nil, false, usagef("enqueue <repo> <item> <owner>")
@@ -296,7 +300,8 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			if len(args) < 3 {
 				return nil, true, usagef("check <repo> <id> <generation> [--path <path>|--no-paths] [--current <name=hash>] " +
 					"[--commit <sha>] [--approved-pinned <name>] [--defer-reads] [--changed-contract <name=hash>] " +
-					"[--head <commit>] [--compatibility-proof <name>] [--reviewed-head <commit>]")
+					"[--head <commit>] [--compatibility-proof <name>] [--reviewed-head <commit>] " +
+					"[--review <contract=reviewer@head>] [--upstream <commit>]")
 			}
 			generation, err := integer(args[2])
 			if err != nil {
@@ -610,6 +615,14 @@ func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
 			request.CompatibilityProof = value
 		case "--reviewed-head":
 			request.ReviewedHead = value
+		case "--review":
+			review, err := parseReview(value)
+			if err != nil {
+				return ledger.CheckRequest{}, err
+			}
+			request.Reviews = append(request.Reviews, review)
+		case "--upstream":
+			request.Upstream = value
 		default:
 			return ledger.CheckRequest{}, usagef("unknown check flag %q", flag)
 		}
@@ -768,6 +781,14 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 			request.CompatibilityProof = value
 		case "--reviewed-head":
 			request.ReviewedHead = value
+		case "--review":
+			review, err := parseReview(value)
+			if err != nil {
+				return ledger.LandRequest{}, err
+			}
+			request.Reviews = append(request.Reviews, review)
+		case "--upstream":
+			request.Upstream = value
 		default:
 			return ledger.LandRequest{}, usagef("unknown land flag %q", flag)
 		}

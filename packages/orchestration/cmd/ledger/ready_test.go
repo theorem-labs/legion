@@ -61,9 +61,9 @@ func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
 	invoke("open", "r", "M-file", "bob", "base", "branch", "--write", "b.lean")
 	invoke("ready", "r", "M-flag", "1", "--head", "head-flag", "--changed-contract", "C.flag=hash-flag",
 		"--compatibility-proof", "C.compat", "--reviewed-head", "head-flag", "--review", "C.flag=alice@head-flag",
-		"--approved-pinned", "C.flag", "--upstream", "upstream-flag")
+		"--approved-pinned", "C.flag")
 
-	request := `{"repo":"r","id":"M-file","generation":1,"head":"head@file","changed_contracts":{"C@file":"hash=from-file"},"compatibility_proof":"C@compat","reviewed_head":"head@file","reviews":[{"contract":"C@file","reviewer":"alice=reviewer","head":"head@file"}],"approved_pinned":["C@file"],"upstream":"upstream@file"}`
+	request := `{"repo":"r","id":"M-file","generation":1,"head":"head@file","changed_contracts":{"C@file":"hash=from-file"},"compatibility_proof":"C@compat","reviewed_head":"head@file","reviews":[{"contract":"C@file","reviewer":"alice=reviewer","head":"head@file"}],"approved_pinned":["C@file"]}`
 	file := filepath.Join(t.TempDir(), "ready.json")
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
 		!reflect.DeepEqual(flag.ChangedContracts, map[string]string{"C.flag": "hash-flag"}) || flag.CompatibilityProof != "C.compat" ||
 		flag.ReviewedHead != "head-flag" || len(flag.Reviews) != 1 || flag.Reviews[0].Contract != "C.flag" ||
 		flag.Reviews[0].Reviewer != "alice" || flag.Reviews[0].Head != "head-flag" || !reflect.DeepEqual(flag.ApprovedPinned, []string{"C.flag"}) ||
-		flag.Upstream != "upstream-flag" {
+		flag.Upstream != "" {
 		t.Fatalf("flag request did not round-trip: %+v", flag)
 	}
 	fromFile := records[1]
@@ -90,7 +90,7 @@ func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
 		!reflect.DeepEqual(fromFile.ChangedContracts, map[string]string{"C@file": "hash=from-file"}) || fromFile.CompatibilityProof != "C@compat" ||
 		fromFile.ReviewedHead != "head@file" || len(fromFile.Reviews) != 1 || fromFile.Reviews[0].Contract != "C@file" ||
 		fromFile.Reviews[0].Reviewer != "alice=reviewer" || fromFile.Reviews[0].Head != "head@file" || !reflect.DeepEqual(fromFile.ApprovedPinned, []string{"C@file"}) ||
-		fromFile.Upstream != "upstream@file" {
+		fromFile.Upstream != "" {
 		t.Fatalf("request-file request did not round-trip: %+v", fromFile)
 	}
 
