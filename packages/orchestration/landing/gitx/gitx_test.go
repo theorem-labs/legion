@@ -103,6 +103,93 @@ func TestChangeSetUsesMergeBase(t *testing.T) {
 	}
 }
 
+func TestDossierCase1KeepsEachMemberChangeSet(t *testing.T) {
+	repo := newRepository(t)
+	base := repo.commit("base", "base\n")
+	first := repo.branch(base, "first", "one\n")
+	second := repo.branch(base, "second", "two\n")
+
+	result, err := Candidate(context.Background(), repo.path, base, []Member{{ID: "first", Head: first}, {ID: "second", Head: second}})
+	if err != nil {
+		t.Fatalf("Candidate() error = %v", err)
+	}
+	if len(result.Dropped) != 0 {
+		t.Fatalf("Candidate() dropped = %#v, want none", result.Dropped)
+	}
+	if got, want := repo.contents(result.Commit, "first"), "one\n"; got != want {
+		t.Fatalf("first contents = %q, want %q", got, want)
+	}
+	if got, want := repo.contents(result.Commit, "second"), "two\n"; got != want {
+		t.Fatalf("second contents = %q, want %q", got, want)
+	}
+}
+
+func TestDossierCase5UsesMemberHeadsRatherThanStagingMergeParents(t *testing.T) {
+	repo := newRepository(t)
+	base := repo.commit("base", "base\n")
+	first := repo.branch(base, "first", "one\n")
+	movedBase := repo.branch(base, "upstream", "new\n")
+	member := repo.branch(movedBase, "member", "member\n")
+
+	result, err := Candidate(context.Background(), repo.path, base, []Member{{ID: "first", Head: first}, {ID: "member", Head: member}})
+	if err != nil {
+		t.Fatalf("Candidate() error = %v", err)
+	}
+	if len(result.Dropped) != 0 {
+		t.Fatalf("Candidate() dropped = %#v, want none", result.Dropped)
+	}
+	if got, want := repo.contents(result.Commit, "member"), "member\n"; got != want {
+		t.Fatalf("member contents = %q, want %q", got, want)
+	}
+}
+
+func TestDossierCase6RebuildsFromBaseWithoutDroppedMember(t *testing.T) {
+	repo := newRepository(t)
+	base := repo.commit("base", "base\n")
+	keep := repo.branch(base, "keep", "keep\n")
+	drop := repo.branch(base, "drop", "drop\n")
+
+	result, err := Rebuild(context.Background(), repo.path, base, []Member{{ID: "keep", Head: keep}, {ID: "drop", Head: drop}}, map[string]struct{}{"drop": struct{}{}})
+	if err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+	if got, want := repo.contents(result.Commit, "keep"), "keep\n"; got != want {
+		t.Fatalf("keep contents = %q, want %q", got, want)
+	}
+	if got, want := repo.contents(result.Commit, "drop"), ""; got != want {
+		t.Fatalf("drop contents = %q, want no file", got)
+	}
+}
+
+func TestDossierCase7DropsDuplicatedHeadWithoutBroadAttribution(t *testing.T) {
+	repo := newRepository(t)
+	base := repo.commit("base", "base\n")
+	head := repo.branch(base, "member", "member\n")
+
+	result, err := Candidate(context.Background(), repo.path, base, []Member{{ID: "one", Head: head}, {ID: "two", Head: head}})
+	if err != nil {
+		t.Fatalf("Candidate() error = %v", err)
+	}
+	if got, want := result.Dropped, []Drop{{ID: "two", Reason: "duplicate"}}; !sameDrops(got, want) {
+		t.Fatalf("Candidate() dropped = %#v, want %#v", got, want)
+	}
+}
+
+func TestDossierCase18ComparesAgainstCurrentBase(t *testing.T) {
+	repo := newRepository(t)
+	base := repo.commit("base", "base\n")
+	current := repo.commit("upstream", "new\n")
+	member := repo.branch(current, "member", "member\n")
+
+	change, err := ChangeSet(context.Background(), repo.path, current, Member{ID: "member", Head: member})
+	if err != nil {
+		t.Fatalf("ChangeSet() error = %v", err)
+	}
+	if got, want := change.Files, []string{"member"}; !sameStrings(got, want) {
+		t.Fatalf("ChangeSet() files = %#v, want %#v (initial base %q)", got, want, base)
+	}
+}
+
 type repository struct {
 	t    *testing.T
 	path string

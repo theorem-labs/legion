@@ -1,0 +1,77 @@
+package landing
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
+
+	"github.com/sjawhar/legion/orchestration/landing/gitx"
+)
+
+// RepositoryGit implements Git by invoking the repository's git binary without
+// creating or changing a working copy.
+type RepositoryGit struct{}
+
+// Candidate builds an in-memory candidate commit.
+func (RepositoryGit) Candidate(ctx context.Context, repository, base string, members []Member) (gitx.Result, error) {
+	inputs := make([]gitx.Member, len(members))
+	for index, member := range members {
+		inputs[index] = gitx.Member{ID: member.Migration, Head: member.Head}
+	}
+	result, err := gitx.Candidate(ctx, repository, base, inputs)
+	if err != nil {
+		return gitx.Result{}, fmt.Errorf("build candidate: %w", err)
+	}
+	return result, nil
+}
+
+// ChangeSet returns a member's merge-base diff against the candidate base.
+func (RepositoryGit) ChangeSet(ctx context.Context, repository, base string, member Member) (gitx.Change, error) {
+	change, err := gitx.ChangeSet(ctx, repository, base, gitx.Member{ID: member.Migration, Head: member.Head})
+	if err != nil {
+		return gitx.Change{}, fmt.Errorf("read change set: %w", err)
+	}
+	return change, nil
+}
+
+// Diff returns a zero-context diff for a member's merge-base range.
+func (RepositoryGit) Diff(ctx context.Context, repository, base string, member Member) (string, error) {
+	mergeBase, err := repositoryGit(ctx, repository, "merge-base", base, member.Head)
+	if err != nil {
+		return "", fmt.Errorf("find merge base for %q: %w", member.Migration, err)
+	}
+	diff, err := repositoryGit(ctx, repository, "diff", "-U0", "--no-color", mergeBase, member.Head)
+	if err != nil {
+		return "", fmt.Errorf("read diff for %q: %w", member.Migration, err)
+	}
+	return diff, nil
+}
+
+// DeclarationLines returns lines in a tree that mention a declaration name.
+func (RepositoryGit) DeclarationLines(ctx context.Context, repository string, tree Tree, name string) ([]string, error) {
+	command := exec.CommandContext(ctx, "git", "-C", repository, "grep", "-h", "-I", "-F", name, string(tree), "--")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("git grep %q: %w: %s", name, err, strings.TrimSpace(string(output)))
+	}
+	text := strings.TrimSpace(string(output))
+	if text == "" {
+		return nil, nil
+	}
+	return strings.Split(text, "\n"), nil
+}
+
+func repositoryGit(ctx context.Context, repository string, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", repository}, args...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
