@@ -173,15 +173,29 @@ func logf(w io.Writer, format string, args ...any) {
 	}
 }
 
-// Refresh brings the index to the tree's current build: it re-reads the modules whose reference file changed,
-// drops the ones that are gone, recomputes their edges, and (with an exporter) re-reads the compiled modules
-// that changed and re-matches the statements that reach a changed definition.
+// Refresh brings the index to the tree's current build. It is RefreshAt without a post-landing synchronisation.
 func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
+	return s.RefreshAt(ctx, tree, opt, nil)
+}
+
+// RefreshAt holds the writer lock across sync and the refresh: a post-landing fetch, checkout and build cannot
+// race a second index refresh, and a query observes only the result after both complete.
+func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sync func(context.Context) error) (RefreshStats, error) {
 	unlock, err := s.lock()
 	if err != nil {
 		return RefreshStats{}, err
 	}
 	defer unlock()
+	if sync != nil {
+		if err := sync(ctx); err != nil {
+			return RefreshStats{}, err
+		}
+	}
+	return s.refreshLocked(ctx, tree, opt)
+}
+
+// refreshLocked is Refresh's body. Its caller holds the writer lock.
+func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	var st RefreshStats
 	files, err := scan(tree, opt.jobs())

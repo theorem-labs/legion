@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -44,6 +45,35 @@ func TestConfigRefusesMissingTreeAndRoots(t *testing.T) {
 	for _, body := range []string{"roots: [A]\n", "tree: x\n", "tree: x\nroots: [A]\nunknown_key: 1\n"} {
 		if _, err := LoadConfig(writeConfig(t, body)); err == nil {
 			t.Errorf("config %q accepted", body)
+		}
+	}
+}
+
+func TestConfigBuildSettingsAndLibraryRelativePath(t *testing.T) {
+	p := writeConfig(t, "tree: ../tree\nlib: out/lean\ndb: state/index.sqlite\nroots: [A]\nbuild: [tool, build]\nremote: /srv/owners.git\nbuild_timeout: 90s\nregistry: registry\n")
+	c, err := LoadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LibRel != filepath.Join("out", "lean") || c.Lib != filepath.Join(c.Tree, "out", "lean") {
+		t.Fatalf("library paths: relative %q, resolved %q", c.LibRel, c.Lib)
+	}
+	if !reflect.DeepEqual(c.Build, []string{"tool", "build"}) || c.Remote != "/srv/owners.git" {
+		t.Fatalf("build settings: %+v", c)
+	}
+	if c.BuildTimeout != 90*time.Second {
+		t.Fatalf("build timeout %s, want 90s", c.BuildTimeout)
+	}
+	defaults, err := LoadConfig(writeConfig(t, "tree: tree\ndb: state/index.sqlite\nroots: [A]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.LibRel != filepath.Join(".lake", "build", "lib", "lean") || defaults.BuildTimeout != 6*time.Hour {
+		t.Fatalf("defaults: relative library %q, timeout %s", defaults.LibRel, defaults.BuildTimeout)
+	}
+	for _, timeout := range []string{"tomorrow", "-1s"} {
+		if _, err := LoadConfig(writeConfig(t, "tree: tree\nroots: [A]\nbuild_timeout: "+timeout+"\n")); err == nil {
+			t.Errorf("accepted build_timeout %q", timeout)
 		}
 	}
 }

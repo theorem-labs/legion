@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,26 +17,54 @@ import (
 // Config is one project's index configuration, a YAML file that the project keeps beside its proofs. `tree` and
 // `db` are relative to the file's directory; `lib`, `registry` and `owners` are relative to the tree.
 type Config struct {
-	Tree      string   `yaml:"tree"`
-	Lib       string   `yaml:"lib"`
-	DB        string   `yaml:"db"`
-	Roots     []string `yaml:"roots"`
-	FileKinds []string `yaml:"file_kinds"`
-	Jobs      int      `yaml:"jobs"`
-	// Registry is the concept registry file (see package conceptgate).
-	Registry string `yaml:"registry"`
+	Tree string
+	// LibRel is the configured library path below Tree; Lib is the resolved path.
+	LibRel    string
+	Lib       string
+	DB        string
+	Roots     []string
+	FileKinds []string
+	Jobs      int
+	// Registry is the concept registry directory (see package conceptgate), relative to Tree.
+	Registry string
+	// Build runs in Tree after RefreshAt has moved it to LAND_COMMIT.
+	Build []string
+	// Remote is the sole remote RefreshAt fetches LAND_COMMIT from when Tree lacks it.
+	Remote string
+	// BuildTimeout bounds Build; LoadConfig defaults it to six hours.
+	BuildTimeout time.Duration
 	// Lean configures the exporter of compiled modules. With Lean.Export off, the index reads only the reference
 	// files (uses, positions, statement hashes).
-	Lean LeanConfig `yaml:"lean"`
+	Lean LeanConfig
 	// Contracts selects the declarations that the ledger tracks, and Owners maps them to their owners.
-	Contracts ContractRule `yaml:"contracts"`
-	Owners    string       `yaml:"owners"`
+	Contracts ContractRule
+	Owners    string
 	// OwnersFormat is the "format" value the owner map must carry (its producer's format name); empty accepts any.
-	OwnersFormat string `yaml:"owners_format"`
+	OwnersFormat string
 	// Repo is the repository's name in the ledger.
-	Repo string `yaml:"repo"`
+	Repo string
 	// Librarian is the command that hands a near match to the librarian (the proposal and verdict on stdin).
-	Librarian []string `yaml:"librarian"`
+	Librarian []string
+}
+
+// configYAML retains YAML's strict field check while Config keeps resolved paths and a parsed duration.
+type configYAML struct {
+	Tree         string       `yaml:"tree"`
+	Lib          string       `yaml:"lib"`
+	DB           string       `yaml:"db"`
+	Roots        []string     `yaml:"roots"`
+	FileKinds    []string     `yaml:"file_kinds"`
+	Jobs         int          `yaml:"jobs"`
+	Registry     string       `yaml:"registry"`
+	Build        []string     `yaml:"build"`
+	Remote       string       `yaml:"remote"`
+	BuildTimeout string       `yaml:"build_timeout"`
+	Lean         LeanConfig   `yaml:"lean"`
+	Contracts    ContractRule `yaml:"contracts"`
+	Owners       string       `yaml:"owners"`
+	OwnersFormat string       `yaml:"owners_format"`
+	Repo         string       `yaml:"repo"`
+	Librarian    []string     `yaml:"librarian"`
 }
 
 // LeanConfig says how to build and run the exporter.
@@ -68,17 +97,27 @@ func LoadConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	var c Config
+	var y configYAML
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
-	if err := dec.Decode(&c); err != nil {
+	if err := dec.Decode(&y); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
-	if c.Tree == "" {
+	if y.Tree == "" {
 		return Config{}, fmt.Errorf("%s: tree is required", path)
 	}
-	if len(c.Roots) == 0 {
+	if len(y.Roots) == 0 {
 		return Config{}, fmt.Errorf("%s: roots are required: the first components of the project's module names", path)
+	}
+	timeout := 6 * time.Hour
+	if y.BuildTimeout != "" {
+		timeout, err = time.ParseDuration(y.BuildTimeout)
+		if err != nil || timeout <= 0 {
+			if err == nil {
+				err = errors.New("must be greater than zero")
+			}
+			return Config{}, fmt.Errorf("%s: build_timeout %q: %w", path, y.BuildTimeout, err)
+		}
 	}
 	dir := filepath.Dir(path)
 	rel := func(base, p string) string {
@@ -87,12 +126,29 @@ func LoadConfig(path string) (Config, error) {
 		}
 		return filepath.Join(base, p)
 	}
-	c.Tree = rel(dir, c.Tree)
-	if c.Lib == "" {
-		c.Lib = filepath.Join(".lake", "build", "lib", "lean")
+	libRel := y.Lib
+	if libRel == "" {
+		libRel = filepath.Join(".lake", "build", "lib", "lean")
 	}
-	c.Lib = rel(c.Tree, c.Lib)
-	c.DB = rel(dir, c.DB)
+	c := Config{
+		Tree:         rel(dir, y.Tree),
+		LibRel:       libRel,
+		DB:           rel(dir, y.DB),
+		Roots:        y.Roots,
+		FileKinds:    y.FileKinds,
+		Jobs:         y.Jobs,
+		Registry:     y.Registry,
+		Build:        y.Build,
+		Remote:       y.Remote,
+		BuildTimeout: timeout,
+		Lean:         y.Lean,
+		Contracts:    y.Contracts,
+		Owners:       y.Owners,
+		OwnersFormat: y.OwnersFormat,
+		Repo:         y.Repo,
+		Librarian:    y.Librarian,
+	}
+	c.Lib = rel(c.Tree, c.LibRel)
 	c.Registry = rel(c.Tree, c.Registry)
 	c.Owners = rel(c.Tree, c.Owners)
 	for i, p := range c.Lean.SearchPath {

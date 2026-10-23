@@ -286,3 +286,42 @@ func TestRefreshRereadsAModuleWhoseSourceChangedInPlace(t *testing.T) {
 		t.Fatal("the statement hash did not change with the statement")
 	}
 }
+
+func TestRefreshAtSerializesTheSyncStepWithTheWriterLock(t *testing.T) {
+	tree := goldenTree(t)
+	s := openStore(t)
+	ctx := context.Background()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.RefreshAt(ctx, tree, RefreshOptions{Commit: "one"}, func(context.Context) error {
+			close(entered)
+			<-release
+			return nil
+		})
+		firstDone <- err
+	}()
+	<-entered
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := s.RefreshAt(ctx, tree, RefreshOptions{Commit: "two"}, func(context.Context) error {
+			close(secondStarted)
+			return nil
+		})
+		secondDone <- err
+	}()
+	select {
+	case <-secondStarted:
+		t.Fatal("the second sync ran while the first writer lock was held")
+	default:
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
