@@ -150,8 +150,17 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if len(args) != 1 {
 			return nil, true, usagef("owners <repo>")
 		}
-		value, err := s.OpenOwners(ctx, args[0])
+		value, err := openOwners(ctx, s, args[0])
 		return value, true, err
+	case "refuse-owner":
+		if len(args) != 4 {
+			return nil, false, usagef("refuse-owner <repo> <owner> <revision> <reason>")
+		}
+		revision, err := canonicalInteger("revision", args[2])
+		if err != nil {
+			return nil, false, err
+		}
+		return mutation(s.RecordOwnerRefused(ctx, args[0], args[1], revision, args[3]))
 	case "claim":
 		if len(args) != 4 {
 			return nil, false, usagef("claim <repo> <item> <holder> <ttl|0>")
@@ -475,6 +484,16 @@ func writeError(stderr io.Writer, jsonOutput bool, err error) int {
 }
 
 func usagef(format string, args ...any) error { return &usageError{fmt.Sprintf(format, args...)} }
+
+// canonicalInteger parses value only in its canonical decimal form, so "07" and "+7" are refused rather than read as
+// the 7 that the ledger stores.
+func canonicalInteger(what, value string) (int64, error) {
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || strconv.FormatInt(n, 10) != value {
+		return 0, usagef("invalid %s %q: want a decimal integer without sign or leading zeros", what, value)
+	}
+	return n, nil
+}
 func integer(value string) (int64, error) {
 	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
@@ -506,6 +525,33 @@ func roundLimit(value string) (int, error) {
 		return 0, usagef("max rounds %q must be in 0..2147483647", value)
 	}
 	return int(limit), nil
+}
+
+// ownerLine is one owner in `ledger owners`: an owner with open work, and its refusal at its current work revision,
+// when it has one.
+type ownerLine struct {
+	Owner   string               `json:"owner"`
+	Refusal *ledger.OwnerRefusal `json:"refusal,omitempty"`
+}
+
+func openOwners(ctx context.Context, s *ledger.Store, repo string) ([]ownerLine, error) {
+	owners, err := s.OpenOwners(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	refusals, err := s.OwnerRefusals(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	byOwner := make(map[string]*ledger.OwnerRefusal, len(refusals))
+	for i := range refusals {
+		byOwner[refusals[i].Owner] = &refusals[i]
+	}
+	lines := make([]ownerLine, len(owners))
+	for i, owner := range owners {
+		lines[i] = ownerLine{Owner: owner, Refusal: byOwner[owner]}
+	}
+	return lines, nil
 }
 
 type extendRequest struct {

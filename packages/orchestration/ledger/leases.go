@@ -126,12 +126,17 @@ func (s *Store) OwnerWorkRevision(ctx context.Context, repo, owner string) (int6
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `SELECT coalesce(max(e.id), 0)
-			FROM events e JOIN work_items item ON item.repo = e.repo AND item.id = e.subject
-			WHERE e.repo = $1 AND item.owner = $2 AND e.kind IN ('item.enqueued', 'item.completed')`,
-			repo, owner).Scan(&revision)
+		return tx.QueryRow(ctx, ownerWorkRevisionQuery("$2"), repo, owner).Scan(&revision)
 	})
 	return revision, err
+}
+
+// ownerWorkRevisionQuery selects OwnerWorkRevision, zero for an owner with no work, of the owner that the SQL
+// expression owner names in repository $1: a parameter, or a column of an enclosing query.
+func ownerWorkRevisionQuery(owner string) string {
+	return `SELECT coalesce(max(e.id), 0)
+		FROM events e JOIN work_items item ON item.repo = e.repo AND item.id = e.subject
+		WHERE e.repo = $1 AND item.owner = ` + owner + ` AND e.kind IN ('item.enqueued', 'item.completed')`
 }
 
 // checkLeaseArgs accepts a ttl of zero, a supervised lease with no end, or a fixed end of at least a

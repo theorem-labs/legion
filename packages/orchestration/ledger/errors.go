@@ -28,6 +28,7 @@ const (
 	ReasonUndeclaredWrite    = "undeclared_write"     // the candidate writes a path outside the migration lock
 	ReasonUndeclaredContract = "undeclared_contract"  // the migration did not declare the changed contract as a read
 	ReasonUpstreamNotAllowed = "upstream_not_allowed" // only the configured upstream owner may record provenance
+	ReasonRefusalConflict    = "refusal_conflict"     // the owner's work revision already has a refusal with another reason
 	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.
 	ReasonStatementUnreviewed = "statement_unreviewed"
 )

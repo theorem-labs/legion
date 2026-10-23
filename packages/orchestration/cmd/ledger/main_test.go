@@ -255,10 +255,14 @@ func TestOwnerCommandsRoundTrip(t *testing.T) {
 		t.Fatalf("%d item.enqueued events for item-1, want 1: %+v", enqueued, log)
 	}
 
-	var owners []string
+	var owners []struct {
+		Owner   string           `json:"owner"`
+		Refusal *json.RawMessage `json:"refusal"`
+	}
 	if err := json.Unmarshal([]byte(invoke("--json", "owners", "r")), &owners); err != nil ||
-		len(owners) != 2 || owners[0] != "function:get_mountpoint" || owners[1] != "struct:mount" {
-		t.Fatalf("open owners: %v %v", err, owners)
+		len(owners) != 2 || owners[0].Owner != "function:get_mountpoint" || owners[1].Owner != "struct:mount" ||
+		owners[0].Refusal != nil || owners[1].Refusal != nil {
+		t.Fatalf("open owners: %v %+v", err, owners)
 	}
 
 	if code, out, _ := call("--json", "enqueue", "r", "item-1", "struct:mount"); code != 1 || !strings.Contains(out, `"reason":"exists"`) {
@@ -298,9 +302,10 @@ func TestOwnerCommandsRoundTrip(t *testing.T) {
 	}
 	invoke("claim", "r", "item-2", "struct:mount", "0")
 	invoke("complete", "r", "item-2", "struct:mount", "1", "done")
+	owners = nil
 	if err := json.Unmarshal([]byte(invoke("--json", "owners", "r")), &owners); err != nil ||
-		len(owners) != 1 || owners[0] != "function:get_mountpoint" {
-		t.Fatalf("open owners after a completion: %v %v", err, owners)
+		len(owners) != 1 || owners[0].Owner != "function:get_mountpoint" || owners[0].Refusal != nil {
+		t.Fatalf("open owners after a completion: %v %+v", err, owners)
 	}
 	if code, _, _ := call("--json", "enqueue", "r", "item-2", "struct:mount"); code != 1 {
 		t.Fatalf("enqueue of a done item exited %d, want 1", code)
