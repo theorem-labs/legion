@@ -1,7 +1,8 @@
 """cgraph build --config FILE --part NAME --out DIR [--cache DIR] [--root DIR] [--jobs N] [--json]
 
 Exit status: 0 the graph is built and every hard check passes; 1 a hard check failed (the outputs
-are written); 2 a usage or configuration error; 3 an input cannot be read or parsed.
+are written); 2 a usage or configuration error; 3 inputs cannot be read or an internal error occurs;
+4 a worker process died.
 """
 
 from __future__ import annotations
@@ -9,10 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 
 from . import config as configuration
 from . import pipeline
+from .errors import InputError, WorkerDied
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,15 +38,30 @@ def main(argv: list[str] | None = None) -> int:
     except configuration.ConfigError as error:
         print(f"cgraph: {error}", file=sys.stderr)
         return 2
-    except (pipeline.InputError, OSError) as error:
+    except WorkerDied as error:
         print(f"cgraph: {error}", file=sys.stderr)
+        return 4
+    except (InputError, OSError) as error:
+        print(f"cgraph: {error}", file=sys.stderr)
+        return 3
+    except Exception as error:
+        print(f"cgraph: internal error: {error}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return 3
     summary = {
         "passes": result.passes,
         "counts": result.counts,
-        "parsed": result.parsed,
+        "parsed": len(result.parsed),
         "reused": len(result.reused),
-        "hard_checks": result.hard_checks,
+        "hard_checks": [
+            {
+                "name": item["name"],
+                "ok": item["ok"],
+                "count": item.get("count", 0),
+                "detail": item["detail"],
+            }
+            for item in result.hard_checks
+        ],
         "outputs": result.outputs,
     }
     if arguments.json:

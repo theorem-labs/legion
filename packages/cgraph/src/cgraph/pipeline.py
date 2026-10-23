@@ -4,9 +4,12 @@ the owners and their topics, the measures, and the report."""
 from __future__ import annotations
 
 import hashlib
-import multiprocessing
 import os
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +17,10 @@ from . import checks, clangfacts, commands, jsonio, link, measures, owners, repo
 from .cache import Cache, Contents, sources_digest
 from .config import Config, part_files
 from .contracts import ContractGraph
+from .errors import InputError, WorkerDied
 from .image import Image
 
 VERSION = "cgraph/1"
-
-
-class InputError(RuntimeError):
-    """An input that cannot be read."""
 
 
 @dataclass
@@ -45,6 +45,25 @@ def _sha256(path: Path | None) -> str | None:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError as error:
         raise InputError(f"cannot read {path}: {error}") from error
+
+
+def _write_outputs(out: Path, rendered: dict[str, str]) -> None:
+    """Write every output to a distinct temporary file before replacing any prior output."""
+    temporary_paths: list[tuple[Path, Path]] = []
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        for name, contents in rendered.items():
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=out)
+            temporary = Path(temporary_name)
+            temporary_paths.append((temporary, out / name))
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(contents)
+        for temporary, destination in temporary_paths:
+            os.replace(temporary, destination)
+    except BaseException:
+        for temporary, _ in temporary_paths:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def run(config: Config, part: str, out: Path, cache_directory: Path | None = None, jobs: int = 1) -> Result:
@@ -80,22 +99,31 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
     digest = config.vocabulary.digest()
     facts: dict[str, dict[str, Any]] = {}
     pending = []
-    for source in files:
-        cached = cache.lookup(source, arguments[source], digest, contents)
-        if cached is not None:
-            facts[source] = cached
-        else:
-            pending.append((source, str(inputs.c_tree), arguments[source], config.vocabulary))
-    if pending:
-        if jobs > 1 and len(pending) > 1:
-            with multiprocessing.get_context("fork").Pool(min(jobs, len(pending))) as pool:
-                parsed = pool.map(_extract, pending, chunksize=1)
-        else:
-            parsed = [_extract(job) for job in pending]
-        for source, unit in parsed:
-            facts[source] = unit
-            cache.store(source, arguments[source], digest, unit, contents)
-    cache.save()
+    try:
+        for source in files:
+            cached = cache.lookup(source, arguments[source], digest, contents)
+            if cached is not None:
+                facts[source] = cached
+            else:
+                pending.append((source, str(inputs.c_tree), arguments[source], config.vocabulary))
+        if pending:
+            if jobs > 1 and len(pending) > 1:
+                try:
+                    with ProcessPoolExecutor(
+                        max_workers=min(jobs, len(pending)), mp_context=get_context("fork")
+                    ) as executor:
+                        parsed = list(executor.map(_extract, pending, chunksize=1))
+                except BrokenProcessPool as error:
+                    raise WorkerDied("a C-facts worker process died") from error
+            else:
+                parsed = [_extract(job) for job in pending]
+            for source, unit in parsed:
+                facts[source] = unit
+                cache.store(source, arguments[source], digest, unit, contents)
+        cache.save()
+    except BaseException:
+        cache.close()
+        raise
     image = Image(inputs.image, inputs.system_map, config.image)
     functions = [(name, function) for unit in facts.values() for name, function in unit["functions"].items()]
     image.arity = {name: function["parameters"] for name, function in functions if "parameters" in function}
@@ -140,10 +168,9 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
         "topics.json": topics,
         "measures.json": numbers,
     }
-    out.mkdir(parents=True, exist_ok=True)
-    for name, value in outputs.items():
-        jsonio.write(out / name, value)
-    (out / "report.md").write_text(report.render(graph, check_document, owner_list, topics, numbers))
+    rendered = {name: jsonio.dumps(value) for name, value in outputs.items()}
+    rendered["report.md"] = report.render(graph, check_document, owner_list, topics, numbers)
+    _write_outputs(out, rendered)
     parsed_sources = sorted(job[0] for job in pending)
     counts = {
         "nodes": len(graph["nodes"]),
@@ -156,7 +183,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
         hard_checks=hard,
         parsed=parsed_sources,
         reused=sorted(set(files) - set(parsed_sources)),
-        outputs={name: str(out / name) for name in [*outputs, "report.md"]},
+        outputs={name: str(out / name) for name in rendered},
         counts=counts,
     )
 

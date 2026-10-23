@@ -8,6 +8,8 @@ import re
 import shlex
 from pathlib import Path
 
+from .errors import InputError
+
 # Arguments that take the next argument as their value and change what the preprocessor or the
 # parser sees.
 _KEEP_WITH_VALUE = {"-include", "-imacros", "-isystem", "-iquote", "-idirafter", "-I", "-D", "-U", "-target"}
@@ -72,20 +74,41 @@ def load_database(
     path: Path, c_tree: Path, rewrites: tuple[tuple[re.Pattern[str], str], ...] = ()
 ) -> dict[str, list[str]]:
     """Map each C file of a compilation database, relative to the C tree, to its parser arguments."""
-    entries = json.loads(path.read_text())
+    try:
+        entries = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as error:
+        raise InputError(f"cannot read compilation database {path}: {error}") from error
+    if not isinstance(entries, list):
+        raise InputError(f"compilation database {path} must be a JSON array")
     tree = c_tree.resolve()
     result: dict[str, list[str]] = {}
-    for entry in entries:
-        directory = Path(entry["directory"])
-        source = Path(_absolute(entry["file"], directory)).resolve()
-        if source.suffix != ".c":
-            continue
+    for index, entry in enumerate(entries):
+        where = f"compilation database {path} entry {index}"
+        if not isinstance(entry, dict):
+            raise InputError(f"{where} must be an object")
+        directory, filename = entry.get("directory"), entry.get("file")
+        if not isinstance(directory, str) or not isinstance(filename, str):
+            raise InputError(f"{where} must contain string directory and file fields")
+        directory_path = Path(directory)
+        source = Path(_absolute(filename, directory_path)).resolve()
         try:
             relative = str(source.relative_to(tree))
-        except ValueError:
+        except ValueError as error:
+            raise InputError(f"{where} names {source} outside the C tree {tree}") from error
+        if source.suffix != ".c":
             continue
-        arguments = entry.get("arguments") or shlex.split(entry["command"])
-        result[relative] = [*rewrite(filter_arguments(arguments, directory), rewrites), *PARSER_FLAGS]
+        arguments = entry.get("arguments")
+        if arguments is None:
+            command = entry.get("command")
+            if not isinstance(command, str):
+                raise InputError(f"{where} must contain string arguments or command")
+            try:
+                arguments = shlex.split(command)
+            except ValueError as error:
+                raise InputError(f"{where} has an invalid command: {error}") from error
+        if not isinstance(arguments, list) or not all(isinstance(argument, str) for argument in arguments):
+            raise InputError(f"{where}.arguments must be a list of strings")
+        result[relative] = [*rewrite(filter_arguments(arguments, directory_path), rewrites), *PARSER_FLAGS]
     return dict(sorted(result.items()))
 
 
