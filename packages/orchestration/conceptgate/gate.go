@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -89,9 +90,11 @@ func ValidateOwnerID(id string) error {
 
 // Gate is the similarity gate in front of the librarian.
 type Gate struct {
-	Index        *declindex.Store
-	Tree         declindex.Tree
-	Registry     string
+	Index    *declindex.Store
+	Tree     declindex.Tree
+	Registry string
+	// AdditionRoot is the registry directory relative to the repository root, slash-separated, as additions name
+	// it; empty is Registry relative to Tree.Source. The command sets it because it reads Registry from a snapshot.
 	AdditionRoot string
 	// Compiled reads the proposal; its Forms are replaced by the registry's at each decision.
 	Compiled  *declindex.CompiledOptions
@@ -308,12 +311,29 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 		return v, err
 	}
 	v.Outcome, v.Reason = Added, "no registered concept or existing declaration states it"
+	addition, err := g.additionPath(Key(c))
+	if err != nil {
+		return v, err
+	}
+	v.Addition = &Addition{Path: addition, Content: string(content), Base: base}
+	return v, nil
+}
+
+// additionPath is the repository-relative, slash-separated path of the addition file with key: the path that its
+// owner writes in its own worktree and opens with `ledger open --write`.
+func (g *Gate) additionPath(key string) (string, error) {
 	root := g.AdditionRoot
 	if root == "" {
-		root = g.Registry
+		rel, err := filepath.Rel(g.Tree.Source, g.Registry)
+		if err != nil {
+			return "", err
+		}
+		root = filepath.ToSlash(rel)
 	}
-	v.Addition = &Addition{Path: filepath.Join(root, "concepts", Key(c)+".yaml"), Content: string(content), Base: base}
-	return v, nil
+	if !filepath.IsLocal(filepath.FromSlash(root)) {
+		return "", fmt.Errorf("the registry %s is not inside the repository", root)
+	}
+	return path.Join(root, "concepts", key+".yaml"), nil
 }
 
 // pendingForms compiles the sources of registry concepts that are not yet declared by the index. It runs only

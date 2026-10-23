@@ -160,52 +160,8 @@ func snapshotGateRegistry(ctx context.Context, tree, commit, rel, base string) (
 		cleanup()
 		return "", nil, err
 	}
-	prefix := filepath.ToSlash(rel)
-	reader := tar.NewReader(out)
-	for {
-		header, err := reader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fail(err)
-		}
-		if header.Typeflag == tar.TypeXGlobalHeader || header.Typeflag == tar.TypeXHeader {
-			continue
-		}
-		name := filepath.Clean(filepath.FromSlash(header.Name))
-		if name != rel && !strings.HasPrefix(filepath.ToSlash(name), prefix+"/") {
-			return fail(fmt.Errorf("git archive returned path outside registry: %s", header.Name))
-		}
-		target := filepath.Join(root, name)
-		inside, err := filepath.Rel(root, target)
-		if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
-			return fail(fmt.Errorf("git archive returned unsafe registry path: %s", header.Name))
-		}
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return fail(err)
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return fail(err)
-			}
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-			if err != nil {
-				return fail(err)
-			}
-			_, copyErr := io.Copy(file, reader)
-			closeErr := file.Close()
-			if copyErr != nil {
-				return fail(copyErr)
-			}
-			if closeErr != nil {
-				return fail(closeErr)
-			}
-		default:
-			return fail(fmt.Errorf("git archive returned unsupported registry entry %s", header.Name))
-		}
+	if err := extractRegistryArchive(out, root, rel); err != nil {
+		return fail(err)
 	}
 	if _, err := io.Copy(io.Discard, out); err != nil {
 		return fail(err)
@@ -223,6 +179,58 @@ func snapshotGateRegistry(ctx context.Context, tree, commit, rel, base string) (
 		return "", nil, fmt.Errorf("the index commit has no registry directory %s", rel)
 	}
 	return registry, cleanup, nil
+}
+
+// extractRegistryArchive writes the directories and regular files of a `git archive` tar of rel below root. An
+// entry whose name is not local (absolute, or leaving the root through `..`) or lies outside rel is refused before
+// anything is written for it, and links and other entry types are refused, so no entry writes outside root.
+func extractRegistryArchive(archive io.Reader, root, rel string) error {
+	prefix := filepath.ToSlash(filepath.Clean(rel))
+	reader := tar.NewReader(archive)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if header.Typeflag == tar.TypeXGlobalHeader || header.Typeflag == tar.TypeXHeader {
+			continue
+		}
+		name := filepath.Clean(filepath.FromSlash(header.Name))
+		if !filepath.IsLocal(name) {
+			return fmt.Errorf("git archive returned unsafe registry path: %s", header.Name)
+		}
+		if slash := filepath.ToSlash(name); slash != prefix && !strings.HasPrefix(slash, prefix+"/") {
+			return fmt.Errorf("git archive returned path outside registry: %s", header.Name)
+		}
+		target := filepath.Join(root, name)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(file, reader)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		default:
+			return fmt.Errorf("git archive returned unsupported registry entry %s", header.Name)
+		}
+	}
 }
 
 // cmdGate decides one proposal. Exit codes: 0 added, 1 refused (an exact duplicate), 4 near (sent to the
@@ -320,7 +328,7 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &unableError{err})
 	}
 	work := filepath.Join(filepath.Dir(state), "proposals")
-	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, AdditionRoot: registry, Compiled: co,
+	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, AdditionRoot: filepath.ToSlash(rel), Compiled: co,
 		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: work}, WorkDir: work}
 	v, err := g.Decide(ctx, p, conceptgate.DecideOptions{Proposer: proposer, AcceptedBy: acceptedBy, ProposalBytes: raw})
 	if err != nil {

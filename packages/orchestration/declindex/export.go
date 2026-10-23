@@ -126,7 +126,10 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 		}
 	}
 	// Lake compiles with its own bundled compiler and flags unless a compiler is configured (a toolchain built from
-	// source has none bundled).
+	// source has none bundled): the configured cc, else the caller's LEAN_CC, which l.env does not pass on.
+	if cc == "" {
+		cc = os.Getenv("LEAN_CC")
+	}
 	env := l.env(nil, os.TempDir())
 	if cc != "" {
 		env = append(env, "LEAN_CC="+cc)
@@ -159,13 +162,11 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 	return binPath, nil
 }
 
-// linker is the C compiler that links the exporter.
+// linker is the C compiler that links the exporter: cc (the configured compiler or LEAN_CC), else the toolchain's
+// own clang, else cc on PATH.
 func linker(l Lean, cc string) string {
 	if cc != "" {
 		return cc
-	}
-	if v := os.Getenv("LEAN_CC"); v != "" {
-		return v
 	}
 	if _, err := os.Stat(l.bin("clang")); err == nil {
 		return l.bin("clang")

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -176,7 +178,7 @@ func TestGateRejectsRegistryMutationAfterInitialStatus(t *testing.T) {
 
 func TestGatePrintsCanonicalAdditionPathAfterSnapshotCleanup(t *testing.T) {
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("the successful gate path compiles untrusted source in Docker")
+		t.Skip("the successful gate path compiles untrusted source: set DECLINDEX_SANDBOX_TEST=1 in a disposable container or CI runner")
 	}
 	if _, err := exec.LookPath("lake"); err != nil {
 		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
@@ -231,14 +233,100 @@ func TestGatePrintsCanonicalAdditionPathAfterSnapshotCleanup(t *testing.T) {
 	if err := json.Unmarshal([]byte(r.out), &verdict); err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(tree, "registry", "concepts", verdict.CompiledHash+".yaml")
-	if verdict.CompiledHash == "" || verdict.Addition.Path != want || strings.Contains(verdict.Addition.Path, "registry-snapshot-") {
+	want := "registry/concepts/" + verdict.CompiledHash + ".yaml"
+	if verdict.CompiledHash == "" || verdict.Addition.Path != want {
 		t.Fatalf("addition path %q, want %q", verdict.Addition.Path, want)
 	}
-	if _, err := os.Stat(verdict.Addition.Path); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(tree, filepath.FromSlash(verdict.Addition.Path))); !os.IsNotExist(err) {
 		t.Fatalf("gate wrote canonical addition path: %v", err)
 	}
 	if status := git(t, tree, "status", "--porcelain"); status != "" {
 		t.Fatalf("gate dirtied the tree: %q", status)
+	}
+}
+
+// The gate's registry snapshot comes from `git archive`, whose entries name tree paths; extraction must still refuse
+// any entry that would write outside the snapshot root or outside the registry, and links.
+func TestExtractRegistryArchiveRefusesEntriesOutsideTheRegistry(t *testing.T) {
+	archive := func(t *testing.T, entries ...tar.Header) *bytes.Buffer {
+		t.Helper()
+		var buf bytes.Buffer
+		w := tar.NewWriter(&buf)
+		for _, h := range entries {
+			body := []byte("escaped\n")
+			if h.Typeflag == tar.TypeReg {
+				h.Size = int64(len(body))
+			}
+			h.Mode = 0o644
+			if err := w.WriteHeader(&h); err != nil {
+				t.Fatal(err)
+			}
+			if h.Typeflag == tar.TypeReg {
+				if _, err := w.Write(body); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return &buf
+	}
+	written := func(t *testing.T, dir string) []string {
+		t.Helper()
+		var got []string
+		err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				got = append(got, p)
+			}
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	hostile := map[string]func(dir string) tar.Header{
+		"parent":          func(string) tar.Header { return tar.Header{Name: "../escape", Typeflag: tar.TypeReg} },
+		"registry-parent": func(string) tar.Header { return tar.Header{Name: "registry/../../escape", Typeflag: tar.TypeReg} },
+		"absolute": func(dir string) tar.Header {
+			return tar.Header{Name: filepath.Join(dir, "escape"), Typeflag: tar.TypeReg}
+		},
+		"sibling": func(string) tar.Header { return tar.Header{Name: "registry/../other/escape", Typeflag: tar.TypeReg} },
+		"outside": func(string) tar.Header { return tar.Header{Name: "other/escape", Typeflag: tar.TypeReg} },
+		"symlink": func(string) tar.Header {
+			return tar.Header{Name: "registry/link", Typeflag: tar.TypeSymlink, Linkname: "../../escape"}
+		},
+	}
+	for name, entry := range hostile {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			root := filepath.Join(dir, "snapshot")
+			if err := os.Mkdir(root, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			err := extractRegistryArchive(archive(t, entry(dir)), root, "registry")
+			if err == nil {
+				t.Fatal("the hostile entry was accepted")
+			}
+			if got := written(t, dir); len(got) != 0 {
+				t.Fatalf("extraction wrote %v (error %v)", got, err)
+			}
+		})
+	}
+	dir := t.TempDir()
+	if err := extractRegistryArchive(archive(t,
+		tar.Header{Name: "registry/", Typeflag: tar.TypeDir},
+		tar.Header{Name: "registry/registry.yaml", Typeflag: tar.TypeReg},
+		tar.Header{Name: "registry/concepts/0123456789abcdef0123456789abcdef.yaml", Typeflag: tar.TypeReg},
+	), dir, "registry"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		filepath.Join(dir, "registry", "concepts", "0123456789abcdef0123456789abcdef.yaml"),
+		filepath.Join(dir, "registry", "registry.yaml"),
+	}
+	if got := written(t, dir); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("extracted %v, want %v", got, want)
 	}
 }

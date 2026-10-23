@@ -17,7 +17,7 @@ import (
 
 func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only in Docker with DECLINDEX_SANDBOX_TEST=1")
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
 	}
 	if _, err := exec.LookPath("lake"); err != nil {
 		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
@@ -101,7 +101,7 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 	first := addition("first", "Fx.First", "theorem Fx.First (x : Nat) (_h : x < 3) : True := trivial\n")
 	second := addition("second", "Fx.Second", "def Fx.Second (x : Nat) : Prop := x < 3\n")
 	for _, addition := range []conceptgate.Addition{first, second} {
-		if err := os.WriteFile(addition.Path, []byte(addition.Content), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(tree, filepath.FromSlash(addition.Path)), []byte(addition.Content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -150,10 +150,8 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 		if err := json.Unmarshal([]byte(result.out), &report); err != nil {
 			t.Fatal(err)
 		}
-		wantAdded := []string{
-			filepath.ToSlash(filepath.Join("registry", "concepts", filepath.Base(first.Path))),
-			filepath.ToSlash(filepath.Join("registry", "concepts", filepath.Base(second.Path))),
-		}
+		// The ledger reports landed additions by the same repository-relative paths that the gate printed.
+		wantAdded := []string{first.Path, second.Path}
 		sort.Strings(wantAdded)
 		if report.Registry == nil || strings.Join(report.Registry.Added, "\x00") != strings.Join(wantAdded, "\x00") ||
 			len(report.Registry.Defects) != 0 || report.Registry.Unable != "" || len(report.Registry.Near) != 1 {
@@ -185,7 +183,7 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(first.Path, body, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(tree, filepath.FromSlash(first.Path)), body, 0o644); err != nil {
 			t.Fatal(err)
 		}
 		check()

@@ -43,6 +43,9 @@ jobs:
       DECLINDEX_REQUIRE_LEAN: "1"
       # The gate compiles proposals only in the Landlock and seccomp sandbox; here its tests must run, not skip.
       DECLINDEX_REQUIRE_SANDBOX: "1"
+      # The gate's own Lean tests compile untrusted proposal source, so they run only where this is set: in a
+      # disposable runner like this one, or a container.
+      DECLINDEX_SANDBOX_TEST: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

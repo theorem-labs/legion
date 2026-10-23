@@ -32,7 +32,7 @@ func (r *recordingLibrarian) Review(_ context.Context, request ReviewRequest) er
 func requireSandboxTest(t *testing.T) {
 	t.Helper()
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only in Docker with DECLINDEX_SANDBOX_TEST=1")
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
 	}
 }
 
@@ -163,16 +163,17 @@ func TestGateDecidesEachKindOfProposal(t *testing.T) {
 			t.Errorf("%s: %s naming %q (%s, %+v), want %s naming %q", c.p.ID, v.Outcome, v.Existing, v.Reason, v.Matches, c.outcome, c.existing)
 		}
 		if c.p.ID == "p7" {
-			if v.Addition == nil || v.Addition.Base != gitHead(t, g.Tree.Source) || !strings.HasSuffix(v.Addition.Path, "/registry/concepts/"+v.CompiledHash+".yaml") || !strings.Contains(v.Addition.Content, "source: |") {
+			if v.Addition == nil || v.Addition.Base != gitHead(t, g.Tree.Source) || v.Addition.Path != "registry/concepts/"+v.CompiledHash+".yaml" || !strings.Contains(v.Addition.Content, "source: |") {
 				t.Fatalf("addition: %+v", v.Addition)
 			}
-			if _, err := os.Stat(v.Addition.Path); !os.IsNotExist(err) {
+			file := filepath.Join(g.Tree.Source, filepath.FromSlash(v.Addition.Path))
+			if _, err := os.Stat(file); !os.IsNotExist(err) {
 				t.Fatalf("the gate wrote its addition: %v", err)
 			}
 			if status := exec.Command("git", "-C", g.Tree.Source, "status", "--porcelain").Run(); status != nil {
 				t.Fatal(status)
 			}
-			if err := os.WriteFile(v.Addition.Path, []byte(v.Addition.Content), 0o644); err != nil {
+			if err := os.WriteFile(file, []byte(v.Addition.Content), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			runGit(t, g.Tree.Source, "add", "registry")
