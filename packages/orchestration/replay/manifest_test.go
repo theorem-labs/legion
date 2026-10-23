@@ -236,6 +236,50 @@ func TestLoadRequiresBuildRounds(t *testing.T) {
 	}
 }
 
+func TestLoadRefusesUnknownFields(t *testing.T) {
+	manifest := minimalManifest("build-round-1.log")
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		json []byte
+	}{
+		{"top-level", append(append([]byte(nil), data[:len(data)-1]...), []byte(`,"unexpected":true}`)...)},
+		{"member", []byte(strings.Replace(string(data), `"id":"m1"`, `"id":"m1","unexpected":true`, 1))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "build-round-1.log"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "manifest.json")
+			if err := os.WriteFile(path, tc.json, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("Load accepted an unknown JSON field")
+			}
+		})
+	}
+}
+
+func TestLoadRefusesNoncanonicalLogPaths(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "logs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "build-round-1.log"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := minimalManifest("logs/../build-round-1.log")
+	if _, err := Load(writeManifestIn(t, dir, manifest)); err == nil {
+		t.Fatal("Load accepted a noncanonical log path")
+	}
+}
+
 func minimalManifest(log string) Manifest {
 	return Manifest{
 		Format:     Format,

@@ -127,8 +127,9 @@ func (m Manifest) validate(dir string) error {
 }
 
 func validateLog(root *os.Root, log string) error {
-	if filepath.IsAbs(log) || log == "" {
-		return fmt.Errorf("is not relative to the manifest")
+	clean := filepath.Clean(log)
+	if filepath.IsAbs(log) || log == "" || clean != log {
+		return fmt.Errorf("is not a clean relative path")
 	}
 	parts := strings.Split(log, string(filepath.Separator))
 	current := ""
