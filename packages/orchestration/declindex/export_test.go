@@ -281,6 +281,7 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 	for _, ok := range []string{
 		"namespace Fx\nopen Fx\n/-- doc -/\n@[simp] def MySp (R : BitVec 5 → BitVec 64) : Prop := R 2#5 &&& 7#64 = 0#64\nend Fx\n",
 		"structure B where\n  pre : Nat\ntheorem t : True := by trivial\n",
+		"attribute [local instance] Fx.SpAligned\nattribute [-simp] Fx.inline\n",
 	} {
 		if err := check(ok); err != nil {
 			t.Errorf("refused %q: %v", ok, err)
@@ -292,6 +293,8 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 		"theorem t : True := by run_tac pure ()\n",
 		"theorem t : 2 + 2 = 4 := by decide +native\n",
 		"@[init] def x : IO Unit := pure ()\n",
+		"attribute [init] Fx.SpAligned\n",
+		"attribute [local instance, export x] Fx.SpAligned\n",
 		"open Fx in\n#eval 1\n",
 		"unsafe def x : Nat := 1\n",
 		"set_option maxHeartbeats 0\n",

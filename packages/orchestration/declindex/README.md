@@ -57,7 +57,7 @@ The gate cannot decide (exit 3) when the index lacks its compiled part, when the
 Compiling a proposal must run none of its code outside a sandbox, so the gate checks it three times:
 
 1. **A text filter** refuses the obvious at once (`#eval`, `run_cmd`, `initialize`, macros, `unsafe`, …). It is fast and nothing relies on it: a character literal `'"'` or an unlisted form passes it.
-2. **Lean's own parser** (`declexport --check`) reads the proposal with the notation of the modules it imports and allows only declarations, `variable`, `universe`, module documentation and the scoping commands (`namespace`, `section`, `end`, `open`), which alone it elaborates. Inside them it allows only listed attributes (`simp`, `instance`, `reducible`, …), refuses `unsafe`, and refuses the forms that run code while elaborating: `by_elab`, `run_tac`, `native_decide`, `decide +native`. A proposal carries no forms: the librarian writes those.
+2. **Lean's own parser** (`declexport --check`) reads the proposal with the notation of the modules it imports and allows only declarations, `variable`, `universe`, module documentation, `attribute` with listed attributes, and the scoping commands (`namespace`, `section`, `end`, `open`), which alone it elaborates. Inside them it allows only listed attributes (`simp`, `instance`, `reducible`, …), refuses `unsafe`, and refuses the forms that run code while elaborating: `by_elab`, `run_tac`, `native_decide`, `decide +native`. A proposal carries no forms: the librarian writes those.
 3. **An operating-system sandbox** (package `confine`) runs the check, the compile and the export. It needs no privilege and no user namespace: Landlock lets the process read only the toolchain, the build outputs it imports and its scratch directory, write only the scratch directory, and execute only its own program; a seccomp filter makes every `socket(2)`, io_uring, ptrace, `process_vm_*`, key, namespace and mount call fail; and its environment is `PATH`, `LEAN_SYSROOT`, `LEAN_PATH`, `HOME` and `TMPDIR` only. Where the sandbox cannot be built (no Landlock), the gate is unable to decide (exit 3) and compiles nothing.
 
 ## The fixture
@@ -69,11 +69,11 @@ Compiling a proposal must run none of its code outside a sandbox, so the gate ch
 Measured on a large built project (52,529 modules, 545,934 declarations), 48 jobs:
 
 - **Parity with the reference `.ilean` reader:** the same 545,934 declarations, 9,686,627 uses and 4,389,369 resolved edges, with 0 differences. For 55 declarations sampled across wide and narrow use, the same direct users, per-directory counts and use lines; reach differs only for the 4 whose users include `example`s, which this index counts once per module.
-- **Refresh from nothing:** 15 min 56 s; 2 min 1 s for the `.ilean` part, 13 min 49 s for the compiled part (789,877 constants).
-- **Update after a landing:** 3.0 s when nothing changed; 19.4 s when one module changed, 14 s of which rebuilds the graph file.
-- **Query times, each process included:** `states` of the fact's concept 0.34 s (23,095 rows); `users` 0.2 s median and 0.67 s worst; `where` 0.014 s; `same` 0.11 s; `gate` about 3.5 s, which includes compiling the proposal.
+- **Refresh from nothing:** 15 min 43 s; 2 min 3 s for the `.ilean` part, 13 min 40 s for the compiled part (789,877 constants).
+- **Update after a landing:** 2.2 s when nothing changed; 3.4 s when one compiled module changed; about 16 s when a reference file changed, 13.5 s of which rebuilds the graph file.
+- **Query times, each process included:** `states` of the fact's concept 0.34 s (23,095 rows); `users` 0.2 s median and 0.67 s worst; `where` 0.014 s; `same` 0.11 s; `gate` about 5 s, which includes the parser check and compiling the proposal in the sandbox.
 - **`states` against the rule's 1,824 files that restate the fact:** 98.1% (1,789) recall through definitions; 66.1% from direct statements only. It also finds 88 files that the rule lacks.
-- **The gate:** a copy of a registered concept was refused, naming it; a restatement of the fact went to the librarian, the only message it received; a new concept was added with its compiled hash; a proposal with an `#eval` that writes a file was refused before compiling, and no file was written.
+- **The gate:** a copy of a registered concept was refused, naming it; a restatement of the fact went to the librarian, the only message it received; a new concept was added with its compiled hash; proposals with an `#eval` that writes a file, the same hidden behind a character literal `'"'`, and a `by_elab` that writes a file were each refused (the first by the text filter, the other two by Lean's parser) and no file was written.
 
 ## The ledger
 

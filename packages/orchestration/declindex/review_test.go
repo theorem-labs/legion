@@ -209,3 +209,20 @@ func TestRefreshCountsAModuleNewerThanItsBuildAsUnreadable(t *testing.T) {
 		t.Fatalf("errors meta %q", n)
 	}
 }
+
+// Lean quotes an auxiliary's name when it holds symbols (`M.«_aux_M___macroRules_M_term_↦ₘ__1»`); its recorded
+// selection is the command or its docstring, and it is as much Lean's as the unquoted kind.
+func TestSelectionHoldsForQuotedNamesLeanMade(t *testing.T) {
+	text := "/-- The points-to. -/\nnotation:50 a:50 \" ↦ₘ \" v:50 => f a v\n"
+	for _, name := range []string{
+		"MachX.«_aux_MachX_Ctx___macroRules_MachX_term_↦ₘ__1»",
+		"_private.M.0.N.«_aux_M___macroRules__private_M_0_N_termRot(_)_1»",
+	} {
+		if !selectionHolds(text, name, 0, len("/-- The points-to. -/")) {
+			t.Errorf("%s was taken for a moved declaration", name)
+		}
+	}
+	if !madeByLean("A.«_aux_x»") || madeByLean("A.«x_y»") || madeByLean("A.«b»._c") == false {
+		t.Error("madeByLean misreads quoted components")
+	}
+}

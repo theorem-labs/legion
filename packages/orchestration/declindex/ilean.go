@@ -236,12 +236,15 @@ func userName(name string) string {
 }
 
 // madeByLean reports whether Lean made the name for a command (an elaborator's or macro's auxiliary, an
-// initializer, a hygienic name): a component that starts with `_`.
+// initializer, a hygienic name): a component that starts with `_`, quoted (`«_aux_…»`) or not.
 func madeByLean(name string) bool {
 	inQuote := false
 	start := true
 	for _, r := range name {
 		switch {
+		case r == '«' && start:
+			inQuote = true
+			continue // the component starts after its opening quote
 		case r == '«':
 			inQuote = true
 		case r == '»':

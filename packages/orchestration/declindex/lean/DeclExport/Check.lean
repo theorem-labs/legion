@@ -5,18 +5,18 @@ open Lean Elab
 imports, before anything elaborates it.
 
 A proposal may hold declarations (`def`, `theorem`, `structure`, …), `variable` and `universe`, module
-documentation, and the scoping commands `namespace`, `section`, `end` and `open`. Only the scoping commands are
-elaborated here, so that the notation they bring into scope parses; they run no code of the proposal's.
-Every other command is refused (`#eval`, `run_cmd`, `initialize`, `macro`, `syntax`, `notation`, `elab`,
-`attribute`, `set_option`, `open … in`, …). Inside the allowed commands, the attributes must be on an allow list,
-`unsafe` is refused, and so are the term and tactic forms that run code while elaborating: `by_elab`,
-`run_tac`, `native_decide` and `decide +native`. -/
+documentation, `attribute` (with listed attributes only, such as `attribute [local instance] x`), and the
+scoping commands `namespace`, `section`, `end` and `open`. Only the scoping commands are elaborated here, so that
+the notation they bring into scope parses; they run no code of the proposal's. Every other command is refused
+(`#eval`, `run_cmd`, `initialize`, `macro`, `syntax`, `notation`, `elab`, `set_option`, `open … in`, …). Inside
+the allowed commands, the attributes must be on an allow list, `unsafe` is refused, and so are the term and
+tactic forms that run code while elaborating: `by_elab`, `run_tac`, `native_decide` and `decide +native`. -/
 
 namespace DeclExport
 
 def allowedCommands : List Name :=
   [``Parser.Command.declaration, ``Parser.Command.variable, ``Parser.Command.universe,
-   ``Parser.Command.moduleDoc]
+   ``Parser.Command.moduleDoc, ``Parser.Command.attribute]
 
 def scopingCommands : List Name :=
   [``Parser.Command.namespace, ``Parser.Command.section, ``Parser.Command.end, ``Parser.Command.open]
