@@ -724,11 +724,28 @@ func TestStatementRecordsRoundTripThroughRequestFiles(t *testing.T) {
 		}
 	}
 	candidate := `"changed_paths":["a.lean"],"current":{"A=B":"h=1","X":"x"},"changed_contracts":{"A=B":"h=2"}`
-	check := writeRequest("check.json", `{"repo":"r","id":"M-1","generation":1,"changed":["a.lean"],`+
-		`"current":{"A=B":"h=1","X":"x"},"changed_contracts":{"A=B":"h=2"},"head":"h=ead","reviewed_head":"other"}`)
-	code, stdout, _ := call("--json", "check", "--request-file", check)
-	if code != 1 || !strings.Contains(stdout, `"kind":"statement_unreviewed"`) || !strings.Contains(stdout, `"name":"A=B"`) {
-		t.Fatalf("unreviewed check: code=%d stdout=%q", code, stdout)
+	// Each record reaches Check through its own JSON key: a matching review and a compatibility proof pass, with or
+	// without the head, and a review at another head or with no head to compare does not.
+	for i, test := range []struct {
+		name, records string
+		pass          bool
+	}{
+		{"a review at its head", `"head":"h=ead","reviewed_head":"h=ead"`, true},
+		{"a compatibility proof", `"head":"h=ead","compatibility_proof":"Spec.«a=b»"`, true},
+		{"a compatibility proof with no head", `"compatibility_proof":"Spec.«a=b»"`, true},
+		{"a review at another head", `"head":"h=ead","reviewed_head":"other"`, false},
+		{"a review with no head", `"reviewed_head":"h=ead"`, false},
+	} {
+		check := writeRequest(fmt.Sprintf("check-%d.json", i), `{"repo":"r","id":"M-1","generation":1,"changed":["a.lean"],`+
+			`"current":{"A=B":"h=1","X":"x"},"changed_contracts":{"A=B":"h=2"},`+test.records+`}`)
+		code, stdout, stderr := call("--json", "check", "--request-file", check)
+		if test.pass {
+			if code != 0 || !strings.Contains(stdout, `"pass":true`) {
+				t.Errorf("check with %s: code=%d stdout=%q stderr=%q; want a pass", test.name, code, stdout, stderr)
+			}
+		} else if code != 1 || !strings.Contains(stdout, `"kind":"statement_unreviewed"`) || !strings.Contains(stdout, `"name":"A=B"`) {
+			t.Errorf("check with %s: code=%d stdout=%q stderr=%q; want statement_unreviewed for A=B", test.name, code, stdout, stderr)
+		}
 	}
 	noHead := writeRequest("no-head.json", `{"repo":"r","migration":"M-1","generation":1,"commit":"c",`+candidate+
 		`,"compatibility_proof":"Spec.«a=b»"}`)
@@ -740,7 +757,7 @@ func TestStatementRecordsRoundTripThroughRequestFiles(t *testing.T) {
 	if code, _, stderr := call("land", "--request-file", land); code != 0 {
 		t.Fatalf("land with a compatibility proof: code=%d stderr=%q", code, stderr)
 	}
-	code, stdout, _ = call("--json", "events", "r", "0", "M-1")
+	code, stdout, _ := call("--json", "events", "r", "0", "M-1")
 	if code != 0 {
 		t.Fatalf("events: code=%d", code)
 	}

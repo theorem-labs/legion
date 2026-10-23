@@ -8,6 +8,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
@@ -521,6 +524,65 @@ func TestLandRefusesAStatementChangeWithNeitherRecord(t *testing.T) {
 		}
 	}
 	wantUnchanged(t, s, m, before)
+}
+
+// A refused statement change must be refused before Land writes anything, not written and then rolled back: the
+// committed state alone cannot tell the two apart. Triggers in this test's own database raise on any write to the
+// tables Land changes, and an approved, reviewed land of the same change proves that they are armed.
+func TestRefusedStatementLandAttemptsNoWrite(t *testing.T) {
+	s, dsn := newStoreDSN(t)
+	ctx := context.Background()
+	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", true))
+	m := must(open(t, s, "M-1", "alice", []string{"a.lean"}, map[string]string{"C": "hash-1"}))
+	before := len(must(s.Events(ctx, "r", 0, "")))
+
+	db := must(pgx.Connect(ctx, dsn))
+	t.Cleanup(func() { _ = db.Close(context.Background()) })
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	exec(`CREATE FUNCTION trap_write() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'write trap: %', TG_TABLE_NAME; END $$`)
+	tables := []string{"contracts", "agreements", "migrations", "events"}
+	for _, table := range tables {
+		exec(`CREATE TRIGGER trap_write BEFORE INSERT OR UPDATE OR DELETE ON ` + table +
+			` FOR EACH STATEMENT EXECUTE FUNCTION trap_write()`)
+	}
+
+	for _, refused := range []struct {
+		name    string
+		request ledger.LandRequest
+		reason  string
+	}{
+		{"no approval", statementLand(m, "head-1", "", "head-1", nil), ledger.ReasonPinned},
+		{"approval and no record", statementLand(m, "head-1", "", "", []string{"C"}), ledger.ReasonStatementUnreviewed},
+		{"approval and a review at another head", statementLand(m, "head-1", "", "head-0", []string{"C"}), ledger.ReasonStatementUnreviewed},
+	} {
+		_, err := s.Land(ctx, refused.request)
+		var r *ledger.Refusal
+		if !errors.As(err, &r) || r.Reason != refused.reason {
+			t.Fatalf("%s: want refusal %q before any write, got %v", refused.name, refused.reason, err)
+		}
+	}
+	wantUnchanged(t, s, m, before)
+
+	approved := statementLand(m, "head-1", "", "head-1", []string{"C"})
+	_, err := s.Land(ctx, approved)
+	var trapped *pgconn.PgError
+	if !errors.As(err, &trapped) || trapped.Code != "P0001" || trapped.Message != "write trap: contracts" {
+		t.Fatalf("approved and reviewed land with the trap armed: want the trap on contracts, got %v", err)
+	}
+	wantUnchanged(t, s, m, before)
+
+	for _, table := range tables {
+		exec(`DROP TRIGGER trap_write ON ` + table)
+	}
+	if landed := must(s.Land(ctx, approved)); landed.State != ledger.StateLanded {
+		t.Fatalf("approved and reviewed land with the trap removed: %+v", landed)
+	}
 }
 
 func TestLandRequiresTheHeadOfAStatementChange(t *testing.T) {
