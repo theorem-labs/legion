@@ -20,7 +20,7 @@ import (
 )
 
 // SchemaVersion changes when the tables change; an index of another version is rebuilt from nothing.
-const SchemaVersion = "1"
+const SchemaVersion = "2"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
@@ -54,16 +54,16 @@ CREATE TABLE IF NOT EXISTS uses (
 );
 CREATE INDEX IF NOT EXISTS uses_target ON uses (target);
 CREATE INDEX IF NOT EXISTS uses_module ON uses (module);
--- Declaration-level edges, used -> user, a generated part (a field, a constructor) counted as its declaration.
--- stmt is 1 when some use is in the user's statement; kind is the user's kind.
+-- Declaration-level edges, used -> user: target is the name the use records (a declaration, or a part Lean
+-- generated from one, such as a field). The graph counts a generated part as its declaration. stmt is 1 when some
+-- use is in the user's statement; kind is the user's kind.
 CREATE TABLE IF NOT EXISTS edges (
-    src    TEXT NOT NULL,
+    target TEXT NOT NULL,
     dst    TEXT NOT NULL,
     module TEXT NOT NULL,
     stmt   INTEGER NOT NULL,
     kind   TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS edges_src ON edges (src, dst);
 CREATE INDEX IF NOT EXISTS edges_module ON edges (module);
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated
 -- type as printed, and its compiled statement hash.

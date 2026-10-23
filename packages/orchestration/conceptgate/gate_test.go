@@ -42,6 +42,12 @@ concepts:
 // Lean toolchain (CI installs one); without one it skips.
 func gateForTest(t *testing.T) (*Gate, *recordingLibrarian) {
 	t.Helper()
+	return gateWith(t, gateRegistry, true)
+}
+
+// gateWith is gateForTest with another registry, and an index with or without its compiled part.
+func gateWith(t *testing.T, registry string, compiled bool) (*Gate, *recordingLibrarian) {
+	t.Helper()
 	if _, err := exec.LookPath("lake"); err != nil {
 		if os.Getenv("DECLINDEX_REQUIRE_LEAN") != "" {
 			t.Fatal("DECLINDEX_REQUIRE_LEAN is set and no lake on PATH")
@@ -71,7 +77,7 @@ func gateForTest(t *testing.T) (*Gate, *recordingLibrarian) {
 		t.Fatal(err)
 	}
 	reg := filepath.Join(t.TempDir(), "registry.yaml")
-	if err := os.WriteFile(reg, []byte(gateRegistry), 0o644); err != nil {
+	if err := os.WriteFile(reg, []byte(registry), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s, err := declindex.Open(filepath.Join(t.TempDir(), "index.sqlite"))
@@ -89,7 +95,11 @@ func gateForTest(t *testing.T) (*Gate, *recordingLibrarian) {
 		Dir:      t.TempDir(),
 	}
 	spec := declindex.Tree{Source: tree, Lib: tree, Roots: declindex.Roots{"Fixture": true}}
-	if _, err := s.Refresh(ctx, spec, declindex.RefreshOptions{Commit: "c", Compiled: co}); err != nil {
+	opt := declindex.RefreshOptions{Commit: "c"}
+	if compiled {
+		opt.Compiled = co
+	}
+	if _, err := s.Refresh(ctx, spec, opt); err != nil {
 		t.Fatal(err)
 	}
 	lib := &recordingLibrarian{}
@@ -111,13 +121,15 @@ func TestGateDecidesEachKindOfProposal(t *testing.T) {
 	}{
 		{proposal("p1", "MySp", "def MySp (Q : BitVec 5 → BitVec 64) : Prop := Q 2#5 &&& 7#64 = 0#64"), Refused, "Fx.SpAligned"},
 		{proposal("p2", "MyWrap", "def MyWrap (y : BitVec 64) : Prop := Fx.Frame y 16"), Refused, "Fx.Wrap"},
-		{proposal("p3", "Fx.Frame", "def Other : Nat := 1"), Refused, "Fx.Frame"},
+		{proposal("p3", "Fx.Frame", "def Other : Nat := 1"), NameTaken, "Fx.Frame"},
 		{proposal("p4", "MyFrame", "def MyFrame (R : BitVec 5 → BitVec 64) (n : Nat) : Prop := n < 3 ∧ R 2#5 &&& 7#64 = 0#64"), Near, ""},
 		{proposal("p5", "MyOuter", "def myInner (x : BitVec 64) : Prop := x &&& 7#64 = 0#64\n"+
 			"def MyOuter (R : BitVec 5 → BitVec 64) : Prop := myInner (R 2#5) ∧ True"), Near, ""},
 		{proposal("p6", "UsesSp", "def UsesSp (R : BitVec 5 → BitVec 64) : Prop := Fx.SpAligned R ∧ R 3#5 = 0"), Added, ""},
 		{proposal("p7", "Fresh", "def Fresh (x : Nat) : Prop := x < 3 ∧ x ≠ 1"), Added, ""},
 		{proposal("p8", "OtherBox", "structure OtherBox (R : BitVec 5 → BitVec 64) : Prop where\n  other : R 2#5 &&& 7#64 = 0#64"), Near, ""},
+		// Fresh was added by p7 and has not landed: the index has no compiled entry for it, the registry has.
+		{proposal("p9", "FreshCopy", "def FreshCopy (y : Nat) : Prop := y < 3 ∧ y ≠ 1"), Refused, "Fresh"},
 	} {
 		v, err := g.Decide(ctx, c.p)
 		if err != nil {
@@ -151,5 +163,57 @@ func TestGateCannotDecideAProposalThatDoesNotCompile(t *testing.T) {
 	}
 	if len(lib.got) != 0 {
 		t.Fatal("the librarian got a proposal the gate could not read")
+	}
+}
+
+// A registered concept that has not landed, has no form and no compiled hash cannot be compared: a proposal goes
+// to the librarian, never into the registry.
+func TestGateRoutesWhatItCannotCompare(t *testing.T) {
+	g, lib := gateWith(t, gateRegistry+"  - name: Fx.Ghost\n    home: Ghost.lean\n    meaning: A concept not declared yet.\n", true)
+	v, err := g.Decide(context.Background(), proposal("q1", "Fresh2", "def Fresh2 (x : Nat) : Prop := x < 5"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Outcome != Near || !strings.Contains(v.Reason, "Fx.Ghost") || len(lib.got) != 1 {
+		t.Fatalf("verdict %+v, librarian %d", v, len(lib.got))
+	}
+	r, _ := Load(g.Registry)
+	if _, ok := r.Find("Fresh2"); ok {
+		t.Fatal("added a proposal the gate could not compare")
+	}
+}
+
+// An index read without its compiled part has no compiled statements to compare: the gate cannot decide.
+func TestGateNeedsTheCompiledIndex(t *testing.T) {
+	g, lib := gateWith(t, gateRegistry, false)
+	v, err := g.Decide(context.Background(), proposal("q2", "MySp2", "def MySp2 (Q : BitVec 5 → BitVec 64) : Prop := Q 2#5 &&& 7#64 = 0#64"))
+	if err == nil {
+		t.Fatalf("decided %+v without the compiled index", v)
+	}
+	r, _ := Load(g.Registry)
+	if _, ok := r.Find("MySp2"); ok || len(lib.got) != 0 {
+		t.Fatal("the gate acted without the compiled index")
+	}
+}
+
+// A proposal is declarations only: one that would run code while it is compiled is refused before Lean sees it.
+func TestGateRefusesAProposalThatRunsCode(t *testing.T) {
+	g, lib := gateForTest(t)
+	target := filepath.Join(t.TempDir(), "written")
+	for _, body := range []string{
+		"#eval IO.FS.writeFile \"" + target + "\" \"x\"",
+		"run_cmd (IO.FS.writeFile \"" + target + "\" \"x\" : IO Unit)",
+		"initialize (IO.FS.writeFile \"" + target + "\" \"x\" : IO Unit)",
+	} {
+		v, err := g.Decide(context.Background(), proposal("evil", "Evil", "def Evil : Nat := 1\n"+body))
+		if err == nil {
+			t.Fatalf("%q decided %+v", body, v)
+		}
+		if _, err := os.Stat(target); err == nil {
+			t.Fatalf("%q wrote a file", body)
+		}
+	}
+	if len(lib.got) != 0 {
+		t.Fatal("the librarian got a refused proposal")
 	}
 }

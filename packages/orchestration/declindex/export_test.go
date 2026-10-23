@@ -67,6 +67,16 @@ func compiledFixture(t *testing.T, l Lean) (dir string, forms []ConstRef) {
 	if err := CompileModule(ctx, l, nil, dir, "Fixture"); err != nil {
 		t.Fatal(err)
 	}
+	copies, err := os.ReadFile(filepath.Join("testdata", "lean", "Copies.lean"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Copies.lean"), copies, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompileModule(ctx, l, nil, dir, "Copies"); err != nil {
+		t.Fatal(err)
+	}
 	fm := FormsModule{Imports: []string{"Fixture"}, Concepts: []ConceptForms{{Concept: "Fx.SpAligned", Forms: spForms}}}
 	text, refs := fm.Source()
 	if err := os.WriteFile(filepath.Join(dir, FormsModuleName+".lean"), []byte(text), 0o644); err != nil {
@@ -84,7 +94,7 @@ func exportFixture(t *testing.T) map[string]Constant {
 	dir, forms := compiledFixture(t, l)
 	x := &Exporter{Lean: l, Bin: exporterForTest(t, l), SearchPath: []string{dir}, Jobs: 1}
 	consts, err := x.Run(context.Background(), Manifest{
-		Modules: []string{"Fixture"}, Imports: []string{FormsModuleName}, Roots: []string{"Fixture"},
+		Modules: []string{"Fixture", "Copies"}, Imports: []string{FormsModuleName}, Roots: []string{"Fixture", "Copies"},
 		Forms: forms, Concepts: []ConstRef{{Concept: "Fx.SpAligned", Const: "Fx.SpAligned"}}, Types: true,
 	})
 	if err != nil {
@@ -153,6 +163,12 @@ func TestExporterHashesACopyAsTheOriginal(t *testing.T) {
 			t.Errorf("%s hashes %s, the original %s", copy, consts[copy].Hash, orig.Hash)
 		}
 	}
+	for _, pair := range [][2]string{{"Fx.pickA", "Fx.pickB"}, {"Fx.posA", "Fx.posB"}} {
+		if a, b := consts[pair[0]].Hash, consts[pair[1]].Hash; a == "" || a != b {
+			t.Errorf("%s hashes %s and its copy %s hashes %s: a declaration's own auxiliaries must not name it",
+				pair[0], a, pair[1], b)
+		}
+	}
 	if consts["Fx.NearSp"].Hash == orig.Hash {
 		t.Error("a different statement hashed as the original")
 	}
@@ -181,5 +197,23 @@ func TestExporterAtomsAgreeAcrossSidesOfAnEquation(t *testing.T) {
 	}
 	if shared("Fx.inline", "Fx.other_reg") {
 		t.Error("the atoms about x2 and x10 agree")
+	}
+}
+
+// A compiled module sees only the toolchain's environment: none of the caller's variables, and its own directory
+// as home.
+func TestCompileModuleRunsLeanInAMinimalEnvironment(t *testing.T) {
+	l := leanForTest(t)
+	dir := t.TempDir()
+	t.Setenv("DECLINDEX_TEST_SECRET", "leaked")
+	probe := "def probe : IO Unit := do\n" +
+		"  if (← IO.getEnv \"DECLINDEX_TEST_SECRET\").isSome then throw (IO.userError \"the caller's environment leaked\")\n" +
+		"  if (← IO.getEnv \"HOME\") != some \"" + dir + "\" then throw (IO.userError \"home is not the module's directory\")\n" +
+		"#eval probe\n"
+	if err := os.WriteFile(filepath.Join(dir, "Probe.lean"), []byte(probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompileModule(context.Background(), l, nil, dir, "Probe"); err != nil {
+		t.Fatal(err)
 	}
 }

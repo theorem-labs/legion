@@ -45,4 +45,10 @@ def NearSp (R : BitVec 5 → BitVec 64) (n : Nat) : Prop := n > 0 ∧ R 2#5 &&& 
 structure SpBox (R : BitVec 5 → BitVec 64) : Prop where
   al : R 2#5 &&& 7#64 = 0#64
 
+/-- Copies whose bodies Lean elaborates through auxiliary definitions (`pickA.match_1`, `posA.proof_1`). -/
+def pickA : Nat → Nat
+  | 0 => 1
+  | n + 1 => n
+def posA : {n : Nat // n > 0} := ⟨1, by decide⟩
+
 end Fx

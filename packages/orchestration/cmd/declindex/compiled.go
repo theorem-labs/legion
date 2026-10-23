@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/declindex"
 	"github.com/sjawhar/legion/orchestration/ledger"
@@ -116,7 +118,7 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 }
 
 // cmdGate decides one proposal. Exit codes: 0 added, 1 refused (an exact duplicate), 4 near (sent to the
-// librarian), 3 unable to decide.
+// librarian), 5 the name is taken, 3 unable to decide.
 func cmdGate(ctx context.Context, e *env, args []string) int {
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return fail(e.stderr, &usageError{"gate takes one PROPOSAL.json"})
@@ -155,6 +157,8 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 		return 1
 	case conceptgate.Near:
 		return 4
+	case conceptgate.NameTaken:
+		return 5
 	}
 	return 0
 }
@@ -183,7 +187,7 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 	owners := declindex.Owners{}
 	if e.cfg.Owners != "" {
 		var err error
-		if owners, err = declindex.LoadOwners(e.cfg.Owners); err != nil {
+		if owners, err = declindex.LoadOwners(e.cfg.Owners, e.cfg.OwnersFormat); err != nil {
 			return fail(e.stderr, &unableError{err})
 		}
 	}
@@ -193,6 +197,9 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 	defer e.close()
 	if c := e.staleNote(ctx); c != treeHead(e.cfg.Tree) {
 		return fail(e.stderr, &unableError{fmt.Errorf("the index is at %q, not the tree's commit: refresh it after the landing first", c)})
+	}
+	if err := requireLedger(ctx, dsn, e.cfg.Repo); err != nil {
+		return fail(e.stderr, &unableError{err})
 	}
 	l, err := ledger.Open(ctx, dsn)
 	if err != nil {
@@ -214,4 +221,30 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// requireLedger checks, reading only, that the database holds the ledger's schema and the repository. The check
+// writes to an existing ledger; it never creates one (ledger.Open would apply the schema to an empty database).
+func requireLedger(ctx context.Context, dsn, repo string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("connect to the ledger: %w", err)
+	}
+	defer conn.Close(ctx)
+	var schema bool
+	if err := conn.QueryRow(ctx, `SELECT to_regclass('schema_versions') IS NOT NULL AND to_regclass('contracts') IS NOT NULL
+		AND to_regclass('repositories') IS NOT NULL`).Scan(&schema); err != nil {
+		return err
+	}
+	if !schema {
+		return fmt.Errorf("the database has no ledger schema; the ledger check does not create one")
+	}
+	var known bool
+	if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM repositories WHERE name = $1)`, repo).Scan(&known); err != nil {
+		return err
+	}
+	if !known {
+		return fmt.Errorf("the ledger has no repository %s", repo)
+	}
+	return nil
 }

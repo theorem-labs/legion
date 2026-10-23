@@ -172,3 +172,51 @@ func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 		t.Fatalf("after the change the user still states the fact: %+v %v", c, err)
 	}
 }
+
+// A concept with no written form is matched by its declaration's body. When a landing changes that body, every
+// module is matched again, also one that restates the old body without applying the concept.
+func TestRefreshRematchesEverythingWhenAFormlessConceptsBodyChanges(t *testing.T) {
+	tree, co := compiledTree(t)
+	l, ctx := co.Exporter.Lean, context.Background()
+	restate := "theorem restate (x : BitVec 64) (_h : 8 ≤ 64 ∧ x &&& 7#64 = 0#64) : True := trivial\n"
+	if err := os.WriteFile(filepath.Join(tree.Source, "Restate.lean"), []byte(restate), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompileModule(ctx, l, nil, tree.Source, "Restate"); err != nil {
+		t.Fatal(err)
+	}
+	stamp := func(rel, h string) {
+		t.Helper()
+		for _, ext := range []string{".ilean.hash", ".olean.hash"} {
+			if err := os.WriteFile(filepath.Join(tree.Lib, rel+ext), []byte(h), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	stamp("Fixture", "a")
+	stamp("Restate", "r")
+	tree.Roots["Restate"] = true
+	co.Forms = FormsModule{Imports: []string{"Fixture"}, Concepts: []ConceptForms{{Concept: "Fx.Frame"}}}
+	s := openStore(t)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co}); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := s.Constant(ctx, "restate"); err != nil || len(c.Facts) != 1 || c.Facts[0].Concept != "Fx.Frame" {
+		t.Fatalf("before the change: %+v %v", c, err)
+	}
+	src, _ := os.ReadFile(filepath.Join(tree.Source, "Fixture.lean"))
+	changed := strings.Replace(string(src), "n ≤ 64 ∧ sp &&& 7#64 = 0#64", "n ≤ 64 ∧ sp.toNat ≥ 0", 1)
+	if err := os.WriteFile(filepath.Join(tree.Source, "Fixture.lean"), []byte(changed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompileModule(ctx, l, nil, tree.Source, "Fixture"); err != nil {
+		t.Fatal(err)
+	}
+	stamp("Fixture", "b")
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: co}); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := s.Constant(ctx, "restate"); err != nil || len(c.Facts) != 0 {
+		t.Fatalf("after the concept's body changed, the old restatement still matches: %+v %v", c, err)
+	}
+}

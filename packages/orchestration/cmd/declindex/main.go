@@ -34,7 +34,8 @@ Commands:
                                definition they apply (via:<definition>), or by using the concept (uses)
   same NAME...                 the declarations whose statements share a relation atom with NAME's statement
   gate PROPOSAL.json           the similarity gate: refuse an exact duplicate (exit 1), send a near match to
-                               the librarian (exit 4), or add the concept to the registry (exit 0); JSON
+                               the librarian (exit 4), refuse a name already taken (exit 5), or add the
+                               concept to the registry (exit 0); JSON
                                {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>}
   ledger [--dsn-file PATH]     after a landing: register new contracts in the ledger (LEDGER_DSN), and report
                                each contract whose ledger hash is not the index's (exit 1)
@@ -142,6 +143,11 @@ func (e *env) open(needIndex bool) error {
 		}
 		if built == "" {
 			return &unableError{fmt.Errorf("the index at %s was never refreshed: run declindex refresh", e.cfg.DB)}
+		}
+		if n, err := s.Meta(context.Background(), "errors"); err != nil {
+			return &unableError{err}
+		} else if n != "0" {
+			return &unableError{fmt.Errorf("the index at %s is incomplete: %s modules' reference files could not be read", e.cfg.DB, n)}
 		}
 	}
 	return nil
@@ -360,7 +366,7 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 		for _, f := range found {
 			out = append(out, hashed{f.Name, f.StmtHash, f.At()})
 			if f.StmtHash == "" {
-				fmt.Fprintf(e.stderr, "declindex: %s has no statement hash: its source file is missing\n", f.Name)
+				fmt.Fprintf(e.stderr, "declindex: %s has no statement hash: its source file is missing or newer than its build\n", f.Name)
 				rc = 1
 			}
 		}

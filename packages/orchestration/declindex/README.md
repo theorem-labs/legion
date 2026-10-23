@@ -4,76 +4,78 @@
 
 - where a name is declared (`where`);
 - who uses it, and how far a change to its statement reaches (`users`);
-- its statement hash (`hash`), the hash a change lock records for its reads;
+- its statement hash (`hash`), the hash a change lock records for its reads, and the same for the landing program (`land-hash`);
 - who states a registered fact (`states`), and who shares a relation atom with a statement (`same`).
 
 It also runs the similarity gate in front of the librarian (`gate`), and after a landing it checks the contract ledger (`ledger`).
 
 ## Parts
 
-- **The `.ilean` part** (`ilean.go`, `refresh.go`, `query.go`, `graph.go`). It reads Lean's reference files: declarations, kinds, positions, uses marked `stmt` or `proof`, and edges. A module is read again when its `.ilean` (Lake's content hash) or its source (size and mtime) changes. Reach walks a compressed graph file written next to the SQLite file.
-  - On the Linux proof's built tree this part gives the same rows as `uses`: 545,934 declarations, 9,686,627 uses and 4,389,369 edges.
-  - The one difference in answers: reach counts each `example` once per module. Lean names every `example` `_example`.
+- **The `.ilean` part** (`ilean.go`, `refresh.go`, `query.go`, `graph.go`). It reads Lean's reference files: declarations, kinds, positions, uses marked `stmt` or `proof`, and edges.
+  - A module is read again when its `.ilean` (Lake's content hash) or its source (size and mtime) changes.
+  - A declaration whose recorded position no longer holds its name (a source newer than its build) gets no statement hash, so nothing hashes text that is not the declaration.
+  - Reach walks a compressed graph file written next to the SQLite file. An edge's target is counted as the longest declared name it extends (`X.wp` is the field of `X`), against every module's declarations when the graph is written, so an incremental refresh answers as a full one does.
+  - The graph file carries the generation of the index it was built from. A query refuses a graph of another generation, and the next refresh writes it again, so a failed write is never read.
 - **The compiled part** (`lean/`, `export.go`, `compiled.go`). The exporter is a Lean program, built with the tree's own toolchain. It reads the `.olean` files and records, for each constant:
   - its printed type;
-  - a compiled statement hash. Binder names, universe names and the declaration's own name are erased, and literals are compared by value. A structure's field names are kept;
+  - a compiled statement hash. Binder names, universe names and the declaration's own name (and every name Lean makes from it) are erased, an auxiliary definition Lean makes while elaborating (a matcher, an abstracted proof) is hashed by its content, and literals are compared by value. A structure's field names are kept;
   - relation atoms;
   - the registry facts its statement states: `direct`, `via:<definition>`, or `uses`.
 - **Matching facts.** A form matches as a first-order pattern, in either order for `=`, `≠`, `↔` and `HEq`, and through local aliases.
   - A definition's templates carry a match through applications of any depth.
-  - After a landing, the modules whose `.olean` changed are read again. So are the statements reached from a definition whose compiled hash changed.
+  - After a landing, the modules whose `.olean` changed are read again, and so are the statements reached from a definition whose compiled hash changed. Every module is read again when the exporter, the forms, or the body of a concept with no form changes.
 - **The registry** (`conceptgate/registry.go`) is a YAML file in the project's git. Each concept has:
   - a name;
   - a home file;
   - a one-sentence meaning;
   - `extends`, when it extends another concept;
-  - forms: Lean lambda terms whose binders are pattern variables. A concept with no form is matched by its declaration's body.
+  - forms: Lean lambda terms whose binders are pattern variables. A concept with no form is matched by its declaration's body;
+  - `compiled_hash`, which the gate saves when it adds a concept.
 
 ## The gate's rules and why
 
-The data behind these rules is the close-match baseline of the stack-alignment fact: 1,824 Spec files defined by a text rule.
+The rules come from a measurement on a large project of one fact restated across it (a register being 8-aligned): how much of its restatements each method found, against a rule-based ground truth.
 
-| Verdict | Rule | Why |
+| Verdict (exit code) | Rule | Why |
 | --- | --- | --- |
-| refused | The name is registered or declared already. Or the compiled statement hash equals that of a registered concept, then of any declaration. The verdict names it. | The exact methods were 100% precise, so an exact duplicate needs no judgment. The compiled hash is finer than the text hash: equal text that elaborates the same gives the same compiled statement. |
-| near | The proposal's own text states a registered form, directly or through a definition the proposal declares. The definitions it reaches may be of any depth. | Compiled statements followed through definitions found 98.0% of the files at 99.2% precision. Text normalisation found at most 85%. |
-| added | Anything else, including a proposal that only applies a registered concept or an existing definition. | Reuse is the wanted outcome. |
+| name-taken (5) | The name is a registered concept's or an existing declaration's. | The statement may be new; the proposal needs another name. |
+| refused (1) | The compiled statement hash equals a registered concept's (its compiled entry in the index, or the hash saved when the gate added it), then any declaration's. The verdict names it. | The exact methods were 100% precise, so an exact duplicate needs no judgment. |
+| near (4) | The proposal's own text states a registered form, directly or through a definition the proposal declares. Or a registered concept cannot be compared: it has no compiled entry, no saved hash and no form. | Compiled statements followed through definitions found 98% of the restatements at 99% precision; text normalisation found at most 85%. A concept the gate cannot compare goes to the librarian, never past it. |
+| added (0) | Anything else, including a proposal that only applies a registered concept or an existing definition. | Reuse is the wanted outcome. |
 
 Two thresholds are deliberately absent:
 
-- **No embedding threshold.** Embeddings reached ROC-AUC 0.797 on this fact, and no threshold reached 90% precision.
-- **No partial-atom threshold.** A threshold of half the atoms would make every inline alignment near `StackFrame`.
+- **No embedding threshold.** Embeddings reached ROC-AUC 0.80 on this fact, and no threshold reached 90% precision.
+- **No partial-atom threshold.** A threshold of half the atoms would make every inline statement of a fact near the definition that bundles it with another.
 
 A proposal's own definition that only wraps a registered concept goes to the librarian. The matcher cannot tell such a template from a restatement, and a false near match costs only a review.
 
-## Measured on the Linux proof's tree
+The gate cannot decide (exit 3) when the index lacks its compiled part, when the proposal does not compile, or when the walk of a statement hits its node budget.
 
-At commit `170372292`, on 48 jobs on the build machine:
+### Untrusted proposals
 
-- **Full build of the `.ilean` part:** 2 min 6 s.
-- **Compiled part:** 15 min 3 s for 52,529 modules and 789,877 constants (the whole refresh from nothing, both parts: 18 min 26 s).
-- **Update after a landing:**
-  - 2.3 s when nothing changed;
-  - 16.2 s when one module changed, 11 s of which rebuilds the graph file.
-- **Query times, each process included:**
-  - `users`: 0.009 s median and 0.59 s worst, for `kObj`;
-  - `states` of the stack-alignment concept: 0.34 s for 23,095 rows;
-  - `gate`: about 3.5 s, which includes compiling the proposal.
-- **`states LinuxMmu.SK.SpAligned` against the rule's 1,824 Spec files:**
-  - direct statements only: 66.1% recall;
-  - through definitions as well: **98.1% (1,789/1,824)** recall.
-  - It also finds 88 Spec files that the rule lacks. The baseline found that some of the rule's misses state the fact through `twStackIn` and the `*WarnRes` definitions.
-  - Of the 35 files it misses, the baseline traced most to `k.sp` or to a parameter named `sp`, which no compiled form names, or to a missing or stale `.olean`.
-- **The gate on the real tree:**
-  - a copy of `StackFrame` was refused, naming `LinuxMmu.SK.StackFrame`;
-  - a restatement of stack alignment was sent to the librarian, the only message it received;
-  - a new concept was added.
+Compiling a proposal must run none of its code. The gate refuses, outside comments and strings, any `#` command (`#eval`, `#print`), `run_cmd`, `run_meta`, `run_elab`, `run_tac`, `initialize`, macros, elaborators, syntax and notation, `unsafe`, `native_decide`, `implemented_by`, `extern`, and the attributes that run or export code (`init`, `export`, `extern`). Lean then compiles it in a scratch directory that is its home, with an environment of `PATH`, `LEAN_PATH`, `HOME` and `TMPDIR` only. The project's own elaborators and tactics run as they do in its build.
+
+## The fixture
+
+`testdata/lean/Fixture.lean` states one fact, register x2 of a register file being 8-aligned (`Fx.SpAligned`), in each way the matcher must find: inline, through a field projection, with sides swapped, through a local alias, with an offset, as `% 8`, through wrappers (`Fx.Frame`, `Fx.Wrap`) of any depth; and statements that look alike and are not it.
+
+## Measured on a large project
+
+Measured on a large built project (52,529 modules, 545,934 declarations), 48 jobs:
+
+- **Parity with the reference `.ilean` reader:** the same 545,934 declarations, 9,686,627 uses and 4,389,369 resolved edges, with 0 differences. For 55 declarations sampled across wide and narrow use, the same direct users, per-directory counts and use lines; reach differs only for the 4 whose users include `example`s, which this index counts once per module.
+- **Refresh from nothing:** 15 min 56 s; 2 min 1 s for the `.ilean` part, 13 min 49 s for the compiled part (789,877 constants). 260 declarations had a source newer than their build and got no statement hash.
+- **Update after a landing:** 3.0 s when nothing changed; 19.4 s when one module changed, 14 s of which rebuilds the graph file.
+- **Query times, each process included:** `states` of the fact's concept 0.34 s (23,095 rows); `users` 0.2 s median and 0.67 s worst; `where` 0.014 s; `same` 0.11 s; `gate` about 3.5 s, which includes compiling the proposal.
+- **`states` against the rule's 1,824 files that restate the fact:** 98.1% (1,789) recall through definitions; 66.1% from direct statements only. It also finds 88 files that the rule lacks.
+- **The gate:** a copy of a registered concept was refused, naming it; a restatement of the fact went to the librarian, the only message it received; a new concept was added with its compiled hash; a proposal with an `#eval` that writes a file was refused before compiling, and no file was written.
 
 ## The ledger
 
 `ledger` runs after a landing on the index of the landed build.
 
-- It registers each contract that the rule selects and that has an owner. A contract's owner comes from an `owners/v1` file. Registration is at version 1, with the statement hash.
-- It reports each contract whose ledger hash differs from the index's, and each ledger contract the index no longer declares. It never advances a contract: only `Land` does.
-- On the Linux proof's slice it registered 420 owned contracts; the next run found all 435 owned contracts matching, 0 defects.
+- It reads the ledger and writes only to an existing one: a database without the ledger's schema or the repository is refused (exit 3).
+- It registers each contract that the rule selects and that has an owner, at version 1 with the statement hash. Owners come from the owner map (`owners`): `{"format": F, "owners": [{"id": <owner key>, "contract": <directory> | null}, …]}`, where `owners_format` names the `F` the deployment expects.
+- It reports each contract whose ledger hash differs from the index's, and each ledger contract the index no longer declares (exit 1). It never advances a contract: only `Land` does.
 - The hash is the text statement hash, because a change lock's reads carry that hash and `Land` compares the two.

@@ -6,8 +6,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
+	"strings"
 )
 
 // graph is the declaration graph in compressed sparse rows, written beside the index after each refresh so
@@ -18,6 +20,8 @@ import (
 // bytes), then the CSR offsets (node count + 1) and the edges, each a target node and a module index whose top bit
 // says that the edge propagates a change (a statement use, or a use by a definition).
 type graph struct {
+	// token is the index generation the graph was built from (meta "graph"); a query refuses another one.
+	token   string
 	names   []string // sorted: a node's id is its index
 	modules []string
 	offs    []uint32
@@ -25,7 +29,7 @@ type graph struct {
 	mod     []uint32
 }
 
-const graphMagic = "declindex-graph-1\n"
+const graphMagic = "declindex-graph-2\n"
 
 const propBit = uint32(1) << 31
 
@@ -37,9 +41,48 @@ func (g *graph) id(name string) (uint32, bool) {
 	return 0, false
 }
 
-// buildGraph reads the edges table into a graph.
+// buildGraph reads the edges table into a graph. Each edge's target is counted as the longest declared name it
+// extends, against the declarations of every module now, so an incremental refresh gives the graph a full one
+// gives.
 func buildGraph(ctx context.Context, q querier) (*graph, error) {
-	rows, err := q.QueryContext(ctx, `SELECT src, dst, module, `+propagates+` FROM edges e`)
+	declared := map[string]bool{}
+	rows, err := q.QueryContext(ctx, `SELECT name FROM decls`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		declared[n] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	owner := map[string]string{}
+	own := func(t string) string {
+		if o, ok := owner[t]; ok {
+			return o
+		}
+		o := t
+		for o != "" && !declared[o] {
+			i := strings.LastIndexByte(o, '.')
+			if i < 0 {
+				o = ""
+				break
+			}
+			o = o[:i]
+		}
+		if o == "" {
+			o = t
+		}
+		owner[t] = o
+		return o
+	}
+	rows, err = q.QueryContext(ctx, `SELECT target, dst, module, `+propagates+` FROM edges e`)
 	if err != nil {
 		return nil, err
 	}
@@ -51,9 +94,13 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 	nameSet, modSet := map[string]bool{}, map[string]bool{}
 	for rows.Next() {
 		var e edge
-		if err := rows.Scan(&e.src, &e.dst, &e.mod, &e.prop); err != nil {
+		var target string
+		if err := rows.Scan(&target, &e.dst, &e.mod, &e.prop); err != nil {
 			rows.Close()
 			return nil, err
+		}
+		if e.src = own(target); e.src == e.dst {
+			continue
 		}
 		nameSet[e.src], nameSet[e.dst], modSet[e.mod] = true, true, true
 		edges = append(edges, e)
@@ -71,14 +118,13 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 	for i, n := range g.names {
 		nodeID[n] = uint32(i)
 	}
-	type packed struct{ src, dst, mod uint32 }
+	type packed struct {
+		src, dst, mod uint32
+		prop          bool
+	}
 	ps := make([]packed, len(edges))
 	for i, e := range edges {
-		m := modID[e.mod]
-		if e.prop {
-			m |= propBit
-		}
-		ps[i] = packed{nodeID[e.src], nodeID[e.dst], m}
+		ps[i] = packed{nodeID[e.src], nodeID[e.dst], modID[e.mod], e.prop}
 	}
 	sort.Slice(ps, func(i, j int) bool {
 		if ps[i].src != ps[j].src {
@@ -89,12 +135,24 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 		}
 		return ps[i].mod < ps[j].mod
 	})
+	// Two targets with one owner give one edge, which propagates when either use does.
+	merged := ps[:0]
+	for _, p := range ps {
+		if n := len(merged); n > 0 && merged[n-1].src == p.src && merged[n-1].dst == p.dst && merged[n-1].mod == p.mod {
+			merged[n-1].prop = merged[n-1].prop || p.prop
+			continue
+		}
+		merged = append(merged, p)
+	}
 	g.offs = make([]uint32, len(g.names)+1)
-	g.dst = make([]uint32, len(ps))
-	g.mod = make([]uint32, len(ps))
-	for i, p := range ps {
+	g.dst = make([]uint32, len(merged))
+	g.mod = make([]uint32, len(merged))
+	for i, p := range merged {
 		g.offs[p.src+1]++
 		g.dst[i], g.mod[i] = p.dst, p.mod
+		if p.prop {
+			g.mod[i] |= propBit
+		}
 	}
 	for i := 1; i < len(g.offs); i++ {
 		g.offs[i] += g.offs[i-1]
@@ -124,10 +182,11 @@ func putStrings(b *bytes.Buffer, ss []string) {
 	}
 }
 
-// write stores the graph at path atomically.
+// write stores the graph at path atomically, with the generation token of the index it was built from.
 func (g *graph) write(path string) error {
 	var b bytes.Buffer
 	b.WriteString(graphMagic)
+	putStrings(&b, []string{g.token})
 	putStrings(&b, g.names)
 	putStrings(&b, g.modules)
 	_ = binary.Write(&b, binary.LittleEndian, uint32(len(g.dst)))
@@ -139,6 +198,26 @@ func (g *graph) write(path string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// graphToken reads only the generation token of the graph file at path; empty when there is none.
+func graphToken(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	head := make([]byte, 4096)
+	n, _ := io.ReadFull(f, head)
+	if !bytes.HasPrefix(head[:n], []byte(graphMagic)) {
+		return ""
+	}
+	r := &reader{b: head[len(graphMagic):n]}
+	t := r.strings()
+	if r.err != nil || len(t) != 1 {
+		return ""
+	}
+	return t[0]
 }
 
 type reader struct {
@@ -198,7 +277,14 @@ func loadGraph(path string) (*graph, error) {
 		return nil, fmt.Errorf("%s is not a declaration graph of this version", path)
 	}
 	r := &reader{b: data[len(graphMagic):]}
+	tok := r.strings()
+	if r.err == nil && len(tok) != 1 {
+		return nil, fmt.Errorf("%s has no generation token", path)
+	}
 	g := &graph{names: r.strings(), modules: r.strings()}
+	if len(tok) == 1 {
+		g.token = tok[0]
+	}
 	e := int(r.u32())
 	g.offs = r.u32s(len(g.names) + 1)
 	g.dst = r.u32s(e)

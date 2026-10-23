@@ -30,6 +30,8 @@ type Config struct {
 	// Contracts selects the declarations that the ledger tracks, and Owners maps them to their owners.
 	Contracts ContractRule `yaml:"contracts"`
 	Owners    string       `yaml:"owners"`
+	// OwnersFormat is the "format" value the owner map must carry (its producer's format name); empty accepts any.
+	OwnersFormat string `yaml:"owners_format"`
 	// Repo is the repository's name in the ledger.
 	Repo string `yaml:"repo"`
 	// Librarian is the command that hands a near match to the librarian (the proposal and verdict on stdin).

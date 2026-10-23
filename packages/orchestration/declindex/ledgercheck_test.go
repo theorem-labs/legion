@@ -31,12 +31,12 @@ func TestGlobRegexp(t *testing.T) {
 
 func TestLoadOwners(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "owners.json")
-	body := `{"format":"cgraph/owners/v1","owners":[{"id":"function:frame_at","role":"function","contract":"Sub"},` +
+	body := `{"format":"graph/owners/v1","owners":[{"id":"function:frame_at","role":"function","contract":"Sub"},` +
 		`{"id":"struct:mount","role":"data_structure","contract":null}]}`
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	o, err := LoadOwners(p)
+	o, err := LoadOwners(p, "graph/owners/v1")
 	if err != nil {
 		t.Fatal(err)
 	}

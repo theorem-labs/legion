@@ -54,6 +54,9 @@ type ModuleData struct {
 	Module string
 	Decls  []Decl
 	Uses   []Use
+	// Stale counts the declarations whose recorded position does not hold their name in the source: the source is
+	// newer than the reference file. Their statement hashes are left empty.
+	Stale int
 }
 
 type ileanFile struct {
@@ -150,7 +153,11 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 						l, c := s.position(b)
 						sigends[name] = sigEnd{l, c}
 					}
-					d.StmtHash = StatementHash(StatementText(s.text, a, e, selEnd, d.Kind))
+					if selectionHolds(s.text, name, sel, selEnd) {
+						d.StmtHash = StatementHash(StatementText(s.text, a, e, selEnd, d.Kind))
+					} else {
+						md.Stale++
+					}
 				}
 			}
 		}
@@ -206,4 +213,33 @@ func sortUses(us []Use) {
 		}
 		return a.Class < b.Class
 	})
+}
+
+// anonymousSelections are the commands whose declarations Lean names itself (an `instance` without a name, the
+// auxiliary of a `macro_rules`): their selection range holds the command, not the name.
+var anonymousSelections = []string{"instance", "example", "macro_rules", "macro", "syntax", "elab_rules", "elab",
+	"notation", "infixl", "infixr", "infix", "prefix", "postfix", "deriving", "@[", "scoped", "local"}
+
+// selectionHolds reports whether the source still holds the declaration at the position its reference file
+// recorded: the selection range is its name (or a dotted suffix of it), or the command of a declaration Lean
+// names itself. A source newer than its build fails it.
+func selectionHolds(text, name string, sel, selEnd int) bool {
+	if sel < 0 || sel > len(text) {
+		return false
+	}
+	unquote := strings.NewReplacer("«", "", "»", "")
+	if selEnd >= sel && selEnd <= len(text) {
+		got := unquote.Replace(text[sel:selEnd])
+		want := unquote.Replace(name)
+		if got != "" && (got == want || strings.HasSuffix(want, "."+got)) {
+			return true
+		}
+	}
+	rest := text[sel:]
+	for _, kw := range anonymousSelections {
+		if strings.HasPrefix(rest, kw) {
+			return true
+		}
+	}
+	return false
 }

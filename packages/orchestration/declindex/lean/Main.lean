@@ -52,12 +52,12 @@ def statementExprs (env : Environment) (ci : ConstantInfo) : List Expr :=
   | .inductInfo v => ci.type :: v.ctors.filterMap (fun c => (env.find? c).map (·.type))
   | _ => [ci.type]
 
-/-- The names a copy of the declaration under another name would rename: itself, its constructors, its parent. -/
-def selfNames (ci : ConstantInfo) : NameSet :=
+/-- The names a copy of the declaration under another name would rename: itself (and so every name Lean makes
+from it), and for a constructor its inductive. -/
+def selfNames (ci : ConstantInfo) : List Name :=
   match ci with
-  | .inductInfo v => v.ctors.foldl (·.insert ·) ({} : NameSet) |>.insert ci.name
-  | .ctorInfo v => ({} : NameSet).insert ci.name |>.insert v.induct
-  | _ => ({} : NameSet).insert ci.name
+  | .ctorInfo v => [ci.name, v.induct]
+  | _ => [ci.name]
 
 def truncate (s : String) (n : Nat := 4000) : String :=
   if s.length ≤ n then s else toString (s.take n) ++ " …"
@@ -70,7 +70,7 @@ partial def binderNames : Expr → List String
 def record (cfg : MatchConfig) (types : Bool) (m : Name) (c : Name) (ci : ConstantInfo) : StateRefT St MetaM Json := do
   let env ← getEnv
   let exprs := statementExprs env ci
-  let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci }
+  let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci, env? := some env }
   let fields : List String := match ci with
     | .inductInfo v => v.ctors.flatMap fun k =>
         match env.find? k with

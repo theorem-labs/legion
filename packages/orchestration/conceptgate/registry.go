@@ -37,6 +37,9 @@ type Concept struct {
 	Forms []string `yaml:"forms,omitempty" json:"forms,omitempty"`
 	// Proposal is the proposal that added it, when the gate added it.
 	Proposal string `yaml:"proposal,omitempty" json:"proposal,omitempty"`
+	// CompiledHash is the compiled statement hash the gate read when it added the concept, so that a copy is
+	// refused before the concept lands and the index has it.
+	CompiledHash string `yaml:"compiled_hash,omitempty" json:"compiled_hash,omitempty"`
 }
 
 // Registry is the registry file.

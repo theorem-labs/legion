@@ -2,7 +2,9 @@ package declindex
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +48,8 @@ type RefreshStats struct {
 	Reread     int `json:"reread"`
 	Removed    int `json:"removed"`
 	Unreadable int `json:"unreadable"`
+	// Stale counts the declarations whose source is newer than their reference file: they have no statement hash.
+	Stale int `json:"stale"`
 	// Exported counts the compiled modules read; Rematched the further modules read because a definition they
 	// apply changed.
 	Exported  int           `json:"exported"`
@@ -240,6 +244,7 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 			continue
 		}
 		st.Reread++
+		st.Stale += md.Stale
 		for _, d := range md.Decls {
 			if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash); err != nil {
 				return st, err
@@ -267,11 +272,26 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 		return st, err
 	}
 	st.Removed = len(gone)
-	for k, v := range map[string]string{
+	meta := map[string]string{
 		"commit": opt.Commit,
 		"built":  time.Now().UTC().Format("2006-01-02T15:04Z"),
 		"errors": fmt.Sprint(st.Unreadable),
-	} {
+	}
+	// The graph file is written after the commit. A new generation token marks it out of date until a graph of
+	// this generation is written, so a failed write is repaired by the next refresh and never read meanwhile.
+	token, err := s.Meta(ctx, "graph")
+	if err != nil {
+		return st, err
+	}
+	if len(changed) > 0 || len(gone) > 0 || token == "" {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return st, err
+		}
+		token = hex.EncodeToString(b[:])
+		meta["graph"] = token
+	}
+	for k, v := range meta {
 		if err := s.setMeta(ctx, tx, k, v); err != nil {
 			return st, err
 		}
@@ -279,12 +299,13 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 	if err := tx.Commit(); err != nil {
 		return st, err
 	}
-	if _, err := os.Stat(s.path + ".graph"); len(changed) > 0 || len(gone) > 0 || err != nil {
+	if graphToken(s.path+".graph") != token {
 		t1 := time.Now()
 		g, err := buildGraph(ctx, s.db)
 		if err != nil {
 			return st, fmt.Errorf("build the declaration graph: %w", err)
 		}
+		g.token = token
 		if err := g.write(s.path + ".graph"); err != nil {
 			return st, fmt.Errorf("write the declaration graph: %w", err)
 		}
@@ -298,8 +319,8 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 		}
 	}
 	st.Elapsed = time.Since(t0)
-	logf(opt.Log, "index: %d re-read, %d removed, %d unreadable, %d compiled modules read, %d re-matched, %s",
-		st.Reread, st.Removed, st.Unreadable, st.Exported, st.Rematched, st.Elapsed.Round(time.Millisecond))
+	logf(opt.Log, "index: %d re-read, %d removed, %d unreadable, %d declarations newer than their build, %d compiled modules read, %d re-matched, %s",
+		st.Reread, st.Removed, st.Unreadable, st.Stale, st.Exported, st.Rematched, st.Elapsed.Round(time.Millisecond))
 	return st, nil
 }
 
@@ -328,49 +349,10 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 	return ParseModule(rel, ilean, src, tree.Roots)
 }
 
-// insertEdges adds the declaration-level edges of the re-read modules. A use's target is counted as the longest
-// declared name it extends (`X.wp` is X's field), so a generated part's use is a use of its declaration.
+// insertEdges adds the declaration-level edges of the re-read modules: for each user declaration, the targets
+// it uses as recorded. Which declaration a target belongs to (`X.wp` is X's field while nothing declares `X.wp`)
+// depends on every module's declarations, so buildGraph decides it when it writes the graph.
 func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []error) error {
-	if len(results) == 0 {
-		return nil
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT name FROM decls`)
-	if err != nil {
-		return err
-	}
-	names := map[string]bool{}
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return err
-		}
-		names[n] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	owner := map[string]string{}
-	own := func(t string) string {
-		if o, ok := owner[t]; ok {
-			return o
-		}
-		o := t
-		for o != "" && !names[o] {
-			i := strings.LastIndexByte(o, '.')
-			if i < 0 {
-				o = ""
-				break
-			}
-			o = o[:i]
-		}
-		if o == "" {
-			o = t
-		}
-		owner[t] = o
-		return o
-	}
 	edges := newBatch(tx, "edges", 5)
 	for i, md := range results {
 		if errs[i] != nil {
@@ -380,18 +362,14 @@ func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []e
 		for _, d := range md.Decls {
 			kind[d.Name] = d.Kind
 		}
-		type pair struct{ src, dst string }
+		type pair struct{ target, dst string }
 		agg := map[pair]bool{}
 		var order []pair
 		for _, u := range md.Uses {
 			if u.Parent == "" {
 				continue
 			}
-			src := own(u.Target)
-			if src == u.Parent {
-				continue
-			}
-			p := pair{src, u.Parent}
+			p := pair{u.Target, u.Parent}
 			if _, ok := agg[p]; !ok {
 				order = append(order, p)
 			}
@@ -402,7 +380,7 @@ func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []e
 			if agg[p] {
 				stmt = 1
 			}
-			if err := edges.add(ctx, p.src, p.dst, md.Module, stmt, kind[p.dst]); err != nil {
+			if err := edges.add(ctx, p.target, p.dst, md.Module, stmt, kind[p.dst]); err != nil {
 				return err
 			}
 		}

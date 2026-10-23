@@ -38,12 +38,21 @@ def hex64 (n : UInt64) : String :=
 
 def H.hex (h : H) : String := hex64 h.a ++ hex64 h.b
 
-/-- How the hash treats names: a universe parameter by its position, a constant by its name except the ones
-mapped to a placeholder (the declaration itself, so that a copy under a new name hashes equal), and a free
-variable by its position of first occurrence when `fvars` is on. -/
+/-- How the hash treats names: a universe parameter by its position; the declaration itself and any name Lean
+made from it (`X.mk`, `X.match_1`) by a placeholder and the name's suffix, so that a copy under a new name
+hashes equal; an auxiliary definition Lean makes while elaborating (a matcher, an abstracted proof) by its
+content, since a copy elsewhere gets its own or reuses an existing one; any other constant by its name. -/
 structure HashCtx where
   levels : List Name := []
-  self : NameSet := {}
+  self : List Name := []
+  env? : Option Environment := none
+
+/-- An auxiliary definition that elaboration made: a matcher, or a proof abstracted out of a body. -/
+def isElabAux (env : Environment) (n : Name) : Bool :=
+  Meta.isMatcherCore env n ||
+    match n with
+    | .str _ s => s.startsWith "proof_" || s.startsWith "match_" || s.startsWith "_auxLemma"
+    | _ => false
 
 partial def hashLevel (ctx : HashCtx) : Level → H
   | .zero => H.tag "z" []
@@ -78,8 +87,15 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
     | .mvar _ => pure (H.tag "?" [])
     | .sort l => pure (H.tag "S" [hashLevel ctx l])
     | .const n ls =>
-      if ctx.self.contains n then pure (H.tag "self" [])
-      else pure (H.tag "c" (H.ofString n.toString :: ls.map (hashLevel ctx)))
+      match ctx.env?.bind fun env => if isElabAux env n then env.find? n else none with
+      | some ci =>
+        let sub : HashCtx := { ctx with levels := ci.levelParams, self := n :: ctx.self }
+        let parts : List H := Id.run (((ci.type :: ci.value?.toList).mapM (hashExpr sub)).run' {})
+        pure (H.tag "aux" (parts ++ ls.map (hashLevel ctx)))
+      | none =>
+        match ctx.self.find? (·.isPrefixOf n) with
+        | some p => pure (H.tag "self" (H.ofString (n.replacePrefix p .anonymous).toString :: ls.map (hashLevel ctx)))
+        | none => pure (H.tag "c" (H.ofString n.toString :: ls.map (hashLevel ctx)))
     | .app .. =>
       match lit? e with
       | some n => pure (H.tag "n" [H.ofString (toString n)])

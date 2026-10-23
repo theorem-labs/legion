@@ -24,9 +24,9 @@ type ContractLedger interface {
 // Owners maps a contract's directory to its owner key (a graph node id such as function:open_file).
 type Owners map[string]string
 
-// LoadOwners reads an owners file of the graph tool (format "cgraph/owners/v1", or "owners/v1"):
-// {"format":…,"owners":[{"id":…,"contract":<directory>|null},…]}.
-func LoadOwners(path string) (Owners, error) {
+// LoadOwners reads an owner map: {"format": F, "owners": [{"id": <owner key>, "contract": <directory>|null}, …]}.
+// format is the F the deployment expects (its graph tool's format name); empty accepts any.
+func LoadOwners(path, format string) (Owners, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -41,8 +41,8 @@ func LoadOwners(path string) (Owners, error) {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if f.Format != "cgraph/owners/v1" && f.Format != "owners/v1" {
-		return nil, fmt.Errorf("%s: format %q, this reader reads cgraph/owners/v1", path, f.Format)
+	if format != "" && f.Format != format {
+		return nil, fmt.Errorf("%s: format %q, the configuration expects %q", path, f.Format, format)
 	}
 	out := Owners{}
 	for _, o := range f.Owners {
@@ -198,7 +198,7 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 				continue
 			}
 			if c.StmtHash == "" {
-				return r, fmt.Errorf("contract %s has no statement hash: its source file is missing", c.Name)
+				return r, fmt.Errorf("contract %s has no statement hash: its source file is missing or newer than its build", c.Name)
 			}
 			if _, err := l.RegisterContract(ctx, repo, c.Name, owner, c.StmtHash, false); err != nil {
 				return r, fmt.Errorf("register %s: %w", c.Name, err)

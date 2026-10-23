@@ -33,6 +33,9 @@ const (
 	Near Outcome = "near"
 	// Added: nothing in the registry or the index states it; it is appended to the registry.
 	Added Outcome = "added"
+	// NameTaken: the name is a registered concept's or an existing declaration's. The statement may be new; the
+	// proposal needs another name. Existing names the holder.
+	NameTaken Outcome = "name-taken"
 )
 
 // Match is one registered fact that the proposal's own text states.
@@ -130,6 +133,14 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 	if err := p.Concept.check(); err != nil {
 		return v, err
 	}
+	if err := checkProposalSource(p.Source); err != nil {
+		return v, err
+	}
+	if d, err := g.Index.Meta(ctx, "compiled"); err != nil {
+		return v, err
+	} else if d == "" {
+		return v, fmt.Errorf("the index was read without its compiled part, so the gate has no compiled statements to compare")
+	}
 	reg, err := Load(g.Registry)
 	if err != nil {
 		return v, err
@@ -143,15 +154,19 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 		v.Outcome, v.Existing, v.ExistingAt, v.Reason = Refused, existing, at, reason
 		return v, nil
 	}
+	taken := func(existing, at, reason string) (Verdict, error) {
+		v.Outcome, v.Existing, v.ExistingAt, v.Reason = NameTaken, existing, at, reason
+		return v, nil
+	}
 	if c, ok := reg.Find(p.Concept.Name); ok {
-		return refuse(c.Name, c.Home, "a concept of this name is registered")
+		return taken(c.Name, c.Home, "a concept of this name is registered")
 	}
 	if found, err := g.Index.Resolve(ctx, p.Concept.Name); err != nil {
 		return v, err
 	} else {
 		for _, f := range found {
 			if f.Name == p.Concept.Name {
-				return refuse(f.Name, f.At(), "a declaration of this name exists")
+				return taken(f.Name, f.At(), "a declaration of this name exists")
 			}
 		}
 	}
@@ -176,18 +191,24 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 		}
 	}
 	v.CompiledHash = decl.Hash
-	// Exact duplicates: a registered concept first, then any declaration of the project.
+	// Exact duplicates: a registered concept first, by its compiled statement in the index or, before it lands,
+	// the one the gate saved when it added it; then any declaration of the project. A concept with neither and no
+	// form cannot be compared.
+	var unknown []string
 	for _, c := range reg.Concepts {
 		rc, err := g.Index.Constant(ctx, c.Name)
 		var nf *declindex.NotFoundError
-		if errors.As(err, &nf) {
-			continue
-		}
-		if err != nil {
+		switch {
+		case errors.As(err, &nf):
+			rc = declindex.Compiled{}
+		case err != nil:
 			return v, err
 		}
-		if rc.Hash == decl.Hash {
+		if (rc.Hash != "" && rc.Hash == decl.Hash) || (c.CompiledHash != "" && c.CompiledHash == decl.Hash) {
 			return refuse(c.Name, c.Home, "the compiled statement equals the registered concept's")
+		}
+		if rc.Hash == "" && c.CompiledHash == "" && len(c.Forms) == 0 {
+			unknown = append(unknown, c.Name)
 		}
 	}
 	same, err := g.Index.SameCompiled(ctx, decl.Hash)
@@ -208,12 +229,16 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 			}
 		}
 	}
-	if len(v.Matches) > 0 {
+	if len(v.Matches) > 0 || len(unknown) > 0 {
 		sort.Slice(v.Matches, func(i, j int) bool {
 			a, b := v.Matches[i], v.Matches[j]
 			return a.Concept+a.Declaration+a.How < b.Concept+b.Declaration+b.How
 		})
 		v.Outcome, v.Reason = Near, "the proposal restates a registered concept's fact"
+		if len(v.Matches) == 0 {
+			v.Reason = "the gate cannot compare the proposal with " + strings.Join(unknown, ", ") +
+				": registered, not declared in the index, with no form and no compiled hash"
+		}
 		if err := g.Librarian.Review(ctx, v, p); err != nil {
 			return v, err
 		}
@@ -221,6 +246,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 	}
 	c := p.Concept
 	c.Proposal = p.ID
+	c.CompiledHash = decl.Hash
 	if err := Add(g.Registry, c); err != nil {
 		return v, err
 	}

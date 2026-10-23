@@ -127,7 +127,26 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	if err != nil {
 		return 0, 0, err
 	}
-	digest, err := compiledDigest(co, m, src)
+	// A concept with no written form is matched by its declaration's body, so the body is part of what the
+	// compiled part was read with: its statement hash (a definition's covers its whole text).
+	var bodies strings.Builder
+	for _, c := range co.Forms.Concepts {
+		if len(c.Forms) > 0 {
+			continue
+		}
+		found, err := s.Resolve(ctx, c.Concept)
+		if err != nil {
+			return 0, 0, err
+		}
+		fmt.Fprintf(&bodies, "%s=", c.Concept)
+		for _, f := range found {
+			if f.Name == c.Concept {
+				fmt.Fprintf(&bodies, "%s:%s;", f.Module, f.StmtHash)
+			}
+		}
+		bodies.WriteString("\n")
+	}
+	digest, err := compiledDigest(co, m, src+"\x00"+bodies.String())
 	if err != nil {
 		return 0, 0, err
 	}

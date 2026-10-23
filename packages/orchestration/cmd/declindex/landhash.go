@@ -60,7 +60,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 		case len(exact) > 1:
 			return fail(e.stderr, &unableError{fmt.Errorf("%s is declared %d times", n, len(exact))})
 		case exact[0].hash == "":
-			return fail(e.stderr, &unableError{fmt.Errorf("%s has no statement hash: its source file is missing", n)})
+			return fail(e.stderr, &unableError{fmt.Errorf("%s has no statement hash: its source file is missing or newer than its build", n)})
 		}
 		out = append(out, exact[0])
 	}

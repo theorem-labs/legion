@@ -410,8 +410,16 @@ func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Re
 func (s *Store) graph() (*graph, error) {
 	s.graphOnce.Do(func() {
 		s.g, s.graphErr = loadGraph(s.path + ".graph")
+		if s.graphErr == nil {
+			if want, err := s.Meta(context.Background(), "graph"); err != nil {
+				s.graphErr = err
+			} else if s.g.token != want {
+				s.graphErr = fmt.Errorf("the graph file is of generation %q, the index of %q", s.g.token, want)
+			}
+		}
 		if s.graphErr != nil {
-			s.graphErr = fmt.Errorf("the declaration graph is missing or unreadable: run declindex refresh: %w", s.graphErr)
+			s.g = nil
+			s.graphErr = fmt.Errorf("the declaration graph is missing, unreadable or out of date: run declindex refresh: %w", s.graphErr)
 		}
 	})
 	return s.g, s.graphErr
