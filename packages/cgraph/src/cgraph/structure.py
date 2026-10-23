@@ -11,6 +11,7 @@ from __future__ import annotations
 import collections
 from typing import TYPE_CHECKING, Any
 
+from . import jsonio
 from .config import Vocabulary
 
 if TYPE_CHECKING:
@@ -26,11 +27,12 @@ def _record_key(node: dict[str, Any]) -> str:
 
 def layout_edges(
     builder: GraphBuilder, records: dict[str, dict[str, Any]], vocabulary: Vocabulary
-) -> list[dict[str, Any]]:
-    """Embedding and pointer edges from clang's record layouts; returns the embedded types that do not join."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Embedding and pointer edges from clang's record layouts, and the input records without nodes."""
     struct_ids = {_record_key(node): node_id for node_id, node in builder.nodes.items() if node["kind"] == "struct"}
     candidates = []
     containers: dict[str, set[str]] = collections.defaultdict(set)
+    drops = []
     for key, parent_id in sorted(struct_ids.items()):
         record = records.get(key)
         if record is None:
@@ -40,6 +42,16 @@ def layout_edges(
                 continue
             child_id = struct_ids.get(f"{field['record']}@{field['record_def']}")
             if child_id is None:
+                drops.append(
+                    {
+                        "kind": "embedding",
+                        "reason": "record_not_a_node",
+                        "function": None,
+                        "target": f"struct:{field['record']}",
+                        "detail": {"parent": parent_id, "field": field["name"], "record_def": field["record_def"]},
+                        "provenance": [{"source": "c", "file": record["def"].rsplit(":", 1)[0], "line": field["line"]}],
+                    }
+                )
                 continue
             candidates.append((parent_id, child_id, record, field))
             if not field["pointer"]:
@@ -71,14 +83,20 @@ def layout_edges(
             layout={"offset": field["offset"], "size": field["size"]},
             base_rule=excluded.get(child_id),
         )
-    return [
-        {"type": child_id, "reason": reason, "containers": sorted(containers[child_id])}
-        for child_id, reason in sorted(excluded.items())
-    ]
+    return (
+        [
+            {"type": child_id, "reason": reason, "containers": sorted(containers[child_id])}
+            for child_id, reason in sorted(excluded.items())
+        ],
+        drops,
+    )
 
 
-def membership_edges(builder: GraphBuilder, linker: Linker, list_calls: list[tuple[str, dict[str, Any]]]) -> None:
-    """``member_of`` from list and hash insertions: the first argument joins the last."""
+def membership_edges(
+    builder: GraphBuilder, linker: Linker, list_calls: list[tuple[str, dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """``member_of`` from list and hash insertions, with every unresolved input recorded."""
+    drops = []
     for function, call in list_calls:
         arguments = []
         resolution = ["insertion_call"]
@@ -91,10 +109,35 @@ def membership_edges(builder: GraphBuilder, linker: Linker, list_calls: list[tup
             if unit is not None:
                 arguments.append(unit)
         if len(arguments) < 2:
+            drops.append(
+                {
+                    "kind": "membership",
+                    "reason": "arguments_unresolved",
+                    "function": function,
+                    "target": None,
+                    "detail": {"operation": call["operation"], "membership": call["membership"]},
+                    "provenance": call["provenance"],
+                }
+            )
             continue
         element, container = arguments[0], arguments[-1]
         source, target = linker.unit_id(element), linker.unit_id(container)
         if source is None or target is None or source not in builder.nodes or target not in builder.nodes:
+            drops.append(
+                {
+                    "kind": "membership",
+                    "reason": "end_not_a_node",
+                    "function": function,
+                    "target": target,
+                    "detail": {
+                        "element": source,
+                        "container": target,
+                        "operation": call["operation"],
+                        "membership": call["membership"],
+                    },
+                    "provenance": call["provenance"],
+                }
+            )
             continue
         builder.edge(
             "member_of",
@@ -108,6 +151,7 @@ def membership_edges(builder: GraphBuilder, linker: Linker, list_calls: list[tup
             element_field=element.get("field"),
             container_field=container.get("field"),
         )
+    return drops
 
 
 def groups(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[list[str]]:
@@ -153,8 +197,8 @@ def subsystems(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list
                 member_provenance[edge["source"]] += edge["provenance"]
                 member_provenance[edge["target"]] += edge["provenance"]
         provenance = sorted(
-            {repr(sorted(item.items())): item for entries in member_provenance.values() for item in entries}.values(),
-            key=lambda item: repr(sorted(item.items())),
+            {jsonio.canonical(item): item for entries in member_provenance.values() for item in entries}.values(),
+            key=jsonio.canonical,
         )
         name = by_id[largest]["name"]
         result.append(

@@ -13,9 +13,13 @@ import collections
 import re
 from typing import Any
 
+from . import jsonio
 from .config import Thresholds
 
-ID_PATTERN = re.compile(r"^(function|struct|global|percpu|subsystem):\S+$")
+# Contract C1, matching Go's `^(function|struct|global|percpu|subsystem):\S+$` exactly. Python's
+# `fullmatch` avoids `$` accepting a final newline and the explicit whitespace class avoids Unicode
+# whitespace that Go's RE2 `\S` accepts.
+ID_PATTERN = re.compile(r"(function|struct|global|percpu|subsystem):[^\t\n\f\r ]+")
 SAMPLE = 50
 
 
@@ -99,15 +103,29 @@ def calls(graph: dict[str, Any]) -> dict[str, Any]:
             }
             for side, groups in classes.items()
         },
+        "pairs": {
+            side: [
+                {"source": source, "target": target, "class": kind}
+                for kind, items in sorted(groups.items())
+                for source, target in items
+            ]
+            for side, groups in classes.items()
+        },
         "address_taken": {
             "c_sites": len(c_pointers),
             "image_addresses": len(image_pointers),
             "agree": len(c_pointers & image_pointers),
             "only_c": len(c_pointers - image_pointers),
             "only_image": len(image_pointers - c_pointers),
-            "examples": {
-                "only_c": _pairs_examples(c_pointers - image_pointers),
-                "only_image": _pairs_examples(image_pointers - c_pointers),
+            "pairs": {
+                "only_c": [
+                    {"source": source, "target": target, "class": "not_address_taken_by_image"}
+                    for source, target in sorted(c_pointers - image_pointers)
+                ],
+                "only_image": [
+                    {"source": source, "target": target, "class": "not_address_taken_by_c"}
+                    for source, target in sorted(image_pointers - c_pointers)
+                ],
             },
         },
         "callback_tables": len(analysis["resolved_callbacks"]),
@@ -195,7 +213,7 @@ def accesses(graph: dict[str, Any]) -> dict[str, Any]:
                 for kind, items in sorted(image_only.items())
             },
             "outside_sized_symbol": {"count": len(outside), "by_section": dict(sorted(outside_kinds.items()))},
-            "generic_unconfirmed": len(analysis["generic_unconfirmed"]),
+            "generic_unconfirmed": analysis.get("excluded", {}).get("access", {}).get("generic_unconfirmed", 0),
         },
         "pairs": {
             "only_c": [
@@ -302,13 +320,17 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             "matched": sum(item["matched"] for item in candidates),
             "by_method": dict(sorted(collections.Counter(item["method"] for item in candidates).items())),
             "excluded": dict(sorted(excluded.items())),
-            "miss_examples": {
-                method: [
-                    {key: item[key] for key in ("function", "struct", "field", "offset", "base")}
-                    for item in candidates
-                    if item["method"] == method
-                ][:3]
-                for method in sorted({item["method"] for item in candidates if not item["matched"]})
+            "misses": [
+                {key: item[key] for key in ("function", "struct", "field", "offset", "base", "method")}
+                for item in candidates
+                if not item["matched"]
+            ],
+            "image_evidence": {
+                function: {
+                    "memory_offsets": offsets[function],
+                    "addi_constants": constants.get(function, []),
+                }
+                for function in sorted({item["function"] for item in candidates if not item["matched"]})
             },
             "sample": {"size": len(sample), "matched": sum(item["matched"] for item in sample), "items": sample},
         },
@@ -346,11 +368,11 @@ def agreement(layer: dict[str, Any], agree: str, left: str, right: str) -> float
 
 def _absolute_paths(value: Any, found: list[str]) -> None:
     if isinstance(value, str):
-        if value.startswith("/") and len(found) < 5:
+        if value.startswith("/"):
             found.append(value)
     elif isinstance(value, dict):
-        for item in value.values():
-            _absolute_paths(item, found)
+        for key in sorted(value):
+            _absolute_paths(value[key], found)
     elif isinstance(value, list):
         for item in value:
             _absolute_paths(item, found)
@@ -376,26 +398,26 @@ def hard(
     ]
     addressed = {min(names) for names in addressed_entries}
     missing_globals = sorted({min(names) for names in addressed_entries if not names & state_names})
-    no_provenance = [
+    no_provenance = sorted(
         f"{item['kind']} {item.get('id') or item['source'] + '->' + item['target']}"
         for item in graph["nodes"] + graph["edges"]
         if not item["provenance"]
-    ]
-    no_layout = [
+    )
+    no_layout = sorted(
         f"{edge['source']}->{edge['target']}"
         for edge in graph["edges"]
         if edge["kind"] in ("embeds", "embeds_base") and (edge["layout"]["offset"] < 0 or edge["layout"]["size"] < 0)
-    ]
+    )
     c_files = set(graph["files"])
-    no_site = [
+    no_site = sorted(
         f"{edge['source']}->{edge['target']}"
         for edge in graph["edges"]
         if edge["kind"] == "member_of"
         and not any(
             item.get("source") == "c" and item.get("line", 0) > 0 and item.get("file") for item in edge["provenance"]
         )
-    ]
-    bad_ids = sorted({identity for identity in node_ids if not ID_PATTERN.match(identity)})
+    )
+    bad_ids = sorted({identity for identity in node_ids if not ID_PATTERN.fullmatch(identity)})
     duplicates = sorted(identity for identity, count in collections.Counter(node_ids).items() if count > 1)
     owner_counts = collections.Counter(owner["id"] for owner in owners["owners"])
     must_own = eligible_owners(graph)
@@ -406,60 +428,106 @@ def hard(
     absolute: list[str] = []
     for document in (graph, owners, topics, layers):
         _absolute_paths(document, absolute)
+    absolute.sort()
     offsets = structure_result["field_offsets"]
     offset_share = offsets["matched"] / offsets["candidates"] if offsets["candidates"] else 1.0
     sample = offsets["sample"]
     sample_share = sample["matched"] / sample["size"] if sample["size"] else 1.0
     call_share = agreement(layers["call_layer"], "agree", "c_edges", "image_edges")
     access_share = layers["access_layer"]["state_agreement"]
+    contract_duplicates = analysis.get("contract_mapping_duplicates", [])
     checks = [
-        ("no C parse errors", not analysis["parse_errors"], f"{len(analysis['parse_errors'])} files with errors"),
+        (
+            "no C parse errors",
+            not analysis["parse_errors"],
+            f"{len(analysis['parse_errors'])} files with errors",
+            [{"file": file, "errors": errors} for file, errors in sorted(analysis["parse_errors"].items())],
+        ),
         (
             "every function of the part's files that the image holds is a node",
             not missing_functions,
             f"{len(part)} nodes; missing {missing_functions[:10]}",
+            missing_functions,
         ),
         (
             "every global the part's image code addresses is a node",
             not missing_globals,
             f"{len(addressed)} addressed; missing {missing_globals[:10]}",
+            missing_globals,
         ),
-        ("every node and edge has provenance", not no_provenance, f"{len(graph['edges'])} edges; {no_provenance[:5]}"),
-        ("every embedding has a clang layout", not no_layout, f"without a layout: {no_layout[:5]}"),
-        ("every membership has a C site", not no_site, f"{len(c_files)} C files; without a site: {no_site[:5]}"),
-        ("node ids are valid and unique", not bad_ids and not duplicates, f"invalid {bad_ids[:5]}; twice {duplicates[:5]}"),
+        ("every node and edge has provenance", not no_provenance, f"{len(graph['edges'])} edges; {no_provenance[:5]}", no_provenance),
+        ("every embedding has a clang layout", not no_layout, f"without a layout: {no_layout[:5]}", no_layout),
+        ("every membership has a C site", not no_site, f"{len(c_files)} C files; without a site: {no_site[:5]}", no_site),
+        (
+            "node ids are valid and unique",
+            not bad_ids and not duplicates,
+            f"invalid {bad_ids[:5]}; twice {duplicates[:5]}",
+            [{"invalid": identity} for identity in bad_ids] + [{"duplicate": identity} for identity in duplicates],
+        ),
         (
             "one owner for each function, data structure and subsystem",
             not unowned and not stray,
             f"{len(owner_counts)} owners; not exactly one {unowned[:5]}; not a node to own {stray[:5]}",
+            [{"not_exactly_one": identity} for identity in unowned] + [{"not_eligible": identity} for identity in stray],
         ),
-        ("every owner has topics, each a valid subject", not bad_topics and not untopiced,
-         f"invalid {bad_topics[:5]}; none {untopiced[:5]}"),
-        ("no absolute path in any output", not absolute, f"{absolute[:5]}"),
+        (
+            "every owner has topics, each a valid subject",
+            not bad_topics and not untopiced,
+            f"invalid {bad_topics[:5]}; none {untopiced[:5]}",
+            [{"invalid": topic} for topic in bad_topics] + [{"none": identity} for identity in untopiced],
+        ),
+        ("no absolute path in any output", not absolute, f"{absolute[:5]}", absolute),
+        (
+            "contract_mapping_unique",
+            not contract_duplicates,
+            f"{len(contract_duplicates)} duplicate contract mappings: {contract_duplicates}",
+            contract_duplicates,
+        ),
         (
             f"call agreement at least {thresholds.call_agreement:.2f}",
             call_share >= thresholds.call_agreement,
             f"{call_share:.4f}",
+            [] if call_share >= thresholds.call_agreement else [{"measured": call_share, "threshold": thresholds.call_agreement}],
         ),
         (
             f"access agreement at least {thresholds.access_agreement:.2f}",
             access_share >= thresholds.access_agreement,
             f"{access_share:.4f}",
+            [] if access_share >= thresholds.access_agreement else [{"measured": access_share, "threshold": thresholds.access_agreement}],
         ),
         (
             f"field offsets at least {thresholds.field_offsets:.2f}, in all and in the first {SAMPLE}",
             offset_share >= thresholds.field_offsets and sample_share >= thresholds.field_offsets,
             f"all {offsets['matched']}/{offsets['candidates']} = {offset_share:.4f}; "
             f"first {sample['size']}: {sample['matched']} = {sample_share:.4f}",
+            []
+            if offset_share >= thresholds.field_offsets and sample_share >= thresholds.field_offsets
+            else [
+                {
+                    "all": offset_share,
+                    "first_sample": sample_share,
+                    "threshold": thresholds.field_offsets,
+                }
+            ],
         ),
     ]  # fmt: skip
-    return [{"name": name, "ok": bool(ok), "detail": detail} for name, ok, detail in checks]
+    return [
+        {
+            "name": name,
+            "ok": bool(ok),
+            "detail": detail,
+            "count": len(items),
+            "items": sorted(items, key=jsonio.canonical),
+        }
+        for name, ok, detail, items in checks
+    ]
 
 
 def valid_subject(subject: str) -> bool:
-    """A subject Envoy's bus accepts: no empty token, no whitespace, no wildcard."""
+    """A subject Envoy's bus accepts: no empty token, no whitespace, no wildcard, at most 4,032 bytes."""
     return (
         bool(subject)
+        and len(subject.encode()) <= 4032
         and not subject.startswith(".")
         and not subject.endswith(".")
         and ".." not in subject

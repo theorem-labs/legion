@@ -6,6 +6,8 @@ from __future__ import annotations
 import collections
 from typing import Any
 
+from . import jsonio
+
 
 def _counts(items: list[dict[str, Any]], key: str) -> str:
     counter = collections.Counter(item[key] for item in items)
@@ -22,6 +24,7 @@ def render(
     owners: dict[str, Any],
     topics: dict[str, Any],
     measures: dict[str, Any],
+    exclusions: dict[str, Any] | None = None,
 ) -> str:
     nodes, edges = graph["nodes"], graph["edges"]
     accesses = [edge for edge in edges if edge["kind"] == "access"]
@@ -31,6 +34,18 @@ def render(
     pairs = measures["pairs_sharing_written_state"]
     neighbours = measures["owner_neighbors"]
     subscriptions = [len(items) for items in topics["owners"].values()]
+    exclusion_document = exclusions or {"counts": checks.get("exclusions", {}), "items": []}
+    exclusion_lines = []
+    for kind, reasons in sorted(exclusion_document["counts"].items()):
+        exclusion_lines.append(
+            f"- `{kind}`: {', '.join(f'{reason} {count}' for reason, count in sorted(reasons.items()))}."
+        )
+    for kind, reasons in sorted(exclusion_document["counts"].items()):
+        for reason in sorted(reasons):
+            items = [item for item in exclusion_document["items"] if item["kind"] == kind and item["reason"] == reason]
+            exclusion_lines.extend(f"  - `{kind}` / `{reason}`: `{jsonio.canonical(item)}`" for item in items[:10])
+    if exclusion_lines:
+        exclusion_lines = ["## Exclusions", "", *exclusion_lines, ""]
     lines = [
         f"# The graph of part `{graph['part']}`",
         "",
@@ -45,6 +60,7 @@ def render(
         f"- Groups of data structures: {groups['total']}, of which {groups['subsystems']} subsystems "
         f"(two or more members) and {groups['singletons']} single data structures.",
         "",
+        *exclusion_lines,
         "## Each layer against a second source",
         "",
         "| Layer | Result |",

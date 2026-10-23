@@ -8,7 +8,7 @@ from typing import Any
 
 from conftest import read
 
-from cgraph import checks
+from cgraph import checks, owners
 from cgraph.owners import token
 
 PREFIX = "notifications.example."
@@ -80,3 +80,15 @@ def test_the_hard_check_reads_who_needs_an_owner_from_the_graph_not_the_owner_li
     graph: dict[str, Any] = read(built, "graph.json")
     owners = read(built, "owners.json")
     assert checks.eligible_owners(graph) == {owner["id"] for owner in owners["owners"]}
+
+
+def test_per_cpu_structures_are_cross_cutting_owners() -> None:
+    graph = {
+        "nodes": [
+            {"id": "function:part", "kind": "function", "part": True},
+            {"id": "struct:cpu_state", "kind": "struct", "per_cpu": True},
+        ],
+        "edges": [{"kind": "access", "source": "function:part", "target": "struct:cpu_state"}],
+    }
+    roles = owners.eligible(graph, owners.relations(graph))
+    assert roles["struct:cpu_state"] == "cross_cutting"

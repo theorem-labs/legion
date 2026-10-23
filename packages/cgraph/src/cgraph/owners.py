@@ -72,7 +72,7 @@ def eligible(graph: dict[str, Any], rel: dict[str, dict[str, set[str]]]) -> dict
         elif node["kind"] == "subsystem":
             result[identity] = "subsystem"
         elif node["kind"] in STATE and (rel[identity]["users"] or rel[identity]["linked"]):
-            result[identity] = "cross_cutting" if node["kind"] == "percpu" else "data_structure"
+            result[identity] = "cross_cutting" if node["kind"] == "percpu" or node.get("per_cpu") else "data_structure"
     return result
 
 

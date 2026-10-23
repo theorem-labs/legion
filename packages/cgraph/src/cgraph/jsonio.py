@@ -2,13 +2,44 @@
 
 from __future__ import annotations
 
+import collections
 import json
 from pathlib import Path
 from typing import Any
 
 
-def _compact(value: Any) -> str:
+def canonical(value: Any) -> str:
+    """The C4 ordering key for JSON values."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def exclusion_document(part: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """The C3 exclusions document, with one canonical order and no duplicate items."""
+    unique: dict[str, dict[str, Any]] = {}
+    for item in items:
+        normalized = {
+            "kind": item["kind"],
+            "reason": item["reason"],
+            "function": item.get("function"),
+            "target": item.get("target"),
+            "detail": item.get("detail"),
+            "provenance": item.get("provenance", []),
+        }
+        unique[canonical(normalized)] = normalized
+    ordered = [unique[key] for key in sorted(unique)]
+    counts: collections.defaultdict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
+    for item in ordered:
+        counts[item["kind"]][item["reason"]] += 1
+    return {
+        "format": "cgraph/exclusions/v1",
+        "part": part,
+        "counts": {kind: dict(sorted(reasons.items())) for kind, reasons in sorted(counts.items())},
+        "items": ordered,
+    }
+
+
+def _compact(value: Any) -> str:
+    return canonical(value)
 
 
 def dumps(value: Any) -> str:

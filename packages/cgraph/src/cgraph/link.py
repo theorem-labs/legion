@@ -12,9 +12,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import structure
+from . import jsonio, structure
 from .config import Config
-from .contracts import ContractGraph
+from .contracts import ContractGraph, c_file
 from .image import FunctionFacts, Image, Symbol
 
 Facts = dict[str, Any]
@@ -56,7 +56,7 @@ class Effective:
     function_pointers: list[dict[str, Any]] = field(default_factory=list)
     field_accesses: list[dict[str, Any]] = field(default_factory=list)
     folds: list[dict[str, Any]] = field(default_factory=list)
-    unbound: int = 0
+    unbound: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _with_via(item: dict[str, Any], helper: str) -> dict[str, Any]:
@@ -345,7 +345,7 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
         function_pointers=list(child.function_pointers),
         field_accesses=list(child.field_accesses),
         folds=list(child.folds),
-        unbound=child.unbound,
+        unbound=list(child.unbound),
     )
     for access in child.accesses:
         if access.get("unit") is not None:
@@ -359,7 +359,7 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
         elif argument is not None and argument.get("param") is not None:
             bound.accesses.append({**access, "param": argument["param"]})
         else:
-            bound.unbound += 1
+            bound.unbound.append(access)
     for call in child.calls:
         rebound = []
         for item in call["arguments"]:
@@ -418,18 +418,10 @@ class GraphBuilder:
 
     def finalize(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         for item in (*self.nodes.values(), *self.edges.values()):
-            unique = {repr(sorted(entry.items())): entry for entry in item["provenance"]}
+            unique = {jsonio.canonical(entry): entry for entry in item["provenance"]}
             item["provenance"] = [unique[key] for key in sorted(unique)]
         nodes = [self.nodes[key] for key in sorted(self.nodes)]
-        edges = sorted(
-            self.edges.values(),
-            key=lambda edge: (
-                edge["kind"],
-                edge["source"],
-                edge["target"],
-                repr(sorted((key, str(value)) for key, value in edge.items() if key != "provenance")),
-            ),
-        )
+        edges = sorted(self.edges.values(), key=jsonio.canonical)
         return nodes, edges
 
 
@@ -441,8 +433,8 @@ def build(
     image: Image,
     contracts: ContractGraph,
     inputs: dict[str, Any],
-) -> dict[str, Any]:
-    """The graph of one part."""
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The graph and C3 exclusions of one part."""
     linker = Linker(config, part_files, tus, image, contracts)
     roots: dict[str, Definition] = {}
     for tu in sorted(linker.part_files):
@@ -475,18 +467,56 @@ def build(
     builder = GraphBuilder()
     analysis: dict[str, Any] = {
         "folds": [],
-        "unevaluated": [],
         "indirect_slots": [],
-        "unbound_parameter_accesses": 0,
-        "generic_unconfirmed": [],
-        "image_decided": [],
         "alternate_definitions": {},
     }
+    exclusions: list[dict[str, Any]] = []
+
+    def exclude(
+        kind: str,
+        reason: str,
+        function: str | None,
+        target: str | None,
+        detail: Any,
+        provenance: list[dict[str, Any]],
+    ) -> None:
+        exclusions.append(
+            {
+                "kind": kind,
+                "reason": reason,
+                "function": function,
+                "target": target,
+                "detail": detail,
+                "provenance": provenance,
+            }
+        )
+
+    # C3 compatibility seam: facts before U2's integration have no ``exclusions`` key and add no
+    # items. U2 emits the same item shape; bare function names become the C1 node id here.
+    for tu, unit_facts in linker.tus.items():
+        for item in unit_facts.get("exclusions", []):
+            function = item.get("function")
+            if function is not None and ":" not in function:
+                function = linker.resolve(tu, function)
+            target = item.get("target")
+            if item.get("kind") == "call" and target is not None and ":" not in target:
+                target = linker.resolve(tu, target)
+            exclude(
+                item["kind"],
+                item["reason"],
+                function,
+                target,
+                item.get("detail"),
+                item.get("provenance", []),
+            )
     image_globals: dict[str, set[str]] = {}
     for identity, definition in sorted(functions.items()):
-        facts = linker.image_facts(definition)
+        image_facts = linker.image_facts(definition)
         image_globals[identity] = {
-            name for fact in facts for entry in fact.globals for name in (entry["global"], *entry.get("aliases", []))
+            name
+            for fact in image_facts
+            for entry in fact.globals
+            for name in (entry["global"], *entry.get("aliases", []))
         }
         symbols = linker.symbols(definition)
         contract = contracts.function(definition.file, definition.name)
@@ -577,14 +607,32 @@ def build(
     image_pairs: set[tuple[str, str]] = set()
     for identity, definition in sorted(functions.items()):
         result = effective[identity]
-        facts = linker.image_facts(definition)
-        image_calls = {call["target"]: call for fact in facts for call in fact.calls}
+        image_facts = linker.image_facts(definition)
+        for fact in image_facts:
+            for item in getattr(fact, "exclusions", []):
+                function = item.get("function") or identity
+                if ":" not in function:
+                    function = identity
+                exclude(
+                    item["kind"],
+                    item["reason"],
+                    function,
+                    item.get("target"),
+                    item.get("detail"),
+                    item.get("provenance", []),
+                )
+        image_calls = {call["target"]: call for fact in image_facts for call in fact.calls}
         for call in result.calls:
             if (call.get("generic") or call.get("conditional")) and call["callee"] not in image_calls:
                 # A call in a _Generic association whose selection could not be read, or under a
                 # __builtin_constant_p choice, that the machine code does not make: not compiled.
-                analysis["generic_unconfirmed" if call.get("generic") else "image_decided"].append(
-                    {"function": identity, "call": call["callee"], "provenance": call["provenance"]}
+                exclude(
+                    "call",
+                    "generic_unconfirmed" if call.get("generic") else "image_decided",
+                    identity,
+                    linker.resolve(call["tu"], call["callee"]),
+                    {"event": "call"},
+                    call["provenance"],
                 )
                 continue
             target = linker.resolve(call["tu"], call["callee"])
@@ -599,7 +647,7 @@ def build(
             )
             c_calls[(identity, target)] += len(call["provenance"])
         c_names = {call["callee"] for call in result.calls}
-        for fact in facts:
+        for fact in image_facts:
             for call in fact.calls:
                 image_pairs.add((identity, linker.resolve(definition.tu, call["target"])))
                 if call["target"] not in c_names:
@@ -610,21 +658,34 @@ def build(
         for access in result.accesses:
             unit = access.get("unit")
             if unit is None:
-                continue
-            if access.get("conditional") and unit["kind"] == "global" and unit["name"] not in image_globals[identity]:
-                analysis["image_decided"].append(
-                    {"function": identity, "unit": unit["name"], "provenance": access["provenance"]}
+                exclude(
+                    "access",
+                    "parameter_at_root",
+                    identity,
+                    None,
+                    {"field": access.get("field"), "parameter": access.get("param")},
+                    access["provenance"],
                 )
+                continue
+            unit_id = linker.unit_id(unit)
+            if access.get("conditional") and unit["kind"] == "global" and unit["name"] not in image_globals[identity]:
+                exclude("access", "image_decided", identity, unit_id, {"event": "access"}, access["provenance"])
                 continue
             if access.get("generic") and (unit["kind"] != "global" or unit["name"] not in image_globals[identity]):
                 # In a _Generic association whose selection could not be read: a global the
                 # machine code addresses stays; a struct access cannot be confirmed and goes.
-                analysis["generic_unconfirmed"].append(
-                    {"function": identity, "unit": unit["name"], "provenance": access["provenance"]}
-                )
+                exclude("access", "generic_unconfirmed", identity, unit_id, {"event": "access"}, access["provenance"])
                 continue
             state = state_node(unit, access["provenance"])
             if state is None:
+                exclude(
+                    "access",
+                    "record_unknown",
+                    identity,
+                    unit_id,
+                    {"unit": unit["name"], "kind": unit["kind"]},
+                    access["provenance"],
+                )
                 continue
             target = state
             builder.edge(
@@ -634,7 +695,7 @@ def build(
                 targets[unit["name"]] = "per_cpu" if target.startswith("percpu:") else _c_class(config, unit["name"])
         # Globals the function's machine code addresses that its C (after folding) does not name:
         # the access a compiler moved here by inlining, or one written in assembly.
-        for fact in facts:
+        for fact in image_facts:
             for item in fact.globals:
                 if item["target_class"] not in ("state", "per_cpu") or {item["global"], *item.get("aliases", [])} & set(
                     targets
@@ -647,14 +708,23 @@ def build(
                 if image_state is not None:
                     builder.edge("access", identity, image_state, item["provenance"], access="image", image_only=True)
         for item in result.unevaluated:
-            if item.get("unit") is not None:
-                analysis["unevaluated"].append(
-                    {
-                        "function": identity,
-                        "unit": linker.unit_id(item["unit"]),
-                        "reason": item["reason"],
-                        "provenance": item["provenance"],
-                    }
+            if "call" in item:
+                exclude(
+                    "call",
+                    item["reason"],
+                    identity,
+                    linker.resolve(definition.tu, item["call"]),
+                    {"event": "unevaluated"},
+                    item["provenance"],
+                )
+            elif item.get("unit") is not None:
+                exclude(
+                    "access",
+                    item["reason"],
+                    identity,
+                    linker.unit_id(item["unit"]),
+                    {"event": "unevaluated"},
+                    item["provenance"],
                 )
         for slot in result.indirect:
             analysis["indirect_slots"].append(
@@ -673,24 +743,38 @@ def build(
             list_calls.append((identity, {**call, "tu": definition.tu}))
         for fold in result.folds:
             analysis["folds"].append({"image_caller": identity, **fold})
-        analysis["unbound_parameter_accesses"] += result.unbound
+        for access in result.unbound:
+            exclude(
+                "access",
+                "unbound_parameter",
+                identity,
+                None,
+                {"field": access.get("field"), "parameter": access.get("param")},
+                access["provenance"],
+            )
         c_targets[identity] = [
             # Whether the image has any symbol of this name: a global the compiler removed has none.
             {"name": name, "target_class": kind, "image_symbol": name in image.map_source_names}
             for name, kind in sorted(targets.items())
         ]
         field_accesses[identity] = sorted(
-            {repr(item): {key: item.get(key, -1) for key in _FIELD_KEYS} for item in result.field_accesses}.values(),
-            key=repr,
+            {
+                jsonio.canonical({key: item.get(key, -1) for key in _FIELD_KEYS}): {
+                    key: item.get(key, -1) for key in _FIELD_KEYS
+                }
+                for item in result.field_accesses
+            }.values(),
+            key=jsonio.canonical,
         )
 
     tables = sorted(
-        (table for facts in linker.tus.values() for table in facts["tables"]),
-        key=lambda table: (table["name"], table["provenance"][0]["file"]),
+        (table for unit_facts in linker.tus.values() for table in unit_facts["tables"]),
+        key=jsonio.canonical,
     )
-    callbacks = _callback_edges(builder, linker, contracts, tables, functions)
-    excluded = structure.layout_edges(builder, linker.records, config.vocabulary)
-    structure.membership_edges(builder, linker, list_calls)
+    callbacks = _callback_edges(builder, linker, contracts, tables, functions, exclusions)
+    excluded, structure_drops = structure.layout_edges(builder, linker.records, config.vocabulary)
+    exclusions.extend(structure_drops)
+    exclusions.extend(structure.membership_edges(builder, linker, list_calls))
     nodes, edges = builder.finalize()
     subsystems = structure.subsystems(nodes, edges)
     structure.attach_guard_locks(subsystems, edges)
@@ -708,13 +792,14 @@ def build(
     nodes, edges = builder.finalize()
     image_names = {identity: sorted(names) for identity, names in image_globals.items()}
     witnesses = [witness for tu in sorted(linker.part_files) for witness in linker.tus[tu]["witnesses"]]
-    expected_functions, contract_without_c = _expected_functions(linker)
+    expected_functions, contract_drops = _expected_functions(linker)
+    exclusions.extend(contract_drops)
+    exclusion_document = jsonio.exclusion_document(part, exclusions)
     analysis.update(
         {
             "part_functions": sorted(functions),
             "roots": sorted(roots),
             "expected_functions": expected_functions,
-            "contract_functions_without_c": contract_without_c,
             "c_calls": [
                 {"source": source, "target": target, "sites": sites}
                 for (source, target), sites in sorted(c_calls.items())
@@ -725,7 +810,7 @@ def build(
             "callback_tables": tables,
             "resolved_callbacks": callbacks,
             "excluded_embedding_bases": excluded,
-            "membership_witnesses": witnesses,
+            "membership_witnesses": sorted(witnesses, key=jsonio.canonical),
             "generic_selections": {
                 key: sum(linker.tus[tu]["generic_selections"][key] for tu in linker.part_files)
                 for key in ("selected", "ambiguous")
@@ -733,19 +818,24 @@ def build(
             "parse_errors": {
                 tu: linker.tus[tu]["errors"] for tu in sorted(linker.part_files) if linker.tus[tu]["errors"]
             },
+            "contract_mapping_duplicates": _contract_mapping_duplicates(linker),
+            "excluded": exclusion_document["counts"],
         }
     )
-    for key in ("folds", "unevaluated", "indirect_slots", "generic_unconfirmed", "image_decided"):
-        analysis[key] = sorted(analysis[key], key=repr)
-    return {
-        "format": "cgraph/graph/v1",
-        "part": part,
-        "files": sorted(part_files),
-        "inputs": inputs,
-        "nodes": nodes,
-        "edges": edges,
-        "analysis": analysis,
-    }
+    for key in ("folds", "indirect_slots"):
+        analysis[key] = sorted(analysis[key], key=jsonio.canonical)
+    return (
+        {
+            "format": "cgraph/graph/v1",
+            "part": part,
+            "files": sorted(part_files),
+            "inputs": inputs,
+            "nodes": nodes,
+            "edges": edges,
+            "analysis": analysis,
+        },
+        exclusion_document,
+    )
 
 
 def _c_class(config: Config, name: str) -> str:
@@ -759,12 +849,11 @@ def _callback_edges(
     contracts: ContractGraph,
     tables: list[dict[str, Any]],
     functions: dict[str, Definition],
+    exclusions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Callback tables the contract graph resolved, kept only where a C initializer assigns the target."""
+    """Callback edges with every contract edge from a part function either linked or excluded."""
     fields: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
-    table_files: dict[str, str] = {}
     for table in tables:
-        table_files.setdefault(table["name"], table["provenance"][0]["file"])
         for entry in table["entries"]:
             fields[(table["name"], entry["target"])].add(entry["field"])
     by_contract: dict[str, Definition] = {}
@@ -773,17 +862,59 @@ def _callback_edges(
         if node is not None:
             by_contract.setdefault(node["id"], definition)
     part_ids = set(functions)
+
+    def exclude(
+        reason: str,
+        source: Definition,
+        target: Definition | None,
+        edge: dict[str, Any],
+        detail: dict[str, Any],
+    ) -> None:
+        exclusions.append(
+            {
+                "kind": "callback",
+                "reason": reason,
+                "function": source.id,
+                "target": target.id if target is not None else str(edge.get("dst")),
+                "detail": detail,
+                "provenance": [{"source": "contract_graph", "id": f"{edge.get('src')}->{edge.get('dst')}"}],
+            }
+        )
+
+    for edge in contracts.edges:
+        if edge.get("kind") not in ("store", "install", "kit"):
+            continue
+        source = by_contract.get(str(edge.get("src")))
+        if source is not None and source.id in part_ids:
+            target = by_contract.get(str(edge.get("dst")))
+            exclude(
+                "kind_not_read",
+                source,
+                target,
+                edge,
+                {"edge_kind": edge["kind"], "evidence": edge.get("evidence", [])},
+            )
+
     callbacks = []
     for edge in contracts.table_edges():
         source = by_contract.get(str(edge.get("src")))
-        target = by_contract.get(str(edge.get("dst")))
-        if source is None or target is None or source.id not in part_ids:
+        if source is None or source.id not in part_ids:
             continue
-        for evidence in edge.get("evidence", []):
-            if not evidence.startswith("table:"):
+        target = by_contract.get(str(edge.get("dst")))
+        if target is None:
+            exclude("target_without_c_definition", source, None, edge, {"evidence": edge.get("evidence", [])})
+            continue
+        evidence = [item for item in edge.get("evidence", []) if item.startswith("table:")]
+        if not evidence:
+            exclude("evidence_not_a_table", source, target, edge, {"evidence": edge.get("evidence", [])})
+            continue
+        for item in evidence:
+            table = item.split(":", 1)[1]
+            field_names = fields.get((table, target.name), set())
+            if not field_names:
+                exclude("no_c_initializer", source, target, edge, {"table": table})
                 continue
-            table = evidence.split(":", 1)[1]
-            for field_name in sorted(fields.get((table, target.name), set())):
+            for field_name in sorted(field_names):
                 if target.id not in builder.nodes:
                     builder.node(target.id, "function", target.name, part=False, c_file=target.file, line=target.line)
                     builder.provenance(target.id, [{"source": "c", "file": target.file, "line": target.line}])
@@ -797,7 +928,7 @@ def _callback_edges(
                     slot=f"{table}.{field_name}",
                 )
                 callbacks.append({"source": source.id, "target": target.id, "table": table, "field": field_name})
-    return sorted({repr(item): item for item in callbacks}.values(), key=repr)
+    return sorted({jsonio.canonical(item): item for item in callbacks}.values(), key=jsonio.canonical)
 
 
 def _image_analysis(
@@ -824,9 +955,7 @@ def _image_analysis(
         constants[identity] = sorted({value for fact in facts for value in fact.addi_constants})
 
     def unique(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return sorted(
-            {repr(sorted(item.items())): item for item in items}.values(), key=lambda item: repr(sorted(item.items()))
-        )
+        return sorted({jsonio.canonical(item): item for item in items}.values(), key=jsonio.canonical)
 
     return {
         "calls": unique(calls),
@@ -847,12 +976,8 @@ def _owned(function: dict[str, Any]) -> bool:
     return bool(function["main_file"] or function["file"].endswith(".c"))
 
 
-def _expected_functions(linker: Linker) -> tuple[list[str], list[str]]:
-    """Functions of the part's files that the image holds, from sources other than the root search:
-    the image's own symbols (a global symbol, or a local one that follows the unit's ELF FILE
-    symbol) whose name a part unit defines, and the contract graph's functions of those files
-    that the image holds and C defines. The second list: contract functions of the part's files
-    that the image holds but no C file defines (assembly)."""
+def _expected_functions(linker: Linker) -> tuple[list[str], list[dict[str, Any]]]:
+    """Functions of the part's files that the image holds, and contract functions without C."""
     expected: set[str] = set()
     for source in sorted(linker.part_files):
         base = os.path.basename(source)
@@ -868,7 +993,7 @@ def _expected_functions(linker: Linker) -> tuple[list[str], list[str]]:
                 definition = linker.visible(source, name)
                 assert definition is not None
                 expected.add(definition.id)
-    without_c: set[str] = set()
+    drops = []
     for (source, name), node in sorted(linker.contracts.functions.items()):
         if (
             source in linker.part_files
@@ -883,5 +1008,32 @@ def _expected_functions(linker: Linker) -> tuple[list[str], list[str]]:
             if definitions:
                 expected.add(definitions[0].id)
             else:
-                without_c.add(f"function:{name}")
-    return sorted(expected), sorted(without_c)
+                drops.append(
+                    {
+                        "kind": "contract_function",
+                        "reason": "no_c_file",
+                        "function": None,
+                        "target": node["id"],
+                        "detail": {"source": source, "symbol": name},
+                        "provenance": [{"source": "contract_graph", "id": node["id"]}],
+                    }
+                )
+    return sorted(expected), sorted(drops, key=jsonio.canonical)
+
+
+def _contract_mapping_duplicates(linker: Linker) -> list[dict[str, Any]]:
+    """Every contract mapping that gives one C function more than one contract node."""
+    mappings: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
+    for node in linker.contracts.nodes.values():
+        if node.get("kind") != "fn":
+            continue
+        source = c_file(node["id"], linker.config.contract_function_prefix)
+        if source is None:
+            continue
+        for symbol in node.get("syms", []):
+            mappings[(source, symbol.split(".", 1)[0])].add(node["id"])
+    return [
+        {"source": source, "symbol": symbol, "ids": sorted(ids)}
+        for (source, symbol), ids in sorted(mappings.items())
+        if len(ids) > 1
+    ]

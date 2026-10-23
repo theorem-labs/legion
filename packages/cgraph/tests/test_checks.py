@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from conftest import read
 
-from cgraph import checks, cli, config
+from cgraph import checks, cli, config, jsonio
 
 Documents = dict[str, Any]
 
@@ -98,6 +98,16 @@ def _offsets(d: Documents) -> None:
     sample["matched"] = 1  # one in fifty is not a pass
 
 
+def _contract_mapping(d: Documents) -> None:
+    d["graph"]["analysis"]["contract_mapping_duplicates"] = [
+        {
+            "source": "src/store.c",
+            "symbol": "box_new",
+            "ids": ["Prog/src/store/BoxNew", "Prog/src/store/BoxNewDuplicate"],
+        }
+    ]
+
+
 MUTATIONS: list[tuple[str, Callable[[Documents], None]]] = [
     ("no C parse errors", _parse),
     ("every function of the part's files that the image holds is a node", _function),
@@ -109,6 +119,7 @@ MUTATIONS: list[tuple[str, Callable[[Documents], None]]] = [
     ("one owner for each function, data structure and subsystem", _owner),
     ("every owner has topics, each a valid subject", _topic),
     ("no absolute path in any output", _absolute),
+    ("contract_mapping_unique", _contract_mapping),
     ("call agreement at least 0.95", _calls),
     ("access agreement at least 0.80", _accesses),
     ("field offsets at least 0.90, in all and in the first 50", _offsets),
@@ -187,3 +198,135 @@ def test_a_c_global_with_no_image_symbol_is_counted_apart_and_aliases_match() ->
     assert (result["agree"], result["only_c"], result["only_image"]) == (2, 0, 0)
     assert result["counted_apart"] == {"state_without_image_symbol": 1}
     assert result["state_agreement"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "function:box_new",
+        "function:helper_dup@src/store.c",
+        "global:next_id.counter@src/store.c",
+        "struct:Box_T@src/x.c",
+        "percpu:current_box",
+        "subsystem:crate",
+    ],
+)
+def test_c1_owner_ids_accept_the_contract_alphabet(identity: str) -> None:
+    assert checks.ID_PATTERN.fullmatch(identity)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "",
+        "box_new",
+        "cluster:crate",
+        "function:",
+        "Function:box_new",
+        "function:box new",
+        "function:box\tnew",
+        "function:box_new\n",
+    ],
+)
+def test_c1_owner_ids_reject_each_invalid_whole_string(documents: Documents, identity: str) -> None:
+    mutated = copy.deepcopy(documents)
+    mutated["graph"]["nodes"].append({**copy.deepcopy(mutated["graph"]["nodes"][0]), "id": identity, "part": False})
+    assert failed(mutated) == ["node ids are valid and unique"]
+
+
+def test_a_4033_byte_topic_fails_only_the_subject_check(documents: Documents) -> None:
+    mutated = copy.deepcopy(documents)
+    mutated["topics"]["owners"]["struct:box"] = ["a" * 4033]
+    assert failed(mutated) == ["every owner has topics, each a valid subject"]
+
+
+def test_hard_checks_have_all_sorted_offending_items_and_counts(documents: Documents) -> None:
+    hard_checks = checks.hard(
+        documents["graph"], documents["owners"], documents["topics"], documents["layers"], documents["thresholds"]
+    )
+    for item in hard_checks:
+        assert item["count"] == len(item["items"])
+        assert item["items"] == sorted(item["items"], key=jsonio.canonical)
+
+
+def test_a_hard_check_lists_every_missing_function(documents: Documents) -> None:
+    mutated = copy.deepcopy(documents)
+    mutated["graph"]["analysis"]["expected_functions"] = [f"function:missing_{index:02d}" for index in range(12)]
+    item = next(
+        item
+        for item in checks.hard(
+            mutated["graph"], mutated["owners"], mutated["topics"], mutated["layers"], mutated["thresholds"]
+        )
+        if item["name"] == "every function of the part's files that the image holds is a node"
+    )
+    assert item["count"] == len(item["items"]) == 12
+
+
+def test_call_and_address_taken_pairs_are_the_complete_symmetric_differences(documents: Documents) -> None:
+    graph = documents["graph"]
+    layer = checks.calls(graph)
+    c_pairs = {(item["source"], item["target"]) for item in graph["analysis"]["c_calls"]}
+    image_pairs = {
+        (item["source"], item["target"])
+        for item in graph["analysis"]["image"]["calls"]
+        if item["source"] in {node["id"] for node in graph["nodes"] if node.get("part")}
+    }
+    assert {(item["source"], item["target"]) for item in layer["pairs"]["only_c"]} == c_pairs - image_pairs
+    assert {(item["source"], item["target"]) for item in layer["pairs"]["only_image"]} == image_pairs - c_pairs
+    address_taken = layer["address_taken"]
+    assert len(address_taken["pairs"]["only_c"]) == address_taken["only_c"]
+    assert len(address_taken["pairs"]["only_image"]) == address_taken["only_image"]
+
+
+def test_every_field_offset_miss_has_per_function_image_evidence(documents: Documents) -> None:
+    offsets = checks.structure(documents["graph"])["field_offsets"]
+    assert len(offsets["misses"]) == offsets["candidates"] - offsets["matched"]
+    assert set(offsets["image_evidence"]) == {item["function"] for item in offsets["misses"]}
+
+
+def test_duplicate_contract_mapping_hard_check_names_both_contract_ids(documents: Documents) -> None:
+    mutated = copy.deepcopy(documents)
+    _contract_mapping(mutated)
+    item = next(
+        item
+        for item in checks.hard(
+            mutated["graph"], mutated["owners"], mutated["topics"], mutated["layers"], mutated["thresholds"]
+        )
+        if item["name"] == "contract_mapping_unique"
+    )
+    assert item["ok"] is False
+    assert item["items"][0]["ids"] == ["Prog/src/store/BoxNew", "Prog/src/store/BoxNewDuplicate"]
+    assert "Prog/src/store/BoxNewDuplicate" in item["detail"]
+
+
+def test_field_offset_misses_keep_all_fields_and_image_evidence_once_per_function() -> None:
+    graph = {
+        "nodes": [{"id": "function:box_new", "kind": "function", "part": True, "image_addresses": ["0x1"]}],
+        "edges": [],
+        "analysis": {
+            "field_accesses": {
+                "function:box_new": [
+                    {"struct": "box", "field": "tag", "offset": 4, "base": "pointer", "size": 4, "bitfield": False},
+                    {"struct": "box", "field": "spare", "offset": 12, "base": "pointer", "size": 4, "bitfield": False},
+                ]
+            },
+            "image": {
+                "memory_offsets": {"function:box_new": [4]},
+                "addi_constants": {"function:box_new": [8]},
+                "globals": [],
+            },
+            "excluded_embedding_bases": [],
+        },
+    }
+    offsets = checks.structure(graph)["field_offsets"]
+    assert offsets["misses"] == [
+        {
+            "function": "function:box_new",
+            "struct": "box",
+            "field": "spare",
+            "offset": 12,
+            "base": "pointer",
+            "method": "no_matching_offset",
+        }
+    ]
+    assert offsets["image_evidence"] == {"function:box_new": {"memory_offsets": [4], "addi_constants": [8]}}

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from conftest import edges, node
+from conftest import FIXTURE, build, edges, node
 
-from cgraph import link
+from cgraph import clangfacts, commands, config, contracts, image, jsonio, link, structure
 
 
 def targets(graph: dict[str, Any], kind: str, source: str, **fields: Any) -> set[str]:
@@ -214,7 +215,7 @@ def test_parameter_accesses_bind_to_the_callers_argument() -> None:
     argument = {"unit": {"kind": "global", "name": "big_lock", "def": None, "field": None, "lock": True}, "param": None}
     assert [item["unit"]["name"] for item in link._bind(child, [argument]).accesses] == ["big_lock"]
     assert link._bind(child, [{"unit": None, "param": 2}]).accesses[0]["param"] == 2
-    assert link._bind(child, [{"unit": None, "param": None}]).unbound == 1
+    assert link._bind(child, [{"unit": None, "param": None}]).unbound == [lock]
 
 
 def test_a_weak_stub_a_macro_generates_gives_way_to_the_strong_definition(graph: dict[str, Any]) -> None:
@@ -223,3 +224,236 @@ def test_a_weak_stub_a_macro_generates_gives_way_to_the_strong_definition(graph:
     # The strong definition's body is the node's: it calls bag_weight, which the compiler folded.
     folds = {fold["helper"] for fold in graph["analysis"]["folds"] if fold["image_caller"] == "function:stub_open"}
     assert folds == {"function:bag_weight"}
+
+
+def _reverse_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _reverse_keys(item) for key, item in reversed(list(value.items()))}
+    if isinstance(value, list):
+        return [_reverse_keys(item) for item in value]
+    return value
+
+
+def _link_fixture(facts: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    files = config.part_files(loaded, "both", None)
+    linked_image = image.Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image)
+    try:
+        contract_graph = contracts.ContractGraph.load(loaded.inputs.contract_graph, loaded.contract_function_prefix)
+        return link.build(
+            loaded,
+            "both",
+            files,
+            facts,
+            linked_image,
+            contract_graph,
+            {"c_sources": "fixture", "image": "fixture"},
+        )
+    finally:
+        linked_image.close()
+
+
+def test_canonical_does_not_depend_on_dictionary_insertion_order() -> None:
+    left = {"function": "function:box_new", "provenance": [{"source": "c", "line": 8, "file": "src/store.c"}]}
+    right = {"provenance": [{"file": "src/store.c", "line": 8, "source": "c"}], "function": "function:box_new"}
+    assert jsonio.canonical(left) == jsonio.canonical(right)
+
+
+def test_canonical_exclusions_are_unique_sorted_and_counted() -> None:
+    first = {
+        "kind": "access",
+        "reason": "sizeof",
+        "function": "function:box_new",
+        "target": "global:box_count",
+        "detail": {"event": "unevaluated"},
+        "provenance": [{"source": "c", "line": 8, "file": "src/store.c"}],
+    }
+    second = {
+        "target": "global:box_count",
+        "function": "function:box_new",
+        "reason": "sizeof",
+        "kind": "access",
+        "provenance": [{"file": "src/store.c", "line": 8, "source": "c"}],
+        "detail": {"event": "unevaluated"},
+    }
+    document = jsonio.exclusion_document("both", [second, first])
+    assert document["counts"] == {"access": {"sizeof": 1}}
+    assert document["items"] == [first]
+
+
+def test_link_build_is_byte_stable_when_every_fact_dictionary_is_reversed() -> None:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    files = config.part_files(loaded, "both", None)
+    facts = {
+        source: clangfacts.extract(
+            source,
+            loaded.inputs.c_tree,
+            commands.rewrite(
+                commands.template_arguments(loaded.flags, loaded.inputs.c_tree, source), loaded.argument_rewrites
+            ),
+            loaded.vocabulary,
+        )
+        for source in files
+    }
+    graph, exclusions = _link_fixture(facts)
+    reversed_graph, reversed_exclusions = _link_fixture(_reverse_keys(facts))
+    assert jsonio.dumps(graph) == jsonio.dumps(reversed_graph)
+    assert jsonio.dumps(exclusions) == jsonio.dumps(reversed_exclusions)
+
+
+def test_cached_fixture_facts_produce_every_output_byte_for_byte_as_a_fresh_build(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    fresh = build(FIXTURE, "both", tmp_path / "fresh", cache)
+    cached = build(FIXTURE, "both", tmp_path / "cached", cache)
+    assert cached.parsed == []
+    assert {name: Path(path).read_bytes() for name, path in fresh.outputs.items()} == {
+        name: Path(path).read_bytes() for name, path in cached.outputs.items()
+    }
+
+
+def test_every_contract_callback_drop_has_a_c3_classification() -> None:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    files = config.part_files(loaded, "both", None)
+    facts = {
+        source: clangfacts.extract(
+            source,
+            loaded.inputs.c_tree,
+            commands.rewrite(
+                commands.template_arguments(loaded.flags, loaded.inputs.c_tree, source), loaded.argument_rewrites
+            ),
+            loaded.vocabulary,
+        )
+        for source in files
+    }
+    source_node = {"id": "Prog/src/store/RunGet", "kind": "fn", "syms": ["run_get"]}
+    target_node = {"id": "Prog/src/store/BoxGet", "kind": "fn", "syms": ["box_get"]}
+    contract_graph = contracts.ContractGraph(
+        nodes={source_node["id"]: source_node, target_node["id"]: target_node},
+        functions={
+            ("src/store.c", "run_get"): source_node,
+            ("src/store.c", "box_get"): target_node,
+        },
+        edges=[
+            {"kind": "table", "src": source_node["id"], "dst": "Prog/src/store/NoC", "evidence": ["table:ops"]},
+            {"kind": "table", "src": source_node["id"], "dst": target_node["id"], "evidence": ["call:ops"]},
+            {"kind": "table", "src": source_node["id"], "dst": target_node["id"], "evidence": ["table:missing"]},
+            *[
+                {"kind": kind, "src": source_node["id"], "dst": target_node["id"], "evidence": []}
+                for kind in ("store", "install", "kit")
+            ],
+        ],
+    )
+    linked_image = image.Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image)
+    try:
+        linker = link.Linker(loaded, files, facts, linked_image, contract_graph)
+        source = linker.visible("src/store.c", "run_get")
+        assert source is not None
+        exclusions: list[dict[str, Any]] = []
+        link._callback_edges(
+            link.GraphBuilder(),
+            linker,
+            contract_graph,
+            [table for unit in facts.values() for table in unit["tables"]],
+            {source.id: source},
+            exclusions,
+        )
+    finally:
+        linked_image.close()
+    assert {item["reason"] for item in exclusions} == {
+        "target_without_c_definition",
+        "evidence_not_a_table",
+        "no_c_initializer",
+        "kind_not_read",
+    }
+    assert all(set(item) == {"kind", "reason", "function", "target", "detail", "provenance"} for item in exclusions)
+
+
+def test_optional_unit_fact_exclusions_are_normalized_into_c3() -> None:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    files = config.part_files(loaded, "both", None)
+    facts = {
+        source: clangfacts.extract(
+            source,
+            loaded.inputs.c_tree,
+            commands.rewrite(
+                commands.template_arguments(loaded.flags, loaded.inputs.c_tree, source), loaded.argument_rewrites
+            ),
+            loaded.vocabulary,
+        )
+        for source in files
+    }
+    facts["src/store.c"]["exclusions"] = [
+        {
+            "kind": "function",
+            "reason": "result_registers_unknown",
+            "function": "box_new",
+            "target": None,
+            "detail": {"result_type": "opaque"},
+            "provenance": [{"source": "c", "file": "src/store.c", "line": 8}],
+        }
+    ]
+    _, exclusions = _link_fixture(facts)
+    assert {
+        "kind": "function",
+        "reason": "result_registers_unknown",
+        "function": "function:box_new",
+        "target": None,
+        "detail": {"result_type": "opaque"},
+        "provenance": [{"source": "c", "file": "src/store.c", "line": 8}],
+    } in exclusions["items"]
+
+
+def test_structure_drops_are_written_as_c3_items() -> None:
+    builder = link.GraphBuilder()
+    builder.node("struct:parent", "struct", "parent", c_file="src/a.c", line=1)
+    _, embedding_drops = structure.layout_edges(
+        builder,
+        {
+            "parent@src/a.c:1": {
+                "def": "src/a.c:1",
+                "fields": [
+                    {"name": "child", "record": "child", "record_def": "src/a.c:4", "line": 2},
+                ],
+            }
+        },
+        config.load(FIXTURE / "cgraph.toml").vocabulary,
+    )
+
+    class MembershipLinker:
+        def __init__(self) -> None:
+            self.tus = {"src/a.c": {"functions": {}}}
+
+        @staticmethod
+        def unit_id(unit: dict[str, Any]) -> str:
+            return f"struct:{unit['name']}"
+
+    membership_drops = structure.membership_edges(
+        builder,
+        MembershipLinker(),
+        [
+            (
+                "function:part",
+                {
+                    "arguments": [None],
+                    "argument_helpers": [None],
+                    "operation": "insert",
+                    "membership": "list",
+                    "provenance": [{"source": "c", "file": "src/a.c", "line": 2}],
+                    "tu": "src/a.c",
+                },
+            ),
+            (
+                "function:part",
+                {
+                    "arguments": [{"name": "child"}, {"name": "parent"}],
+                    "argument_helpers": [None, None],
+                    "operation": "insert",
+                    "membership": "list",
+                    "provenance": [{"source": "c", "file": "src/a.c", "line": 3}],
+                    "tu": "src/a.c",
+                },
+            ),
+        ],
+    )
+    assert embedding_drops[0]["reason"] == "record_not_a_node"
+    assert {item["reason"] for item in membership_drops} == {"arguments_unresolved", "end_not_a_node"}
