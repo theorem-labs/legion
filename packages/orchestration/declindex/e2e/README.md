@@ -29,13 +29,13 @@ docker buildx build --tag declindex-e2e:bad-elan \
 
 ## Sandbox acceptance
 
-Create one empty run directory below `~/.cache/infra109/infra145-runs/` before starting the driver. The driver records the image ID, `docker version`, the kernel release, `lean --version`, each case's output, the Landlock `strace`, and `sandbox.tsv` there.
+Create one empty run directory, here `$RUN`, before starting the driver. The driver records the image ID, `docker version`, the kernel release, `lean --version`, each case's output, the Landlock `strace`, and `sandbox.tsv` there.
 
 ```sh
-mkdir -p ~/.cache/infra109/infra145-runs/e4-local
+mkdir -p "$RUN"
 packages/orchestration/declindex/e2e/sandbox-e2e.sh \
   --image declindex-e2e:local \
-  --out ~/.cache/infra109/infra145-runs/e4-local
+  --out "$RUN"
 ```
 
 The driver starts one-shot containers only, each as the invoking user. The first copies `declindex/testdata/lean` into the run's `work/tree`, commits it with an empty registry, builds it with Lake, and refreshes a compiled index; each probe then gets its own copy of that index, without an exporter. The probes mount `work/tree` read-only. The driver prints one TSV row for each case and exits 1 unless all five pass:
@@ -57,7 +57,7 @@ The first four cases use Docker's default seccomp profile. The last passes `deny
 ```sh
 go run ./packages/orchestration/declindex/e2e/recall \
   --states states.json \
-  --concept LinuxMmu.SK.SpAligned \
+  --concept Example.Concept \
   --truth truth.txt \
   --extras extras.tsv
 ```
@@ -100,8 +100,8 @@ E7_CANDIDATE_COMMIT=<40-lowercase-hex-commit> \
 E7_CHANGED_HASH=<16-lowercase-hex-statement-hash> \
 packages/orchestration/declindex/e2e/ledger-join.sh \
   /path/to/declindex.yaml \
-  machcsl-riscv-experimental \
-  LinuxMmu.SK.SpAligned \
+  <ledger-repository> \
+  Example.Concept \
   function:alloc_mnt_ns \
   /path/to/ledger-dsn
 ```
