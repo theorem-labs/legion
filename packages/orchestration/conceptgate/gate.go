@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -267,34 +266,41 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 	return v, nil
 }
 
-// export compiles the proposal against the build and reads it with the registry's forms.
+// export checks the proposal, compiles it against the build and reads it with the registry's forms, each step in
+// the sandbox with a fresh scratch directory of its own below one run directory that the gate owns and removes.
 func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declindex.Constant, error) {
-	if err := os.MkdirAll(g.WorkDir, 0o755); err != nil {
+	if err := os.MkdirAll(g.WorkDir, 0o700); err != nil {
 		return nil, err
 	}
-	dir, err := os.MkdirTemp(g.WorkDir, "proposal-")
+	run, err := declindex.NewScratch(g.WorkDir)
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(dir)
-	if err := os.WriteFile(filepath.Join(dir, ProposalModule+".lean"), []byte(p.Source), 0o644); err != nil {
-		return nil, err
-	}
+	defer os.RemoveAll(run)
+	ex := *g.Compiled.Exporter
+	ex.ScratchDir, ex.Confined = run, true
 	co := *g.Compiled
-	co.Dir = filepath.Join(dir, "forms")
-	co.Confined = true
+	co.Exporter, co.Confined = &ex, true
 	if co.Forms, err = Forms(ctx, g.Index, reg); err != nil {
 		return nil, err
 	}
-	if err := co.Exporter.CheckSource(ctx, filepath.Join(dir, ProposalModule+".lean"), co.Exporter.SearchPath); err != nil {
+	check, err := declindex.NewScratch(run)
+	if err != nil {
 		return nil, err
 	}
-	if err := declindex.CompileConfined(ctx, co.Exporter.Lean, co.Exporter.SearchPath, dir, ProposalModule); err != nil {
+	if err := ex.CheckSource(ctx, []byte(p.Source), ex.SearchPath, check); err != nil {
+		return nil, err
+	}
+	compiled, err := declindex.NewScratch(run)
+	if err != nil {
+		return nil, err
+	}
+	if err := declindex.CompileConfined(ctx, ex.Lean, ex.SearchPath, compiled, ProposalModule, []byte(p.Source)); err != nil {
 		return nil, fmt.Errorf("the proposal does not compile: %w", err)
 	}
 	roots := declindex.Roots{ProposalModule: true}
 	for r := range g.Tree.Roots {
 		roots[r] = true
 	}
-	return co.Export(ctx, roots, []string{ProposalModule}, []string{dir})
+	return co.Export(ctx, roots, []string{ProposalModule}, []string{compiled})
 }

@@ -182,20 +182,26 @@ func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel s
 		"-o", base+".olean", "-i", base+".ilean", base+".lean")
 }
 
-// confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path and
-// read, writes only beneath write, and opens no socket. It fails when the sandbox is unavailable, and then nothing
-// runs.
-func (l Lean) confined(ctx context.Context, argv []string, dir string, searchPath, read, write []string) (*exec.Cmd, error) {
+// NewScratch makes a fresh scratch directory for one confined run below base (the system's temporary directory
+// when empty): this user's, mode 0700, and empty.
+func NewScratch(base string) (string, error) { return confine.NewScratch(base) }
+
+// confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path,
+// read and its scratch directory, writes only the scratch directory (which must be fresh, and into which the
+// inputs are copied), starts no other process and opens no socket. It fails when the sandbox is unavailable,
+// and then nothing runs.
+func (l Lean) confined(ctx context.Context, argv []string, scratch string, inputs []confine.Input, searchPath, read []string) (*confine.Cmd, error) {
 	reads := append(append([]string{l.Prefix}, searchPath...), read...)
-	return confine.Command(ctx, confine.Spec{Argv: argv, Env: l.env(searchPath, dir), Dir: dir, Read: reads, Write: write})
+	return confine.Command(ctx, confine.Spec{Argv: argv, Env: l.env(searchPath, scratch), Scratch: scratch, Inputs: inputs, Read: reads})
 }
 
-// CompileConfined is CompileModule in the sandbox: for a module that untrusted source wrote. Lean writes only
-// beneath root.
-func CompileConfined(ctx context.Context, l Lean, searchPath []string, root, rel string) error {
-	base := filepath.Join(root, filepath.FromSlash(rel))
-	argv := []string{l.bin("lean"), "-R", root, "-o", base + ".olean", "-i", base + ".ilean", base + ".lean"}
-	cmd, err := l.confined(ctx, argv, root, append([]string{root}, searchPath...), nil, []string{root})
+// CompileConfined compiles source as the module rel in the sandbox, for source that untrusted text wrote. scratch
+// must be fresh (NewScratch): the source is copied into it, and Lean writes its outputs there and nowhere else.
+func CompileConfined(ctx context.Context, l Lean, searchPath []string, scratch, rel string, source []byte) error {
+	base := filepath.Join(scratch, filepath.FromSlash(rel))
+	argv := []string{l.bin("lean"), "-R", scratch, "-o", base + ".olean", "-i", base + ".ilean", base + ".lean"}
+	cmd, err := l.confined(ctx, argv, scratch, []confine.Input{{Name: rel + ".lean", Data: source}},
+		append([]string{scratch}, searchPath...), nil)
 	if err != nil {
 		return err
 	}
@@ -210,12 +216,12 @@ func CompileConfined(ctx context.Context, l Lean, searchPath []string, root, rel
 // CheckSandbox reports whether toolchain l runs in the sandbox here: the sandbox is available, and a confined
 // `lean --version` runs.
 func CheckSandbox(ctx context.Context, l Lean) error {
-	dir, err := os.MkdirTemp("", "declindex-sandbox-")
+	dir, err := NewScratch("")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	cmd, err := l.confined(ctx, []string{l.bin("lean"), "--version"}, dir, nil, nil, []string{dir})
+	cmd, err := l.confined(ctx, []string{l.bin("lean"), "--version"}, dir, nil, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -228,11 +234,12 @@ func CheckSandbox(ctx context.Context, l Lean) error {
 // ErrRefusedSource says that a proposal's source holds more than declarations.
 var ErrRefusedSource = errors.New("the proposal is not declarations only")
 
-// CheckSource parses the module at file with Lean's own parser, in the sandbox, and refuses it unless it holds
-// only declarations (see lean/DeclExport/Check.lean). searchPath holds the modules it imports.
-func (x *Exporter) CheckSource(ctx context.Context, file string, searchPath []string) error {
-	dir := filepath.Dir(file)
-	cmd, err := x.Lean.confined(ctx, []string{x.Bin, "--check", file}, dir, searchPath, []string{dir}, nil)
+// CheckSource parses source with Lean's own parser, in the sandbox, and refuses it unless it holds only
+// declarations (see lean/DeclExport/Check.lean). searchPath holds the modules it imports; scratch must be fresh.
+func (x *Exporter) CheckSource(ctx context.Context, source []byte, searchPath []string, scratch string) error {
+	file := filepath.Join(scratch, "Proposal.lean")
+	cmd, err := x.Lean.confined(ctx, []string{x.Bin, "--check", file}, scratch,
+		[]confine.Input{{Name: "Proposal.lean", Data: source}}, searchPath, nil)
 	if err != nil {
 		return err
 	}
@@ -326,6 +333,8 @@ type Exporter struct {
 	Log               io.Writer
 	// Confined runs the exporter in the sandbox, for modules that untrusted source wrote.
 	Confined bool
+	// ScratchDir holds each run's fresh scratch directory; empty is the system's temporary directory.
+	ScratchDir string
 }
 
 // ErrExporter wraps a failed exporter run: the question stays unanswered.
@@ -369,34 +378,43 @@ func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
 	return out, nil
 }
 
+// started is a program the exporter reads: exec.Cmd, or confine.Cmd, whose Start also lets its one exec through.
+type started interface {
+	StdoutPipe() (io.ReadCloser, error)
+	Start() error
+	Wait() error
+}
+
 func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
-	tmp, err := os.MkdirTemp("", "declexport-")
+	manifest, err := json.Marshal(m.complete())
+	if err != nil {
+		return nil, err
+	}
+	tmp, err := NewScratch(x.ScratchDir)
 	if err != nil {
 		return nil, err
 	}
 	defer os.RemoveAll(tmp)
-	f, err := os.Create(filepath.Join(tmp, "manifest.json"))
-	if err != nil {
-		return nil, err
-	}
-	if err := json.NewEncoder(f).Encode(m.complete()); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	if err := f.Close(); err != nil {
-		return nil, err
-	}
-	var cmd *exec.Cmd
+	path := filepath.Join(tmp, "manifest.json")
+	var stderr bytes.Buffer
+	var cmd started
 	if x.Confined {
-		if cmd, err = x.Lean.confined(ctx, []string{x.Bin, f.Name()}, tmp, x.SearchPath, []string{tmp}, nil); err != nil {
+		c, err := x.Lean.confined(ctx, []string{x.Bin, path}, tmp, []confine.Input{{Name: "manifest.json", Data: manifest}},
+			x.SearchPath, nil)
+		if err != nil {
 			return nil, err
 		}
+		c.Stderr = &stderr
+		cmd = c
 	} else {
-		cmd = exec.CommandContext(ctx, x.Bin, f.Name())
-		cmd.Env = x.Lean.env(x.SearchPath, tmp)
+		if err := os.WriteFile(path, manifest, 0o600); err != nil {
+			return nil, err
+		}
+		c := exec.CommandContext(ctx, x.Bin, path)
+		c.Env = x.Lean.env(x.SearchPath, tmp)
+		c.Stderr = &stderr
+		cmd = c
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err

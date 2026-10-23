@@ -223,8 +223,8 @@ func TestCompileModuleRunsLeanInAMinimalEnvironment(t *testing.T) {
 	}
 }
 
-// Code that a confined compile runs (here an `#eval`) cannot write outside the module's directory, read the
-// caller's home, or start another program.
+// Code that a confined compile runs (here an `#eval`) cannot write outside its scratch directory, read the caller's
+// home, start another program, or start Lean itself again.
 func TestCompileConfinedKeepsTheModulesCodeIn(t *testing.T) {
 	l := leanForTest(t)
 	if err := CheckSandbox(context.Background(), l); err != nil {
@@ -233,20 +233,24 @@ func TestCompileConfinedKeepsTheModulesCodeIn(t *testing.T) {
 		}
 		t.Skip(err)
 	}
-	dir, outside := t.TempDir(), t.TempDir()
+	dir, err := NewScratch(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
 	target := filepath.Join(outside, "written")
+	spawn := func(cmd string) string {
+		return "  let r ← (IO.Process.output { cmd := \"" + cmd + "\", args := #[\"--version\"] }).toBaseIO\n" +
+			"  if let .ok o := r then if o.exitCode == 0 then throw (IO.userError s!\"ran " + cmd + ": {o.stdout}\")\n"
+	}
 	probe := "def probe : IO Unit := do\n" +
 		"  try IO.FS.writeFile \"" + target + "\" \"x\" catch _ => pure ()\n" +
 		"  let home ← (IO.FS.readFile \"" + filepath.Join(os.Getenv("HOME"), ".bashrc") + "\").toBaseIO\n" +
 		"  if home matches .ok _ then throw (IO.userError \"read the home directory\")\n" +
-		"  let sh ← (IO.Process.output { cmd := \"/bin/sh\", args := #[\"-c\", \"true\"] }).toBaseIO\n" +
-		"  if let .ok o := sh then if o.exitCode == 0 then throw (IO.userError s!\"ran another program: {o.stdout}\")\n" +
+		spawn("/bin/sh") + spawn(l.bin("lean")) +
 		"  IO.FS.writeFile \"inside\" \"x\"\n" +
 		"#eval probe\n"
-	if err := os.WriteFile(filepath.Join(dir, "Probe.lean"), []byte(probe), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := CompileConfined(context.Background(), l, nil, dir, "Probe"); err != nil {
+	if err := CompileConfined(context.Background(), l, nil, dir, "Probe", []byte(probe)); err != nil {
 		t.Fatalf("%v", err)
 	}
 	if _, err := os.Stat(target); err == nil {
@@ -254,6 +258,9 @@ func TestCompileConfinedKeepsTheModulesCodeIn(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "inside")); err != nil {
 		t.Fatalf("the confined module could not write in its own directory: %v", err)
+	}
+	if err := CompileConfined(context.Background(), l, nil, dir, "Probe", []byte(probe)); err == nil {
+		t.Fatal("a scratch directory that a run already used was accepted")
 	}
 }
 
@@ -271,12 +278,11 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 	x := &Exporter{Lean: l, Bin: exporterForTest(t, l)}
 	check := func(body string) error {
 		t.Helper()
-		work := t.TempDir()
-		f := filepath.Join(work, "P.lean")
-		if err := os.WriteFile(f, []byte("import Fixture\n"+body), 0o644); err != nil {
+		work, err := NewScratch(t.TempDir())
+		if err != nil {
 			t.Fatal(err)
 		}
-		return x.CheckSource(context.Background(), f, []string{dir})
+		return x.CheckSource(context.Background(), []byte("import Fixture\n"+body), []string{dir}, work)
 	}
 	for _, ok := range []string{
 		"namespace Fx\nopen Fx\n/-- doc -/\n@[simp] def MySp (R : BitVec 5 → BitVec 64) : Prop := R 2#5 &&& 7#64 = 0#64\nend Fx\n",
@@ -297,6 +303,8 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 		"attribute [local instance, export x] Fx.SpAligned\n",
 		"open Fx in\n#eval 1\n",
 		"unsafe def x : Nat := 1\n",
+		"initialize counter : IO.Ref Nat ← IO.mkRef 0\n",
+		"builtin_initialize pure ()\n",
 		"set_option maxHeartbeats 0\n",
 		"macro \"m\" : term => `(1)\n",
 	} {
