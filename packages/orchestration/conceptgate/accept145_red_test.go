@@ -1,8 +1,12 @@
 package conceptgate
 
 import (
+	"context"
 	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
 // Accept145 (INFRA-145 acceptance, E8): orchestration-lean.yaml sets DECLINDEX_REQUIRE_SANDBOX=1 with the comment
@@ -17,4 +21,32 @@ func TestRequiredSandboxRunsTheGateTests(t *testing.T) {
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
 		t.Fatal("DECLINDEX_REQUIRE_SANDBOX is set, but the gate's sandboxed Lean tests skip: they run only with DECLINDEX_SANDBOX_TEST=1")
 	}
+}
+
+// Accept145 (INFRA-145 acceptance, E2): a librarian concept with forms and no stored source states its fact through
+// its forms; the index need not declare its name (README: "A concept with no form is matched by its declaration's
+// body", so one with forms is not). Forms keeps only concepts the index declares, so the copy's
+// LinuxMmu.SK.SpAligned (18 forms, declared nowhere) leaves an empty forms module and `declindex states
+// LinuxMmu.SK.SpAligned` finds 0 of the 1,824 files at d2672b5c5 (v1, format 1: 1,789). Run
+// infra145-e2-20261023T2236Z on linux28-poc-build.
+func TestFormsKeepsUndeclaredConceptsForms(t *testing.T) {
+	reg, defects, err := Load(filepath.Join("testdata", "registry"))
+	if err != nil || len(defects) != 0 {
+		t.Fatalf("load: %v %v", err, defects)
+	}
+	s, err := declindex.Open(filepath.Join(t.TempDir(), "index.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	fm, err := Forms(context.Background(), s, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range fm.Concepts {
+		if c.Concept == "Fx.SpAligned" && len(c.Forms) == 1 {
+			return
+		}
+	}
+	t.Fatalf("the forms module lost Fx.SpAligned's form; concepts %+v", fm.Concepts)
 }
