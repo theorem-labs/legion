@@ -107,3 +107,12 @@ func TestPublicConfigKeepsItsYAMLSchema(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigRefusesUnsafeRegistryPaths(t *testing.T) {
+	for _, registry := range []string{"/srv/registry", "../registry", "../../registry"} {
+		_, err := LoadConfig(writeConfig(t, "tree: tree\nroots: [A]\nregistry: "+registry+"\n"))
+		if err == nil || !strings.Contains(err.Error(), "registry") {
+			t.Errorf("unsafe registry path %q: %v", registry, err)
+		}
+	}
+}

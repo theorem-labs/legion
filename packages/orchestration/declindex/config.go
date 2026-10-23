@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -109,6 +110,12 @@ func LoadConfig(path string) (Config, error) {
 	if len(y.Roots) == 0 {
 		return Config{}, fmt.Errorf("%s: roots are required: the first components of the project's module names", path)
 	}
+	if y.Registry != "" {
+		clean := filepath.Clean(y.Registry)
+		if filepath.IsAbs(y.Registry) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return Config{}, fmt.Errorf("%s: registry must be a non-empty relative path below the tree", path)
+		}
+	}
 	timeout := 6 * time.Hour
 	if y.BuildTimeout != "" {
 		timeout, err = time.ParseDuration(y.BuildTimeout)
@@ -155,6 +162,89 @@ func LoadConfig(path string) (Config, error) {
 		c.Lean.SearchPath[i] = rel(c.Tree, p)
 	}
 	return c, nil
+}
+
+// GateRegistryDir resolves the configured registry through symlinks and requires it to remain a subdirectory of
+// the tree. The gate reads only this resolved directory.
+func (c Config) GateRegistryDir() (string, error) {
+	if c.Registry == "" {
+		return "", errors.New("the configuration names no registry")
+	}
+	return pathInside(c.Tree, c.Registry)
+}
+
+// GateStatePath resolves the configured index path through symlinks and requires it to remain outside the tree.
+// A gate opens this existing file read-only, so neither the index nor its scratch work can dirty the tree.
+func (c Config) GateStatePath() (string, error) {
+	tree, err := canonicalPath(c.Tree)
+	if err != nil {
+		return "", err
+	}
+	state, err := canonicalStatePath(c.DB)
+	if err != nil {
+		return "", err
+	}
+	if isInside(tree, state) {
+		return "", fmt.Errorf("the gate index state %s must be outside the tree %s", state, tree)
+	}
+	return state, nil
+}
+
+func pathInside(tree, path string) (string, error) {
+	root, err := canonicalPath(tree)
+	if err != nil {
+		return "", err
+	}
+	child, err := canonicalPath(path)
+	if err != nil {
+		return "", err
+	}
+	if !isInside(root, child) {
+		return "", fmt.Errorf("registry %s must resolve inside the tree %s", child, root)
+	}
+	return child, nil
+}
+
+func canonicalPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(absolute)
+}
+
+func canonicalStatePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := absolute
+	var missing []string
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return resolved, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing parent for index state %s", absolute)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func isInside(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // ErrNoDB is returned when no index path is configured.

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -118,7 +120,110 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 	return rc
 }
 
-var gateSandboxAvailable = confine.Available
+var (
+	gateSandboxAvailable    = confine.Available
+	gateAfterRegistryStatus func()
+)
+
+func gateRegistryClean(tree, rel string) error {
+	status, err := exec.Command("git", "-C", tree, "status", "--porcelain", "--untracked-files=all", "--", rel).Output()
+	if err != nil {
+		return fmt.Errorf("check registry changes: %w", err)
+	}
+	if len(status) != 0 {
+		return fmt.Errorf("the registry has local changes")
+	}
+	return nil
+}
+
+// snapshotGateRegistry extracts the registry from the verified index commit outside the tree. All gate reads use
+// this immutable snapshot, never the caller's mutable working-tree directory.
+func snapshotGateRegistry(ctx context.Context, tree, commit, rel, base string) (string, func(), error) {
+	root, err := os.MkdirTemp(base, "registry-snapshot-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(root) }
+	cmd := exec.CommandContext(ctx, "git", "-C", tree, "archive", "--format=tar", commit, "--", rel)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	fail := func(err error) (string, func(), error) {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		cleanup()
+		return "", nil, err
+	}
+	prefix := filepath.ToSlash(rel)
+	reader := tar.NewReader(out)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fail(err)
+		}
+		if header.Typeflag == tar.TypeXGlobalHeader || header.Typeflag == tar.TypeXHeader {
+			continue
+		}
+		name := filepath.Clean(filepath.FromSlash(header.Name))
+		if name != rel && !strings.HasPrefix(filepath.ToSlash(name), prefix+"/") {
+			return fail(fmt.Errorf("git archive returned path outside registry: %s", header.Name))
+		}
+		target := filepath.Join(root, name)
+		inside, err := filepath.Rel(root, target)
+		if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+			return fail(fmt.Errorf("git archive returned unsafe registry path: %s", header.Name))
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return fail(err)
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fail(err)
+			}
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+			if err != nil {
+				return fail(err)
+			}
+			_, copyErr := io.Copy(file, reader)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return fail(copyErr)
+			}
+			if closeErr != nil {
+				return fail(closeErr)
+			}
+		default:
+			return fail(fmt.Errorf("git archive returned unsupported registry entry %s", header.Name))
+		}
+	}
+	if _, err := io.Copy(io.Discard, out); err != nil {
+		return fail(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	registry := filepath.Join(root, rel)
+	if info, err := os.Stat(registry); err != nil || !info.IsDir() {
+		cleanup()
+		if err != nil {
+			return "", nil, err
+		}
+		return "", nil, fmt.Errorf("the index commit has no registry directory %s", rel)
+	}
+	return registry, cleanup, nil
+}
 
 // cmdGate decides one proposal. Exit codes: 0 added, 1 refused (an exact duplicate), 4 near (sent to the
 // librarian), 5 the name is taken, 3 unable to decide.
@@ -155,12 +260,23 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if e.cfg.Registry == "" {
 		return fail(e.stderr, &usageError{"the configuration names no registry"})
 	}
-	// The gate compiles untrusted text only in the sandbox: where there is none, it starts nothing (no toolchain
-	// lookup, no exporter build) and cannot decide.
 	if err := gateSandboxAvailable(); err != nil {
 		return fail(e.stderr, &unableError{fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)})
 	}
-	if err := e.open(true); err != nil {
+	registry, err := e.cfg.GateRegistryDir()
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	state, err := e.cfg.GateStatePath()
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	tree, err := filepath.EvalSymlinks(e.cfg.Tree)
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	e.cfg.Tree, e.cfg.Registry, e.cfg.DB = tree, registry, state
+	if err := e.openReadOnly(true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -171,15 +287,25 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if head := treeHead(e.cfg.Tree); head != commit {
 		return fail(e.stderr, &unableError{fmt.Errorf("the tree HEAD %s differs from the index commit %s", head, commit)})
 	}
-	if rel, err := filepath.Rel(e.cfg.Tree, e.cfg.Registry); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		status, err := exec.Command("git", "-C", e.cfg.Tree, "status", "--porcelain", "--untracked-files=all", "--", rel).Output()
-		if err != nil {
-			return fail(e.stderr, &unableError{fmt.Errorf("check registry changes: %w", err)})
-		}
-		if len(status) != 0 {
-			return fail(e.stderr, &unableError{fmt.Errorf("the registry has local changes")})
-		}
+	rel, err := filepath.Rel(e.cfg.Tree, registry)
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
 	}
+	if err := gateRegistryClean(e.cfg.Tree, rel); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	if gateAfterRegistryStatus != nil {
+		gateAfterRegistryStatus()
+	}
+	snapshot, cleanup, err := snapshotGateRegistry(ctx, e.cfg.Tree, commit, rel, filepath.Dir(state))
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	defer cleanup()
+	if err := gateRegistryClean(e.cfg.Tree, rel); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	e.cfg.Registry = snapshot
 	raw, err := os.ReadFile(args[0])
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
@@ -193,7 +319,7 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	work := filepath.Join(filepath.Dir(e.cfg.DB), "proposals")
+	work := filepath.Join(filepath.Dir(state), "proposals")
 	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, Compiled: co,
 		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: work}, WorkDir: work}
 	v, err := g.Decide(ctx, p, conceptgate.DecideOptions{Proposer: proposer, AcceptedBy: acceptedBy, ProposalBytes: raw})

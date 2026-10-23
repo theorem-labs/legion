@@ -328,3 +328,25 @@ func TestRefreshAtSerializesTheSyncStepWithTheWriterLock(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestOpenReadOnlyRequiresAnInitializedIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.sqlite")
+	if _, err := OpenReadOnly(path); err == nil {
+		t.Fatal("opened a missing index read-only")
+	}
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	if version, err := reader.Meta(context.Background(), "schema"); err != nil || version != SchemaVersion {
+		t.Fatalf("read-only schema: %q, %v", version, err)
+	}
+}

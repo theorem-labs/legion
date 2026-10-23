@@ -83,3 +83,88 @@ func TestGateRequiresIndexCommitAndCleanRegistry(t *testing.T) {
 		}
 	})
 }
+
+func TestGateRejectsInTreeStateAndEscapedRegistry(t *testing.T) {
+	old := gateSandboxAvailable
+	gateSandboxAvailable = func() error { return nil }
+	t.Cleanup(func() { gateSandboxAvailable = old })
+	t.Run("state", func(t *testing.T) {
+		config, tree, proposal := gateFixture(t)
+		body, err := os.ReadFile(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = []byte(strings.Replace(string(body), "db: state/index.sqlite", "db: tree/.declindex/index.sqlite", 1))
+		if err := os.WriteFile(config, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "outside the tree") {
+			t.Fatalf("in-tree state: %+v", r)
+		}
+		if status := git(t, tree, "status", "--porcelain"); status != "" {
+			t.Fatalf("gate dirtied the tree: %q", status)
+		}
+	})
+	t.Run("registry", func(t *testing.T) {
+		config, tree, proposal := gateFixture(t)
+		outside := filepath.Join(filepath.Dir(tree), "outside-registry")
+		if err := os.MkdirAll(filepath.Join(outside, "concepts"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(outside, "registry.yaml"), []byte("version: 2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		body, err := os.ReadFile(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = []byte(strings.Replace(string(body), "registry: registry", "registry: ../outside-registry", 1))
+		if err := os.WriteFile(config, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "registry") {
+			t.Fatalf("escaped registry: %+v", r)
+		}
+	})
+	t.Run("symlink", func(t *testing.T) {
+		config, tree, proposal := gateFixture(t)
+		outside := filepath.Join(filepath.Dir(tree), "symlink-registry")
+		if err := os.MkdirAll(filepath.Join(outside, "concepts"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(outside, "registry.yaml"), []byte("version: 2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(filepath.Join(tree, "registry")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(tree, "registry")); err != nil {
+			t.Fatal(err)
+		}
+		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "inside the tree") {
+			t.Fatalf("symlink registry: %+v", r)
+		}
+	})
+}
+
+func TestGateRejectsRegistryMutationAfterInitialStatus(t *testing.T) {
+	oldSandbox, oldStatus := gateSandboxAvailable, gateAfterRegistryStatus
+	gateSandboxAvailable = func() error { return nil }
+	t.Cleanup(func() {
+		gateSandboxAvailable = oldSandbox
+		gateAfterRegistryStatus = oldStatus
+	})
+	config, tree, proposal := gateFixture(t)
+	gateAfterRegistryStatus = func() {
+		if err := os.WriteFile(filepath.Join(tree, "registry", "mutated"), []byte("dirty"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+	if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "registry has local changes") {
+		t.Fatalf("registry mutation: %+v", r)
+	}
+}
