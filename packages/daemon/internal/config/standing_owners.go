@@ -2,10 +2,12 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/sjawhar/legion/daemon/internal/claim"
 	"github.com/sjawhar/legion/daemon/internal/runtime"
 )
 
@@ -94,6 +96,9 @@ func readStandingOwner(value *yaml.Node, key string) (StandingOwner, error) {
 	if strings.ContainsAny(name, " \t\r\n") {
 		return StandingOwner{}, fmt.Errorf("%s.name must not contain whitespace", key)
 	}
+	if _, err := claim.OwnerToken("owner", name); err != nil {
+		return StandingOwner{}, fmt.Errorf("%s.name: %w", key, err)
+	}
 	prompt, err := requiredString(members["prompt_file"], key+".prompt_file", "")
 	if err != nil {
 		return StandingOwner{}, err
@@ -122,8 +127,8 @@ func readCost(value *yaml.Node, key string) (float64, error) {
 		return 0, fmt.Errorf("%s must be a positive number", key)
 	}
 	var cost float64
-	if err := value.Decode(&cost); err != nil || cost <= 0 {
-		return 0, fmt.Errorf("%s must be a positive number", key)
+	if err := value.Decode(&cost); err != nil || cost <= 0 || math.IsNaN(cost) || math.IsInf(cost, 0) {
+		return 0, fmt.Errorf("%s must be a finite positive number", key)
 	}
 	return cost, nil
 }

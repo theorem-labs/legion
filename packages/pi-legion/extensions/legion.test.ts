@@ -799,6 +799,13 @@ describe("Legion OMP extension", () => {
       tree: "REPO-42",
       issue: "REPO-43",
     });
+    expect(
+      classifySession({
+        LEGION_ROLE: "owner",
+        LEGION_TREE: "",
+        LEGION_ISSUE: "",
+      })
+    ).toEqual({ kind: "standing-owner" });
     expect(classifySession({})).toEqual({ kind: "not-legion" });
   });
   test("classifies the controller by LEGION_CONTROLLER alone, ignoring a redundant LEGION_ROLE=controller", () => {

@@ -1098,6 +1098,7 @@ func resumeByRule(m *Machine, ctx context.Context, ev Event) error {
 // the claim kept goes once the agent is ready.
 func retry(m *Machine, ctx context.Context, _ Event) error {
 	m.claim.Budgets = Budgets{}
+	m.claim.OwnerRetryRevision = 0
 	return m.revive(ctx)
 }
 
@@ -1108,7 +1109,7 @@ func retry(m *Machine, ctx context.Context, _ Event) error {
 // its keeper. A claim's role never changes, so the refusal cannot race the decision it guards.
 func operatorRetry(m *Machine, ctx context.Context, ev Event) error {
 	switch m.claim.Role {
-	case claim.RoleArchitect:
+	case claim.RoleArchitect, claim.RoleOwner:
 		return retry(m, ctx, ev)
 	case claim.RoleController:
 		return &RefusedError{State: m.claim.State, Request: "retry",

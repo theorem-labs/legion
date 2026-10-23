@@ -111,6 +111,33 @@ func controllerSpec() SpawnSpec {
 	}
 }
 
+func standingOwnerSpec(t *testing.T) SpawnSpec {
+	t.Helper()
+	token, err := claim.OwnerToken("omp", "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return SpawnSpec{
+		Claim:      token,
+		Project:    "omp",
+		Role:       claim.RoleOwner,
+		Generation: 1,
+		BootToken:  "boot-secret",
+		Env:        map[string]string{},
+		Secrets:    map[string]string{"ENVOY_TOKEN": "envoy-secret"},
+		Prompt:     PromptParts{RolePromptPaths: []string{"/roles/owner-a.md"}},
+	}
+}
+
+// A standing owner has its own tree-independent shape: a project and owner token, but no issue,
+// tree, repository, or workspace.
+func TestValidateSpawnSpecAcceptsStandingOwnersTreeIndependentShape(t *testing.T) {
+	owned := map[string]bool{"LEGION_BOOT_TOKEN_FILE": true}
+	if err := ValidateSpawnSpec(standingOwnerSpec(t), owned); err != nil {
+		t.Fatalf("ValidateSpawnSpec standing owner: %v", err)
+	}
+}
+
 // The project controller's launch, under `controller: daemon`, is a spec of its own shape: the
 // controller role, the project's controller token, and no issue, tree, repository or workspace —
 // the controller works Dispatch, never a checkout. Anything else on it is refused, as a workflow

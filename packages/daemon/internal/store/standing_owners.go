@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/jackc/pgx/v5"
 
@@ -16,7 +17,8 @@ func (s *Store) ReserveStandingOwnerAttempt(ctx context.Context, c supervise.Cla
 	if !claim.IsStandingOwner(c.Role, c.Issue, c.Tree) {
 		return nil
 	}
-	if maxRunning < 1 || budget <= 0 || cost <= 0 {
+	if maxRunning < 1 || budget <= 0 || cost <= 0 || math.IsNaN(budget) || math.IsInf(budget, 0) ||
+		math.IsNaN(cost) || math.IsInf(cost, 0) {
 		return fmt.Errorf("standing-owner admission has invalid limits")
 	}
 	generation := int64(c.Generation + 1)
@@ -37,7 +39,8 @@ func (s *Store) ReserveStandingOwnerAttempt(ctx context.Context, c supervise.Cla
 				AND state IN ('launching', 'shim_connected', 'registered', 'ready', 'working', 'idle', 'launch_uncertain')
 			UNION
 			SELECT a.owner_token FROM standing_owner_attempts a JOIN claims owner ON owner.token = a.owner_token
-				WHERE owner.project = $1 AND owner.role = $2 AND owner.token <> $3 AND owner.state = 'queued'
+				WHERE owner.project = $1 AND owner.role = $2 AND owner.token <> $3
+					AND owner.state IN ('queued', 'suspended', 'failed') AND a.capacity_reserved
 					AND a.generation = owner.generation + 1
 		) running`, c.Project, string(claim.RoleOwner), string(c.Token)).Scan(&running); err != nil {
 			return err
@@ -54,6 +57,20 @@ func (s *Store) ReserveStandingOwnerAttempt(ctx context.Context, c supervise.Cla
 			return fmt.Errorf("standing owner %s refused: budget_usd %.2f would be exceeded by %.2f", c.Token, budget, reserved+cost)
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO standing_owner_attempts (owner_token, generation, reserved_usd) VALUES ($1, $2, $3)`, string(c.Token), generation, cost)
+		return err
+	})
+}
+
+// ReleaseStandingOwnerPendingCapacity releases only an unresolved pre-launch capacity reservation.
+// Its monetary reservation stays in the attempt history and remains part of budget accounting.
+func (s *Store) ReleaseStandingOwnerPendingCapacity(ctx context.Context, c supervise.Claim) error {
+	if !claim.IsStandingOwner(c.Role, c.Issue, c.Tree) {
+		return nil
+	}
+	return s.Tx(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE standing_owner_attempts SET capacity_reserved = false
+			WHERE owner_token = $1 AND generation = $2 AND capacity_reserved`,
+			string(c.Token), int64(c.Generation+1))
 		return err
 	})
 }

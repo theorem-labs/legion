@@ -18,6 +18,15 @@ export const LEGION_ROLES = [
 
 export type LegionRole = (typeof LEGION_ROLES)[number];
 
+// StandingOwnerRole is tree-independent: unlike LegionRole, it never names a Dispatch issue.
+export const STANDING_OWNER_ROLE = "owner" as const;
+export const LEGION_CLAIM_ROLES = [...LEGION_ROLES, STANDING_OWNER_ROLE] as const;
+export type LegionClaimRole = (typeof LEGION_CLAIM_ROLES)[number];
+
+export function isLegionClaimRole(role: string): role is LegionClaimRole {
+  return LEGION_CLAIM_ROLES.some((candidate) => candidate === role);
+}
+
 export interface ParsedRoleToken {
   project: string;
   issue: IssueKey;
@@ -79,6 +88,15 @@ export function sanitizeToken(part: string): string {
 export function controllerToken(project: string): string {
   assertLegionProjectToken(project);
   return `legion-${project}-controller`;
+}
+
+/** The Envoy role token of a tree-independent standing owner. */
+export function standingOwnerToken(project: string, owner: string): string {
+  assertLegionProjectToken(project);
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(owner)) {
+    throw new Error(`Invalid standing owner: ${owner}`);
+  }
+  return `legion-${project}-owner-${owner}`;
 }
 
 export function roleTopic(token: string): string {

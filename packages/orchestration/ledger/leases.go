@@ -82,6 +82,26 @@ func (s *Store) HasOpenWork(ctx context.Context, repo, owner string) (bool, erro
 	return open, err
 }
 
+// OwnerWorkRevision is the newest durable queue-change event of owner. Leasing an item does not
+// change its work, while enqueueing and completing one do; callers use the revision to distinguish
+// new work from the same work that exhausted a retry budget.
+func (s *Store) OwnerWorkRevision(ctx context.Context, repo, owner string) (int64, error) {
+	if strings.TrimSpace(owner) == "" {
+		return 0, invalid("empty owner")
+	}
+	var revision int64
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT coalesce(max(e.id), 0)
+			FROM events e JOIN work_items item ON item.repo = e.repo AND item.id = e.subject
+			WHERE e.repo = $1 AND item.owner = $2 AND e.kind IN ('item.enqueued', 'item.completed')`,
+			repo, owner).Scan(&revision)
+	})
+	return revision, err
+}
+
 func checkLeaseArgs(id, holder string, ttl time.Duration) error {
 	switch {
 	case id == "":

@@ -98,8 +98,8 @@ func (t Token) OwnerName(project string) (string, bool) {
 	return name, ok && ownerName.MatchString(name)
 }
 
-// Role is the role t names: the workflow role it ends in (Cut), or RoleController for the
-// project controller's token (ControllerToken); ok is false for a token that is neither.
+// Role is the role t names: the workflow role it ends in, or one of the two tree-independent
+// roles (controller and owner).
 func (t Token) Role() (role Role, ok bool) {
 	if _, role, ok := t.Cut(); ok {
 		return role, true
@@ -108,6 +108,13 @@ func (t Token) Role() (role Role, ok bool) {
 	project, suffixed := strings.CutSuffix(project, "-"+string(RoleController))
 	if prefixed && suffixed && projectToken.MatchString(project) {
 		return RoleController, true
+	}
+	parts := strings.Split(string(t), "-owner-")
+	if len(parts) == 2 {
+		project, prefixed := strings.CutPrefix(parts[0], "legion-")
+		if prefixed && projectToken.MatchString(project) && ownerName.MatchString(parts[1]) {
+			return RoleOwner, true
+		}
 	}
 	return "", false
 }

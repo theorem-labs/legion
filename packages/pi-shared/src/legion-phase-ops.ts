@@ -1,4 +1,4 @@
-import { type LegionRole, zodSchemaApi } from "@legion/contracts";
+import { isLegionRole, type LegionClaimRole, type LegionRole, zodSchemaApi } from "@legion/contracts";
 import {
   LEGION_PHASE_BACKWARD_TARGETS,
   type LegionIssue,
@@ -15,7 +15,7 @@ export interface ClaimCapability {
   readonly sessionID: string;
   readonly tree: string;
   readonly issue: string;
-  readonly role: LegionRole;
+  readonly role: LegionClaimRole;
   readonly secret: string;
 }
 
@@ -215,6 +215,9 @@ export async function executePhaseOp(
   input: unknown
 ): Promise<Readonly<Record<string, unknown>>> {
   const { daemon, claim } = runtime;
+  if (!isLegionRole(claim.role)) {
+    throw new Error("workflow operations are unavailable to a standing owner");
+  }
   const parsed = PhaseOpArguments.safeParse(input);
   const issues = parsed.success ? [] : parsed.error.issues;
   const unknownFields = issues.filter((issue) => issue.code === "unrecognized_keys");

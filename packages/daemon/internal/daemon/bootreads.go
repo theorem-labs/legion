@@ -71,6 +71,9 @@ func readBoot(cfg config.Config, lookup func(string) (string, bool), getenv func
 			return bootReads{}, err
 		}
 	}
+	if err := readStandingOwnerFiles(cfg); err != nil {
+		return bootReads{}, err
+	}
 	if cfg.DispatchURL != "" {
 		if r.dispatchToken, err = config.ReadSecretPointer("dispatch_token_file", cfg.DispatchTokenFile); err != nil {
 			return bootReads{}, err
@@ -88,6 +91,23 @@ func readBoot(cfg config.Config, lookup func(string) (string, bool), getenv func
 		return bootReads{}, err
 	}
 	return r, nil
+}
+
+// readStandingOwnerFiles holds startup and --check-config to the local files every owner launch
+// needs, while deliberately leaving the remote ledger for its independent admission reconnect.
+func readStandingOwnerFiles(cfg config.Config) error {
+	if cfg.StandingOwners == nil {
+		return nil
+	}
+	if _, err := config.ReadPrivateSecretPointer("standing_owners.ledger_dsn_file", cfg.StandingOwners.LedgerDSNFile); err != nil {
+		return err
+	}
+	for _, owner := range cfg.StandingOwners.Owners {
+		if _, err := os.ReadFile(owner.PromptFile); err != nil {
+			return fmt.Errorf("standing_owners owner %s prompt_file %s could not be read: %w", owner.Name, owner.PromptFile, err)
+		}
+	}
+	return nil
 }
 
 // natsConnection is the NATS user the daemon's own connection authenticates as: its own seed

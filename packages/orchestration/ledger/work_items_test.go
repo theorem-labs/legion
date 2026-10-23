@@ -43,3 +43,39 @@ func TestEnqueueMakesOnlyItsOwnersOpenWorkVisible(t *testing.T) {
 		t.Fatal("the completed item still wakes its owner")
 	}
 }
+
+func TestOwnerWorkRevisionChangesOnlyWhenItsQueueChanges(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	revision, err := s.OwnerWorkRevision(ctx, "r", "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision != 0 {
+		t.Fatalf("initial revision = %d, want 0", revision)
+	}
+	if err := s.Enqueue(ctx, "r", "item-a", "owner-a"); err != nil {
+		t.Fatal(err)
+	}
+	opened := must(s.OwnerWorkRevision(ctx, "r", "owner-a"))
+	if opened == 0 {
+		t.Fatal("enqueue left owner revision at zero")
+	}
+	lease := must(s.Claim(ctx, "r", "item-a", "worker", time.Minute))
+	if got := must(s.OwnerWorkRevision(ctx, "r", "owner-a")); got != opened {
+		t.Fatalf("claim changed owner work revision from %d to %d", opened, got)
+	}
+	if err := s.Complete(ctx, "r", "item-a", "worker", lease.Generation, "done"); err != nil {
+		t.Fatal(err)
+	}
+	completed := must(s.OwnerWorkRevision(ctx, "r", "owner-a"))
+	if completed <= opened {
+		t.Fatalf("completion revision = %d, want greater than %d", completed, opened)
+	}
+	if err := s.Enqueue(ctx, "r", "item-b", "owner-b"); err != nil {
+		t.Fatal(err)
+	}
+	if got := must(s.OwnerWorkRevision(ctx, "r", "owner-a")); got != completed {
+		t.Fatalf("other owner's enqueue changed revision from %d to %d", completed, got)
+	}
+}

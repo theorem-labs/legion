@@ -72,12 +72,19 @@ func ValidateSpawnSpec(spec SpawnSpec, runtimeOwned map[string]bool) error {
 	refuse := func(format string, args ...any) error {
 		return fmt.Errorf("spawn %s: "+format, append([]any{spec.Claim}, args...)...)
 	}
-	if spec.Role == claim.RoleController {
+	switch {
+	case spec.Role == claim.RoleController:
 		if err := validateControllerShape(spec, refuse); err != nil {
 			return err
 		}
-	} else if err := validateClaimShape(spec, refuse); err != nil {
-		return err
+	case spec.Role == claim.RoleOwner:
+		if err := validateStandingOwnerShape(spec, refuse); err != nil {
+			return err
+		}
+	default:
+		if err := validateClaimShape(spec, refuse); err != nil {
+			return err
+		}
 	}
 	if len(spec.Prompt.RolePromptPaths) == 0 {
 		return refuse("no role prompt")
@@ -182,6 +189,33 @@ func validateControllerShape(spec SpawnSpec, refuse func(string, ...any) error) 
 	}
 	if spec.WorkspaceRecoveredFrom != "" {
 		return refuse("the controller has no workspace to recover (got %s)", spec.WorkspaceRecoveredFrom)
+	}
+	return nil
+}
+
+// validateStandingOwnerShape holds a standing owner to its tree-independent launch contract. Its
+// token, rather than an issue/workspace, identifies the durable owner process.
+func validateStandingOwnerShape(spec SpawnSpec, refuse func(string, ...any) error) error {
+	for _, field := range []struct{ name, value string }{{"project", spec.Project}, {"boot token", spec.BootToken}} {
+		if field.value == "" {
+			return refuse("no %s", field.name)
+		}
+	}
+	if !claim.IsStandingOwner(spec.Role, spec.Issue, spec.Tree) {
+		return refuse("the standing owner's claim is on no issue and no tree (issue %q, tree %q)", spec.Issue, spec.Tree)
+	}
+	owner, ok := spec.Claim.OwnerName(spec.Project)
+	if !ok || owner == "" {
+		return refuse("the standing owner's claim token is not an owner token of project %s", spec.Project)
+	}
+	if !spec.Repository.IsZero() {
+		return refuse("the standing owner works no repository (got %s)", spec.Repository)
+	}
+	if spec.DefaultBranch != "" {
+		return refuse("the standing owner works no repository, so it has no default branch (got %s)", spec.DefaultBranch)
+	}
+	if spec.WorkspaceRecoveredFrom != "" {
+		return refuse("the standing owner has no workspace to recover (got %s)", spec.WorkspaceRecoveredFrom)
 	}
 	return nil
 }

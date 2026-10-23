@@ -3,6 +3,7 @@ import { readSecretFile } from "@legion/envoy-client/secret-file";
 
 export type LegionSessionKind =
   | { kind: "controller" }
+  | { kind: "standing-owner" }
   | { kind: "root-architect"; tree: string }
   | { kind: "phase-worker"; role: LegionRole; tree: string; issue: string }
   | { kind: "not-legion" };
@@ -19,6 +20,13 @@ export function classifySession(env: NodeJS.ProcessEnv): LegionSessionKind {
   if (env.LEGION_CONTROLLER === "1") return { kind: "controller" };
 
   if (env.LEGION_ROLE === undefined) return { kind: "not-legion" };
+
+  if (env.LEGION_ROLE === "owner") {
+    if (env.LEGION_TREE !== "" || env.LEGION_ISSUE !== "") {
+      throw new Error("standing owner has an issue or tree launch marker");
+    }
+    return { kind: "standing-owner" };
+  }
 
   if (!isLegionRole(env.LEGION_ROLE)) {
     throw new Error(`LEGION_ROLE "${env.LEGION_ROLE}" is not a Legion role`);

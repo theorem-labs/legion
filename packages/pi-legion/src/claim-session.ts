@@ -66,16 +66,26 @@ export function createClaimSession(deps: {
         agentId,
         pluginContract: pkg.legion.daemonApiVersion,
       },
-      measure: (claim) =>
-        deps.measureCapabilities(context, {
+      measure: (claim) => {
+        if (claim.role === "owner") {
+          return Promise.resolve({
+            measuredAt: new Date().toISOString(),
+            elapsedMs: 0,
+            rows: [],
+          });
+        }
+        return deps.measureCapabilities(context, {
           issue: claim.issue,
           promptAgents: claim.promptAgents,
-        }),
-      afterRegister: () =>
-        exportJjSessionAttribution(
+        });
+      },
+      afterRegister: (registered) => {
+        if (registered.role === "owner") return Promise.resolve();
+        return exportJjSessionAttribution(
           sessionFile,
           requiredEnvironment(process.env, "LEGION_STATE_DIR")
-        ),
+        );
+      },
       setCapability: (registered) => {
         capability = registered;
       },

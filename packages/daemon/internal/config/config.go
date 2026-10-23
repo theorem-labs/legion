@@ -902,6 +902,9 @@ func resolve(file fileConfig, env func(string) string, configDir string) (Config
 	}
 
 	if file.StandingOwners != nil {
+		if file.Kubernetes != nil {
+			return Config{}, errors.New("standing_owners needs runtime: tmux: standing owners run as one supervised tmux process on the VM, and the Kubernetes runtime has no owner pod contract")
+		}
 		owners := *file.StandingOwners
 		owners.LedgerDSNFile = underConfig(owners.LedgerDSNFile, configDir)
 		owners.Owners = slices.Clone(owners.Owners)

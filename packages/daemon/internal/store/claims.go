@@ -23,7 +23,7 @@ var _ supervise.Store = (*Store)(nil)
 // separately (a delivery changes far more often than the claim it rides on) and read together.
 const claimSelect = `select c.token, c.project, c.tree, c.issue, c.role, c.generation, c.tree_epoch, c.session,
 	c.session_file, c.locator, c.state, c.launch_failures, c.deaths, c.prompt_failures, c.prompt_retires,
-	c.boot_token_hash, c.capability_hash, c.uncertain_streak, c.workspace_lost, c.last_start_row, c.serving_generation,
+	c.boot_token_hash, c.capability_hash, c.uncertain_streak, c.standing_owner_retry_revision, c.workspace_lost, c.last_start_row, c.serving_generation,
 	c.agent_secrets_enrollment, c.agent_secrets_enrollment_incarnation, c.suspended_by,
 	c.plugin_contract, c.plugin_relaunch_for,
 	d.delivery_id, d.task, d.phase, d.generation, d.queued_at, d.delivered_at, d.marked_by, d.confirmed_at, d.interrupted
@@ -59,10 +59,10 @@ func putClaim(ctx context.Context, db execer, c supervise.Claim) error {
 	}
 	_, err := db.Exec(ctx, `insert into claims (token, project, tree, issue, role, generation, tree_epoch,
 		session, session_file, locator, state, launch_failures, deaths, prompt_failures, prompt_retires,
-		boot_token_hash, capability_hash, uncertain_streak, workspace_lost, last_start_row,
+		boot_token_hash, capability_hash, uncertain_streak, standing_owner_retry_revision, workspace_lost, last_start_row,
 		serving_generation, agent_secrets_enrollment, agent_secrets_enrollment_incarnation, suspended_by,
 		plugin_contract, plugin_relaunch_for)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 		on conflict (token) do update set project = excluded.project, tree = excluded.tree,
 		issue = excluded.issue, role = excluded.role, generation = excluded.generation, tree_epoch = excluded.tree_epoch,
 		session = excluded.session, session_file = excluded.session_file,
@@ -71,6 +71,7 @@ func putClaim(ctx context.Context, db execer, c supervise.Claim) error {
 		prompt_failures = excluded.prompt_failures,
 		prompt_retires = excluded.prompt_retires, boot_token_hash = excluded.boot_token_hash,
 		capability_hash = excluded.capability_hash, uncertain_streak = excluded.uncertain_streak,
+		standing_owner_retry_revision = excluded.standing_owner_retry_revision,
 		workspace_lost = excluded.workspace_lost, last_start_row = excluded.last_start_row,
 		serving_generation = excluded.serving_generation,
 		agent_secrets_enrollment = excluded.agent_secrets_enrollment,
@@ -82,7 +83,7 @@ func putClaim(ctx context.Context, db execer, c supervise.Claim) error {
 		string(c.Token), c.Project, c.Tree, c.Issue, string(c.Role), int64(c.Generation), int64(c.TreeEpoch),
 		c.Session, c.SessionFile, locator, string(c.State),
 		c.Budgets.LaunchFailures, c.Budgets.Deaths, c.Budgets.PromptFailures, c.Budgets.PromptRetires,
-		c.BootTokenHash, c.CapabilityHash, c.UncertainStreak, c.WorkspaceLost, c.LastStartRow, int64(c.ServingGeneration),
+		c.BootTokenHash, c.CapabilityHash, c.UncertainStreak, c.OwnerRetryRevision, c.WorkspaceLost, c.LastStartRow, int64(c.ServingGeneration),
 		enrollmentID, enrollmentIncarnation, string(c.SuspendedBy),
 		c.PluginContract, c.PluginRelaunchFor,
 	)
@@ -334,6 +335,7 @@ func scanClaim(row pgx.Row) (supervise.Claim, error) {
 		deliveryPhase              *string
 		deliveryGeneration         *int64
 		servingGeneration          int64
+		ownerRetryRevision         int64
 		enrollmentID, enrollmentIC *string
 		queuedAt, delivered        *time.Time
 		confirmed                  *time.Time
@@ -341,7 +343,7 @@ func scanClaim(row pgx.Row) (supervise.Claim, error) {
 	)
 	err := row.Scan(&token, &c.Project, &c.Tree, &c.Issue, &role, &generation, &treeEpoch, &c.Session,
 		&c.SessionFile, &locator, &state, &c.Budgets.LaunchFailures, &c.Budgets.Deaths, &c.Budgets.PromptFailures,
-		&c.Budgets.PromptRetires, &c.BootTokenHash, &c.CapabilityHash, &c.UncertainStreak, &c.WorkspaceLost,
+		&c.Budgets.PromptRetires, &c.BootTokenHash, &c.CapabilityHash, &c.UncertainStreak, &ownerRetryRevision, &c.WorkspaceLost,
 		&c.LastStartRow, &servingGeneration, &enrollmentID, &enrollmentIC, &by,
 		&c.PluginContract, &c.PluginRelaunchFor,
 		&deliveryID, &task, &deliveryPhase, &deliveryGeneration, &queuedAt, &delivered, &markedBy, &confirmed, &interrupted)
@@ -353,6 +355,7 @@ func scanClaim(row pgx.Row) (supervise.Claim, error) {
 	}
 	c.Token, c.Role, c.State, c.SuspendedBy = claim.Token(token), claim.Role(role), supervise.ClaimState(state), supervise.SuspendSource(by)
 	c.Generation, c.TreeEpoch, c.ServingGeneration = uint64(generation), uint64(treeEpoch), uint64(servingGeneration)
+	c.OwnerRetryRevision = ownerRetryRevision
 	if locator != nil {
 		var loc runtime.Locator
 		if err := json.Unmarshal(locator, &loc); err != nil {

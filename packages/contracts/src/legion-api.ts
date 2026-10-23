@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DISPATCH_KEY_PATTERN, LEGION_ROLES } from "./legion-roles";
+import { DISPATCH_KEY_PATTERN, LEGION_CLAIM_ROLES, LEGION_ROLES } from "./legion-roles";
 
 /**
  * The Legion daemon's HTTP API, as its readers see it.
@@ -407,9 +407,9 @@ export type LegionIssue = LegionState["issues"][string];
  * discovered agents against (contract 21). Never null: a role whose prompts name none gets `[]`. */
 export const LegionRegisterResponse = z.strictObject({
   claimToken: nonEmptyString,
-  tree: nonEmptyString,
-  issue: nonEmptyString,
-  role: z.enum(LEGION_ROLES),
+  tree: z.string(),
+  issue: z.string(),
+  role: z.enum(LEGION_CLAIM_ROLES),
   generation: z.number().int().positive(),
   secret: nonEmptyString,
   promptAgents: z.array(nonEmptyString),
@@ -513,9 +513,9 @@ const legionDeliveryView = z.strictObject({
  * supervisor holds it, but its hashes. */
 export const LegionOperatorClaimResponse = z.strictObject({
   token: nonEmptyString,
-  tree: nonEmptyString,
-  issue: nonEmptyString,
-  role: z.enum(LEGION_ROLES),
+  tree: z.string(),
+  issue: z.string(),
+  role: z.enum(LEGION_CLAIM_ROLES),
   generation: z.number().int().nonnegative(),
   state: z.enum(LEGION_CLAIM_STATES),
   session: z.string(),

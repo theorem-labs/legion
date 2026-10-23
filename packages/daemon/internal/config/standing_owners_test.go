@@ -1,7 +1,9 @@
 package config
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sjawhar/legion/daemon/internal/runtime"
@@ -46,5 +48,46 @@ func TestLoadReadsStandingOwners(t *testing.T) {
 	if got := owners.Owners[1]; got.Name != "proof-b" || got.PromptFile != "/srv/prompts/proof-b.md" ||
 		got.Harness != runtime.BackendOmp || got.MaxCostUSD != 4 {
 		t.Errorf("second owner = %+v", got)
+	}
+}
+
+func standingOwnersYAML(budget, cost, owner string) string {
+	return fmt.Sprintf(`standing_owners:
+  ledger_dsn_file: credentials/ledger-dsn
+  repository: example/repository
+  max_running: 1
+  budget_usd: %s
+  owners:
+    - name: %s
+      prompt_file: prompts/owner.md
+      harness: omp
+      max_cost_usd: %s
+`, budget, owner, cost)
+}
+
+func TestStandingOwnersRefuseInvalidValuesBeforeDaemonBoot(t *testing.T) {
+	for _, tc := range []struct {
+		name, budget, cost, owner string
+	}{
+		{"a NaN budget", ".nan", "1", "owner-a"},
+		{"an infinite budget", ".inf", "1", "owner-a"},
+		{"a NaN maximum cost", "1", ".nan", "owner-a"},
+		{"an infinite maximum cost", "1", ".inf", "owner-a"},
+		{"an invalid owner token", "1", "1", "Owner_A"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfigFile(t, minimalFile+standingOwnersYAML(tc.budget, tc.cost, tc.owner)), noEnv)
+			if err == nil {
+				t.Fatalf("Load accepted standing-owner configuration: %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestStandingOwnersAreTmuxOnly(t *testing.T) {
+	body := kubernetesFile + standingOwnersYAML("1", "1", "owner-a")
+	_, err := LoadForValidation(writeConfigFile(t, body), noEnv)
+	if err == nil || !strings.Contains(err.Error(), "standing_owners") || !strings.Contains(err.Error(), "tmux") {
+		t.Fatalf("LoadForValidation = %v, want standing_owners tmux refusal", err)
 	}
 }

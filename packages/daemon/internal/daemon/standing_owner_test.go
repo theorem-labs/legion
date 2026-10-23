@@ -134,7 +134,7 @@ func TestStandingOwnerStartsWhenLedgerItemIsEnqueuedAndSleepsWhenDone(t *testing
 
 // A daemon stopped after it persisted launching but before Spawn returns leaves no unrecorded
 // process. The next daemon repairs that launch and starts generation two exactly once.
-func TestStandingOwnerRecoversLaunchRecordedBeforeProcessStart(t *testing.T) {
+func TestFakeSupervisorRepairsOwnerLaunchRecordedBeforeSpawn(t *testing.T) {
 	cfg := testConfig(t)
 	queue := openOwnerLedger(t, cfg.PostgresDSN)
 	repo := "record-" + randomSuffix(t)
@@ -167,7 +167,7 @@ func TestStandingOwnerRecoversLaunchRecordedBeforeProcessStart(t *testing.T) {
 	}
 }
 
-func TestStandingOwnerRestartAdoptsLiveOwnerWithoutSecondStart(t *testing.T) {
+func TestFakeOwnerRestartDoesNotSpawnRecordedLiveOwner(t *testing.T) {
 	cfg := testConfig(t)
 	queue := openOwnerLedger(t, cfg.PostgresDSN)
 	repo := "adopt-" + randomSuffix(t)
@@ -191,7 +191,7 @@ func TestStandingOwnerRestartAdoptsLiveOwnerWithoutSecondStart(t *testing.T) {
 	}
 }
 
-func TestStandingOwnerVMRestartStartsOnlyWithQueuedWork(t *testing.T) {
+func TestFakeOwnerGoneWithEmptyQueueSleeps(t *testing.T) {
 	cfg := testConfig(t)
 	queue := openOwnerLedger(t, cfg.PostgresDSN)
 	repo := "restart-" + randomSuffix(t)
@@ -238,7 +238,7 @@ func TestStandingOwnerVMRestartStartsOnlyWithQueuedWork(t *testing.T) {
 	}
 }
 
-func TestStandingOwnerOrphanSweepReapsUnrecordedPane(t *testing.T) {
+func TestFakeOrphanSweepSeesUnrecordedOwnerToken(t *testing.T) {
 	cfg := testConfig(t)
 	queue := openOwnerLedger(t, cfg.PostgresDSN)
 	repo := "orphan-" + randomSuffix(t)
@@ -368,4 +368,156 @@ func TestStandingOwnerRepeatedStopsWaitAfterRetryBudget(t *testing.T) {
 	if got := len(rt.CallsOf("Spawn")) + len(rt.CallsOf("Resume")); got != cfg.LaunchFailureLimit {
 		t.Fatalf("owner launches = %d, want %d before retry budget exhaustion", got, cfg.LaunchFailureLimit)
 	}
+}
+
+func TestStandingOwnerLedgerOutageLeavesDaemonServing(t *testing.T) {
+	cfg := testConfig(t)
+	dsnFile := filepath.Join(t.TempDir(), "ledger-dsn")
+	if err := os.WriteFile(dsnFile, []byte("postgres://postgres:test@127.0.0.1:1/postgres\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prompt := filepath.Join(t.TempDir(), "owner.md")
+	if err := os.WriteFile(prompt, []byte("Wait for work."), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.StandingOwners = &config.StandingOwners{
+		LedgerDSNFile: dsnFile, Repository: "example/repository", MaxRunning: 1, BudgetUSD: 1,
+		Owners: []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: runtime.BackendOmp, MaxCostUSD: 1}},
+	}
+	rt := fake.NewRuntime()
+	startDaemon(t, cfg, fakeRuntime(rt, &built{}))
+	time.Sleep(20 * time.Millisecond)
+	if got := len(rt.CallsOf("Spawn")); got != 0 {
+		t.Fatalf("owners launched while their ledger is unreachable: %d", got)
+	}
+}
+
+func TestStandingOwnersCountPendingSuspendedReservations(t *testing.T) {
+	cfg := testConfig(t)
+	a := standingOwnerClaim(t, cfg, supervise.StateSuspended, nil)
+	b := a
+	var err error
+	b.Token, err = claim.OwnerToken(a.Project, "owner-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	putStandingOwner(t, cfg, a)
+	putStandingOwner(t, cfg, b)
+	st, err := store.Open(context.Background(), cfg.PostgresDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.ReserveStandingOwnerAttempt(context.Background(), a, 1, 10, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReserveStandingOwnerAttempt(context.Background(), b, 1, 10, 1); err == nil {
+		t.Fatal("two suspended owners reserved max_running 1")
+	}
+}
+
+func TestUnstartedOwnerReservationDoesNotStrandCapacity(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "abandoned-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	ownerB := cfg.StandingOwners.Owners[0]
+	ownerB.Name = "owner-b"
+	cfg.StandingOwners.Owners = append(cfg.StandingOwners.Owners, ownerB)
+	a := standingOwnerClaim(t, cfg, supervise.StateQueued, nil)
+	putStandingOwner(t, cfg, a)
+	st, err := store.Open(context.Background(), cfg.PostgresDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReserveStandingOwnerAttempt(context.Background(), a, 1, 10, 1); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	if err := queue.Enqueue(context.Background(), repo, "item-b", "owner-b"); err != nil {
+		t.Fatal(err)
+	}
+	rt := fake.NewRuntime()
+	o := fakeRuntime(rt, &built{})
+	o.orphanSweep = 20 * time.Millisecond
+	startDaemon(t, cfg, o)
+	testwait.Eventually(t, "owner-b capacity after abandoned reservation", func() bool {
+		return len(rt.CallsOf("Spawn")) == 1
+	})
+}
+
+func TestSleepingOwnerDoesNotWakeOnRestartWithoutWork(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "sleeping-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	owner := standingOwnerClaim(t, cfg, supervise.StateQueued, nil)
+	owner.Generation = 1
+	putStandingOwner(t, cfg, owner)
+	rt := fake.NewRuntime()
+	o := fakeRuntime(rt, &built{})
+	o.orphanSweep = 20 * time.Millisecond
+	d := startDaemon(t, cfg, o)
+	time.Sleep(3 * o.orphanSweep)
+	if got := len(rt.CallsOf("Spawn")); got != 0 {
+		t.Fatalf("sleeping owner launches %d times without work", got)
+	}
+	if got := d.claim(owner.Token); got.State != string(supervise.StateQueued) || got.Generation != 1 {
+		t.Fatalf("sleeping owner = %+v, want queued generation one", got)
+	}
+}
+
+func TestExhaustedOwnerRetriesOnlyAfterWorkRevisionChanges(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "revision-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	enqueueOwnerWork(t, queue, repo)
+	revision, err := queue.OwnerWorkRevision(context.Background(), repo, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := standingOwnerClaim(t, cfg, supervise.StateFailed, nil)
+	owner.Budgets.Deaths = cfg.LaunchFailureLimit
+	owner.OwnerRetryRevision = revision
+	putStandingOwner(t, cfg, owner)
+	rt := fake.NewRuntime()
+	o := fakeRuntime(rt, &built{})
+	o.orphanSweep = 20 * time.Millisecond
+	startDaemon(t, cfg, o)
+	time.Sleep(3 * o.orphanSweep)
+	if got := len(rt.CallsOf("Spawn")); got != 0 {
+		t.Fatalf("same work retried exhausted owner %d times", got)
+	}
+	if err := queue.Enqueue(context.Background(), repo, "item-b", "owner-a"); err != nil {
+		t.Fatal(err)
+	}
+	testwait.Eventually(t, "changed work retry", func() bool { return len(rt.CallsOf("Spawn")) == 1 })
+}
+
+func TestOperatorRetryClearsExhaustedStandingOwner(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "operator-retry-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	enqueueOwnerWork(t, queue, repo)
+	revision, err := queue.OwnerWorkRevision(context.Background(), repo, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := standingOwnerClaim(t, cfg, supervise.StateFailed, nil)
+	owner.Budgets.Deaths = cfg.LaunchFailureLimit
+	owner.OwnerRetryRevision = revision
+	putStandingOwner(t, cfg, owner)
+	rt := fake.NewRuntime()
+	d := startDaemon(t, cfg, fakeRuntime(rt, &built{}))
+	time.Sleep(50 * time.Millisecond)
+	if got := len(rt.CallsOf("Spawn")); got != 0 {
+		t.Fatalf("exhausted owner launched before an operator retry: %d", got)
+	}
+	status, body := d.request(http.MethodPost, "/legion/v1/operator/claims/"+string(owner.Token)+"/retry", nil, true)
+	if status != http.StatusOK {
+		t.Fatalf("operator retry = %d: %s", status, body)
+	}
+	testwait.Eventually(t, "operator standing owner retry", func() bool { return len(rt.CallsOf("Spawn")) == 1 })
 }

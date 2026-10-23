@@ -138,6 +138,9 @@ type Claim struct {
 	BootTokenHash   []byte
 	CapabilityHash  []byte
 	UncertainStreak int
+	// OwnerRetryRevision is the ledger queue revision that exhausted a standing owner's retry
+	// budget. Zero means no owner retry wait is recorded.
+	OwnerRetryRevision int64
 	// SuspendedBy is who suspended the claim while it is suspended, and "" otherwise.
 	SuspendedBy SuspendSource
 	// SuspensionHeld is whether a suspension is held for the agent's turn (holdSuspension), and
@@ -217,9 +220,11 @@ type Store interface {
 	RetireDelivery(ctx context.Context, c Claim, deliveryID string) error
 }
 
-// WorkQueue answers whether a configured standing owner has open work.
+// WorkQueue answers whether a configured standing owner has open work and the revision of the
+// queue changes that last affected that owner.
 type WorkQueue interface {
 	HasWork(ctx context.Context, owner string) (bool, error)
+	WorkRevision(ctx context.Context, owner string) (int64, error)
 }
 
 // Specs builds the part of a launch the claim does not carry — the pane's environment, its
@@ -397,6 +402,12 @@ var ErrRetryArchitectOnly = errors.New("the operator's retry relaunches only an 
 // overrides (Claim.RuleHolds): a wait, ended only by the operator's resume. RuleHoldError wraps it
 // for the outbox log.
 var ErrHeldByOperator = wait.New("the suspension holds until the operator resumes the claim")
+
+// ErrStandingOwnerNoWork leaves an owner asleep: no open ledger item currently names it.
+var ErrStandingOwnerNoWork = errors.New("standing owner has no open work")
+
+// ErrStandingOwnerWorkUnavailable leaves an owner asleep until the ledger reconnects.
+var ErrStandingOwnerWorkUnavailable = errors.New("standing owner work queue is unavailable")
 
 // Machine is one claim's decision owner.
 type Machine struct {
@@ -730,6 +741,21 @@ func (m *Machine) terminal(state ClaimState) {
 	}
 }
 
+// RetryStandingOwnerForWorkRevision resets an exhausted owner only when its ledger queue changed.
+// The revision is durable with the exhausted claim, so a restart cannot treat the same open work
+// as fresh.
+func (m *Machine) RetryStandingOwnerForWorkRevision(ctx context.Context, revision int64) error {
+	m.mu.Lock()
+	defer m.unlock()
+	if !claim.IsStandingOwner(m.claim.Role, m.claim.Issue, m.claim.Tree) || m.claim.State != StateFailed ||
+		revision <= m.claim.OwnerRetryRevision {
+		return nil
+	}
+	m.claim.Budgets = Budgets{}
+	m.claim.OwnerRetryRevision = 0
+	return m.revive(ctx)
+}
+
 // Wait blocks until every send the machine started has had its outcome handled — what a daemon
 // waits for before closing the store the outcome is written to.
 func (m *Machine) Wait() {
@@ -1024,6 +1050,11 @@ func (m *Machine) died(ctx context.Context, observation runtime.Observation) err
 			m.claim.State = StateQueued
 			return m.persist(ctx)
 		}
+		revision, err := m.deps.WorkQueue.WorkRevision(ctx, owner)
+		if err != nil {
+			return fmt.Errorf("read work revision for standing owner %s: %w", owner, err)
+		}
+		m.claim.OwnerRetryRevision = revision
 		standingOwnerWithWork = true
 	}
 	if err := m.interrupted(ctx, "the process died in the task's turn"); err != nil {

@@ -948,15 +948,19 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 	if err != nil {
 		return nil, err
 	}
+	var workQueue supervise.WorkQueue
+	if queue != nil {
+		workQueue = queue
+	}
 	claims, err := st.Claims(boot)
 	if err != nil {
-		closeStandingOwnerQueue(&queue, log)
+		closeStandingOwnerQueue(queue, log)
 		return nil, err
 	}
 	claims = ofProject(claims, p.project)
 	claims, err = ensureStandingOwners(boot, st, p.project, owners, claims)
 	if err != nil {
-		closeStandingOwnerQueue(&queue, log)
+		closeStandingOwnerQueue(queue, log)
 		return nil, err
 	}
 	reports, err := st.CapabilityReports(boot)
@@ -987,10 +991,11 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 		endDrain()
 		return nil, fmt.Errorf("build the %s runtime: %w", cfg.Runtime.Name, err)
 	}
+
 	sup.deps = supervise.Deps{
 		Runtime: rt,
 		Conns:   listener,
-		Store:   pruning(gateLaunch(tokens.Recording(st), ownerLaunchCheck(st, cfg.StandingOwners, owners, p.checkLaunch)), runtime.SecretsDir(cfg.StateDir), log),
+		Store:   pruning(gateLaunch(tokens.Recording(st), ownerLaunchCheck(st, cfg.StandingOwners, owners, workQueue, p.checkLaunch)), runtime.SecretsDir(cfg.StateDir), log),
 		Specs: specs{
 			stateDir: cfg.StateDir, project: p.project, instructions: p.instructions, secrets: p.secrets, prompts: p.prompts,
 			identity: p.identity, repository: p.repository,
@@ -1004,14 +1009,9 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 		PhaseHolds:   p.phaseHolds,
 		TreeClosable: p.treeClosable,
 		VolumeLost:   sup.volumeLost,
-		WorkQueue: func() supervise.WorkQueue {
-			if queue.store == nil {
-				return nil
-			}
-			return queue
-		}(),
-		Clock: p.clock,
-		Log:   log,
+		WorkQueue:    workQueue,
+		Clock:        p.clock,
+		Log:          log,
 		Limits: supervise.Limits{
 			LaunchFailures: cfg.LaunchFailureLimit,
 			PromptFailures: cfg.PromptFailureLimit,
@@ -1031,12 +1031,7 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 	stopping, beginStop := context.WithCancel(context.Background())
 	return &supervision{
 		cfg: cfg, log: log, plan: p, stream: listener, runtime: rt, supervisor: sup, tokens: tokens, claims: claims,
-		workQueue: func() supervise.WorkQueue {
-			if queue.store == nil {
-				return nil
-			}
-			return queue
-		}(), ledger: &queue,
+		workQueue: workQueue, ledger: queue,
 		reports: reportsOfClaims(reports, claims), reportStore: st,
 		cancel: cancel, draining: draining, endDrain: endDrain, decided: api.NewRouteDecisions(),
 		stopping: stopping, beginStop: beginStop,

@@ -591,6 +591,20 @@ func (r *rig) spec(tree, issue string, role claim.Role) runtime.SpawnSpec {
 	}
 }
 
+func (r *rig) ownerSpec() runtime.SpawnSpec {
+	r.t.Helper()
+	spec := r.spec("LEGION-1", "LEGION-1", claim.RoleTester)
+	token, err := claim.OwnerToken(r.project, "owner-a")
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	spec.Claim, spec.Tree, spec.Issue, spec.Role = token, "", "", claim.RoleOwner
+	r.daemon.mu.Lock()
+	r.daemon.claims[spec.BootToken] = bootClaim{token: token, role: claim.RoleOwner, generation: spec.Generation}
+	r.daemon.mu.Unlock()
+	return spec
+}
+
 // workspace is the directory the runtime locates for an issue of a configuration with no
 // repository: `<state_dir>/workspaces/<issue>`.
 func (r *rig) workspace(issue string) string {
@@ -1922,4 +1936,26 @@ func TestRealTmuxAPaneAStaleSweepAdoptedIsReapedByTheNextSweep(t *testing.T) {
 	if obs := probe(t, r.rt, kept); obs.Kind != runtime.Alive {
 		t.Errorf("the pane of a claim the sweep still names did not survive: %+v", obs)
 	}
+}
+
+func TestRealTmuxStandingOwnerRegistersAndStops(t *testing.T) {
+	r := newRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	spec := r.ownerSpec()
+	loc, err := r.rt.Spawn(ctx, spec)
+	if err != nil {
+		t.Fatalf("Spawn standing owner: %v", err)
+	}
+	registration := r.daemon.awaitReady(t, spec.BootToken)
+	if registration.BootToken != spec.BootToken {
+		t.Fatalf("registered boot token = %q, want %q", registration.BootToken, spec.BootToken)
+	}
+	if obs := probe(t, r.rt, loc); obs.Kind != runtime.Alive {
+		t.Fatalf("standing owner probe = %+v, want alive", obs)
+	}
+	if err := r.rt.Suspend(ctx, loc); err != nil {
+		t.Fatalf("Suspend standing owner: %v", err)
+	}
+	awaitGone(t, r.rt, loc, "standing owner suspension")
 }

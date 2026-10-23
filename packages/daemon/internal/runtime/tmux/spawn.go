@@ -97,6 +97,13 @@ func validateSpawnSpec(spec runtime.SpawnSpec, providerKeys []string) error {
 // (workspace.Location), which must exist, or, for a configuration with no repository,
 // `<state_dir>/workspaces/<issue>`, made here.
 func (r *Runtime) workspaceDir(spec runtime.SpawnSpec) (string, error) {
+	if claim.IsStandingOwner(spec.Role, spec.Issue, spec.Tree) {
+		dir := filepath.Join(r.stateDir, "owners", string(spec.Claim))
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", fmt.Errorf("the standing-owner directory: %w", err)
+		}
+		return dir, nil
+	}
 	if spec.Repository.IsZero() {
 		dir := filepath.Join(r.stateDir, "workspaces", spec.Issue)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -398,7 +405,7 @@ func (r *Runtime) launch(ctx context.Context, spec runtime.SpawnSpec) (runtime.L
 		return runtime.Locator{}, fmt.Errorf("spawn %s: %w", spec.Claim, err)
 	}
 	ghRoot, ghDefault, ghWriter := "", "", strings.ToLower(spec.Repository.Owner())
-	if r.gitHubCredential != nil {
+	if r.gitHubCredential != nil && !claim.IsStandingOwner(spec.Role, spec.Issue, spec.Tree) {
 		ghRoot = runtime.GHConfigDir(r.stateDir, spec.Claim)
 		bundle, err := r.gitHubCredential(ctx, spec.Role, ghWriter)
 		if err != nil {

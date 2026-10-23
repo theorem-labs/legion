@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { isLegionRole } from "@legion/contracts";
 import { activeDispatchSettings } from "@legion/envoy-client/dispatch-config";
 import { resolveIssueDocumentId } from "@legion/envoy-client/dispatch-execute";
 import { DispatchClient } from "@legion/envoy-client/dispatch-http";
@@ -137,7 +138,7 @@ export default function legionExtension(pi: PiApi): void {
   let phaseStall: PhaseStall = "closed";
   const phaseWorkerSession = (context: SessionContext): boolean => {
     const role = claimSession.capability(context.sessionManager.getSessionId())?.role;
-    return role !== undefined && role !== "architect";
+    return role !== undefined && isLegionRole(role) && role !== "architect";
   };
   const advancePhaseStall = (input: PhaseStallInput): string | undefined => {
     const step = stepPhaseStall(phaseStall, input);
@@ -230,23 +231,22 @@ export default function legionExtension(pi: PiApi): void {
     if (session.kind === "controller") {
       await controllerSession.handleSessionStart(context);
     } else {
-      // A resume whose role launcher found the workspace recreated since the session was last
-      // written (src/workspace-recreated.ts) is told so in a message saved to the session ahead of
-      // the next turn, whatever starts that turn (a task, an Envoy delivery), so a process lost in
-      // that turn resumes with the notice already in its history. It goes before the role claim, so
-      // no delivery on the role's topic can start a turn ahead of it, and a subagent, which returned
-      // above, never is told.
-      recreatedNotice = workspaceRecreatedNotice(
-        process.env,
-        session.kind === "root-architect" ? session.tree : session.issue
-      );
-      if (recreatedNotice !== undefined) {
-        pi.sendMessage(workspaceRecreatedMessage(recreatedNotice), {
-          deliverAs: "steer",
-          triggerTurn: false,
-        });
+      // A workspace can be recreated only for a workflow claim. Standing owners deliberately have
+      // no issue workspace or workflow tools.
+      if (session.kind !== "standing-owner") {
+        recreatedNotice = workspaceRecreatedNotice(
+          process.env,
+          session.kind === "root-architect" ? session.tree : session.issue
+        );
+        if (recreatedNotice !== undefined) {
+          pi.sendMessage(workspaceRecreatedMessage(recreatedNotice), {
+            deliverAs: "steer",
+            triggerTurn: false,
+          });
+        }
       }
       await claimSession.bootstrap(context);
+      if (session.kind === "standing-owner") return;
     }
     registerLegionTool();
     await activateLegionTool();
