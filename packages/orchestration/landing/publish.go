@@ -54,7 +54,14 @@ type EventPublisher interface {
 }
 
 // Publish puts a green candidate through the merge queue and records its members
-// only after GitHub confirms that exact head merged.
+// only after GitHub confirms that exact head merged. Until its pull request is
+// recorded, a batch whose derived values are not at the current key (a new
+// checking policy) is advanced again before anything is pushed. Once the pull
+// request is recorded, the batch has been published to the merge queue, which
+// may merge it at any moment, so it waits for the queue's outcome: failing it
+// would leave the queued pull request to merge without a ledger record. A merged
+// batch completes under the receipt, and so the policy, that its merge
+// validated.
 func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 	if r.Store == nil || r.Ledger == nil || r.GitHub == nil {
 		return Batch{}, fmt.Errorf("store, ledger, and GitHub are required to publish")
@@ -68,6 +75,19 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 	if batch.BaseBranch == "" {
 		return Batch{}, fmt.Errorf("batch %q has no base branch", batch.ID)
 	}
+	if batch.MergeValidated {
+		return r.completeMerged(ctx, &batch)
+	}
+	if batch.PullRequest.Number == 0 && !r.fresh(batch) {
+		if err := r.valid(); err != nil {
+			return Batch{}, err
+		}
+		advanced, err := r.advance(ctx, &batch)
+		if err != nil || advanced.State != Green {
+			return advanced, err
+		}
+		batch = advanced
+	}
 	if batch.Branch == "" {
 		batch.Branch = "land/" + batch.ID
 	}
@@ -75,9 +95,6 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 		if err := r.transition(ctx, &batch, Publishing, ""); err != nil {
 			return Batch{}, err
 		}
-	}
-	if batch.MergeValidated {
-		return r.completeMerged(ctx, &batch)
 	}
 	if err := r.GitHub.Push(ctx, batch.Repository, batch.Branch, batch.Candidate.Commit); err != nil {
 		return r.fail(ctx, &batch, "github: push")
@@ -107,9 +124,15 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 	if err != nil {
 		return r.fail(ctx, &batch, "github: wait")
 	}
+	return r.recordMerge(ctx, &batch, pull)
+}
+
+// recordMerge records GitHub's final view of the batch's pull request. Only a
+// merge of the exact candidate commit validates the batch and completes it.
+func (r Runner) recordMerge(ctx context.Context, batch *Batch, pull PullRequest) (Batch, error) {
 	batch.PullRequest = pull
 	batch.MergeValidated = pull.State == PullRequestMerged && pull.Head == batch.Candidate.Commit && pull.MergedCommit != ""
-	if err := r.Store.Save(ctx, batch); err != nil {
+	if err := r.Store.Save(ctx, *batch); err != nil {
 		return Batch{}, fmt.Errorf("record merged pull request: %w", err)
 	}
 	if !batch.MergeValidated {
@@ -123,19 +146,22 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 		if pull.State == PullRequestMerged && pull.Head != batch.Candidate.Commit {
 			reason = "merged unexpected head"
 		}
-		return r.fail(ctx, &batch, "github: "+reason)
+		return r.fail(ctx, batch, "github: "+reason)
 	}
-	return r.completeMerged(ctx, &batch)
+	return r.completeMerged(ctx, batch)
 }
 
+// completeMerged records a merged batch's members, score and events. It never
+// rechecks: the merge is irreversible, and the receipt holds the key, and so the
+// policy, that validated it.
 func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error) {
 	mergedCommit := batch.PullRequest.MergedCommit
 	for _, member := range batch.ActiveMembers {
 		if contains(batchMemberNames(batch.LandedMembers), member.Migration) {
 			continue
 		}
-		if len(member.ReadNames) != 0 && member.HashesTree != batch.Candidate.Tree {
-			return r.retryable(ctx, batch, "ledger hashes stale", fmt.Errorf("member %q hashes tree %q, candidate tree %q", member.Migration, member.HashesTree, batch.Candidate.Tree))
+		if member.LedgerKey != batch.Receipt.Key || member.HashesKey != batch.Receipt.Key {
+			return r.retryable(ctx, batch, "ledger decision stale", fmt.Errorf("member %q was checked at key %q, the receipt is at %q", member.Migration, member.LedgerKey, batch.Receipt.Key))
 		}
 		request := LandRequest{
 			Repo:             batch.Repository,

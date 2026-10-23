@@ -57,7 +57,7 @@ func TestRestartContinuesPublishingWithoutLandingMemberTwice(t *testing.T) {
 	runner := testRunner(ledger, &builderFake{})
 	runner.Store = store
 	runner.GitHub = &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}}
-	batch := greenBatch()
+	batch := greenBatchFor(runner)
 	batch.State = Publishing
 	batch.Branch = "land/batch"
 	if err := store.Save(context.Background(), batch); err != nil {

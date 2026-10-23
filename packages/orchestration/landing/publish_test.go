@@ -71,8 +71,16 @@ func TestPublishKeepsMembersWhenPersonClosesPullRequest(t *testing.T) {
 	}
 }
 
+// greenBatch is a green batch whose receipt is at the current key of a runner
+// with no configuration digest and no checks.
 func greenBatch() Batch {
-	return Batch{
+	return greenBatchFor(Runner{})
+}
+
+// greenBatchFor is a green batch whose receipt, and every member's ledger
+// decision, is at the runner's current key.
+func greenBatchFor(runner Runner) Batch {
+	batch := Batch{
 		ID:            "batch",
 		Repository:    "repo",
 		BaseBranch:    "trunk",
@@ -80,8 +88,16 @@ func greenBatch() Batch {
 		FrozenMembers: []Member{member("one")},
 		ActiveMembers: []Member{member("one")},
 		State:         Green,
-		Receipt:       &Receipt{Tree: "tree", Members: []Member{member("one")}},
 	}
+	key := runner.key(batch)
+	batch.CandidateKey = key
+	batch.ChecksKey = key
+	for index := range batch.ActiveMembers {
+		batch.ActiveMembers[index].LedgerKey = key
+		batch.ActiveMembers[index].HashesKey = key
+	}
+	batch.Receipt = &Receipt{Key: key, Tree: "tree", Members: cloneMembers(batch.ActiveMembers)}
+	return batch
 }
 
 func candidateResult(commit string) gitx.Result {

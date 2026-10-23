@@ -13,21 +13,22 @@ func TestReviewCurrentHashesRefreshForCurrentCandidateTree(t *testing.T) {
 	batch := Batch{
 		Repository:    "repo",
 		Candidate:     gitx.Result{Tree: "tree-first"},
-		ActiveMembers: []Member{{Migration: "reader", Generation: 1, ReadNames: []string{"Read"}}},
+		ActiveMembers: []Member{{Migration: "reader", Generation: 1, ReadNames: []string{"Read"}}, {Migration: "other", Generation: 1}},
 	}
 
-	if err := runner.revalidateCandidate(context.Background(), &batch); err != nil {
-		t.Fatalf("first revalidate error = %v", err)
+	if _, err := runner.checkLedger(context.Background(), &batch); err != nil {
+		t.Fatalf("first check error = %v", err)
 	}
+	batch.ActiveMembers = batch.ActiveMembers[:1]
 	batch.Candidate.Tree = "tree-final"
-	if err := runner.revalidateCandidate(context.Background(), &batch); err != nil {
-		t.Fatalf("second revalidate error = %v", err)
+	if _, err := runner.checkLedger(context.Background(), &batch); err != nil {
+		t.Fatalf("second check error = %v", err)
 	}
 	if got, want := batch.ActiveMembers[0].CurrentHashes["Read"], "tree-final"; got != want {
 		t.Fatalf("current hash = %q, want %q", got, want)
 	}
-	if got, want := batch.ActiveMembers[0].HashesTree, "tree-final"; got != want {
-		t.Fatalf("hash tree = %q, want %q", got, want)
+	if got, want := batch.ActiveMembers[0].HashesKey, runner.key(batch); got != want {
+		t.Fatalf("hashes key = %q, want the current key %q", got, want)
 	}
 }
 

@@ -232,6 +232,7 @@ type ledgerFake struct {
 	refusals map[string]string
 	returned []returned
 	landed   []string
+	commits  map[string]string
 }
 
 type returned struct {
@@ -245,6 +246,10 @@ func (f *ledgerFake) Check(_ context.Context, _ string, migration string, _ int6
 
 func (f *ledgerFake) Land(_ context.Context, request LandRequest) error {
 	f.landed = append(f.landed, request.Migration)
+	if f.commits == nil {
+		f.commits = make(map[string]string)
+	}
+	f.commits[request.Migration] = request.Commit
 	return nil
 }
 
@@ -253,7 +258,11 @@ func (f *ledgerFake) ReturnMember(_ context.Context, _ string, migration string,
 	return nil
 }
 
-func (f *ledgerFake) MigrationState(context.Context, string, string) (string, string, error) {
+// MigrationState reports what Land recorded, as the real ledger does.
+func (f *ledgerFake) MigrationState(_ context.Context, _ string, migration string) (string, string, error) {
+	if commit, landed := f.commits[migration]; landed {
+		return "landed", commit, nil
+	}
 	return "open", "", nil
 }
 
@@ -296,11 +305,12 @@ func (f checkerFake) Check(_ context.Context, tree Tree) ([]Finding, error) {
 type gitFake struct {
 	changes     map[string]gitx.Change
 	diffs       map[string]string
+	conflicts   map[string]bool
 	changeBases []string
 }
 
 func newGitFake() *gitFake {
-	return &gitFake{changes: map[string]gitx.Change{}, diffs: map[string]string{}}
+	return &gitFake{changes: map[string]gitx.Change{}, diffs: map[string]string{}, conflicts: map[string]bool{}}
 }
 
 func (f *gitFake) Resolve(_ context.Context, _ string, rev string) (string, error) {
@@ -308,14 +318,19 @@ func (f *gitFake) Resolve(_ context.Context, _ string, rev string) (string, erro
 }
 
 func (f *gitFake) Candidate(_ context.Context, _ string, base string, members []Member) (gitx.Result, error) {
-	if len(members) == 0 {
-		return gitx.Result{Tree: "tree-base", Commit: base}, nil
-	}
 	ids := make([]string, 0, len(members))
+	var dropped []gitx.Drop
 	for _, member := range members {
+		if f.conflicts[member.Migration] {
+			dropped = append(dropped, gitx.Drop{ID: member.Migration, Reason: "conflict"})
+			continue
+		}
 		ids = append(ids, member.Migration)
 	}
-	return gitx.Result{Tree: "tree-" + strings.Join(ids, "+"), Commit: strings.Join(ids, "+")}, nil
+	if len(ids) == 0 {
+		return gitx.Result{Tree: "tree-base", Commit: base, Dropped: dropped}, nil
+	}
+	return gitx.Result{Tree: "tree-" + strings.Join(ids, "+"), Commit: strings.Join(ids, "+"), Dropped: dropped}, nil
 }
 
 func (f *gitFake) Rebuild(ctx context.Context, repository, base string, members []Member, without map[string]struct{}) (gitx.Result, error) {

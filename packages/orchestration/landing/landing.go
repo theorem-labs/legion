@@ -94,7 +94,9 @@ const (
 	Failed     State = "failed"
 )
 
-// Member is the frozen identity of one proposed migration.
+// Member is the frozen identity of one proposed migration. Changed is read once,
+// when the batch freezes. CurrentHashes and the ledger decision are derived
+// values, each stored with the batch key it was derived at.
 type Member struct {
 	Migration        string            `json:"migration"`
 	Generation       int64             `json:"generation"`
@@ -103,7 +105,8 @@ type Member struct {
 	Changed          []string          `json:"changed"`
 	ReadNames        []string          `json:"readNames"`
 	CurrentHashes    map[string]string `json:"currentHashes"`
-	HashesTree       string            `json:"hashesTree"`
+	HashesKey        string            `json:"hashesKey"`
+	LedgerKey        string            `json:"ledgerKey"`
 	ChangedContracts map[string]string `json:"changedContracts"`
 	ApprovedPinned   []string          `json:"approvedPinned"`
 }
@@ -121,8 +124,10 @@ type CheckVerdict struct {
 	Reason  string `json:"reason"`
 }
 
-// Receipt binds a green candidate to its policy and evidence.
+// Receipt binds a green candidate to its policy and evidence. Key is the batch
+// key the receipt was derived at.
 type Receipt struct {
+	Key               string         `json:"key"`
 	Tree              string         `json:"tree"`
 	Toolchain         string         `json:"toolchain"`
 	ConfigurationHash string         `json:"configurationHash"`
@@ -158,8 +163,15 @@ type Operation struct {
 	State      OperationState `json:"state"`
 }
 
-// Batch persists an immutable input set independently from members eventually
-// landed after a publisher confirms the merge.
+// Batch is the durable record of one landing batch. Its authoritative inputs are
+// the base, the frozen members and the active (ordered) member set, the
+// checking-policy digest and the phase (State). Every derived value (the
+// candidate, each member's current hashes and ledger decision, the repository
+// checks and the receipt) is stored with the key it was derived at, and it is
+// recomputed before the next side effect whenever that key differs from the
+// batch's current key. A batch that GitHub merged (MergeValidated) is the one
+// exception: it completes under the receipt, and so the policy, that the merge
+// validated, whatever policy the runner has later.
 type Batch struct {
 	ID                string               `json:"id"`
 	Repository        string               `json:"repository"`
@@ -167,9 +179,8 @@ type Batch struct {
 	BaseBranch        string               `json:"baseBranch"`
 	Branch            string               `json:"branch"`
 	Candidate         gitx.Result          `json:"candidate"`
+	CandidateKey      string               `json:"candidateKey"`
 	InitialCandidate  gitx.Result          `json:"initialCandidate"`
-	CheckedTree       string               `json:"checkedTree"`
-	CandidateDirty    bool                 `json:"candidateDirty"`
 	FrozenMembers     []Member             `json:"frozenMembers"`
 	ActiveMembers     []Member             `json:"activeMembers"`
 	LandedMembers     []Member             `json:"landedMembers"`
@@ -179,18 +190,56 @@ type Batch struct {
 	State             State                `json:"state"`
 	Reason            string               `json:"reason"`
 	Round             int                  `json:"round"`
-	ChangesTree       string               `json:"changesTree"`
-	ChangeMembers     []string             `json:"changeMembers"`
-	LedgerTree        string               `json:"ledgerTree"`
-	LedgerMembers     []string             `json:"ledgerMembers"`
-	Checks            []CheckVerdict       `json:"checks"`
 	CheckPolicyDigest string               `json:"checkPolicyDigest"`
-	CheckPolicy       []string             `json:"checkPolicy"`
-	CheckMembers      []string             `json:"checkMembers"`
+	Checks            []CheckVerdict       `json:"checks"`
+	ChecksKey         string               `json:"checksKey"`
 	Score             CheckVerdict         `json:"score"`
 	PullRequest       PullRequest          `json:"pullRequest"`
 	MergeValidated    bool                 `json:"mergeValidated"`
 	Receipt           *Receipt             `json:"receipt"`
+}
+
+// batchKey identifies the inputs of every derived value: the base, the ordered
+// active members and the checking policy.
+func batchKey(base string, members []Member, policy string) string {
+	type identity struct {
+		Migration      string `json:"migration"`
+		Generation     int64  `json:"generation"`
+		Head           string `json:"head"`
+		ComparisonBase string `json:"comparisonBase"`
+	}
+	identities := make([]identity, len(members))
+	for index, member := range members {
+		identities[index] = identity{Migration: member.Migration, Generation: member.Generation, Head: member.Head, ComparisonBase: member.ComparisonBase}
+	}
+	body, _ := json.Marshal(struct {
+		Base    string     `json:"base"`
+		Policy  string     `json:"policy"`
+		Members []identity `json:"members"`
+	}{Base: base, Policy: policy, Members: identities})
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+// key is the batch's current key under the runner's checking policy.
+func (r Runner) key(batch Batch) string {
+	return batchKey(batch.Base, batch.ActiveMembers, r.policyDigest())
+}
+
+// fresh reports whether every derived value (the candidate, each member's read
+// hashes and ledger decision, the repository checks and the receipt) is at the
+// batch's current key.
+func (r Runner) fresh(batch Batch) bool {
+	key := r.key(batch)
+	if batch.Receipt == nil || batch.Receipt.Key != key || batch.CandidateKey != key || batch.ChecksKey != key {
+		return false
+	}
+	for _, member := range batch.ActiveMembers {
+		if member.LedgerKey != key || member.HashesKey != key {
+			return false
+		}
+	}
+	return true
 }
 
 // Input starts one frozen batch.
@@ -229,7 +278,7 @@ type Runner struct {
 	Toolchain    func(context.Context, Tree) (string, error)
 }
 
-// Run freezes, checks, builds and attributes one batch until it is green or failed.
+// Run freezes one batch and advances it until it is green or failed.
 func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 	if err := r.valid(); err != nil {
 		return Batch{}, err
@@ -247,6 +296,9 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 		}
 		return existing, nil
 	}
+	if err := r.readChanges(ctx, input.Repository, input.Base, input.Members); err != nil {
+		return Batch{}, err
+	}
 	batch := Batch{
 		ID:                input.ID,
 		Repository:        input.Repository,
@@ -255,16 +307,15 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 		FrozenMembers:     cloneMembers(input.Members),
 		ActiveMembers:     cloneMembers(input.Members),
 		Operations:        make(map[string]Operation),
-		CheckPolicyDigest: r.ConfigDigest,
-		CheckPolicy:       r.checkPolicyNames(),
+		CheckPolicyDigest: r.policyDigest(),
+		State:             Frozen,
 	}
 	candidate, err := r.candidate(ctx, batch.Repository, batch.Base, batch.ActiveMembers)
 	if err != nil {
 		return Batch{}, fmt.Errorf("freeze candidate: %w", err)
 	}
-	batch.Candidate = candidate
+	r.setCandidate(&batch, candidate)
 	batch.InitialCandidate = candidate
-	batch.State = Frozen
 	created, err := r.Store.Create(ctx, batch)
 	if err != nil {
 		return Batch{}, fmt.Errorf("create batch %q: %w", batch.ID, err)
@@ -279,47 +330,55 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 		}
 		return existing, nil
 	}
-	if err := r.applyCandidateDrops(ctx, &batch); err != nil {
-		return Batch{}, err
-	}
-	if err := r.collectChanges(ctx, &batch); err != nil {
-		return r.fail(ctx, &batch, "changes")
-	}
-	if err := r.checkLedger(ctx, &batch); err != nil {
-		return r.fail(ctx, &batch, "ledger")
-	}
-	if err := r.rebuild(ctx, &batch); err != nil {
-		return r.fail(ctx, &batch, "candidate")
-	}
-	if err := r.revalidateCandidate(ctx, &batch); err != nil {
-		return r.fail(ctx, &batch, "ledger")
-	}
-	batch.Round = 0
-	return r.drive(ctx, &batch, true)
+	return r.advance(ctx, &batch)
 }
 
-func (r Runner) drive(ctx context.Context, batch *Batch, checkBeforeBuild bool) (Batch, error) {
-	for ; batch.Round < r.roundLimit(); batch.Round++ {
-		if checkBeforeBuild {
-			ready, err := r.runChecks(ctx, batch)
-			if err != nil {
+// advance brings every derived value to the batch's current key, in order (the
+// candidate, each member's ledger decision, the repository checks, the build
+// and its receipt), and builds until the candidate is green or the batch fails.
+// Each step compares its stored key with the current key before its side
+// effect and recomputes only when they differ. A returned member changes the
+// key, so the loop starts again from the candidate.
+func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
+	if policy := r.policyDigest(); batch.CheckPolicyDigest != policy {
+		batch.CheckPolicyDigest = policy
+		if err := r.Store.Save(ctx, *batch); err != nil {
+			return *batch, fmt.Errorf("record check policy: %w", err)
+		}
+	}
+	for {
+		if err := r.ensureCandidate(ctx, batch); err != nil {
+			return r.fail(ctx, batch, "candidate")
+		}
+		returned, err := r.checkLedger(ctx, batch)
+		if err != nil {
+			return r.fail(ctx, batch, "ledger")
+		}
+		if returned {
+			continue
+		}
+		returned, err = r.runChecks(ctx, batch)
+		if err != nil {
+			var unable checkUnable
+			if errors.As(err, &unable) {
 				return r.fail(ctx, batch, "check-unable")
 			}
-			if !ready {
-				if err := r.rebuild(ctx, batch); err != nil {
-					return r.fail(ctx, batch, "candidate")
-				}
-				if err := r.revalidateCandidate(ctx, batch); err != nil {
-					return r.fail(ctx, batch, "ledger")
-				}
-				batch.Round--
-				continue
-			}
-			if err := r.transition(ctx, batch, Checked, ""); err != nil {
-				return Batch{}, err
-			}
+			return r.fail(ctx, batch, "return")
 		}
-		checkBeforeBuild = true
+		if returned {
+			continue
+		}
+		if r.fresh(*batch) {
+			if batch.State != Green {
+				if err := r.transition(ctx, batch, Green, ""); err != nil {
+					return Batch{}, err
+				}
+			}
+			return *batch, nil
+		}
+		if batch.Round >= r.roundLimit() {
+			return r.fail(ctx, batch, "max-rounds")
+		}
 		result, infra, err := r.build(ctx, batch)
 		if err != nil {
 			return r.fail(ctx, batch, "build")
@@ -352,17 +411,11 @@ func (r Runner) drive(ctx context.Context, batch *Batch, checkBeforeBuild bool) 
 		if baseBroken || len(culprits) == 0 {
 			return r.fail(ctx, batch, "base-broken")
 		}
+		batch.Round++
 		if err := r.returnMembers(ctx, batch, culprits); err != nil {
 			return r.fail(ctx, batch, "return")
 		}
-		if err := r.rebuild(ctx, batch); err != nil {
-			return r.fail(ctx, batch, "candidate")
-		}
-		if err := r.revalidateCandidate(ctx, batch); err != nil {
-			return r.fail(ctx, batch, "ledger")
-		}
 	}
-	return r.fail(ctx, batch, "max-rounds")
 }
 
 func (r Runner) valid() error {
@@ -385,44 +438,107 @@ func (r Runner) candidate(ctx context.Context, repository, base string, members 
 	return r.Git.Candidate(ctx, repository, base, members)
 }
 
-func (r Runner) collectChanges(ctx context.Context, batch *Batch) error {
-	for index := range batch.ActiveMembers {
-		member := &batch.ActiveMembers[index]
+// readChanges records each member's changed files once, when the batch
+// freezes. They depend only on the member's head and its comparison base.
+func (r Runner) readChanges(ctx context.Context, repository, base string, members []Member) error {
+	for index := range members {
+		member := &members[index]
 		comparisonBase := member.ComparisonBase
 		if comparisonBase == "" {
-			comparisonBase = batch.Base
+			comparisonBase = base
 		}
-		change, err := r.Git.ChangeSet(ctx, batch.Repository, comparisonBase, *member)
+		change, err := r.Git.ChangeSet(ctx, repository, comparisonBase, *member)
 		if err != nil {
 			return fmt.Errorf("read changed files for %q: %w", member.Migration, err)
 		}
 		member.Changed = append([]string(nil), change.Files...)
 	}
-	batch.ChangesTree = batch.Candidate.Tree
-	batch.ChangeMembers = memberIDs(batch.ActiveMembers)
-	return r.Store.Save(ctx, *batch)
+	return nil
 }
 
-func (r Runner) checkLedger(ctx context.Context, batch *Batch) error {
-	members := cloneMembers(batch.ActiveMembers)
-	for _, snapshot := range members {
+// setCandidate records a candidate with the key of the member set it contains:
+// the active members less those that the candidate itself dropped.
+func (r Runner) setCandidate(batch *Batch, candidate gitx.Result) {
+	batch.Candidate = candidate
+	batch.CandidateKey = batchKey(batch.Base, candidateMembers(*batch), r.policyDigest())
+}
+
+// ensureCandidate makes the candidate match the current key. It rebuilds from
+// the base and the frozen members without the returned ones when the stored
+// key differs, then returns each member that the candidate itself dropped (a
+// conflict, a carrier, a duplicate or a member already in the base), which
+// brings the current key to the candidate's.
+func (r Runner) ensureCandidate(ctx context.Context, batch *Batch) error {
+	if batch.CandidateKey != batchKey(batch.Base, candidateMembers(*batch), r.policyDigest()) {
+		without := make(map[string]struct{}, len(batch.Dropped))
+		for _, dropped := range batch.Dropped {
+			without[dropped.Migration] = struct{}{}
+		}
+		candidate, err := r.Git.Rebuild(ctx, batch.Repository, batch.Base, batch.FrozenMembers, without)
+		if err != nil {
+			return fmt.Errorf("rebuild candidate: %w", err)
+		}
+		r.setCandidate(batch, candidate)
+		if err := r.Store.Save(ctx, *batch); err != nil {
+			return fmt.Errorf("record rebuilt candidate: %w", err)
+		}
+	}
+	for _, drop := range batch.Candidate.Dropped {
+		if err := r.returnMember(ctx, batch, drop.ID, drop.Reason); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// candidateMembers is the active members less those the stored candidate dropped.
+func candidateMembers(batch Batch) []Member {
+	out := make([]Member, 0, len(batch.ActiveMembers))
+	for _, member := range batch.ActiveMembers {
+		dropped := false
+		for _, drop := range batch.Candidate.Dropped {
+			if drop.ID == member.Migration {
+				dropped = true
+				break
+			}
+		}
+		if !dropped {
+			out = append(out, member)
+		}
+	}
+	return out
+}
+
+// checkLedger checks each active member whose ledger decision is not at the
+// current key, with read hashes of the current candidate, also stored with
+// that key. Every member is checked against the same candidate; the refused
+// ones are returned, and checkLedger reports whether it returned any.
+func (r Runner) checkLedger(ctx context.Context, batch *Batch) (bool, error) {
+	key := r.key(*batch)
+	returned := false
+	for _, snapshot := range cloneMembers(batch.ActiveMembers) {
+		if snapshot.LedgerKey == key {
+			continue
+		}
 		index := memberIndex(batch.ActiveMembers, snapshot.Migration)
 		if index < 0 {
 			continue
 		}
 		member := &batch.ActiveMembers[index]
-		hashes, err := r.Hasher.Hashes(ctx, Tree(batch.Candidate.Tree), member.ReadNames)
-		if err != nil {
-			return fmt.Errorf("hash reads for %q: %w", member.Migration, err)
+		if member.HashesKey != key {
+			hashes, err := r.Hasher.Hashes(ctx, Tree(batch.Candidate.Tree), member.ReadNames)
+			if err != nil {
+				return returned, fmt.Errorf("hash reads for %q: %w", member.Migration, err)
+			}
+			member.CurrentHashes = cloneHashes(hashes)
+			member.HashesKey = key
+			if err := r.Store.Save(ctx, *batch); err != nil {
+				return returned, fmt.Errorf("record current hashes for %q: %w", member.Migration, err)
+			}
 		}
-		member.CurrentHashes = cloneHashes(hashes)
-		member.HashesTree = batch.Candidate.Tree
-		if err := r.Store.Save(ctx, *batch); err != nil {
-			return fmt.Errorf("record current hashes for %q: %w", member.Migration, err)
-		}
-		result, err := r.Ledger.Check(ctx, batch.Repository, member.Migration, member.Generation, member.Changed, hashes)
+		result, err := r.Ledger.Check(ctx, batch.Repository, member.Migration, member.Generation, member.Changed, cloneHashes(member.CurrentHashes))
 		if err != nil {
-			return fmt.Errorf("check %q: %w", member.Migration, err)
+			return returned, fmt.Errorf("check %q: %w", member.Migration, err)
 		}
 		if result.Refused || result.Reason != "" {
 			reason := result.Reason
@@ -430,40 +546,17 @@ func (r Runner) checkLedger(ctx context.Context, batch *Batch) error {
 				reason = "refused"
 			}
 			if err := r.returnMember(ctx, batch, member.Migration, reason); err != nil {
-				return err
+				return returned, err
 			}
+			returned = true
+			continue
+		}
+		member.LedgerKey = key
+		if err := r.Store.Save(ctx, *batch); err != nil {
+			return returned, fmt.Errorf("record ledger decision for %q: %w", member.Migration, err)
 		}
 	}
-	batch.LedgerTree = batch.Candidate.Tree
-	batch.LedgerMembers = memberIDs(batch.ActiveMembers)
-	if err := r.Store.Save(ctx, *batch); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (r Runner) revalidateCandidate(ctx context.Context, batch *Batch) error {
-	for {
-		dropped := len(batch.Dropped)
-		if err := r.checkLedger(ctx, batch); err != nil {
-			return err
-		}
-		if len(batch.Dropped) == dropped {
-			return nil
-		}
-		if err := r.rebuild(ctx, batch); err != nil {
-			return err
-		}
-	}
-}
-
-func (r Runner) applyCandidateDrops(ctx context.Context, batch *Batch) error {
-	for _, drop := range batch.Candidate.Dropped {
-		if err := r.returnMember(ctx, batch, drop.ID, drop.Reason); err != nil {
-			return err
-		}
-	}
-	return nil
+	return returned, nil
 }
 
 func (r Runner) returnMembers(ctx context.Context, batch *Batch, culprits map[string]string) error {
@@ -480,17 +573,15 @@ func (r Runner) returnMembers(ctx context.Context, batch *Batch, culprits map[st
 	return nil
 }
 
+// returnMember removes an active member and records the intent to return it in
+// one save, so the current key changes before the ledger hears of it.
 func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reason string) error {
 	member, found := findMember(batch.ActiveMembers, migration)
 	if !found {
 		return nil
 	}
 	key := "return/" + migration
-	if operation, found := batch.operation(key); found && operation.State == OperationComplete {
-		return nil
-	}
 	batch.ActiveMembers = withoutMember(batch.ActiveMembers, migration)
-	batch.CandidateDirty = true
 	if !containsDropped(batch.Dropped, migration) {
 		batch.Dropped = append(batch.Dropped, DroppedMember{Migration: migration, Reason: reason})
 	}
@@ -508,41 +599,29 @@ func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reaso
 	return nil
 }
 
-func (r Runner) rebuild(ctx context.Context, batch *Batch) error {
-	without := make(map[string]struct{}, len(batch.Dropped))
-	for _, dropped := range batch.Dropped {
-		without[dropped.Migration] = struct{}{}
-	}
-	candidate, err := r.Git.Rebuild(ctx, batch.Repository, batch.Base, batch.FrozenMembers, without)
-	if err != nil {
-		return fmt.Errorf("rebuild candidate: %w", err)
-	}
-	batch.Candidate = candidate
-	batch.CandidateDirty = false
-	batch.CheckedTree = ""
-	for index := range batch.ActiveMembers {
-		batch.ActiveMembers[index].CurrentHashes = nil
-		batch.ActiveMembers[index].HashesTree = ""
-	}
-	if err := r.Store.Save(ctx, *batch); err != nil {
-		return fmt.Errorf("record rebuilt candidate: %w", err)
-	}
-	return r.applyCandidateDrops(ctx, batch)
-}
+// checkUnable is a configured check that could not decide.
+type checkUnable struct{ error }
 
+func (e checkUnable) Unwrap() error { return e.error }
+
+// runChecks runs the configured repository checks on the candidate when their
+// stored result is not at the current key. A finding returns the members that
+// changed its path, and runChecks reports that it returned them.
 func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
+	key := r.key(*batch)
+	if batch.ChecksKey == key {
+		return false, nil
+	}
+	batch.Checks = nil
 	for index, checker := range r.Checks {
-		name := checker.Name()
-		if name == "" {
-			name = fmt.Sprintf("check-%d", index+1)
-		}
+		name := checkName(checker, index)
 		findings, err := checker.Check(ctx, Tree(batch.Candidate.Tree))
 		if err != nil {
 			batch.setCheck(CheckVerdict{Name: name, Verdict: "unable", Reason: err.Error()})
 			if saveErr := r.Store.Save(ctx, *batch); saveErr != nil {
 				return false, fmt.Errorf("record unavailable check: %w", saveErr)
 			}
-			return false, err
+			return false, checkUnable{err}
 		}
 		if len(findings) == 0 {
 			batch.setCheck(CheckVerdict{Name: name, Verdict: "pass"})
@@ -562,21 +641,20 @@ func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 				if err := r.Store.Save(ctx, *batch); err != nil {
 					return false, fmt.Errorf("record unattributable check: %w", err)
 				}
-				return false, fmt.Errorf("check %q cannot attribute %q", name, finding.Path)
+				return false, checkUnable{fmt.Errorf("check %q cannot attribute %q", name, finding.Path)}
 			}
 		}
 		batch.setCheck(CheckVerdict{Name: name, Verdict: "fail", Reason: findings[0].Reason})
 		if err := r.returnMembers(ctx, batch, culprits); err != nil {
 			return false, err
 		}
-		return false, nil
+		return true, nil
 	}
-	batch.CheckedTree = batch.Candidate.Tree
-	batch.CheckMembers = memberIDs(batch.ActiveMembers)
-	if err := r.Store.Save(ctx, *batch); err != nil {
-		return false, fmt.Errorf("record checks: %w", err)
+	batch.ChecksKey = key
+	if err := r.transition(ctx, batch, Checked, ""); err != nil {
+		return false, err
 	}
-	return true, nil
+	return false, nil
 }
 
 func containsDropped(dropped []DroppedMember, migration string) bool {
@@ -756,19 +834,6 @@ func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, r
 	return lines, nil
 }
 
-func attributionMembers(attributions []blame.Attribution) []string {
-	members := make(map[string]struct{}, len(attributions))
-	for _, attribution := range attributions {
-		members[attribution.Member] = struct{}{}
-	}
-	out := make([]string, 0, len(members))
-	for member := range members {
-		out = append(out, member)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func (r Runner) receipt(ctx context.Context, batch Batch, output string) (Receipt, error) {
 	if r.Toolchain == nil {
 		return Receipt{}, fmt.Errorf("toolchain identity is required")
@@ -785,6 +850,7 @@ func (r Runner) receipt(ctx context.Context, batch Batch, output string) (Receip
 	}
 	digest := sha256.Sum256([]byte(output))
 	return Receipt{
+		Key:               r.key(batch),
 		Tree:              batch.Candidate.Tree,
 		Toolchain:         toolchain,
 		ConfigurationHash: r.ConfigDigest,
@@ -834,25 +900,27 @@ func (r Runner) transition(ctx context.Context, batch *Batch, state State, reaso
 	return nil
 }
 
-func (r Runner) checkPolicyNames() []string {
+// policyDigest identifies the checking policy: the configuration digest and the
+// configured checks, by name.
+func (r Runner) policyDigest() string {
 	names := make([]string, len(r.Checks))
 	for index, checker := range r.Checks {
-		name := checker.Name()
-		if name == "" {
-			name = fmt.Sprintf("check-%d", index+1)
-		}
-		names[index] = name
+		names[index] = checkName(checker, index)
 	}
 	sort.Strings(names)
-	return names
+	body, _ := json.Marshal(struct {
+		Configuration string   `json:"configuration"`
+		Checks        []string `json:"checks"`
+	}{Configuration: r.ConfigDigest, Checks: names})
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
 }
 
-func memberIDs(members []Member) []string {
-	ids := make([]string, len(members))
-	for index, member := range members {
-		ids[index] = member.Migration
+func checkName(checker Checker, index int) string {
+	if name := checker.Name(); name != "" {
+		return name
 	}
-	return ids
+	return fmt.Sprintf("check-%d", index+1)
 }
 
 func (r Runner) roundLimit() int {
@@ -1022,10 +1090,8 @@ func cloneBatch(batch Batch) Batch {
 	batch.LandedMembers = cloneMembers(batch.LandedMembers)
 	batch.NotifiedMembers = append([]string(nil), batch.NotifiedMembers...)
 	batch.Dropped = append([]DroppedMember(nil), batch.Dropped...)
-	batch.ChangeMembers = append([]string(nil), batch.ChangeMembers...)
-	batch.LedgerMembers = append([]string(nil), batch.LedgerMembers...)
-	batch.CheckPolicy = append([]string(nil), batch.CheckPolicy...)
-	batch.CheckMembers = append([]string(nil), batch.CheckMembers...)
+	batch.Candidate.Dropped = append([]gitx.Drop(nil), batch.Candidate.Dropped...)
+	batch.InitialCandidate.Dropped = append([]gitx.Drop(nil), batch.InitialCandidate.Dropped...)
 	batch.Checks = append([]CheckVerdict(nil), batch.Checks...)
 	if batch.Operations != nil {
 		operations := make(map[string]Operation, len(batch.Operations))
