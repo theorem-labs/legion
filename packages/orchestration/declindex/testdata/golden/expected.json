@@ -1,0 +1,263 @@
+{
+ "module": "Golden",
+ "decls": [
+  {
+   "name": "Gold.Aligned",
+   "short": "Aligned",
+   "module": "Golden",
+   "kind": "abbrev",
+   "line": 7,
+   "hash": "cad50378567521cb"
+  },
+  {
+   "name": "Gold.Box",
+   "short": "Box",
+   "module": "Golden",
+   "kind": "structure",
+   "line": 36,
+   "hash": "a1958191558b3263"
+  },
+  {
+   "name": "Gold.Frame",
+   "short": "Frame",
+   "module": "Golden",
+   "kind": "structure",
+   "line": 10,
+   "hash": "99f6f22a2728d92e"
+  },
+  {
+   "name": "Gold.SpWord",
+   "short": "SpWord",
+   "module": "Golden",
+   "kind": "def",
+   "line": 4,
+   "hash": "d2be38b3f7b4deb7"
+  },
+  {
+   "name": "Gold.astral",
+   "short": "astral",
+   "module": "Golden",
+   "kind": "theorem",
+   "line": 33,
+   "hash": "28e0844a30e3f6be"
+  },
+  {
+   "name": "Gold.box_pos",
+   "short": "box_pos",
+   "module": "Golden",
+   "kind": "theorem",
+   "line": 42,
+   "hash": "639889f6cea3120d"
+  },
+  {
+   "name": "Gold.frame_al",
+   "short": "frame_al",
+   "module": "Golden",
+   "kind": "theorem",
+   "line": 14,
+   "hash": "2942fc5e30307f42"
+  },
+  {
+   "name": "Gold.frame_lo",
+   "short": "frame_lo",
+   "module": "Golden",
+   "kind": "theorem",
+   "line": 17,
+   "hash": "9d9fba31f41fc258"
+  },
+  {
+   "name": "Gold.instFrameDec",
+   "short": "instFrameDec",
+   "module": "Golden",
+   "kind": "instance",
+   "line": 27,
+   "hash": "0ae72244e7cbb9ee"
+  },
+  {
+   "name": "Gold.pick",
+   "short": "pick",
+   "module": "Golden",
+   "kind": "def",
+   "line": 21,
+   "hash": "df67ff3cd915b1aa"
+  },
+  {
+   "name": "Gold.useBox",
+   "short": "useBox",
+   "module": "Golden",
+   "kind": "def",
+   "line": 40,
+   "hash": "e4c4c72370374fd5"
+  },
+  {
+   "name": "Gold.uses_hidden",
+   "short": "uses_hidden",
+   "module": "Golden",
+   "kind": "theorem",
+   "line": 31,
+   "hash": "53c5a3b0b2f74d3c"
+  },
+  {
+   "name": "Gold.withStr",
+   "short": "withStr",
+   "module": "Golden",
+   "kind": "def",
+   "line": 25,
+   "hash": "bbf861ea960b6a25"
+  },
+  {
+   "name": "_private.Golden.0.Gold.hidden",
+   "short": "hidden",
+   "module": "Golden",
+   "kind": "def",
+   "line": 29,
+   "hash": "7e7ea5cc9e9e9393"
+  }
+ ],
+ "uses": [
+  [
+   "Gold.Aligned",
+   "Golden",
+   11,
+   8,
+   "Gold.Frame",
+   "proof"
+  ],
+  [
+   "Gold.Aligned",
+   "Golden",
+   14,
+   52,
+   "Gold.frame_al",
+   "stmt"
+  ],
+  [
+   "Gold.Aligned",
+   "Golden",
+   27,
+   53,
+   "Gold.instFrameDec",
+   "stmt"
+  ],
+  [
+   "Gold.Box",
+   "Golden",
+   40,
+   17,
+   "Gold.useBox",
+   "stmt"
+  ],
+  [
+   "Gold.Box",
+   "Golden",
+   42,
+   22,
+   "Gold.box_pos",
+   "stmt"
+  ],
+  [
+   "Gold.Box.mk",
+   "Golden",
+   40,
+   40,
+   "Gold.useBox",
+   "proof"
+  ],
+  [
+   "Gold.Box.ok",
+   "Golden",
+   43,
+   28,
+   "Gold.box_pos",
+   "proof"
+  ],
+  [
+   "Gold.Box.val",
+   "Golden",
+   38,
+   8,
+   "Gold.Box",
+   "proof"
+  ],
+  [
+   "Gold.Box.val",
+   "Golden",
+   40,
+   33,
+   "Gold.useBox",
+   "proof"
+  ],
+  [
+   "Gold.Box.val",
+   "Golden",
+   40,
+   62,
+   "Gold.useBox",
+   "proof"
+  ],
+  [
+   "Gold.Frame",
+   "Golden",
+   14,
+   40,
+   "Gold.frame_al",
+   "stmt"
+  ],
+  [
+   "Gold.Frame",
+   "Golden",
+   17,
+   40,
+   "Gold.frame_lo",
+   "stmt"
+  ],
+  [
+   "Gold.Frame.al",
+   "Golden",
+   14,
+   68,
+   "Gold.frame_al",
+   "proof"
+  ],
+  [
+   "Gold.Frame.lo",
+   "Golden",
+   19,
+   11,
+   "Gold.frame_lo",
+   "proof"
+  ],
+  [
+   "Gold.pick",
+   "Golden",
+   33,
+   106,
+   "Gold.astral",
+   "stmt"
+  ],
+  [
+   "Gold.useBox",
+   "Golden",
+   42,
+   29,
+   "Gold.box_pos",
+   "stmt"
+  ],
+  [
+   "Gold.useBox",
+   "Golden",
+   43,
+   10,
+   "Gold.box_pos",
+   "proof"
+  ],
+  [
+   "_private.Golden.0.Gold.hidden",
+   "Golden",
+   31,
+   23,
+   "Gold.uses_hidden",
+   "stmt"
+  ]
+ ]
+}
