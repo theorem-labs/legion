@@ -564,3 +564,30 @@ func TestUnfinishedOwnerLaunchSleepsWhenLedgerHasNoWork(t *testing.T) {
 		t.Fatalf("unfinished owner after recovery = %+v, want queued generation one", got)
 	}
 }
+
+func TestExhaustedOwnerRetryRevisionSurvivesRestart(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "revision-restart-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	enqueueOwnerWork(t, queue, repo)
+	revision, err := queue.OwnerWorkRevision(context.Background(), repo, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := standingOwnerClaim(t, cfg, supervise.StateFailed, nil)
+	owner.Budgets.Deaths = cfg.LaunchFailureLimit
+	owner.OwnerRetryRevision = revision
+	putStandingOwner(t, cfg, owner)
+	first := startDaemon(t, cfg, fakeRuntime(fake.NewRuntime(), &built{}))
+	first.stop()
+	if err := queue.Enqueue(context.Background(), repo, "item-b", "owner-a"); err != nil {
+		t.Fatal(err)
+	}
+	rebindHeldPorts(t, &cfg)
+	rt := fake.NewRuntime()
+	o := fakeRuntime(rt, &built{})
+	o.orphanSweep = 20 * time.Millisecond
+	startDaemon(t, cfg, o)
+	testwait.Eventually(t, "changed revision after restart", func() bool { return len(rt.CallsOf("Spawn")) == 1 })
+}
