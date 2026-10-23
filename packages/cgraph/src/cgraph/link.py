@@ -255,9 +255,14 @@ class Linker:
                 assert helper is not None
                 child = self.effective(tu, callee, caller, (*stack, name))
                 bound = _bind(child, call["arguments"])
-                result.calls += [_with_via(item, helper.id) for item in bound.calls]
+                # A helper folded under a __builtin_constant_p choice is itself left to the image.
+                mark = {"conditional": True} if call.get("conditional") else {}
+                result.calls += [{**_with_via(item, helper.id), **mark} for item in bound.calls]
                 for kind in _EVENT_LISTS:
-                    getattr(result, kind).extend(_with_via(item, helper.id) for item in getattr(bound, kind))
+                    getattr(result, kind).extend(
+                        {**_with_via(item, helper.id), **(mark if kind == "accesses" else {})}
+                        for item in getattr(bound, kind)
+                    )
                 result.folds.append({"helper": helper.id, "provenance": call["provenance"]})
                 result.folds += bound.folds
                 result.unbound += bound.unbound
@@ -308,6 +313,15 @@ class Linker:
                 kept.append(pointer)
                 continue
             child = self.effective(tu, target, caller, (*stack, name))
+            # Fold only what the caller's machine code shows: a call or a global of the target.
+            shown = {item["callee"] for item in child.calls} & callees or {
+                item["unit"]["name"]
+                for item in child.accesses
+                if item.get("unit") is not None and item["unit"]["kind"] == "global"
+            } & self.image_globals(caller)
+            if not shown:
+                kept.append(pointer)
+                continue
             result.calls += [_with_via(item, helper.id) for item in child.calls]
             for kind in _EVENT_LISTS:
                 if kind != "function_pointers":
@@ -597,7 +611,7 @@ def build(
             unit = access.get("unit")
             if unit is None:
                 continue
-            if access.get("conditional") and unit["name"] not in image_globals[identity]:
+            if access.get("conditional") and unit["kind"] == "global" and unit["name"] not in image_globals[identity]:
                 analysis["image_decided"].append(
                     {"function": identity, "unit": unit["name"], "provenance": access["provenance"]}
                 )

@@ -42,29 +42,51 @@ _DISPLACEMENT_REACH = 2048
 
 @dataclass
 class _State:
-    """Registers that hold a known value; registers that hold an unknown base plus a known constant
+    """Registers that hold a known value (``constants`` are those formed with ``lui``/``li``, which
+    are numbers, not addresses); registers that hold an unknown base plus a known constant
     (``relative``); and registers that hold a known address plus an unknown offset (``anchored``: a
     per-CPU offset or an index added to the address of an object)."""
 
     values: dict[int, int] = field(default_factory=dict)
     relative: dict[int, int] = field(default_factory=dict)
     anchored: dict[int, int] = field(default_factory=dict)
+    constants: set[int] = field(default_factory=set)
 
     def copy(self) -> _State:
-        return _State(dict(self.values), dict(self.relative), dict(self.anchored))
+        return _State(dict(self.values), dict(self.relative), dict(self.anchored), set(self.constants))
 
     def meet(self, other: _State) -> _State:
         def same(mine: dict[int, int], theirs: dict[int, int]) -> dict[int, int]:
             return {register: value for register, value in mine.items() if theirs.get(register) == value}
 
+        values = {
+            register: value
+            for register, value in same(self.values, other.values).items()
+            if (register in self.constants) == (register in other.constants)
+        }
         return _State(
-            same(self.values, other.values),
+            values,
             same(self.relative, other.relative),
             same(self.anchored, other.anchored),
+            {register for register in values if register in self.constants},
         )
+
+    def address(self, register: int) -> int | None:
+        """The address a register holds: a known value that is not a ``lui``/``li`` number."""
+        if register in self.values and register not in self.constants:
+            return self.values[register]
+        return None
 
 
 _ATOMIC_PREFIXES = ("amo", "lr.", "sc.")
+# Compressed two-operand forms read their destination: c.add rd, rs2 is rd = rd + rs2.
+_READS_DESTINATION = {
+    "c.add", "c.addw", "c.sub", "c.subw", "c.and", "c.or", "c.xor", "c.addi", "c.addiw", "c.slli", "c.srli",
+    "c.srai", "c.andi",
+}  # fmt: skip
+_NUMBERS = {"lui", "c.lui", "li", "c.li"}
+# Instructions whose result is the address they read plus something: the address lives on in it.
+_DERIVES = {"addi", "addiw", "c.addi", "c.addiw", "mv", "c.mv", "add", "c.add", "addw", "c.addw"}
 
 
 def _reads(instruction: Any, operands: list[Any]) -> tuple[set[int], set[int]]:
@@ -76,7 +98,7 @@ def _reads(instruction: Any, operands: list[Any]) -> tuple[set[int], set[int]]:
     if mnemonic.startswith(_ATOMIC_PREFIXES):
         # amoadd.d rd, rs2, (rs1): rd is written, rs2 is a value, rs1 the base.
         values = set(registers[1:-1])
-    elif mnemonic in _NO_DESTINATION:
+    elif mnemonic in _NO_DESTINATION or mnemonic in _READS_DESTINATION:
         values = set(registers)
     else:
         values = set(registers[1:])
@@ -85,23 +107,38 @@ def _reads(instruction: Any, operands: list[Any]) -> tuple[set[int], set[int]]:
     return bases, values - bases
 
 
+def _is_number(instruction: Any, operands: list[Any], state: _State) -> bool:
+    """Whether the value an instruction computes is a number (rooted in ``lui``/``li``), not an address."""
+    mnemonic = instruction.mnemonic
+    if mnemonic in _NUMBERS:
+        return True
+    sources = [operand.reg for operand in operands[1:] if operand.type == CS_OP_REG]
+    if mnemonic in _READS_DESTINATION and operands and operands[0].type == CS_OP_REG:
+        sources.append(operands[0].reg)
+    known = [register for register in sources if register in state.values]
+    return bool(known) and all(register in state.constants for register in known)
+
+
 def _anchored_value(
     instruction: Any,
     operands: list[Any],
-    values: dict[int, int],
-    anchored: dict[int, int],
+    state: _State,
     section_of: Any,
 ) -> tuple[int, int] | None:
-    """A register that becomes a known address plus an unknown offset: ``add rd, address, offset``, or
-    ``addi``/``mv`` of such a register."""
+    """A register that becomes a known address plus an unknown offset: ``add rd, address, offset``,
+    ``add rd, anchored, offset``, or ``addi``/``mv`` of such a register."""
+    values, anchored = state.values, state.anchored
     mnemonic = instruction.mnemonic
     kinds = [operand.type for operand in operands]
     if mnemonic in ("add", "c.add") and kinds and all(kind == CS_OP_REG for kind in kinds):
         registers = [operand.reg for operand in operands]
         left, right = (registers[1], registers[2]) if len(registers) == 3 else (registers[0], registers[1])
         for address, offset in ((left, right), (right, left)):
-            if address in values and offset not in values and section_of(values[address]) is not None:
-                return registers[0], values[address]
+            known = state.address(address)
+            if known is not None and offset not in values and section_of(known) is not None:
+                return registers[0], known
+            if address in anchored and offset not in values:
+                return registers[0], anchored[address]
         return None
     if mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in anchored:
         return operands[0].reg, (anchored[operands[1].reg] + operands[2].imm) & _MASK
@@ -110,6 +147,29 @@ def _anchored_value(
     if mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in anchored:
         return operands[0].reg, anchored[operands[1].reg]
     return None
+
+
+def _flow(decoder: Any, instructions: list[Any]) -> list[list[int]]:
+    """The successors of each instruction: the next one, a branch target, none after a return, an
+    indirect jump or a jump to an address outside the function."""
+    index_of = {instruction.address: index for index, instruction in enumerate(instructions)}
+    successors: list[list[int]] = []
+    for index, instruction in enumerate(instructions):
+        mnemonic = instruction.mnemonic
+        operands = list(instruction.operands)
+        following = [index + 1] if index + 1 < len(instructions) else []
+        target = None
+        if (mnemonic in _BRANCHES or mnemonic in {"j", "c.j"}) and operands and operands[-1].type == CS_OP_IMM:
+            target = index_of.get((instruction.address + operands[-1].imm) & _MASK)
+        if mnemonic in _BRANCHES:
+            successors.append(following + ([target] if target is not None else []))
+        elif mnemonic in {"j", "c.j"}:
+            successors.append([target] if target is not None else [])
+        elif mnemonic in _ENDS or (mnemonic in {"jalr", "c.jalr"} and not _links(decoder, operands)):
+            successors.append([])
+        else:
+            successors.append(following)
+    return successors
 
 
 def _links(decoder: Any, operands: list[Any]) -> bool:
@@ -235,6 +295,7 @@ class Image:
         objects: list[tuple[int, int, str, str]] = []
         function_ranges: list[tuple[int, int, str, str]] = []
         self.object_symbols: dict[str, list[Symbol]] = {}
+        markers: list[tuple[int, str]] = []
         symtab = self.elf.get_section_by_name(".symtab")
         current_file = ""
         for symbol in symtab.iter_symbols() if isinstance(symtab, SymbolTableSection) else []:
@@ -258,6 +319,9 @@ class Image:
             elif kind in ("STT_OBJECT", "STT_NOTYPE") and not (int(section["sh_flags"]) & SH_FLAGS.SHF_EXECINSTR):
                 objects.append((entry.address, entry.size, entry.name, entry.section))
                 self.object_symbols.setdefault(symbol.name, []).append(entry)
+            elif kind == "STT_NOTYPE" and not entry.size:
+                # A marker in code (_stext, _sinittext, secondary_start_sbi) that C compares or passes.
+                markers.append((entry.address, entry.name))
         for symbols in self.functions.values():
             symbols.sort(key=lambda item: item.address)
         # A call target is named by the function symbol that starts there; System.map's zero-size
@@ -271,12 +335,19 @@ class Image:
         self.sized_object_names = sorted({name for _, size, name, _ in self.objects if size})
         # Names an address has without storage of their own: zero-size symbols (jiffies, which the
         # linker script makes an alias of jiffies_64; an empty lock_class_key; a section marker).
-        self.zero_size_at: dict[int, list[str]] = {}
+        zero_size: dict[int, set[str]] = {}
         for address, size, name, _ in self.objects:
             if not size:
-                self.zero_size_at.setdefault(address, []).append(source_name(name))
-        # The C names of every data symbol System.map lists, for telling a global the compiler removed.
-        self.map_source_names = frozenset(source_name(name) for _, kind, name in self.map if kind not in text_kinds)
+                zero_size.setdefault(address, set()).add(source_name(name))
+        for address, name in markers:
+            zero_size.setdefault(address, set()).add(source_name(name))
+        # Names without a leading underscore first: vdso_start before __end_init_stack.
+        self.zero_size_at = {
+            address: sorted(names, key=lambda name: (name.startswith("_"), name))
+            for address, names in zero_size.items()
+        }
+        # The C names of every symbol System.map lists, for telling a global the compiler removed.
+        self.map_source_names = frozenset(source_name(name) for _, _, name in self.map)
         self.decoder = Cs(CS_ARCH_RISCV, CS_MODE_RISCV64 | CS_MODE_RISCVC)
         self.decoder.detail = True
         self.cache: dict[int, FunctionFacts] = {}
@@ -323,93 +394,106 @@ class Image:
         """The facts of a function's machine code that starts at ``address``."""
         facts = FunctionFacts()
         instructions = list(self.decoder.disasm(code, address))
-        for index, state in self._block_states(instructions):
+        successors = _flow(self.decoder, instructions)
+        for index, state in self._block_states(instructions, successors):
             instruction = instructions[index]
-            escapes = instruction.mnemonic not in _ADDI or self._escapes(instructions, index)
+            escapes = instruction.mnemonic not in _ADDI or self._escapes(instructions, successors, index)
             self._step(name, instruction, state, facts, escapes)
         return facts
 
-    def _escapes(self, instructions: list[Any], index: int, limit: int = 64) -> bool:
-        """Whether the register an ``addi`` sets is used other than as the base of loads and stores
-        before it is overwritten: passed to a call, returned, stored, compared or computed with. Only
-        then is the address itself an access; a base for loads and stores gives the accesses itself."""
+    def _escapes(self, instructions: list[Any], successors: list[list[int]], index: int, limit: int = 256) -> bool:
+        """Whether the address an ``addi`` sets is used, on some path, other than as the base of loads
+        and stores: passed to a call, returned, stored, compared or computed with. Registers derived
+        from it by ``addi``, ``mv`` or ``add`` are followed, and callee-saved registers survive calls.
+        Only an escaping address is itself an access; a base gives the accesses of its loads and stores."""
         operands = list(instructions[index].operands)
         if not operands or operands[0].type != CS_OP_REG:
             return True
-        register = operands[0].reg
-        name = self.decoder.reg_name(register)
-        for following in instructions[index + 1 : index + 1 + limit]:
-            mnemonic = following.mnemonic
-            following_operands = list(following.operands)
-            bases, reads = _reads(following, following_operands)
-            if register in reads:
+        pending = [(following, frozenset({operands[0].reg})) for following in successors[index]]
+        seen: set[tuple[int, frozenset[int]]] = set()
+        while pending and limit:
+            limit -= 1
+            position, tracked = pending.pop()
+            if (position, tracked) in seen:
+                continue
+            seen.add((position, tracked))
+            instruction = instructions[position]
+            mnemonic = instruction.mnemonic
+            current = list(instruction.operands)
+            _, reads = _reads(instruction, current)
+            written = frozenset(_written_registers(instruction, current))
+            used = reads & tracked
+            if used and not (mnemonic in _DERIVES and written):
                 return True
-            calls = mnemonic in {"jal", "c.jal"} or (
-                mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, following_operands)
-            )
-            if calls or mnemonic in {"j", "c.j", "jr", "c.jr"}:
-                # An argument register reaches the callee; at a jump the use is elsewhere.
-                return bool(name.startswith("a")) or mnemonic in {"j", "c.j"}
+            names = {self.decoder.reg_name(register) for register in tracked}
+            calls = mnemonic in {"jal", "c.jal"} or (mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, current))
+            if calls or mnemonic in {"jr", "c.jr"}:
+                # An argument register reaches the callee; across a call only callee-saved registers live.
+                if any(name.startswith("a") for name in names):
+                    return True
+                tracked = frozenset(
+                    register for register in tracked if self.decoder.reg_name(register).startswith(("s", "sp", "gp"))
+                )
             if mnemonic in _ENDS:
-                return bool(name == "a0")
-            if register in _written_registers(following, following_operands) and register not in bases:
-                return False
-        return True
+                if "a0" in names:
+                    return True
+                continue
+            # A derived register holds the address plus something; any other write ends the address there.
+            tracked = (tracked | written) if used else (tracked - written)
+            if tracked:
+                pending += [(following, tracked) for following in successors[position]]
+        return bool(pending)
 
-    def _block_states(self, instructions: list[Any]) -> list[tuple[int, _State]]:
+    def _block_states(self, instructions: list[Any], successors: list[list[int]]) -> list[tuple[int, _State]]:
         """Each instruction's index with the register state before it, from a forward must-analysis
         over the function's basic blocks: a register holds a value at a block's start only when every
         path into the block gives it that value, so an address formed before a branch and used after
-        a join is followed, and one formed on only one path is not."""
+        a join is followed, and one formed on only one path is not. Blocks reached only through an
+        indirect jump (a jump table) start from the state the indirect jumps leave."""
         if not instructions:
             return []
-        index_of = {instruction.address: index for index, instruction in enumerate(instructions)}
         leaders = {0}
-        successors: dict[int, list[int]] = {}
-        for index, instruction in enumerate(instructions):
-            mnemonic = instruction.mnemonic
-            operands = list(instruction.operands)
-            target = None
-            if (mnemonic in _BRANCHES or mnemonic in {"j", "c.j"}) and operands and operands[-1].type == CS_OP_IMM:
-                target = index_of.get((instruction.address + operands[-1].imm) & _MASK)
-            follows = []
-            if mnemonic in _BRANCHES:
-                follows = [index + 1] + ([target] if target is not None else [])
-            elif mnemonic in {"j", "c.j"}:
-                follows = [target] if target is not None else []
-            elif mnemonic in _ENDS or (mnemonic in {"jalr", "c.jalr"} and not _links(self.decoder, operands)):
-                follows = []
-            else:
-                continue
-            successors[index] = [item for item in follows if item is not None and item < len(instructions)]
-            leaders.update(successors[index])
-            if index + 1 < len(instructions):
-                leaders.add(index + 1)
+        for index, following in enumerate(successors):
+            if following != [index + 1]:
+                leaders.update(following)
+                if index + 1 < len(instructions):
+                    leaders.add(index + 1)
         starts = sorted(leaders)
         ends = {start: (starts[position + 1] if position + 1 < len(starts) else len(instructions))
                 for position, start in enumerate(starts)}  # fmt: skip
-        block_successors = {}
-        for start, end in ends.items():
-            last = end - 1
-            block_successors[start] = successors.get(last, [end] if end < len(instructions) else [])
         entry: dict[int, _State | None] = {start: None for start in starts}
         entry[0] = _State()
-        pending = [0]
-        budget = 64 * len(starts)
-        while pending and budget:
-            budget -= 1
-            start = pending.pop()
-            state = entry[start]
-            assert state is not None
-            state = state.copy()
-            for index in range(start, ends[start]):
-                self._step("", instructions[index], state, None)
-            for successor in block_successors[start]:
-                known = entry.get(successor)
-                merged = state.copy() if known is None else known.meet(state)
-                if known is None or merged != known:
-                    entry[successor] = merged
-                    pending.append(successor)
+        indirect: list[_State] = []
+
+        def settle(pending: list[int]) -> None:
+            budget = 64 * len(starts)
+            while pending and budget:
+                budget -= 1
+                start = pending.pop()
+                state = entry[start]
+                assert state is not None
+                state = state.copy()
+                for index in range(start, ends[start]):
+                    self._step("", instructions[index], state, None)
+                last = instructions[ends[start] - 1]
+                if last.mnemonic in {"jr", "c.jr"}:
+                    indirect.append(state.copy())
+                for successor in successors[ends[start] - 1]:
+                    known = entry.get(successor)
+                    merged = state.copy() if known is None else known.meet(state)
+                    if known is None or merged != known:
+                        entry[successor] = merged
+                        pending.append(successor)
+
+        settle([0])
+        unreached = [start for start in starts if entry[start] is None]
+        if unreached and indirect:
+            seed = indirect[0]
+            for state in indirect[1:]:
+                seed = seed.meet(state)
+            for start in unreached:
+                entry[start] = seed.copy()
+            settle(list(reversed(unreached)))
         result = []
         for start in starts:
             state = (entry[start] or _State()).copy()
@@ -425,12 +509,12 @@ class Image:
         if section is None:
             return
         resolved = resolve_sized(self.objects, address)
-        zero_size = sorted(set(self.zero_size_at.get(address, [])))
-        if resolved is None and zero_size:
+        zero_size = list(self.zero_size_at.get(address, []))
+        target = resolve_sized(self.function_ranges, address) if resolved is None else None
+        if resolved is None and target is None and zero_size:
             # Only zero-size names at the address: an empty object, or a marker the code compares.
             resolved = (zero_size[0], address, section[2])
         if resolved is None:
-            target = resolve_sized(self.function_ranges, address)
             if target is not None:
                 name, start, section_name = target
                 facts.function_addresses.append(
@@ -503,7 +587,7 @@ class Image:
                         facts.globals.append(
                             self._thread_pointer(function, instruction.address, displacement, "thread_pointer_access")
                         )
-                elif base in values:
+                elif state.address(base) is not None:
                     self._record_address(
                         function, (values[base] + displacement) & _MASK, instruction.address, "load_or_store", facts
                     )
@@ -526,7 +610,8 @@ class Image:
                     facts,
                 )
             elif mnemonic in _REGISTER_CALLS:
-                target = _register_target(operands, values)
+                target = _register_target(operands, {register: value for register, value in values.items()
+                                                     if register not in state.constants})  # fmt: skip
                 if target is not None:
                     tail = mnemonic in {"jr", "c.jr"} or not _links(self.decoder, operands)
                     self._call(function, instruction.address, target, tail, facts)
@@ -538,16 +623,22 @@ class Image:
                     values.pop(register, None)
                     relative.pop(register, None)
                     anchored.pop(register, None)
+                    state.constants.discard(register)
         derived = _relative_value(instruction, operands, values, relative)
-        indexed = _anchored_value(instruction, operands, values, anchored, self.section_of)
+        indexed = _anchored_value(instruction, operands, state, self.section_of)
+        number = computed is not None and _is_number(instruction, operands, state)
         for register in _written_registers(instruction, operands):
             values.pop(register, None)
             relative.pop(register, None)
             anchored.pop(register, None)
+            state.constants.discard(register)
         if computed is not None:
             destination, value = computed
             values[destination] = value
-            if facts is not None and mnemonic in _ADDI and escapes:
+            if number:
+                # lui and li form numbers (an ioctl command, a mask), not addresses.
+                state.constants.add(destination)
+            elif facts is not None and mnemonic in _ADDI and escapes:
                 self._record_address(function, value, instruction.address, "addi_address", facts)
         elif indexed is not None:
             anchored[indexed[0]] = indexed[1]

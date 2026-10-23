@@ -667,14 +667,19 @@ def _exits_under_builtin(statement: ci.Cursor, evaluator: _Evaluator) -> bool:
     return len(parts) >= 2 and _mentions(parts[0], _IMAGE_DECIDES) and evaluator.exits(parts[1])
 
 
-def _pure(expression: ci.Cursor) -> bool:
-    """No call and no assignment inside: dropping the expression changes nothing but its value."""
+def _pure(expression: ci.Cursor, definitions: dict[str, ci.Cursor], depth: int = 0) -> bool:
+    """No assignment, no asm and no call except to an inline helper that is itself pure (get_current()
+    returns the thread pointer): dropping the expression changes nothing but its value."""
     for node in expression.walk_preorder():
-        if node.kind == K.CALL_EXPR or node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR:
-            return False
-        if node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node):
-            return False
-        if node.kind == K.UNARY_OPERATOR and libclang.is_increment(node):
+        if node.kind == K.CALL_EXPR:
+            callee = definitions.get(node.spelling)
+            if callee is None or depth > 2 or not _is_inline(callee) or not _pure(callee, definitions, depth + 1):
+                return False
+        elif (
+            node.kind in (K.COMPOUND_ASSIGNMENT_OPERATOR, K.ASM_STMT)
+            or (node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node))
+            or (node.kind == K.UNARY_OPERATOR and libclang.is_increment(node))
+        ):
             return False
     return True
 
@@ -1180,7 +1185,7 @@ class _FunctionWalk:
             arguments = list(node.get_arguments() or [])
             for child_index, child in enumerate(children):
                 position = next((place for place, argument in enumerate(arguments) if argument == child), None)
-                if position is not None and position in ignored and _pure(child):
+                if position is not None and position in ignored and _pure(child, self.x.evaluator.definitions):
                     # A value only a parameter the inline callee never reads receives: not computed.
                     self.walk(child, node, child_index, "ignored_argument", generic)
                 else:

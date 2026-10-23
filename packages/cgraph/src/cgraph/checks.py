@@ -147,8 +147,8 @@ def accesses(graph: dict[str, Any]) -> dict[str, Any]:
         for name, item in sorted(c_values.items()):
             pair = (function, name)
             kind = item["target_class"]
-            if kind == "state" and not item.get("image_symbol", True):
-                apart["state_without_image_symbol"].append(pair)
+            if kind in ("state", "compiler_symbol") and not item.get("image_symbol", True):
+                apart[f"{kind}_without_image_symbol"].append(pair)
                 continue
             c_total.add(pair)
             if kind == "state":

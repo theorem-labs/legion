@@ -216,3 +216,40 @@ def test_a_displacement_split_into_addi_2047_and_a_load(image: Image) -> None:
     code = struct.pack("<3I", _addi(s3, A0, 2047), _load(A1, s3, 481), 0x00008067)
     offsets = image.decode("synthetic", code, 0x11000).memory_offsets
     assert 2528 in offsets and 481 in offsets
+
+
+RA, SP, S1, A2, A3 = 1, 2, 9, 12, 13
+RET = 0x00008067
+
+
+def _jal(rd: int, offset: int) -> int:
+    bits = offset & 0x1FFFFF
+    return (((bits >> 20) & 1) << 31 | ((bits >> 1) & 0x3FF) << 21 | ((bits >> 11) & 1) << 20
+            | ((bits >> 12) & 0xFF) << 12 | rd << 7 | 0x6F)  # fmt: skip
+
+
+def _store(rs2: int, base: int, offset: int) -> int:
+    return ((offset >> 5) & 0x7F) << 25 | rs2 << 20 | base << 15 | 3 << 12 | (offset & 0x1F) << 7 | 0x23
+
+
+def test_a_lui_number_is_not_an_address(image: Image) -> None:
+    """``lui a0, hi; addi a0, a0, lo`` equal to pair_a's address is a number (an ioctl command)."""
+    address = image.object_symbols["pair_a"][0].address
+    high, low = (address + 0x800) >> 12, address - (((address + 0x800) >> 12) << 12)
+    code = struct.pack("<4I", _u(0x37, A0, high), _addi(A0, A0, low), _load(A1, A0, 0), RET)
+    assert image.decode("synthetic", code, 0x11000).globals == []
+
+
+def test_a_callee_saved_base_keeps_its_address_across_a_call(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack("<5I", _u(0x17, S1, high), _addi(S1, S1, low), _jal(RA, 0x100), _load(A1, S1, 8), RET)
+    assert _operations(image.decode("synthetic", code, start)) == {("pair_b", "load_or_store")}
+
+
+def test_a_compressed_add_derives_the_address_and_a_store_lets_it_escape(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    compressed_add = (0b1001 << 12) | (A2 << 7) | (A3 << 2) | 0b10
+    code = struct.pack("<IIHII", _u(0x17, A3, high), _addi(A3, A3, low), compressed_add, _store(A2, SP, 0), RET)
+    assert ("pair_a", "addi_address") in _operations(image.decode("synthetic", code, start))
