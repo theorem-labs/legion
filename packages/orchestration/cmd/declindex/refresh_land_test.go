@@ -253,6 +253,43 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		}
 		assertIndexCommit(t, f.config, f.second)
 	})
+	t.Run("repairs a graph write that failed after the index commit", func(t *testing.T) {
+		f := newLandingFixture(t)
+		cfg, err := declindex.LoadConfig(f.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(cfg.DB + ".graph"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(cfg.DB+".graph.tmp", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 3 {
+			t.Fatalf("graph write failure: %+v", r)
+		}
+		if err := os.Remove(cfg.DB + ".graph.tmp"); err != nil {
+			t.Fatal(err)
+		}
+		body, err := os.ReadFile(f.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retryBuild := "build:\n  - sh\n  - -c\n  - 'echo retry-graph > retry-graph'"
+		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.refreshAt(t, f.second); r.code != 0 {
+			t.Fatalf("graph write retry: %+v", r)
+		}
+		if _, err := os.Stat(filepath.Join(f.tree, "retry-graph")); err != nil {
+			t.Fatal(err)
+		}
+		assertIndexCommit(t, f.config, f.second)
+		if r := invoke(t, "--config", f.config, "users", "Frame"); r.code != 0 {
+			t.Fatalf("query after graph repair: %+v", r)
+		}
+	})
 	t.Run("leaves a clean older tree untouched when the index is already current", func(t *testing.T) {
 		f := newLandingFixture(t)
 		if r := f.refreshAt(t, f.second); r.code != 0 {
@@ -261,6 +298,9 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		git(t, f.tree, "checkout", "-q", "--detach", f.first)
 		if r := f.refreshAt(t, f.second); r.code != 0 {
 			t.Fatalf("covered refresh: %+v", r)
+		}
+		if r := f.refreshAt(t, f.first); r.code != 0 || !strings.Contains(r.errOut, f.second) || !strings.Contains(r.errOut, f.first) {
+			t.Fatalf("ancestor covered refresh: %+v", r)
 		}
 		if got := git(t, f.tree, "rev-parse", "HEAD"); got != f.first {
 			t.Fatalf("covered refresh moved the tree to %s", got)

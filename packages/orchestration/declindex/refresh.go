@@ -219,11 +219,12 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 		if dirty {
 			return RefreshStats{}, errors.New("the tree has tracked changes")
 		}
-		covered, err := s.indexCoversLandedCommit(ctx, tree.Source, opt.Commit)
+		covering, err := s.indexCoversLandedCommit(ctx, tree.Source, opt.Commit)
 		if err != nil {
 			return RefreshStats{}, err
 		}
-		if covered {
+		if covering != "" {
+			logf(opt.Log, "declindex: index at %s covers LAND_COMMIT %s", covering, opt.Commit)
 			return RefreshStats{}, ErrAlreadyPast
 		}
 	}
