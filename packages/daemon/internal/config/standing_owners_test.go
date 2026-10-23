@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/legion/daemon/internal/runtime"
 )
@@ -35,7 +36,8 @@ func TestLoadReadsStandingOwners(t *testing.T) {
 	}
 	owners := cfg.StandingOwners
 	if owners.LedgerDSNFile != filepath.Join(filepath.Dir(path), "credentials/ledger-dsn") ||
-		owners.Repository != "example/repository" || owners.MaxRunning != 2 || owners.BudgetUSD != 12.5 {
+		owners.Repository != "example/repository" || owners.MaxRunning != 2 || owners.BudgetUSD != 12.5 ||
+		owners.LedgerTimeout != 5*time.Second {
 		t.Fatalf("StandingOwners = %+v", owners)
 	}
 	if len(owners.Owners) != 2 {
@@ -48,6 +50,22 @@ func TestLoadReadsStandingOwners(t *testing.T) {
 	if got := owners.Owners[1]; got.Name != "proof-b" || got.PromptFile != "/srv/prompts/proof-b.md" ||
 		got.Harness != runtime.BackendOmp || got.MaxCostUSD != 4 {
 		t.Errorf("second owner = %+v", got)
+	}
+}
+
+func TestStandingOwnersLedgerTimeoutIsConfigurable(t *testing.T) {
+	body := strings.Replace(standingOwnersYAML("1", "1", "owner-a"), "  max_running: 1\n",
+		"  max_running: 1\n  ledger_timeout_seconds: 2\n", 1)
+	cfg, err := Load(writeConfigFile(t, minimalFile+body), noEnv)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.StandingOwners.LedgerTimeout; got != 2*time.Second {
+		t.Fatalf("LedgerTimeout = %s, want 2s", got)
+	}
+	bad := strings.Replace(body, "ledger_timeout_seconds: 2", "ledger_timeout_seconds: 0", 1)
+	if _, err := Load(writeConfigFile(t, minimalFile+bad), noEnv); err == nil {
+		t.Fatal("Load accepted a zero ledger timeout")
 	}
 }
 

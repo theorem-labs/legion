@@ -138,8 +138,8 @@ type Claim struct {
 	BootTokenHash   []byte
 	CapabilityHash  []byte
 	UncertainStreak int
-	// OwnerRetryRevision is the ledger queue revision that exhausted a standing owner's retry
-	// budget. Zero means no owner retry wait is recorded.
+	// OwnerRetryRevision is the ledger work revision a standing owner's current failure budget is
+	// spent on, bound when that budget starts. Zero means no budget is bound yet.
 	OwnerRetryRevision int64
 	// SuspendedBy is who suspended the claim while it is suspended, and "" otherwise.
 	SuspendedBy SuspendSource
@@ -741,14 +741,14 @@ func (m *Machine) terminal(state ClaimState) {
 	}
 }
 
-// RetryStandingOwnerForWorkRevision resets an exhausted owner only when its ledger queue changed.
-// The revision is durable with the exhausted claim, so a restart cannot treat the same open work
-// as fresh.
+// RetryStandingOwnerForWorkRevision resets an exhausted owner only when its ledger queue changed
+// after the revision its failure budget was spent on. An owner with no bound revision waits for an
+// operator retry, so unknown history never counts as changed work.
 func (m *Machine) RetryStandingOwnerForWorkRevision(ctx context.Context, revision int64) error {
 	m.mu.Lock()
 	defer m.unlock()
 	if !claim.IsStandingOwner(m.claim.Role, m.claim.Issue, m.claim.Tree) || m.claim.State != StateFailed ||
-		revision <= m.claim.OwnerRetryRevision {
+		m.claim.OwnerRetryRevision == 0 || revision <= m.claim.OwnerRetryRevision {
 		return nil
 	}
 	m.claim.Budgets = Budgets{}
@@ -928,6 +928,9 @@ func (m *Machine) launchAfter(ctx context.Context, charged bool) error {
 		if err := m.checkLaunch(ctx); err != nil {
 			return m.relaunchRefused(ctx, func(ctx context.Context) error { return m.launchAfter(ctx, charged) }, err)
 		}
+		if err := m.bindOwnerWorkRevision(ctx); err != nil {
+			return m.relaunchRefused(ctx, func(ctx context.Context) error { return m.launchAfter(ctx, charged) }, err)
+		}
 		m.claim.Generation++
 		token := rand.Text()
 		m.claim.BootTokenHash = HashBootToken(token)
@@ -1046,15 +1049,9 @@ func (m *Machine) died(ctx context.Context, observation runtime.Observation) err
 			return fmt.Errorf("read queued work for standing owner %s: %w", owner, err)
 		}
 		if !hasWork {
-			m.letGo()
-			m.claim.State = StateQueued
+			m.sleepWithoutWork()
 			return m.persist(ctx)
 		}
-		revision, err := m.deps.WorkQueue.WorkRevision(ctx, owner)
-		if err != nil {
-			return fmt.Errorf("read work revision for standing owner %s: %w", owner, err)
-		}
-		m.claim.OwnerRetryRevision = revision
 		standingOwnerWithWork = true
 	}
 	if err := m.interrupted(ctx, "the process died in the task's turn"); err != nil {
@@ -1077,6 +1074,40 @@ func (m *Machine) died(ctx context.Context, observation runtime.Observation) err
 		return m.relaunchFresh(ctx)
 	}
 	return m.relaunchAfterFailure(ctx)
+}
+
+// bindOwnerWorkRevision ties a standing owner's fresh failure budget to the work revision it is
+// about to be spent on. Every failure path (a refused start, a registration or prompt failure, a
+// death) then exhausts a budget whose revision is already durable with the launching record.
+func (m *Machine) bindOwnerWorkRevision(ctx context.Context) error {
+	if !claim.IsStandingOwner(m.claim.Role, m.claim.Issue, m.claim.Tree) || m.claim.OwnerRetryRevision != 0 {
+		return nil
+	}
+	if m.deps.WorkQueue == nil {
+		return ErrStandingOwnerWorkUnavailable
+	}
+	owner, ok := m.claim.Token.OwnerName(m.claim.Project)
+	if !ok {
+		return fmt.Errorf("supervise: standing owner %s has an invalid token", m.claim.Token)
+	}
+	revision, err := m.deps.WorkQueue.WorkRevision(ctx, owner)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrStandingOwnerWorkUnavailable, err)
+	}
+	if revision <= 0 {
+		return fmt.Errorf("%w: owner %s has open work but no work revision", ErrStandingOwnerWorkUnavailable, owner)
+	}
+	m.claim.OwnerRetryRevision = revision
+	return nil
+}
+
+// sleepWithoutWork leaves a standing owner queued after its work ran out. The failure budget it
+// spent belonged to that work, so the next work starts a fresh one.
+func (m *Machine) sleepWithoutWork() {
+	m.letGo()
+	m.claim.State = StateQueued
+	m.claim.Budgets = Budgets{}
+	m.claim.OwnerRetryRevision = 0
 }
 
 // relaunchFresh is a resume whose workspace-init found the issue's volume lost, the session file

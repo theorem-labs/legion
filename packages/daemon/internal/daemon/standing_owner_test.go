@@ -3,7 +3,11 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -53,7 +57,8 @@ func standingOwnerConfig(t *testing.T, cfg *config.Config, queue *ledger.Store, 
 		t.Fatalf("write owner prompt: %v", err)
 	}
 	cfg.StandingOwners = &config.StandingOwners{LedgerDSNFile: dsnFile, Repository: repo, MaxRunning: 1, BudgetUSD: 10,
-		Owners: []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: "omp", MaxCostUSD: 1}}}
+		LedgerTimeout: 5 * time.Second,
+		Owners:        []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: "omp", MaxCostUSD: 1}}}
 }
 
 func standingOwnerClaim(t *testing.T, cfg config.Config, state supervise.ClaimState, locator *runtime.Locator) supervise.Claim {
@@ -381,7 +386,7 @@ func TestStandingOwnerLedgerOutageLeavesDaemonServing(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.StandingOwners = &config.StandingOwners{
-		LedgerDSNFile: dsnFile, Repository: "example/repository", MaxRunning: 1, BudgetUSD: 1,
+		LedgerDSNFile: dsnFile, Repository: "example/repository", MaxRunning: 1, BudgetUSD: 1, LedgerTimeout: 5 * time.Second,
 		Owners: []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: runtime.BackendOmp, MaxCostUSD: 1}},
 	}
 	rt := fake.NewRuntime()
@@ -590,4 +595,217 @@ func TestExhaustedOwnerRetryRevisionSurvivesRestart(t *testing.T) {
 	o.orphanSweep = 20 * time.Millisecond
 	startDaemon(t, cfg, o)
 	testwait.Eventually(t, "changed revision after restart", func() bool { return len(rt.CallsOf("Spawn")) == 1 })
+}
+
+// A reservation whose capacity was released takes capacity again only through the cap check,
+// keeps its one monetary charge, and two concurrent retries at its generation admit it once.
+func TestReleasedReservationReacquiresCapacityBeforeReuse(t *testing.T) {
+	cfg := testConfig(t)
+	a := standingOwnerClaim(t, cfg, supervise.StateQueued, nil)
+	b := a
+	var err error
+	b.Token, err = claim.OwnerToken(a.Project, "owner-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	putStandingOwner(t, cfg, a)
+	putStandingOwner(t, cfg, b)
+	st, err := store.Open(context.Background(), cfg.PostgresDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if err := st.ReserveStandingOwnerAttempt(ctx, a, 1, 10, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReleaseStandingOwnerPendingCapacity(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReserveStandingOwnerAttempt(ctx, b, 1, 10, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReserveStandingOwnerAttempt(ctx, a, 1, 10, 1); err == nil {
+		t.Fatal("released reservation bypassed max_running")
+	}
+	if err := st.ReleaseStandingOwnerPendingCapacity(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	for range 2 {
+		go func() { results <- st.ReserveStandingOwnerAttempt(ctx, a, 1, 10, 1) }()
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("a concurrent same-generation retry was refused: %v", err)
+		}
+	}
+	var reserved float64
+	var rows, active int
+	if err := st.Pool().QueryRow(ctx, `SELECT coalesce(sum(reserved_usd), 0), count(*), count(*) FILTER (WHERE capacity_reserved)
+		FROM standing_owner_attempts WHERE owner_token = $1`, string(a.Token)).Scan(&reserved, &rows, &active); err != nil {
+		t.Fatal(err)
+	}
+	if reserved != 1 || rows != 1 || active != 1 {
+		t.Fatalf("owner A's reservations = $%.2f in %d rows, %d holding capacity; want $1.00 in one active row", reserved, rows, active)
+	}
+	if err := st.ReserveStandingOwnerAttempt(ctx, b, 1, 10, 1); err == nil {
+		t.Fatal("owner B was admitted while owner A's readmitted reservation holds the only slot")
+	}
+}
+
+func TestFailedOwnerSpawnsDoNotResetWithoutWorkChange(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.LaunchFailureLimit = 2
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "launch-failure-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	cfg.StandingOwners.BudgetUSD = 1000
+	enqueueOwnerWork(t, queue, repo)
+	rt := fake.NewRuntime()
+	for range 100 {
+		rt.ScriptSpawn(fake.SpawnResult{Err: errors.New("harness unavailable")})
+	}
+	o := fakeRuntime(rt, &built{})
+	o.orphanSweep = 20 * time.Millisecond
+	d := startDaemon(t, cfg, o)
+	testwait.Eventually(t, "initial owner spawn failures", func() bool { return len(rt.CallsOf("Spawn")) >= 2 })
+	time.Sleep(150 * time.Millisecond)
+	token := standingOwnerClaim(t, cfg, supervise.StateQueued, nil).Token
+	if got := len(rt.CallsOf("Spawn")); got != 2 {
+		t.Fatalf("unchanged work caused %d failed Spawn attempts, want 2 then wait; state=%s", got, d.claim(token).State)
+	}
+}
+
+// A registration that never arrives is the second owner failure path: the launch's revision is
+// bound before the deadline charges it, so an exhausted owner does not reset on unchanged work.
+func TestOwnerRegistrationFailuresBindTheirWorkRevision(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.LaunchFailureLimit = 2
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "registration-failure-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	enqueueOwnerWork(t, queue, repo)
+	revision, err := queue.OwnerWorkRevision(context.Background(), repo, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := fake.NewRuntime()
+	o := fakeRuntime(rt, &built{})
+	clock := &heldClock{}
+	o.clock = clock
+	d := startDaemon(t, cfg, o)
+	token := standingOwnerClaim(t, cfg, supervise.StateQueued, nil).Token
+	testwait.Eventually(t, "first owner launch", func() bool { return len(rt.CallsOf("Spawn")) == 1 })
+	if got := storedClaim(t, cfg, token).OwnerRetryRevision; got != revision {
+		t.Fatalf("launching owner's bound work revision = %d, want %d", got, revision)
+	}
+	deadline := cfg.WorkerBootTimeout * time.Duration(cfg.WorkerBootRegistrationDeadlineIntervals)
+	for range cfg.LaunchFailureLimit {
+		clock.fire(cfg.WorkerBootTimeout)
+		clock.fire(deadline)
+	}
+	testwait.Eventually(t, "registration failures exhaust the owner", func() bool {
+		return d.claim(token).State == string(supervise.StateFailed)
+	})
+	launches := len(rt.CallsOf("Spawn")) + len(rt.CallsOf("Resume"))
+	time.Sleep(100 * time.Millisecond)
+	if got := len(rt.CallsOf("Spawn")) + len(rt.CallsOf("Resume")); got != launches {
+		t.Fatalf("unchanged work relaunched the exhausted owner: %d launches, then %d", launches, got)
+	}
+	if got := storedClaim(t, cfg, token).OwnerRetryRevision; got != revision {
+		t.Fatalf("exhausted owner's work revision = %d, want %d", got, revision)
+	}
+}
+
+// A ledger that accepts TCP and never answers the PostgreSQL handshake holds owner admission
+// closed, never the daemon's boot: /healthz answers within 500ms.
+func TestSilentLedgerDoesNotBlockDaemonBoot(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	standingOwnerConfig(t, &cfg, queue, "silent-"+randomSuffix(t))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+				}
+			}()
+		}
+	}()
+	dsn := "postgres://postgres:test@" + listener.Addr().String() + "/postgres?sslmode=disable"
+	if err := os.WriteFile(cfg.StandingOwners.LedgerDSNFile, []byte(dsn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt := fake.NewRuntime()
+	startDaemonWithin(t, cfg, fakeRuntime(rt, &built{}), quietLogger(), 500*time.Millisecond)
+	if got := len(rt.CallsOf("Spawn")); got != 0 {
+		t.Fatalf("owner launched %d times while its ledger never answered", got)
+	}
+}
+
+// The same ledger endpoint, unreachable at first, answers owner admission again once it returns,
+// without replacing the queue.
+func TestLedgerQueueReconnectsAfterServiceReturns(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "reconnect-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	enqueueOwnerWork(t, queue, repo)
+	parsed, err := url.Parse(cfg.PostgresDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := parsed.Host
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	var available atomic.Bool
+	go func() {
+		for {
+			client, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer client.Close()
+				if !available.Load() {
+					return
+				}
+				backend, err := net.Dial("tcp", upstream)
+				if err != nil {
+					return
+				}
+				defer backend.Close()
+				go io.Copy(backend, client)
+				io.Copy(client, backend)
+			}()
+		}
+	}()
+	parsed.Host = listener.Addr().String()
+	q := &ledgerQueue{dsn: parsed.String(), repo: repo, timeout: 5 * time.Second}
+	t.Cleanup(func() { closeStandingOwnerQueue(q, quietLogger()) })
+	if _, err := q.HasWork(context.Background(), "owner-a"); err == nil {
+		t.Fatal("the unreachable ledger answered")
+	}
+	available.Store(true)
+	testwait.Eventually(t, "ledger reconnect", func() bool {
+		hasWork, err := q.HasWork(context.Background(), "owner-a")
+		return err == nil && hasWork
+	})
 }

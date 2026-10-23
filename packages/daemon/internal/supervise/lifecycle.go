@@ -50,8 +50,13 @@ func (m *Machine) relaunchRefused(ctx context.Context, relaunch func(context.Con
 	if m.claim.Locator != nil || !slices.Contains(live, m.claim.State) {
 		return err
 	}
-	if errors.Is(err, ErrStandingOwnerNoWork) || errors.Is(err, ErrStandingOwnerWorkUnavailable) {
-		m.log.Info("supervise: standing owner remains asleep", "error", err)
+	if errors.Is(err, ErrStandingOwnerNoWork) {
+		m.log.Info("supervise: standing owner has no work and sleeps", "error", err)
+		m.sleepWithoutWork()
+		return errors.Join(err, m.persist(ctx))
+	}
+	if errors.Is(err, ErrStandingOwnerWorkUnavailable) {
+		m.log.Info("supervise: standing owner remains asleep until its work queue answers", "error", err)
 		m.letGo()
 		m.claim.State = StateQueued
 		return errors.Join(err, m.persist(ctx))

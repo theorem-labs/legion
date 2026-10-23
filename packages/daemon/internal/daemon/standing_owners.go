@@ -15,9 +15,11 @@ import (
 )
 
 // ledgerQueue reconnects lazily: ledger availability gates owner admission only, never daemon
-// boot or the six workflow roles.
+// boot or the six workflow roles. Every call — the connection, its schema check and the read —
+// runs under its own deadline, so a ledger that never answers holds only the owner that asked.
 type ledgerQueue struct {
 	dsn, repo string
+	timeout   time.Duration
 
 	mu       sync.Mutex
 	store    *ledger.Store
@@ -26,6 +28,8 @@ type ledgerQueue struct {
 }
 
 func (q *ledgerQueue) HasWork(ctx context.Context, owner string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, q.timeout)
+	defer cancel()
 	store, err := q.open(ctx)
 	if err != nil {
 		return false, err
@@ -39,6 +43,8 @@ func (q *ledgerQueue) HasWork(ctx context.Context, owner string) (bool, error) {
 }
 
 func (q *ledgerQueue) WorkRevision(ctx context.Context, owner string) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, q.timeout)
+	defer cancel()
 	store, err := q.open(ctx)
 	if err != nil {
 		return 0, err
@@ -66,8 +72,7 @@ func (q *ledgerQueue) open(ctx context.Context) (*ledger.Store, error) {
 		return store, nil
 	}
 	q.failures++
-	delay := time.Second << min(q.failures-1, 5)
-	q.nextTry = time.Now().Add(delay)
+	q.nextTry = time.Now().Add(time.Second << min(q.failures-1, 5))
 	return nil, fmt.Errorf("open standing-owner ledger: %w", err)
 }
 
@@ -83,7 +88,7 @@ func (q *ledgerQueue) failed(store *ledger.Store) {
 	q.nextTry = time.Now().Add(time.Second << min(q.failures-1, 5))
 }
 
-func openStandingOwnerQueue(_ context.Context, cfg *config.StandingOwners) (*ledgerQueue, error) {
+func openStandingOwnerQueue(cfg *config.StandingOwners) (*ledgerQueue, error) {
 	if cfg == nil {
 		return nil, nil
 	}
@@ -91,7 +96,7 @@ func openStandingOwnerQueue(_ context.Context, cfg *config.StandingOwners) (*led
 	if err != nil {
 		return nil, err
 	}
-	return &ledgerQueue{dsn: dsn, repo: cfg.Repository}, nil
+	return &ledgerQueue{dsn: dsn, repo: cfg.Repository, timeout: cfg.LedgerTimeout}, nil
 }
 
 func ownerConfigs(cfg *config.StandingOwners, project string) (map[claim.Token]config.StandingOwner, error) {
@@ -165,11 +170,29 @@ func ownerLaunchCheck(st *store.Store, cfg *config.StandingOwners, owners map[cl
 	}
 }
 
-func (s *supervision) wakeStandingOwners(ctx context.Context) {
+// admitStandingOwners decides owner admission on its own goroutine, beside the serving API: once
+// at once and then every sweep interval. Boot, health and the software roles never wait on it.
+func (s *supervision) admitStandingOwners(ctx context.Context) {
 	if s.workQueue == nil {
 		return
 	}
+	ticker := time.NewTicker(s.plan.orphanSweep)
+	defer ticker.Stop()
+	for {
+		s.wakeStandingOwners(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *supervision) wakeStandingOwners(ctx context.Context) {
 	for _, machine := range s.supervisor.supervised() {
+		if ctx.Err() != nil {
+			return
+		}
 		c := machine.View().Claim
 		if !claim.IsStandingOwner(c.Role, c.Issue, c.Tree) ||
 			(c.State != supervise.StateQueued && c.State != supervise.StateFailed) {

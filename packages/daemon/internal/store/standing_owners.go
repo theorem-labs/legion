@@ -26,12 +26,19 @@ func (s *Store) ReserveStandingOwnerAttempt(ctx context.Context, c supervise.Cla
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, c.Project); err != nil {
 			return err
 		}
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM standing_owner_attempts WHERE owner_token = $1 AND generation = $2)`, string(c.Token), generation).Scan(&exists); err != nil {
+		var exists, capacityReserved bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM standing_owner_attempts WHERE owner_token = $1 AND generation = $2)`,
+			string(c.Token), generation).Scan(&exists); err != nil {
 			return err
 		}
 		if exists {
-			return nil
+			if err := tx.QueryRow(ctx, `SELECT capacity_reserved FROM standing_owner_attempts WHERE owner_token = $1 AND generation = $2`,
+				string(c.Token), generation).Scan(&capacityReserved); err != nil {
+				return err
+			}
+			if capacityReserved {
+				return nil
+			}
 		}
 		var running int
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM (
@@ -52,9 +59,15 @@ func (s *Store) ReserveStandingOwnerAttempt(ctx context.Context, c supervise.Cla
 		if err := tx.QueryRow(ctx, `SELECT coalesce(sum(coalesce(a.actual_usd, a.reserved_usd)), 0)
 			FROM standing_owner_attempts a JOIN claims owner ON owner.token = a.owner_token
 			WHERE owner.project = $1`, c.Project).Scan(&reserved); err != nil {
+			return err
 		}
-		if reserved+cost > budget {
+		if !exists && reserved+cost > budget {
 			return fmt.Errorf("standing owner %s refused: budget_usd %.2f would be exceeded by %.2f", c.Token, budget, reserved+cost)
+		}
+		if exists {
+			_, err := tx.Exec(ctx, `UPDATE standing_owner_attempts SET capacity_reserved = true
+				WHERE owner_token = $1 AND generation = $2 AND capacity_reserved = false`, string(c.Token), generation)
+			return err
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO standing_owner_attempts (owner_token, generation, reserved_usd) VALUES ($1, $2, $3)`, string(c.Token), generation, cost)
 		return err

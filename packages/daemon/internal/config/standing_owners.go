@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -19,14 +20,19 @@ type StandingOwner struct {
 	MaxCostUSD float64
 }
 
-// StandingOwners is the configuration for the daemon's standing-owner supervisor.
+// StandingOwners is the configuration for the daemon's standing-owner supervisor. LedgerTimeout
+// bounds each ledger call owner admission makes: the connection, its schema check and each read.
 type StandingOwners struct {
 	LedgerDSNFile string
 	Repository    string
 	MaxRunning    int
 	BudgetUSD     float64
+	LedgerTimeout time.Duration
 	Owners        []StandingOwner
 }
+
+// defaultLedgerTimeout bounds a ledger call when standing_owners.ledger_timeout_seconds is unset.
+const defaultLedgerTimeout = 5 * time.Second
 
 func readStandingOwners(value *yaml.Node, key string) (*StandingOwners, error) {
 	if value.Tag == "!!null" {
@@ -35,7 +41,7 @@ func readStandingOwners(value *yaml.Node, key string) (*StandingOwners, error) {
 	if value.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("%s must be a mapping", key)
 	}
-	members, err := members(value, key, "ledger_dsn_file", "repository", "max_running", "budget_usd", "owners")
+	members, err := members(value, key, "ledger_dsn_file", "repository", "max_running", "budget_usd", "ledger_timeout_seconds", "owners")
 	if err != nil {
 		return nil, err
 	}
@@ -61,6 +67,17 @@ func readStandingOwners(value *yaml.Node, key string) (*StandingOwners, error) {
 	if err != nil {
 		return nil, err
 	}
+	timeout := defaultLedgerTimeout
+	if node, ok := members["ledger_timeout_seconds"]; ok {
+		seconds, err := readPositiveInteger(node, key+".ledger_timeout_seconds", 0)
+		if err != nil {
+			return nil, err
+		}
+		if seconds == nil {
+			return nil, fmt.Errorf("%s.ledger_timeout_seconds must be a positive integer", key)
+		}
+		timeout = time.Duration(*seconds) * time.Second
+	}
 	ownersNode, ok := members["owners"]
 	if !ok || ownersNode.Kind != yaml.SequenceNode || len(ownersNode.Content) == 0 {
 		return nil, fmt.Errorf("%s.owners must be a non-empty array", key)
@@ -78,7 +95,8 @@ func readStandingOwners(value *yaml.Node, key string) (*StandingOwners, error) {
 		seen[owner.Name] = true
 		owners = append(owners, owner)
 	}
-	return &StandingOwners{LedgerDSNFile: ledgerDSNFile, Repository: repository, MaxRunning: *maxRunning, BudgetUSD: budget, Owners: owners}, nil
+	return &StandingOwners{LedgerDSNFile: ledgerDSNFile, Repository: repository, MaxRunning: *maxRunning, BudgetUSD: budget,
+		LedgerTimeout: timeout, Owners: owners}, nil
 }
 
 func readStandingOwner(value *yaml.Node, key string) (StandingOwner, error) {

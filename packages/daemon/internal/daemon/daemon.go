@@ -944,7 +944,7 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 	if err != nil {
 		return nil, err
 	}
-	queue, err := openStandingOwnerQueue(boot, cfg.StandingOwners)
+	queue, err := openStandingOwnerQueue(cfg.StandingOwners)
 	if err != nil {
 		return nil, err
 	}
@@ -1077,7 +1077,6 @@ func (s *supervision) start(boot context.Context) error {
 		}
 	}
 	close(s.supervisor.restored)
-	s.wakeStandingOwners(s.supervisor.ctx)
 
 	observations, err := s.runtime.Observe(s.supervisor.ctx)
 	if err != nil {
@@ -1295,7 +1294,6 @@ func (s *supervision) reconcileOrphans(ctx context.Context) {
 		if err := s.runtime.ReconcileOrphans(ctx, knownClaims(claims), orphanGrace); err != nil && ctx.Err() == nil {
 			s.log.Error("reconcile orphans", "error", err)
 		}
-		s.wakeStandingOwners(ctx)
 		s.refreshStalePlugins(claims, "sweep")
 	}
 }
@@ -1494,6 +1492,15 @@ func serve(ctx context.Context, cfg config.Config, st *store.Store, startedAt ti
 			return nil
 		})
 	}
+	group.Go(func() error {
+		select {
+		case <-serverStarted:
+		case <-serving.Done():
+			return nil
+		}
+		s.admitStandingOwners(serving)
+		return nil
+	})
 	group.Go(func() error {
 		watchController(serving, st, cfg, p, s.log)
 		return nil
