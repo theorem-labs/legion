@@ -5,7 +5,6 @@ package ledger
 import (
 	"context"
 	"embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -108,17 +107,6 @@ func (s *Store) tx(ctx context.Context, fn func(pgx.Tx) error) error {
 		}
 		return err
 	}
-}
-
-// event appends one row to the event log inside tx.
-func event(ctx context.Context, tx pgx.Tx, repo, kind, subject, actor string, data any) error {
-	b, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO events (repo, kind, subject, actor, data) VALUES ($1, $2, $3, $4, $5)`,
-		repo, kind, subject, actor, b)
-	return err
 }
 
 // lockRepo takes the repository's row lock, which serialises every change to its migrations' locks, and returns

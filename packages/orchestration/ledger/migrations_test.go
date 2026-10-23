@@ -428,3 +428,82 @@ func TestEventLogRecordsChangesAndRefusesEdits(t *testing.T) {
 		}
 	}
 }
+
+func TestEventCursorDoesNotSkipAcrossOutOfOrderCommits(t *testing.T) {
+	s, dsn := newStoreDSN(t)
+	ctx := context.Background()
+	must(open(t, s, "M-a", "alice", []string{"a.lean"}, nil))
+	must(open(t, s, "M-b", "bob", []string{"b.lean"}, nil))
+
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	must(observer.Exec(ctx, `CREATE FUNCTION block_event_a() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.subject = 'M-a' AND NEW.kind = 'migration.taken_over' THEN
+				PERFORM pg_advisory_xact_lock(730000001);
+			END IF;
+			RETURN NEW;
+		END
+	$$`))
+	must(observer.Exec(ctx, `CREATE TRIGGER block_event_a AFTER INSERT ON events
+		FOR EACH ROW EXECUTE FUNCTION block_event_a()`))
+
+	blocker := must(pgx.Connect(ctx, dsn))
+	defer blocker.Close(ctx)
+	block := must(blocker.Begin(ctx))
+	blocked := true
+	defer func() {
+		if blocked {
+			_ = block.Rollback(ctx)
+		}
+	}()
+	must(block.Exec(ctx, `SELECT pg_advisory_xact_lock(730000001)`))
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := s.TakeOver(ctx, "r", "M-a", "carol", 1)
+		first <- err
+	}()
+	waitForBlockedConnections(t, observer, 1)
+
+	second := make(chan error, 1)
+	go func() {
+		_, err := s.TakeOver(ctx, "r", "M-b", "dave", 1)
+		second <- err
+	}()
+	waitForBlockedConnections(t, observer, 2)
+
+	if err := block.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blocked = false
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+
+	var a, b ledger.Event
+	for _, event := range must(s.Events(ctx, "r", 0, "")) {
+		if event.Kind != "migration.taken_over" {
+			continue
+		}
+		switch event.Subject {
+		case "M-a":
+			a = event
+		case "M-b":
+			b = event
+		}
+	}
+	if a.ID == 0 || b.ID == 0 {
+		t.Fatalf("takeover events missing: A=%+v B=%+v", a, b)
+	}
+	if a.ID >= b.ID {
+		t.Fatalf("event IDs are not commit-ordered: A=%d B=%d", a.ID, b.ID)
+	}
+	after := must(s.Events(ctx, "r", a.ID, ""))
+	if len(after) != 1 || after[0].ID != b.ID {
+		t.Fatalf("events after A=%d: %+v; want B=%d", a.ID, after, b.ID)
+	}
+}

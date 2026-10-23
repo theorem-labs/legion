@@ -2,7 +2,6 @@ package ledger
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -704,28 +703,4 @@ func migrations(ctx context.Context, q querier, repo, state string) ([]Migration
 		out = append(out, m)
 	}
 	return out, nil
-}
-
-// Event is one entry of the append-only log.
-type Event struct {
-	ID      int64           `json:"id"`
-	At      time.Time       `json:"at"`
-	Kind    string          `json:"kind"`
-	Subject string          `json:"subject"`
-	Actor   string          `json:"actor,omitempty"`
-	Data    json.RawMessage `json:"data"`
-}
-
-// Events lists a repository's events after the given id, oldest first; subject "" means every subject.
-func (s *Store) Events(ctx context.Context, repo string, after int64, subject string) ([]Event, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, at, kind, subject, actor, data FROM events
-		WHERE repo = $1 AND id > $2 AND ($3 = '' OR subject = $3) ORDER BY id`, repo, after, subject)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Event, error) {
-		var e Event
-		err := r.Scan(&e.ID, &e.At, &e.Kind, &e.Subject, &e.Actor, &e.Data)
-		return e, err
-	})
 }
