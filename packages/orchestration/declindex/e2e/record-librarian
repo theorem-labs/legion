@@ -1,0 +1,84 @@
+#!/bin/sh
+set -eu
+
+usage() {
+	printf '%s\n' 'usage: record-librarian --id ID --proposer OWNER --proposal FILE [-- COMMAND ...]' >&2
+	exit 2
+}
+
+record=${LIBRARIAN_RECORD-}
+if [ -z "$record" ]; then
+	printf '%s\n' 'record-librarian: LIBRARIAN_RECORD is required' >&2
+	exit 2
+fi
+
+id=
+proposer=
+proposal=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--id)
+		[ "$#" -ge 2 ] || usage
+		id=$2
+		shift 2
+		;;
+	--proposer)
+		[ "$#" -ge 2 ] || usage
+		proposer=$2
+		shift 2
+		;;
+	--proposal)
+		[ "$#" -ge 2 ] || usage
+		proposal=$2
+		shift 2
+		;;
+	--)
+		shift
+		break
+		;;
+	*)
+		usage
+		;;
+	esac
+done
+
+case "$id" in
+'' | *[!A-Za-z0-9._:-]*)
+	printf '%s\n' 'record-librarian: id must contain only letters, digits, dot, underscore, colon, and hyphen' >&2
+	exit 2
+	;;
+esac
+case "$proposer" in
+'' | *"$(printf '\t')"* | *'
+'*)
+	printf '%s\n' 'record-librarian: proposer must be one non-empty TSV field' >&2
+	exit 2
+	;;
+esac
+[ -n "$proposal" ] || usage
+
+umask 077
+hash_line=$(sha256sum "$proposal")
+hash=${hash_line%% *}
+case "$hash" in
+????????????????????????????????????????????????????????????????)
+	;;
+*)
+	printf '%s\n' 'record-librarian: sha256sum returned an invalid digest' >&2
+	exit 2
+	;;
+esac
+case "$hash" in
+*[!0-9a-f]*)
+	printf '%s\n' 'record-librarian: sha256sum returned an invalid digest' >&2
+	exit 2
+	;;
+esac
+
+mkdir -p "$record.d"
+printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$proposer" "$hash" >> "$record"
+cp "$proposal" "$record.d/$id"
+
+if [ "$#" -gt 0 ]; then
+	"$@"
+fi
