@@ -90,25 +90,48 @@ export function controllerToken(project: string): string {
   return `legion-${project}-controller`;
 }
 
-/** An owner's ledger key: a graph node id (`function:get_mountpoint`) or a named role
- * (`librarian`) — the Go daemon's `claim.ownerKey`. */
-const OWNER_KEY = /^[a-z][A-Za-z0-9_.:-]*$/;
-/** Each key character an Envoy role token cannot hold, as `_` and one letter. */
-const OWNER_ESCAPES: Record<string, string> = { _: "__", ".": "_d", ":": "_c" };
+/** The graph node kinds an owner key may name, the part of a node id before its first colon —
+ * the Go daemon's `claim.NodeKinds`. */
+export const OWNER_NODE_KINDS = ["function", "struct", "global", "percpu", "subsystem"] as const;
+/** A graph node id (`function:mnt_get_writers@fs/namespace.c`) or a named role (`librarian`) —
+ * the Go daemon's `claim.IsOwnerKey`. */
+const NODE_OWNER_KEY = new RegExp(`^(?:${OWNER_NODE_KINDS.join("|")}):\\S+$`);
+const NAMED_OWNER_KEY = /^[a-z][a-z0-9-]*$/;
+/** The bytes an owner name spells as `_` and one letter; every other byte outside `[a-z0-9-]` but
+ * an uppercase letter is `_x` and two lowercase hex digits. */
+const OWNER_ESCAPES: Record<string, string> = { _: "_", ".": "d", ":": "c", "/": "s", "@": "a" };
+const OWNER_UNESCAPES: Record<string, string> = { _: "_", d: ".", c: ":", s: "/", a: "@" };
 /** An owner token names files in the daemon's state directory, so it stays under NAME_MAX with
  * room for their suffixes — the Go daemon's `claim.MaxOwnerTokenLength`. */
 const MAX_OWNER_TOKEN_LENGTH = 200;
 
+function isOwnerKey(key: string): boolean {
+  return NODE_OWNER_KEY.test(key) || NAMED_OWNER_KEY.test(key);
+}
+
+function literalOwnerByte(byte: number): boolean {
+  return (byte >= 0x61 && byte <= 0x7a) || (byte >= 0x30 && byte <= 0x39) || byte === 0x2d;
+}
+
 /** The Envoy role token of a tree-independent standing owner, `legion-<project>-owner-<name>`,
- * byte for byte the Go daemon's `claim.OwnerToken`: name is the key with `_` as `__`, `.` as
- * `_d`, `:` as `_c` and an uppercase letter as `_u` and the letter lowercased, so two keys never
- * share a token. */
+ * byte for byte the Go daemon's `claim.OwnerToken`: name is the key's UTF-8 bytes with a-z, 0-9
+ * and `-` as themselves, `_` as `__`, `.` as `_d`, `:` as `_c`, `/` as `_s`, `@` as `_a`, an
+ * uppercase letter as `_u` and the letter lowercased, and any other byte as `_x` and two lowercase
+ * hex digits, so two keys never share a token. */
 export function standingOwnerToken(project: string, owner: string): string {
   assertLegionProjectToken(project);
-  if (!OWNER_KEY.test(owner)) {
+  if (!isOwnerKey(owner)) {
     throw new Error(`Invalid standing owner: ${owner}`);
   }
-  const name = owner.replace(/[A-Z_.:]/g, (c) => OWNER_ESCAPES[c] ?? `_u${c.toLowerCase()}`);
+  let name = "";
+  for (const byte of new TextEncoder().encode(owner)) {
+    const char = String.fromCharCode(byte);
+    const escaped = OWNER_ESCAPES[char];
+    if (literalOwnerByte(byte)) name += char;
+    else if (escaped !== undefined) name += `_${escaped}`;
+    else if (byte >= 0x41 && byte <= 0x5a) name += `_u${char.toLowerCase()}`;
+    else name += `_x${byte.toString(16).padStart(2, "0")}`;
+  }
   const token = `legion-${project}-owner-${name}`;
   if (token.length > MAX_OWNER_TOKEN_LENGTH) {
     throw new Error(
@@ -116,6 +139,55 @@ export function standingOwnerToken(project: string, owner: string): string {
     );
   }
   return token;
+}
+
+/** The owner key a standing owner's token of project encodes — the Go daemon's `Token.OwnerKey`,
+ * as strict as its `claim.DecodeOwnerName` — or undefined for a token that is no owner token of
+ * project, or whose name no key encodes to. */
+export function standingOwnerKey(project: string, token: string): string | undefined {
+  const prefix = `legion-${project}-owner-`;
+  if (!isLegionProjectToken(project) || !token.startsWith(prefix)) return undefined;
+  const name = token.slice(prefix.length);
+  const bytes: number[] = [];
+  for (let i = 0; i < name.length; i += 1) {
+    const byte = name.charCodeAt(i);
+    if (literalOwnerByte(byte)) {
+      bytes.push(byte);
+      continue;
+    }
+    if (name[i] !== "_" || i + 1 >= name.length) return undefined;
+    i += 1;
+    const letterAfter = name[i] ?? "";
+    if (letterAfter === "u") {
+      const letter = name.charCodeAt(i + 1);
+      if (!(letter >= 0x61 && letter <= 0x7a)) return undefined;
+      i += 1;
+      bytes.push(letter - 0x20);
+    } else if (letterAfter === "x") {
+      const hex = name.slice(i + 1, i + 3);
+      if (!/^[0-9a-f]{2}$/.test(hex)) return undefined;
+      const byte = Number.parseInt(hex, 16);
+      // An escape of a byte with a shorter spelling is no key's name: refused, as Go refuses it.
+      const shorter =
+        literalOwnerByte(byte) ||
+        OWNER_ESCAPES[String.fromCharCode(byte)] !== undefined ||
+        (byte >= 0x41 && byte <= 0x5a);
+      if (shorter) return undefined;
+      i += 2;
+      bytes.push(byte);
+    } else {
+      const unescaped = OWNER_UNESCAPES[letterAfter];
+      if (unescaped === undefined) return undefined;
+      bytes.push(unescaped.charCodeAt(0));
+    }
+  }
+  let key: string;
+  try {
+    key = new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    return undefined;
+  }
+  return isOwnerKey(key) ? key : undefined;
 }
 
 export function roleTopic(token: string): string {

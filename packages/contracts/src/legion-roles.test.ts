@@ -9,6 +9,7 @@ import {
   roleToken,
   roleTopic,
   sanitizeToken,
+  standingOwnerKey,
   standingOwnerToken,
 } from "./legion-roles";
 
@@ -69,19 +70,43 @@ describe("role token grammar", () => {
   });
 });
 
-// The Go daemon's claim.OwnerToken reads the same fixture: an owner's agent claims the role the
-// daemon launched it under.
+// The Go daemon's claim.OwnerToken and claim.DecodeOwnerName read the same fixture: an owner's
+// agent claims the role the daemon launched it under, and both sides decode it to one key.
 describe("standingOwnerToken", () => {
-  test("spells every owner key as fixtures/owner-tokens.json does", () => {
+  test("spells every owner key as fixtures/owner-tokens.json does, and decodes it back", () => {
     for (const [key, token] of Object.entries(ownerTokens.tokens)) {
       expect(standingOwnerToken(ownerTokens.project, key)).toBe(token);
       expect(token).toMatch(ENVOY_ROLE_TOKEN);
+      expect(standingOwnerKey(ownerTokens.project, token)).toBe(key);
     }
   });
 
-  test("refuses a key outside the owner-key alphabet", () => {
+  test("refuses a key outside the owner-key grammar", () => {
     for (const key of ownerTokens.refused) {
       expect(() => standingOwnerToken(ownerTokens.project, key)).toThrow("Invalid standing owner");
+    }
+  });
+
+  test("decodes no name that no key encodes to", () => {
+    for (const name of ownerTokens.malformed) {
+      expect(
+        standingOwnerKey(ownerTokens.project, `legion-${ownerTokens.project}-owner-${name}`)
+      ).toBeUndefined();
+    }
+    expect(
+      standingOwnerKey("other", standingOwnerToken(ownerTokens.project, "librarian"))
+    ).toBeUndefined();
+  });
+
+  test("round-trips every printable ASCII byte of a node id's suffix, each to its own token", () => {
+    const seen = new Map<string, string>();
+    for (let code = 0x21; code < 0x7f; code += 1) {
+      const key = `function:a${String.fromCharCode(code)}`;
+      const token = standingOwnerToken("p", key);
+      expect(token).toMatch(ENVOY_ROLE_TOKEN);
+      expect(seen.get(token)).toBeUndefined();
+      seen.set(token, key);
+      expect(standingOwnerKey("p", token)).toBe(key);
     }
   });
 
