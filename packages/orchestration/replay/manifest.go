@@ -55,6 +55,7 @@ func Load(path string) (Manifest, error) {
 
 	var manifest Manifest
 	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&manifest); err != nil {
 		return Manifest{}, fmt.Errorf("decode manifest: %w", err)
 	}
@@ -72,15 +73,19 @@ func Load(path string) (Manifest, error) {
 }
 
 func (m Manifest) validate(dir string) error {
-	root, err := filepath.EvalSymlinks(dir)
+	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return fmt.Errorf("resolve manifest directory: %w", err)
+		return fmt.Errorf("open manifest directory: %w", err)
 	}
+	defer root.Close()
 	if m.Format != Format {
 		return fmt.Errorf("manifest format %q, want %q", m.Format, Format)
 	}
 	if !commitID.MatchString(m.Base) {
 		return fmt.Errorf("manifest base %q is not a 40-character lowercase hexadecimal commit", m.Base)
+	}
+	if len(m.BuildRounds) == 0 {
+		return fmt.Errorf("manifest has no build rounds")
 	}
 
 	members := make(map[string]struct{}, len(m.Members))
@@ -92,6 +97,12 @@ func (m Manifest) validate(dir string) error {
 			return fmt.Errorf("manifest member %q head %q is not a 40-character lowercase hexadecimal commit", member.ID, member.Head)
 		}
 		members[member.ID] = struct{}{}
+	}
+	for _, unresolved := range m.Unresolved {
+		if _, exists := members[unresolved.ID]; exists {
+			return fmt.Errorf("manifest repeats member %q as unresolved", unresolved.ID)
+		}
+		members[unresolved.ID] = struct{}{}
 	}
 
 	for index, round := range m.BuildRounds {
@@ -115,31 +126,38 @@ func (m Manifest) validate(dir string) error {
 	return nil
 }
 
-func validateLog(root, log string) error {
-	log = filepath.Clean(log)
-	if filepath.IsAbs(log) || log == "." || log == ".." || strings.HasPrefix(log, ".."+string(filepath.Separator)) {
+func validateLog(root *os.Root, log string) error {
+	if filepath.IsAbs(log) || log == "" {
 		return fmt.Errorf("is not relative to the manifest")
 	}
 	parts := strings.Split(log, string(filepath.Separator))
-	current := root
+	current := ""
 	for i, part := range parts {
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("is not a clean relative path")
+		}
+		if current == "" {
+			current = part
+		} else {
+			current = filepath.Join(current, part)
+		}
+		info, err := root.Lstat(current)
 		if err != nil {
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("contains a symbolic link")
 		}
-		if i < len(parts)-1 {
-			if !info.IsDir() {
-				return fmt.Errorf("has a non-directory path component")
-			}
-			continue
+		if i < len(parts)-1 && !info.IsDir() {
+			return fmt.Errorf("has a non-directory path component")
 		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("is not a regular file")
-		}
+	}
+	info, err := root.Stat(log)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("is not a regular file")
 	}
 	return nil
 }
