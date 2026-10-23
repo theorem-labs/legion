@@ -779,6 +779,70 @@ func TestStatementRecordsRoundTripThroughRequestFiles(t *testing.T) {
 	}
 }
 
+func TestContractListRoundTrips(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		code := run(context.Background(), args, getenv, &out, &err)
+		return code, out.String(), err.String()
+	}
+	invoke := func(args ...string) string {
+		t.Helper()
+		code, stdout, stderr := call(args...)
+		if code != 0 {
+			t.Fatalf("%v exited %d: %s", args, code, stderr)
+		}
+		return stdout
+	}
+	type listed struct {
+		Name          string `json:"name"`
+		Owner         string `json:"owner"`
+		StatementHash string `json:"statement_hash"`
+		Version       int64  `json:"version"`
+		Pinned        bool   `json:"pinned"`
+	}
+	list := func() []listed {
+		t.Helper()
+		stdout := invoke("--json", "contract", "list", "r")
+		var contracts []listed
+		if err := json.Unmarshal([]byte(stdout), &contracts); err != nil || contracts == nil {
+			t.Fatalf("contract list JSON: %v: %q", err, stdout)
+		}
+		return contracts
+	}
+
+	if code, _, stderr := call("--json", "contract", "list", "r"); code != 3 || !strings.Contains(stderr, `"r"`) {
+		t.Fatalf("contract list of an unknown repository: code=%d stderr=%q; want 3", code, stderr)
+	}
+	invoke("repo", "ensure", "r", "0")
+	if got := list(); len(got) != 0 {
+		t.Fatalf("contract list of an empty repository: %+v", got)
+	}
+	invoke("contract", "register", "r", "Z.last", "alice", "hash-z1", "true")
+	invoke("contract", "register", "r", "B.first", "bob", "hash-b1", "false")
+	invoke("open", "r", "M-1", "bob", "base", "branch", "--write", "b.lean", "--read", "B.first=hash-b1")
+	invoke("land", "--repo", "r", "--migration", "M-1", "--generation", "1", "--commit", "commit-1",
+		"--path", "b.lean", "--current", "B.first=hash-b1", "--changed-contract", "B.first=hash-b2",
+		"--head", "head-1", "--reviewed-head", "head-1")
+	want := []listed{
+		{Name: "B.first", Owner: "bob", StatementHash: "hash-b2", Version: 2},
+		{Name: "Z.last", Owner: "alice", StatementHash: "hash-z1", Version: 1, Pinned: true},
+	}
+	if got := list(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("contract list: %+v, want %+v", got, want)
+	}
+	if code, _, stderr := call("contract", "list"); code != 2 || !strings.Contains(stderr, "contract list <repo>") {
+		t.Fatalf("contract list without a repository: code=%d stderr=%q; want 2", code, stderr)
+	}
+}
+
 func TestRepoEnsureRejectsRoundLimitsOutsideInt32(t *testing.T) {
 	dsn := testpg.Database(t, "ledger_command")
 	getenv := func(key string) string {

@@ -75,6 +75,44 @@ func (s *Store) Contract(ctx context.Context, repo, name string) (Contract, erro
 	return c, err
 }
 
+// Contracts lists every contract of a repository at its current owner, hash and version, ordered by name, from one
+// read-only repeatable-read snapshot. A repository with no contracts gives an empty list; an unknown one is
+// NotFoundError.
+func (s *Store) Contracts(ctx context.Context, repo string) ([]Contract, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM repositories WHERE name = $1)`, repo).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, &NotFoundError{What: "repository", ID: repo}
+	}
+	rows, err := tx.Query(ctx, `SELECT name, owner, statement_hash, version, pinned, updated_at FROM contracts
+		WHERE repo = $1 ORDER BY name`, repo)
+	if err != nil {
+		return nil, err
+	}
+	contracts, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Contract, error) {
+		var c Contract
+		err := r.Scan(&c.Name, &c.Owner, &c.StatementHash, &c.Version, &c.Pinned, &c.UpdatedAt)
+		return c, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	if contracts == nil {
+		contracts = []Contract{}
+	}
+	return contracts, nil
+}
+
 // TransferContract moves a contract to a new owner without changing its statement or version.
 func (s *Store) TransferContract(ctx context.Context, repo, name, fromOwner, toOwner string) (Contract, error) {
 	if strings.TrimSpace(name) == "" || strings.TrimSpace(fromOwner) == "" || strings.TrimSpace(toOwner) == "" {

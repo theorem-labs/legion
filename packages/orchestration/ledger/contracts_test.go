@@ -62,6 +62,47 @@ func TestTransferContractRequiresCurrentOwner(t *testing.T) {
 	wantRefusal(t, err, ledger.ReasonNotOwner)
 }
 
+func TestContractsListsTheRepositorysContractsAtTheirCurrentVersions(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if got := must(s.Contracts(ctx, "r")); got == nil || len(got) != 0 {
+		t.Fatalf("contracts of an empty repository: %#v, want an empty list", got)
+	}
+	must(s.EnsureRepo(ctx, "other", 0))
+	must(s.RegisterContract(ctx, "other", "A.other", "carol", "hash-o", false))
+	must(s.RegisterContract(ctx, "r", "Z.last", "alice", "hash-z1", true))
+	must(s.RegisterContract(ctx, "r", "B.first", "bob", "hash-b1", false))
+	m := must(open(t, s, "M-1", "bob", []string{"b.lean"}, map[string]string{"B.first": "hash-b1"}))
+	must(s.Land(ctx, landRequest(m, "commit-1", []string{"b.lean"}, map[string]string{"B.first": "hash-b1"},
+		map[string]string{"B.first": "hash-b2"}, nil)))
+
+	got := must(s.Contracts(ctx, "r"))
+	want := []ledger.Contract{
+		must(s.Contract(ctx, "r", "B.first")),
+		must(s.Contract(ctx, "r", "Z.last")),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("contracts: %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("contract %d: %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if b := got[0]; b.Name != "B.first" || b.Owner != "bob" || b.StatementHash != "hash-b2" || b.Version != 2 || b.Pinned {
+		t.Errorf("advanced contract: %+v", b)
+	}
+	if z := got[1]; z.Name != "Z.last" || z.Owner != "alice" || z.StatementHash != "hash-z1" || z.Version != 1 || !z.Pinned {
+		t.Errorf("unchanged contract: %+v", z)
+	}
+
+	_, err := s.Contracts(ctx, "missing")
+	var missing *ledger.NotFoundError
+	if !errors.As(err, &missing) || missing.What != "repository" || missing.ID != "missing" {
+		t.Fatalf("contracts of an unknown repository: want not found, got %v", err)
+	}
+}
+
 func TestOpenAndExtendCaptureRegisteredContractVersions(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

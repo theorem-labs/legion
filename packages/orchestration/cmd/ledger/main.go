@@ -328,7 +328,7 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 
 func contractCommand(ctx context.Context, s *ledger.Store, args []string) (any, bool, error) {
 	if len(args) == 0 {
-		return nil, false, usagef("contract register|transfer|show ...")
+		return nil, false, usagef("contract register|transfer|show|list ...")
 	}
 	switch args[0] {
 	case "register":
@@ -350,6 +350,12 @@ func contractCommand(ctx context.Context, s *ledger.Store, args []string) (any, 
 			return nil, true, usagef("contract show <repo> <name>")
 		}
 		value, err := s.Contract(ctx, args[1], args[2])
+		return value, true, err
+	case "list":
+		if len(args) != 2 {
+			return nil, true, usagef("contract list <repo>")
+		}
+		value, err := s.Contracts(ctx, args[1])
 		return value, true, err
 	default:
 		return nil, false, usagef("unknown contract command %q", args[0])
