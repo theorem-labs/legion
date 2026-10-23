@@ -25,8 +25,7 @@ git clone --filter=blob:none "$repository" "$dir"
 git -C "$dir" checkout "$commit"
 (
   cd "$dir"
-  # CMake 3.25 otherwise mistakes FetchContent's source directory for a completed clone.
-  cmake --preset release -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+  cmake --preset release
 )
 make -C "$dir/build/release" stage2 -j"$(nproc)"
 "$dir/build/release/stage2/bin/lean" --version | grep --fixed-strings "$commit"
