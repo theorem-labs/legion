@@ -17,7 +17,6 @@ import (
 // contract's hash and version change only when the landing program lands it (ledger.Store.Land); the index
 // registers the contracts that are new and checks the others.
 type ContractLedger interface {
-	Contract(ctx context.Context, repo, name string) (ledger.Contract, error)
 	Contracts(ctx context.Context, repo string) ([]ledger.Contract, error)
 	RegisterContract(ctx context.Context, repo, name, owner, hash string, pinned bool) (ledger.Contract, error)
 }
@@ -157,8 +156,10 @@ type LedgerReport struct {
 
 // CheckLedger runs after a landing, on the index of the landed build. It registers every contract the rule
 // selects that the ledger lacks and that has an owner, at version 1 with the index's statement hash, and reports
-// every registered contract whose ledger hash differs from the index's. It never advances a contract: only a
-// landing does. The hash is the statement hash (StatementHash), the hash a change lock records for its reads.
+// every registered contract whose ledger hash differs from the index's, and every ledger contract the index no
+// longer declares. It never advances a contract: only a landing does. The hash is the statement hash
+// (StatementHash), the hash a change lock records for its reads. The ledger is read in one call, so the check
+// costs one round trip plus one per contract it registers.
 func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, rule ContractRule, owners Owners) (LedgerReport, error) {
 	var r LedgerReport
 	var err error
@@ -168,6 +169,14 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 	contracts, err := s.Contracts(ctx, rule)
 	if err != nil {
 		return r, err
+	}
+	all, err := l.Contracts(ctx, repo)
+	if err != nil {
+		return r, fmt.Errorf("list the ledger's contracts: %w", err)
+	}
+	inLedger := make(map[string]ledger.Contract, len(all))
+	for _, c := range all {
+		inLedger[c.Name] = c
 	}
 	count := map[string]int{}
 	for _, c := range contracts {
@@ -180,10 +189,9 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 			continue
 		}
 		r.Contracts++
-		cur, err := l.Contract(ctx, repo, c.Name)
-		var nf *ledger.NotFoundError
+		cur, ok := inLedger[c.Name]
 		switch {
-		case errors.As(err, &nf):
+		case !ok:
 			owner := owners[dirOf(c.Path)]
 			if owner == "" {
 				r.Unowned = append(r.Unowned, c.Name)
@@ -196,8 +204,6 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 				return r, fmt.Errorf("register %s: %w", c.Name, err)
 			}
 			r.Registered = append(r.Registered, c.Name)
-		case err != nil:
-			return r, fmt.Errorf("read contract %s: %w", c.Name, err)
 		case cur.StatementHash == c.StmtHash:
 			r.Matching++
 		default:
@@ -206,16 +212,8 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 		}
 	}
 	sort.Strings(r.Ambiguous)
-	selected := map[string]bool{}
-	for _, c := range contracts {
-		selected[c.Name] = true
-	}
-	all, err := l.Contracts(ctx, repo)
-	if err != nil {
-		return r, fmt.Errorf("list the ledger's contracts: %w", err)
-	}
 	for _, c := range all {
-		if !selected[c.Name] {
+		if count[c.Name] == 0 {
 			r.Gone = append(r.Gone, c.Name)
 		}
 	}

@@ -51,13 +51,13 @@ A proposal's own definition that only wraps a registered concept goes to the lib
 At commit `170372292`, on 48 jobs on the build machine:
 
 - **Full build of the `.ilean` part:** 2 min 6 s.
-- **Compiled part:** 14 min 33 s for 52,529 modules and 789,877 constants.
+- **Compiled part:** 15 min 3 s for 52,529 modules and 789,877 constants (the whole refresh from nothing, both parts: 18 min 26 s).
 - **Update after a landing:**
   - 2.3 s when nothing changed;
   - 16.2 s when one module changed, 11 s of which rebuilds the graph file.
 - **Query times, each process included:**
   - `users`: 0.009 s median and 0.59 s worst, for `kObj`;
-  - `states` of the stack-alignment concept: 1.05 s for 23,095 rows;
+  - `states` of the stack-alignment concept: 0.34 s for 23,095 rows;
   - `gate`: about 3.5 s, which includes compiling the proposal.
 - **`states LinuxMmu.SK.SpAligned` against the rule's 1,824 Spec files:**
   - direct statements only: 66.1% recall;
@@ -74,5 +74,6 @@ At commit `170372292`, on 48 jobs on the build machine:
 `ledger` runs after a landing on the index of the landed build.
 
 - It registers each contract that the rule selects and that has an owner. A contract's owner comes from an `owners/v1` file. Registration is at version 1, with the statement hash.
-- It reports each contract whose ledger hash differs from the index's. It never advances a contract: only `Land` does.
+- It reports each contract whose ledger hash differs from the index's, and each ledger contract the index no longer declares. It never advances a contract: only `Land` does.
+- On the Linux proof's slice it registered 420 owned contracts; the next run found all 435 owned contracts matching, 0 defects.
 - The hash is the text statement hash, because a change lock's reads carry that hash and `Land` compares the two.
