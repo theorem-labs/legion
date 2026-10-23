@@ -32,13 +32,13 @@ const (
 // OpenRequest declares a migration: what it writes (files, or directories ending in "/", new files included)
 // and the statement hash of each declaration it read.
 type OpenRequest struct {
-	Repo       string
-	ID         string
-	Owner      string
-	BaseCommit string
-	Branch     string
-	Writes     []string
-	Reads      map[string]string
+	Repo       string            `json:"repo"`
+	ID         string            `json:"id"`
+	Owner      string            `json:"owner"`
+	BaseCommit string            `json:"base_commit"`
+	Branch     string            `json:"branch"`
+	Writes     []string          `json:"writes"`
+	Reads      map[string]string `json:"reads"`
 }
 
 // Migration is a migration's record. Writes and Reads are its declared change lock.
@@ -63,14 +63,14 @@ type Migration struct {
 
 // CheckRequest asks whether a candidate change may land for a migration.
 type CheckRequest struct {
-	Repo       string
-	ID         string
-	Generation int64
+	Repo       string `json:"repo"`
+	ID         string `json:"id"`
+	Generation int64  `json:"generation"`
 	// Changed is every path the candidate adds, modifies or deletes, relative to the repository root.
-	Changed []string
+	Changed []string `json:"changed"`
 	// Current maps a read's name to its statement hash in the candidate's base. An empty hash means the statement
 	// no longer exists; a name missing from the map was not hashed, so that read cannot be decided.
-	Current map[string]string
+	Current map[string]string `json:"current"`
 }
 
 // Violation is one reason a candidate must not land.

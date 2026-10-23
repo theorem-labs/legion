@@ -381,3 +381,122 @@ func TestRepeatableListFlagsPreserveCommaPaths(t *testing.T) {
 		t.Fatalf("comma path check: %v %q", err, result)
 	}
 }
+
+func TestJSONRequestFilesPreserveEqualsNamesAndHashes(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	invoke := func(args ...string) string {
+		t.Helper()
+		var out, err bytes.Buffer
+		if code := run(context.Background(), args, getenv, &out, &err); code != 0 {
+			t.Fatalf("%v exited %d: %s", args, code, err.String())
+		}
+		return out.String()
+	}
+	writeRequest := func(name, content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	invoke("repo", "ensure", "r", "0")
+	invoke("contract", "register", "r", "A=B", "owner", "h=1", "false")
+	openFile := writeRequest("open.json", `{"repo":"r","id":"M-1","owner":"owner","base_commit":"base","branch":"branch","writes":["a=b.lean"],"reads":{"A=B":"h=1"}}`)
+	invoke("open", "--request-file", openFile)
+	extendFile := writeRequest("extend.json", `{"repo":"r","id":"M-1","generation":1,"writes":["b=c.lean"],"reads":{}}`)
+	invoke("extend", "--request-file", extendFile)
+	checkFile := writeRequest("check.json", `{"repo":"r","id":"M-1","generation":1,"changed":["a=b.lean","b=c.lean"],"current":{"A=B":"h=1"}}`)
+	check := invoke("--json", "check", "--request-file", checkFile)
+	var checked struct {
+		Pass bool `json:"pass"`
+	}
+	if err := json.Unmarshal([]byte(check), &checked); err != nil || !checked.Pass {
+		t.Fatalf("equals check: %v %q", err, check)
+	}
+	agreeFile := writeRequest("agree.json", `{"repo":"r","id":"agreement","parties":["owner"],"reads":{"A=B":1}}`)
+	invoke("agree", "--request-file", agreeFile)
+	landFile := writeRequest("land.json", `{"repo":"r","migration":"M-1","generation":1,"commit":"commit-1","changed_paths":["a=b.lean","b=c.lean"],"current":{"A=B":"h=1"},"changed_contracts":{"A=B":"h=2"}}`)
+	invoke("land", "--request-file", landFile)
+	contract := invoke("--json", "contract", "show", "r", "A=B")
+	var shown struct {
+		StatementHash string `json:"statement_hash"`
+		Version       int64  `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(contract), &shown); err != nil || shown.StatementHash != "h=2" || shown.Version != 2 {
+		t.Fatalf("equals contract: %v %+v", err, shown)
+	}
+}
+
+func TestFlagMapArgumentsRejectAmbiguousEquals(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		return run(context.Background(), args, getenv, &out, &err), err.String()
+	}
+	mustCode := func(want int, args ...string) {
+		t.Helper()
+		code, stderr := call(args...)
+		if code != want || !strings.Contains(stderr, "use --request-file") {
+			t.Fatalf("%v: code=%d stderr=%q", args, code, stderr)
+		}
+	}
+	if code, stderr := call("repo", "ensure", "r", "0"); code != 0 {
+		t.Fatalf("ensure: code=%d stderr=%q", code, stderr)
+	}
+	mustCode(2, "open", "r", "M-1", "owner", "base", "branch", "--write", "a.lean", "--read", "A=B=h=1")
+	if code, stderr := call("open", "r", "M-1", "owner", "base", "branch", "--write", "a.lean"); code != 0 {
+		t.Fatalf("open: code=%d stderr=%q", code, stderr)
+	}
+	mustCode(2, "extend", "r", "M-1", "1", "--read", "A=B=h=1")
+	mustCode(2, "check", "r", "M-1", "1", "--current", "A=B=h=1")
+	mustCode(2, "agree", "r", "agreement", "--party", "owner", "--read", "A=B=1")
+	mustCode(2, "land", "--repo", "r", "--migration", "M-1", "--generation", "1", "--commit", "commit-1",
+		"--current", "A=B=h=1")
+}
+
+func TestRepoEnsureRejectsRoundLimitsOutsideInt32(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		code := run(context.Background(), args, getenv, &out, &err)
+		return code, out.String(), err.String()
+	}
+	if code, _, stderr := call("repo", "ensure", "max", "2147483647"); code != 0 {
+		t.Fatalf("max limit: code=%d stderr=%q", code, stderr)
+	}
+	statusCode, status, stderr := call("--json", "status", "max")
+	if statusCode != 0 || !strings.Contains(status, `"max_landing_rounds":2147483647`) {
+		t.Fatalf("max status: code=%d output=%q stderr=%q", statusCode, status, stderr)
+	}
+	for _, limit := range []string{"2147483648", "4294967296", "-1"} {
+		name := "bad-" + limit
+		if code, _, stderr := call("repo", "ensure", name, limit); code != 2 {
+			t.Errorf("limit %s: code=%d stderr=%q; want 2", limit, code, stderr)
+		}
+		if code, _, _ := call("status", name); code != 3 {
+			t.Errorf("limit %s persisted repository: status code=%d; want 3", limit, code)
+		}
+	}
+}

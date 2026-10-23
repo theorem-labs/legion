@@ -114,11 +114,11 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if len(args) != 3 || args[0] != "ensure" {
 			return nil, false, usagef("repo ensure <repo> <max-rounds>")
 		}
-		limit, err := integer(args[2])
+		limit, err := roundLimit(args[2])
 		if err != nil {
 			return nil, false, err
 		}
-		return mutation(s.EnsureRepo(ctx, args[1], int(limit)))
+		return mutation(s.EnsureRepo(ctx, args[1], limit))
 	case "claim":
 		if len(args) != 4 {
 			return nil, false, usagef("claim <repo> <item> <holder> <ttl>")
@@ -171,6 +171,12 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		value, err := s.Item(ctx, args[0], args[1])
 		return value, true, err
 	case "open":
+		if request, jsonInput, err := requestFile[ledger.OpenRequest](args); jsonInput {
+			if err != nil {
+				return nil, false, err
+			}
+			return mutation(s.OpenMigration(ctx, request))
+		}
 		if len(args) < 5 {
 			return nil, false, usagef("open <repo> <id> <owner> <base> <branch> --write <path> [--write <path>] [--read <name=hash>]")
 		}
@@ -185,6 +191,12 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			Repo: args[0], ID: args[1], Owner: args[2], BaseCommit: args[3], Branch: args[4], Writes: writes, Reads: reads,
 		}))
 	case "extend":
+		if request, jsonInput, err := requestFile[extendRequest](args); jsonInput {
+			if err != nil {
+				return nil, false, err
+			}
+			return mutation(s.ExtendMigration(ctx, request.Repo, request.ID, request.Generation, request.Writes, request.Reads))
+		}
 		if len(args) < 3 {
 			return nil, false, usagef("extend <repo> <id> <generation> [--write <path>] [--read <name=hash>]")
 		}
@@ -210,18 +222,27 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		return mutation(s.TakeOver(ctx, args[0], args[1], args[2], generation))
 	case "check":
-		if len(args) < 3 {
-			return nil, true, usagef("check <repo> <id> <generation> [--path <path>] [--current <name=hash>]")
+		var request ledger.CheckRequest
+		if decoded, jsonInput, err := requestFile[ledger.CheckRequest](args); jsonInput {
+			if err != nil {
+				return nil, true, err
+			}
+			request = decoded
+		} else {
+			if len(args) < 3 {
+				return nil, true, usagef("check <repo> <id> <generation> [--path <path>] [--current <name=hash>]")
+			}
+			generation, err := integer(args[2])
+			if err != nil {
+				return nil, true, err
+			}
+			paths, current, err := parsePathsAndCurrent(args[3:])
+			if err != nil {
+				return nil, true, err
+			}
+			request = ledger.CheckRequest{Repo: args[0], ID: args[1], Generation: generation, Changed: paths, Current: current}
 		}
-		generation, err := integer(args[2])
-		if err != nil {
-			return nil, true, err
-		}
-		paths, current, err := parsePathsAndCurrent(args[3:])
-		if err != nil {
-			return nil, true, err
-		}
-		value, err := s.Check(ctx, ledger.CheckRequest{Repo: args[0], ID: args[1], Generation: generation, Changed: paths, Current: current})
+		value, err := s.Check(ctx, request)
 		if err != nil {
 			return value, true, err
 		}
@@ -256,6 +277,12 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 	case "contract":
 		return contractCommand(ctx, s, args)
 	case "agree":
+		if request, jsonInput, err := requestFile[agreementRequest](args); jsonInput {
+			if err != nil {
+				return nil, false, err
+			}
+			return mutation(s.RecordAgreement(ctx, request.Repo, request.ID, request.Parties, request.Reads))
+		}
 		if len(args) < 2 {
 			return nil, false, usagef("agree <repo> <id> --party <party> [--party <party>] --read <contract=version>")
 		}
@@ -368,10 +395,59 @@ func duration(value string) (time.Duration, error) {
 	}
 	return d, nil
 }
+
+const maxLandingRounds = int64(2147483647)
+
+func roundLimit(value string) (int, error) {
+	limit, err := integer(value)
+	if err != nil {
+		return 0, err
+	}
+	if limit < 0 || limit > maxLandingRounds {
+		return 0, usagef("max rounds %q must be in 0..2147483647", value)
+	}
+	return int(limit), nil
+}
+
+type extendRequest struct {
+	Repo       string            `json:"repo"`
+	ID         string            `json:"id"`
+	Generation int64             `json:"generation"`
+	Writes     []string          `json:"writes"`
+	Reads      map[string]string `json:"reads"`
+}
+
+type agreementRequest struct {
+	Repo    string           `json:"repo"`
+	ID      string           `json:"id"`
+	Parties []string         `json:"parties"`
+	Reads   map[string]int64 `json:"reads"`
+}
+
+func requestFile[T any](args []string) (T, bool, error) {
+	var request T
+	if len(args) == 0 || args[0] != "--request-file" {
+		return request, false, nil
+	}
+	if len(args) != 2 {
+		return request, true, usagef("--request-file needs one path")
+	}
+	contents, err := os.ReadFile(args[1])
+	if err != nil {
+		return request, true, fmt.Errorf("read request file: %w", err)
+	}
+	if err := json.Unmarshal(contents, &request); err != nil {
+		return request, true, usagef("invalid request JSON: %v", err)
+	}
+	return request, true, nil
+}
 func parsePair(value string, allowEmpty bool) (string, string, error) {
 	name, content, ok := strings.Cut(value, "=")
 	if !ok || name == "" || (!allowEmpty && content == "") {
 		return "", "", usagef("invalid name=value %q", value)
+	}
+	if strings.Contains(content, "=") {
+		return "", "", usagef("ambiguous name=value %q; use --request-file", value)
 	}
 	return name, content, nil
 }
