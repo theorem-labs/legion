@@ -13,6 +13,10 @@ docker buildx build --load --tag declindex-e2e:local \
 
 The image never builds Lean. It copies the prebuilt toolchain `/opt/lean/<LEAN_FORK_COMMIT>` from `LEAN_IMAGE`, which defaults to the worker image `us-west1-docker.pkg.dev/theorem-agent-infra/legion/worker-lean@sha256:3c923ef45665cfd719c52e4706e558016b0e253edfb241f83b2cb8f08762c2ab`, and the build fails unless `lean --githash` equals `LEAN_FORK_COMMIT`. Pulling that image needs read access to the `legion` Artifact Registry repository. Where only a local copy of a worker image exists, pass it with `--build-arg LEAN_IMAGE=<image>` and record the substitution with the run. `build-lean.sh` builds Lean from source for CI runners only.
 
+**Rules:**
+- **No Lean compile on the devbox.** The toolchain comes from the worker-lean image pinned by digest.
+- **Any image rebuild on the devbox must reuse the previous image's layers** (`docker buildx build --cache-from declindex-e2e:local ...`), or it does not happen on the devbox.
+
 The base is the digest-pinned `golang:1.27.1-trixie` image, because the prebuilt toolchain links the system `libgmp` and `libstdc++` of Debian trixie; the build checks that `libgmp10` is 6.3.0 or newer, which Lean requires. The image installs elan v4.2.4 after checking its SHA-256, links the toolchain as `theorem-labs/lean4:machcsl-v4.36-d71bb0c6d0` and makes it the default, and installs `declindex`, `ledger`, `python3` and `strace`.
 
 The checksum's negative control (E8) is the same build with one digit of `ELAN_SHA256` changed; it must fail at `sha256sum --check`, before `elan-init` runs:
