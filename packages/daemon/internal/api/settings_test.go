@@ -153,6 +153,7 @@ var settingsExcluded = map[string]string{
 	"StandingOwner.MaxCostUSD":      "standing-owner admission policy is daemon-only",
 	"StandingOwners.Reconcile":      "standing-owner admission policy is daemon-only",
 	"StandingOwners.Templates":      "standing-owner launch policy is daemon-only",
+	"StandingOwners.NeverStart":     "standing-owner launch policy is daemon-only",
 	"OwnerTemplate.PromptFile":      "a daemon-local prompt path",
 	"OwnerTemplate.Harness":         "standing-owner launch policy is daemon-only",
 	"OwnerTemplate.MaxCostUSD":      "standing-owner admission policy is daemon-only",

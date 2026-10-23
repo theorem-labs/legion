@@ -548,6 +548,22 @@ export const LegionOperatorClaimsResponse = z.strictObject({
   claims: z.array(LegionOperatorClaimResponse),
 });
 
+/** `api.OwnerRefusal`: a standing owner the daemon will not start while its work stays at
+ * `revision`; `recorded` is whether the ledger holds the durable refusal. */
+export const LegionOwnerRefusal = z.strictObject({
+  repository: nonEmptyString,
+  owner: nonEmptyString,
+  revision: z.number().int().positive(),
+  reason: nonEmptyString,
+  refusedAt: z.string().datetime({ offset: true }),
+  recorded: z.boolean(),
+});
+
+/** `api.OwnerRefusals`, the body of `GET /legion/v1/operator/owners/refused`, in owner order. */
+export const LegionOwnerRefusalsResponse = z.strictObject({
+  refused: z.array(LegionOwnerRefusal),
+});
+
 /** The credential grant body from `internal/api/credentials.go`. */
 export const LegionGrantResponse = z.strictObject({
   grantId: nonEmptyString,

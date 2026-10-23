@@ -626,6 +626,18 @@ func TestOperatorClaimGolden(t *testing.T) {
 	golden(t, "operator-claim.json", operatorClaim())
 }
 
+// What GET /legion/v1/operator/owners/refused answers: each owner the daemon will not start while
+// its work is unchanged, recorded in the ledger or not yet.
+func TestOwnerRefusalsGolden(t *testing.T) {
+	at := time.Date(2026, 10, 23, 18, 40, 0, 0, time.UTC)
+	golden(t, "owner-refusals.json", OwnerRefusals{Refused: []OwnerRefusal{
+		{Repository: "example/repository", Owner: "file:fs/namespace.c", Revision: 41,
+			Reason: "standing_owners.templates has no template for node kind file", RefusedAt: at, Recorded: true},
+		{Repository: "example/repository", Owner: "struct:mount", Revision: 44,
+			Reason: "standing_owners.templates has no template for node kind struct", RefusedAt: at},
+	}})
+}
+
 // What the list route answers: a queued claim carries no locator and no delivery yet; a standing
 // owner names no tree or issue, and carries the ledger key it owns.
 func TestOperatorClaimsGolden(t *testing.T) {

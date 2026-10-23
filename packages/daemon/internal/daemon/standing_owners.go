@@ -5,16 +5,68 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/sjawhar/legion/daemon/internal/api"
 	"github.com/sjawhar/legion/daemon/internal/claim"
 	"github.com/sjawhar/legion/daemon/internal/config"
 	"github.com/sjawhar/legion/daemon/internal/store"
 	"github.com/sjawhar/legion/daemon/internal/supervise"
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
+
+// OwnerRefusalRecorder records, durably, that the daemon will not start an owner at a work
+// revision: the ledger's RecordOwnerRefused (INFRA-135 task L6), idempotent per owner and revision,
+// which appends `owner.refused` once.
+type OwnerRefusalRecorder interface {
+	RecordOwnerRefused(ctx context.Context, repo, owner string, revision int64, reason string) error
+}
+
+// ownerRefusals is every owner the admission loop refused while its work is unchanged, keyed by
+// owner, for the operator API (RefusedOwners); the admission loop writes it and the API reads it.
+type ownerRefusals struct {
+	mu      sync.Mutex
+	byOwner map[string]api.OwnerRefusal
+}
+
+// list is every refusal, in owner order.
+func (r *ownerRefusals) list() []api.OwnerRefusal {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	refused := make([]api.OwnerRefusal, 0, len(r.byOwner))
+	for _, refusal := range r.byOwner {
+		refused = append(refused, refusal)
+	}
+	slices.SortFunc(refused, func(a, b api.OwnerRefusal) int { return strings.Compare(a.Owner, b.Owner) })
+	return refused
+}
+
+func (r *ownerRefusals) get(owner string) (api.OwnerRefusal, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	refusal, ok := r.byOwner[owner]
+	return refusal, ok
+}
+
+func (r *ownerRefusals) put(refusal api.OwnerRefusal) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byOwner[refusal.Owner] = refusal
+}
+
+// forget drops the refusal of every owner not in open: its work is done, so the refusal is over.
+func (r *ownerRefusals) forget(open map[string]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for owner := range r.byOwner {
+		if !open[owner] {
+			delete(r.byOwner, owner)
+		}
+	}
+}
 
 // ledgerQueue is the daemon's view of the standing owners' ledger repository. It connects lazily
 // and reconnects with backoff: ledger availability gates owner admission only, never daemon boot
@@ -360,14 +412,18 @@ type admission struct {
 	s        *supervision
 	queue    *ledgerQueue
 	launches func(string) (config.OwnerTemplate, bool)
+	// neverStart is standing_owners.never_start: owners admission neither starts nor refuses.
+	neverStart map[string]bool
+	// refusals is each owner refused at its current work revision, which the operator API lists;
+	// recorder records each one durably in the ledger, nil for a daemon that records none.
+	refusals *ownerRefusals
+	recorder OwnerRefusalRecorder
 	// cursor is the newest ledger event read; known is whether it was read yet.
 	cursor int64
 	known  bool
 	// asked is each owner an event or pass asked to start that has not started yet; the sweep logs
 	// an owner it starts that nothing asked for, because that is a notification lost.
 	asked map[string]bool
-	// warned is each owner key already logged as one the daemon cannot launch.
-	warned map[string]bool
 }
 
 // admitStandingOwners wakes standing owners on their own goroutine, beside the serving API, so
@@ -388,7 +444,12 @@ func (s *supervision) admitStandingOwners(ctx context.Context) {
 		s.ledger.listen(ctx, notes)
 	}()
 	defer listening.Wait()
-	a := &admission{s: s, queue: s.ledger, launches: ownerLaunches(s.cfg.StandingOwners), asked: map[string]bool{}, warned: map[string]bool{}}
+	neverStart := map[string]bool{}
+	for _, owner := range s.cfg.StandingOwners.NeverStart {
+		neverStart[owner] = true
+	}
+	a := &admission{s: s, queue: s.ledger, launches: ownerLaunches(s.cfg.StandingOwners), neverStart: neverStart,
+		refusals: s.refused, recorder: s.plan.ownerRefusals, asked: map[string]bool{}}
 	sweep := time.NewTicker(s.cfg.StandingOwners.Reconcile)
 	defer sweep.Stop()
 	a.begin(ctx)
@@ -443,8 +504,8 @@ func (a *admission) events(ctx context.Context) {
 	}
 }
 
-// pass starts every owner with open work, and gives up the capacity a queued owner with none
-// reserved.
+// pass starts every owner with open work, gives up the capacity a queued owner with none reserved,
+// and ends the refusal of an owner whose work is done.
 func (a *admission) pass(ctx context.Context, why string) {
 	owners, err := a.queue.openOwners(ctx)
 	if err != nil {
@@ -456,6 +517,7 @@ func (a *admission) pass(ctx context.Context, why string) {
 		open[owner] = true
 		a.wake(ctx, owner, why)
 	}
+	a.refusals.forget(open)
 	for _, m := range a.s.supervisor.supervised() {
 		c := m.View().Claim
 		key, isOwner := c.StandingOwnerKey()
@@ -473,21 +535,25 @@ func (a *admission) pass(ctx context.Context, why string) {
 
 // wake starts the owner of key: it supervises a new claim for an owner the ledger names first, a
 // queued owner is asked to spawn, and an owner that exhausted its retries is retried once its work
-// changed.
+// changed. An owner on never_start is left alone, and one the daemon cannot launch is refused.
 func (a *admission) wake(ctx context.Context, key, why string) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || a.neverStart[key] {
 		return
 	}
 	token, err := claim.OwnerToken(a.s.plan.project, key)
 	if err != nil {
-		a.warnOnce(key, "standing owner: the ledger names an owner whose key cannot be a claim token; not started", "error", err)
+		a.refuse(ctx, key, fmt.Sprintf("the owner key is not one a standing owner can hold: %v", err))
 		return
 	}
 	m, supervised := a.s.supervisor.Machine(token)
 	if !supervised {
 		if _, ok := a.launches(key); !ok {
-			kind, _, _ := strings.Cut(key, ":")
-			a.warnOnce(key, "standing owner: the ledger names an owner with no named entry and no template for its kind; not started", "kind", kind)
+			kind, _, isNode := strings.Cut(key, ":")
+			reason := fmt.Sprintf("no standing_owners.owners entry is named %s", key)
+			if isNode {
+				reason = fmt.Sprintf("standing_owners.templates has no template for node kind %s", kind)
+			}
+			a.refuse(ctx, key, reason)
 			return
 		}
 		m, _, err = a.s.supervisor.Create(ctx, supervise.Claim{Token: token, Project: a.s.plan.project, Role: claim.RoleOwner,
@@ -521,12 +587,34 @@ func (a *admission) wake(ctx context.Context, key, why string) {
 	}
 }
 
-func (a *admission) warnOnce(key, message string, attrs ...any) {
-	if a.warned[key] {
+// refuse records that the daemon will not start owner while its work stays at the current
+// revision: durably in the ledger (recorder), once per revision, and in the operator API's list.
+// A refusal the ledger did not take is asked again at the next event or sweep.
+func (a *admission) refuse(ctx context.Context, owner, reason string) {
+	revision, err := a.queue.WorkRevision(ctx, owner)
+	if err != nil {
+		a.logLedger(ctx, "read a refused owner's work revision", err)
 		return
 	}
-	a.warned[key] = true
-	a.s.log.Warn(message, append([]any{"owner", key}, attrs...)...)
+	prior, refusedBefore := a.refusals.get(owner)
+	if refusedBefore && prior.Revision == revision && (prior.Recorded || a.recorder == nil) {
+		return
+	}
+	refusal := api.OwnerRefusal{Repository: a.queue.repo, Owner: owner, Revision: revision, Reason: reason, RefusedAt: time.Now().UTC()}
+	if refusedBefore && prior.Revision == revision {
+		refusal.RefusedAt = prior.RefusedAt
+	} else {
+		a.s.log.Warn("standing owner: refused; it starts only once its configuration can launch it", "owner", owner,
+			"revision", revision, "reason", reason)
+	}
+	if a.recorder != nil {
+		if err := a.recorder.RecordOwnerRefused(ctx, a.queue.repo, owner, revision, reason); err != nil {
+			a.logLedger(ctx, "record a refused owner", err)
+		} else {
+			refusal.Recorded = true
+		}
+	}
+	a.refusals.put(refusal)
 }
 
 func (a *admission) logLedger(ctx context.Context, what string, err error) {

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -103,6 +104,7 @@ func TestStandingOwnerConfigurationRefusesWhatCannotRun(t *testing.T) {
 		"neither owners nor templates":       head,
 		"a template kind with a colon":       head + template(`"function:x"`),
 		"an uppercase template kind":         head + template("Function"),
+		"a kind no node id has":              head + template("file"),
 		"a named owner shaped like a node":   head + "  owners:\n    - name: function:get_mountpoint\n      prompt_file: p\n      harness: omp\n      max_cost_usd: 1\n",
 		"a zero reconciliation":              head + template("function") + "  reconcile_seconds: 0\n",
 		"a named owner outside the alphabet": head + "  owners:\n    - name: Owner_A\n      prompt_file: p\n      harness: omp\n      max_cost_usd: 1\n",
@@ -169,5 +171,33 @@ func TestStandingOwnersAreTmuxOnly(t *testing.T) {
 	_, err := LoadForValidation(writeConfigFile(t, body), noEnv)
 	if err == nil || !strings.Contains(err.Error(), "standing_owners") || !strings.Contains(err.Error(), "tmux") {
 		t.Fatalf("LoadForValidation = %v, want standing_owners tmux refusal", err)
+	}
+}
+
+// never_start names owners whose items stay open for `owner status` and that the daemon never
+// starts: named roles or node ids, each an owner key, each once, and none an owner it is also told
+// to start.
+func TestStandingOwnersNeverStartListsOwnerKeys(t *testing.T) {
+	body := strings.Replace(standingOwnersYAML("1", "1", "owner-a"), "  max_running: 1\n",
+		"  max_running: 1\n  never_start: [escalations, \"function:mnt_get_writers@fs/namespace.c\"]\n", 1)
+	cfg, err := Load(writeConfigFile(t, minimalFile+body), noEnv)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.StandingOwners.NeverStart; !slices.Equal(got, []string{"escalations", "function:mnt_get_writers@fs/namespace.c"}) {
+		t.Fatalf("NeverStart = %q", got)
+	}
+	for name, list := range map[string]string{
+		"a key outside the grammar": "[\"file:x\"]",
+		"a key twice":               "[escalations, escalations]",
+		"a configured owner":        "[owner-a]",
+		"not a list":                "escalations",
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := strings.Replace(body, "[escalations, \"function:mnt_get_writers@fs/namespace.c\"]", list, 1)
+			if _, err := Load(writeConfigFile(t, minimalFile+bad), noEnv); err == nil || !strings.Contains(err.Error(), "never_start") {
+				t.Fatalf("Load = %v, want a never_start refusal", err)
+			}
+		})
 	}
 }

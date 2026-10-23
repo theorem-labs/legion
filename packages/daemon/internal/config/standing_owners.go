@@ -3,7 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
-	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,9 +33,10 @@ type OwnerTemplate struct {
 // StandingOwners is the configuration for the daemon's standing-owner supervisor. Owners are the
 // named owners; every other owner is a graph node the ledger names (an open item's owner, such as
 // `function:get_mountpoint`), launched by the template of its kind — the part of its id before the
-// colon. LedgerTimeout bounds each ledger call owner admission makes: the connection, its schema
-// check and each read. Reconcile is how often the safety sweep reads every open owner, beside the
-// wake each ledger event sends.
+// colon. NeverStart are owners the daemon never starts, whose items stay open for `owner status`
+// (an escalation queue a person reads). LedgerTimeout bounds each ledger call owner admission
+// makes: the connection, its schema check and each read. Reconcile is how often the safety sweep
+// reads every open owner, beside the wake each ledger event sends.
 type StandingOwners struct {
 	LedgerDSNFile string
 	Repository    string
@@ -45,6 +46,7 @@ type StandingOwners struct {
 	Reconcile     time.Duration
 	Owners        []StandingOwner
 	Templates     map[string]OwnerTemplate
+	NeverStart    []string
 }
 
 // TemplateFor is the template of a graph node id's kind, the part before its first colon.
@@ -64,9 +66,6 @@ const (
 	defaultReconcile = 5 * time.Minute
 )
 
-// nodeKind is a graph node kind: a template's key, the prefix of a node id before its colon.
-var nodeKind = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
-
 func readStandingOwners(value *yaml.Node, key string) (*StandingOwners, error) {
 	if value.Tag == "!!null" {
 		return nil, nil
@@ -75,7 +74,7 @@ func readStandingOwners(value *yaml.Node, key string) (*StandingOwners, error) {
 		return nil, fmt.Errorf("%s must be a mapping", key)
 	}
 	members, err := members(value, key, "ledger_dsn_file", "repository", "max_running", "budget_usd", "ledger_timeout_seconds",
-		"reconcile_seconds", "owners", "templates")
+		"reconcile_seconds", "owners", "templates", "never_start")
 	if err != nil {
 		return nil, err
 	}
@@ -134,8 +133,8 @@ func readStandingOwners(value *yaml.Node, key string) (*StandingOwners, error) {
 		}
 		for i := 0; i+1 < len(templatesNode.Content); i += 2 {
 			kind := templatesNode.Content[i].Value
-			if !nodeKind.MatchString(kind) {
-				return nil, fmt.Errorf("%s.templates: %q is not a node kind (lowercase letters, digits and _, as before a node id's colon)", key, kind)
+			if !slices.Contains(claim.NodeKinds, kind) {
+				return nil, fmt.Errorf("%s.templates: %q is not a node kind; a node id's kind is one of %s", key, kind, strings.Join(claim.NodeKinds, ", "))
 			}
 			template, err := readOwnerLaunch(templatesNode.Content[i+1], key+".templates."+kind, "prompt_file", "harness", "max_cost_usd")
 			if err != nil {
@@ -147,8 +146,40 @@ func readStandingOwners(value *yaml.Node, key string) (*StandingOwners, error) {
 	if len(owners) == 0 && len(templates) == 0 {
 		return nil, fmt.Errorf("%s needs owners or templates: with neither, no owner can start", key)
 	}
+	neverStart, err := readNeverStart(members["never_start"], key+".never_start", owners)
+	if err != nil {
+		return nil, err
+	}
 	return &StandingOwners{LedgerDSNFile: ledgerDSNFile, Repository: repository, MaxRunning: *maxRunning, BudgetUSD: budget,
-		LedgerTimeout: timeout, Reconcile: reconcile, Owners: owners, Templates: templates}, nil
+		LedgerTimeout: timeout, Reconcile: reconcile, Owners: owners, Templates: templates, NeverStart: neverStart}, nil
+}
+
+// readNeverStart reads the owners the daemon never starts: owner keys, each once, none an owner
+// the same file names to start.
+func readNeverStart(value *yaml.Node, key string, owners []StandingOwner) ([]string, error) {
+	if value == nil || value.Tag == "!!null" {
+		return nil, nil
+	}
+	if value.Kind != yaml.SequenceNode {
+		return nil, fmt.Errorf("%s must be an array of owner keys", key)
+	}
+	var keys []string
+	for index, node := range value.Content {
+		owner, err := requiredString(node, fmt.Sprintf("%s[%d]", key, index), "")
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case !claim.IsOwnerKey(owner):
+			return nil, fmt.Errorf("%s[%d] %q is not an owner key: a graph node id (%s, a colon, then no whitespace) or a named role", key, index, owner, strings.Join(claim.NodeKinds, "|"))
+		case slices.Contains(keys, owner):
+			return nil, fmt.Errorf("%s names %s twice", key, owner)
+		case slices.ContainsFunc(owners, func(o StandingOwner) bool { return o.Name == owner }):
+			return nil, fmt.Errorf("%s names %s, which owners also configures to start", key, owner)
+		}
+		keys = append(keys, owner)
+	}
+	return keys, nil
 }
 
 // readSeconds reads an optional positive count of seconds, fallback when absent.

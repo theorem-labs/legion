@@ -152,6 +152,9 @@ type overrides struct {
 	// none of to reserve. nil, in production, is nothing: every launch reaches the real store's
 	// own check.
 	checkLaunch func(context.Context, supervise.Claim) error
+	// ownerRefusals stands in for the ledger's durable owner refusal (OwnerRefusalRecorder); nil,
+	// in production until the ledger serves RecordOwnerRefused, records none.
+	ownerRefusals OwnerRefusalRecorder
 }
 
 // Build is what the binary knows of its own build: Revision, the commit it was built from, and
@@ -587,6 +590,8 @@ type plan struct {
 	// checkLaunch is overrides.checkLaunch; nil wraps the store with nothing, so every launch
 	// reaches the real store's own CheckLaunch.
 	checkLaunch func(context.Context, supervise.Claim) error
+	// ownerRefusals is overrides.ownerRefusals.
+	ownerRefusals OwnerRefusalRecorder
 }
 
 // runtimeFactory builds the runtime over the worker stream (C3): ctx is supervision's lifetime,
@@ -657,6 +662,7 @@ func prepare(cfg config.Config, log *slog.Logger, o overrides) (plan, error) {
 		tools: reads.tmux.tools, clock: clock, orphanSweep: orphanSweep, controllerRetry: controllerRetry, stopBudget: stop,
 		secretsEnroller: secretsEnroller, secretsLogin: secretsLogin, strandedReported: o.strandedReported,
 		pluginRelaunchable: pluginRelaunchable, plugins: plugins, pluginsSource: pluginsSource, checkLaunch: o.checkLaunch,
+		ownerRefusals: o.ownerRefusals,
 	}
 	if cfg.Runtime.Name == "kubernetes" {
 		err = prepareSandbox(cfg, o, reads.sandbox, &p)
@@ -872,6 +878,8 @@ type supervision struct {
 	claims     []supervise.Claim
 	// ledger is the standing owners' ledger queue, nil without standing_owners.
 	ledger *ledgerQueue
+	// refused is the standing owners admission refused, which the operator API lists.
+	refused *ownerRefusals
 	// imageReport is what the worker image's passed probe reported: of the image, from its OK line,
 	// and of the pool, the attempts that waited on its capacity (bootprobe.ImageReport); under
 	// tmux, the model-fallback mark alone, read by plan.modelFallback. probed is whether the probe
@@ -1025,7 +1033,7 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 	stopping, beginStop := context.WithCancel(context.Background())
 	return &supervision{
 		cfg: cfg, log: log, plan: p, stream: listener, runtime: rt, supervisor: sup, tokens: tokens, claims: claims,
-		ledger:  queue,
+		ledger: queue, refused: &ownerRefusals{byOwner: map[string]api.OwnerRefusal{}},
 		reports: reportsOfClaims(reports, claims), reportStore: st,
 		cancel: cancel, draining: draining, endDrain: endDrain, decided: api.NewRouteDecisions(),
 		stopping: stopping, beginStop: beginStop,
@@ -1428,6 +1436,7 @@ func serve(ctx context.Context, cfg config.Config, st *store.Store, startedAt ti
 		ClaimReady:         claimReadyHook(keeper, claimReady),
 		PromptAgents:       promptAgents(p.roleReferences),
 		CapabilityReported: s.capabilityReported,
+		RefusedOwners:      s.refused.list,
 	})
 
 	group, serving := errgroup.WithContext(ctx)
