@@ -100,6 +100,9 @@ func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) 
 		return nil, err
 	}
 	o := &owners{s: s, cache: map[string]Found{}}
+	if err := o.preload(ctx, names); err != nil {
+		return nil, err
+	}
 	seen := map[string]bool{}
 	var out []Found
 	for _, n := range names {
@@ -356,6 +359,63 @@ type owners struct {
 	cache map[string]Found
 }
 
+// preload resolves many constant names at once: one query per 500 candidate names (each name and its dotted
+// prefixes), not one lookup per name. A wide concept has tens of thousands of statements.
+func (o *owners) preload(ctx context.Context, names []string) error {
+	cands := map[string]bool{}
+	for _, n := range names {
+		for p := n; p != ""; {
+			cands[p] = true
+			i := strings.LastIndexByte(p, '.')
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+		}
+	}
+	list := keys(cands)
+	found := map[string]Found{}
+	for i := 0; i < len(list); i += 500 {
+		chunk := list[i:min(i+500, len(list))]
+		rows, err := o.s.db.QueryContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
+			FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var f Found
+			var rel string
+			if err := rows.Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
+				rows.Close()
+				return err
+			}
+			f.Path = sourcePath(rel, f.Module)
+			if _, ok := found[f.Name]; !ok {
+				found[f.Name] = f
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	for _, n := range names {
+		o.cache[n] = Found{Name: n}
+		for p := n; p != ""; {
+			if f, ok := found[p]; ok {
+				o.cache[n] = f
+				break
+			}
+			i := strings.LastIndexByte(p, '.')
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+		}
+	}
+	return nil
+}
+
 func (o *owners) of(ctx context.Context, name string) (Found, error) {
 	if f, ok := o.cache[name]; ok {
 		return f, nil
@@ -415,6 +475,13 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 		return nil, err
 	}
 	o := &owners{s: s, cache: map[string]Found{}}
+	consts := make([]string, len(rs))
+	for i, r := range rs {
+		consts[i] = r.name
+	}
+	if err := o.preload(ctx, consts); err != nil {
+		return nil, err
+	}
 	out := make([]Stating, 0, len(rs))
 	for _, r := range rs {
 		f, err := o.of(ctx, r.name)
@@ -452,6 +519,9 @@ func (s *Store) SameAtoms(ctx context.Context, name string) ([]string, error) {
 		return nil, err
 	}
 	o := &owners{s: s, cache: map[string]Found{}}
+	if err := o.preload(ctx, names); err != nil {
+		return nil, err
+	}
 	seen := map[string]bool{}
 	var out []string
 	for _, n := range names {

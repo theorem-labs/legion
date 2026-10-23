@@ -1,512 +1,508 @@
 {
- "Gold.Aligned": {
-  "at": "Golden.lean:7",
-  "declaration": "Gold.Aligned",
-  "direct": {
-   "by_directory": {
-    "": {
-     "other proof": 1,
-     "other stmt": 2
+  "Gold.Aligned": {
+    "at": "Golden.lean:7",
+    "declaration": "Gold.Aligned",
+    "direct": {
+      "by_directory": {
+        "": {
+          "other proof": 1,
+          "other stmt": 2
+        },
+        "Sub": {
+          "other stmt": 1
+        }
+      },
+      "declarations": 4,
+      "directories": 2,
+      "proof_uses": 1,
+      "stmt_uses": 3,
+      "uses": 4
     },
-    "Sub": {
-     "other stmt": 1
+    "kind": "abbrev",
+    "lines": [
+      "Golden.lean:11:8 in Gold.Frame [proof]",
+      "Golden.lean:14:52 in Gold.frame_al [stmt]",
+      "Golden.lean:27:53 in Gold.instFrameDec [stmt]",
+      "Sub/Wrap.lean:10:65 in Gold2.frameAt_al [stmt]"
+    ],
+    "reach": {
+      "all_directories": 2,
+      "proof_directories": 1,
+      "proofs_to_redo": 1,
+      "statement_directories": 2,
+      "statements_changed": 7,
+      "why": {
+        "": "Aligned -> Gold.Frame",
+        "Sub": "Aligned -> Gold.Frame -> Gold2.FrameAt"
+      }
     }
-   },
-   "declarations": 4,
-   "directories": 2,
-   "proof_uses": 1,
-   "stmt_uses": 3,
-   "uses": 4
   },
-  "kind": "abbrev",
-  "lines": [
-   "Golden.lean:11:8 in Gold.Frame [proof]",
-   "Golden.lean:14:52 in Gold.frame_al [stmt]",
-   "Golden.lean:27:53 in Gold.instFrameDec [stmt]",
-   "Sub/Wrap.lean:10:65 in Gold2.frameAt_al [stmt]"
-  ],
-  "reach": {
-   "all_directories": 2,
-   "proof_directories": 1,
-   "proofs_to_redo": 1,
-   "statement_directories": 2,
-   "statements_changed": 7,
-   "why": {
-    "": "Aligned -> Gold.Frame",
-    "Sub": "Aligned -> Gold.Frame -> Gold2.FrameAt"
-   }
-  }
- },
- "Gold.Box": {
-  "at": "Golden.lean:36",
-  "declaration": "Gold.Box",
-  "direct": {
-   "by_directory": {
-    "": {
-     "other proof": 4,
-     "other stmt": 2
-    }
-   },
-   "declarations": 2,
-   "directories": 1,
-   "proof_uses": 4,
-   "stmt_uses": 2,
-   "uses": 6
-  },
-  "kind": "structure",
-  "lines": [
-   "Golden.lean:40:17 in Gold.useBox [stmt]",
-   "Golden.lean:40:40 in Gold.useBox [proof]",
-   "Golden.lean:40:33 in Gold.useBox [proof]",
-   "Golden.lean:40:62 in Gold.useBox [proof]",
-   "Golden.lean:42:22 in Gold.box_pos [stmt]",
-   "Golden.lean:43:28 in Gold.box_pos [proof]"
-  ],
-  "reach": {
-   "all_directories": 2,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 2,
-   "statements_changed": 3,
-   "why": {
-    "": "Box -> Gold.box_pos",
-    "Sub": "Box -> Gold.useBox -> Gold2.box_two"
-   }
-  }
- },
- "Gold.Frame": {
-  "at": "Golden.lean:10",
-  "declaration": "Gold.Frame",
-  "direct": {
-   "by_directory": {
-    "": {
-     "other proof": 2,
-     "other stmt": 2
+  "Gold.Box": {
+    "at": "Golden.lean:36",
+    "declaration": "Gold.Box",
+    "direct": {
+      "by_directory": {
+        "": {
+          "other proof": 4,
+          "other stmt": 2
+        }
+      },
+      "declarations": 2,
+      "directories": 1,
+      "proof_uses": 4,
+      "stmt_uses": 2,
+      "uses": 6
     },
-    "Sub": {
-     "other proof": 5
+    "kind": "structure",
+    "lines": [
+      "Golden.lean:40:17 in Gold.useBox [stmt]",
+      "Golden.lean:40:40 in Gold.useBox [proof]",
+      "Golden.lean:40:33 in Gold.useBox [proof]",
+      "Golden.lean:40:62 in Gold.useBox [proof]",
+      "Golden.lean:42:22 in Gold.box_pos [stmt]",
+      "Golden.lean:43:28 in Gold.box_pos [proof]"
+    ],
+    "reach": {
+      "all_directories": 2,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 2,
+      "statements_changed": 3,
+      "why": {
+        "": "Box -> Gold.box_pos",
+        "Sub": "Box -> Gold.useBox -> Gold2.box_two"
+      }
     }
-   },
-   "declarations": 6,
-   "directories": 2,
-   "proof_uses": 7,
-   "stmt_uses": 2,
-   "uses": 9
   },
-  "kind": "structure",
-  "lines": [
-   "Golden.lean:14:40 in Gold.frame_al [stmt]",
-   "Golden.lean:14:68 in Gold.frame_al [proof]",
-   "Golden.lean:17:40 in Gold.frame_lo [stmt]",
-   "Golden.lean:19:11 in Gold.frame_lo [proof]",
-   "Sub/Wrap.lean:8:50 in Gold2.FrameAt [proof]",
-   "Sub/Wrap.lean:10:86 in Gold2.frameAt_al [proof]",
-   "Sub/Wrap.lean:13:15 in Gold2.frameAt_use [proof]",
-   "Sub/Wrap.lean:17:13 in Gold2.only_proof [proof]",
-   "Sub/Wrap.lean:17:14 in Gold2.only_proof [proof]"
-  ],
-  "reach": {
-   "all_directories": 2,
-   "proof_directories": 1,
-   "proofs_to_redo": 1,
-   "statement_directories": 2,
-   "statements_changed": 5,
-   "why": {
-    "": "Frame -> Gold.frame_al",
-    "Sub": "Frame -> Gold2.FrameAt"
-   }
-  }
- },
- "Gold.SpWord": {
-  "at": "Golden.lean:4",
-  "declaration": "Gold.SpWord",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "def",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold.astral": {
-  "at": "Golden.lean:33",
-  "declaration": "Gold.astral",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold.box_pos": {
-  "at": "Golden.lean:42",
-  "declaration": "Gold.box_pos",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold.frame_al": {
-  "at": "Golden.lean:14",
-  "declaration": "Gold.frame_al",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold.frame_lo": {
-  "at": "Golden.lean:17",
-  "declaration": "Gold.frame_lo",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold.instFrameDec": {
-  "at": "Golden.lean:27",
-  "declaration": "Gold.instFrameDec",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "instance",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold.pick": {
-  "at": "Golden.lean:21",
-  "declaration": "Gold.pick",
-  "direct": {
-   "by_directory": {
-    "": {
-     "other stmt": 1
-    }
-   },
-   "declarations": 1,
-   "directories": 1,
-   "proof_uses": 0,
-   "stmt_uses": 1,
-   "uses": 1
-  },
-  "kind": "def",
-  "lines": [
-   "Golden.lean:33:106 in Gold.astral [stmt]"
-  ],
-  "reach": {
-   "all_directories": 1,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 1,
-   "statements_changed": 1,
-   "why": {
-    "": "pick -> Gold.astral"
-   }
-  }
- },
- "Gold.useBox": {
-  "at": "Golden.lean:40",
-  "declaration": "Gold.useBox",
-  "direct": {
-   "by_directory": {
-    "": {
-     "other proof": 1,
-     "other stmt": 1
+  "Gold.Frame": {
+    "at": "Golden.lean:10",
+    "declaration": "Gold.Frame",
+    "direct": {
+      "by_directory": {
+        "": {
+          "other proof": 2,
+          "other stmt": 2
+        },
+        "Sub": {
+          "other proof": 5
+        }
+      },
+      "declarations": 6,
+      "directories": 2,
+      "proof_uses": 7,
+      "stmt_uses": 2,
+      "uses": 9
     },
-    "Sub": {
-     "other stmt": 1
+    "kind": "structure",
+    "lines": [
+      "Golden.lean:14:40 in Gold.frame_al [stmt]",
+      "Golden.lean:14:68 in Gold.frame_al [proof]",
+      "Golden.lean:17:40 in Gold.frame_lo [stmt]",
+      "Golden.lean:19:11 in Gold.frame_lo [proof]",
+      "Sub/Wrap.lean:8:50 in Gold2.FrameAt [proof]",
+      "Sub/Wrap.lean:10:86 in Gold2.frameAt_al [proof]",
+      "Sub/Wrap.lean:13:15 in Gold2.frameAt_use [proof]",
+      "Sub/Wrap.lean:17:13 in Gold2.only_proof [proof]",
+      "Sub/Wrap.lean:17:14 in Gold2.only_proof [proof]"
+    ],
+    "reach": {
+      "all_directories": 2,
+      "proof_directories": 1,
+      "proofs_to_redo": 1,
+      "statement_directories": 2,
+      "statements_changed": 5,
+      "why": {
+        "": "Frame -> Gold.frame_al",
+        "Sub": "Frame -> Gold2.FrameAt"
+      }
     }
-   },
-   "declarations": 2,
-   "directories": 2,
-   "proof_uses": 1,
-   "stmt_uses": 2,
-   "uses": 3
   },
-  "kind": "def",
-  "lines": [
-   "Golden.lean:42:29 in Gold.box_pos [stmt]",
-   "Golden.lean:43:10 in Gold.box_pos [proof]",
-   "Sub/Wrap.lean:20:19 in Gold2.box_two [stmt]"
-  ],
-  "reach": {
-   "all_directories": 2,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 2,
-   "statements_changed": 2,
-   "why": {
-    "": "useBox -> Gold.box_pos",
-    "Sub": "useBox -> Gold2.box_two"
-   }
-  }
- },
- "Gold.uses_hidden": {
-  "at": "Golden.lean:31",
-  "declaration": "Gold.uses_hidden",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold.withStr": {
-  "at": "Golden.lean:25",
-  "declaration": "Gold.withStr",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "def",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold2.FrameAt": {
-  "at": "Sub/Wrap.lean:7",
-  "declaration": "Gold2.FrameAt",
-  "direct": {
-   "by_directory": {
-    "Sub": {
-     "other stmt": 2
+  "Gold.SpWord": {
+    "at": "Golden.lean:4",
+    "declaration": "Gold.SpWord",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "def",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
     }
-   },
-   "declarations": 2,
-   "directories": 1,
-   "proof_uses": 0,
-   "stmt_uses": 2,
-   "uses": 2
   },
-  "kind": "def",
-  "lines": [
-   "Sub/Wrap.lean:10:52 in Gold2.frameAt_al [stmt]",
-   "Sub/Wrap.lean:12:53 in Gold2.frameAt_use [stmt]"
-  ],
-  "reach": {
-   "all_directories": 1,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 1,
-   "statements_changed": 2,
-   "why": {
-    "Sub": "FrameAt -> Gold2.frameAt_al"
-   }
-  }
- },
- "Gold2.box_two": {
-  "at": "Sub/Wrap.lean:20",
-  "declaration": "Gold2.box_two",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold2.frameAt_al": {
-  "at": "Sub/Wrap.lean:10",
-  "declaration": "Gold2.frameAt_al",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold2.frameAt_use": {
-  "at": "Sub/Wrap.lean:12",
-  "declaration": "Gold2.frameAt_use",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "Gold2.only_proof": {
-  "at": "Sub/Wrap.lean:16",
-  "declaration": "Gold2.only_proof",
-  "direct": {
-   "by_directory": {},
-   "declarations": 0,
-   "directories": 0,
-   "proof_uses": 0,
-   "stmt_uses": 0,
-   "uses": 0
-  },
-  "kind": "theorem",
-  "lines": [],
-  "reach": {
-   "all_directories": 0,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 0,
-   "statements_changed": 0,
-   "why": {}
-  }
- },
- "_private.Golden.0.Gold.hidden": {
-  "at": "Golden.lean:29",
-  "declaration": "_private.Golden.0.Gold.hidden",
-  "direct": {
-   "by_directory": {
-    "": {
-     "other stmt": 1
+  "Gold.astral": {
+    "at": "Golden.lean:33",
+    "declaration": "Gold.astral",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
     }
-   },
-   "declarations": 1,
-   "directories": 1,
-   "proof_uses": 0,
-   "stmt_uses": 1,
-   "uses": 1
   },
-  "kind": "def",
-  "lines": [
-   "Golden.lean:31:23 in Gold.uses_hidden [stmt]"
-  ],
-  "reach": {
-   "all_directories": 1,
-   "proof_directories": 0,
-   "proofs_to_redo": 0,
-   "statement_directories": 1,
-   "statements_changed": 1,
-   "why": {
-    "": "hidden -> Gold.uses_hidden"
-   }
+  "Gold.box_pos": {
+    "at": "Golden.lean:42",
+    "declaration": "Gold.box_pos",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold.frame_al": {
+    "at": "Golden.lean:14",
+    "declaration": "Gold.frame_al",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold.frame_lo": {
+    "at": "Golden.lean:17",
+    "declaration": "Gold.frame_lo",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold.instFrameDec": {
+    "at": "Golden.lean:27",
+    "declaration": "Gold.instFrameDec",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "instance",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold.pick": {
+    "at": "Golden.lean:21",
+    "declaration": "Gold.pick",
+    "direct": {
+      "by_directory": {
+        "": {
+          "other stmt": 1
+        }
+      },
+      "declarations": 1,
+      "directories": 1,
+      "proof_uses": 0,
+      "stmt_uses": 1,
+      "uses": 1
+    },
+    "kind": "def",
+    "lines": ["Golden.lean:33:106 in Gold.astral [stmt]"],
+    "reach": {
+      "all_directories": 1,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 1,
+      "statements_changed": 1,
+      "why": {
+        "": "pick -> Gold.astral"
+      }
+    }
+  },
+  "Gold.useBox": {
+    "at": "Golden.lean:40",
+    "declaration": "Gold.useBox",
+    "direct": {
+      "by_directory": {
+        "": {
+          "other proof": 1,
+          "other stmt": 1
+        },
+        "Sub": {
+          "other stmt": 1
+        }
+      },
+      "declarations": 2,
+      "directories": 2,
+      "proof_uses": 1,
+      "stmt_uses": 2,
+      "uses": 3
+    },
+    "kind": "def",
+    "lines": [
+      "Golden.lean:42:29 in Gold.box_pos [stmt]",
+      "Golden.lean:43:10 in Gold.box_pos [proof]",
+      "Sub/Wrap.lean:20:19 in Gold2.box_two [stmt]"
+    ],
+    "reach": {
+      "all_directories": 2,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 2,
+      "statements_changed": 2,
+      "why": {
+        "": "useBox -> Gold.box_pos",
+        "Sub": "useBox -> Gold2.box_two"
+      }
+    }
+  },
+  "Gold.uses_hidden": {
+    "at": "Golden.lean:31",
+    "declaration": "Gold.uses_hidden",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold.withStr": {
+    "at": "Golden.lean:25",
+    "declaration": "Gold.withStr",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "def",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold2.FrameAt": {
+    "at": "Sub/Wrap.lean:7",
+    "declaration": "Gold2.FrameAt",
+    "direct": {
+      "by_directory": {
+        "Sub": {
+          "other stmt": 2
+        }
+      },
+      "declarations": 2,
+      "directories": 1,
+      "proof_uses": 0,
+      "stmt_uses": 2,
+      "uses": 2
+    },
+    "kind": "def",
+    "lines": [
+      "Sub/Wrap.lean:10:52 in Gold2.frameAt_al [stmt]",
+      "Sub/Wrap.lean:12:53 in Gold2.frameAt_use [stmt]"
+    ],
+    "reach": {
+      "all_directories": 1,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 1,
+      "statements_changed": 2,
+      "why": {
+        "Sub": "FrameAt -> Gold2.frameAt_al"
+      }
+    }
+  },
+  "Gold2.box_two": {
+    "at": "Sub/Wrap.lean:20",
+    "declaration": "Gold2.box_two",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold2.frameAt_al": {
+    "at": "Sub/Wrap.lean:10",
+    "declaration": "Gold2.frameAt_al",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold2.frameAt_use": {
+    "at": "Sub/Wrap.lean:12",
+    "declaration": "Gold2.frameAt_use",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "Gold2.only_proof": {
+    "at": "Sub/Wrap.lean:16",
+    "declaration": "Gold2.only_proof",
+    "direct": {
+      "by_directory": {},
+      "declarations": 0,
+      "directories": 0,
+      "proof_uses": 0,
+      "stmt_uses": 0,
+      "uses": 0
+    },
+    "kind": "theorem",
+    "lines": [],
+    "reach": {
+      "all_directories": 0,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 0,
+      "statements_changed": 0,
+      "why": {}
+    }
+  },
+  "_private.Golden.0.Gold.hidden": {
+    "at": "Golden.lean:29",
+    "declaration": "_private.Golden.0.Gold.hidden",
+    "direct": {
+      "by_directory": {
+        "": {
+          "other stmt": 1
+        }
+      },
+      "declarations": 1,
+      "directories": 1,
+      "proof_uses": 0,
+      "stmt_uses": 1,
+      "uses": 1
+    },
+    "kind": "def",
+    "lines": ["Golden.lean:31:23 in Gold.uses_hidden [stmt]"],
+    "reach": {
+      "all_directories": 1,
+      "proof_directories": 0,
+      "proofs_to_redo": 0,
+      "statement_directories": 1,
+      "statements_changed": 1,
+      "why": {
+        "": "hidden -> Gold.uses_hidden"
+      }
+    }
   }
- }
 }

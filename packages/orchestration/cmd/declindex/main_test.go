@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -159,5 +160,59 @@ func TestWhereAndStatus(t *testing.T) {
 	}
 	if s.code != 0 || json.Unmarshal([]byte(s.out), &st) != nil || st.Modules != 2 {
 		t.Fatalf("status: %+v", s)
+	}
+}
+
+func git(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// The landing program's hasher: LAND_TREE and LAND_NAMES in, exactly name<TAB>hash out; anything it cannot
+// answer for every name is unable to check (exit 3) with nothing printed.
+func TestLandHashAnswersTheLandingProgram(t *testing.T) {
+	config := fixture(t)
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "one")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	land := func(treeID string, names ...string) result {
+		t.Helper()
+		j, _ := json.Marshal(names)
+		env := map[string]string{"LAND_TREE": treeID, "LAND_NAMES": string(j)}
+		var out, errOut bytes.Buffer
+		code := run(context.Background(), []string{"--config", config, "land-hash"}, func(k string) string { return env[k] }, &out, &errOut)
+		return result{code, out.String(), errOut.String()}
+	}
+	first := git(t, tree, "rev-parse", "HEAD^{tree}")
+	r := land(first, "Gold.frame_lo", "Gold2.FrameAt")
+	if r.code != 0 || !strings.HasPrefix(r.out, "Gold.frame_lo\t9d9fba31f41fc258\nGold2.FrameAt\t") || strings.Count(r.out, "\n") != 2 {
+		t.Fatalf("land-hash: %+v", r)
+	}
+	for _, names := range [][]string{{"NoSuch"}, {"Gold.frame_lo", "Gold.frame_lo"}, {"frame_lo"}} {
+		if r := land(first, names...); r.code != 3 || r.out != "" {
+			t.Errorf("%v: %+v, want unable to check and no output", names, r)
+		}
+	}
+	src := filepath.Join(tree, "Golden.lean")
+	data, _ := os.ReadFile(src)
+	if err := os.WriteFile(src, append(data, []byte("\n-- an edit\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, tree, "commit", "-q", "-am", "two")
+	second := git(t, tree, "rev-parse", "HEAD^{tree}")
+	if r := land(second, "Gold2.FrameAt"); r.code != 0 {
+		t.Fatalf("a file the candidate kept: %+v", r)
+	}
+	if r := land(second, "Gold2.FrameAt", "Gold.frame_lo"); r.code != 3 || r.out != "" {
+		t.Fatalf("a file the candidate changed: %+v", r)
 	}
 }

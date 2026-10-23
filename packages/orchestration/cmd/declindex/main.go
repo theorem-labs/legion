@@ -18,7 +18,7 @@ import (
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
-const usage = "usage: declindex --config FILE [--db FILE] [--json] <refresh|status|where|users|hash|states|same|gate|ledger> ..."
+const usage = "usage: declindex --config FILE [--db FILE] [--json] <refresh|status|where|users|hash|states|same|gate|ledger|land-hash> ..."
 
 const help = usage + `
 
@@ -38,6 +38,8 @@ Commands:
                                {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>}
   ledger [--dsn-file PATH]     after a landing: register new contracts in the ledger (LEDGER_DSN), and report
                                each contract whose ledger hash is not the index's (exit 1)
+  land-hash                    the landing program's hasher: LAND_TREE and LAND_NAMES (a JSON array) in,
+                               name<TAB>hash out; exit 3 when any name cannot be answered at LAND_TREE
 
 NAME is a full name or any dotted suffix of one. A name declared twice is answered once per declaration.
 Exit codes: 0 answered, 1 a name not found, 2 usage, 3 unable to check (no index, unreadable configuration).`
@@ -155,15 +157,16 @@ var commands map[string]func(context.Context, *env, []string) int
 
 func init() {
 	commands = map[string]func(context.Context, *env, []string) int{
-		"refresh": cmdRefresh,
-		"status":  cmdStatus,
-		"where":   cmdWhere,
-		"users":   cmdUsers,
-		"hash":    cmdHash,
-		"states":  cmdStates,
-		"same":    cmdSame,
-		"gate":    cmdGate,
-		"ledger":  cmdLedger,
+		"refresh":   cmdRefresh,
+		"status":    cmdStatus,
+		"where":     cmdWhere,
+		"users":     cmdUsers,
+		"hash":      cmdHash,
+		"states":    cmdStates,
+		"same":      cmdSame,
+		"gate":      cmdGate,
+		"ledger":    cmdLedger,
+		"land-hash": cmdLandHash,
 	}
 }
 
