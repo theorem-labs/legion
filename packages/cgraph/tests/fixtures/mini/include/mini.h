@@ -53,10 +53,11 @@ struct item {
 	struct box *parent;
 	int value;
 };
-/* Only crate embeds box, so the embedding joins them; crate is the larger struct. */
+/* Only crate embeds box, so the embedding joins them; crate is the larger struct. box sits at
+ * offset 8, so c->box.size is 8 + 56 bytes from c. */
 struct crate {
-	struct box box;
 	long tag;
+	struct box box;
 };
 struct ops {
 	int (*get)(struct box *);
@@ -128,6 +129,25 @@ static inline class_tree_t class_tree_constructor(struct rwsem *s)
 	class_tree_t __guard __attribute__((cleanup(class_tree_destructor))) = class_tree_constructor(&tree_sem)
 
 #define pick_list(x) _Generic((x), struct box *: &box_table[0], struct bag *: &all_bags)
+/* _Generic in a macro that selects a call and a struct access: only the selected arm is code. */
+int box_weight(void);
+int bag_weight(void);
+#define weight_of(x) _Generic((x), struct box *: box_weight(), struct bag *: bag_weight())
+#define size_of(x) _Generic((x), struct box *: ((struct box *)(void *)(x))->size, \
+	struct bag *: (long)((struct bag *)(void *)(x))->n)
+
+/* Cleanup attributes outside the class convention: a free helper and a plain cleanup function. */
+#define __cleanup(func) __attribute__((__cleanup__(func)))
+#define __free(name) __cleanup(__free_##name)
+static inline void __free_obj(void *p)
+{
+	obj_free(*(void **)p);
+}
+void tree_unlock(struct rwsem **s);
+#define LOCK_TREE(s) struct rwsem *s __cleanup(tree_unlock) = &tree_sem
+
+/* A default the architecture may replace: the strong definition in bags.c wins at link time. */
+int arch_hook(void);
 #define CHECK_VALUE(e) ((void)sizeof(e))
 #define FEATURE_X 0
 

@@ -56,3 +56,13 @@ long crate_size(struct crate *c)
 {
 	return c->box.size + c->tag;
 }
+
+int arch_hook(void)
+{
+	return 2;
+}
+
+__attribute__((noinline)) int bag_weight(void)
+{
+	return 3;
+}

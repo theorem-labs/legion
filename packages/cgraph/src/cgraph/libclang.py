@@ -56,6 +56,14 @@ def is_increment(cursor: ci.Cursor) -> bool:
     return int(_lib().clang_getCursorUnaryOperatorKind(cursor)) in _INCREMENT_OPERATORS
 
 
+def is_macro_function_like(cursor: ci.Cursor) -> bool:
+    lib = _lib()
+    function = lib.clang_Cursor_isMacroFunctionLike
+    function.argtypes = [ci.Cursor]
+    function.restype = ctypes.c_uint
+    return bool(function(cursor))
+
+
 def is_address_of(cursor: ci.Cursor) -> bool:
     """``&expr``: CXUnaryOperator_AddrOf is 5."""
     return int(_lib().clang_getCursorUnaryOperatorKind(cursor)) == 5

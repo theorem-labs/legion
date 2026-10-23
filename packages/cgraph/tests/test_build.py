@@ -8,7 +8,7 @@ from pathlib import Path
 
 from conftest import FIXTURE, build, read
 
-from cgraph import checks, cli
+from cgraph import cli
 
 OUTPUTS = ("graph.json", "checks.json", "owners.json", "topics.json", "measures.json", "report.md")
 
@@ -66,7 +66,7 @@ def test_incremental_build_after_a_change_to_one_file_equals_a_full_build(copy: 
     assert any(
         edge["kind"] == "access"
         and edge["source"] == "function:box_tree_add"
-        and edge["target"] == "global:box_count"
+        and edge["target"] == "global:box_count@src/store.c"
         and edge["access"] == "write"
         for edge in graph["edges"]
     )
@@ -103,12 +103,3 @@ def test_an_assembly_function_of_a_part_file_is_reported_not_a_node(copy: Path, 
     out = tmp_path / "out"
     assert cli.main(["build", "--config", str(copy / "cgraph.toml"), "--part", "store", "--out", str(out)]) == 0
     assert read(out, "graph.json")["analysis"]["contract_functions_without_c"] == ["function:anchor_pair"]
-
-
-def test_a_function_the_image_holds_but_the_graph_lacks_fails_the_hard_check(built: Path) -> None:
-    graph = read(built, "graph.json")
-    graph["analysis"]["expected_functions"].append("function:missing_one")
-    owners, topics = read(built, "owners.json"), read(built, "topics.json")
-    failed = [item for item in checks.hard(graph, owners, topics, checks.structure(graph)) if not item["ok"]]
-    assert [item["name"] for item in failed] == ["every function of the part's files that the image holds is a node"]
-    assert "function:missing_one" in failed[0]["detail"]

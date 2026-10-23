@@ -86,6 +86,29 @@ def _is_unnamed_member(field: ci.Cursor) -> bool:
     return not field.spelling or "(anonymous" in field.spelling or "(unnamed" in field.spelling
 
 
+def _displacement(member: ci.Cursor) -> int:
+    """Bytes from the base pointer of a member expression to the field it names, along ``.`` links."""
+    total = 0
+    node = member
+    while node.kind == K.MEMBER_REF_EXPR:
+        field = node.referenced
+        record = _named_struct(field.semantic_parent) if field is not None else None
+        offset = record.type.get_offset(field.spelling) if record is not None else -1
+        if offset < 0:
+            return -1
+        total += offset
+        children = _children(node)
+        if not children:
+            break
+        base = children[0]
+        while base.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len(_children(base)) == 1:
+            base = _children(base)[0]
+        if base.type.get_canonical().kind == TK.POINTER or base.kind != K.MEMBER_REF_EXPR:
+            break
+        node = base
+    return total // 8
+
+
 _SCALAR_KINDS = (
     TK.BOOL,
     TK.CHAR_U,
@@ -121,10 +144,14 @@ class _Extractor:
         self.vocabulary = vocabulary
         self.transparent = vocabulary.kit_types | vocabulary.lock_types
         self.records: dict[str, ci.Cursor] = {}
-        self.texts: dict[Path, bytes] = {}
         self.relative_cache: dict[str, str] = {}
         self.generic = {"selected": 0, "ambiguous": 0}
         self.plain: dict[str, bool] = {}
+        # The unit's macro definitions (the last definition of a name wins), read on demand.
+        self.macros: dict[str, ci.Cursor] = {
+            cursor.spelling: cursor for cursor in tu.cursor.get_children() if cursor.kind == K.MACRO_DEFINITION
+        }
+        self.macro_cache: dict[str, tuple[frozenset[str], list[str]] | None] = {}
 
     # Locations -----------------------------------------------------------------------------
 
@@ -355,52 +382,96 @@ class _Extractor:
             "fields": fields,
         }
 
-    # Unevaluated parts ---------------------------------------------------------------------
+    # Macros --------------------------------------------------------------------------------
 
-    def text(self, path: Path) -> bytes:
-        if path not in self.texts:
-            try:
-                self.texts[path] = path.read_bytes()
-            except OSError:
-                self.texts[path] = b""
-        return self.texts[path]
+    def macro(self, name: str) -> tuple[frozenset[str], list[str]] | None:
+        """A macro's parameters and the tokens of its body, or None when ``name`` is no macro."""
+        if name not in self.macro_cache:
+            cursor = self.macros.get(name)
+            if cursor is None:
+                self.macro_cache[name] = None
+            else:
+                tokens = [token.spelling for token in self.tu.get_tokens(extent=cursor.extent)][1:]
+                parameters: frozenset[str] = frozenset()
+                if libclang.is_macro_function_like(cursor) and tokens[:1] == ["("] and ")" in tokens:
+                    end = tokens.index(")")
+                    parameters = frozenset(token for token in tokens[1:end] if token != ",")
+                    tokens = tokens[end + 1 :]
+                self.macro_cache[name] = (parameters, tokens)
+        return self.macro_cache[name]
 
-    def association_type(self, expression: ci.Cursor) -> str | None:
-        """The type name written before ``:`` in front of a ``_Generic`` association."""
-        path, offset = libclang.spelling_location(expression.extent.start)
-        if path is None:
-            return None
-        text = self.text(path)
-        index = offset - 1
-        while index >= 0 and chr(text[index]) in " \t\r\n\\":
-            index -= 1
-        if index < 0 or text[index : index + 1] != b":":
-            return None
-        end = index
-        depth = 0
-        index -= 1
-        while index >= 0:
-            character = chr(text[index])
-            if character in ")]":
-                depth += 1
-            elif character in "([":
-                if depth == 0:
+    def written_tokens(self, cursor: ci.Cursor, bound: ci.Cursor) -> list[str]:
+        """The tokens of a construct as the source writes it. Inside a macro, libclang gives the
+        construct no tokens, so the tokens from its expansion site to the end of that statement
+        (a ``;`` outside parentheses, within ``bound``) stand in."""
+        try:
+            tokens = [token.spelling for token in self.tu.get_tokens(extent=cursor.extent)]
+            if tokens:
+                return tokens
+            # The location of a construct inside a macro is a macro location, which has no tokens;
+            # its file, line and column are those of the expansion site.
+            site = cursor.location
+            if site.file is None:
+                return []
+            start = ci.SourceLocation.from_position(self.tu, site.file, site.line, site.column)
+            extent = ci.SourceRange.from_locations(start, bound.extent.end)
+            written: list[str] = []
+            depth = 0
+            for token in self.tu.get_tokens(extent=extent):
+                spelling = token.spelling
+                depth += {"(": 1, "[": 1, ")": -1, "]": -1}.get(spelling, 0)
+                if (depth <= 0 and spelling in (";", "{", "}")) or depth < 0:
                     break
-                depth -= 1
-            elif character == "," and depth == 0:
-                break
-            index -= 1
-        return _normal_type(text[index + 1 : end].decode(errors="replace").replace("\\", " "))
+                written.append(spelling)
+            return written
+        except Exception:
+            return []
 
-    def selected_associations(self, node: ci.Cursor) -> set[int] | None:
-        """The index of the association ``_Generic`` selects, or None when it cannot be told."""
+    def expansion_bodies(
+        self, cursor: ci.Cursor, bound: ci.Cursor, limit: int = 256
+    ) -> list[tuple[frozenset[str], list[str]]]:
+        """The text of a construct as written, then the bodies of the macros it expands, transitively."""
+        seeds = self.written_tokens(cursor, bound)
+        bodies: list[tuple[frozenset[str], list[str]]] = [(frozenset(), seeds)]
+        queue = [token for token in seeds if _IDENTIFIER.match(token)]
+        seen: set[str] = set()
+        while queue and len(seen) < limit:
+            name = queue.pop(0)
+            if name in seen:
+                continue
+            seen.add(name)
+            macro = self.macro(name)
+            if macro is None:
+                continue
+            bodies.append(macro)
+            queue.extend(token for token in macro[1] if _IDENTIFIER.match(token) and token not in seen)
+        return bodies
+
+    def selected_associations(self, node: ci.Cursor, bound: ci.Cursor) -> set[int] | None:
+        """The index of the association ``_Generic`` selects, or None when it cannot be told.
+
+        libclang gives the association expressions but not their types, and a ``_Generic`` the
+        kernel writes sits in a macro. So the macros the expression expands are read, the
+        ``_Generic`` association lists in their bodies are parsed, and the list whose expressions
+        name what the AST's associations name gives each association its type."""
         children = _children(node)
-        control = children[0]
+        control, arms = children[0], children[1:]
         candidates = {_normal_type(control.type.spelling), _normal_type(control.type.get_canonical().spelling)}
-        names = [self.association_type(arm) for arm in children[1:]]
-        if any(name is None for name in names):
+        arm_names = [
+            {child.spelling for child in arm.walk_preorder() if child.kind in _NAMING_KINDS and child.spelling}
+            for arm in arms
+        ]
+        tables = set()
+        for parameters, body in self.expansion_bodies(node, bound):
+            for table in _generic_tables(body, parameters, self):
+                if len(table) == len(arms) and all(
+                    identifiers <= names for (_, identifiers), names in zip(table, arm_names, strict=True)
+                ):
+                    tables.add(tuple(kind for kind, _ in table))
+        if len(tables) != 1:
             self.generic["ambiguous"] += 1
             return None
+        names = list(next(iter(tables)))
         matches = {index for index, name in enumerate(names, 1) if name in candidates}
         if len(matches) == 1:
             self.generic["selected"] += 1
@@ -410,6 +481,91 @@ class _Extractor:
             return {names.index("default") + 1}
         self.generic["ambiguous"] += 1
         return None
+
+    def cleanup_function(self, node: ci.Cursor, bound: ci.Cursor) -> str | None:
+        """The function a ``cleanup`` attribute on a local names, read from the declaration as
+        written and from the macros it expands (``__free(x)``, ``LOCK_MOUNT(...)``)."""
+        templates = self.vocabulary.cleanup_macros
+        for parameters, body in self.expansion_bodies(node, bound, limit=32):
+            for index, token in enumerate(body[:-3]):
+                if body[index + 1] != "(" or body[index + 3] != ")" or not _IDENTIFIER.match(body[index + 2]):
+                    continue
+                argument = body[index + 2]
+                if argument in parameters:
+                    continue
+                if token in ("cleanup", "__cleanup__"):
+                    return argument
+                if token in templates:
+                    return templates[token].format(arg=argument)
+        return None
+
+
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_NAMING_KINDS = (K.DECL_REF_EXPR, K.MEMBER_REF_EXPR, K.CALL_EXPR)
+_C_WORDS = frozenset({
+    "struct", "union", "enum", "const", "volatile", "unsigned", "signed", "char", "short", "int", "long", "void",
+    "float", "double", "_Bool", "bool", "sizeof", "typeof", "__typeof__", "default", "NULL",
+})  # fmt: skip
+
+
+def _split_top(tokens: list[str], separator: str) -> list[list[str]]:
+    parts: list[list[str]] = [[]]
+    depth = 0
+    for token in tokens:
+        if token in "([{":
+            depth += 1
+        elif token in ")]}":
+            depth -= 1
+        if token == separator and depth == 0:
+            parts.append([])
+        else:
+            parts[-1].append(token)
+    return parts
+
+
+def _generic_tables(
+    body: list[str], parameters: frozenset[str], extractor: _Extractor
+) -> list[list[tuple[str, frozenset[str]]]]:
+    """Each ``_Generic(...)`` in a token list: per association, its type and the identifiers of its
+    expression that are neither parameters, C words nor macros."""
+    tables = []
+    for start, token in enumerate(body):
+        if token != "_Generic" or body[start + 1 : start + 2] != ["("]:
+            continue
+        depth, end = 0, start + 1
+        for end in range(start + 1, len(body)):
+            depth += {"(": 1, ")": -1}.get(body[end], 0)
+            if depth == 0:
+                break
+        parts = _split_top(body[start + 2 : end], ",")
+        table: list[tuple[str, frozenset[str]]] = []
+        for arm in parts[1:]:
+            colon, pending = None, 0
+            nesting = 0
+            for index, item in enumerate(arm):
+                nesting += {"(": 1, "[": 1, "{": 1, ")": -1, "]": -1, "}": -1}.get(item, 0)
+                if nesting == 0 and item == "?":
+                    pending += 1
+                elif nesting == 0 and item == ":":
+                    if pending:
+                        pending -= 1
+                    else:
+                        colon = index
+                        break
+            if colon is None:
+                table = []
+                break
+            expression = arm[colon + 1 :]
+            identifiers = frozenset(
+                item for position, item in enumerate(expression)
+                if _IDENTIFIER.match(item) and item not in parameters and item not in _C_WORDS
+                and (position == 0 or expression[position - 1] not in ("struct", "union", "enum"))
+                and extractor.macro(item) is None
+            )  # fmt: skip
+            table.append((_normal_type(" ".join(arm[:colon])), identifiers))
+        if table:
+            tables.append(table)
+    return tables
 
 
 def _normal_type(text: str) -> str:
@@ -472,6 +628,9 @@ class _FunctionWalk:
                     "def": unit["def"],
                     "field": unit["field"],
                     "offset": unit.get("offset", -1),
+                    # What the machine code adds to the base pointer: the field's offset plus the
+                    # offsets of the members a "." chain passes through (c->box.size).
+                    "displacement": _displacement(where) if where.kind == K.MEMBER_REF_EXPR else -1,
                     "provenance": provenance,
                 }
             )
@@ -503,7 +662,7 @@ class _FunctionWalk:
         visit(expression)
         return found
 
-    def call(self, node: ci.Cursor, parent: ci.Cursor | None, reason: str | None) -> None:
+    def call(self, node: ci.Cursor, parent: ci.Cursor | None, reason: str | None, generic: bool = False) -> None:
         referenced = node.referenced
         arguments = list(node.get_arguments() or [])
         if referenced is not None and referenced.kind == K.FUNCTION_DECL:
@@ -514,9 +673,11 @@ class _FunctionWalk:
                     {"call": callee, "reason": reason, "provenance": [self.x.location(node)]}
                 )
                 return
-            self.events["calls"].append(
-                {"callee": callee, "arguments": described, "provenance": [self.x.location(node)]}
-            )
+            event: dict[str, Any] = {"callee": callee, "arguments": described, "provenance": [self.x.location(node)]}
+            if generic:
+                # In a _Generic association whose selection could not be read: the image decides.
+                event["generic"] = True
+            self.events["calls"].append(event)
             for argument in arguments:
                 for reference in self.address_taken(argument):
                     self.events["function_pointers"].append(
@@ -640,26 +801,38 @@ class _FunctionWalk:
         self.add_access(unit, self.mode(node, parent, index), node, reason)
 
     def cleanup(self, node: ci.Cursor, initializer: ci.Cursor | None) -> None:
-        """A local of a cleanup class calls the class's destructor when its scope ends.
+        """A local with a cleanup calls a destructor when its scope ends.
 
-        The destructor gets the arguments the constructor got: the local holds what the
-        constructor took, such as the lock a guard holds.
+        A local of a cleanup class (``guard(...)``) calls the class's destructor with the
+        arguments the constructor got: the local holds what the constructor took, such as the
+        lock a guard holds. Any other local with a ``cleanup`` attribute (``__free(x)``,
+        ``LOCK_MOUNT(...)``) calls the function the attribute names with the local's address, which
+        holds what its initializer gave, or an object of the local's type.
         """
         pattern = self.x.vocabulary.cleanup_class
-        if pattern is None:
+        match = pattern.fullmatch(node.type.spelling) if pattern is not None else None
+        if match is not None:
+            destructor = self.x.vocabulary.cleanup_destructor.format(name=match.group(1))
+            constructor = initializer
+            while constructor is not None and constructor.kind == K.UNEXPOSED_EXPR and len(_children(constructor)) == 1:
+                constructor = _children(constructor)[0]
+            arguments = (
+                [self.argument(argument) for argument in constructor.get_arguments() or []]
+                if constructor is not None and constructor.kind == K.CALL_EXPR
+                else []
+            )
+        elif any(child.kind == K.UNEXPOSED_ATTR for child in node.get_children()):
+            function = self.x.cleanup_function(node, self.cursor)
+            if function is None:
+                return
+            destructor = function
+            held = self.argument(initializer) if initializer is not None else {"unit": None, "param": None}
+            if held["unit"] is None:
+                record, _, _ = _canonical_record(node.type)
+                held = {"unit": self.x.record_unit(record, None) if record is not None else None, "param": None}
+            arguments = [held]
+        else:
             return
-        match = pattern.fullmatch(node.type.spelling)
-        if match is None:
-            return
-        destructor = self.x.vocabulary.cleanup_destructor.format(name=match.group(1))
-        constructor = initializer
-        while constructor is not None and constructor.kind == K.UNEXPOSED_EXPR and len(_children(constructor)) == 1:
-            constructor = _children(constructor)[0]
-        arguments = (
-            [self.argument(argument) for argument in constructor.get_arguments() or []]
-            if constructor is not None and constructor.kind == K.CALL_EXPR
-            else []
-        )
         self.events["calls"].append(
             {
                 "callee": destructor,
@@ -674,7 +847,7 @@ class _FunctionWalk:
     ) -> None:
         kind = node.kind
         if kind == K.CALL_EXPR:
-            self.call(node, parent, reason)
+            self.call(node, parent, reason, generic)
         elif kind in (K.DECL_REF_EXPR, K.MEMBER_REF_EXPR):
             self.reference(node, parent, index, reason, generic)
         children = _children(node)
@@ -683,7 +856,7 @@ class _FunctionWalk:
                 self.walk(child, node, child_index, reason or "sizeof", generic)
             return
         if kind == K.GENERIC_SELECTION_EXPR and children:
-            selected = self.x.selected_associations(node) if reason is None else set()
+            selected = self.x.selected_associations(node, self.cursor) if reason is None else set()
             self.walk(children[0], node, 0, reason or "generic_control", generic)
             for child_index, child in enumerate(children[1:], 1):
                 if selected is None:
@@ -789,22 +962,40 @@ def _witnesses(source: str, main: Path, vocabulary: Vocabulary) -> list[dict[str
     return witnesses
 
 
+def _is_weak(tu: ci.TranslationUnit, cursor: ci.Cursor) -> bool:
+    """A definition marked weak (``__weak`` or ``__attribute__((weak))`` before its name)."""
+    try:
+        tokens = [token.spelling for token in tu.get_tokens(extent=cursor.extent)]
+    except Exception:
+        return False
+    head = tokens[: tokens.index(cursor.spelling)] if cursor.spelling in tokens else tokens
+    return any(token in ("__weak", "weak", "__weak__") for token in head)
+
+
 def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabulary) -> Facts:
     """Parse one C file of the tree and return its facts."""
     main = (c_tree / source).resolve()
     index = ci.Index.create()
-    tu = index.parse(str(main), args=arguments)
+    # The preprocessing record keeps the unit's macro definitions, which _Generic selection and
+    # cleanup attributes are read from.
+    tu = index.parse(str(main), args=arguments, options=ci.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
     extractor = _Extractor(tu, source, c_tree, vocabulary)
     errors = sorted(
         {
-            f"{diagnostic.location.file}:{diagnostic.location.line}: {diagnostic.spelling}"
+            f"{extractor.relative(diagnostic.location.file.name if diagnostic.location.file else None)}:"
+            f"{diagnostic.location.line}: {diagnostic.spelling}"
             for diagnostic in tu.diagnostics
             if diagnostic.severity >= ci.Diagnostic.Error
         }
     )
     includes = sorted({extractor.relative(include.include.name) for include in tu.get_includes()})
     definitions = _definitions(tu)
-    pending = sorted(name for name, cursor in definitions.items() if _main_file(cursor, main))
+    # The unit's own functions: those of its file and of the C files it includes.
+    pending = sorted(
+        name
+        for name, cursor in definitions.items()
+        if _main_file(cursor, main) or extractor.relative(cursor.location.file.name).endswith(".c")
+    )
     functions: dict[str, Any] = {}
     while pending:
         name = pending.pop()
@@ -822,6 +1013,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             "file": extractor.relative(cursor.location.file.name),
             "line": cursor.location.line,
             "static": cursor.linkage == ci.LinkageKind.INTERNAL,
+            "weak": _is_weak(tu, cursor),
             "main_file": _main_file(cursor, main),
             "returns": walk.returns(),
             "events": walk.events,

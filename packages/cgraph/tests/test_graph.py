@@ -25,20 +25,20 @@ def test_folded_helpers_lend_their_accesses_to_the_image_caller(graph: dict[str,
         "function:obj_alloc",
         "function:spin_lock",
         "function:spin_unlock",
-        "function:box_size",
+        "function:box_size@include/mini.h",
     }
     access = next(
         edge
         for edge in edges(graph, "access", "function:box_new")
         if edge["target"] == "global:table_lock" and edge["access"] == "lock"
     )
-    assert access["provenance"][0]["via"][0] == "function:hash_box"
+    assert access["provenance"][0]["via"][0] == "function:hash_box@src/store.c"
 
 
 def test_a_header_helper_the_image_calls_stays_a_call_and_is_a_part_function(graph: dict[str, Any]) -> None:
-    helper = node(graph, "function:box_size")
+    helper = node(graph, "function:box_size@include/mini.h")
     assert helper["part"] and helper["c_file"] == "include/mini.h"
-    assert "function:box_size" in targets(graph, "call", "function:box_new", image="direct")
+    assert "function:box_size@include/mini.h" in targets(graph, "call", "function:box_new", image="direct")
 
 
 def test_guard_takes_and_releases_the_lock_its_constructor_names(graph: dict[str, Any]) -> None:
@@ -46,10 +46,41 @@ def test_guard_takes_and_releases_the_lock_its_constructor_names(graph: dict[str
     assert "function:up_write" in targets(graph, "call", "function:box_tree_add", image="tail")
 
 
-def test_unselected_generic_association_is_not_an_access(graph: dict[str, Any]) -> None:
+def test_only_the_selected_generic_association_is_code(graph: dict[str, Any]) -> None:
+    """The _Generic sits in a macro; its association types are read from the macro body."""
     found = targets(graph, "access", "function:bag_count")
-    assert "global:box_table" not in found and "global:all_bags" not in found
-    assert {item["unit"] for item in graph["analysis"]["generic_unconfirmed"]} == {"box_table", "all_bags"}
+    assert "global:all_bags" in found and "global:box_table" not in found
+    calls = targets(graph, "call", "function:box_scoped")
+    assert "function:box_weight" in calls and "function:bag_weight" not in calls
+    fields = {(edge["target"], edge.get("field")) for edge in edges(graph, "access", "function:box_scoped")}
+    assert ("struct:box", "size") in fields and ("struct:bag", "n") not in fields
+    assert graph["analysis"]["generic_selections"] == {"selected": 3, "ambiguous": 0}
+
+
+def test_cleanup_attribute_locals_call_their_destructor(graph: dict[str, Any]) -> None:
+    """LOCK_TREE's __cleanup(tree_unlock) and __free(obj) run at scope exit, as the image shows."""
+    calls = {edge["target"]: edge for edge in edges(graph, "call", "function:box_scoped")}
+    assert calls["function:tree_unlock"]["image"] == "direct"
+    assert calls["function:obj_free"]["provenance"][0]["via"] == ["function:__free_obj@include/mini.h"]
+    accesses = {(edge["target"], edge["access"]) for edge in edges(graph, "access", "function:box_scoped")}
+    assert ("struct:box", "free") in accesses
+
+
+def test_strong_definition_is_the_node_and_the_weak_one_is_recorded(graph: dict[str, Any]) -> None:
+    hook = node(graph, "function:arch_hook")
+    assert hook["c_file"] == "src/bags.c" and hook["weak_definitions"] == ["src/store.c:88"]
+    assert targets(graph, "call", "function:use_hook") == {"function:arch_hook"}
+    assert graph["analysis"]["alternate_definitions"]["function:arch_hook"]["others"] == [
+        {"definition": "src/store.c:88", "weak": True}
+    ]
+
+
+def test_ids_follow_linkage_not_collisions(graph: dict[str, Any]) -> None:
+    """A static is @file even when nothing else has its name; an external function never is."""
+    ids = {item["id"] for item in graph["nodes"]}
+    expected = {"function:box_get@src/store.c", "function:visit@src/bags.c", "global:box_count@src/store.c",
+                "global:next_id.counter@src/store.c", "function:box_new", "global:box_table"}  # fmt: skip
+    assert expected <= ids
 
 
 def test_two_definitions_of_one_name_get_file_ids_and_their_own_image_copy(graph: dict[str, Any]) -> None:
@@ -57,7 +88,7 @@ def test_two_definitions_of_one_name_get_file_ids_and_their_own_image_copy(graph
     bags = node(graph, "function:helper_dup@src/bags.c")
     assert store["image_addresses"] != bags["image_addresses"]
     assert targets(graph, "call", "function:store_dup") == {"function:helper_dup@src/store.c"}
-    assert "global:box_count" in targets(graph, "access", "function:helper_dup@src/store.c")
+    assert "global:box_count@src/store.c" in targets(graph, "access", "function:helper_dup@src/store.c")
 
 
 def test_per_cpu_state_has_its_own_prefix(graph: dict[str, Any]) -> None:
@@ -96,7 +127,7 @@ def test_guard_locks_of_a_subsystem(graph: dict[str, Any]) -> None:
 
 def test_callback_table_edge_needs_the_c_initializer(graph: dict[str, Any]) -> None:
     (edge,) = [edge for edge in edges(graph, "call_indirect", "function:run_get")]
-    assert edge["target"] == "function:box_get" and edge["slot"] == "box_ops.get"
+    assert edge["target"] == "function:box_get@src/store.c" and edge["slot"] == "box_ops.get"
     assert edge["resolution"] == "callback_table"
 
 

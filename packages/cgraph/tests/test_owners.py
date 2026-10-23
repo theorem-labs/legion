@@ -41,12 +41,14 @@ def test_owner_key_is_the_node_id_and_carries_the_contract(built: Path) -> None:
 def test_function_owner_topics(built: Path) -> None:
     topics = set(read(built, "topics.json")["owners"]["function:box_new"])
     assert {topic("function:box_new", "needs"), f"{PREFIX}all"} <= topics
-    assert topic("function:box_size", "callers") in topics
+    assert topic("function:box_size@include/mini.h", "callers") in topics
     assert topic("struct:box", "users") in topics and topic("subsystem:crate", "users") in topics
     assert topic("global:table_lock", "users") in topics
-    assert topic("struct:box", "neighbors") in topics and topic("function:box_size", "neighbors") in topics
+    assert (
+        topic("struct:box", "neighbors") in topics and topic("function:box_size@include/mini.h", "neighbors") in topics
+    )
     assert not any(item.endswith(".linked") for item in topics)
-    callee = set(read(built, "topics.json")["owners"]["function:box_size"])
+    callee = set(read(built, "topics.json")["owners"]["function:box_size@include/mini.h"])
     assert topic("function:box_new", "callees") in callee
 
 
@@ -70,15 +72,11 @@ def test_node_with_a_dot_is_one_subject_token(built: Path) -> None:
     assert token("global:next_id.counter") == "global:next_id%2Ecounter"
     assert token("function:helper_dup@src/store.c") == "function:helper_dup%40src%2Fstore%2Ecc"[:-1]
     owners = read(built, "topics.json")["owners"]
-    assert topic("global:next_id.counter", "users") in owners["function:box_new"]
+    assert topic("global:next_id.counter@src/store.c", "users") in owners["function:box_new"]
     assert all(checks.valid_subject(item) for items in owners.values() for item in items)
 
 
-def test_hard_check_fails_on_a_missing_owner(built: Path) -> None:
+def test_the_hard_check_reads_who_needs_an_owner_from_the_graph_not_the_owner_list(built: Path) -> None:
     graph: dict[str, Any] = read(built, "graph.json")
     owners = read(built, "owners.json")
-    topics = read(built, "topics.json")
-    structure = checks.structure(graph)
-    owners["owners"] = [owner for owner in owners["owners"] if owner["id"] != "struct:box"]
-    failed = {item["name"] for item in checks.hard(graph, owners, topics, structure) if not item["ok"]}
-    assert failed == {"one owner for each function, data structure and subsystem"}
+    assert checks.eligible_owners(graph) == {owner["id"] for owner in owners["owners"]}

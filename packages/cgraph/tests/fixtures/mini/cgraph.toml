@@ -37,6 +37,14 @@ hash = ["hash_insert"]
 [c.cleanup]
 class_type = "^class_(.+)_t$"
 destructor = "class_{name}_destructor"
+attribute_macros = { "__free" = "__free_{arg}", "__cleanup" = "{arg}" }
+
+[checks]
+min_call_agreement = 0.95
+# Two C accesses the compiler leaves out (a NULL test of &all_bags; a table address indexed in a
+# register), of eleven: 9/11.
+min_access_agreement = 0.8
+min_field_offsets = 0.9
 
 [image]
 arch = "riscv64"

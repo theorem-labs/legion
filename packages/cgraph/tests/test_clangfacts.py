@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -68,10 +69,35 @@ def test_typeof_expression_is_not_an_access(units: dict[str, dict[str, Any]]) ->
     assert ("tree_sem", "type") in unevaluated(units, "src/bags.c", "bag_count")
 
 
-def test_generic_associations_the_text_cannot_decide_are_marked(units: dict[str, dict[str, Any]]) -> None:
-    events = units["src/bags.c"]["functions"]["bag_count"]["events"]["accesses"]
-    generic = {item["unit"]["name"] for item in events if item.get("generic")}
-    assert generic == {"box_table", "all_bags"}
+def test_generic_association_types_are_read_from_the_macro(units: dict[str, dict[str, Any]]) -> None:
+    events = units["src/bags.c"]["functions"]["bag_count"]["events"]
+    assert ("all_bags", "read", None) in accesses(units, "src/bags.c", "bag_count")
+    assert ("box_table", "generic_unselected") in unevaluated(units, "src/bags.c", "bag_count")
+    assert not any(item.get("generic") for item in events["accesses"])
+    assert units["src/bags.c"]["generic_selections"] == {"selected": 1, "ambiguous": 0}
+
+
+def test_cleanup_attribute_names_the_destructor(units: dict[str, dict[str, Any]]) -> None:
+    calls = units["src/store.c"]["functions"]["box_scoped"]["events"]["calls"]
+    implied = {call["callee"]: call for call in calls if call.get("implied") == "cleanup"}
+    assert set(implied) == {"tree_unlock", "__free_obj"}
+    assert implied["tree_unlock"]["arguments"][0]["unit"]["name"] == "tree_sem"
+    assert implied["__free_obj"]["arguments"][0]["unit"]["name"] == "box"
+
+
+def test_weak_definition_is_marked(units: dict[str, dict[str, Any]]) -> None:
+    assert units["src/store.c"]["functions"]["arch_hook"]["weak"]
+    assert not units["src/bags.c"]["functions"]["arch_hook"]["weak"]
+
+
+def test_a_field_through_a_member_chain_has_its_displacement(units: dict[str, dict[str, Any]]) -> None:
+    fields = units["src/bags.c"]["functions"]["crate_size"]["events"]["field_accesses"]
+    size = next(item for item in fields if item["field"] == "size")
+    assert (size["offset"], size["displacement"]) == (56, 64)
+
+
+def test_unit_facts_name_no_absolute_path(units: dict[str, dict[str, Any]]) -> None:
+    assert "/home/" not in json.dumps(units) and FIXTURE.as_posix() not in json.dumps(units)
 
 
 def test_function_local_static_uses_the_compiler_name(units: dict[str, dict[str, Any]]) -> None:

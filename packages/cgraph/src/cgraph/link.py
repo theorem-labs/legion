@@ -32,6 +32,15 @@ class Definition:
     static: bool
     tu: str  # the first unit, in path order, that defines it
     id: str = ""
+    weak: bool = False
+
+
+def function_id(name: str, file: str, static: bool) -> str:
+    """``function:<name>`` for external linkage, ``function:<name>@<file>`` for a static function.
+
+    Linkage decides, never a collision with another name, so a definition that appears later does
+    not rename this one."""
+    return f"function:{name}@{file}" if static else f"function:{name}"
 
 
 @dataclass
@@ -47,11 +56,6 @@ class Effective:
     field_accesses: list[dict[str, Any]] = field(default_factory=list)
     folds: list[dict[str, Any]] = field(default_factory=list)
     unbound: int = 0
-
-
-def _suffixes(keys: list[tuple[str, int]]) -> dict[tuple[str, int], str]:
-    files = collections.Counter(file for file, _ in keys)
-    return {(file, line): file if files[file] == 1 else f"{file}:{line}" for file, line in keys}
 
 
 def _with_via(item: dict[str, Any], helper: str) -> dict[str, Any]:
@@ -76,38 +80,48 @@ class Linker:
             for name, function in facts["functions"].items():
                 key = (name, function["file"], function["line"])
                 if key not in self.definitions:
-                    definition = Definition(name, function["file"], function["line"], function["static"], tu)
+                    definition = Definition(
+                        name, function["file"], function["line"], function["static"], tu,
+                        function_id(name, function["file"], function["static"]), bool(function.get("weak")),
+                    )  # fmt: skip
                     self.definitions[key] = definition
                     self.by_name[name].append(definition)
-        for name, definitions in self.by_name.items():
-            if len(definitions) == 1:
-                definitions[0].id = f"function:{name}"
-                continue
-            suffixes = _suffixes([(item.file, item.line) for item in definitions])
-            for item in definitions:
-                item.id = f"function:{name}@{suffixes[(item.file, item.line)]}"
+        # External definitions of one name: the linker keeps the strong one, which is the node; the
+        # weak defaults it replaced are recorded on it.
+        self.primary: dict[str, Definition] = {}
+        self.alternates: dict[str, list[Definition]] = collections.defaultdict(list)
+        for definition in sorted(
+            self.definitions.values(), key=lambda item: (item.id, item.weak, item.file, item.line)
+        ):
+            if definition.id in self.primary:
+                self.alternates[definition.id].append(definition)
+            else:
+                self.primary[definition.id] = definition
         self.records: dict[str, dict[str, Any]] = {}
         for facts in self.tus.values():
             for key, record in facts["records"].items():
                 self.records.setdefault(key, record)
-        record_definitions: dict[str, list[tuple[str, int]]] = collections.defaultdict(list)
+        header_records: dict[str, set[str]] = collections.defaultdict(set)
         for record in self.records.values():
-            file, line = record["def"].rsplit(":", 1)
-            record_definitions[record["name"]].append((file, int(line)))
+            file = record["def"].rsplit(":", 1)[0]
+            if not file.endswith(".c"):
+                header_records[record["name"]].add(file)
+        # A struct defined in a C file is that file's: struct:<name>@<file>. A header's is
+        # struct:<name>, unless two headers define the name.
         self.struct_ids: dict[str, str] = {}
-        for name, keys in record_definitions.items():
-            suffixes = _suffixes(sorted(set(keys)))
-            for file, line in keys:
-                self.struct_ids[f"{name}@{file}:{line}"] = (
-                    f"struct:{name}" if len(suffixes) == 1 else f"struct:{name}@{suffixes[(file, line)]}"
-                )
-        self.global_keys: dict[str, set[str | None]] = collections.defaultdict(set)
+        for record in self.records.values():
+            name, file = record["name"], record["def"].rsplit(":", 1)[0]
+            local = file.endswith(".c") or len(header_records[name]) > 1
+            self.struct_ids[f"{name}@{record['def']}"] = f"struct:{name}@{file}" if local else f"struct:{name}"
+        self.global_ids: dict[str, set[str]] = collections.defaultdict(set)
         for facts in self.tus.values():
             for function in facts["functions"].values():
                 for item in function["events"]["accesses"] + function["events"]["unevaluated"]:
                     unit = item.get("unit")
                     if unit is not None and unit["kind"] == "global":
-                        self.global_keys[unit["name"]].add(unit.get("def"))
+                        identity = self.unit_id(unit)
+                        if identity is not None:
+                            self.global_ids[unit["name"]].add(identity)
         self.symbol_cache: dict[tuple[str, str, int], list[Symbol]] = {}
         self.callee_cache: dict[tuple[str, str, int], set[str]] = {}
         self.effective_cache: dict[tuple[str, str, tuple[str, str, int]], Effective] = {}
@@ -120,15 +134,14 @@ class Linker:
             return None
         return self.definitions[(name, function["file"], function["line"])]
 
+    def node_of(self, definition: Definition) -> Definition:
+        """The definition that is the node of ``definition``'s id: the strong one of a weak pair."""
+        return self.primary[definition.id]
+
     def resolve(self, tu: str, name: str) -> str:
         """The id a call to ``name`` from unit ``tu`` reaches."""
         definition = self.visible(tu, name)
-        if definition is not None:
-            return definition.id
-        external = [item for item in self.by_name.get(name, []) if not item.static]
-        if len(external) == 1:
-            return external[0].id
-        return f"function:{name}"
+        return definition.id if definition is not None else f"function:{name}"
 
     def is_percpu(self, name: str) -> bool:
         if name in self.vocabulary.percpu_globals:
@@ -138,40 +151,54 @@ class Linker:
         )
 
     def unit_id(self, unit: Unit) -> str | None:
+        """``global:<name>`` for external linkage, ``global:<name>@<file>`` for a static global or a
+        function-local static; ``percpu:`` the same for per-CPU state."""
         if unit["kind"] == "struct":
             return self.struct_ids.get(f"{unit['name']}@{unit['def']}")
         name = unit["name"]
         prefix = "percpu" if self.is_percpu(name) else "global"
-        keys = self.global_keys.get(name, {unit.get("def")})
         definition = unit.get("def")
-        if len(keys) <= 1 or definition is None:
-            return f"{prefix}:{name}"
-        return f"{prefix}:{name}@{definition.rsplit(':', 1)[0]}"
+        return f"{prefix}:{name}" if definition is None else f"{prefix}:{name}@{definition.rsplit(':', 1)[0]}"
+
+    def image_global_id(self, name: str, symbol_file: str) -> str:
+        """The node a global the image addresses is: the C global of that name, the static one
+        whose file the ELF FILE symbol names when there are several, or a new external one."""
+        ids = sorted(self.global_ids.get(name, set()))
+        if len(ids) == 1:
+            return ids[0]
+        matching = [identity for identity in ids if os.path.basename(identity.rsplit("@", 1)[-1]) == symbol_file]
+        if len(matching) == 1:
+            return matching[0]
+        prefix = "percpu" if self.is_percpu(name) else "global"
+        return f"{prefix}:{name}"
 
     # The image -----------------------------------------------------------------------------
 
     def symbols(self, definition: Definition) -> list[Symbol]:
+        """The image copies of a definition, by linkage: the global symbol of an external function;
+        the local symbol that follows its unit's ELF FILE symbol for a C file's static; every unit's
+        local copy of a header's static inline that no C file's static of the name claims."""
         key = (definition.name, definition.file, definition.line)
         if key in self.symbol_cache:
             return self.symbol_cache[key]
         candidates = self.image.functions.get(definition.name, [])
         contract = self.contracts.function(definition.file, definition.name)
         address = contract.get("addr") if contract else None
-        if address:
-            pinned = [symbol for symbol in candidates if symbol.address == int(address, 16)]
-            if pinned:
-                candidates = pinned
-        if len(self.by_name[definition.name]) > 1 and not address:
-            base = os.path.basename(definition.file)
-            if definition.file.endswith(".c") and definition.static:
-                candidates = [symbol for symbol in candidates if symbol.local and symbol.file == base]
-            elif definition.file.endswith(".c"):
-                candidates = [symbol for symbol in candidates if not symbol.local]
-            else:
-                others = {
-                    os.path.basename(item.file) for item in self.by_name[definition.name] if item is not definition
-                }
-                candidates = [symbol for symbol in candidates if symbol.local and symbol.file not in others]
+        pinned = [symbol for symbol in candidates if address and symbol.address == int(address, 16)]
+        if pinned:
+            candidates = pinned
+        elif not definition.static:
+            candidates = [symbol for symbol in candidates if not symbol.local]
+        elif definition.file.endswith(".c"):
+            names = {os.path.basename(definition.tu), os.path.basename(definition.file)}
+            candidates = [symbol for symbol in candidates if symbol.local and symbol.file in names]
+        else:
+            claimed = {
+                os.path.basename(item.tu)
+                for item in self.by_name[definition.name]
+                if item.static and item.file.endswith(".c")
+            }
+            candidates = [symbol for symbol in candidates if symbol.local and symbol.file not in claimed]
         self.symbol_cache[key] = candidates
         return candidates
 
@@ -203,7 +230,13 @@ class Linker:
         callees = self.image_callees(caller)
         for call in events["calls"]:
             callee = call["callee"]
-            if call.get("visible") and callee not in callees and callee not in stack and callee != name:
+            if (
+                call.get("visible")
+                and not call.get("generic")
+                and callee not in callees
+                and callee not in stack
+                and callee != name
+            ):
                 helper = self.visible(tu, callee)
                 assert helper is not None
                 child = self.effective(tu, callee, caller, (*stack, name))
@@ -335,7 +368,7 @@ def build(
             if _owned(function):
                 definition = linker.visible(tu, name)
                 if definition is not None and linker.symbols(definition):
-                    roots[definition.id] = definition
+                    roots[definition.id] = linker.node_of(definition)
     functions = dict(roots)
     effective: dict[str, Effective] = {}
     pending = sorted(functions)
@@ -355,7 +388,7 @@ def build(
                 and call["callee"] in callees
                 and linker.symbols(helper)
             ):
-                functions[helper.id] = helper
+                functions[helper.id] = linker.node_of(helper)
                 pending.append(helper.id)
     builder = GraphBuilder()
     analysis: dict[str, Any] = {
@@ -364,7 +397,7 @@ def build(
         "indirect_slots": [],
         "unbound_parameter_accesses": 0,
         "generic_unconfirmed": [],
-        "ambiguous_image_names": [],
+        "alternate_definitions": {},
     }
     image_globals: dict[str, set[str]] = {}
     for identity, definition in sorted(functions.items()):
@@ -385,24 +418,20 @@ def build(
             line=definition.line,
             image_addresses=sorted(_hex(symbol.address) for symbol in symbols),
             contract=contract["id"] if contract else None,
+            weak_definitions=[f"{item.file}:{item.line}" for item in linker.alternates.get(identity, [])] or None,
         )
         builder.provenance(identity, provenance)
-    for name, definitions in sorted(linker.by_name.items()):
-        if len(definitions) > 1:
-            analysis["ambiguous_image_names"].append(
-                {
-                    "name": name,
-                    "definitions": sorted(item.id for item in definitions),
-                    "mapped": {
-                        item.id: sorted(_hex(symbol.address) for symbol in linker.symbols(item)) for item in definitions
-                    },
-                }
-            )
+    for identity, alternates in sorted(linker.alternates.items()):
+        node = linker.primary[identity]
+        analysis["alternate_definitions"][identity] = {
+            "node": f"{node.file}:{node.line}", "weak": node.weak,
+            "others": [{"definition": f"{item.file}:{item.line}", "weak": item.weak} for item in alternates],
+        }  # fmt: skip
 
     def function_node(identity: str, name: str, where: list[dict[str, Any]]) -> None:
         if identity in builder.nodes:
             return
-        definition = next((item for item in linker.by_name.get(name, []) if item.id == identity), None)
+        definition = linker.primary.get(identity)
         if definition is not None:
             builder.node(identity, "function", name, part=False, c_file=definition.file, line=definition.line)
             builder.provenance(identity, [{"source": "c", "file": definition.file, "line": definition.line}])
@@ -412,8 +441,8 @@ def build(
 
     unit_nodes: dict[str, Unit] = {}
 
-    def state_node(unit: Unit, where: list[dict[str, Any]]) -> str | None:
-        identity = linker.unit_id(unit)
+    def state_node(unit: Unit, where: list[dict[str, Any]], known: str | None = None) -> str | None:
+        identity = known or linker.unit_id(unit)
         if identity is None:
             return None
         if identity not in builder.nodes:
@@ -466,6 +495,13 @@ def build(
         facts = linker.image_facts(definition)
         image_calls = {call["target"]: call for fact in facts for call in fact.calls}
         for call in result.calls:
+            if call.get("generic") and call["callee"] not in image_calls:
+                # A call in a _Generic association whose selection could not be read, and that
+                # the machine code does not make: not the selected association.
+                analysis["generic_unconfirmed"].append(
+                    {"function": identity, "call": call["callee"], "provenance": call["provenance"]}
+                )
+                continue
             target = linker.resolve(call["tu"], call["callee"])
             function_node(target, call["callee"], call["provenance"])
             image_call = image_calls.get(call["callee"])
@@ -490,7 +526,9 @@ def build(
             unit = access.get("unit")
             if unit is None:
                 continue
-            if access.get("generic") and unit["kind"] == "global" and unit["name"] not in image_globals[identity]:
+            if access.get("generic") and (unit["kind"] != "global" or unit["name"] not in image_globals[identity]):
+                # In a _Generic association whose selection could not be read: a global the
+                # machine code addresses stays; a struct access cannot be confirmed and goes.
                 analysis["generic_unconfirmed"].append(
                     {"function": identity, "unit": unit["name"], "provenance": access["provenance"]}
                 )
@@ -510,8 +548,10 @@ def build(
             for item in fact.globals:
                 if item["target_class"] not in ("state", "per_cpu") or item["global"] in targets:
                     continue
+                symbols = image.object_symbols.get(item.get("symbol", item["global"]), [])
+                identity_hint = linker.image_global_id(item["global"], symbols[0].file if symbols else "")
                 unit = {"kind": "global", "name": item["global"], "def": None, "field": None, "lock": False}
-                image_state = state_node(unit, item["provenance"])
+                image_state = state_node(unit, item["provenance"], identity_hint)
                 if image_state is not None:
                     builder.edge("access", identity, image_state, item["provenance"], access="image", image_only=True)
         for item in result.unevaluated:
@@ -545,7 +585,8 @@ def build(
         c_targets[identity] = [{"name": name, "target_class": kind} for name, kind in sorted(targets.items())]
         field_accesses[identity] = sorted(
             {
-                repr(item): {key: item[key] for key in ("struct", "field", "offset")} for item in result.field_accesses
+                repr(item): {key: item.get(key, -1) for key in ("struct", "field", "offset", "displacement")}
+                for item in result.field_accesses
             }.values(),
             key=repr,
         )

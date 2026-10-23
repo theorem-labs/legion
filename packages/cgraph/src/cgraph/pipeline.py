@@ -106,7 +106,13 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
             "system_map": _sha256(inputs.system_map),
             "compile_commands_files": len(database) if database is not None else None,
             "contract_graph": _sha256(inputs.contract_graph),
-            "contract_graph_meta": contracts.meta or None,
+            # The contract graph's own record, without the paths of the machine that made it.
+            "contract_graph_meta": {
+                key: value
+                for key, value in sorted(contracts.meta.items())
+                if not (isinstance(value, str) and value.startswith("/"))
+            }
+            or None,
             "vocabulary": digest,
         }
         graph = link.build(config, part, files, facts, image, contracts, recorded)
@@ -119,7 +125,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
         "access_layer": checks.accesses(graph),
         "structure_layer": checks.structure(graph),
     }
-    hard = checks.hard(graph, owner_list, topics, layers["structure_layer"])
+    hard = checks.hard(graph, owner_list, topics, layers, config.thresholds)
     passes = all(item["ok"] for item in hard)
     check_document = {"format": "cgraph/checks/v1", "part": part, **layers, "hard_checks": hard, "passes": passes}
     outputs = {

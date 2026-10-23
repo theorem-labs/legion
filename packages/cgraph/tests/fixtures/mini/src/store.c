@@ -84,3 +84,31 @@ int run_get(const struct ops *o, struct box *b)
 {
 	return o->get(b);
 }
+
+__attribute__((weak)) int arch_hook(void)
+{
+	return 0;
+}
+
+int use_hook(void)
+{
+	return arch_hook();
+}
+
+__attribute__((noinline)) int box_weight(void)
+{
+	return ++box_count;
+}
+
+__attribute__((noinline)) void tree_unlock(struct rwsem **s)
+{
+	up_write(*s);
+}
+
+int box_scoped(struct box *b)
+{
+	LOCK_TREE(held);
+	struct box *spare __free(obj) = obj_alloc(sizeof(*spare));
+
+	return weight_of(b) + (int)size_of(b) + (spare != NULL);
+}

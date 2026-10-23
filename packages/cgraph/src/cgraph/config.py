@@ -55,6 +55,9 @@ class Vocabulary:
     membership_witness_macros: tuple[str, ...] = ()
     cleanup_class: re.Pattern[str] | None = None
     cleanup_destructor: str = ""
+    # Macros that put a cleanup attribute on a local, and the function each names: "{arg}" is the
+    # macro's argument ("__free" = "__free_{arg}").
+    cleanup_macros: dict[str, str] = field(default_factory=dict)
     base_type_min_containers: int = 2
 
     def digest(self) -> str:
@@ -73,6 +76,7 @@ class Vocabulary:
             "membership_witness_macros": list(self.membership_witness_macros),
             "cleanup_class": self.cleanup_class.pattern if self.cleanup_class else None,
             "cleanup_destructor": self.cleanup_destructor,
+            "cleanup_macros": dict(sorted(self.cleanup_macros.items())),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -105,6 +109,33 @@ class Inputs:
 
 
 @dataclass(frozen=True)
+class Thresholds:
+    """The least agreement each layer check must reach for a run to pass, each a fraction in [0, 1]."""
+
+    # C calls and image calls between image functions of the part: |both| / |either|.
+    call_agreement: float = 0.0
+    # Accesses to state globals, C against image: |both| / |either|.
+    access_agreement: float = 0.0
+    # Field accesses whose displacement the function's machine code holds.
+    field_offsets: float = 0.0
+
+
+def _thresholds(table: dict[str, Any]) -> Thresholds:
+    _unknown(table, {"min_call_agreement", "min_access_agreement", "min_field_offsets"}, "checks")
+    values = {}
+    for key, name in (
+        ("min_call_agreement", "call_agreement"),
+        ("min_access_agreement", "access_agreement"),
+        ("min_field_offsets", "field_offsets"),
+    ):
+        value = table.get(key, 0.0)
+        if not isinstance(value, int | float) or not 0 <= value <= 1:
+            raise ConfigError(f"checks.{key} must be a number from 0 to 1")
+        values[name] = float(value)
+    return Thresholds(**values)
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     inputs: Inputs
@@ -116,6 +147,7 @@ class Config:
     image: ImageRules
     contract_function_prefix: str
     topic_prefix: str
+    thresholds: Thresholds = field(default_factory=lambda: Thresholds())
 
 
 def _expect(table: dict[str, Any], key: str, kind: type | tuple[type, ...], where: str, required: bool = False) -> Any:
@@ -167,7 +199,7 @@ def load(path: Path, root: Path | None = None) -> Config:
         raise ConfigError(f"configuration {path} does not exist") from error
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f"configuration {path} is not valid TOML: {error}") from error
-    _unknown(data, {"inputs", "parts", "c", "image", "contract_graph", "topics"}, "configuration")
+    _unknown(data, {"inputs", "parts", "c", "image", "contract_graph", "topics", "checks"}, "configuration")
 
     inputs_table = _expect(data, "inputs", dict, "configuration", required=True)
     _unknown(
@@ -270,7 +302,11 @@ def load(path: Path, root: Path | None = None) -> Config:
                 raise ConfigError(f"c.membership names {call} twice")
             membership[call] = kind
     cleanup_table = _expect(c_table, "cleanup", dict, "c") or {}
-    _unknown(cleanup_table, {"class_type", "destructor"}, "c.cleanup")
+    _unknown(cleanup_table, {"class_type", "destructor", "attribute_macros"}, "c.cleanup")
+    cleanup_macros = _expect(cleanup_table, "attribute_macros", dict, "c.cleanup") or {}
+    for name, template in cleanup_macros.items():
+        if not isinstance(template, str) or "{arg}" not in template:
+            raise ConfigError(f"c.cleanup.attribute_macros.{name} must be a string containing {{arg}}")
     cleanup_class = _expect(cleanup_table, "class_type", str, "c.cleanup")
     cleanup_destructor = _expect(cleanup_table, "destructor", str, "c.cleanup") or ""
     if (cleanup_class is None) != (not cleanup_destructor):
@@ -296,6 +332,7 @@ def load(path: Path, root: Path | None = None) -> Config:
         membership_witness_macros=tuple(_strings(c_table, "membership_witness_macros", "c")),
         cleanup_class=cleanup_pattern,
         cleanup_destructor=cleanup_destructor,
+        cleanup_macros=dict(cleanup_macros),
         base_type_min_containers=2 if minimum is None else minimum,
     )
     if vocabulary.base_type_min_containers < 2:
@@ -342,6 +379,7 @@ def load(path: Path, root: Path | None = None) -> Config:
         image=image_rules,
         contract_function_prefix=prefix,
         topic_prefix=topic_prefix,
+        thresholds=_thresholds(_expect(data, "checks", dict, "configuration") or {}),
     )
 
 
