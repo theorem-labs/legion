@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -93,9 +94,26 @@ func (r Registry) Check() error {
 	return r.FormsModule().Check()
 }
 
-// Load reads and checks a registry file.
+// registryFile resolves the configured registry directory to its registry file. T0 keeps format 1 for
+// compatibility; Task R changes the directory's format to one concept file per entry.
+func registryFile(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return filepath.Join(path, "registry.yaml"), nil
+	}
+	return path, nil
+}
+
+// Load reads and checks a registry file, or registry.yaml in a configured registry directory.
 func Load(path string) (Registry, error) {
-	raw, err := os.ReadFile(path)
+	file, err := registryFile(path)
+	if err != nil {
+		return Registry{}, err
+	}
+	raw, err := os.ReadFile(file)
 	if err != nil {
 		return Registry{}, err
 	}
@@ -103,10 +121,10 @@ func Load(path string) (Registry, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(&r); err != nil {
-		return Registry{}, fmt.Errorf("%s: %w", path, err)
+		return Registry{}, fmt.Errorf("%s: %w", file, err)
 	}
 	if err := r.Check(); err != nil {
-		return Registry{}, fmt.Errorf("%s: %w", path, err)
+		return Registry{}, fmt.Errorf("%s: %w", file, err)
 	}
 	return r, nil
 }
@@ -136,7 +154,11 @@ var ErrExists = errors.New("already registered")
 // Add appends a concept to the registry file. The existing text, comments included, stays as it is: the new
 // entry is appended to the concepts list, which must be the file's last key.
 func Add(path string, c Concept) error {
-	r, err := Load(path)
+	file, err := registryFile(path)
+	if err != nil {
+		return err
+	}
+	r, err := Load(file)
 	if err != nil {
 		return err
 	}
@@ -151,7 +173,7 @@ func Add(path string, c Concept) error {
 	if err != nil {
 		return err
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(file)
 	if err != nil {
 		return err
 	}
@@ -164,7 +186,7 @@ func Add(path string, c Concept) error {
 	for _, line := range strings.Split(strings.TrimSuffix(string(entry), "\n"), "\n") {
 		b.WriteString("  " + line + "\n")
 	}
-	tmp := path + ".tmp"
+	tmp := file + ".tmp"
 	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
 		return err
 	}
@@ -176,5 +198,5 @@ func Add(path string, c Concept) error {
 		_ = os.Remove(tmp)
 		return errors.New("the registry's concepts list is not its last key, so a concept cannot be appended")
 	}
-	return os.Rename(tmp, path)
+	return os.Rename(tmp, file)
 }

@@ -181,6 +181,9 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 // RefreshAt holds the writer lock across sync and the refresh: a post-landing fetch, checkout and build cannot
 // race a second index refresh, and a query observes only the result after both complete.
 func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sync func(context.Context) error) (RefreshStats, error) {
+	if s.beforeRefreshLock != nil {
+		s.beforeRefreshLock()
+	}
 	unlock, err := s.lock()
 	if err != nil {
 		return RefreshStats{}, err

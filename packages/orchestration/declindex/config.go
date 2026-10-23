@@ -17,34 +17,34 @@ import (
 // Config is one project's index configuration, a YAML file that the project keeps beside its proofs. `tree` and
 // `db` are relative to the file's directory; `lib`, `registry` and `owners` are relative to the tree.
 type Config struct {
-	Tree string
+	Tree string `yaml:"tree"`
 	// LibRel is the configured library path below Tree; Lib is the resolved path.
-	LibRel    string
-	Lib       string
-	DB        string
-	Roots     []string
-	FileKinds []string
-	Jobs      int
+	LibRel    string   `yaml:"-"`
+	Lib       string   `yaml:"lib"`
+	DB        string   `yaml:"db"`
+	Roots     []string `yaml:"roots"`
+	FileKinds []string `yaml:"file_kinds"`
+	Jobs      int      `yaml:"jobs"`
 	// Registry is the concept registry directory (see package conceptgate), relative to Tree.
-	Registry string
+	Registry string `yaml:"registry"`
 	// Build runs in Tree after RefreshAt has moved it to LAND_COMMIT.
-	Build []string
+	Build []string `yaml:"build"`
 	// Remote is the sole remote RefreshAt fetches LAND_COMMIT from when Tree lacks it.
-	Remote string
+	Remote string `yaml:"remote"`
 	// BuildTimeout bounds Build; LoadConfig defaults it to six hours.
-	BuildTimeout time.Duration
+	BuildTimeout time.Duration `yaml:"build_timeout"`
 	// Lean configures the exporter of compiled modules. With Lean.Export off, the index reads only the reference
 	// files (uses, positions, statement hashes).
-	Lean LeanConfig
+	Lean LeanConfig `yaml:"lean"`
 	// Contracts selects the declarations that the ledger tracks, and Owners maps them to their owners.
-	Contracts ContractRule
-	Owners    string
+	Contracts ContractRule `yaml:"contracts"`
+	Owners    string       `yaml:"owners"`
 	// OwnersFormat is the "format" value the owner map must carry (its producer's format name); empty accepts any.
-	OwnersFormat string
+	OwnersFormat string `yaml:"owners_format"`
 	// Repo is the repository's name in the ledger.
-	Repo string
+	Repo string `yaml:"repo"`
 	// Librarian is the command that hands a near match to the librarian (the proposal and verdict on stdin).
-	Librarian []string
+	Librarian []string `yaml:"librarian"`
 }
 
 // configYAML retains YAML's strict field check while Config keeps resolved paths and a parsed duration.

@@ -98,6 +98,9 @@ type Store struct {
 	graphOnce sync.Once
 	g         *graph
 	graphErr  error
+
+	// beforeRefreshLock is a test hook. It runs immediately before RefreshAt attempts the writer lock.
+	beforeRefreshLock func()
 }
 
 // Open opens (creating it if needed) the index at path. An index of another schema version is emptied, so the

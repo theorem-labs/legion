@@ -89,3 +89,23 @@ func TestAddAppendsAndKeepsTheFileAsWritten(t *testing.T) {
 		t.Fatal("a second concept of the same name was added")
 	}
 }
+
+func TestLoadRegistryDirectoryUsesItsRegistryFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "registry.yaml"), []byte(sample), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Concepts) != 2 {
+		t.Fatalf("directory registry has %d concepts", len(got.Concepts))
+	}
+	if err := Add(dir, Concept{Name: "Fx.NewThing", Home: "New.lean", Meaning: "A thing that nothing states yet."}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "registry.yaml")); err != nil {
+		t.Fatal(err)
+	}
+}

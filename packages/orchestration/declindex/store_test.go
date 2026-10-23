@@ -303,6 +303,8 @@ func TestRefreshAtSerializesTheSyncStepWithTheWriterLock(t *testing.T) {
 		firstDone <- err
 	}()
 	<-entered
+	secondAttempted := make(chan struct{})
+	s.beforeRefreshLock = func() { close(secondAttempted) }
 	secondStarted := make(chan struct{})
 	secondDone := make(chan error, 1)
 	go func() {
@@ -312,6 +314,7 @@ func TestRefreshAtSerializesTheSyncStepWithTheWriterLock(t *testing.T) {
 		})
 		secondDone <- err
 	}()
+	<-secondAttempted
 	select {
 	case <-secondStarted:
 		t.Fatal("the second sync ran while the first writer lock was held")

@@ -4,8 +4,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -74,6 +77,33 @@ func TestConfigBuildSettingsAndLibraryRelativePath(t *testing.T) {
 	for _, timeout := range []string{"tomorrow", "-1s"} {
 		if _, err := LoadConfig(writeConfig(t, "tree: tree\nroots: [A]\nbuild_timeout: "+timeout+"\n")); err == nil {
 			t.Errorf("accepted build_timeout %q", timeout)
+		}
+	}
+}
+
+func TestPublicConfigKeepsItsYAMLSchema(t *testing.T) {
+	raw, err := yaml.Marshal(Config{
+		Tree:         "tree",
+		Lib:          "lib",
+		DB:           "state.sqlite",
+		FileKinds:    []string{"Spec"},
+		Build:        []string{"build"},
+		Remote:       "remote",
+		BuildTimeout: time.Minute,
+		OwnersFormat: "owners/v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, key := range []string{"file_kinds:", "build:", "remote:", "build_timeout:", "owners_format:"} {
+		if !strings.Contains(text, key) {
+			t.Errorf("public Config YAML lacks %q:\n%s", key, text)
+		}
+	}
+	for _, key := range []string{"filekinds:", "buildtimeout:", "ownersformat:"} {
+		if strings.Contains(text, key) {
+			t.Errorf("public Config YAML uses an implicit key %q:\n%s", key, text)
 		}
 	}
 }
