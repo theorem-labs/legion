@@ -56,6 +56,22 @@ def is_increment(cursor: ci.Cursor) -> bool:
     return int(_lib().clang_getCursorUnaryOperatorKind(cursor)) in _INCREMENT_OPERATORS
 
 
+# CXBinaryOperatorKind and CXUnaryOperatorKind values (clang-c/Index.h): Mul 3 ... Or 19, LAnd 20,
+# LOr 21; PostInc 1 ... AddrOf 5, LNot 10.
+LOGICAL_AND = 20
+LOGICAL_OR = 21
+LOGICAL_NOT = 10
+SUBTRACT = 7
+
+
+def binary_kind(cursor: ci.Cursor) -> int:
+    return int(_lib().clang_getCursorBinaryOperatorKind(cursor))
+
+
+def unary_kind(cursor: ci.Cursor) -> int:
+    return int(_lib().clang_getCursorUnaryOperatorKind(cursor))
+
+
 def is_macro_function_like(cursor: ci.Cursor) -> bool:
     lib = _lib()
     function = lib.clang_Cursor_isMacroFunctionLike

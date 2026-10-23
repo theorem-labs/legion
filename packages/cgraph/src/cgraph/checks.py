@@ -45,16 +45,30 @@ def calls(graph: dict[str, Any]) -> dict[str, Any]:
     tails = {(item["source"], item["target"]) for item in image_calls if item["tail"]}
     names = {node["id"]: node["name"] for node in graph["nodes"]}
     only_c, only_image = c_pairs - image_pairs, image_pairs - c_pairs
+    pointers = {
+        (edge["source"], edge["target"])
+        for edge in graph["edges"]
+        if edge["kind"] == "call_indirect" and edge["source"] in functions
+    }
+    weak = {node["id"] for node in graph["nodes"] if node.get("weak_definitions")}
     classes: dict[str, dict[str, list[tuple[str, str]]]] = {
         "only_c": collections.defaultdict(list),
         "only_image": collections.defaultdict(list),
     }
     for pair in sorted(only_c):
-        classes["only_c"][
-            "compiler_builtin" if names.get(pair[1], "").startswith("__builtin_") else "no_image_call"
-        ].append(pair)
+        cause = "compiler_builtin" if names.get(pair[1], "").startswith("__builtin_") else "no_image_call"
+        classes["only_c"][cause].append(pair)
     for pair in sorted(only_image):
-        classes["only_image"]["tail_call" if pair in tails else "other"].append(pair)
+        if pair in pointers:
+            # A function pointer the C passes or stores, which the compiler turned into a direct call.
+            cause = "devirtualized_callback"
+        elif pair[0] in weak:
+            cause = "caller_has_weak_alternate"
+        elif pair in tails:
+            cause = "tail_call"
+        else:
+            cause = "other"
+        classes["only_image"][cause].append(pair)
     c_pointers = {
         (edge["source"], edge["target"])
         for edge in graph["edges"]
@@ -196,22 +210,43 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
         if any(item.get("source") == "c" and item.get("line", 0) > 0 for item in edge["provenance"])
     ]
     offsets, constants = analysis["image"]["memory_offsets"], analysis["image"]["addi_constants"]
+    global_offsets: dict[str, set[int]] = collections.defaultdict(set)
+    for entry in analysis["image"]["globals"]:
+        global_offsets[entry["function"]].add(entry["offset"])
     candidates = []
+    excluded: collections.Counter[str] = collections.Counter()
     for function, fields in sorted(analysis["field_accesses"].items()):
         if function not in offsets:
             continue
+        displacements = set(offsets[function])
+        if not displacements - {0}:
+            # The machine code makes no memory access with a displacement: nothing to match.
+            excluded["no_memory_access_in_image"] += len(fields)
+            continue
         for item in fields:
-            # What the machine code adds to the base pointer; the field's own offset when the C
-            # expression gives no displacement.
-            offset = item["displacement"] if item.get("displacement", -1) >= 0 else item["offset"]
-            if offset < 0:
+            base = item.get("base", "pointer")
+            if base in ("local", "other"):
+                # An object on the stack or in registers: the compiler keeps it in registers.
+                excluded[f"{base}_object"] += 1
                 continue
-            if offset in offsets[function]:
+            offset = item["displacement"] if item.get("displacement", -1) >= 0 else item["offset"]
+            if offset < 0 and base != "container_of":
+                continue
+            size = max(1, item.get("size", 1) or 1)
+            if base == "global" and offset in global_offsets[function]:
+                method = "global_address_offset"
+            elif offset in displacements:
                 method = "memory_displacement"
             elif offset in constants.get(function, []):
                 method = "addi_field_address"
-            elif -offset in constants.get(function, []):
+            elif -offset in constants.get(function, []) or (offset < 0 and -offset in displacements):
                 method = "negative_addi_container_offset"
+            elif any(offset < value < offset + size for value in displacements):
+                method = "narrower_access_inside_field"
+            elif item.get("bitfield") and ({offset & ~3, offset & ~7} & displacements):
+                method = "bitfield_storage_unit"
+            elif offset >= 2048:
+                method = "no_match_beyond_12_bit_displacement"
             else:
                 method = "no_matching_offset"
             candidate = {
@@ -219,7 +254,8 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 "struct": item["struct"],
                 "field": item["field"],
                 "offset": offset,
-                "matched": method != "no_matching_offset",
+                "base": base,
+                "matched": not method.startswith("no_"),
                 "method": method,
             }
             if not candidate["matched"]:
@@ -246,6 +282,15 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             "candidates": len(candidates),
             "matched": sum(item["matched"] for item in candidates),
             "by_method": dict(sorted(collections.Counter(item["method"] for item in candidates).items())),
+            "excluded": dict(sorted(excluded.items())),
+            "miss_examples": {
+                method: [
+                    {key: item[key] for key in ("function", "struct", "field", "offset", "base")}
+                    for item in candidates
+                    if item["method"] == method
+                ][:3]
+                for method in sorted({item["method"] for item in candidates if not item["matched"]})
+            },
             "sample": {"size": len(sample), "matched": sum(item["matched"] for item in sample), "items": sample},
         },
         "excluded_embedding_bases": analysis["excluded_embedding_bases"],

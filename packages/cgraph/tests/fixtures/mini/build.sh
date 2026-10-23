@@ -11,7 +11,7 @@ FLAGS=(--target=riscv64-unknown-elf -march=rv64imac -mabi=lp64 -mcmodel=medany -
 	-nostdinc -fno-builtin -Iinclude -std=gnu11)
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-for source in src/store.c src/bags.c src/anchor.S; do
+for source in src/store.c src/bags.c src/flow.c src/anchor.S; do
 	"$CLANG" "${FLAGS[@]}" -c "$source" -o "$work/$(basename "$source").o"
 done
 # The stubs give the external helpers a body so the image links; the tests never read them.
@@ -26,6 +26,6 @@ void obj_free(void *p) { (void)p; }
 void _start(void) { for (;;) ; }
 EOF
 "$CLANG" "${FLAGS[@]}" -c "$work/stubs.c" -o "$work/stubs.o"
-"$LLD" -o image/mini.elf --build-id=none "$work/store.c.o" "$work/bags.c.o" "$work/anchor.S.o" "$work/stubs.o"
+"$LLD" -o image/mini.elf --build-id=none "$work/store.c.o" "$work/bags.c.o" "$work/flow.c.o" "$work/anchor.S.o" "$work/stubs.o"
 # Like the kernel's System.map, the map leaves out assembler-local labels (.L...).
 "$NM" -n image/mini.elf | awk 'NF == 3 && $3 !~ /^\.L/' >image/System.map

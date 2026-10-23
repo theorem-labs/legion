@@ -20,6 +20,7 @@ from .image import FunctionFacts, Image, Symbol
 Facts = dict[str, Any]
 Unit = dict[str, Any]
 _EVENT_LISTS = ("accesses", "unevaluated", "list_calls", "indirect", "function_pointers", "field_accesses")
+_FIELD_KEYS = ("struct", "field", "offset", "displacement", "base", "size", "bitfield")
 
 
 @dataclass
@@ -249,6 +250,17 @@ class Linker:
                 result.unbound += bound.unbound
             else:
                 result.calls.append({**call, "tu": tu})
+                if call.get("visible") and callee in callees and callee not in stack and callee != name:
+                    # The machine code calls the helper here but may inline it at another site:
+                    # its calls that the caller's machine code makes and the caller's C does not
+                    # are the inlined copy's.
+                    own = {item["callee"] for item in events["calls"]}
+                    helper = self.visible(tu, callee)
+                    assert helper is not None
+                    child = self.effective(tu, callee, caller, (*stack, name))
+                    for item in _bind(child, call["arguments"]).calls:
+                        if item["callee"] in callees and item["callee"] not in own and item["callee"] != callee:
+                            result.calls.append({**_with_via(item, helper.id), "partial_inline": True})
         self.effective_cache[key] = result
         return result
 
@@ -397,6 +409,7 @@ def build(
         "indirect_slots": [],
         "unbound_parameter_accesses": 0,
         "generic_unconfirmed": [],
+        "image_decided": [],
         "alternate_definitions": {},
     }
     image_globals: dict[str, set[str]] = {}
@@ -495,10 +508,10 @@ def build(
         facts = linker.image_facts(definition)
         image_calls = {call["target"]: call for fact in facts for call in fact.calls}
         for call in result.calls:
-            if call.get("generic") and call["callee"] not in image_calls:
-                # A call in a _Generic association whose selection could not be read, and that
-                # the machine code does not make: not the selected association.
-                analysis["generic_unconfirmed"].append(
+            if (call.get("generic") or call.get("conditional")) and call["callee"] not in image_calls:
+                # A call in a _Generic association whose selection could not be read, or under a
+                # __builtin_constant_p choice, that the machine code does not make: not compiled.
+                analysis["generic_unconfirmed" if call.get("generic") else "image_decided"].append(
                     {"function": identity, "call": call["callee"], "provenance": call["provenance"]}
                 )
                 continue
@@ -525,6 +538,11 @@ def build(
         for access in result.accesses:
             unit = access.get("unit")
             if unit is None:
+                continue
+            if access.get("conditional") and unit["name"] not in image_globals[identity]:
+                analysis["image_decided"].append(
+                    {"function": identity, "unit": unit["name"], "provenance": access["provenance"]}
+                )
                 continue
             if access.get("generic") and (unit["kind"] != "global" or unit["name"] not in image_globals[identity]):
                 # In a _Generic association whose selection could not be read: a global the
@@ -584,10 +602,7 @@ def build(
         analysis["unbound_parameter_accesses"] += result.unbound
         c_targets[identity] = [{"name": name, "target_class": kind} for name, kind in sorted(targets.items())]
         field_accesses[identity] = sorted(
-            {
-                repr(item): {key: item.get(key, -1) for key in ("struct", "field", "offset", "displacement")}
-                for item in result.field_accesses
-            }.values(),
+            {repr(item): {key: item.get(key, -1) for key in _FIELD_KEYS} for item in result.field_accesses}.values(),
             key=repr,
         )
 
@@ -642,7 +657,7 @@ def build(
             },
         }
     )
-    for key in ("folds", "unevaluated", "indirect_slots", "generic_unconfirmed"):
+    for key in ("folds", "unevaluated", "indirect_slots", "generic_unconfirmed", "image_decided"):
         analysis[key] = sorted(analysis[key], key=repr)
     return {
         "format": "cgraph/graph/v1",

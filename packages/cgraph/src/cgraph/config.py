@@ -86,6 +86,8 @@ class ImageRules:
     thread_pointer: str | None = None
     percpu_sections: tuple[str, ...] = ()
     symbol_classes: dict[str, re.Pattern[str]] = field(default_factory=dict)
+    # Image callee -> the C function it stands for.
+    call_aliases: dict[str, str] = field(default_factory=dict)
 
     def symbol_class(self, name: str, section: str = "") -> str:
         """``per_cpu``, ``compiler_symbol``, ``constant_data`` or ``state`` for a data symbol."""
@@ -339,7 +341,10 @@ def load(path: Path, root: Path | None = None) -> Config:
         raise ConfigError("c.base_type_min_containers must be at least 2")
 
     image_table = _expect(data, "image", dict, "configuration") or {}
-    _unknown(image_table, {"arch", "thread_pointer", "percpu_sections", "symbol_classes"}, "image")
+    _unknown(image_table, {"arch", "thread_pointer", "percpu_sections", "symbol_classes", "call_aliases"}, "image")
+    aliases = _expect(image_table, "call_aliases", dict, "image") or {}
+    if not all(isinstance(value, str) for value in aliases.values()):
+        raise ConfigError("image.call_aliases must map names to names")
     arch = _expect(image_table, "arch", str, "image") or "riscv64"
     if arch != "riscv64":
         raise ConfigError("image.arch must be riscv64, the only architecture the image reader decodes")
@@ -357,6 +362,7 @@ def load(path: Path, root: Path | None = None) -> Config:
         thread_pointer=_expect(image_table, "thread_pointer", str, "image"),
         percpu_sections=tuple(_strings(image_table, "percpu_sections", "image")),
         symbol_classes=symbol_classes,
+        call_aliases=dict(aliases),
     )
 
     contract_table = _expect(data, "contract_graph", dict, "configuration") or {}

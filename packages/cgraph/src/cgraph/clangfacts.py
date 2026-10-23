@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import clang.cindex as ci
 from clang.cindex import CursorKind as K
@@ -86,8 +86,29 @@ def _is_unnamed_member(field: ci.Cursor) -> bool:
     return not field.spelling or "(anonymous" in field.spelling or "(unnamed" in field.spelling
 
 
-def _displacement(member: ci.Cursor) -> int:
-    """Bytes from the base pointer of a member expression to the field it names, along ``.`` links."""
+def _strip(node: ci.Cursor) -> ci.Cursor:
+    while node.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR, K.CSTYLE_CAST_EXPR) and _children(node):
+        node = _children(node)[-1]
+    return node
+
+
+def _container_offset(base: ci.Cursor) -> int | None:
+    """The member offset a ``container_of`` subtracts from the pointer it is given, in bytes."""
+    for node in base.walk_preorder():
+        if node.kind == K.BINARY_OPERATOR and libclang.binary_kind(node) == libclang.SUBTRACT:
+            operands = _children(node)
+            if len(operands) == 2 and operands[0].type.get_canonical().kind == TK.POINTER:
+                value = libclang.constant_int(operands[1])
+                if value is not None:
+                    return value
+    return None
+
+
+def _displacement(member: ci.Cursor) -> tuple[int, str]:
+    """Bytes from the base of a member expression to the field it names, along ``.`` links, and
+    what the base is: ``pointer``; ``container_of`` (the displacement already less the member
+    offset); ``global`` (the address of a global, folded into a pc-relative address); ``local`` (an
+    object on the stack or in registers)."""
     total = 0
     node = member
     while node.kind == K.MEMBER_REF_EXPR:
@@ -95,18 +116,33 @@ def _displacement(member: ci.Cursor) -> int:
         record = _named_struct(field.semantic_parent) if field is not None else None
         offset = record.type.get_offset(field.spelling) if record is not None else -1
         if offset < 0:
-            return -1
+            return -1, "unknown"
         total += offset
         children = _children(node)
         if not children:
-            break
-        base = children[0]
-        while base.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and len(_children(base)) == 1:
-            base = _children(base)[0]
-        if base.type.get_canonical().kind == TK.POINTER or base.kind != K.MEMBER_REF_EXPR:
-            break
-        node = base
-    return total // 8
+            return total // 8, "pointer"
+        base = _strip(children[0])
+        through_pointer = children[0].type.get_canonical().kind == TK.POINTER
+        if through_pointer:
+            if base.kind == K.UNARY_OPERATOR and libclang.is_address_of(base) and _children(base):
+                target = _strip(_children(base)[0])
+                if target.kind == K.DECL_REF_EXPR and _is_global_var(target.referenced):
+                    return total // 8, "global"
+            container = _container_offset(base)
+            if container is not None:
+                return total // 8 - container, "container_of"
+            return total // 8, "pointer"
+        if base.kind == K.MEMBER_REF_EXPR:
+            node = base
+            continue
+        if base.kind == K.DECL_REF_EXPR and base.referenced is not None:
+            referenced = base.referenced
+            if referenced.kind == K.PARM_DECL or (referenced.kind == K.VAR_DECL and not _is_global_var(referenced)):
+                return total // 8, "local"
+            if _is_global_var(referenced):
+                return total // 8, "global"
+        return total // 8, "other"
+    return total // 8, "pointer"
 
 
 _SCALAR_KINDS = (
@@ -152,6 +188,10 @@ class _Extractor:
             cursor.spelling: cursor for cursor in tu.cursor.get_children() if cursor.kind == K.MACRO_DEFINITION
         }
         self.macro_cache: dict[str, tuple[frozenset[str], list[str]] | None] = {}
+        self.evaluator = _Evaluator(
+            {cursor.spelling: cursor for cursor in tu.cursor.get_children()
+             if cursor.kind == K.FUNCTION_DECL and cursor.is_definition() and cursor.spelling}
+        )  # fmt: skip
 
     # Locations -----------------------------------------------------------------------------
 
@@ -573,11 +613,150 @@ def _normal_type(text: str) -> str:
     return re.sub(r"\s*\*\s*", "*", text)
 
 
-def _constant_condition(condition: ci.Cursor) -> int | None:
-    for child in condition.walk_preorder():
-        if child.kind == K.CALL_EXPR and child.spelling == "__builtin_constant_p":
+# Builtins whose answer the compiler gives only while it optimizes: the image decides the branch.
+_IMAGE_DECIDES = frozenset({"__builtin_constant_p", "__builtin_object_size", "__builtin_dynamic_object_size"})
+_UNREACHABLE = frozenset({"__builtin_unreachable", "__builtin_trap"})
+_ENTRIES = (K.LABEL_STMT, K.CASE_STMT, K.DEFAULT_STMT)
+_EXITS = (K.RETURN_STMT, K.GOTO_STMT, K.BREAK_STMT, K.CONTINUE_STMT)
+_BRANCHES = (K.IF_STMT, K.CONDITIONAL_OPERATOR, K.SWITCH_STMT, K.WHILE_STMT, K.FOR_STMT, K.DO_STMT, K.GOTO_STMT)
+
+
+def _mentions(cursor: ci.Cursor, names: frozenset[str]) -> bool:
+    return any(
+        node.kind in (K.CALL_EXPR, K.DECL_REF_EXPR) and node.spelling in names for node in cursor.walk_preorder()
+    )
+
+
+class _Evaluator:
+    """What the compiler folds that clang's evaluator alone does not: inline helpers that return one
+    truth value, locals that keep their initializer, ``x & 0`` and ``x * 0``, ``__builtin_expect``."""
+
+    _OPERATIONS: ClassVar[dict[int, Any]] = {
+        3: lambda a, b: a * b, 6: lambda a, b: a + b, 7: lambda a, b: a - b,
+        8: lambda a, b: a << b if 0 <= b < 64 else None, 9: lambda a, b: a >> b if 0 <= b < 64 else None,
+        11: lambda a, b: int(a < b), 12: lambda a, b: int(a > b), 13: lambda a, b: int(a <= b),
+        14: lambda a, b: int(a >= b), 15: lambda a, b: int(a == b), 16: lambda a, b: int(a != b),
+        17: lambda a, b: a & b, 18: lambda a, b: a ^ b, 19: lambda a, b: a | b,
+    }  # fmt: skip
+
+    def __init__(self, definitions: dict[str, ci.Cursor]) -> None:
+        self.definitions = definitions
+        self.helpers: dict[str, int | None] = {}
+        self.locals: dict[int, int | None] = {}
+
+    def evaluate(self, cursor: ci.Cursor, depth: int = 0) -> int | None:
+        if _mentions(cursor, _IMAGE_DECIDES):
             return None
-    return libclang.constant_int(condition)
+        value = libclang.constant_int(cursor)
+        if value is not None or depth > 6:
+            return value
+        kind, inner = cursor.kind, _children(cursor)
+        if kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR, K.CSTYLE_CAST_EXPR) and inner:
+            return self.evaluate(inner[-1], depth)
+        if kind == K.UNARY_OPERATOR and inner and libclang.unary_kind(cursor) == libclang.LOGICAL_NOT:
+            value = self.evaluate(inner[0], depth)
+            return None if value is None else int(not value)
+        if kind == K.BINARY_OPERATOR and len(inner) == 2:
+            operator = libclang.binary_kind(cursor)
+            left = self.evaluate(inner[0], depth)
+            if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
+                if left is not None and bool(left) == (operator == libclang.LOGICAL_OR):
+                    return int(bool(left))
+                right = self.evaluate(inner[1], depth)
+                return None if left is None or right is None else int(bool(right))
+            right = self.evaluate(inner[1], depth)
+            if operator in (3, 17) and (left == 0 or right == 0):
+                return 0
+            operation = self._OPERATIONS.get(operator)
+            return None if left is None or right is None or operation is None else operation(left, right)
+        if kind == K.DECL_REF_EXPR and cursor.referenced is not None and cursor.referenced.kind == K.VAR_DECL:
+            parent = cursor.referenced.semantic_parent
+            if parent is not None and parent.kind == K.FUNCTION_DECL:
+                return self.local(cursor.referenced, depth)
+            return None
+        if kind == K.CALL_EXPR and cursor.referenced is not None:
+            if cursor.referenced.spelling == "__builtin_expect":
+                arguments = list(cursor.get_arguments() or [])
+                return self.evaluate(arguments[0], depth) if arguments else None
+            if cursor.referenced.kind == K.FUNCTION_DECL:
+                return self.helper(cursor.referenced.spelling, depth)
+        return None
+
+    def helper(self, name: str, depth: int) -> int | None:
+        """The truth value an inline helper always returns, when every return gives the same one."""
+        if name in self.helpers:
+            return self.helpers[name]
+        self.helpers[name] = None
+        definition = self.definitions.get(name)
+        if definition is None or depth > 3:
+            return None
+        values = set()
+        for node in definition.walk_preorder():
+            if node.kind == K.RETURN_STMT:
+                inner = _children(node)
+                value = self.evaluate(inner[0], depth + 1) if inner else None
+                if value is None:
+                    return None
+                values.add(bool(value))
+        result = int(values.pop()) if len(values) == 1 else None
+        self.helpers[name] = result
+        return result
+
+    def local(self, variable: ci.Cursor, depth: int) -> int | None:
+        """A local's value when its initializer evaluates and nothing writes it or takes its address."""
+        key = variable.hash
+        if key in self.locals:
+            return self.locals[key]
+        self.locals[key] = None
+        initializer = libclang.var_initializer(variable)
+        function = variable.semantic_parent
+        if initializer is None or function is None:
+            return None
+        for node in function.walk_preorder():
+            if node.kind not in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR, K.UNARY_OPERATOR):
+                continue
+            operands = _children(node)
+            target = operands[0] if operands else None
+            while target is not None and target.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and _children(target):
+                target = _children(target)[0]
+            if target is None or target.kind != K.DECL_REF_EXPR or target.referenced is None:
+                continue
+            if target.referenced.hash != key:
+                continue
+            if (
+                node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR
+                or (node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node))
+                or (node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node)))
+            ):
+                return None
+        value = self.evaluate(initializer, depth + 1)
+        self.locals[key] = value
+        return value
+
+    def exits(self, statement: ci.Cursor) -> bool:
+        """Control does not fall through: a return, goto, break or continue, a block that ends in
+        one, an if whose constant-true branch exits, or a noreturn builtin with no branch around it."""
+        kind = statement.kind
+        if kind in _EXITS:
+            return True
+        inner = _children(statement)
+        if kind == K.COMPOUND_STMT:
+            return bool(inner) and self.exits(inner[-1])
+        if kind == K.IF_STMT and len(inner) >= 2:
+            value = self.evaluate(inner[0])
+            if value is not None:
+                branch = inner[1] if value else (inner[2] if len(inner) > 2 else None)
+                return branch is not None and self.exits(branch)
+            return False
+        if kind in _BRANCHES:
+            return False
+        found = False
+        for node in statement.walk_preorder():
+            if node.kind in _BRANCHES:
+                return False
+            if node.kind == K.CALL_EXPR and node.spelling in _UNREACHABLE:
+                found = True
+        return found
 
 
 class _FunctionWalk:
@@ -596,6 +775,7 @@ class _FunctionWalk:
             "function_pointers": [],
             "field_accesses": [],
         }
+        self.conditional = 0  # depth of __builtin_constant_p branches being walked
 
     def argument(self, expression: ci.Cursor) -> dict[str, Any]:
         return {"unit": self.x.unit_from_ref(expression), "param": self.parameter_root(expression)}
@@ -620,17 +800,29 @@ class _FunctionWalk:
         if generic:
             # An association of a _Generic whose selection could not be read: the image decides.
             item["generic"] = True
+        if self.conditional and unit["kind"] == "global":
+            item["conditional"] = True
         self.events["accesses"].append(item)
         if unit["kind"] == "struct" and unit.get("field") is not None:
+            displacement, base = _displacement(where) if where.kind == K.MEMBER_REF_EXPR else (-1, "unknown")
+            field = where.referenced if where.kind == K.MEMBER_REF_EXPR else None
+            try:
+                size = field.type.get_size() if field is not None else -1
+            except Exception:
+                size = -1
             self.events["field_accesses"].append(
                 {
                     "struct": unit["name"],
                     "def": unit["def"],
                     "field": unit["field"],
                     "offset": unit.get("offset", -1),
-                    # What the machine code adds to the base pointer: the field's offset plus the
-                    # offsets of the members a "." chain passes through (c->box.size).
-                    "displacement": _displacement(where) if where.kind == K.MEMBER_REF_EXPR else -1,
+                    # What the machine code adds to its base register: the field's offset plus the
+                    # offsets of the members a "." chain passes through (c->box.size), less the
+                    # member offset a container_of subtracts.
+                    "displacement": displacement,
+                    "base": base,
+                    "size": size,
+                    "bitfield": bool(field is not None and field.is_bitfield()),
                     "provenance": provenance,
                 }
             )
@@ -668,6 +860,9 @@ class _FunctionWalk:
         if referenced is not None and referenced.kind == K.FUNCTION_DECL:
             callee = referenced.spelling
             described = [self.argument(argument) for argument in arguments]
+            if reason is None and callee.startswith("__builtin_"):
+                # A compiler builtin: folded or emitted inline, not a call to a function of the program.
+                reason = "builtin"
             if reason is not None:
                 self.events["unevaluated"].append(
                     {"call": callee, "reason": reason, "provenance": [self.x.location(node)]}
@@ -677,6 +872,9 @@ class _FunctionWalk:
             if generic:
                 # In a _Generic association whose selection could not be read: the image decides.
                 event["generic"] = True
+            if self.conditional:
+                # Under a __builtin_constant_p choice: the image decides.
+                event["conditional"] = True
             self.events["calls"].append(event)
             for argument in arguments:
                 for reference in self.address_taken(argument):
@@ -883,13 +1081,42 @@ class _FunctionWalk:
             self.walk(children[-1], node, len(children) - 1, reason, generic)
             return
         if kind in (K.IF_STMT, K.CONDITIONAL_OPERATOR) and len(children) >= 2 and reason is None:
-            value = _constant_condition(children[0])
+            condition = children[0]
+            if _mentions(condition, _IMAGE_DECIDES):
+                # __builtin_constant_p and __builtin_object_size choose a branch only at compile
+                # time: both branches are walked, and the machine code decides which calls stay.
+                self.walk(condition, node, 0, reason, generic)
+                self.conditional += 1
+                for child_index, child in enumerate(children[1:], 1):
+                    self.walk(child, node, child_index, reason, generic)
+                self.conditional -= 1
+                return
+            value = self.x.evaluator.evaluate(condition)
             if value is not None:
                 live = 1 if value else 2
-                self.walk(children[0], node, 0, reason, generic)
+                self.walk(condition, node, 0, reason, generic)
                 for child_index, child in enumerate(children[1:], 1):
                     self.walk(child, node, child_index, None if child_index == live else "dead_branch", generic)
                 return
+        if kind == K.BINARY_OPERATOR and len(children) == 2 and reason is None:
+            operator = libclang.binary_kind(node)
+            if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
+                left = self.x.evaluator.evaluate(children[0])
+                decided = left is not None and (bool(left) == (operator == libclang.LOGICAL_OR))
+                self.walk(children[0], node, 0, reason, generic)
+                self.walk(children[1], node, 1, "dead_branch" if decided else reason, generic)
+                return
+        if kind == K.COMPOUND_STMT and reason is None:
+            # Statements after a return, a goto, a break, a continue or a noreturn call are reached
+            # only through a label or a case.
+            dead = False
+            for child_index, child in enumerate(children):
+                if child.kind in _ENTRIES:
+                    dead = False
+                self.walk(child, node, child_index, "after_exit" if dead else None, generic)
+                if not dead and self.x.evaluator.exits(child):
+                    dead = True
+            return
         for child_index, child in enumerate(children):
             self.walk(child, node, child_index, reason, generic)
 

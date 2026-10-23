@@ -25,7 +25,7 @@ from .config import ImageRules
 _COMPRESSED_MEMORY = {"c.ld", "c.lw", "c.sd", "c.sw", "c.fld", "c.fsd"}
 _DIRECT_CALLS = {"jal", "j", "c.j", "c.jal"}
 _REGISTER_CALLS = {"jalr", "c.jalr", "jr", "c.jr"}
-_ADDI = {"addi", "addiw", "c.addi"}
+_ADDI = {"addi", "addiw", "c.addi", "c.addiw"}
 _MASK = (1 << 64) - 1
 
 
@@ -140,6 +140,12 @@ class Image:
                 self.object_symbols.setdefault(symbol.name, []).append(entry)
         for symbols in self.functions.values():
             symbols.sort(key=lambda item: item.address)
+        # A call target is named by the function symbol that starts there; System.map's zero-size
+        # markers at the same address (__sched_text_start, __lock_text_start) name it only where no
+        # function symbol does.
+        for name, copies in sorted(self.functions.items()):
+            for copy in copies:
+                self.text_at[copy.address] = name
         self.objects = sorted(set(objects))
         self.function_ranges = sorted(set(function_ranges))
         self.sized_object_names = sorted({name for _, size, name, _ in self.objects if size})
@@ -304,7 +310,9 @@ class Image:
             facts.calls.append(
                 {
                     "source": function,
-                    "target": callee,
+                    # The compiler may call another library function for the one C names (bcmp for
+                    # a memcmp whose result is only compared with zero).
+                    "target": self.rules.call_aliases.get(callee, callee),
                     "instruction": _hex(instruction),
                     "tail": tail,
                     "provenance": [{"source": "image", "address": _hex(instruction)}],

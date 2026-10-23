@@ -28,12 +28,12 @@ def test_layer_checks_are_written(built: Path) -> None:
     structure = result["structure_layer"]
     assert structure["embeds"] == {"total": 1, "layout_confirmed": 1, "unconfirmed": 0}
     offsets = structure["field_offsets"]
-    # crate.box sits at offset 0, which the code folds into the load of box.size: the one miss.
-    misses = {
-        (item["function"], item["struct"], item["field"]) for item in offsets["sample"]["items"] if not item["matched"]
+    # c->box.size is matched at 8 + 56, the displacement along the member chain; every field the
+    # fixture's machine code touches matches.
+    assert offsets["matched"] == offsets["candidates"] > 0
+    assert ("function:crate_size", "box", "size", 64) in {
+        (item["function"], item["struct"], item["field"], item["offset"]) for item in offsets["sample"]["items"]
     }
-    assert misses == {("function:crate_size", "crate", "box")}
-    assert offsets["matched"] == offsets["candidates"] - 1
     assert result["passes"] and all(item["ok"] for item in result["hard_checks"])
 
 
