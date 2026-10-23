@@ -27,6 +27,8 @@ const (
 	ViolationStaleRead       = "stale_read"       // a read's statement hash changed, or the statement is gone
 	ViolationUnverifiedRead  = "unverified_read"  // no current hash was supplied for a read, so it cannot be decided
 	ViolationOverlap         = "overlap"          // the declared writes overlap another open migration's
+	// A changed registered contract has neither a compatibility proof nor an agent's review at the candidate's head.
+	ViolationStatementUnreviewed = "statement_unreviewed"
 )
 
 // OpenRequest declares a migration: what it writes (files, or directories ending in "/", new files included)
@@ -71,6 +73,12 @@ type CheckRequest struct {
 	// Current maps a read's name to its statement hash in the candidate's base. An empty hash means the statement
 	// no longer exists; a name missing from the map was not hashed, so that read cannot be decided.
 	Current map[string]string `json:"current"`
+	// ChangedContracts, CompatibilityProof and ReviewedHead are the statement change and its records, as Land
+	// receives them. Head is optional here: without it, only a compatibility proof can clear a statement change.
+	ChangedContracts   map[string]string `json:"changed_contracts"`
+	Head               string            `json:"head"`
+	CompatibilityProof string            `json:"compatibility_proof"`
+	ReviewedHead       string            `json:"reviewed_head"`
 }
 
 // Violation is one reason a candidate must not land.
@@ -411,8 +419,12 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 	return m, err
 }
 
-// cleanCheckRequest validates and normalizes candidate paths before they are compared to declared writes.
+// cleanCheckRequest validates and normalizes candidate paths before they are compared to declared writes, and
+// validates the candidate's changed contracts and statement records.
 func cleanCheckRequest(req CheckRequest) (CheckRequest, error) {
+	if err := checkStatementChange(req.ChangedContracts, req.Head, req.CompatibilityProof, req.ReviewedHead); err != nil {
+		return CheckRequest{}, err
+	}
 	changed := make([]string, 0, len(req.Changed))
 	for _, path := range req.Changed {
 		cleaned, err := cleanRepoPath(path)
@@ -516,6 +528,12 @@ func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error
 		if err != nil {
 			return err
 		}
+		// Land decides the statement rule after its contract checks, so it is not one of the shared violations.
+		statement, err := statementViolations(ctx, tx, migration, cleaned)
+		if err != nil {
+			return err
+		}
+		res.Violations = append(res.Violations, statement...)
 		res.Pass = len(res.Violations) == 0
 		kinds := make([]string, 0, len(res.Violations))
 		for _, violation := range res.Violations {

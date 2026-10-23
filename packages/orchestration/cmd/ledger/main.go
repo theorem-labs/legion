@@ -230,17 +230,18 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			request = decoded
 		} else {
 			if len(args) < 3 {
-				return nil, true, usagef("check <repo> <id> <generation> [--path <path>] [--current <name=hash>]")
+				return nil, true, usagef("check <repo> <id> <generation> [--path <path>] [--current <name=hash>] " +
+					"[--changed-contract <name=hash>] [--head <commit>] [--compatibility-proof <name>] [--reviewed-head <commit>]")
 			}
 			generation, err := integer(args[2])
 			if err != nil {
 				return nil, true, err
 			}
-			paths, current, err := parsePathsAndCurrent(args[3:])
+			request, err = parseCheckFlags(args[3:])
 			if err != nil {
 				return nil, true, err
 			}
-			request = ledger.CheckRequest{Repo: args[0], ID: args[1], Generation: generation, Changed: paths, Current: current}
+			request.Repo, request.ID, request.Generation = args[0], args[1], generation
 		}
 		value, err := s.Check(ctx, request)
 		if err != nil {
@@ -473,29 +474,42 @@ func parseWritesAndReads(args []string) ([]string, map[string]string, error) {
 	return writes, reads, nil
 }
 
-func parsePathsAndCurrent(args []string) ([]string, map[string]string, error) {
-	paths := []string{}
-	current := map[string]string{}
+// parseCheckFlags reads a check's candidate: its changed paths, current read hashes, changed contracts and statement
+// records. The records are single values, kept verbatim as --path keeps its value.
+func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
+	request := ledger.CheckRequest{Changed: []string{}, Current: map[string]string{}, ChangedContracts: map[string]string{}}
 	for len(args) > 0 {
 		if len(args) < 2 {
-			return nil, nil, usagef("list flags need values")
+			return ledger.CheckRequest{}, usagef("list flags need values")
 		}
 		flag, value := args[0], args[1]
 		args = args[2:]
 		switch flag {
 		case "--path":
-			paths = append(paths, value)
+			request.Changed = append(request.Changed, value)
 		case "--current":
 			name, hash, err := parsePair(value, true)
 			if err != nil {
-				return nil, nil, err
+				return ledger.CheckRequest{}, err
 			}
-			current[name] = hash
+			request.Current[name] = hash
+		case "--changed-contract":
+			name, hash, err := parsePair(value, false)
+			if err != nil {
+				return ledger.CheckRequest{}, err
+			}
+			request.ChangedContracts[name] = hash
+		case "--head":
+			request.Head = value
+		case "--compatibility-proof":
+			request.CompatibilityProof = value
+		case "--reviewed-head":
+			request.ReviewedHead = value
 		default:
-			return nil, nil, usagef("unknown list flag %q", flag)
+			return ledger.CheckRequest{}, usagef("unknown list flag %q", flag)
 		}
 	}
-	return paths, current, nil
+	return request, nil
 }
 
 func parseAgreement(args []string) ([]string, map[string]int64, error) {
@@ -589,6 +603,12 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 			request.ChangedContracts[name] = hash
 		case "--approved-pinned":
 			request.ApprovedPinned = append(request.ApprovedPinned, value)
+		case "--head":
+			request.Head = value
+		case "--compatibility-proof":
+			request.CompatibilityProof = value
+		case "--reviewed-head":
+			request.ReviewedHead = value
 		default:
 			return ledger.LandRequest{}, usagef("unknown land flag %q", flag)
 		}
