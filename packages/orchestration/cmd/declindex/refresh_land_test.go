@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -95,12 +96,48 @@ func assertProcessGone(t *testing.T, pid int) {
 		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
 			return
 		}
+		raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+		if err == nil && zombieProcess(raw) {
+			return
+		}
 		select {
 		case <-deadline.C:
 			t.Fatalf("timed-out build process %d still exists", pid)
 		case <-tick.C:
 		}
 	}
+}
+
+func TestAssertProcessGoneTreatsZombieAsGone(t *testing.T) {
+	if _, err := os.Stat("/proc"); err != nil {
+		t.Skip("/proc is unavailable")
+	}
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Wait() })
+	path := filepath.Join("/proc", strconv.Itoa(cmd.Process.Pid), "stat")
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil && zombieProcess(raw) {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("child process did not become a zombie")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	assertProcessGone(t, cmd.Process.Pid)
+}
+
+func zombieProcess(raw []byte) bool {
+	end := bytes.LastIndexByte(raw, ')')
+	return end >= 0 && len(raw) > end+2 && raw[end+2] == 'Z'
 }
 
 func TestRefreshAtLandedCommit(t *testing.T) {

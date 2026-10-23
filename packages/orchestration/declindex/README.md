@@ -1,92 +1,140 @@
 # The declaration index and the similarity gate
 
-`cmd/declindex` answers, for a built Lean project:
+`cmd/declindex` answers questions about a built Lean project and protects the concept registry that its owners share. The command's help is the short command reference; this document describes the persisted data and the landing contracts. For container acceptance drivers, see [the end-to-end driver](e2e/README.md).
 
-- where a name is declared (`where`);
-- who uses it, and how far a change to its statement reaches (`users`);
-- its statement hash (`hash`), the hash a change lock records for its reads, and the same for the landing program (`land-hash`);
-- who states a registered fact (`states`), and who shares a relation atom with a statement (`same`).
+## Index data and storage
 
-It also runs the similarity gate in front of the librarian (`gate`), and after a landing it checks the contract ledger (`ledger`).
+The index has two parts in one SQLite file next to the build:
 
-## Parts
+- The `.ilean` part records declarations, source positions, direct uses, and declaration edges. It also records `sources`: every indexed Lean source path and the Git blob ID of the bytes that the index read. A changed source can therefore be distinguished from a source that the index already read.
+- The compiled part reads `.olean` files with an exporter built by the tree's Lean toolchain. It records each constant's printed type, compiled statement hash, relation atoms, and the registry facts that its statement states.
 
-- **The `.ilean` part** (`ilean.go`, `refresh.go`, `query.go`, `graph.go`). It reads Lean's reference files: declarations, kinds, positions, uses marked `stmt` or `proof`, and edges.
-  - A module is read again when its `.ilean` (Lake's content hash) or its source (size and mtime) changes.
-  - A module whose source is newer than its build (a declaration's recorded position no longer holds its name) is unreadable: the refresh reports it, and queries and the ledger check are unable to check (exit 3) until a build brings it back. Names Lean makes for a command (an elaborator's auxiliary, an initializer) have no written name and are not compared.
-  - Reach walks a compressed graph file written next to the SQLite file. An edge's target is counted as the longest declared name it extends (`X.wp` is the field of `X`), against every module's declarations when the graph is written, so an incremental refresh answers as a full one does.
-  - The graph file carries the generation of the index it was built from. A query refuses a graph of another generation, and the next refresh writes it again, so a failed write is never read.
-- **The compiled part** (`lean/`, `export.go`, `compiled.go`). The exporter is a Lean program, built with the tree's own toolchain. It reads the `.olean` files and records, for each constant:
-  - its printed type;
-  - a compiled statement hash. Binder names, universe names, the declaration's own name and the names Lean generates from it (`X.eq_1`, `X._unfold`, `X.rec`) are erased, a sub-declaration the user wrote (`X.base`) is kept by name, an auxiliary definition Lean makes while elaborating (a matcher, an abstracted proof) is hashed by its content, and literals are compared by value. A structure's field names are kept;
-  - relation atoms;
-  - the registry facts its statement states: `direct`, `via:<definition>`, or `uses`.
-- **Matching facts.** A form matches as a first-order pattern, in either order for `=`, `≠`, `↔` and `HEq`, and through local aliases.
-  - A definition's templates carry a match through applications of any depth.
-  - After a landing, the modules whose `.olean` changed are read again, and so are the statements reached from a definition whose compiled hash changed. Every module is read again when the exporter, the forms, or the body of a concept with no form changes.
-- **The registry** (`conceptgate/registry.go`) is a YAML file in the project's git. Each concept has:
-  - a name;
-  - a home file;
-  - a one-sentence meaning;
-  - `extends`, when it extends another concept;
-  - forms: Lean lambda terms whose binders are pattern variables. A concept with no form is matched by its declaration's body;
-  - `compiled_hash`, which the gate saves when it adds a concept.
+The index metadata has `commit`, the Git commit it read, and `prev_commit`, the commit it replaced during the latest refresh. A post-landing registry check compares those two commits. A module whose source is newer than its build, or whose recorded declaration position no longer holds its name, is unreadable until a build replaces the output; affected queries exit 3.
 
-## The gate's rules and why
+The declaration graph is intentionally not in the Postgres ledger. SQLite stores the declaration, use, edge, compiled-constant, atom, fact, source, and metadata tables, with the reach graph in a sibling file. Postgres stores contract owners, statement hashes, versions, and change-lock reads. This keeps index queries local to the build and keeps ledger transactions limited to the data that coordinates landings.
 
-The rules come from a measurement on a large project of one fact restated across it (a register being 8-aligned): how much of its restatements each method found, against a rule-based ground truth.
+## Concept registry
 
-| Verdict (exit code) | Rule | Why |
+The registry is format 2 and is rooted at the project tree's configured `registry` directory:
+
+```text
+registry/
+├── registry.yaml
+└── concepts/
+    └── <key>.yaml
+```
+
+`registry.yaml` contains `version: 2` and optional imports and opens for the forms module. Each concept file has one name, home file, one-sentence meaning, optional `extends` and forms, and, for gate additions, the proposal ID, proposer, compiled hash, accepted-by decision, accepted near matches, and stored source. A concept with a compiled hash is keyed as `concepts/<compiled_hash>.yaml`; a librarian-written concept without one is keyed as `concepts/<name>.yaml`.
+
+One concept per file lets an owner open a change lock on only the proposed addition. The gate writes no registry file. The owner writes the returned `addition.content` to `addition.path`, opens or extends its migration with `ledger open --write <addition.path>`, and lands it normally.
+
+The loader reports duplicate names, duplicate compiled hashes, wrongly keyed files, and missing `extends` targets as registry defects. `refresh` and `gate` report those defects as notes and continue. `ledger` reports them in its registry result and exits 1. A format-1 registry is not accepted.
+
+Stored source is untrusted input. Refresh and the ordinary registry forms module never compile it. Only the gate and the post-landing recheck compile stored source, and both do so in the sandbox.
+
+## Similarity gate and librarian route
+
+An owner runs:
+
+```text
+declindex --config <cfg> gate --proposer <owner-id> [--accepted-by <owner-id>] PROPOSAL.json
+```
+
+`PROPOSAL.json` has `id`, `concept` (`name`, `home`, `meaning`, and optional `extends`), and `source`, a Lean module that declares the concept. It carries no forms. Before deciding, the gate requires the sandbox, an index with a compiled part at the tree's HEAD, and a clean registry directory. Failure of any of those checks is exit 3 with a cause on stderr and no librarian request.
+
+| Exit | Verdict | Owner action |
 | --- | --- | --- |
-| name-taken (5) | The name is a registered concept's or an existing declaration's. | The statement may be new; the proposal needs another name. |
-| refused (1) | The compiled statement hash equals a registered concept's (its compiled entry in the index, or the hash saved when the gate added it), then any declaration's. The verdict names it. | The exact methods were 100% precise, so an exact duplicate needs no judgment. |
-| near (4) | The proposal's own text states a registered form, directly or through a definition the proposal declares. Or a registered concept cannot be compared: it has no compiled entry, no saved hash and no form. | Compiled statements followed through definitions found 98% of the restatements at 99% precision; text normalisation found at most 85%. A concept the gate cannot compare goes to the librarian, never past it. |
-| added (0) | Anything else, including a proposal that only applies a registered concept or an existing definition. | Reuse is the wanted outcome. |
+| 0 | `added`: no registered fact or existing declaration states the proposal. | Write and land the returned addition. |
+| 1 | `refused`: the proposal is an exact duplicate. | Use the named existing concept. |
+| 3 | Unable to check. | Keep the item open and retry after the cause is repaired or the index is refreshed. |
+| 4 | `near`: a registered fact is restated. | Wait for the librarian's decision. |
+| 5 | `name-taken`: a concept or declaration already has the proposal name. | Use that concept, or use another name for a different statement. |
+| 2 | Usage error. | Correct the command invocation. |
 
-Two thresholds are deliberately absent:
+The comparison has no embedding threshold and no partial-atom threshold. Exact compiled hashes are refused. A statement that directly states a registered form, or states it through a declaration in the proposal, is near. A proposal that the gate cannot compare is also near rather than accepted. `--accepted-by` records a librarian decision that a near proposal is new; the resulting addition records `accepted_by` and `accepted_near`.
 
-- **No embedding threshold.** Embeddings reached ROC-AUC 0.80 on this fact, and no threshold reached 90% precision.
-- **No partial-atom threshold.** A threshold of half the atoms would make every inline statement of a fact near the definition that bundles it with another.
+For every near result, the configured `librarian: [cmd, args…]` receives:
 
-A proposal's own definition that only wraps a registered concept goes to the librarian. The matcher cannot tell such a template from a restatement, and a false near match costs only a review.
+```text
+cmd args… --id <verdict-id> --proposer <owner-id> --proposal <file>
+```
 
-The gate cannot decide (exit 3) when the index lacks its compiled part, when the proposal does not compile, or when the walk of a statement hits its node budget.
+The file is mode 0600 in the gate work directory and is removed after the command exits. It contains fixed text, the deterministic ID and validated proposer outside a nonce-delimited block, and one JSON line inside the block. The JSON carries the verdict and the untrusted proposal. The command receives empty standard input. Exit 0 means delivery; another exit or a 120-second timeout makes the gate exit 3. The post-landing recheck uses the same command with `--id recheck-<added-hash>-<other-key>` and `kind: "recheck"` in the envelope.
 
-### Untrusted proposals
+### Untrusted source confinement
 
-Compiling a proposal must run none of its code outside a sandbox, so the gate checks it three times:
+The gate and recheck apply three controls before accepting a stored or proposed source:
 
-1. **A text filter** refuses the obvious at once (`#eval`, `run_cmd`, `initialize`, macros, `unsafe`, …). It is fast and nothing relies on it: a character literal `'"'` or an unlisted form passes it.
-2. **Lean's own parser** (`declexport --check`) reads the proposal with the notation of the modules it imports and allows only declarations, `variable`, `universe`, module documentation, `attribute` with listed attributes, and the scoping commands (`namespace`, `section`, `end`, `open`), which alone it elaborates. Inside them it allows only listed attributes (`simp`, `instance`, `reducible`, …), refuses `unsafe`, and refuses the forms that run code while elaborating: `by_elab`, `run_tac`, `native_decide`, `decide +native`. A proposal carries no forms: the librarian writes those.
-3. **An operating-system sandbox** (package `confine`) runs the check, the compile and the export. It needs no privilege and no user namespace, and it needs Landlock ABI 3 (Linux 6.2), the first that governs truncation:
-   - **Files.** Landlock lets the process read only the toolchain, the build outputs it imports and its scratch directory, and write only the scratch directory. It never grants REFER, so nothing is linked or renamed into or out of the scratch directory. The scratch directory is fresh for each step (this user's, mode 0700, and empty when the step starts, so no entry placed beforehand, such as a hard link to an outside file, can be in it), and the inputs are copied into it.
-   - **Processes.** The program is its only process. The seccomp filter sends the launcher's one exec of the program to the parent, which lets it through and closes the channel; the kernel then fails every later `execve` and `execveat`, so neither another program, Lean itself, nor the dynamic loader running a copied binary can start. `clone` succeeds only for a thread, `clone3` reports ENOSYS (the C library falls back to `clone`), and `fork` and `vfork` fail.
-   - **The rest.** Every `socket(2)`, io_uring, ptrace, `process_vm_*`, key, bpf, namespace and mount call fails, and the environment is `PATH`, `LEAN_SYSROOT`, `LEAN_PATH`, `HOME` and `TMPDIR` only.
+1. A text filter rejects obvious executable forms.
+2. Lean's parser allow-list admits declarations and limited surrounding syntax, and refuses forms that execute during elaboration.
+3. `confine` runs checking, compilation, and export in a fresh Landlock and seccomp sandbox. It requires Landlock ABI 3 or later, allows writes only to fresh scratch directories, permits only the launched process, and blocks later `execve`, forks, sockets, mounts, namespace operations, and other privileged interfaces.
 
-   Where the sandbox cannot be built (no Landlock, or an ABI before 3), the gate is unable to decide (exit 3) and compiles nothing.
+Without that sandbox, the source is not compiled and the relevant operation exits 3. The detailed container controls and invocation are documented in [the end-to-end driver](e2e/README.md).
 
-The initializers of the modules a proposal imports (the project's own, and its own elaborators and tactics) run inside the sandbox when the proposal is checked and compiled. That is acceptable because the sandbox confines them as it does the proposal: they can read only what the step reads, write only its fresh scratch directory, and start no process. A proposal cannot define an initializer of its own: the parser check refuses `initialize`, `builtin_initialize` and the `init` attributes.
+## Landing interfaces
 
-## The fixture
+### `refresh`
 
-`testdata/lean/Fixture.lean` states one fact, register x2 of a register file being 8-aligned (`Fx.SpAligned`), in each way the matcher must find: inline, through a field projection, with sides swapped, through a local alias, with an offset, as `% 8`, through wrappers (`Fx.Frame`, `Fx.Wrap`) of any depth; and statements that look alike and are not it.
+The landing hook invokes:
 
-## Measured on a large project
+```text
+declindex refresh --config <cfg> && declindex ledger --config <cfg>
+```
 
-Measured on a large built project (52,529 modules, 545,934 declarations), 48 jobs:
+The landing program sets `LAND_COMMIT` and `LAND_PART`; `declindex` reads `LAND_COMMIT` and does not read `LAND_PART`. With a 40-hex `LAND_COMMIT`, `refresh` runs under the index writer lock. It refuses tracked tree changes, recognizes an index that already covers the commit, fetches a missing commit from configured `remote`, checks out the commit, runs configured `build` within `build_timeout` (six hours by default), records `sources`, and stores the replaced commit as `prev_commit`.
 
-- **Parity with the reference `.ilean` reader:** the same 545,934 declarations, 9,686,627 uses and 4,389,369 resolved edges, with 0 differences. For 55 declarations sampled across wide and narrow use, the same direct users, per-directory counts and use lines; reach differs only for the 4 whose users include `example`s, which this index counts once per module.
-- **Refresh from nothing:** 15 min 43 s; 2 min 3 s for the `.ilean` part, 13 min 40 s for the compiled part (789,877 constants).
-- **Update after a landing:** 2.2 s when nothing changed; 3.4 s when one compiled module changed; about 16 s when a reference file changed, 13.5 s of which rebuilds the graph file.
-- **Query times, each process included:** `states` of the fact's concept 0.34 s (23,095 rows); `users` 0.2 s median and 0.67 s worst; `where` 0.014 s; `same` 0.11 s; `gate` about 5 s, which includes the parser check and compiling the proposal in the sandbox.
-- **`states` against the rule's 1,824 files that restate the fact:** 98.1% (1,789) recall through definitions; 66.1% from direct statements only. It also finds 88 files that the rule lacks.
-- **The gate:** a copy of a registered concept was refused, naming it; a restatement of the fact went to the librarian, the only message it received; a new concept was added with its compiled hash; proposals with an `#eval` that writes a file, the same hidden behind a character literal `'"'`, and a `by_elab` that writes a file were each refused (the first by the text filter, the other two by Lean's parser) and no file was written.
+`refresh` exits 0 after reading the build, 3 when it cannot safely read it, 75 for a failed fetch, build timeout, or signalled build, and 2 for usage. A configured build that exits nonzero exits 3.
 
-## The ledger
+### `land-hash`
 
-`ledger` runs after a landing on the index of the landed build.
+The landing program calls `declindex land-hash` twice for every registered contract:
 
-- It reads the ledger and writes only to an existing one: a database without the ledger's schema or the repository is refused (exit 3).
-- It registers each contract that the rule selects and that has an owner, at version 1 with the statement hash. Owners come from the owner map (`owners`): `{"format": F, "owners": [{"id": <owner key>, "contract": <directory> | null}, …]}`, where `owners_format` names the `F` the deployment expects.
-- It reports each contract whose ledger hash differs from the index's, and each ledger contract the index no longer declares (exit 1). It never advances a contract: only `Land` does.
-- The hash is the text statement hash, because a change lock's reads carry that hash and `Land` compares the two.
+1. At the base tree, with the index at that tree. Unchanged declarations are answered from the index; no candidate build directory is needed.
+2. At the built candidate tree. For each source blob that differs from the indexed `sources` blob, `LAND_BUILD_DIR` must hold a fresh Lake `.ilean` and trace for that tree. The candidate answer gives the changed contract's candidate hash and path; unchanged declarations keep the indexed answer.
+
+The command takes no positional arguments. Its environment is:
+
+- `LAND_TREE`: the 40-hex Git object whose tree is being answered.
+- `LAND_GIT_DIR`: a Git directory that can read `LAND_TREE` and its blobs.
+- `LAND_NAMES` or `LAND_NAMES_FILE`: a JSON array of distinct, non-empty, fully qualified names. The file form is required for large requests. If both are set, their arrays must be equal.
+- `LAND_BUILD_DIR`: the candidate build root when a requested declaration is in a changed source file.
+
+On exit 0, each requested name produces one line in request order:
+
+```text
+name<TAB>hash<TAB>path
+```
+
+The `hash` is the 16-hex text statement hash and `path` is the repository-relative declaration path. An absent declaration is `name<TAB>absent<TAB>-`; an ambiguous declaration is `name<TAB>ambiguous<TAB><sorted,comma-joined paths>`. Exit 3 writes no stdout when the request, Git tree, source snapshot, candidate build, trace, or parsed declaration is unusable. Exit 2 is a usage error.
+
+### `ledger`
+
+`ledger` checks the ledger only after the index is at the tree's HEAD. It opens the ledger through `ledger.OpenExisting`: a database without every required schema version, or without the configured repository, is not changed and is unable to check. The DSN comes from `LEDGER_DSN` or `--dsn-file`. The landing adapter can instead use `--contracts-file FILE --emit FILE`; that mode emits required registrations and never connects to Postgres.
+
+The contract check registers selected, owned declarations that the ledger lacks, then compares every ledger contract whose name has no `:` with the index by exact name across every module. It reports a changed hash as a defect, no declaration as gone, and multiple declarations as ambiguous. Names with `:` are non-Lean ledger contracts and are not compared with declarations.
+
+The registry check loads format 2, lists the concept files added in `prev_commit..commit`, and recompiles each added source only in the sandbox. It records additions, loader and recheck defects, near pairs, and an inability reason in the `registry` JSON member. Every near pair runs the librarian command once unless its accepted-near record suppresses it.
+
+The JSON output is:
+
+```json
+{"commit":"…","contracts":{…},"registry":{"added":[],"defects":[],"near":[],"unable":""}}
+```
+
+The final stderr line counts contracts, registrations, contract defects, gone, unowned, ambiguous, and registry additions, near pairs, and defects. `ledger` exits 0 only when both checks are clean; 1 for a contract hash defect, gone, unowned, ambiguous contract, registry defect, or added near pair; 3 when it cannot check; 75 for a ledger connection failure; and 2 for usage. If a recheck is unable but either check found a defect, it exits 1 and includes the inability in the report.
+
+## Baseline measurements and acceptance records
+
+The following baseline measurements describe the indexed project, not acceptance evidence for this change: 52,529 modules, 545,934 declarations, 9,686,627 uses, 4,389,369 edges, and 789,877 compiled constants. The initial refresh took 15 minutes 43 seconds; an unchanged update took 2.2 seconds; a one-module compiled update took 3.4 seconds. Process-inclusive query times were 0.014 seconds for `where`, 0.2 seconds median and 0.67 seconds worst for `users`, 0.34 seconds for `states`, 0.11 seconds for `same`, and about 5 seconds for `gate`.
+
+No E1–E5 acceptance run record exists yet. Do not treat the baseline numbers as their result. Before this document is accepted, its acceptance records must be amended with each concrete run ID, command output, revision, binary hash, duration, and measured outcome at these paths:
+
+| Acceptance row | Required record path |
+| --- | --- |
+| E1 parity | `/theorem/infra145/runs/infra145-e1-<UTC yyyymmddThhmmZ>/` |
+| E2 recall and exact duplicates | `/theorem/infra145/runs/infra145-e2-<UTC yyyymmddThhmmZ>/` |
+| E3 gate and librarian route | `/theorem/infra145/runs/infra145-e3-<UTC yyyymmddThhmmZ>/` |
+| E4 sandbox controls | `~/.cache/infra109/infra145-runs/infra145-e4-<UTC yyyymmddThhmmZ>/` |
+| E5 `land-hash` | `/theorem/infra145/runs/infra145-e5-<UTC yyyymmddThhmmZ>/` |
+
+The required records are generated by the end-to-end drivers. They are the evidence for the baseline-scale claims and the acceptance outcomes, not this README.
