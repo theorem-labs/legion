@@ -16,11 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from capstone import CS_ARCH_RISCV, CS_MODE_RISCV64, CS_MODE_RISCVC, CS_OP_IMM, CS_OP_MEM, CS_OP_REG, Cs
+from elftools.common.exceptions import ELFError
 from elftools.elf.constants import SH_FLAGS
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 
 from .config import ImageRules
+from .errors import InputError
+from .imagecache import ImageCache
 
 _COMPRESSED_MEMORY = {"c.ld", "c.lw", "c.sd", "c.sw", "c.fld", "c.fsd"}
 _DIRECT_CALLS = {"jal", "j", "c.j", "c.jal"}
@@ -228,6 +231,31 @@ class FunctionFacts:
     outside: list[dict[str, Any]] = field(default_factory=list)
     memory_offsets: set[int] = field(default_factory=set)
     addi_constants: set[int] = field(default_factory=set)
+    exclusions: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts:
+    return FunctionFacts(
+        calls=value["calls"],
+        globals=value["globals"],
+        function_addresses=value["function_addresses"],
+        outside=value["outside"],
+        memory_offsets=set(value["memory_offsets"]),
+        addi_constants=set(value["addi_constants"]),
+        exclusions=value.get("exclusions", []),
+    )
+
+
+def _facts_for_cache(facts: FunctionFacts) -> dict[str, Any]:
+    return {
+        "calls": facts.calls,
+        "globals": facts.globals,
+        "function_addresses": facts.function_addresses,
+        "outside": facts.outside,
+        "memory_offsets": sorted(facts.memory_offsets),
+        "addi_constants": sorted(facts.addi_constants),
+        "exclusions": facts.exclusions,
+    }
 
 
 def _hex(value: int) -> str:
@@ -244,14 +272,20 @@ def source_name(symbol: str) -> str:
 
 
 def read_system_map(path: Path) -> list[tuple[int, str, str]]:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as error:
+        raise InputError(f"cannot read System.map {path}: {error}") from error
     entries: list[tuple[int, str, str]] = []
-    for line in path.read_text().splitlines():
-        pieces = line.split(maxsplit=2)
-        if len(pieces) == 3:
-            try:
-                entries.append((int(pieces[0], 16), pieces[1], pieces[2]))
-            except ValueError:
-                continue
+    for number, line in enumerate(lines, start=1):
+        pieces = line.split()
+        if len(pieces) != 3 or len(pieces[1]) != 1:
+            raise InputError(f"System.map {path} line {number}: expected address type name")
+        try:
+            address = int(pieces[0], 16)
+        except ValueError as error:
+            raise InputError(f"System.map {path} line {number}: address is not hexadecimal") from error
+        entries.append((address, pieces[1], pieces[2]))
     return sorted(entries)
 
 
@@ -271,7 +305,7 @@ def resolve_sized(symbols: list[tuple[int, int, str, str]], address: int) -> tup
 
 
 class Image:
-    def __init__(self, image: Path, system_map: Path, rules: ImageRules) -> None:
+    def __init__(self, image: Path, system_map: Path, rules: ImageRules, cache_directory: Path | None = None) -> None:
         self.rules = rules
         self.map = read_system_map(system_map)
         named = {(address, name) for address, _, name in self.map}
@@ -281,6 +315,25 @@ class Image:
             if kind in text_kinds:
                 self.text_at.setdefault(address, name)
         self.text_starts = sorted(self.text_at)
+        try:
+            self._load_elf(image, named)
+        except (OSError, ELFError) as error:
+            handle = getattr(self, "handle", None)
+            if handle is not None:
+                handle.close()
+            raise InputError(f"cannot parse ELF {image}: {error}") from error
+        self.decoder = Cs(CS_ARCH_RISCV, CS_MODE_RISCV64 | CS_MODE_RISCVC)
+        self.decoder.detail = True
+        self.cache: dict[int, FunctionFacts] = {}
+        self.section_data: dict[str, bytes] = {}
+        # The number of parameters of each function the C defines, for the argument registers a
+        # call passes, and the registers it returns in; set by the caller before facts are read.
+        # Where unknown: eight arguments, two result registers.
+        self.arity: dict[str, int] = {}
+        self.results: dict[str, int] = {}
+        self.image_cache = ImageCache(cache_directory, image, system_map, rules, Path(__file__))
+
+    def _load_elf(self, image: Path, named: set[tuple[int, str]]) -> None:
         self.handle = image.open("rb")
         self.elf = ELFFile(self.handle)
         self.sections: list[tuple[int, int, str, bool]] = []
@@ -349,15 +402,6 @@ class Image:
         }
         # The C names of every symbol System.map lists, for telling a global the compiler removed.
         self.map_source_names = frozenset(source_name(name) for _, _, name in self.map)
-        self.decoder = Cs(CS_ARCH_RISCV, CS_MODE_RISCV64 | CS_MODE_RISCVC)
-        self.decoder.detail = True
-        self.cache: dict[int, FunctionFacts] = {}
-        self.section_data: dict[str, bytes] = {}
-        # The number of parameters of each function the C defines, for the argument registers a
-        # call passes, and the registers it returns in; set by the caller before facts are read.
-        # Where unknown: eight arguments, two result registers.
-        self.arity: dict[str, int] = {}
-        self.results: dict[str, int] = {}
 
     def close(self) -> None:
         self.handle.close()
@@ -381,6 +425,10 @@ class Image:
         cached = self.cache.get(symbol.address)
         if cached is not None:
             return cached
+        payload = self.image_cache.load(symbol.name, symbol.address, symbol.size, self.arity, self.results)
+        if payload is not None:
+            self.cache[symbol.address] = _facts_from_cache(payload)
+            return self.cache[symbol.address]
         facts = FunctionFacts()
         self.cache[symbol.address] = facts
         section = self.section_of(symbol.address)
@@ -394,6 +442,14 @@ class Image:
         start = symbol.address - section[0]
         code = data[start : start + max(0, self._end(symbol) - symbol.address)]
         self.cache[symbol.address] = self.decode(symbol.name, code, symbol.address)
+        self.image_cache.store(
+            symbol.name,
+            symbol.address,
+            symbol.size,
+            self.arity,
+            self.results,
+            _facts_for_cache(self.cache[symbol.address]),
+        )
         return self.cache[symbol.address]
 
     def decode(self, name: str, code: bytes, address: int) -> FunctionFacts:
@@ -729,6 +785,28 @@ class Image:
                     "provenance": [{"source": "image", "address": _hex(instruction)}],
                 }
             )
+            return
+        facts.exclusions.append(
+            {
+                "kind": "image_call",
+                "reason": "target_not_text",
+                "function": function,
+                "target": _hex(target),
+                "detail": self._nearest_symbol(target),
+                "provenance": [{"source": "image", "address": _hex(instruction)}],
+            }
+        )
+
+    def _nearest_symbol(self, address: int) -> str:
+        index = bisect.bisect_right(self.map, (address, "\uffff", "\uffff")) - 1
+        if index < 0:
+            return "no System.map symbol at or before the target"
+        symbol_address = self.map[index][0]
+        names: list[str] = []
+        while index >= 0 and self.map[index][0] == symbol_address:
+            names.append(self.map[index][2])
+            index -= 1
+        return f"{', '.join(sorted(names))} at {_hex(symbol_address)}"
 
 
 # Instructions whose first register operand is read, not written: stores, branches, and jumps

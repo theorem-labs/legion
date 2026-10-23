@@ -124,7 +124,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
     except BaseException:
         cache.close()
         raise
-    image = Image(inputs.image, inputs.system_map, config.image)
+    image = Image(inputs.image, inputs.system_map, config.image, cache_directory)
     functions = [(name, function) for unit in facts.values() for name, function in unit["functions"].items()]
     image.arity = {name: function["parameters"] for name, function in functions if "parameters" in function}
     image.results = {

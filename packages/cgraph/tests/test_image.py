@@ -3,18 +3,118 @@
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
 import pytest
 from conftest import FIXTURE
 
-from cgraph import config
-from cgraph.image import FunctionFacts, Image, resolve_sized, source_name
+from cgraph import config, imagecache
+from cgraph.errors import InputError
+from cgraph.image import FunctionFacts, Image, read_system_map, resolve_sized, source_name
+from cgraph.imagecache import ImageCache
 
 
 @pytest.fixture(scope="module")
 def image() -> Image:
     loaded = config.load(FIXTURE / "cgraph.toml")
     return Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image)
+
+
+def test_malformed_system_map_names_its_line(tmp_path: Path) -> None:
+    path = tmp_path / "System.map"
+    path.write_text("0000000000010000 T valid\nmalformed\n")
+    with pytest.raises(InputError, match=r"System\.map .* line 2"):
+        read_system_map(path)
+
+
+def test_malformed_elf_is_an_input_error(tmp_path: Path) -> None:
+    image_path = tmp_path / "not-an-elf"
+    image_path.write_bytes(b"not an ELF")
+    system_map = tmp_path / "System.map"
+    system_map.write_text("0000000000010000 T function\n")
+    with pytest.raises(InputError, match=r"cannot parse ELF"):
+        Image(image_path, system_map, config.ImageRules())
+
+
+def test_image_cache_reuses_every_function_without_decoding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    cache = tmp_path / "cache"
+    cold = Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image, cache)
+    try:
+        expected = {
+            (symbol.name, symbol.address): cold.facts(symbol) for copies in cold.functions.values() for symbol in copies
+        }
+    finally:
+        cold.close()
+    image_cache = cache / "image"
+    cold_bytes = {path.name: path.read_bytes() for path in sorted(image_cache.glob("*.json"))}
+    assert cold_bytes
+
+    warm = Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image, cache)
+    try:
+
+        def fail_decode(*_arguments: object) -> FunctionFacts:
+            raise AssertionError("warm image facts must be read from the cache")
+
+        monkeypatch.setattr(warm, "decode", fail_decode)
+        assert {
+            (symbol.name, symbol.address): warm.facts(symbol) for copies in warm.functions.values() for symbol in copies
+        } == expected
+    finally:
+        warm.close()
+    assert {path.name: path.read_bytes() for path in sorted(image_cache.glob("*.json"))} == cold_bytes
+
+
+def test_image_cache_key_covers_each_decoder_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    image_path = FIXTURE / "image" / "mini.elf"
+    system_map = FIXTURE / "image" / "System.map"
+    source = tmp_path / "image.py"
+    source.write_text("image decoder")
+
+    def key(
+        image: Path = image_path,
+        map_path: Path = system_map,
+        rules: config.ImageRules = loaded.image,
+        decoder_source: Path = source,
+        name: str = "function",
+        address: int = 1,
+        size: int = 2,
+        arity: dict[str, int] | None = None,
+        results: dict[str, int] | None = None,
+    ) -> str:
+        return ImageCache(tmp_path / "cache", image, map_path, rules, decoder_source).key(
+            name, address, size, arity or {"function": 1}, results or {"function": 1}
+        )
+
+    changed_image = tmp_path / "image"
+    changed_image.write_bytes(image_path.read_bytes() + b"changed")
+    changed_map = tmp_path / "System.map"
+    changed_map.write_text(system_map.read_text() + "0000000000020000 T changed\n")
+    changed_source = tmp_path / "changed-image.py"
+    changed_source.write_text("changed decoder")
+    keys = {
+        key(),
+        key(image=changed_image),
+        key(map_path=changed_map),
+        key(rules=config.ImageRules(thread_pointer="other")),
+        key(decoder_source=changed_source),
+        key(name="other"),
+        key(address=2),
+        key(size=3),
+        key(arity={"function": 2}),
+        key(results={"function": 2}),
+    }
+    monkeypatch.setattr(imagecache.capstone, "__version__", "changed")
+    keys.add(key())
+    assert len(keys) == 11
+
+
+def test_disabled_image_cache_does_not_read_inputs(tmp_path: Path) -> None:
+    cache = ImageCache(
+        None, tmp_path / "missing-image", tmp_path / "missing-map", config.ImageRules(), tmp_path / "missing-source"
+    )
+    assert cache.load("function", 1, 2, {}, {}) is None
 
 
 def globals_of(image: Image, name: str) -> set[str]:
@@ -226,6 +326,22 @@ def _jal(rd: int, offset: int) -> int:
     bits = offset & 0x1FFFFF
     return (((bits >> 20) & 1) << 31 | ((bits >> 1) & 0x3FF) << 21 | ((bits >> 11) & 1) << 20
             | ((bits >> 12) & 0xFF) << 12 | rd << 7 | 0x6F)  # fmt: skip
+
+
+def test_call_to_non_text_symbol_is_recorded_as_an_exclusion(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    target = image.object_symbols["pair_a"][0].address
+    facts = image.decode("synthetic", struct.pack("<I", _jal(ZERO, target - start)), start)
+    assert facts.exclusions == [
+        {
+            "kind": "image_call",
+            "reason": "target_not_text",
+            "function": "synthetic",
+            "target": f"0x{target:x}",
+            "detail": f"pair_a, pair_alias at 0x{target:x}",
+            "provenance": [{"source": "image", "address": f"0x{start:x}"}],
+        }
+    ]
 
 
 def _store(rs2: int, base: int, offset: int) -> int:
