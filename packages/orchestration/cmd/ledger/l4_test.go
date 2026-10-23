@@ -120,6 +120,48 @@ func TestL4ContractListShowsProofReviewAndUpstreamRecords(t *testing.T) {
 	}
 }
 
+// A mixed-owner landing through the command line, with both --reviewed-head and each owner's --review, is accepted, and
+// contract list shows each owner's own review as its contract's last_change.
+func TestL4MixedOwnerLandingRecordsEachExplicitReview(t *testing.T) {
+	call := l4Command(t)
+	mustL4Code(t, call, 0, "repo", "ensure", "r", "0")
+	mustL4Code(t, call, 0, "contract", "register", "r", "C", "alice", "hash-1", "false")
+	mustL4Code(t, call, 0, "contract", "register", "r", "D", "bob", "hash-1", "false")
+	mustL4Code(t, call, 0, "open", "r", "M-mixed", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1", "--read", "D=hash-1")
+	candidate := []string{"--path", "a.lean", "--current", "C=hash-1", "--current", "D=hash-1",
+		"--changed-contract", "C=hash-2", "--changed-contract", "D=hash-2", "--head", "head-1", "--reviewed-head", "head-1",
+		"--review", "D=bob@head-1", "--review", "C=alice@head-1"}
+	mustL4Code(t, call, 0, append([]string{"--json", "check", "r", "M-mixed", "1", "--commit", "commit-1"}, candidate...)...)
+	mustL4Code(t, call, 0, append([]string{"land", "--repo", "r", "--migration", "M-mixed", "--generation", "1", "--commit", "commit-1"}, candidate...)...)
+
+	code, stdout, stderr := call("--json", "contract", "list", "r")
+	if code != 0 {
+		t.Fatalf("contract list: code=%d stderr=%q", code, stderr)
+	}
+	var contracts []struct {
+		Name       string          `json:"name"`
+		LastChange json.RawMessage `json:"last_change"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &contracts); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]any{}
+	for _, contract := range contracts {
+		var change any
+		if err := json.Unmarshal(contract.LastChange, &change); err != nil {
+			t.Fatalf("%s last change %q: %v", contract.Name, contract.LastChange, err)
+		}
+		got[contract.Name] = change
+	}
+	want := map[string]any{
+		"C": map[string]any{"review": map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
+		"D": map[string]any{"review": map[string]any{"contract": "D", "reviewer": "bob", "head": "head-1"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("contract list changes %#v, want %#v", got, want)
+	}
+}
+
 type l4Call func(args ...string) (int, string, string)
 
 func l4Command(t *testing.T) l4Call {

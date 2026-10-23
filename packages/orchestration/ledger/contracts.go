@@ -605,12 +605,18 @@ func checkContractViolations(ctx context.Context, tx pgx.Tx, migration Migration
 // Land validates a complete candidate, advances its changed contracts, makes dependent agreements stale, and closes
 // the migration at the supplied commit. It holds the repository, migration and contract locks through every step.
 //
-// A candidate with changed contracts changes a statement. It needs Head, and it lands only with a CompatibilityProof
-// or with a ReviewedHead equal to Head; with neither it is refused as statement_unreviewed, after the shared checks
-// and the pinned approvals and before any write. A candidate with no changed contracts changes proofs only and needs
-// neither record. The ledger trusts its caller for these records, as it does for ApprovedPinned: it does not build
-// the proof declaration or confirm that the review happened. It keeps them in the migration.landed event, so the
-// record shows which way each landing took.
+// A candidate with changed contracts changes a statement, and it needs Head. Each changed registered contract must be
+// cleared by one record: the CompatibilityProof, which clears every one; a review in Reviews that names the contract,
+// whose Reviewer is the contract's owner in the ledger and whose Head is the request's Head; or a ReviewedHead equal to
+// Head, which clears them only when every changed contract has one owner, and then counts as that owner's review.
+// Otherwise Land refuses with statement_unreviewed, naming every contract left uncleared, after the shared checks and
+// the pinned approvals and before any write. A candidate with no changed contracts changes proofs only and needs none
+// of these records. Upstream is accepted only when the migration's owner is the repository's upstream owner, and is
+// refused with upstream_not_allowed otherwise. It is provenance only: it clears neither the statement rule nor a pinned
+// contract. The ledger trusts its caller for these records, as it does for ApprovedPinned: it does not build the proof
+// declaration or confirm that the review happened. It stores the record that cleared each advanced contract, with the
+// upstream commit beside it, as that contract's last_change, and keeps the request's records in the migration.landed
+// event.
 func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 	candidateRequest := CheckRequest{
 		Repo: req.Repo, ID: req.Migration, Generation: req.Generation, Commit: req.Commit, Changed: req.ChangedPaths,

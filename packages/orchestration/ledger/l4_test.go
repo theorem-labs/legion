@@ -296,6 +296,45 @@ func TestL4ContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 	}
 }
 
+// TestL4MixedOwnersRecordEachExplicitReview lands two contracts of two owners with both a reviewed head and each
+// owner's explicit review. The reviewed head clears neither, because the owners differ, so the explicit reviews clear
+// them, and each contract's last_change records its own owner's review rather than a review derived from the reviewed
+// head.
+func TestL4MixedOwnersRecordEachExplicitReview(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
+	must(s.RegisterContract(ctx, "r", "D", "bob", "hash-1", false))
+	reads := map[string]string{"C": "hash-1", "D": "hash-1"}
+	migration := must(open(t, s, "M-mixed", "alice", []string{"a.lean"}, reads))
+	request := ledger.LandRequest{
+		Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-1",
+		ChangedPaths: []string{"a.lean"}, Current: reads, ChangedContracts: map[string]string{"C": "hash-2", "D": "hash-2"},
+		Head: "head-1", ReviewedHead: "head-1", Reviews: []ledger.Review{
+			{Contract: "D", Reviewer: "bob", Head: "head-1"},
+			{Contract: "C", Reviewer: "alice", Head: "head-1"},
+		},
+	}
+	if check := must(s.Check(ctx, l4CheckRequest(request))); !check.Pass {
+		t.Fatalf("check of a mixed-owner change with each owner's review: %+v", check)
+	}
+	if _, err := s.Land(ctx, request); err != nil {
+		t.Fatalf("land of a mixed-owner change with each owner's review: %v", err)
+	}
+	want := map[string]any{
+		"C": map[string]any{"review": map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
+		"D": map[string]any{"review": map[string]any{"contract": "D", "reviewer": "bob", "head": "head-1"}},
+	}
+	contracts := must(s.Contracts(ctx, "r"))
+	if len(contracts) != 2 {
+		t.Fatalf("contracts: %+v", contracts)
+	}
+	for _, contract := range contracts {
+		assertL4JSON(t, contract.LastChange, want[contract.Name])
+		assertL4JSON(t, must(s.Contract(ctx, "r", contract.Name)).LastChange, want[contract.Name])
+	}
+}
+
 func l4CheckRequest(request ledger.LandRequest) ledger.CheckRequest {
 	return ledger.CheckRequest{
 		Repo: request.Repo, ID: request.Migration, Generation: request.Generation, Commit: request.Commit,
