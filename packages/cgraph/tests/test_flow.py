@@ -14,7 +14,11 @@ def flow(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     out = tmp_path_factory.mktemp("flow")
     result = build(FIXTURE, "flow", out)
     assert result.passes, result.hard_checks
-    return {"graph": read(out, "graph.json"), "checks": read(out, "checks.json")}
+    return {
+        "graph": read(out, "graph.json"),
+        "checks": read(out, "checks.json"),
+        "exclusions": read(out, "exclusions.json"),
+    }
 
 
 def edges_from(graph: dict[str, Any], source: str) -> list[tuple[str, str]]:
@@ -24,8 +28,11 @@ def edges_from(graph: dict[str, Any], source: str) -> list[tuple[str, str]]:
 def test_an_inline_helper_constant_and_a_decided_and_remove_their_branches(flow: dict[str, Any]) -> None:
     """feature_on() returns 0, so `on && b->size`, `if (feature_on())` and `0 && bag_weight()` are dead."""
     assert edges_from(flow["graph"], "function:flow_guarded") == []
-    reasons = {(item["unit"], item["reason"]) for item in flow["graph"]["analysis"]["unevaluated"]
-               if item["function"] == "function:flow_guarded"}  # fmt: skip
+    reasons = {
+        (item["target"], item["reason"])
+        for item in flow["exclusions"]["items"]
+        if item["function"] == "function:flow_guarded"
+    }
     assert ("struct:box", "dead_branch") in reasons
 
 
@@ -35,8 +42,10 @@ def test_code_after_a_return_is_not_code(flow: dict[str, Any]) -> None:
 
 def test_the_image_decides_a_builtin_constant_choice(flow: dict[str, Any]) -> None:
     assert edges_from(flow["graph"], "function:flow_builtin") == []
-    decided = flow["graph"]["analysis"]["image_decided"]
-    assert ("function:flow_builtin", "box_weight") in [(item["function"], item.get("call")) for item in decided]
+    decided = {
+        (item["function"], item["target"]) for item in flow["exclusions"]["items"] if item["reason"] == "image_decided"
+    }
+    assert ("function:flow_builtin", "function:box_weight") in decided
 
 
 def test_a_container_of_field_is_matched_at_its_displacement(flow: dict[str, Any]) -> None:
@@ -49,20 +58,25 @@ def test_layer_checks_classify_what_they_exclude(tmp_path: Path) -> None:
     out = tmp_path / "out"
     build(FIXTURE, "both", out)
     offsets = read(out, "checks.json")["structure_layer"]["field_offsets"]
-    assert "excluded" in offsets and "miss_examples" in offsets
+    assert "excluded" in offsets and "misses" in offsets and "image_evidence" in offsets
 
 
 def test_an_argument_the_inline_callee_ignores_is_not_an_access(flow: dict[str, Any]) -> None:
     assert edges_from(flow["graph"], "function:flow_ignored") == []
-    reasons = {(item["unit"], item["reason"]) for item in flow["graph"]["analysis"]["unevaluated"]
-               if item["function"] == "function:flow_ignored"}  # fmt: skip
+    reasons = {
+        (item["target"], item["reason"])
+        for item in flow["exclusions"]["items"]
+        if item["function"] == "function:flow_ignored"
+    }
     assert reasons == {("global:all_bags", "ignored_argument")}
 
 
 def test_code_after_a_builtin_decided_exit_is_left_to_the_image(flow: dict[str, Any]) -> None:
     assert edges_from(flow["graph"], "function:flow_builtin_exit") == []
-    decided = {(item["function"], item.get("call")) for item in flow["graph"]["analysis"]["image_decided"]}
-    assert ("function:flow_builtin_exit", "box_weight") in decided
+    decided = {
+        (item["function"], item["target"]) for item in flow["exclusions"]["items"] if item["reason"] == "image_decided"
+    }
+    assert ("function:flow_builtin_exit", "function:box_weight") in decided
 
 
 def test_a_function_passed_to_an_inlined_helper_is_folded(flow: dict[str, Any]) -> None:

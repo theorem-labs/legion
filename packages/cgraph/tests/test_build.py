@@ -14,7 +14,11 @@ from conftest import FIXTURE, build, read
 
 from cgraph import cli, pipeline
 
-OUTPUTS = ("graph.json", "checks.json", "owners.json", "topics.json", "measures.json", "report.md")
+OUTPUTS = ("graph.json", "checks.json", "exclusions.json", "owners.json", "topics.json", "measures.json", "report.md")
+
+
+def digests(out: Path) -> dict[str, str]:
+    return {name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in OUTPUTS}
 
 
 def output_bytes(out: Path) -> dict[str, bytes]:
@@ -32,8 +36,12 @@ def cli_build(copy: Path, out: Path, cache: Path | None = None, jobs: int = 1) -
     return cli.main(cli_arguments(copy, out, cache, jobs))
 
 
-def digests(out: Path) -> dict[str, str]:
-    return {name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in OUTPUTS}
+def test_build_writes_c3_exclusions_and_the_check_count(built: Path) -> None:
+    exclusions = read(built, "exclusions.json")
+    checks = read(built, "checks.json")
+    assert exclusions["format"] == "cgraph/exclusions/v1"
+    assert checks["exclusions"] == exclusions["counts"]
+    assert sum(sum(reasons.values()) for reasons in exclusions["counts"].values()) == len(exclusions["items"])
 
 
 def test_layer_checks_are_written(built: Path) -> None:
@@ -334,7 +342,7 @@ def test_concurrent_cli_builds_share_a_valid_cache(copy: Path, tmp_path: Path) -
     assert set(manifest) == {"src/store.c"}
 
 
-def test_an_assembly_function_of_a_part_file_is_reported_not_a_node(copy: Path, tmp_path: Path) -> None:
+def test_an_assembly_function_of_a_part_file_is_excluded_not_a_node(copy: Path, tmp_path: Path) -> None:
     contracts = json.loads((copy / "contracts.json").read_text())
     contracts["nodes"].append(
         {"id": "Prog/src/store/AnchorPair", "kind": "fn", "syms": ["anchor_pair"], "addr": "", "in_image": True}
@@ -342,4 +350,14 @@ def test_an_assembly_function_of_a_part_file_is_reported_not_a_node(copy: Path, 
     (copy / "contracts.json").write_text(json.dumps(contracts))
     out = tmp_path / "out"
     assert cli.main(["build", "--config", str(copy / "cgraph.toml"), "--part", "store", "--out", str(out)]) == 0
-    assert read(out, "graph.json")["analysis"]["contract_functions_without_c"] == ["function:anchor_pair"]
+    item = next(
+        item
+        for item in read(out, "exclusions.json")["items"]
+        if item["kind"] == "contract_function" and item["target"] == "Prog/src/store/AnchorPair"
+    )
+    assert {key: item[key] for key in ("kind", "reason", "function", "target")} == {
+        "kind": "contract_function",
+        "reason": "no_c_file",
+        "function": None,
+        "target": "Prog/src/store/AnchorPair",
+    }

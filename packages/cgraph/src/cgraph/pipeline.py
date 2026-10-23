@@ -148,7 +148,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
             or None,
             "vocabulary": digest,
         }
-        graph = link.build(config, part, files, facts, image, contracts, recorded)
+        graph, exclusions = link.build(config, part, files, facts, image, contracts, recorded)
     finally:
         image.close()
     owner_list, topics = owners.build(graph, config.topic_prefix)
@@ -160,16 +160,24 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
     }
     hard = checks.hard(graph, owner_list, topics, layers, config.part_thresholds.get(part, config.thresholds))
     passes = all(item["ok"] for item in hard)
-    check_document = {"format": "cgraph/checks/v1", "part": part, **layers, "hard_checks": hard, "passes": passes}
+    check_document = {
+        "format": "cgraph/checks/v1",
+        "part": part,
+        **layers,
+        "exclusions": exclusions["counts"],
+        "hard_checks": hard,
+        "passes": passes,
+    }
     outputs = {
         "graph.json": graph,
         "checks.json": check_document,
+        "exclusions.json": exclusions,
         "owners.json": owner_list,
         "topics.json": topics,
         "measures.json": numbers,
     }
     rendered = {name: jsonio.dumps(value) for name, value in outputs.items()}
-    rendered["report.md"] = report.render(graph, check_document, owner_list, topics, numbers)
+    rendered["report.md"] = report.render(graph, check_document, owner_list, topics, numbers, exclusions)
     _write_outputs(out, rendered)
     parsed_sources = sorted(job[0] for job in pending)
     counts = {
