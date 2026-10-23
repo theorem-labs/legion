@@ -217,6 +217,11 @@ type Store interface {
 	RetireDelivery(ctx context.Context, c Claim, deliveryID string) error
 }
 
+// WorkQueue answers whether a configured standing owner has open work.
+type WorkQueue interface {
+	HasWork(ctx context.Context, owner string) (bool, error)
+}
+
 // Specs builds the part of a launch the claim does not carry — the pane's environment, its
 // secrets, its prompt, its workspace. The machine fills in who the launch is for: the claim's
 // identity, the generation, the boot token, and the session file a resume continues.
@@ -290,6 +295,8 @@ type Deps struct {
 	// fresh, so the daemon can tell the issue's other claims (IssueVolumeLost): their sessions were
 	// on the same volume. nil tells no one.
 	VolumeLost func(c Claim)
+	// WorkQueue reads a standing owner's ledger queue after its process ends.
+	WorkQueue WorkQueue
 	// PhaseHolds says whether issue is still in phase: the workflow enqueues a task for the phase
 	// its issue was in, and the outbox refuses to start a role for a phase the issue has left
 	// (daemon/outbox.go), so a delivery queued before the phase moved on is that same staleness
@@ -890,11 +897,11 @@ func (m *Machine) launch(ctx context.Context) error {
 // go stopped: by then the claim records no process, so nothing else would launch it before a
 // restart. One the daemon's stop cut short is left to the next boot, as a start it cut short is.
 func (m *Machine) launchAfter(ctx context.Context, charged bool) error {
-	if err := m.checkLaunch(ctx); err != nil {
-		return m.relaunchRefused(ctx, func(ctx context.Context) error { return m.launchAfter(ctx, charged) }, err)
-	}
 	m.letGo()
 	for {
+		if err := m.checkLaunch(ctx); err != nil {
+			return m.relaunchRefused(ctx, func(ctx context.Context) error { return m.launchAfter(ctx, charged) }, err)
+		}
 		m.claim.Generation++
 		token := rand.Text()
 		m.claim.BootTokenHash = HashBootToken(token)
@@ -999,13 +1006,40 @@ func (m *Machine) stopPrevious(ctx context.Context) error {
 func (m *Machine) died(ctx context.Context, observation runtime.Observation) error {
 	m.log.Warn("supervise: process died", "incarnation", m.claim.Locator.Incarnation, "observed", string(observation.Kind),
 		"detail", observation.Detail)
+	standingOwnerWithWork := false
+	if claim.IsStandingOwner(m.claim.Role, m.claim.Issue, m.claim.Tree) {
+		if m.deps.WorkQueue == nil {
+			return errors.New("supervise: no standing-owner work queue")
+		}
+		owner, ok := m.claim.Token.OwnerName(m.claim.Project)
+		if !ok {
+			return fmt.Errorf("supervise: standing owner %s has an invalid token", m.claim.Token)
+		}
+		hasWork, err := m.deps.WorkQueue.HasWork(ctx, owner)
+		if err != nil {
+			return fmt.Errorf("read queued work for standing owner %s: %w", owner, err)
+		}
+		if !hasWork {
+			m.letGo()
+			m.claim.State = StateQueued
+			return m.persist(ctx)
+		}
+		standingOwnerWithWork = true
+	}
 	if err := m.interrupted(ctx, "the process died in the task's turn"); err != nil {
 		return err
 	}
 	if m.held != nil {
 		return m.endHeld(ctx)
 	}
-	if m.chargeDeath() {
+	if standingOwnerWithWork {
+		m.claim.Budgets.Deaths++
+		m.log.Warn("supervise: standing owner stopped with work left", "deaths", m.claim.Budgets.Deaths,
+			"limit", m.deps.Limits.LaunchFailures)
+		if m.claim.Budgets.Deaths >= m.deps.Limits.LaunchFailures {
+			return m.fail(ctx, "standing-owner stops with work left ran out")
+		}
+	} else if m.chargeDeath() {
 		return m.fail(ctx, "deaths with work outstanding ran out")
 	}
 	if observation.Kind == runtime.Gone && observation.WorkspaceLost {

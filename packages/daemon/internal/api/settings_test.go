@@ -140,6 +140,16 @@ var settingsEmitted = map[string]string{
 // derived value that is no setting.
 var settingsExcluded = map[string]string{
 	"Config.PostgresDSN":            "a credential: a DSN carries its password",
+	"Config.StandingOwners":         "the standing-owner supervisor contains a ledger credential path",
+	"StandingOwners.LedgerDSNFile":  "the path of a file holding a credential",
+	"StandingOwners.Repository":     "standing-owner queue scope is not a pod setting",
+	"StandingOwners.MaxRunning":     "standing-owner admission policy is daemon-only",
+	"StandingOwners.BudgetUSD":      "standing-owner admission policy is daemon-only",
+	"StandingOwners.Owners":         "standing-owner launch policy is daemon-only",
+	"StandingOwner.Name":            "standing-owner launch policy is daemon-only",
+	"StandingOwner.PromptFile":      "a daemon-local prompt path",
+	"StandingOwner.Harness":         "standing-owner launch policy is daemon-only",
+	"StandingOwner.MaxCostUSD":      "standing-owner admission policy is daemon-only",
 	"GitHubApp.PrivateKey":          "a credential: Config holds the PEM resolved whatever the file's source",
 	"GitHubApp.PrivateKeyCommand":   "the source of a credential",
 	"GitHubApp.PrivateKeySecret":    "the source of a credential",

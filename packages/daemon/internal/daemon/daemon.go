@@ -870,6 +870,8 @@ type supervision struct {
 	supervisor *supervisor
 	tokens     *api.BootTokens
 	claims     []supervise.Claim
+	workQueue  supervise.WorkQueue
+	ledger     *ledgerQueue
 	// imageReport is what the worker image's passed probe reported: of the image, from its OK line,
 	// and of the pool, the attempts that waited on its capacity (bootprobe.ImageReport); under
 	// tmux, the model-fallback mark alone, read by plan.modelFallback. probed is whether the probe
@@ -938,11 +940,25 @@ func shimAddress(bound, advertiseHost string) (string, error) {
 // workflow's App tokens (nil without a workflow): every step of supervision that can refuse, so a
 // daemon that cannot supervise refuses before its boot is recorded.
 func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, p plan, st *store.Store, apps appauth.Tokens) (*supervision, error) {
-	claims, err := st.Claims(boot)
+	owners, err := ownerConfigs(cfg.StandingOwners, p.project)
 	if err != nil {
 		return nil, err
 	}
+	queue, err := openStandingOwnerQueue(boot, cfg.StandingOwners)
+	if err != nil {
+		return nil, err
+	}
+	claims, err := st.Claims(boot)
+	if err != nil {
+		closeStandingOwnerQueue(&queue, log)
+		return nil, err
+	}
 	claims = ofProject(claims, p.project)
+	claims, err = ensureStandingOwners(boot, st, p.project, owners, claims)
+	if err != nil {
+		closeStandingOwnerQueue(&queue, log)
+		return nil, err
+	}
 	reports, err := st.CapabilityReports(boot)
 	if err != nil {
 		return nil, err
@@ -974,22 +990,28 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 	sup.deps = supervise.Deps{
 		Runtime: rt,
 		Conns:   listener,
-		Store:   pruning(gateLaunch(tokens.Recording(st), p.checkLaunch), runtime.SecretsDir(cfg.StateDir), log),
+		Store:   pruning(gateLaunch(tokens.Recording(st), ownerLaunchCheck(st, cfg.StandingOwners, owners, p.checkLaunch)), runtime.SecretsDir(cfg.StateDir), log),
 		Specs: specs{
 			stateDir: cfg.StateDir, project: p.project, instructions: p.instructions, secrets: p.secrets, prompts: p.prompts,
 			identity: p.identity, repository: p.repository,
 			repositories: func() api.RepositoriesView { return p.repositories.view(nil) },
 			designGate:   cfg.Gates.Design, slackChannels: cfg.Projects[cfg.Project].SlackChannels,
 			mergeRules: cfg.Projects[cfg.Project].Merge, runtimeName: cfg.Runtime.Name, plugins: p.plugins,
-			backend: cfg.BackendFor,
+			backend: cfg.BackendFor, owners: owners,
 		},
 		Identity:     adoptIdentity(p.identity, p.repository),
 		Secrets:      p.secretsEnroller,
 		PhaseHolds:   p.phaseHolds,
 		TreeClosable: p.treeClosable,
 		VolumeLost:   sup.volumeLost,
-		Clock:        p.clock,
-		Log:          log,
+		WorkQueue: func() supervise.WorkQueue {
+			if queue.store == nil {
+				return nil
+			}
+			return queue
+		}(),
+		Clock: p.clock,
+		Log:   log,
 		Limits: supervise.Limits{
 			LaunchFailures: cfg.LaunchFailureLimit,
 			PromptFailures: cfg.PromptFailureLimit,
@@ -1009,6 +1031,12 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 	stopping, beginStop := context.WithCancel(context.Background())
 	return &supervision{
 		cfg: cfg, log: log, plan: p, stream: listener, runtime: rt, supervisor: sup, tokens: tokens, claims: claims,
+		workQueue: func() supervise.WorkQueue {
+			if queue.store == nil {
+				return nil
+			}
+			return queue
+		}(), ledger: &queue,
 		reports: reportsOfClaims(reports, claims), reportStore: st,
 		cancel: cancel, draining: draining, endDrain: endDrain, decided: api.NewRouteDecisions(),
 		stopping: stopping, beginStop: beginStop,
@@ -1054,6 +1082,7 @@ func (s *supervision) start(boot context.Context) error {
 		}
 	}
 	close(s.supervisor.restored)
+	s.wakeStandingOwners(s.supervisor.ctx)
 
 	observations, err := s.runtime.Observe(s.supervisor.ctx)
 	if err != nil {
@@ -1271,6 +1300,7 @@ func (s *supervision) reconcileOrphans(ctx context.Context) {
 		if err := s.runtime.ReconcileOrphans(ctx, knownClaims(claims), orphanGrace); err != nil && ctx.Err() == nil {
 			s.log.Error("reconcile orphans", "error", err)
 		}
+		s.wakeStandingOwners(ctx)
 		s.refreshStalePlugins(claims, "sweep")
 	}
 }
@@ -1336,6 +1366,7 @@ func (s *supervision) stop() {
 		s.supervisor.stop()
 		s.supervisor.wait()
 		s.wg.Wait()
+		closeStandingOwnerQueue(s.ledger, s.log)
 	})
 }
 

@@ -61,6 +61,17 @@ github_apps:
 #                                      # environment. Under runtime: kubernetes, as in this file, the loader
 #                                      # refuses claude: the worker image carries no Claude Code.
 
+# standing_owners:                    # optional ledger-backed owners: each has no Dispatch issue or tree
+#   ledger_dsn_file: ./ledger-dsn     # an owner-only file holding the ledger PostgreSQL DSN
+#   repository: example/repository    # the ledger repository whose work items wake these owners
+#   max_running: 2                    # at most this many owner launches or live owners at once
+#   budget_usd: 20                    # every attempt reserves its owner's maximum cost before launch
+#   owners:
+#     - name: proof-a                 # lowercase letters, digits and hyphens; becomes the owner queue key
+#       prompt_file: ./prompts/proof-a.md
+#       harness: omp
+#       max_cost_usd: 4
+
 runtime:
   kubernetes:
     namespace: legion

@@ -35,11 +35,11 @@ func (s *Store) OpenTreeLifecycle(ctx context.Context, project, tree string, aut
 
 // AdmitClaim binds a new or reactivated claim to an open lifecycle and writes both in one short
 // globally serialized transaction. The caller receives the epoch it must carry through every later
-// launch; runtime work happens after this transaction commits. The project controller's claim
-// (`controller: daemon`) belongs to no tree, so it binds no lifecycle: it is written at epoch zero.
+// launch; runtime work happens after this transaction commits. Tree-independent claims have no
+// lifecycle, so they are written at epoch zero.
 func (s *Store) AdmitClaim(ctx context.Context, c supervise.Claim) (supervise.Claim, error) {
 	err := s.Tx(ctx, func(tx pgx.Tx) error {
-		if claim.IsController(c.Role, c.Issue, c.Tree) {
+		if claim.IsTreeIndependent(c.Role, c.Issue, c.Tree) {
 			c.TreeEpoch = 0
 			return putClaim(ctx, tx, c)
 		}
@@ -58,10 +58,9 @@ func (s *Store) AdmitClaim(ctx context.Context, c supervise.Claim) (supervise.Cl
 
 // CheckLaunch rejects a delayed claim before it can persist StateLaunching or call a runtime after
 // the tree lifecycle reserved cleanup. The machine returns this named error directly, so outbox
-// retry preserves its claim and launch budget. The project controller's claim, on no tree, has no
-// cleanup to meet.
+// retry preserves its claim and launch budget. Tree-independent claims have no cleanup to meet.
 func (s *Store) CheckLaunch(ctx context.Context, c supervise.Claim) error {
-	if claim.IsController(c.Role, c.Issue, c.Tree) {
+	if claim.IsTreeIndependent(c.Role, c.Issue, c.Tree) {
 		return nil
 	}
 	return s.Tx(ctx, func(tx pgx.Tx) error {

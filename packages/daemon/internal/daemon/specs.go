@@ -65,6 +65,8 @@ type specs struct {
 	// backend is the backend a role runs on (config.Config.BackendFor); nil runs every role on Oh
 	// My Pi.
 	backend func(claim.Role) runtime.Backend
+	// owners maps each configured standing-owner claim to its launch shape.
+	owners map[claim.Token]config.StandingOwner
 }
 
 // rolePromptPath is where a claim's role prompt is kept for every launch of it.
@@ -83,20 +85,25 @@ func rolePromptPath(stateDir string, token claim.Token) string {
 func (s specs) SpawnSpec(ctx context.Context, c supervise.Claim) (runtime.SpawnSpec, error) {
 	var spec runtime.SpawnSpec
 	var err error
-	if c.Role == claim.RoleController {
+	switch {
+	case c.Role == claim.RoleController:
 		spec, err = s.controllerSpawnSpec()
-	} else {
+	case claim.IsStandingOwner(c.Role, c.Issue, c.Tree):
+		spec, err = s.standingOwnerSpawnSpec(c)
+	default:
 		spec, err = s.workerSpawnSpec(ctx, c)
 	}
 	if err != nil {
 		return runtime.SpawnSpec{}, err
 	}
-	var part string
-	if spec.Backend, part, err = s.launchBackend(c.Role); err != nil {
-		return runtime.SpawnSpec{}, err
-	}
-	if part != "" {
-		spec.Prompt.RolePromptPaths = append(spec.Prompt.RolePromptPaths, part)
+	if !claim.IsStandingOwner(c.Role, c.Issue, c.Tree) {
+		var part string
+		if spec.Backend, part, err = s.launchBackend(c.Role); err != nil {
+			return runtime.SpawnSpec{}, err
+		}
+		if part != "" {
+			spec.Prompt.RolePromptPaths = append(spec.Prompt.RolePromptPaths, part)
+		}
 	}
 	spec.Plugins = s.stalePluginInstall(c)
 	return spec, nil
@@ -209,6 +216,22 @@ func (s specs) controllerSpawnSpec() (runtime.SpawnSpec, error) {
 		Prompt: runtime.PromptParts{
 			RolePromptPaths:            paths,
 			Addressing:                 addressing,
+			DeploymentInstructionsPath: s.instructions,
+		},
+	}, nil
+}
+
+func (s specs) standingOwnerSpawnSpec(c supervise.Claim) (runtime.SpawnSpec, error) {
+	owner, ok := s.owners[c.Token]
+	if !ok {
+		return runtime.SpawnSpec{}, fmt.Errorf("no standing-owner configuration for %s", c.Token)
+	}
+	return runtime.SpawnSpec{
+		Backend: owner.Harness,
+		Env:     map[string]string{},
+		Secrets: maps.Clone(s.secrets),
+		Prompt: runtime.PromptParts{
+			RolePromptPaths:            []string{owner.PromptFile},
 			DeploymentInstructionsPath: s.instructions,
 		},
 	}, nil

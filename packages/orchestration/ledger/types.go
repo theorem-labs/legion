@@ -11,9 +11,11 @@ type Repository struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
-// Item is a work item and its lease. Holder is empty when nobody holds it.
+// Item is a work item and its lease. Owner is the standing owner whose queue carries it; Holder is
+// empty when nobody holds it.
 type Item struct {
 	ID         string     `json:"id"`
+	Owner      string     `json:"owner,omitempty"`
 	State      string     `json:"state"` // open | done
 	Holder     string     `json:"holder,omitempty"`
 	Generation int64      `json:"generation"`

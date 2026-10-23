@@ -17,3 +17,13 @@ func IsTreeArchitect(role Role, issue, tree string) bool {
 func IsController(role Role, issue, tree string) bool {
 	return role == RoleController && issue == "" && tree == ""
 }
+
+// IsStandingOwner is whether a claim is a standing owner, with no issue or tree.
+func IsStandingOwner(role Role, issue, tree string) bool {
+	return role == RoleOwner && issue == "" && tree == ""
+}
+
+// IsTreeIndependent is whether a claim has no tree lifecycle to bind or check before launching.
+func IsTreeIndependent(role Role, issue, tree string) bool {
+	return IsController(role, issue, tree) || IsStandingOwner(role, issue, tree)
+}

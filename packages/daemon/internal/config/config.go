@@ -73,6 +73,9 @@ type Config struct {
 	StateDir      string
 	Runtime       Runtime
 	AdmissionCap  int
+	// StandingOwners is nil unless the deployment configures the ledger-backed standing-owner
+	// supervisor.
+	StandingOwners *StandingOwners
 
 	// DaemonURL is the API address every pane is told (`LEGION_DAEMON_URL`), with no trailing
 	// slash; the loopback address on Port unless the file names another.
@@ -272,6 +275,7 @@ type fileConfig struct {
 	Durations              map[string]int
 	Counts                 map[string]int
 	WorkerBackends         map[claim.Role]runtime.Backend
+	StandingOwners         *StandingOwners
 }
 
 // Load reads the daemon's complete runtime configuration. App private-key commands and secrets
@@ -357,6 +361,8 @@ func readKeys(root *yaml.Node) (fileConfig, error) {
 			file.Port, err = readInt(value, key)
 		case "admission_cap":
 			file.AdmissionCap, err = readInt(value, key)
+		case "standing_owners":
+			file.StandingOwners, err = readStandingOwners(value, key)
 		case "runtime":
 			file.Kubernetes, err = readRuntime(value)
 		case "daemon_url":
@@ -895,6 +901,15 @@ func resolve(file fileConfig, env func(string) string, configDir string) (Config
 		return Config{}, errors.New("admission_cap must be a positive integer")
 	}
 
+	if file.StandingOwners != nil {
+		owners := *file.StandingOwners
+		owners.LedgerDSNFile = underConfig(owners.LedgerDSNFile, configDir)
+		owners.Owners = slices.Clone(owners.Owners)
+		for i := range owners.Owners {
+			owners.Owners[i].PromptFile = underConfig(owners.Owners[i].PromptFile, configDir)
+		}
+		cfg.StandingOwners = &owners
+	}
 	if err := resolveStage2(file, configDir, &cfg); err != nil {
 		return Config{}, err
 	}

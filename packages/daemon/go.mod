@@ -13,6 +13,7 @@ require (
 	github.com/nats-io/nats.go v1.50.0
 	github.com/nats-io/nkeys v0.4.15
 	github.com/sjawhar/envoy v0.0.0
+	github.com/sjawhar/legion/orchestration v0.0.0
 	github.com/testcontainers/testcontainers-go v0.41.0
 	github.com/testcontainers/testcontainers-go/modules/nats v0.41.0
 	golang.org/x/sync v0.23.0
@@ -134,3 +135,4 @@ require (
 )
 
 replace github.com/sjawhar/envoy => ../envoy
+replace github.com/sjawhar/legion/orchestration => ../orchestration

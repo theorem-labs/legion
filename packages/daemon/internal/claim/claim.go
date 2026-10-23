@@ -27,3 +27,7 @@ const (
 // none of Roles, and NewToken never builds a token of it; its one token is ControllerToken. The
 // daemon holds such a claim only when it launches the controller itself (`controller: daemon`).
 const RoleController Role = "controller"
+
+// RoleOwner is a standing owner. It holds no Dispatch issue or tree; its ledger queue decides
+// when the daemon starts it.
+const RoleOwner Role = "owner"

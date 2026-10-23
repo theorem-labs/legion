@@ -13,6 +13,7 @@ var (
 	projectToken = regexp.MustCompile(`^[a-z0-9]+$`)
 	// notAlphanumeric is everything ProjectToken drops.
 	notAlphanumeric = regexp.MustCompile(`[^a-z0-9]`)
+	ownerName       = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 )
 
 // Roles are the six roles a claim can be on, in the order the workflow reaches them.
@@ -77,6 +78,25 @@ func (t Token) Cut() (issue string, role Role, ok bool) {
 // ControllerToken is the project controller's role token, `legion-<project>-controller`
 // (legion-roles.ts:66-69). project is already a ProjectToken.
 func ControllerToken(project string) Token { return Token("legion-" + project + "-controller") }
+
+// OwnerToken is the standing owner's token. owner must be a lowercase, hyphen-separated name so
+// the token stays one unambiguous Envoy role topic.
+func OwnerToken(project, owner string) (Token, error) {
+	if !projectToken.MatchString(project) {
+		return "", fmt.Errorf("owner token: project %q is not a project token", project)
+	}
+	if !ownerName.MatchString(owner) {
+		return "", fmt.Errorf("owner token: owner %q must be lowercase letters, digits, and hyphens", owner)
+	}
+	return Token(fmt.Sprintf("legion-%s-owner-%s", project, owner)), nil
+}
+
+// OwnerName is the configured owner name encoded in an owner token.
+func (t Token) OwnerName(project string) (string, bool) {
+	prefix := "legion-" + project + "-owner-"
+	name, ok := strings.CutPrefix(string(t), prefix)
+	return name, ok && ownerName.MatchString(name)
+}
 
 // Role is the role t names: the workflow role it ends in (Cut), or RoleController for the
 // project controller's token (ControllerToken); ok is false for a token that is neither.

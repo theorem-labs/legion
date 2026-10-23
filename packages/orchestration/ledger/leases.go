@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -32,6 +33,53 @@ func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds in
 		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{"max_landing_rounds": maxLandingRounds})
 	})
 	return r, err
+}
+
+// Enqueue creates an open work item for owner. Repeating an open enqueue for the same owner is
+// idempotent; an existing item belongs to one owner for its whole history.
+func (s *Store) Enqueue(ctx context.Context, repo, id, owner string) error {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(owner) == "" {
+		return invalid("an enqueued item needs an id and an owner")
+	}
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		var existingOwner, state string
+		err := tx.QueryRow(ctx, `INSERT INTO work_items (repo, id, owner) VALUES ($1, $2, $3)
+			ON CONFLICT DO NOTHING RETURNING owner, state`, repo, id, owner).Scan(&existingOwner, &state)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := tx.QueryRow(ctx, `SELECT owner, state FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`,
+				repo, id).Scan(&existingOwner, &state); err != nil {
+				return err
+			}
+			if existingOwner == owner && state == "open" {
+				return nil
+			}
+			return refuse(ReasonExists, "item %s already belongs to owner %s in state %s", id, existingOwner, state)
+		}
+		if err != nil {
+			return err
+		}
+		return event(ctx, tx, repo, "item.enqueued", id, owner, map[string]any{"owner": owner})
+	})
+}
+
+// HasOpenWork reports whether owner names at least one open item in repository.
+func (s *Store) HasOpenWork(ctx context.Context, repo, owner string) (bool, error) {
+	if strings.TrimSpace(owner) == "" {
+		return false, invalid("empty owner")
+	}
+	var open bool
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM work_items WHERE repo = $1 AND owner = $2 AND state = 'open'
+		)`, repo, owner).Scan(&open)
+	})
+	return open, err
 }
 
 func checkLeaseArgs(id, holder string, ttl time.Duration) error {
@@ -265,9 +313,9 @@ func (s *Store) Expire(ctx context.Context, repo string) ([]Item, error) {
 func (s *Store) Item(ctx context.Context, repo, id string) (Item, error) {
 	var it Item
 	var holder, result *string
-	err := s.pool.QueryRow(ctx, `SELECT id, state, holder, generation, lease_expires_at, result
+	err := s.pool.QueryRow(ctx, `SELECT id, owner, state, holder, generation, lease_expires_at, result
 		FROM work_items WHERE repo = $1 AND id = $2`, repo, id).
-		Scan(&it.ID, &it.State, &holder, &it.Generation, &it.ExpiresAt, &result)
+		Scan(&it.ID, &it.Owner, &it.State, &holder, &it.Generation, &it.ExpiresAt, &result)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return it, &NotFoundError{What: "item", ID: id}
 	}
