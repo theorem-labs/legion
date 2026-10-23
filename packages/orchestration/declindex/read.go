@@ -19,6 +19,15 @@ func (e *IncompleteError) Error() string {
 	return "the index is incomplete: no modules"
 }
 
+// Head is one source binder or conclusion whose type starts with Head.
+type Head struct {
+	Name   string
+	Module string
+	Role   string
+	Head   string
+	Line   int
+}
+
 // Commit returns the commit whose tree the index describes.
 func (s *Store) Commit(ctx context.Context) (string, error) {
 	return s.Meta(ctx, "commit")
@@ -76,6 +85,11 @@ func (s *Store) DeclsShort(ctx context.Context, shorts []string) ([]Decl, error)
 	return s.declarations(ctx, "short", shorts)
 }
 
+// DeclsWithShape returns declarations whose normalized source statement has any supplied shape.
+func (s *Store) DeclsWithShape(ctx context.Context, shapes []string) ([]Decl, error) {
+	return s.declarations(ctx, "shape", shapes)
+}
+
 func (s *Store) declarations(ctx context.Context, column string, values []string) ([]Decl, error) {
 	values = uniqueStrings(values)
 	var declarations []Decl
@@ -111,6 +125,65 @@ func (s *Store) declarations(ctx context.Context, column string, values []string
 		return declarations[i].Line < declarations[j].Line
 	})
 	return declarations, nil
+}
+
+// Heads returns source heads with role whose resolved head is any supplied name.
+func (s *Store) Heads(ctx context.Context, role string, names []string) ([]Head, error) {
+	return s.heads(ctx, "head", role, names)
+}
+
+// HeadsOf returns every source head of the named declarations.
+func (s *Store) HeadsOf(ctx context.Context, names []string) ([]Head, error) {
+	return s.heads(ctx, "name", "", names)
+}
+
+func (s *Store) heads(ctx context.Context, column, role string, values []string) ([]Head, error) {
+	values = uniqueStrings(values)
+	var heads []Head
+	for start := 0; start < len(values); start += 500 {
+		chunk := values[start:min(start+500, len(values))]
+		query := `SELECT name, module, role, head, line FROM heads WHERE ` + column + ` IN (` + placeholders(len(chunk)) + `)`
+		args := anys(chunk)
+		if role != "" {
+			query += ` AND role = ?`
+			args = append(args, role)
+		}
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var head Head
+			if err := rows.Scan(&head.Name, &head.Module, &head.Role, &head.Head, &head.Line); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			heads = append(heads, head)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	sort.Slice(heads, func(i, j int) bool {
+		a, b := heads[i], heads[j]
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		if a.Module != b.Module {
+			return a.Module < b.Module
+		}
+		if a.Role != b.Role {
+			return a.Role < b.Role
+		}
+		if a.Head != b.Head {
+			return a.Head < b.Head
+		}
+		return a.Line < b.Line
+	})
+	return heads, nil
 }
 
 // UsesOf returns uses of each requested declaration and its generated parts.

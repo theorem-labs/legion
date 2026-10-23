@@ -225,8 +225,24 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	parallel(len(changed), opt.jobs(), func(i int) {
 		results[i], errs[i] = readModule(tree, changed[i].rel)
 	})
-	logf(opt.Log, "index: %d modules, %d reference files changed, %d gone, read in %s", len(files), len(changed),
-		len(gone), time.Since(t0).Round(time.Millisecond))
+	// An unchanged module's heads were resolved against the declarations of an earlier refresh. The unchanged
+	// modules whose resolution the changed declaration names can move are re-read with the changed ones.
+	resolve, err := s.headModulesToResolve(ctx, files, old, changed, gone, results, errs)
+	if err != nil {
+		return st, err
+	}
+	if len(resolve) > 0 {
+		more := make([]ModuleData, len(resolve))
+		moreErrs := make([]error, len(resolve))
+		parallel(len(resolve), opt.jobs(), func(i int) {
+			more[i], moreErrs[i] = readModule(tree, resolve[i].rel)
+		})
+		changed = append(changed, resolve...)
+		results = append(results, more...)
+		errs = append(errs, moreErrs...)
+	}
+	logf(opt.Log, "index: %d modules, %d reference files changed, %d re-read to resolve heads, %d gone, read in %s",
+		len(files), len(changed)-len(resolve), len(resolve), len(gone), time.Since(t0).Round(time.Millisecond))
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return st, err
@@ -234,7 +250,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	defer func() { _ = tx.Rollback() }()
 	for _, rel := range append(append([]string(nil), gone...), relsOf(changed)...) {
 		if o, ok := old[rel]; ok {
-			for _, t := range []string{"decls", "uses", "edges", "imports"} {
+			for _, t := range []string{"decls", "heads", "uses", "edges", "imports"} {
 				if _, err := tx.ExecContext(ctx, "DELETE FROM "+t+" WHERE module = ?", o.module); err != nil {
 					return st, err
 				}
@@ -249,10 +265,15 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 			return st, err
 		}
 	}
-	decls := newBatch(tx, "decls", 6)
+	type pendingHead struct {
+		name, module string
+		source       SourceHead
+	}
+	decls := newBatch(tx, "decls", 7)
 	uses := newBatch(tx, "uses", 6)
 	imports := newBatch(tx, "imports", 2)
 	imports.verb = "INSERT OR IGNORE"
+	var pendingHeads []pendingHead
 	for i, md := range results {
 		if errs[i] != nil {
 			st.Unreadable++
@@ -261,9 +282,26 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		}
 		st.Reread++
 		st.Stale += md.Stale
+		// Shapes and heads join declarations by source line. A declaration without a statement hash has no
+		// trusted source position (see ModuleData.Stale), so the line may hold another declaration.
+		shapes := make(map[int]string, len(md.Shapes))
+		for _, shape := range md.Shapes {
+			shapes[shape.Line] = shape.Shape
+		}
+		declsByLine := make(map[int][]Decl, len(md.Decls))
 		for _, d := range md.Decls {
-			if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash); err != nil {
+			shape := ""
+			if d.StmtHash != "" {
+				shape = shapes[d.Line]
+				declsByLine[d.Line] = append(declsByLine[d.Line], d)
+			}
+			if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash, shape); err != nil {
 				return st, err
+			}
+		}
+		for _, head := range md.Heads {
+			for _, d := range declsByLine[head.Line] {
+				pendingHeads = append(pendingHeads, pendingHead{name: d.Name, module: d.Module, source: head})
 			}
 		}
 		for _, u := range md.Uses {
@@ -285,6 +323,23 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	}
 	if err := decls.flush(ctx); err != nil {
 		return st, err
+	}
+	if len(pendingHeads) > 0 {
+		declared, err := declaredNames(ctx, tx)
+		if err != nil {
+			return st, err
+		}
+		isDeclared := func(name string) bool { return declared[name] }
+		heads := newBatch(tx, "heads", 5)
+		for _, pending := range pendingHeads {
+			resolved := ResolveHead(pending.source, isDeclared)
+			if err := heads.add(ctx, pending.name, pending.module, pending.source.Role, resolved, pending.source.Line); err != nil {
+				return st, err
+			}
+		}
+		if err := heads.flush(ctx); err != nil {
+			return st, err
+		}
 	}
 	if err := uses.flush(ctx); err != nil {
 		return st, err
@@ -354,6 +409,130 @@ func relsOf(fs []moduleFile) []string {
 		out[i] = f.rel
 	}
 	return out
+}
+
+// headModulesToResolve returns the unchanged modules with a stored head whose resolution can differ once the
+// changed and gone modules are rewritten. Every candidate ResolveHead tries ends with the written name, so a head
+// can resolve differently only when a declaration name with its last component is added or removed.
+func (s *Store) headModulesToResolve(ctx context.Context, files []moduleFile, old map[string]stored, changed []moduleFile,
+	gone []string, results []ModuleData, errs []error) ([]moduleFile, error) {
+	// With nothing rewritten no name moves; with every module changed none is left unchanged.
+	if (len(changed) == 0 && len(gone) == 0) || len(changed) == len(files) {
+		return nil, nil
+	}
+	rewritten := map[string]bool{}
+	for _, rel := range append(relsOf(changed), gone...) {
+		if o, ok := old[rel]; ok {
+			rewritten[o.module] = true
+		}
+	}
+	before, err := s.declNamesIn(ctx, rewritten)
+	if err != nil {
+		return nil, err
+	}
+	after := map[string]bool{}
+	for i, md := range results {
+		if errs[i] != nil {
+			continue
+		}
+		for _, d := range md.Decls {
+			after[d.Name] = true
+		}
+	}
+	moved := map[string]bool{}
+	for name := range before {
+		if !after[name] {
+			moved[lastComponent(name)] = true
+		}
+	}
+	for name := range after {
+		if !before[name] {
+			moved[lastComponent(name)] = true
+		}
+	}
+	if len(moved) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT module, head FROM heads`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	modules := map[string]bool{}
+	for rows.Next() {
+		var module, head string
+		if err := rows.Scan(&module, &head); err != nil {
+			return nil, err
+		}
+		if !rewritten[module] && moved[lastComponent(head)] {
+			modules[module] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	changedRels := make(map[string]bool, len(changed))
+	for _, f := range changed {
+		changedRels[f.rel] = true
+	}
+	var out []moduleFile
+	for _, f := range files {
+		if o, ok := old[f.rel]; ok && !changedRels[f.rel] && modules[o.module] {
+			out = append(out, f)
+		}
+	}
+	return out, nil
+}
+
+// declNamesIn returns the stored declaration names of the modules.
+func (s *Store) declNamesIn(ctx context.Context, modules map[string]bool) (map[string]bool, error) {
+	list := make([]string, 0, len(modules))
+	for module := range modules {
+		list = append(list, module)
+	}
+	names := map[string]bool{}
+	for start := 0; start < len(list); start += 500 {
+		chunk := list[start:min(start+500, len(list))]
+		rows, err := s.db.QueryContext(ctx, `SELECT name FROM decls WHERE module IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			names[name] = true
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return names, nil
+}
+
+// lastComponent is the part of a dotted name after its last dot, as Decl.Short is.
+func lastComponent(name string) string { return name[strings.LastIndexByte(name, '.')+1:] }
+
+func declaredNames(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM decls`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names[name] = true
+	}
+	return names, rows.Err()
 }
 
 func readModule(tree Tree, rel string) (ModuleData, error) {

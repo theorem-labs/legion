@@ -31,7 +31,7 @@ func isSpace(r rune) bool { return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f
 
 func isAlnum(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }
 
-func isWord(r rune) bool { return isAlnum(r) || r == '_' }
+func isWord(r rune) bool { return isAlnum(r) || r == '_' || r == '\'' }
 
 // source is one file's text with the byte offset of each line's start.
 type source struct {
@@ -290,4 +290,822 @@ func StatementText(text string, start, end, sigFrom int, kind string) string {
 func StatementHash(statement string) string {
 	sum := sha256.Sum256([]byte(statement))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+// SourceShape is the shape of one declaration as its source writes it.
+type SourceShape struct {
+	Line  int
+	Kind  string
+	Shape string
+}
+
+// SourceHead is one type head written in a declaration's explicit binder or conclusion. Namespace and Opens are
+// the lexical scope at Line, so ResolveHead can resolve it against another declaration set.
+type SourceHead struct {
+	Line      int
+	Role      string
+	Written   string
+	Opens     []string
+	Namespace string
+}
+
+type sourceLine struct {
+	line       int
+	start, end int
+}
+
+type sourceDeclaration struct {
+	line                           int
+	kind                           string
+	start, end                     int
+	keywordEnd, nameStart, nameEnd int
+	commandLine                    int
+}
+
+// SourceShapes returns one normalized statement shape for every declaration in src.
+func SourceShapes(src []byte) []SourceShape {
+	text := string(src)
+	decls := sourceDeclarations(text)
+	out := make([]SourceShape, 0, len(decls))
+	for _, d := range decls {
+		statement := text[d.start:d.end]
+		sigFrom := d.keywordEnd - d.start
+		if d.nameStart < d.nameEnd {
+			prefix := d.nameStart - d.start
+			statement = statement[:prefix] + "_" + statement[d.nameEnd-d.start:]
+			sigFrom = prefix + 1
+		}
+		out = append(out, SourceShape{
+			Line:  d.line,
+			Kind:  d.kind,
+			Shape: StatementHash(StatementText(statement, 0, len(statement), sigFrom, d.kind)),
+		})
+	}
+	return out
+}
+
+// SourceHeads returns the binder and conclusion type heads written by theorem-like source declarations.
+func SourceHeads(src []byte) []SourceHead {
+	text := string(src)
+	decls := sourceDeclarations(text)
+	byLine := make(map[int][]sourceDeclaration, len(decls))
+	for _, d := range decls {
+		byLine[d.commandLine] = append(byLine[d.commandLine], d)
+	}
+	s := newSource(text)
+	lines := sourceLines(s)
+	scopes := []sourceScope{{}}
+	var out []SourceHead
+	var pendingOpen []string
+	var mutualEnds []int
+	for i, line := range lines {
+		word, end := sourceWord(text, line.start, line.end)
+		if pendingOpen != nil {
+			if decls := byLine[line.line]; len(decls) > 0 {
+				out = appendSourceHeads(out, text, decls, sourceScopeWithOpens(scopes[len(scopes)-1], pendingOpen))
+				pendingOpen = nil
+				continue
+			}
+			if sourceAttributeLine(text, line) {
+				continue
+			}
+			if word == "mutual" {
+				if end := sourceMutualEnd(text, lines, i); end >= 0 {
+					if len(mutualEnds) == 0 {
+						scope := sourceScopeWithOpens(scopes[len(scopes)-1], pendingOpen)
+						out = appendSourceHeadsInRange(out, text, decls, line.line, lines[end].line, scope)
+					}
+					mutualEnds = append(mutualEnds, end)
+				}
+				pendingOpen = nil
+				continue
+			}
+			pendingOpen = nil
+		}
+		switch word {
+		case "namespace":
+			nameStart, nameEnd := sourceName(text, end, line.end)
+			if nameStart == nameEnd {
+				continue
+			}
+			parent := scopes[len(scopes)-1]
+			name := text[nameStart:nameEnd]
+			if strings.HasPrefix(name, "_root_.") {
+				name = strings.TrimPrefix(name, "_root_.")
+			} else if parent.namespace != "" {
+				name = parent.namespace + "." + name
+			}
+			scopes = append(scopes, sourceScope{namespace: name, opens: append([]string(nil), parent.opens...)})
+		case "section":
+			parent := scopes[len(scopes)-1]
+			scopes = append(scopes, sourceScope{namespace: parent.namespace, opens: append([]string(nil), parent.opens...)})
+		case "mutual":
+			if end := sourceMutualEnd(text, lines, i); end >= 0 {
+				if len(mutualEnds) == 0 {
+					out = appendSourceHeadsInRange(out, text, decls, line.line, lines[end].line, scopes[len(scopes)-1])
+				}
+				mutualEnds = append(mutualEnds, end)
+			}
+		case "end":
+			if len(mutualEnds) > 0 && mutualEnds[len(mutualEnds)-1] == i {
+				mutualEnds = mutualEnds[:len(mutualEnds)-1]
+				continue
+			}
+			if len(scopes) > 1 {
+				scopes = scopes[:len(scopes)-1]
+			}
+		case "open":
+			if len(mutualEnds) > 0 {
+				continue
+			}
+			names, local := sourceOpenNames(text, end, line.end)
+			current := scopes[len(scopes)-1]
+			names = sourceOpenNamesInScope(current, names)
+			if local {
+				if decls := byLine[line.line]; len(decls) > 0 {
+					out = appendSourceHeads(out, text, decls, sourceScopeWithOpens(current, names))
+				} else if len(names) > 0 {
+					pendingOpen = names
+				}
+				continue
+			}
+			scope := &scopes[len(scopes)-1]
+			scope.opens = append(scope.opens, names...)
+		default:
+			if len(mutualEnds) == 0 {
+				out = appendSourceHeads(out, text, byLine[line.line], scopes[len(scopes)-1])
+			}
+		}
+	}
+	return out
+}
+
+// ResolveHead resolves h in the namespace and opened namespaces that its source had in scope. It returns the
+// written name unchanged when none is declared.
+func ResolveHead(h SourceHead, declared func(string) bool) string {
+	written := h.Written
+	rootWritten := strings.HasPrefix(written, "_root_.")
+	if rootWritten {
+		written = strings.TrimPrefix(written, "_root_.")
+	}
+	if !rootWritten {
+		for namespace := strings.TrimPrefix(h.Namespace, "_root_."); namespace != ""; {
+			candidate := namespace + "." + written
+			if declared(candidate) {
+				return candidate
+			}
+			i := strings.LastIndexByte(namespace, '.')
+			if i < 0 {
+				break
+			}
+			namespace = namespace[:i]
+		}
+	}
+	if !rootWritten {
+		for _, open := range h.Opens {
+			open = strings.TrimPrefix(open, "_root_.")
+			if open == "" {
+				continue
+			}
+			candidate := open + "." + written
+			if declared(candidate) {
+				return candidate
+			}
+		}
+	}
+	if declared(written) {
+		return written
+	}
+	return h.Written
+}
+
+type sourceScope struct {
+	namespace string
+	opens     []string
+}
+
+func sourceHeadKind(kind string) bool {
+	switch kind {
+	case "theorem", "lemma", "def", "abbrev", "structure":
+		return true
+	default:
+		return false
+	}
+}
+
+func appendSourceHeads(out []SourceHead, text string, decls []sourceDeclaration, scope sourceScope) []SourceHead {
+	for _, d := range decls {
+		if sourceHeadKind(d.kind) {
+			out = append(out, declarationHeads(text, d, scope)...)
+		}
+	}
+	return out
+}
+
+func appendSourceHeadsInRange(out []SourceHead, text string, decls []sourceDeclaration, firstLine, lastLine int, scope sourceScope) []SourceHead {
+	for _, d := range decls {
+		if d.commandLine > firstLine && d.commandLine < lastLine && sourceHeadKind(d.kind) {
+			out = append(out, declarationHeads(text, d, scope)...)
+		}
+	}
+	return out
+}
+
+func sourceScopeWithOpens(scope sourceScope, opens []string) sourceScope {
+	return sourceScope{
+		namespace: scope.namespace,
+		opens:     append(append([]string(nil), scope.opens...), opens...),
+	}
+}
+
+func sourceOpenNamesInScope(scope sourceScope, names []string) []string {
+	out := make([]string, 0, len(names)*2)
+	for _, name := range names {
+		if strings.HasPrefix(name, "_root_.") {
+			out = append(out, strings.TrimPrefix(name, "_root_."))
+		} else if scope.namespace != "" {
+			out = append(out, scope.namespace+"."+name, name)
+		} else {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func sourceLines(s *source) []sourceLine {
+	lines := make([]sourceLine, 0, len(s.starts))
+	for line := range s.starts {
+		text := s.line(line)
+		if text == "" {
+			continue
+		}
+		r, _ := utf8.DecodeRuneInString(text)
+		if isSpace(r) || !lineHasCode(text) {
+			continue
+		}
+		start := s.starts[line]
+		lines = append(lines, sourceLine{line: line, start: start, end: start + len(text)})
+	}
+	return lines
+}
+
+func lineHasCode(text string) bool {
+	i := skipSourceSpaceAndComments(text, 0, len(text))
+	return i < len(text)
+}
+
+func sourceAttributeLine(text string, line sourceLine) bool {
+	start := skipSourceSpaceAndComments(text, line.start, line.end)
+	return strings.HasPrefix(text[start:line.end], "@[")
+}
+
+func sourceDeclarations(text string) []sourceDeclaration {
+	s := newSource(text)
+	lines := sourceLines(s)
+	out := make([]sourceDeclaration, 0, len(lines))
+	var mutualStarts []int
+	for i, line := range lines {
+		word, _ := sourceWord(text, line.start, line.end)
+		switch word {
+		case "mutual":
+			mutualStarts = append(mutualStarts, line.line+1)
+			continue
+		case "end":
+			if len(mutualStarts) > 0 {
+				start := mutualStarts[len(mutualStarts)-1]
+				mutualStarts = mutualStarts[:len(mutualStarts)-1]
+				if len(mutualStarts) == 0 {
+					out = append(out, sourceMutualDeclarations(s, start, line.line)...)
+				}
+				continue
+			}
+		}
+		if len(mutualStarts) > 0 {
+			continue
+		}
+		end := sourceDeclarationEnd(text, lines, i)
+		if d, ok := sourceDeclarationAt(s, line.line, end); ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func sourceMutualDeclarations(s *source, firstLine, lastLine int) []sourceDeclaration {
+	var candidates []sourceDeclaration
+	indent := -1
+	for line := firstLine; line < lastLine; line++ {
+		d, ok := sourceDeclarationAt(s, line, s.starts[lastLine])
+		if !ok {
+			continue
+		}
+		lineIndent := sourceIndentation(s.line(line))
+		if indent < 0 || lineIndent < indent {
+			indent = lineIndent
+		}
+		candidates = append(candidates, d)
+	}
+	if indent < 0 {
+		return nil
+	}
+	out := make([]sourceDeclaration, 0, len(candidates))
+	for _, d := range candidates {
+		if sourceIndentation(s.line(d.commandLine)) == indent {
+			out = append(out, d)
+		}
+	}
+	for i := range out {
+		out[i].end = s.starts[lastLine]
+		if i+1 < len(out) {
+			out[i].end = out[i+1].start
+		}
+	}
+	return out
+}
+
+func sourceDeclarationAt(s *source, line, end int) (sourceDeclaration, bool) {
+	lineStart := s.starts[line]
+	lineEnd := lineStart + len(s.line(line))
+	kind, keywordEnd, ok := sourceDeclKeyword(s.text, lineStart, lineEnd)
+	if !ok {
+		return sourceDeclaration{}, false
+	}
+	startLine := decoratedDeclarationLine(s, line)
+	nameStart, nameEnd := sourceName(s.text, keywordEnd, lineEnd)
+	return sourceDeclaration{
+		line:        startLine + 1,
+		kind:        kind,
+		start:       s.starts[startLine],
+		end:         end,
+		keywordEnd:  keywordEnd,
+		nameStart:   nameStart,
+		nameEnd:     nameEnd,
+		commandLine: line,
+	}, true
+}
+
+func sourceDeclarationEnd(text string, lines []sourceLine, current int) int {
+	next := current + 1
+	for next < len(lines) && sourceContinuationLine(text, lines[next]) {
+		next++
+	}
+	if next < len(lines) {
+		return lines[next].start
+	}
+	return len(text)
+}
+
+func sourceContinuationLine(text string, line sourceLine) bool {
+	word, _ := sourceWord(text, line.start, line.end)
+	switch word {
+	case "where", "termination_by", "decreasing_by", "deriving":
+		return true
+	}
+	start := skipSourceSpaceAndComments(text, line.start, line.end)
+	return start < line.end && text[start] == '|'
+}
+
+func sourceIndentation(text string) int {
+	indent := 0
+	for _, r := range text {
+		if !isSpace(r) {
+			break
+		}
+		indent++
+	}
+	return indent
+}
+
+func sourceMutualEnd(text string, lines []sourceLine, start int) int {
+	depth := 1
+	for i := start + 1; i < len(lines); i++ {
+		word, _ := sourceWord(text, lines[i].start, lines[i].end)
+		switch word {
+		case "mutual":
+			depth++
+		case "end":
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func decoratedDeclarationLine(s *source, line int) int {
+	start := line
+	indent := sourceIndentation(s.line(line))
+	for line--; line >= 0; line-- {
+		text := strings.TrimFunc(s.line(line), isSpace)
+		if strings.HasPrefix(text, "@[") || strings.HasPrefix(text, "/-") {
+			start = line
+			continue
+		}
+		if decorationStart := sourceMultilineDecorationStart(s, line, indent); decorationStart >= 0 {
+			start = decorationStart
+			line = decorationStart
+			continue
+		}
+		break
+	}
+	return start
+}
+
+func sourceMultilineDecorationStart(s *source, lastLine, indent int) int {
+	last := strings.TrimFunc(s.line(lastLine), isSpace)
+	if !strings.HasSuffix(last, "]") && !strings.HasSuffix(last, "-/") {
+		return -1
+	}
+	lastEnd := s.starts[lastLine] + len(s.line(lastLine))
+	for line := lastLine; line >= 0; line-- {
+		text := s.line(line)
+		if strings.TrimFunc(text, isSpace) == "" {
+			return -1
+		}
+		lineIndent := sourceIndentation(text)
+		if lineIndent < indent {
+			return -1
+		}
+		if lineIndent > indent {
+			continue
+		}
+		start := s.starts[line]
+		lineEnd := start + len(text)
+		for start < lineEnd {
+			r, size := utf8.DecodeRuneInString(s.text[start:])
+			if !isSpace(r) {
+				break
+			}
+			start += size
+		}
+		switch {
+		case strings.HasPrefix(s.text[start:], "@["):
+			if close := matchingBracket(s.text, start+1, lastEnd); close >= 0 {
+				return line
+			}
+		case strings.HasPrefix(s.text[start:], "/-"):
+			if end := skipBlockComment(s.text, start, lastEnd); end <= lastEnd {
+				return line
+			}
+		}
+		return -1
+	}
+	return -1
+}
+
+func sourceDeclKeyword(text string, start, end int) (string, int, bool) {
+	depth := 0
+	for i := start; i < end; {
+		switch {
+		case strings.HasPrefix(text[i:], "--"):
+			return "", 0, false
+		case strings.HasPrefix(text[i:], "/-"):
+			i = skipBlockComment(text, i, end)
+			continue
+		case text[i] == '"':
+			i = skipString(text, i, end)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		switch {
+		case strings.ContainsRune(openBrackets, r):
+			depth++
+		case strings.ContainsRune(closeBrackets, r):
+			depth = max(0, depth-1)
+		case depth == 0:
+			for _, kind := range keywords {
+				keywordEnd := i + len(kind)
+				if keywordEnd <= end && strings.HasPrefix(text[i:], kind) && wordBoundaryBefore(text, i, true) &&
+					(keywordEnd >= end || wordBoundaryAfterDot(text, keywordEnd, end)) {
+					return kind, keywordEnd, true
+				}
+			}
+		}
+		i += size
+	}
+	return "", 0, false
+}
+
+func sourceWord(text string, start, end int) (string, int) {
+	start = skipSourceSpaceAndComments(text, start, end)
+	if start >= end {
+		return "", start
+	}
+	r, _ := utf8.DecodeRuneInString(text[start:])
+	if !isWord(r) {
+		return "", start
+	}
+	i := next(text, start)
+	for i < end {
+		r, _ := utf8.DecodeRuneInString(text[i:])
+		if !isWord(r) {
+			break
+		}
+		i = next(text, i)
+	}
+	return text[start:i], i
+}
+
+func sourceName(text string, start, end int) (int, int) {
+	start = skipSourceSpaceAndComments(text, start, end)
+	if start >= end {
+		return start, start
+	}
+	i := start
+	for {
+		if strings.HasPrefix(text[i:end], "«") {
+			close := strings.Index(text[i:end], "»")
+			if close < 0 {
+				if i == start {
+					return start, start
+				}
+				return start, i
+			}
+			i += close + len("»")
+		} else {
+			r, _ := utf8.DecodeRuneInString(text[i:])
+			if !isWord(r) {
+				if i == start {
+					return start, start
+				}
+				return start, i
+			}
+			i = next(text, i)
+			for i < end {
+				r, _ := utf8.DecodeRuneInString(text[i:])
+				if !isWord(r) {
+					break
+				}
+				i = next(text, i)
+			}
+		}
+		if i >= end || text[i] != '.' {
+			return start, i
+		}
+		dot := i
+		i++
+		if i >= end {
+			return start, dot
+		}
+		if strings.HasPrefix(text[i:end], "«") {
+			continue
+		}
+		r, _ := utf8.DecodeRuneInString(text[i:])
+		if !isWord(r) {
+			return start, dot
+		}
+	}
+}
+
+func skipSourceSpaceAndComments(text string, start, end int) int {
+	for start < end {
+		switch {
+		case strings.HasPrefix(text[start:], "--"):
+			if lineEnd := strings.IndexByte(text[start:end], '\n'); lineEnd >= 0 {
+				start += lineEnd + 1
+			} else {
+				return end
+			}
+		case strings.HasPrefix(text[start:], "/-"):
+			start = skipBlockComment(text, start, end)
+		default:
+			r, size := utf8.DecodeRuneInString(text[start:])
+			if !isSpace(r) {
+				return start
+			}
+			start += size
+		}
+	}
+	return start
+}
+
+func sourceOpenNames(text string, start, end int) ([]string, bool) {
+	var names []string
+	for start < end {
+		nameStart, nameEnd := sourceName(text, start, end)
+		if nameStart == nameEnd {
+			return names, false
+		}
+		name := text[nameStart:nameEnd]
+		if name == "scoped" {
+			return names, false
+		}
+		if name == "in" {
+			return names, true
+		}
+		names = append(names, name)
+		start = nameEnd
+	}
+	return names, false
+}
+
+func declarationHeads(text string, d sourceDeclaration, scope sourceScope) []SourceHead {
+	end := d.end
+	if body, ok := bodyStart(text, d.keywordEnd, d.end); ok {
+		end = body
+	}
+	start := d.nameEnd
+	if start == d.nameStart {
+		start = d.keywordEnd
+	}
+	lastColon := lastTopLevelColon(text, start, end)
+	telescopeEnd := end
+	if lastColon >= 0 {
+		telescopeEnd = lastColon
+	}
+	var out []SourceHead
+	depth := 0
+	for i := start; i < telescopeEnd; {
+		switch {
+		case strings.HasPrefix(text[i:], "--"):
+			i = skipSourceSpaceAndComments(text, i, telescopeEnd)
+			continue
+		case strings.HasPrefix(text[i:], "/-"):
+			i = skipBlockComment(text, i, telescopeEnd)
+			continue
+		case text[i] == '"':
+			i = skipString(text, i, telescopeEnd)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		switch {
+		case r == '(' && depth == 0:
+			if close := matchingBracket(text, i, telescopeEnd); close >= 0 {
+				binder := text[i+size : close]
+				if colon := topLevelColon(binder, 0, len(binder)); colon >= 0 {
+					if head := sourceTypeHead(binder[colon+1:]); head != "" {
+						out = append(out, sourceHead(d, "binder", head, scope))
+					}
+				}
+			}
+			depth++
+		case strings.ContainsRune(openBrackets, r):
+			depth++
+		case strings.ContainsRune(closeBrackets, r):
+			depth = max(0, depth-1)
+		}
+		i += size
+	}
+	if lastColon >= 0 {
+		if head := sourceTypeHead(text[lastColon+1 : end]); head != "" {
+			out = append(out, sourceHead(d, "conclusion", head, scope))
+		}
+	}
+	return out
+}
+
+func sourceHead(d sourceDeclaration, role, written string, scope sourceScope) SourceHead {
+	return SourceHead{
+		Line:      d.line,
+		Role:      role,
+		Written:   written,
+		Opens:     append([]string(nil), scope.opens...),
+		Namespace: scope.namespace,
+	}
+}
+
+func matchingBracket(text string, start, end int) int {
+	depth := 0
+	for i := start; i < end; {
+		switch {
+		case strings.HasPrefix(text[i:], "--"):
+			i = skipSourceSpaceAndComments(text, i, end)
+			continue
+		case strings.HasPrefix(text[i:], "/-"):
+			i = skipBlockComment(text, i, end)
+			continue
+		case text[i] == '"':
+			i = skipString(text, i, end)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		switch {
+		case strings.ContainsRune(openBrackets, r):
+			depth++
+		case strings.ContainsRune(closeBrackets, r):
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+		i += size
+	}
+	return -1
+}
+
+func topLevelColon(text string, start, end int) int {
+	depth := 0
+	for i := start; i < end; {
+		switch {
+		case strings.HasPrefix(text[i:], "--"):
+			i = skipSourceSpaceAndComments(text, i, end)
+			continue
+		case strings.HasPrefix(text[i:], "/-"):
+			i = skipBlockComment(text, i, end)
+			continue
+		case text[i] == '"':
+			i = skipString(text, i, end)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		switch {
+		case strings.ContainsRune(openBrackets, r):
+			depth++
+		case strings.ContainsRune(closeBrackets, r):
+			depth = max(0, depth-1)
+		case r == ':' && depth == 0 && (i+size >= end || text[i+size] != '='):
+			return i
+		}
+		i += size
+	}
+	return -1
+}
+
+func lastTopLevelColon(text string, start, end int) int {
+	last := -1
+	depth := 0
+	for i := start; i < end; {
+		switch {
+		case strings.HasPrefix(text[i:], "--"):
+			i = skipSourceSpaceAndComments(text, i, end)
+			continue
+		case strings.HasPrefix(text[i:], "/-"):
+			i = skipBlockComment(text, i, end)
+			continue
+		case text[i] == '"':
+			i = skipString(text, i, end)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		switch {
+		case strings.ContainsRune(openBrackets, r):
+			depth++
+		case strings.ContainsRune(closeBrackets, r):
+			depth = max(0, depth-1)
+		case r == ':' && depth == 0 && (i+size >= end || text[i+size] != '='):
+			last = i
+		}
+		i += size
+	}
+	return last
+}
+
+func sourceTypeHead(text string) string {
+	text = strings.TrimFunc(stripComments(text), isSpace)
+	for {
+		if strings.HasPrefix(text, "∀") {
+			comma := topLevelComma(text, len("∀"), len(text))
+			if comma < 0 {
+				return ""
+			}
+			text = strings.TrimFunc(text[comma+1:], isSpace)
+			continue
+		}
+		if strings.HasPrefix(text, "(") {
+			close := matchingBracket(text, 0, len(text))
+			if close == len(text)-1 {
+				text = strings.TrimFunc(text[1:close], isSpace)
+				continue
+			}
+		}
+		if strings.HasPrefix(text, "@") {
+			text = strings.TrimFunc(text[1:], isSpace)
+			continue
+		}
+		break
+	}
+	start, end := sourceName(text, 0, len(text))
+	if start == end {
+		return ""
+	}
+	return text[start:end]
+}
+
+func topLevelComma(text string, start, end int) int {
+	depth := 0
+	for i := start; i < end; {
+		switch {
+		case strings.HasPrefix(text[i:], "--"):
+			i = skipSourceSpaceAndComments(text, i, end)
+			continue
+		case strings.HasPrefix(text[i:], "/-"):
+			i = skipBlockComment(text, i, end)
+			continue
+		case text[i] == '"':
+			i = skipString(text, i, end)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		switch {
+		case strings.ContainsRune(openBrackets, r):
+			depth++
+		case strings.ContainsRune(closeBrackets, r):
+			depth = max(0, depth-1)
+		case r == ',' && depth == 0:
+			return i
+		}
+		i += size
+	}
+	return -1
 }

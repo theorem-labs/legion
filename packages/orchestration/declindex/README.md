@@ -13,6 +13,9 @@ It also runs the similarity gate in front of the librarian (`gate`), and after a
 
 - **The `.ilean` part** (`ilean.go`, `refresh.go`, `query.go`, `graph.go`). It reads Lean's reference files: declarations, kinds, positions, uses marked `stmt` or `proof`, and edges.
   - A module is read again when its `.ilean` (Lake's content hash) or its source (size and mtime) changes.
+  - Source-only shapes replace a declaration's written name before hashing its statement, so renamed copies compare
+    alike. The index also records the resolved heads of source binders and conclusions; these source facts need no
+    compiled output and let graph checks compare a candidate with the built base.
   - A module whose source is newer than its build (a declaration's recorded position no longer holds its name) is unreadable: the refresh reports it, and queries and the ledger check are unable to check (exit 3) until a build brings it back. Names Lean makes for a command (an elaborator's auxiliary, an initializer) have no written name and are not compared.
   - Reach walks a compressed graph file written next to the SQLite file. An edge's target is counted as the longest declared name it extends (`X.wp` is the field of `X`), against every module's declarations when the graph is written, so an incremental refresh answers as a full one does.
   - The graph file carries the generation of the index it was built from. A query refuses a graph of another generation, and the next refresh writes it again, so a failed write is never read.

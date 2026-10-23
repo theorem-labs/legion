@@ -55,6 +55,10 @@ type ModuleData struct {
 	Decls   []Decl
 	Uses    []Use
 	Imports []string
+	// Shapes and Heads are read from the source alone, nil when it is missing. Their Line is a declaration's
+	// 1-based first line, its doc comment and attributes included, which the index matches to Decl.Line.
+	Shapes []SourceShape
+	Heads  []SourceHead
 	// Stale counts the declarations whose recorded position does not hold their name in the source: the source is
 	// newer than the reference file. Their statement hashes are left empty.
 	Stale int
@@ -127,6 +131,8 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 	if src != nil {
 		s = newSource(string(src))
 		md.Imports = HeaderImports(src)
+		md.Shapes = SourceShapes(src)
+		md.Heads = SourceHeads(src)
 	}
 	names := make([]string, 0, len(f.Decls))
 	for name := range f.Decls {

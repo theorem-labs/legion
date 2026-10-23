@@ -20,10 +20,13 @@ import (
 )
 
 // SchemaVersion changes when the tables change; an index of another version is rebuilt from nothing.
-const SchemaVersion = "3"
+const SchemaVersion = "4"
 
-const schema = `
-CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
+// metaSchema is created alone first, so that the version of an existing index is read before any other table
+// or index of this schema is created over its tables: an index on a column the older table lacks would fail.
+const metaSchema = `CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;`
+
+const schema = metaSchema + `
 -- One row for each module whose reference file the index read. ilean_key and olean_key identify the build output
 -- it was read from (Lake's content hash, or size and mtime without one).
 CREATE TABLE IF NOT EXISTS modules (
@@ -45,11 +48,23 @@ CREATE TABLE IF NOT EXISTS decls (
     module    TEXT NOT NULL,
     kind      TEXT NOT NULL,
     line      INTEGER NOT NULL,
-    stmt_hash TEXT NOT NULL
+    stmt_hash TEXT NOT NULL,
+    shape     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decls_name ON decls (name);
 CREATE INDEX IF NOT EXISTS decls_short ON decls (short);
 CREATE INDEX IF NOT EXISTS decls_module ON decls (module);
+CREATE INDEX IF NOT EXISTS decls_shape ON decls (shape);
+CREATE TABLE IF NOT EXISTS heads (
+    name   TEXT NOT NULL,
+    module TEXT NOT NULL,
+    role   TEXT NOT NULL,
+    head   TEXT NOT NULL,
+    line   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS heads_role_head ON heads (role, head);
+CREATE INDEX IF NOT EXISTS heads_name ON heads (name);
+CREATE INDEX IF NOT EXISTS heads_module ON heads (module);
 CREATE TABLE IF NOT EXISTS uses (
     target TEXT NOT NULL,
     module TEXT NOT NULL,
@@ -94,7 +109,7 @@ CREATE INDEX IF NOT EXISTS facts_name ON facts (name);
 CREATE INDEX IF NOT EXISTS facts_module ON facts (module);
 `
 
-var tables = []string{"meta", "modules", "imports", "decls", "uses", "edges", "consts", "atoms", "facts"}
+var tables = []string{"meta", "modules", "imports", "decls", "heads", "uses", "edges", "consts", "atoms", "facts"}
 
 // Store is an open index: the SQLite file at path, and the declaration graph beside it at path + ".graph".
 type Store struct {
@@ -127,25 +142,25 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) init(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("create the index schema: %w", err)
+	if _, err := s.db.ExecContext(ctx, metaSchema); err != nil {
+		return fmt.Errorf("create the index meta table: %w", err)
 	}
 	v, err := s.Meta(ctx, "schema")
 	if err != nil {
 		return err
 	}
-	if v == SchemaVersion {
-		return nil
-	}
-	if v != "" {
+	if v != "" && v != SchemaVersion {
 		for _, t := range tables {
 			if _, err := s.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+t); err != nil {
 				return err
 			}
 		}
-		if _, err := s.db.ExecContext(ctx, schema); err != nil {
-			return err
-		}
+	}
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("create the index schema: %w", err)
+	}
+	if v == SchemaVersion {
+		return nil
 	}
 	return s.setMeta(ctx, s.db, "schema", SchemaVersion)
 }
