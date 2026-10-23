@@ -89,9 +89,10 @@ func ValidateOwnerID(id string) error {
 
 // Gate is the similarity gate in front of the librarian.
 type Gate struct {
-	Index    *declindex.Store
-	Tree     declindex.Tree
-	Registry string
+	Index        *declindex.Store
+	Tree         declindex.Tree
+	Registry     string
+	AdditionRoot string
 	// Compiled reads the proposal; its Forms are replaced by the registry's at each decision.
 	Compiled  *declindex.CompiledOptions
 	Librarian Librarian
@@ -307,7 +308,11 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 		return v, err
 	}
 	v.Outcome, v.Reason = Added, "no registered concept or existing declaration states it"
-	v.Addition = &Addition{Path: filepath.Join(g.Registry, "concepts", Key(c)+".yaml"), Content: string(content), Base: base}
+	root := g.AdditionRoot
+	if root == "" {
+		root = g.Registry
+	}
+	v.Addition = &Addition{Path: filepath.Join(root, "concepts", Key(c)+".yaml"), Content: string(content), Base: base}
 	return v, nil
 }
 
