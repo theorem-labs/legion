@@ -396,14 +396,10 @@ func duration(value string) (time.Duration, error) {
 	return d, nil
 }
 
-const maxLandingRounds = int64(2147483647)
-
+// roundLimit parses a repository's landing-round limit into the range of the schema's integer column.
 func roundLimit(value string) (int, error) {
-	limit, err := integer(value)
-	if err != nil {
-		return 0, err
-	}
-	if limit < 0 || limit > maxLandingRounds {
+	limit, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || limit < 0 {
 		return 0, usagef("max rounds %q must be in 0..2147483647", value)
 	}
 	return int(limit), nil
