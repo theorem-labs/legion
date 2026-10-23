@@ -186,6 +186,39 @@ jobs:
         working-directory: packages/daemon
 
 
+  # packages/cgraph, the graph of a C program and its image (packages/cgraph/README.md): lint,
+  # format, type check and tests on the committed fixture program, with the versions uv.lock pins.
+  cgraph:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: packages/cgraph
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          working-directory: packages/cgraph
+          enable-cache: false
+
+      - name: Install the locked environment
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Check formatting
+        run: uv run ruff format --check src tests
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Test
+        run: uv run pytest -q
+
+
   test:
     runs-on: ubuntu-24.04
     services:

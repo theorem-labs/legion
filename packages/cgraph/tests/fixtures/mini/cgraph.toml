@@ -1,0 +1,52 @@
+# The fixture program's configuration: the same keys a real program's configuration has.
+[inputs]
+c_tree = "."
+image = "image/mini.elf"
+system_map = "image/System.map"
+contract_graph = "contracts.json"
+contract_source = "lean"
+
+[parts.store]
+files = ["src/store.c"]
+
+[parts.both]
+files = ["src/bags.c", "src/store.c"]
+
+[c]
+flags = ["-nostdinc", "-I{c_tree}/include", "--target=riscv64-unknown-elf", "-march=rv64imac", "-mabi=lp64",
+         "-std=gnu11", "-ffreestanding", "-DMODULE={stem}"]
+kit_types = ["list_node"]
+value_types = []
+lock_types = ["spin", "rwsem", "seqlk"]
+lock_type_words = []
+percpu_globals = ["current_box"]
+percpu_structs = []
+membership_witness_macros = ["for_each_box"]
+base_type_min_containers = 2
+
+[c.calls]
+unlock = "unlock|^up_"
+lock = "^(?!.*unlock)(?:.*lock|down_)"
+alloc = "alloc"
+free = "free"
+
+[c.membership]
+list = ["list_insert"]
+hash = ["hash_insert"]
+
+[c.cleanup]
+class_type = "^class_(.+)_t$"
+destructor = "class_{name}_destructor"
+
+[image]
+arch = "riscv64"
+thread_pointer = "current_box"
+
+[image.symbol_classes]
+compiler_symbol = "^__key$"
+
+[contract_graph]
+function_prefix = "Prog/"
+
+[topics]
+prefix = "notifications.example."

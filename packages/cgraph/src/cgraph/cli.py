@@ -1,0 +1,63 @@
+"""cgraph build --config FILE --part NAME --out DIR [--cache DIR] [--root DIR] [--jobs N] [--json]
+
+Exit status: 0 the graph is built and every hard check passes; 1 a hard check failed (the outputs
+are written); 2 a usage or configuration error; 3 an input cannot be read or parsed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from . import config as configuration
+from . import pipeline
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="cgraph", description=__doc__.split("\n\n")[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    build = commands.add_parser("build", help="build the graph, its checks, owners and topics for one part")
+    build.add_argument("--config", required=True, type=Path)
+    build.add_argument("--part", required=True)
+    build.add_argument("--out", required=True, type=Path)
+    build.add_argument(
+        "--cache", type=Path, help="keep each unit's facts here and reuse those whose inputs did not change"
+    )
+    build.add_argument("--root", type=Path, help="resolve the configuration's input paths against this directory")
+    build.add_argument("--jobs", type=int, default=pipeline.default_jobs())
+    build.add_argument("--json", action="store_true", help="print the summary as JSON")
+    arguments = parser.parse_args(argv)
+    try:
+        loaded = configuration.load(arguments.config, arguments.root)
+        result = pipeline.run(loaded, arguments.part, arguments.out, arguments.cache, max(1, arguments.jobs))
+    except configuration.ConfigError as error:
+        print(f"cgraph: {error}", file=sys.stderr)
+        return 2
+    except (pipeline.InputError, OSError) as error:
+        print(f"cgraph: {error}", file=sys.stderr)
+        return 3
+    summary = {
+        "passes": result.passes,
+        "counts": result.counts,
+        "parsed": result.parsed,
+        "reused": len(result.reused),
+        "hard_checks": result.hard_checks,
+        "outputs": result.outputs,
+    }
+    if arguments.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(
+            f"{'passes' if result.passes else 'FAILS'}: {result.counts['nodes']} nodes, {result.counts['edges']} "
+            f"edges, {result.counts['owners']} owners; parsed {len(result.parsed)} of {result.counts['files']} files"
+        )
+        for item in result.hard_checks:
+            if not item["ok"]:
+                print(f"  FAIL {item['name']}: {item['detail']}")
+    return 0 if result.passes else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
