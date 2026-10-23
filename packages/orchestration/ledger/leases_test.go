@@ -53,12 +53,14 @@ func TestTwentyConcurrentClaimersGetExactlyOneHolder(t *testing.T) {
 }
 
 func TestExpiredLeaseIsRegrantedAndOldHolderIsRefusedByGeneration(t *testing.T) {
-	s := newStore(t)
+	s, dsn := newStoreDSN(t)
 	ctx := context.Background()
-	old := must(s.Claim(ctx, "r", "item", "alice", 150*time.Millisecond))
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	old := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
 	_, err := s.Claim(ctx, "r", "item", "bob", time.Minute)
 	wantRefusal(t, err, ledger.ReasonLeaseHeld)
-	time.Sleep(300 * time.Millisecond)
+	waitForDatabaseExpiry(t, observer, old.ExpiresAt)
 
 	// A late renew or result from alice, before anyone else claims, is refused: the lease is over.
 	_, err = s.Renew(ctx, "r", "item", "alice", old.Generation, time.Minute)
@@ -88,9 +90,11 @@ func TestExpiredLeaseIsRegrantedAndOldHolderIsRefusedByGeneration(t *testing.T) 
 }
 
 func TestRenewMovesAndPersistsExpiryByRequestedLength(t *testing.T) {
-	s := newStore(t)
+	s, dsn := newStoreDSN(t)
 	ctx := context.Background()
-	l := must(s.Claim(ctx, "r", "item", "alice", 100*time.Millisecond))
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	l := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
 	ttl := 300 * time.Millisecond
 	r := must(s.Renew(ctx, "r", "item", "alice", l.Generation, ttl))
 	if r.Generation != l.Generation {
@@ -99,7 +103,7 @@ func TestRenewMovesAndPersistsExpiryByRequestedLength(t *testing.T) {
 	if got := r.ExpiresAt.Sub(l.ExpiresAt); got != ttl {
 		t.Fatalf("renew moved expiry by %s, want %s", got, ttl)
 	}
-	time.Sleep(175 * time.Millisecond)
+	waitForDatabaseExpiry(t, observer, l.ExpiresAt)
 	item := must(s.Item(ctx, "r", "item"))
 	if item.Holder != "alice" || item.ExpiresAt == nil || !item.ExpiresAt.Equal(r.ExpiresAt) {
 		t.Fatalf("renewed expiry was not persisted: %+v; want %s", item, r.ExpiresAt)
@@ -124,11 +128,13 @@ func TestReleaseFreesTheItemAndRetiresTheGeneration(t *testing.T) {
 }
 
 func TestExpireSweepsOnlyExpiredLeases(t *testing.T) {
-	s := newStore(t)
+	s, dsn := newStoreDSN(t)
 	ctx := context.Background()
-	must(s.Claim(ctx, "r", "short", "alice", 100*time.Millisecond))
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	short := must(s.Claim(ctx, "r", "short", "alice", 20*time.Millisecond))
 	must(s.Claim(ctx, "r", "long", "bob", time.Hour))
-	time.Sleep(250 * time.Millisecond)
+	waitForDatabaseExpiry(t, observer, short.ExpiresAt)
 
 	st := must(s.Status(ctx, "r"))
 	if len(st.Stale) != 1 || st.Stale[0].ID != "short" {
@@ -150,6 +156,102 @@ func TestExpireSweepsOnlyExpiredLeases(t *testing.T) {
 	}
 	if again := must(s.Expire(ctx, "r")); len(again) != 0 {
 		t.Fatalf("second sweep expired %+v", again)
+	}
+}
+
+func TestExpireLocksThenRechecksLeaseLiveness(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T, s *ledger.Store, dsn string, lease ledger.Lease, lock pgx.Tx, observer *pgx.Conn)
+	}{
+		{
+			name: "expires while sweep waits",
+			run: func(t *testing.T, s *ledger.Store, dsn string, lease ledger.Lease, lock pgx.Tx, observer *pgx.Conn) {
+				swept := make(chan struct {
+					items []ledger.Item
+					err   error
+				}, 1)
+				go func() {
+					items, err := s.Expire(context.Background(), "r")
+					swept <- struct {
+						items []ledger.Item
+						err   error
+					}{items, err}
+				}()
+				waitForBlockedConnections(t, observer, 1)
+				waitForDatabaseExpiry(t, observer, lease.ExpiresAt)
+				if err := lock.Rollback(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				got := <-swept
+				if got.err != nil {
+					t.Fatal(got.err)
+				}
+				if len(got.items) != 1 || got.items[0].ID != "item" || got.items[0].Holder != "alice" {
+					t.Fatalf("swept items: %+v", got.items)
+				}
+			},
+		},
+		{
+			name: "renewed before sweep gets row",
+			run: func(t *testing.T, s *ledger.Store, dsn string, lease ledger.Lease, lock pgx.Tx, observer *pgx.Conn) {
+				swept := make(chan struct {
+					items []ledger.Item
+					err   error
+				}, 1)
+				go func() {
+					items, err := s.Expire(context.Background(), "r")
+					swept <- struct {
+						items []ledger.Item
+						err   error
+					}{items, err}
+				}()
+				waitForBlockedConnections(t, observer, 1)
+				var renewed time.Time
+				if err := lock.QueryRow(context.Background(), `UPDATE work_items
+					SET lease_expires_at = clock_timestamp() + interval '1 minute'
+					WHERE repo = $1 AND id = $2
+					RETURNING lease_expires_at`, "r", "item").Scan(&renewed); err != nil {
+					t.Fatal(err)
+				}
+				waitForDatabaseExpiry(t, observer, lease.ExpiresAt)
+				if err := lock.Commit(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				got := <-swept
+				if got.err != nil {
+					t.Fatal(got.err)
+				}
+				if len(got.items) != 0 {
+					t.Fatalf("sweep freed renewed lease: %+v", got.items)
+				}
+				item := must(s.Item(context.Background(), "r", "item"))
+				if item.Holder != "alice" || item.ExpiresAt == nil || !item.ExpiresAt.Equal(renewed) {
+					t.Fatalf("renewed item: %+v; want expiry %s", item, renewed)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s, dsn := newStoreDSN(t)
+			ctx := context.Background()
+			lease := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
+			locker := must(pgx.Connect(ctx, dsn))
+			defer locker.Close(ctx)
+			observer := must(pgx.Connect(ctx, dsn))
+			defer observer.Close(ctx)
+			lock := must(locker.Begin(ctx))
+			locked := true
+			defer func() {
+				if locked {
+					_ = lock.Rollback(ctx)
+				}
+			}()
+			must(lock.Exec(ctx, `SELECT 1 FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`, "r", "item"))
+			test.run(t, s, dsn, lease, lock, observer)
+			locked = false
+		})
 	}
 }
 

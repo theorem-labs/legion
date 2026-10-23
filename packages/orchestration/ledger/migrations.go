@@ -206,12 +206,14 @@ func overlapRefusal(other string, c []PathClash) *Refusal {
 }
 
 func checkReads(reads map[string]string) error {
-	for n, h := range reads {
-		if strings.TrimSpace(n) == "" {
+	for name, hash := range reads {
+		switch {
+		case strings.TrimSpace(name) == "":
 			return invalid("a read has an empty name")
-		}
-		if strings.TrimSpace(h) == "" {
-			return invalid("read %s has no hash", n)
+		case strings.TrimSpace(name) != name:
+			return invalid("read %q has leading or trailing whitespace", name)
+		case strings.TrimSpace(hash) == "":
+			return invalid("read %s has no hash", name)
 		}
 	}
 	return nil

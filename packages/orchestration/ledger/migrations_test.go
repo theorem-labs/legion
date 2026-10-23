@@ -353,6 +353,31 @@ func TestOpenAndCheckRejectPathsWithLeadingOrTrailingWhitespace(t *testing.T) {
 	}
 }
 
+func TestOpenAndExtendRejectReadNamesWithLeadingOrTrailingWhitespace(t *testing.T) {
+	for _, name := range []string{" a.lean", "a.lean ", " X.declaration"} {
+		t.Run("open "+name, func(t *testing.T) {
+			s := newStore(t)
+			_, err := open(t, s, "M-open", "alice", []string{"owned.lean"}, map[string]string{name: "hash"})
+			var invalid *ledger.InvalidError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("open read %q: want invalid, got %v", name, err)
+			}
+		})
+	}
+	t.Run("extend", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		migration := must(open(t, s, "M-extend", "alice", []string{"owned.lean"}, nil))
+		for _, name := range []string{" b.lean", "b.lean "} {
+			_, err := s.ExtendMigration(ctx, "r", migration.ID, migration.Generation, nil, map[string]string{name: "hash"})
+			var invalid *ledger.InvalidError
+			if !errors.As(err, &invalid) {
+				t.Errorf("extend read %q: want invalid, got %v", name, err)
+			}
+		}
+	})
+}
+
 func TestExtendAddsPathsUnlessTheyOverlap(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

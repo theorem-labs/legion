@@ -214,25 +214,41 @@ func (s *Store) Expire(ctx context.Context, repo string) ([]Item, error) {
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `UPDATE work_items w SET holder = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
-			FROM (SELECT id, holder, lease_expires_at FROM work_items
-			      WHERE repo = $1 AND holder IS NOT NULL AND lease_expires_at <= clock_timestamp() FOR UPDATE) old
-			WHERE w.repo = $1 AND w.id = old.id
-			RETURNING w.id, w.state, old.holder, w.generation, old.lease_expires_at`, repo)
+		rows, err := tx.Query(ctx, `SELECT id, state, holder, generation, lease_expires_at
+			FROM work_items
+			WHERE repo = $1 AND holder IS NOT NULL
+			ORDER BY id
+			FOR UPDATE`, repo)
 		if err != nil {
 			return err
 		}
+		locked := []Item{}
 		for rows.Next() {
 			var it Item
-			var exp time.Time
-			if err := rows.Scan(&it.ID, &it.State, &it.Holder, &it.Generation, &exp); err != nil {
+			if err := rows.Scan(&it.ID, &it.State, &it.Holder, &it.Generation, &it.ExpiresAt); err != nil {
+				rows.Close()
 				return err
 			}
-			it.ExpiresAt = &exp
-			out = append(out, it)
+			locked = append(locked, it)
 		}
 		if err := rows.Err(); err != nil {
+			rows.Close()
 			return err
+		}
+		rows.Close()
+		var now time.Time
+		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+			return err
+		}
+		for _, it := range locked {
+			if it.ExpiresAt == nil || it.ExpiresAt.After(now) {
+				continue
+			}
+			if _, err := tx.Exec(ctx, `UPDATE work_items SET holder = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
+				WHERE repo = $1 AND id = $2`, repo, it.ID); err != nil {
+				return err
+			}
+			out = append(out, it)
 		}
 		for _, it := range out {
 			if err := event(ctx, tx, repo, "item.expired", it.ID, it.Holder,
