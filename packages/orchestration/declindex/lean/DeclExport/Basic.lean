@@ -38,10 +38,11 @@ def hex64 (n : UInt64) : String :=
 
 def H.hex (h : H) : String := hex64 h.a ++ hex64 h.b
 
-/-- How the hash treats names: a universe parameter by its position; the declaration itself and any name Lean
-made from it (`X.mk`, `X.match_1`) by a placeholder and the name's suffix, so that a copy under a new name
-hashes equal; an auxiliary definition Lean makes while elaborating (a matcher, an abstracted proof) by its
-content, since a copy elsewhere gets its own or reuses an existing one; any other constant by its name. -/
+/-- How the hash treats names: a universe parameter by its position; the declaration itself, and the names Lean
+generates from it (`X.eq_1`, `X._unfold`, `X.rec`, `X.match_1`), by a placeholder and the generated suffix, so
+that a copy under a new name hashes equal; an auxiliary definition Lean makes while elaborating (a matcher, an
+abstracted proof) by its content, since a copy elsewhere gets its own or reuses an existing one; any other
+constant, a sub-declaration the user wrote (`X.base`) included, by its name. -/
 structure HashCtx where
   levels : List Name := []
   self : List Name := []
@@ -53,6 +54,21 @@ def isElabAux (env : Environment) (n : Name) : Bool :=
     match n with
     | .str _ s => s.startsWith "proof_" || s.startsWith "match_" || s.startsWith "_auxLemma"
     | _ => false
+
+/-- A name component Lean generates for a declaration's own parts: equation and unfolding lemmas, recursors and
+the other parts of an inductive, the parts of structural and well-founded recursion, and compiler auxiliaries. -/
+def generatedComponent (s : String) : Bool :=
+  s.startsWith "_" ||
+  ["rec", "recOn", "casesOn", "noConfusion", "noConfusionType", "below", "brecOn", "binductionOn", "ibelow",
+   "sizeOf_spec", "eq_def", "eq_unfold", "injEq", "inj", "ctorIdx", "toCtorIdx", "ctorElim", "ctorElimType"].contains s ||
+  ["match_", "proof_", "eq_", "spec_", "lambda_", "closed_", "elambda_"].any fun p =>
+    s.startsWith p && s.length > p.length && (s.drop p.length).all Char.isDigit
+
+/-- A suffix (the name after a declaration's) every component of which Lean generates. -/
+def generatedSuffix : Name → Bool
+  | .anonymous => true
+  | .num p _ => generatedSuffix p
+  | .str p s => generatedComponent s && generatedSuffix p
 
 partial def hashLevel (ctx : HashCtx) : Level → H
   | .zero => H.tag "z" []
@@ -93,8 +109,11 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
         let parts : List H := Id.run (((ci.type :: ci.value?.toList).mapM (hashExpr sub)).run' {})
         pure (H.tag "aux" (parts ++ ls.map (hashLevel ctx)))
       | none =>
-        match ctx.self.find? (·.isPrefixOf n) with
-        | some p => pure (H.tag "self" (H.ofString (n.replacePrefix p .anonymous).toString :: ls.map (hashLevel ctx)))
+        let own := ctx.self.findIdx? fun p => p == n || (p.isPrefixOf n && generatedSuffix (n.replacePrefix p .anonymous))
+        match own with
+        | some i =>
+          let suffix := (n.replacePrefix ctx.self[i]! .anonymous).toString
+          pure (H.tag "self" (H.ofU i.toUInt64 :: H.ofString suffix :: ls.map (hashLevel ctx)))
         | none => pure (H.tag "c" (H.ofString n.toString :: ls.map (hashLevel ctx)))
     | .app .. =>
       match lit? e with

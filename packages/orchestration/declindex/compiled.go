@@ -23,6 +23,8 @@ type CompiledOptions struct {
 	Forms FormsModule
 	// Dir holds the compiled forms module.
 	Dir string
+	// Confined compiles the forms and runs the exporter in the sandbox: the gate's setting, for proposals.
+	Confined bool
 }
 
 // compiledDigest names what the compiled part was read with: the exporter and the forms. When it changes, every
@@ -40,6 +42,7 @@ func compiledDigest(co *CompiledOptions, m Manifest, formsSource string) (string
 func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter, Manifest, string, error) {
 	src, forms := co.Forms.Source()
 	x := *co.Exporter
+	x.Confined = x.Confined || co.Confined
 	m := Manifest{Forms: forms, Types: true}
 	for r := range roots {
 		m.Roots = append(m.Roots, r)
@@ -58,7 +61,11 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 		if err := os.WriteFile(filepath.Join(co.Dir, FormsModuleName+".lean"), []byte(src), 0o644); err != nil {
 			return nil, m, "", err
 		}
-		if err := CompileModule(ctx, x.Lean, x.SearchPath, co.Dir, FormsModuleName); err != nil {
+		compile := CompileModule
+		if co.Confined {
+			compile = CompileConfined
+		}
+		if err := compile(ctx, x.Lean, x.SearchPath, co.Dir, FormsModuleName); err != nil {
 			return nil, m, "", fmt.Errorf("compile the registry's forms: %w", err)
 		}
 		x.SearchPath = append(append([]string(nil), x.SearchPath...), co.Dir)

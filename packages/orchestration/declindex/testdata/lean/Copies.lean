@@ -7,4 +7,8 @@ def pickB : Nat → Nat
   | n + 1 => n
 def posB : {n : Nat // n > 0} := ⟨1, by decide⟩
 
+/-- The same shape about another user declaration: not a copy of Fx.Q. -/
+def MyQ.base : Nat := 2
+def MyQ : Prop := MyQ.base = 1
+
 end Fx

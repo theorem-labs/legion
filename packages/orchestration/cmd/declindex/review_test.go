@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -89,5 +90,37 @@ func TestLandHashRefusesADeclarationWhoseSourceIsNewerThanItsBuild(t *testing.T)
 	code := run(context.Background(), []string{"--config", config, "land-hash"}, func(k string) string { return env[k] }, &out, &errOut)
 	if code != 3 || out.Len() != 0 {
 		t.Fatalf("land-hash of a stale declaration: exit %d, %q %q", code, out.String(), errOut.String())
+	}
+}
+
+// A module whose source moved since its build makes the index incomplete: refresh, queries and the ledger check
+// are unable to check, so the ledger never calls a live contract gone.
+func TestAModuleNewerThanItsBuildStopsQueriesAndTheLedger(t *testing.T) {
+	config := fixture(t)
+	body, _ := os.ReadFile(config)
+	body = append(body, []byte("repo: r\ncontracts:\n  paths: [\"**/*.lean\"]\n  kinds: [def]\n")...)
+	if err := os.WriteFile(config, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(filepath.Dir(config), "tree", "Golden.lean")
+	data, _ := os.ReadFile(src)
+	if err := os.WriteFile(src, append([]byte("-- edited after the build\n"), data...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := invoke(t, "--config", config, "refresh"); r.code != 3 || !strings.Contains(r.errOut, "newer than its build") {
+		t.Fatalf("refresh: %+v", r)
+	}
+	if r := invoke(t, "--config", config, "where", "FrameAt"); r.code != 3 {
+		t.Fatalf("where: %+v", r)
+	}
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"--config", config, "ledger"}, func(k string) string {
+		if k == "LEDGER_DSN" {
+			return "postgres://nobody@127.0.0.1:1/none"
+		}
+		return ""
+	}, &out, &errOut)
+	if code != 3 || out.Len() != 0 {
+		t.Fatalf("ledger: exit %d, %q %q", code, out.String(), errOut.String())
 	}
 }

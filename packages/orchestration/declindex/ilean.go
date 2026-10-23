@@ -220,17 +220,59 @@ func sortUses(us []Use) {
 var anonymousSelections = []string{"instance", "example", "macro_rules", "macro", "syntax", "elab_rules", "elab",
 	"notation", "infixl", "infixr", "infix", "prefix", "postfix", "deriving", "@[", "scoped", "local"}
 
+// userName is a declaration's name as its source writes it: a private name without its `_private.<module>.<n>.`
+// prefix.
+func userName(name string) string {
+	if !strings.HasPrefix(name, "_private.") {
+		return name
+	}
+	parts := strings.Split(name, ".")
+	for i, p := range parts {
+		if i > 0 && p != "" && strings.Trim(p, "0123456789") == "" {
+			return strings.Join(parts[i+1:], ".")
+		}
+	}
+	return name
+}
+
+// madeByLean reports whether Lean made the name for a command (an elaborator's or macro's auxiliary, an
+// initializer, a hygienic name): a component that starts with `_`.
+func madeByLean(name string) bool {
+	inQuote := false
+	start := true
+	for _, r := range name {
+		switch {
+		case r == '«':
+			inQuote = true
+		case r == '»':
+			inQuote = false
+		case r == '.' && !inQuote:
+			start = true
+			continue
+		case start && r == '_':
+			return true
+		}
+		start = false
+	}
+	return false
+}
+
 // selectionHolds reports whether the source still holds the declaration at the position its reference file
-// recorded: the selection range is its name (or a dotted suffix of it), or the command of a declaration Lean
-// names itself. A source newer than its build fails it.
+// recorded: the selection range is its name (or a dotted suffix of it, or the name written from `_root_`), or the
+// command of a declaration Lean names itself. A name Lean made has no written name to compare and passes. A
+// source newer than its build fails it.
 func selectionHolds(text, name string, sel, selEnd int) bool {
+	want := userName(name)
+	if madeByLean(want) {
+		return true
+	}
 	if sel < 0 || sel > len(text) {
 		return false
 	}
 	unquote := strings.NewReplacer("«", "", "»", "")
 	if selEnd >= sel && selEnd <= len(text) {
-		got := unquote.Replace(text[sel:selEnd])
-		want := unquote.Replace(name)
+		got := strings.TrimPrefix(unquote.Replace(text[sel:selEnd]), "_root_.")
+		want := unquote.Replace(want)
 		if got != "" && (got == want || strings.HasSuffix(want, "."+got)) {
 			return true
 		}

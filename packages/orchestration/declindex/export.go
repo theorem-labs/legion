@@ -18,6 +18,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // The exporter's Lean sources. It is built with the project's own toolchain, because a compiled module can be
@@ -48,11 +50,12 @@ func FindLean(ctx context.Context, dir, prefix string) (Lean, error) {
 	return Lean{Prefix: strings.TrimSpace(string(out))}, nil
 }
 
-// env is the whole environment of a toolchain process: the toolchain first on a system PATH, LEAN_PATH, and
-// HOME and TMPDIR at home. Nothing else of the caller's environment (credentials, tokens) reaches Lean, and a
+// env is the whole environment of a toolchain process: the toolchain first on a system PATH, its root
+// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, and HOME and TMPDIR at home. Nothing else of the caller's environment (credentials, tokens) reaches Lean, and a
 // module that a proposal compiles sees only its scratch directory as home.
 func (l Lean) env(searchPath []string, home string) []string {
 	env := []string{
+		"LEAN_SYSROOT=" + l.Prefix,
 		"LEAN_PATH=" + strings.Join(searchPath, string(os.PathListSeparator)),
 		"PATH=" + strings.Join([]string{filepath.Join(l.Prefix, "bin"), "/usr/local/bin", "/usr/bin", "/bin"}, string(os.PathListSeparator)),
 		"HOME=" + home,
@@ -179,6 +182,74 @@ func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel s
 		"-o", base+".olean", "-i", base+".ilean", base+".lean")
 }
 
+// confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path and
+// read, writes only beneath write, and opens no socket. It fails when the sandbox is unavailable, and then nothing
+// runs.
+func (l Lean) confined(ctx context.Context, argv []string, dir string, searchPath, read, write []string) (*exec.Cmd, error) {
+	reads := append(append([]string{l.Prefix}, searchPath...), read...)
+	return confine.Command(ctx, confine.Spec{Argv: argv, Env: l.env(searchPath, dir), Dir: dir, Read: reads, Write: write})
+}
+
+// CompileConfined is CompileModule in the sandbox: for a module that untrusted source wrote. Lean writes only
+// beneath root.
+func CompileConfined(ctx context.Context, l Lean, searchPath []string, root, rel string) error {
+	base := filepath.Join(root, filepath.FromSlash(rel))
+	argv := []string{l.bin("lean"), "-R", root, "-o", base + ".olean", "-i", base + ".ilean", base + ".lean"}
+	cmd, err := l.confined(ctx, argv, root, append([]string{root}, searchPath...), nil, []string{root})
+	if err != nil {
+		return err
+	}
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("lean %s: %w\n%s", base+".lean", err, out.String())
+	}
+	return nil
+}
+
+// CheckSandbox reports whether toolchain l runs in the sandbox here: the sandbox is available, and a confined
+// `lean --version` runs.
+func CheckSandbox(ctx context.Context, l Lean) error {
+	dir, err := os.MkdirTemp("", "declindex-sandbox-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	cmd, err := l.confined(ctx, []string{l.bin("lean"), "--version"}, dir, nil, nil, []string{dir})
+	if err != nil {
+		return err
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: a confined lean --version failed: %v: %s", confine.ErrUnavailable, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ErrRefusedSource says that a proposal's source holds more than declarations.
+var ErrRefusedSource = errors.New("the proposal is not declarations only")
+
+// CheckSource parses the module at file with Lean's own parser, in the sandbox, and refuses it unless it holds
+// only declarations (see lean/DeclExport/Check.lean). searchPath holds the modules it imports.
+func (x *Exporter) CheckSource(ctx context.Context, file string, searchPath []string) error {
+	dir := filepath.Dir(file)
+	cmd, err := x.Lean.confined(ctx, []string{x.Bin, "--check", file}, dir, searchPath, []string{dir}, nil)
+	if err != nil {
+		return err
+	}
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err = cmd.Run()
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &ee) && ee.ExitCode() == 1:
+		return fmt.Errorf("%w: %s", ErrRefusedSource, strings.TrimSpace(out.String()))
+	default:
+		return fmt.Errorf("%w: the source check failed: %v: %s", ErrExporter, err, strings.TrimSpace(out.String()))
+	}
+}
+
 // ConstRef names a constant that stands for a concept: a form, or the concept's own declaration.
 type ConstRef struct {
 	Concept string `json:"concept"`
@@ -253,6 +324,8 @@ type Exporter struct {
 	// ModulesPerProcess bounds one process's target modules; zero is all of a shard.
 	ModulesPerProcess int
 	Log               io.Writer
+	// Confined runs the exporter in the sandbox, for modules that untrusted source wrote.
+	Confined bool
 }
 
 // ErrExporter wraps a failed exporter run: the question stays unanswered.
@@ -297,11 +370,15 @@ func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
 }
 
 func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
-	f, err := os.CreateTemp("", "declexport-*.json")
+	tmp, err := os.MkdirTemp("", "declexport-")
 	if err != nil {
 		return nil, err
 	}
-	defer os.Remove(f.Name())
+	defer os.RemoveAll(tmp)
+	f, err := os.Create(filepath.Join(tmp, "manifest.json"))
+	if err != nil {
+		return nil, err
+	}
 	if err := json.NewEncoder(f).Encode(m.complete()); err != nil {
 		_ = f.Close()
 		return nil, err
@@ -309,8 +386,15 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, x.Bin, f.Name())
-	cmd.Env = x.Lean.env(x.SearchPath, os.TempDir())
+	var cmd *exec.Cmd
+	if x.Confined {
+		if cmd, err = x.Lean.confined(ctx, []string{x.Bin, f.Name()}, tmp, x.SearchPath, []string{tmp}, nil); err != nil {
+			return nil, err
+		}
+	} else {
+		cmd = exec.CommandContext(ctx, x.Bin, f.Name())
+		cmd.Env = x.Lean.env(x.SearchPath, tmp)
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()

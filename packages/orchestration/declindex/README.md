@@ -13,12 +13,12 @@ It also runs the similarity gate in front of the librarian (`gate`), and after a
 
 - **The `.ilean` part** (`ilean.go`, `refresh.go`, `query.go`, `graph.go`). It reads Lean's reference files: declarations, kinds, positions, uses marked `stmt` or `proof`, and edges.
   - A module is read again when its `.ilean` (Lake's content hash) or its source (size and mtime) changes.
-  - A declaration whose recorded position no longer holds its name (a source newer than its build) gets no statement hash, so nothing hashes text that is not the declaration.
+  - A module whose source is newer than its build (a declaration's recorded position no longer holds its name) is unreadable: the refresh reports it, and queries and the ledger check are unable to check (exit 3) until a build brings it back. Names Lean makes for a command (an elaborator's auxiliary, an initializer) have no written name and are not compared.
   - Reach walks a compressed graph file written next to the SQLite file. An edge's target is counted as the longest declared name it extends (`X.wp` is the field of `X`), against every module's declarations when the graph is written, so an incremental refresh answers as a full one does.
   - The graph file carries the generation of the index it was built from. A query refuses a graph of another generation, and the next refresh writes it again, so a failed write is never read.
 - **The compiled part** (`lean/`, `export.go`, `compiled.go`). The exporter is a Lean program, built with the tree's own toolchain. It reads the `.olean` files and records, for each constant:
   - its printed type;
-  - a compiled statement hash. Binder names, universe names and the declaration's own name (and every name Lean makes from it) are erased, an auxiliary definition Lean makes while elaborating (a matcher, an abstracted proof) is hashed by its content, and literals are compared by value. A structure's field names are kept;
+  - a compiled statement hash. Binder names, universe names, the declaration's own name and the names Lean generates from it (`X.eq_1`, `X._unfold`, `X.rec`) are erased, a sub-declaration the user wrote (`X.base`) is kept by name, an auxiliary definition Lean makes while elaborating (a matcher, an abstracted proof) is hashed by its content, and literals are compared by value. A structure's field names are kept;
   - relation atoms;
   - the registry facts its statement states: `direct`, `via:<definition>`, or `uses`.
 - **Matching facts.** A form matches as a first-order pattern, in either order for `=`, `≠`, `↔` and `HEq`, and through local aliases.
@@ -54,7 +54,11 @@ The gate cannot decide (exit 3) when the index lacks its compiled part, when the
 
 ### Untrusted proposals
 
-Compiling a proposal must run none of its code. The gate refuses, outside comments and strings, any `#` command (`#eval`, `#print`), `run_cmd`, `run_meta`, `run_elab`, `run_tac`, `initialize`, macros, elaborators, syntax and notation, `unsafe`, `native_decide`, `implemented_by`, `extern`, and the attributes that run or export code (`init`, `export`, `extern`). Lean then compiles it in a scratch directory that is its home, with an environment of `PATH`, `LEAN_PATH`, `HOME` and `TMPDIR` only. The project's own elaborators and tactics run as they do in its build.
+Compiling a proposal must run none of its code outside a sandbox, so the gate checks it three times:
+
+1. **A text filter** refuses the obvious at once (`#eval`, `run_cmd`, `initialize`, macros, `unsafe`, …). It is fast and nothing relies on it: a character literal `'"'` or an unlisted form passes it.
+2. **Lean's own parser** (`declexport --check`) reads the proposal with the notation of the modules it imports and allows only declarations, `variable`, `universe`, module documentation and the scoping commands (`namespace`, `section`, `end`, `open`), which alone it elaborates. Inside them it allows only listed attributes (`simp`, `instance`, `reducible`, …), refuses `unsafe`, and refuses the forms that run code while elaborating: `by_elab`, `run_tac`, `native_decide`, `decide +native`. A proposal carries no forms: the librarian writes those.
+3. **An operating-system sandbox** (package `confine`) runs the check, the compile and the export. It needs no privilege and no user namespace: Landlock lets the process read only the toolchain, the build outputs it imports and its scratch directory, write only the scratch directory, and execute only its own program; a seccomp filter makes every `socket(2)`, io_uring, ptrace, `process_vm_*`, key, namespace and mount call fail; and its environment is `PATH`, `LEAN_SYSROOT`, `LEAN_PATH`, `HOME` and `TMPDIR` only. Where the sandbox cannot be built (no Landlock), the gate is unable to decide (exit 3) and compiles nothing.
 
 ## The fixture
 
@@ -65,7 +69,7 @@ Compiling a proposal must run none of its code. The gate refuses, outside commen
 Measured on a large built project (52,529 modules, 545,934 declarations), 48 jobs:
 
 - **Parity with the reference `.ilean` reader:** the same 545,934 declarations, 9,686,627 uses and 4,389,369 resolved edges, with 0 differences. For 55 declarations sampled across wide and narrow use, the same direct users, per-directory counts and use lines; reach differs only for the 4 whose users include `example`s, which this index counts once per module.
-- **Refresh from nothing:** 15 min 56 s; 2 min 1 s for the `.ilean` part, 13 min 49 s for the compiled part (789,877 constants). 260 declarations had a source newer than their build and got no statement hash.
+- **Refresh from nothing:** 15 min 56 s; 2 min 1 s for the `.ilean` part, 13 min 49 s for the compiled part (789,877 constants).
 - **Update after a landing:** 3.0 s when nothing changed; 19.4 s when one module changed, 14 s of which rebuilds the graph file.
 - **Query times, each process included:** `states` of the fact's concept 0.34 s (23,095 rows); `users` 0.2 s median and 0.67 s worst; `where` 0.014 s; `same` 0.11 s; `gate` about 3.5 s, which includes compiling the proposal.
 - **`states` against the rule's 1,824 files that restate the fact:** 98.1% (1,789) recall through definitions; 66.1% from direct statements only. It also finds 88 files that the rule lacks.

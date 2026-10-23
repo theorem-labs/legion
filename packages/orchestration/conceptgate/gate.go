@@ -95,6 +95,8 @@ type Gate struct {
 	Librarian Librarian
 	// WorkDir holds the compiled proposals.
 	WorkDir string
+	// CheckSandbox is declindex.CheckSandbox, unless a test replaces it.
+	CheckSandbox func(context.Context, declindex.Lean) error
 }
 
 // ProposalModule is the module name a proposal is compiled as.
@@ -133,8 +135,19 @@ func (g *Gate) Decide(ctx context.Context, p Proposal) (Verdict, error) {
 	if err := p.Concept.check(); err != nil {
 		return v, err
 	}
+	if len(p.Concept.Forms) > 0 {
+		return v, fmt.Errorf("a proposal carries no forms: the librarian writes a concept's forms")
+	}
+	// A fast first refusal; the Lean parser check and the sandbox below are what hold.
 	if err := checkProposalSource(p.Source); err != nil {
 		return v, err
+	}
+	check := g.CheckSandbox
+	if check == nil {
+		check = declindex.CheckSandbox
+	}
+	if err := check(ctx, g.Compiled.Exporter.Lean); err != nil {
+		return v, fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)
 	}
 	if d, err := g.Index.Meta(ctx, "compiled"); err != nil {
 		return v, err
@@ -269,10 +282,14 @@ func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declinde
 	}
 	co := *g.Compiled
 	co.Dir = filepath.Join(dir, "forms")
+	co.Confined = true
 	if co.Forms, err = Forms(ctx, g.Index, reg); err != nil {
 		return nil, err
 	}
-	if err := declindex.CompileModule(ctx, co.Exporter.Lean, co.Exporter.SearchPath, dir, ProposalModule); err != nil {
+	if err := co.Exporter.CheckSource(ctx, filepath.Join(dir, ProposalModule+".lean"), co.Exporter.SearchPath); err != nil {
+		return nil, err
+	}
+	if err := declindex.CompileConfined(ctx, co.Exporter.Lean, co.Exporter.SearchPath, dir, ProposalModule); err != nil {
 		return nil, fmt.Errorf("the proposal does not compile: %w", err)
 	}
 	roots := declindex.Roots{ProposalModule: true}

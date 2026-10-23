@@ -165,3 +165,47 @@ func TestAUseOfItsOwnUndeclaredParentIsAnEdgeFromItsOwner(t *testing.T) {
 		t.Fatalf("reach %+v, want the auxiliary", a.Reach)
 	}
 }
+
+// Lean names the declarations of some commands itself (an elaborator's auxiliary, an option's initializer); their
+// recorded selection is the command. They are not evidence that the source moved, and a `_root_.` name is its own.
+func TestSelectionHoldsForNamesLeanMade(t *testing.T) {
+	text := "/-- doc -/\nelab_rules : tactic | `(tactic| t) => pure ()\ndef _root_.A.b : Nat := 1\nregister_option x : Bool := {}\n"
+	if !selectionHolds(text, "M._aux_M___elabRules_M_tacticT_1", 0, 10) {
+		t.Error("an elaborator's auxiliary (internal name) was taken for a moved declaration")
+	}
+	at := strings.Index(text, "_root_")
+	if !selectionHolds(text, "A.b", at, at+len("_root_.A.b")) {
+		t.Error("a `_root_.` name was taken for a moved declaration")
+	}
+	if !selectionHolds(text, "_private.M.0.initFn._@.M.1._hyg.4", strings.Index(text, "register"), len(text)) {
+		t.Error("an option's initializer (private hygienic name) was taken for a moved declaration")
+	}
+	if selectionHolds(text, "_private.M.0.A.c", at, at+len("_root_.A.b")) {
+		t.Error("a private user declaration at another name's position was taken as current")
+	}
+	if selectionHolds(text, "A.z", at, at+len("_root_.A.b")) {
+		t.Error("a declaration at another name's position was taken as current")
+	}
+}
+
+// A module whose source moved since its build is unreadable: the refresh says so (exit 3 in the command), and
+// the index refuses to answer until a build brings it back.
+func TestRefreshCountsAModuleNewerThanItsBuildAsUnreadable(t *testing.T) {
+	tree := goldenTree(t)
+	src := filepath.Join(tree.Source, "Golden.lean")
+	data, _ := os.ReadFile(src)
+	if err := os.WriteFile(src, append([]byte("-- edited after the build\n"), data...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := openStore(t)
+	st, err := s.Refresh(context.Background(), tree, RefreshOptions{Commit: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Unreadable != 1 || st.Reread != 1 {
+		t.Fatalf("stats %+v: want the moved module unreadable and the other read", st)
+	}
+	if n, _ := s.Meta(context.Background(), "errors"); n != "1" {
+		t.Fatalf("errors meta %q", n)
+	}
+}

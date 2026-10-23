@@ -51,4 +51,8 @@ def pickA : Nat → Nat
   | n + 1 => n
 def posA : {n : Nat // n > 0} := ⟨1, by decide⟩
 
+/-- A statement about a user declaration under its own name. -/
+def Q.base : Nat := 1
+def Q : Prop := Q.base = 1
+
 end Fx

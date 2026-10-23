@@ -240,7 +240,7 @@ func TestReachCountsEachModulesExample(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("A", `{"version":5,"module":"A","decls":{"A.t":[0,0,0,19,0,4,0,7]},"references":{}}`, "def t : Prop := True\n")
+	write("A", `{"version":5,"module":"A","decls":{"A.t":[0,0,0,19,0,4,0,5]},"references":{}}`, "def t : Prop := True\n")
 	for _, rel := range []string{"P/B", "Q/C"} {
 		mod := strings.ReplaceAll(rel, "/", ".")
 		write(rel, `{"version":5,"module":"`+mod+`","decls":{"_example":[0,0,0,33,0,0,0,7]},`+

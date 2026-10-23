@@ -346,7 +346,11 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 	} else if src == nil {
 		src = []byte{}
 	}
-	return ParseModule(rel, ilean, src, tree.Roots)
+	md, err := ParseModule(rel, ilean, src, tree.Roots)
+	if err == nil && md.Stale > 0 {
+		return md, fmt.Errorf("%s.lean is newer than its build: %d declarations are not where its reference file records them", rel, md.Stale)
+	}
+	return md, err
 }
 
 // insertEdges adds the declaration-level edges of the re-read modules: for each user declaration, the targets

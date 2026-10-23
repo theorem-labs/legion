@@ -1,4 +1,5 @@
 import DeclExport.Match
+import DeclExport.Check
 open Lean Meta DeclExport
 
 /-! `declexport MANIFEST.json`: load compiled modules (no elaboration, no build) and print one JSON line for each
@@ -100,7 +101,12 @@ def record (cfg : MatchConfig) (types : Bool) (m : Name) (c : Name) (ci : Consta
   return Json.mkObj fields
 
 def main (args : List String) : IO UInt32 := do
-  let [path] := args | IO.eprintln "usage: declexport MANIFEST.json"; return 2
+  if let ["--check", file] := args then
+    initSearchPath (← findSysroot)
+    match ← checkProposal file with
+    | none => return 0
+    | some why => IO.eprintln s!"declexport: the proposal is refused: {why}"; return 1
+  let [path] := args | IO.eprintln "usage: declexport MANIFEST.json | declexport --check PROPOSAL.lean"; return 2
   let manifest ← match Json.parse (← IO.FS.readFile path) >>= fromJson? (α := Manifest) with
     | .ok m => pure m
     | .error e => IO.eprintln s!"declexport: {path}: {e}"; return 2

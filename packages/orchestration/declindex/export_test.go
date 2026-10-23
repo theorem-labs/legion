@@ -2,6 +2,7 @@ package declindex
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -169,6 +170,10 @@ func TestExporterHashesACopyAsTheOriginal(t *testing.T) {
 				pair[0], a, pair[1], b)
 		}
 	}
+	if consts["Fx.Q"].Hash == "" || consts["Fx.Q"].Hash == consts["Fx.MyQ"].Hash {
+		t.Errorf("Fx.Q and Fx.MyQ hash %s and %s: a sub-declaration the user wrote is hashed by its name",
+			consts["Fx.Q"].Hash, consts["Fx.MyQ"].Hash)
+	}
 	if consts["Fx.NearSp"].Hash == orig.Hash {
 		t.Error("a different statement hashed as the original")
 	}
@@ -215,5 +220,85 @@ func TestCompileModuleRunsLeanInAMinimalEnvironment(t *testing.T) {
 	}
 	if err := CompileModule(context.Background(), l, nil, dir, "Probe"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Code that a confined compile runs (here an `#eval`) cannot write outside the module's directory, read the
+// caller's home, or start another program.
+func TestCompileConfinedKeepsTheModulesCodeIn(t *testing.T) {
+	l := leanForTest(t)
+	if err := CheckSandbox(context.Background(), l); err != nil {
+		if os.Getenv("DECLINDEX_REQUIRE_SANDBOX") != "" {
+			t.Fatal(err)
+		}
+		t.Skip(err)
+	}
+	dir, outside := t.TempDir(), t.TempDir()
+	target := filepath.Join(outside, "written")
+	probe := "def probe : IO Unit := do\n" +
+		"  try IO.FS.writeFile \"" + target + "\" \"x\" catch _ => pure ()\n" +
+		"  let home ← (IO.FS.readFile \"" + filepath.Join(os.Getenv("HOME"), ".bashrc") + "\").toBaseIO\n" +
+		"  if home matches .ok _ then throw (IO.userError \"read the home directory\")\n" +
+		"  let sh ← (IO.Process.output { cmd := \"/bin/sh\", args := #[\"-c\", \"true\"] }).toBaseIO\n" +
+		"  if let .ok o := sh then if o.exitCode == 0 then throw (IO.userError s!\"ran another program: {o.stdout}\")\n" +
+		"  IO.FS.writeFile \"inside\" \"x\"\n" +
+		"#eval probe\n"
+	if err := os.WriteFile(filepath.Join(dir, "Probe.lean"), []byte(probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompileConfined(context.Background(), l, nil, dir, "Probe"); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Fatal("the confined module wrote outside its directory")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "inside")); err != nil {
+		t.Fatalf("the confined module could not write in its own directory: %v", err)
+	}
+}
+
+// Lean's own parser decides what a proposal holds: text that hides a command from a text filter does not hide it
+// from the parser.
+func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
+	l := leanForTest(t)
+	if err := CheckSandbox(context.Background(), l); err != nil {
+		if os.Getenv("DECLINDEX_REQUIRE_SANDBOX") != "" {
+			t.Fatal(err)
+		}
+		t.Skip(err)
+	}
+	dir, _ := compiledFixture(t, l)
+	x := &Exporter{Lean: l, Bin: exporterForTest(t, l)}
+	check := func(body string) error {
+		t.Helper()
+		work := t.TempDir()
+		f := filepath.Join(work, "P.lean")
+		if err := os.WriteFile(f, []byte("import Fixture\n"+body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return x.CheckSource(context.Background(), f, []string{dir})
+	}
+	for _, ok := range []string{
+		"namespace Fx\nopen Fx\n/-- doc -/\n@[simp] def MySp (R : BitVec 5 → BitVec 64) : Prop := R 2#5 &&& 7#64 = 0#64\nend Fx\n",
+		"structure B where\n  pre : Nat\ntheorem t : True := by trivial\n",
+	} {
+		if err := check(ok); err != nil {
+			t.Errorf("refused %q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"def c : Char := '\"'\n#eval 1\n",
+		"def e : Nat := by_elab return Lean.mkNatLit 1\n",
+		"theorem t : True := by run_tac pure ()\n",
+		"theorem t : 2 + 2 = 4 := by decide +native\n",
+		"@[init] def x : IO Unit := pure ()\n",
+		"open Fx in\n#eval 1\n",
+		"unsafe def x : Nat := 1\n",
+		"set_option maxHeartbeats 0\n",
+		"macro \"m\" : term => `(1)\n",
+	} {
+		if err := check(bad); !errors.Is(err, ErrRefusedSource) {
+			t.Errorf("%q: %v, want a refusal", bad, err)
+		}
 	}
 }

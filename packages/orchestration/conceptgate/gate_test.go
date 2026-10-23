@@ -2,6 +2,7 @@ package conceptgate
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -196,14 +197,19 @@ func TestGateNeedsTheCompiledIndex(t *testing.T) {
 	}
 }
 
-// A proposal is declarations only: one that would run code while it is compiled is refused before Lean sees it.
+// A proposal is declarations only: one that would run code while it is compiled is refused, and none of its code
+// runs. The last two hide their code from the text check: a character literal `'"'` opens what the text check
+// reads as a string, and `by_elab` is not on its list.
 func TestGateRefusesAProposalThatRunsCode(t *testing.T) {
 	g, lib := gateForTest(t)
 	target := filepath.Join(t.TempDir(), "written")
+	write := "IO.FS.writeFile \"" + target + "\" \"x\""
 	for _, body := range []string{
-		"#eval IO.FS.writeFile \"" + target + "\" \"x\"",
-		"run_cmd (IO.FS.writeFile \"" + target + "\" \"x\" : IO Unit)",
-		"initialize (IO.FS.writeFile \"" + target + "\" \"x\" : IO Unit)",
+		"#eval " + write,
+		"run_cmd (" + write + " : IO Unit)",
+		"initialize (" + write + " : IO Unit)",
+		"def quote : Char := '\"'\n#eval " + write + "\n-- '\"'",
+		"def run : Nat := by_elab do " + write + "; return Lean.mkNatLit 1",
 	} {
 		v, err := g.Decide(context.Background(), proposal("evil", "Evil", "def Evil : Nat := 1\n"+body))
 		if err == nil {
@@ -215,5 +221,34 @@ func TestGateRefusesAProposalThatRunsCode(t *testing.T) {
 	}
 	if len(lib.got) != 0 {
 		t.Fatal("the librarian got a refused proposal")
+	}
+}
+
+// The gate compiles a proposal only inside the sandbox. Where there is none, it cannot decide, and compiles
+// nothing.
+func TestGateWithoutASandboxCannotDecide(t *testing.T) {
+	g, lib := gateForTest(t)
+	g.CheckSandbox = func(context.Context, declindex.Lean) error { return errors.New("no sandbox here") }
+	work := g.WorkDir
+	v, err := g.Decide(context.Background(), proposal("q3", "Fresh3", "def Fresh3 (x : Nat) : Prop := x < 4"))
+	if err == nil || !strings.Contains(err.Error(), "no sandbox here") {
+		t.Fatalf("decided %+v (%v) without a sandbox", v, err)
+	}
+	if entries, _ := os.ReadDir(work); len(entries) != 0 {
+		t.Fatalf("the gate wrote %d entries without a sandbox", len(entries))
+	}
+	if r, _ := Load(g.Registry); len(lib.got) != 0 || len(r.Concepts) != 2 {
+		t.Fatal("the gate acted without a sandbox")
+	}
+}
+
+// Forms are the librarian's: a proposal carries none, since the gate would add them to the registry, and the
+// index compiles the registry's forms outside the sandbox.
+func TestGateRefusesAProposalWithForms(t *testing.T) {
+	g, _ := gateForTest(t)
+	p := proposal("q4", "Fresh4", "def Fresh4 (x : Nat) : Prop := x < 4")
+	p.Concept.Forms = []string{"fun (x : Nat) => x < 4"}
+	if v, err := g.Decide(context.Background(), p); err == nil {
+		t.Fatalf("decided %+v", v)
 	}
 }

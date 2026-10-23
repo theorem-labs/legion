@@ -38,6 +38,8 @@ jobs:
       LEAN_TOOLCHAIN: leanprover/lean4:v4.35.0
       # The Lean tests skip without lake; here a missing toolchain fails them instead.
       DECLINDEX_REQUIRE_LEAN: "1"
+      # The gate compiles proposals only in the Landlock and seccomp sandbox; here its tests must run, not skip.
+      DECLINDEX_REQUIRE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
