@@ -1266,6 +1266,15 @@ def _witnesses(source: str, main: Path, vocabulary: Vocabulary) -> list[dict[str
 _WEAK = frozenset({"__weak", "weak", "__weak__"})
 
 
+def _parameter_count(cursor: ci.Cursor) -> int:
+    """The argument registers a call to the function fills: its parameters, at most eight; all eight
+    for a variadic function or one declared without a prototype."""
+    typ = cursor.type
+    if typ.kind != TK.FUNCTIONPROTO or typ.is_function_variadic():
+        return 8
+    return min(8, len(list(cursor.get_arguments() or [])))
+
+
 def _is_weak(extractor: _Extractor, cursor: ci.Cursor) -> bool:
     """A definition marked weak: ``__weak`` or ``__attribute__((weak))`` before its name, written in
     the source or, for a definition a macro generates (``COND_SYSCALL(x)``), in the macros it expands."""
@@ -1320,8 +1329,9 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             "line": cursor.location.line,
             "static": cursor.linkage == ci.LinkageKind.INTERNAL,
             "weak": _is_weak(extractor, cursor),
-            # Registers a0..a7 carry the first eight integer arguments; a variadic one may take all.
-            "parameters": 8 if cursor.type.is_function_variadic() else min(8, len(list(cursor.get_arguments() or []))),
+            # Registers a0..a7 carry the first eight integer arguments; a variadic one, or one declared
+            # without a prototype, may take all of them.
+            "parameters": _parameter_count(cursor),
             "main_file": _main_file(cursor, main),
             "returns": walk.returns(),
             "events": walk.events,
