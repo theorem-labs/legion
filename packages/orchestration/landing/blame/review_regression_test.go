@@ -16,9 +16,15 @@ func TestReviewAttributedDeclarationAndPrivateConstructorPatterns(t *testing.T) 
 	if strength != 3 || label != "removed" {
 		t.Fatalf("attributed declaration evidence = (%d, %q), want (3, removed)", strength, label)
 	}
-	names := Names("Constructor for `_private.Mod.0.Hidden` is marked as private")
-	if len(names) == 0 || names[0].Value != "Hidden" || names[0].Kind != Unknown {
-		t.Fatalf("private constructor names = %#v, want Hidden unknown", names)
+	for _, message := range []string{
+		"Constructor for `_private.Mod.0.Hidden` is marked as private",
+		"from structure `_private.Mod.0.Hidden` is private",
+		"`_private.Alpha.0.Record` is private",
+	} {
+		names := Names(message)
+		if len(names) == 0 || names[0].Kind != Unknown {
+			t.Fatalf("private diagnostic %q names = %#v, want unknown", message, names)
+		}
 	}
 }
 

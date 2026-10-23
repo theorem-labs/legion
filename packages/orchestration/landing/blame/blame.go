@@ -18,6 +18,7 @@ type BuildResult struct {
 	Green      bool
 	Output     string
 	InfraClass string
+	Absent     bool
 }
 
 // Builder builds the requested modules from a source tree.
@@ -82,7 +83,8 @@ var (
 	applicationRE  = regexp.MustCompile("(?s)(?:in the application|type expected, got)\\s*\\n\\s*\\(?@?([A-Za-z_][A-Za-z0-9_.'!?-]*)")
 	weakTypeRE     = regexp.MustCompile("(?s)(?:has type|expected to have type)\\s*\\n\\s*\\(?@?([A-Z][A-Za-z0-9_.'!?-]*)")
 	fieldsMissing  = regexp.MustCompile("Fields missing: ((?:`[^`]+`(?:, )?)+)")
-	privateCtorRE  = regexp.MustCompile("(?i)(?:Constructor for|from structure) `_private\\.[^`]*?\\.0\\.([^`]+)` is private|Constructor for `_private\\.[^`]*?\\.0\\.([^`]+)` is marked as private")
+	privateCtorRE  = regexp.MustCompile("(?i)Constructor for `_private\\.[^`]*?\\.0\\.([^`]+)` is marked as private|from structure `_private\\.[^`]*?\\.0\\.([^`]+)` is private")
+	privateBareRE  = regexp.MustCompile("(?i)`_private\\.[^`]*?\\.0\\.([^`]+)` is private")
 )
 
 var noise = map[string]struct{}{
@@ -169,6 +171,9 @@ func Names(block string) []Name {
 				addName(&found, value, Unknown)
 			}
 		}
+	}
+	for _, match := range privateBareRE.FindAllStringSubmatch(block, -1) {
+		addName(&found, match[1], Unknown)
 	}
 	addAll(addedRE.FindAllStringSubmatch(block, -1), Added)
 	addAll(fieldOfRE.FindAllStringSubmatch(block, -1), Changed)
@@ -667,11 +672,14 @@ func ConfirmModules(ctx context.Context, base string, modules []string, members 
 		if err != nil {
 			return Confirmation{}, fmt.Errorf("build base for %q: %w", module, err)
 		}
-		baseRed, err := isRed(ctx, builder, baseTree, []string{module})
+		baseResult, err := builder.Build(ctx, baseTree, []string{module})
 		if err != nil {
 			return Confirmation{}, fmt.Errorf("check base for %q: %w", module, err)
 		}
-		if baseRed {
+		if baseResult.InfraClass != "" {
+			return Confirmation{}, fmt.Errorf("check base for %q: infrastructure failure: %s", module, baseResult.InfraClass)
+		}
+		if !baseResult.Absent && !baseResult.Green {
 			out.BaseBroken = append(out.BaseBroken, module)
 			continue
 		}
@@ -762,6 +770,9 @@ func isRed(ctx context.Context, builder Builder, tree Tree, modules []string) (b
 	}
 	if result.InfraClass != "" {
 		return false, fmt.Errorf("infrastructure failure: %s", result.InfraClass)
+	}
+	if result.Absent {
+		return false, nil
 	}
 	return !result.Green, nil
 }

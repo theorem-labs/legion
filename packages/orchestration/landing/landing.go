@@ -26,6 +26,7 @@ type Ledger interface {
 	Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error)
 	Land(context.Context, LandRequest) error
 	ReturnMember(context.Context, string, string, int64, string) error
+	MigrationState(context.Context, string, string) (state string, landedCommit string, err error)
 }
 
 // LandRequest matches the ledger's complete landing transaction input.
@@ -34,10 +35,10 @@ type LandRequest struct {
 	Migration        string            `json:"migration"`
 	Generation       int64             `json:"generation"`
 	Commit           string            `json:"commit"`
-	ChangedPaths     []string          `json:"changedPaths"`
+	ChangedPaths     []string          `json:"changed_paths"`
 	Current          map[string]string `json:"current"`
-	ChangedContracts map[string]string `json:"changedContracts"`
-	ApprovedPinned   []string          `json:"approvedPinned"`
+	ChangedContracts map[string]string `json:"changed_contracts"`
+	ApprovedPinned   []string          `json:"approved_pinned"`
 }
 
 // CheckResult describes one ledger decision.
@@ -102,6 +103,7 @@ type Member struct {
 	Changed          []string          `json:"changed"`
 	ReadNames        []string          `json:"readNames"`
 	CurrentHashes    map[string]string `json:"currentHashes"`
+	HashesTree       string            `json:"hashesTree"`
 	ChangedContracts map[string]string `json:"changedContracts"`
 	ApprovedPinned   []string          `json:"approvedPinned"`
 }
@@ -145,38 +147,50 @@ const (
 
 // Operation is the idempotency record for one member or batch side effect.
 type Operation struct {
-	Key    string         `json:"key"`
-	Kind   string         `json:"kind"`
-	Member string         `json:"member"`
-	Commit string         `json:"commit"`
-	Reason string         `json:"reason"`
-	State  OperationState `json:"state"`
+	Key        string         `json:"key"`
+	Kind       string         `json:"kind"`
+	Batch      string         `json:"batch"`
+	Repository string         `json:"repository"`
+	Member     string         `json:"member"`
+	Generation int64          `json:"generation"`
+	Commit     string         `json:"commit"`
+	Reason     string         `json:"reason"`
+	State      OperationState `json:"state"`
 }
 
 // Batch persists an immutable input set independently from members eventually
 // landed after a publisher confirms the merge.
 type Batch struct {
-	ID               string               `json:"id"`
-	Repository       string               `json:"repository"`
-	Base             string               `json:"base"`
-	BaseBranch       string               `json:"baseBranch"`
-	Branch           string               `json:"branch"`
-	Candidate        gitx.Result          `json:"candidate"`
-	InitialCandidate gitx.Result          `json:"initialCandidate"`
-	CheckedTree      string               `json:"checkedTree"`
-	FrozenMembers    []Member             `json:"frozenMembers"`
-	ActiveMembers    []Member             `json:"activeMembers"`
-	LandedMembers    []Member             `json:"landedMembers"`
-	NotifiedMembers  []string             `json:"notifiedMembers"`
-	Dropped          []DroppedMember      `json:"dropped"`
-	Operations       map[string]Operation `json:"operations"`
-	State            State                `json:"state"`
-	Reason           string               `json:"reason"`
-	Round            int                  `json:"round"`
-	Checks           []CheckVerdict       `json:"checks"`
-	Score            CheckVerdict         `json:"score"`
-	PullRequest      PullRequest          `json:"pullRequest"`
-	Receipt          *Receipt             `json:"receipt"`
+	ID                string               `json:"id"`
+	Repository        string               `json:"repository"`
+	Base              string               `json:"base"`
+	BaseBranch        string               `json:"baseBranch"`
+	Branch            string               `json:"branch"`
+	Candidate         gitx.Result          `json:"candidate"`
+	InitialCandidate  gitx.Result          `json:"initialCandidate"`
+	CheckedTree       string               `json:"checkedTree"`
+	CandidateDirty    bool                 `json:"candidateDirty"`
+	FrozenMembers     []Member             `json:"frozenMembers"`
+	ActiveMembers     []Member             `json:"activeMembers"`
+	LandedMembers     []Member             `json:"landedMembers"`
+	NotifiedMembers   []string             `json:"notifiedMembers"`
+	Dropped           []DroppedMember      `json:"dropped"`
+	Operations        map[string]Operation `json:"operations"`
+	State             State                `json:"state"`
+	Reason            string               `json:"reason"`
+	Round             int                  `json:"round"`
+	ChangesTree       string               `json:"changesTree"`
+	ChangeMembers     []string             `json:"changeMembers"`
+	LedgerTree        string               `json:"ledgerTree"`
+	LedgerMembers     []string             `json:"ledgerMembers"`
+	Checks            []CheckVerdict       `json:"checks"`
+	CheckPolicyDigest string               `json:"checkPolicyDigest"`
+	CheckPolicy       []string             `json:"checkPolicy"`
+	CheckMembers      []string             `json:"checkMembers"`
+	Score             CheckVerdict         `json:"score"`
+	PullRequest       PullRequest          `json:"pullRequest"`
+	MergeValidated    bool                 `json:"mergeValidated"`
+	Receipt           *Receipt             `json:"receipt"`
 }
 
 // Input starts one frozen batch.
@@ -234,13 +248,15 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 		return existing, nil
 	}
 	batch := Batch{
-		ID:            input.ID,
-		Repository:    input.Repository,
-		Base:          input.Base,
-		BaseBranch:    input.BaseBranch,
-		FrozenMembers: cloneMembers(input.Members),
-		ActiveMembers: cloneMembers(input.Members),
-		Operations:    make(map[string]Operation),
+		ID:                input.ID,
+		Repository:        input.Repository,
+		Base:              input.Base,
+		BaseBranch:        input.BaseBranch,
+		FrozenMembers:     cloneMembers(input.Members),
+		ActiveMembers:     cloneMembers(input.Members),
+		Operations:        make(map[string]Operation),
+		CheckPolicyDigest: r.ConfigDigest,
+		CheckPolicy:       r.checkPolicyNames(),
 	}
 	candidate, err := r.candidate(ctx, batch.Repository, batch.Base, batch.ActiveMembers)
 	if err != nil {
@@ -275,7 +291,9 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 	if err := r.rebuild(ctx, &batch); err != nil {
 		return r.fail(ctx, &batch, "candidate")
 	}
-
+	if err := r.revalidateCandidate(ctx, &batch); err != nil {
+		return r.fail(ctx, &batch, "ledger")
+	}
 	batch.Round = 0
 	return r.drive(ctx, &batch, true)
 }
@@ -290,6 +308,9 @@ func (r Runner) drive(ctx context.Context, batch *Batch, checkBeforeBuild bool) 
 			if !ready {
 				if err := r.rebuild(ctx, batch); err != nil {
 					return r.fail(ctx, batch, "candidate")
+				}
+				if err := r.revalidateCandidate(ctx, batch); err != nil {
+					return r.fail(ctx, batch, "ledger")
 				}
 				batch.Round--
 				continue
@@ -337,6 +358,9 @@ func (r Runner) drive(ctx context.Context, batch *Batch, checkBeforeBuild bool) 
 		if err := r.rebuild(ctx, batch); err != nil {
 			return r.fail(ctx, batch, "candidate")
 		}
+		if err := r.revalidateCandidate(ctx, batch); err != nil {
+			return r.fail(ctx, batch, "ledger")
+		}
 	}
 	return r.fail(ctx, batch, "max-rounds")
 }
@@ -374,17 +398,25 @@ func (r Runner) collectChanges(ctx context.Context, batch *Batch) error {
 		}
 		member.Changed = append([]string(nil), change.Files...)
 	}
+	batch.ChangesTree = batch.Candidate.Tree
+	batch.ChangeMembers = memberIDs(batch.ActiveMembers)
 	return r.Store.Save(ctx, *batch)
 }
 
 func (r Runner) checkLedger(ctx context.Context, batch *Batch) error {
-	for index := range batch.ActiveMembers {
+	members := cloneMembers(batch.ActiveMembers)
+	for _, snapshot := range members {
+		index := memberIndex(batch.ActiveMembers, snapshot.Migration)
+		if index < 0 {
+			continue
+		}
 		member := &batch.ActiveMembers[index]
 		hashes, err := r.Hasher.Hashes(ctx, Tree(batch.Candidate.Tree), member.ReadNames)
 		if err != nil {
 			return fmt.Errorf("hash reads for %q: %w", member.Migration, err)
 		}
 		member.CurrentHashes = cloneHashes(hashes)
+		member.HashesTree = batch.Candidate.Tree
 		if err := r.Store.Save(ctx, *batch); err != nil {
 			return fmt.Errorf("record current hashes for %q: %w", member.Migration, err)
 		}
@@ -402,7 +434,27 @@ func (r Runner) checkLedger(ctx context.Context, batch *Batch) error {
 			}
 		}
 	}
+	batch.LedgerTree = batch.Candidate.Tree
+	batch.LedgerMembers = memberIDs(batch.ActiveMembers)
+	if err := r.Store.Save(ctx, *batch); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (r Runner) revalidateCandidate(ctx context.Context, batch *Batch) error {
+	for {
+		dropped := len(batch.Dropped)
+		if err := r.checkLedger(ctx, batch); err != nil {
+			return err
+		}
+		if len(batch.Dropped) == dropped {
+			return nil
+		}
+		if err := r.rebuild(ctx, batch); err != nil {
+			return err
+		}
+	}
 }
 
 func (r Runner) applyCandidateDrops(ctx context.Context, batch *Batch) error {
@@ -438,10 +490,11 @@ func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reaso
 		return nil
 	}
 	batch.ActiveMembers = withoutMember(batch.ActiveMembers, migration)
+	batch.CandidateDirty = true
 	if !containsDropped(batch.Dropped, migration) {
 		batch.Dropped = append(batch.Dropped, DroppedMember{Migration: migration, Reason: reason})
 	}
-	batch.startOperation(Operation{Key: key, Kind: "return", Member: migration, Reason: reason})
+	batch.startOperation(Operation{Key: key, Kind: "return", Batch: batch.ID, Repository: batch.Repository, Member: migration, Generation: member.Generation, Reason: reason})
 	if err := r.Store.Save(ctx, *batch); err != nil {
 		return fmt.Errorf("record return intent for %q: %w", migration, err)
 	}
@@ -465,7 +518,12 @@ func (r Runner) rebuild(ctx context.Context, batch *Batch) error {
 		return fmt.Errorf("rebuild candidate: %w", err)
 	}
 	batch.Candidate = candidate
+	batch.CandidateDirty = false
 	batch.CheckedTree = ""
+	for index := range batch.ActiveMembers {
+		batch.ActiveMembers[index].CurrentHashes = nil
+		batch.ActiveMembers[index].HashesTree = ""
+	}
 	if err := r.Store.Save(ctx, *batch); err != nil {
 		return fmt.Errorf("record rebuilt candidate: %w", err)
 	}
@@ -514,6 +572,7 @@ func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 		return false, nil
 	}
 	batch.CheckedTree = batch.Candidate.Tree
+	batch.CheckMembers = memberIDs(batch.ActiveMembers)
 	if err := r.Store.Save(ctx, *batch); err != nil {
 		return false, fmt.Errorf("record checks: %w", err)
 	}
@@ -775,6 +834,27 @@ func (r Runner) transition(ctx context.Context, batch *Batch, state State, reaso
 	return nil
 }
 
+func (r Runner) checkPolicyNames() []string {
+	names := make([]string, len(r.Checks))
+	for index, checker := range r.Checks {
+		name := checker.Name()
+		if name == "" {
+			name = fmt.Sprintf("check-%d", index+1)
+		}
+		names[index] = name
+	}
+	sort.Strings(names)
+	return names
+}
+
+func memberIDs(members []Member) []string {
+	ids := make([]string, len(members))
+	for index, member := range members {
+		ids[index] = member.Migration
+	}
+	return ids
+}
+
 func (r Runner) roundLimit() int {
 	if r.MaxRounds > 0 {
 		return r.MaxRounds
@@ -810,6 +890,15 @@ func sameInput(batch Batch, input Input) bool {
 		}
 	}
 	return true
+}
+
+func memberIndex(members []Member, migration string) int {
+	for index, member := range members {
+		if member.Migration == migration {
+			return index
+		}
+	}
+	return -1
 }
 
 func findMember(members []Member, migration string) (Member, bool) {
@@ -933,6 +1022,10 @@ func cloneBatch(batch Batch) Batch {
 	batch.LandedMembers = cloneMembers(batch.LandedMembers)
 	batch.NotifiedMembers = append([]string(nil), batch.NotifiedMembers...)
 	batch.Dropped = append([]DroppedMember(nil), batch.Dropped...)
+	batch.ChangeMembers = append([]string(nil), batch.ChangeMembers...)
+	batch.LedgerMembers = append([]string(nil), batch.LedgerMembers...)
+	batch.CheckPolicy = append([]string(nil), batch.CheckPolicy...)
+	batch.CheckMembers = append([]string(nil), batch.CheckMembers...)
 	batch.Checks = append([]CheckVerdict(nil), batch.Checks...)
 	if batch.Operations != nil {
 		operations := make(map[string]Operation, len(batch.Operations))

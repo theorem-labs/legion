@@ -56,6 +56,10 @@ func (f *requestLedgerFake) ReturnMember(context.Context, string, string, int64,
 	return nil
 }
 
+func (f *requestLedgerFake) MigrationState(context.Context, string, string) (string, string, error) {
+	return "open", "", nil
+}
+
 type commitScoreFake struct{ commit string }
 
 func (f *commitScoreFake) Score(context.Context, string, string) (string, error) { return "score", nil }

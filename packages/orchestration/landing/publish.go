@@ -76,7 +76,7 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 			return Batch{}, err
 		}
 	}
-	if batch.PullRequest.State == PullRequestMerged && batch.PullRequest.MergedCommit != "" {
+	if batch.MergeValidated {
 		return r.completeMerged(ctx, &batch)
 	}
 	if err := r.GitHub.Push(ctx, batch.Repository, batch.Branch, batch.Candidate.Commit); err != nil {
@@ -108,16 +108,20 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 		return r.fail(ctx, &batch, "github: wait")
 	}
 	batch.PullRequest = pull
+	batch.MergeValidated = pull.State == PullRequestMerged && pull.Head == batch.Candidate.Commit && pull.MergedCommit != ""
 	if err := r.Store.Save(ctx, batch); err != nil {
 		return Batch{}, fmt.Errorf("record merged pull request: %w", err)
 	}
-	if pull.State != PullRequestMerged || pull.Head != batch.Candidate.Commit || pull.MergedCommit == "" {
+	if !batch.MergeValidated {
 		reason := strings.TrimSpace(pull.Reason)
 		if reason == "" {
 			reason = string(pull.State)
 		}
 		if pull.State == PullRequestMerged && pull.MergedCommit == "" {
 			reason = "merged commit unavailable"
+		}
+		if pull.State == PullRequestMerged && pull.Head != batch.Candidate.Commit {
+			reason = "merged unexpected head"
 		}
 		return r.fail(ctx, &batch, "github: "+reason)
 	}
@@ -129,6 +133,9 @@ func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error)
 	for _, member := range batch.ActiveMembers {
 		if contains(batchMemberNames(batch.LandedMembers), member.Migration) {
 			continue
+		}
+		if len(member.ReadNames) != 0 && member.HashesTree != batch.Candidate.Tree {
+			return r.retryable(ctx, batch, "ledger hashes stale", fmt.Errorf("member %q hashes tree %q, candidate tree %q", member.Migration, member.HashesTree, batch.Candidate.Tree))
 		}
 		request := LandRequest{
 			Repo:             batch.Repository,
@@ -143,26 +150,26 @@ func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error)
 		key := "land/" + member.Migration
 		operation, found := batch.operation(key)
 		if !found {
-			operation = Operation{Key: key, Kind: "land", Member: member.Migration, Commit: mergedCommit}
+			operation = Operation{Key: key, Kind: "land", Batch: batch.ID, Repository: batch.Repository, Member: member.Migration, Generation: member.Generation, Commit: mergedCommit}
 			batch.startOperation(operation)
 			if err := r.Store.Save(ctx, *batch); err != nil {
 				return Batch{}, fmt.Errorf("record land intent for %q: %w", member.Migration, err)
 			}
 		}
 		if operation.State != OperationComplete {
-			if status, supported := r.Ledger.(OperationStatus); supported {
-				done, err := status.OperationComplete(ctx, operation)
-				if err != nil {
-					return r.retryable(ctx, batch, "ledger operation status", err)
-				}
-				if done {
-					batch.completeOperation(key)
-					if err := r.Store.Save(ctx, *batch); err != nil {
-						return Batch{}, fmt.Errorf("record observed land %q: %w", member.Migration, err)
-					}
-				}
+			state, landedCommit, err := r.Ledger.MigrationState(ctx, batch.Repository, member.Migration)
+			if err != nil {
+				return r.retryable(ctx, batch, "ledger migration state", err)
 			}
-			if current, _ := batch.operation(key); current.State != OperationComplete {
+			if state == "landed" {
+				if landedCommit != mergedCommit {
+					return r.retryable(ctx, batch, "ledger landed commit mismatch", fmt.Errorf("migration %q landed at %q, want %q", member.Migration, landedCommit, mergedCommit))
+				}
+				batch.completeOperation(key)
+				if err := r.Store.Save(ctx, *batch); err != nil {
+					return Batch{}, fmt.Errorf("record observed land %q: %w", member.Migration, err)
+				}
+			} else {
 				if err := r.Ledger.Land(ctx, request); err != nil {
 					return r.retryable(ctx, batch, "ledger: land", err)
 				}
@@ -181,7 +188,7 @@ func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error)
 		key := "score"
 		operation, found := batch.operation(key)
 		if !found {
-			operation = Operation{Key: key, Kind: "score", Commit: mergedCommit}
+			operation = Operation{Key: key, Kind: "score", Batch: batch.ID, Repository: batch.Repository, Commit: mergedCommit}
 			batch.startOperation(operation)
 			if err := r.Store.Save(ctx, *batch); err != nil {
 				return Batch{}, fmt.Errorf("record score intent: %w", err)
@@ -217,7 +224,7 @@ func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error)
 			key := "event/" + member.Migration
 			operation, found := batch.operation(key)
 			if !found {
-				operation = Operation{Key: key, Kind: "event", Member: member.Migration, Commit: mergedCommit}
+				operation = Operation{Key: key, Kind: "event", Batch: batch.ID, Repository: batch.Repository, Member: member.Migration, Generation: member.Generation, Commit: mergedCommit}
 				batch.startOperation(operation)
 				if err := r.Store.Save(ctx, *batch); err != nil {
 					return Batch{}, fmt.Errorf("record event intent for %q: %w", member.Migration, err)

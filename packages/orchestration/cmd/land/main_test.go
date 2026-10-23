@@ -96,10 +96,11 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 		"hasher":         []string{"sh", "-c", "exit 0"},
 		"toolchain":      []string{"sh", "-c", "printf tool"},
 		"ledger": map[string]any{
-			"check":  []string{"sh", "-c", "printf '{\"pass\":true}\\n'"},
-			"return": []string{"sh", "-c", "exit 0"},
-			"land":   []string{"sh", "-c", "exit 0"},
-			"status": []string{"sh", "-c", "printf '{\"complete\":false}\\n'"},
+			"check":          []string{"sh", "-c", "printf '{\"pass\":true}\\n'"},
+			"return":         []string{"sh", "-c", "exit 0"},
+			"land":           []string{"sh", "-c", "exit 0"},
+			"status":         []string{"sh", "-c", "printf '{\"complete\":false}\\n'"},
+			"migrationState": []string{"sh", "-c", "printf '{\"state\":\"open\"}\\n'"},
 		},
 	})
 	if err != nil {

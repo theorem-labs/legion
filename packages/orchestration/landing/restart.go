@@ -19,6 +19,10 @@ func (r Runner) Reconcile(ctx context.Context) ([]Batch, error) {
 	for _, batch := range batches {
 		next, err := r.resume(ctx, batch)
 		if err != nil {
+			if next.State == Publishing {
+				resumed = append(resumed, next)
+				continue
+			}
 			return resumed, err
 		}
 		resumed = append(resumed, next)
@@ -27,13 +31,28 @@ func (r Runner) Reconcile(ctx context.Context) ([]Batch, error) {
 }
 
 func (r Runner) resume(ctx context.Context, batch Batch) (Batch, error) {
+	policyChanged := batch.CheckPolicyDigest != r.ConfigDigest || !sameStringSet(batch.CheckPolicy, r.checkPolicyNames())
+	if policyChanged {
+		batch.CheckPolicyDigest = r.ConfigDigest
+		batch.CheckPolicy = r.checkPolicyNames()
+		batch.CheckedTree = ""
+		if err := r.Store.Save(ctx, batch); err != nil {
+			return Batch{}, fmt.Errorf("record changed check policy: %w", err)
+		}
+	}
 	returned, err := r.recoverReturns(ctx, &batch)
 	if err != nil {
 		return batch, err
 	}
-	if returned {
+	if batch.State != Frozen && (returned || batch.CandidateDirty) {
 		if err := r.rebuild(ctx, &batch); err != nil {
 			return r.fail(ctx, &batch, "candidate")
+		}
+		if err := r.collectChanges(ctx, &batch); err != nil {
+			return r.fail(ctx, &batch, "changes")
+		}
+		if err := r.revalidateCandidate(ctx, &batch); err != nil {
+			return r.fail(ctx, &batch, "ledger")
 		}
 		return r.drive(ctx, &batch, true)
 	}
@@ -45,15 +64,22 @@ func (r Runner) resume(ctx context.Context, batch Batch) (Batch, error) {
 		if err := r.collectChanges(ctx, &batch); err != nil {
 			return r.fail(ctx, &batch, "changes")
 		}
-		if err := r.checkLedger(ctx, &batch); err != nil {
+		if err := r.revalidateCandidate(ctx, &batch); err != nil {
 			return r.fail(ctx, &batch, "ledger")
-		}
-		if err := r.rebuild(ctx, &batch); err != nil {
-			return r.fail(ctx, &batch, "candidate")
 		}
 		return r.drive(ctx, &batch, true)
 	case Checked, Building, Blaming:
-		return r.drive(ctx, &batch, batch.CheckedTree != batch.Candidate.Tree)
+		currentMembers := memberIDs(batch.ActiveMembers)
+		if policyChanged || batch.ChangesTree != batch.Candidate.Tree || !sameStringSet(batch.ChangeMembers, currentMembers) || batch.LedgerTree != batch.Candidate.Tree || !sameStringSet(batch.LedgerMembers, currentMembers) {
+			if err := r.collectChanges(ctx, &batch); err != nil {
+				return r.fail(ctx, &batch, "changes")
+			}
+			if err := r.revalidateCandidate(ctx, &batch); err != nil {
+				return r.fail(ctx, &batch, "ledger")
+			}
+			return r.drive(ctx, &batch, true)
+		}
+		return r.drive(ctx, &batch, policyChanged || batch.CheckedTree != batch.Candidate.Tree || !sameStringSet(batch.CheckMembers, currentMembers))
 	case Green, Publishing:
 		return r.Publish(ctx, batch)
 	default:
@@ -95,4 +121,16 @@ func (r Runner) recoverReturns(ctx context.Context, batch *Batch) (bool, error) 
 		recovered = true
 	}
 	return recovered, nil
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }

@@ -42,8 +42,11 @@ func (l *observedLedger) Land(context.Context, LandRequest) error { l.lands++; r
 func (l *observedLedger) ReturnMember(context.Context, string, string, int64, string) error {
 	return nil
 }
-func (l *observedLedger) OperationComplete(_ context.Context, operation Operation) (bool, error) {
-	return operation.Kind == "land" && l.lands == 1, nil
+func (l *observedLedger) MigrationState(context.Context, string, string) (string, string, error) {
+	if l.lands > 0 {
+		return "landed", "merged", nil
+	}
+	return "open", "", nil
 }
 
 type landCrashStore struct {

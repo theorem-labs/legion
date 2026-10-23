@@ -23,8 +23,8 @@ func TestGitHubCLIPushesCandidateBranchOnly(t *testing.T) {
 
 func TestGitHubCLIFindsQueueRemoval(t *testing.T) {
 	executor := &commandExecutorFake{outputs: []string{
-		`[{"number":7,"headRefOid":"candidate","state":"OPEN","mergeStateStatus":"DIRTY"}]`,
-		`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null,"mergeCommit":null}}}}`,
+		`[{"number":7,"headRefOid":"candidate","state":"OPEN","mergeStateStatus":"UNSTABLE"}]`,
+		`{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null,"mergeCommit":null,"timelineItems":{"nodes":[{"reason":"checks failed"}]}}}}}`,
 	}}
 	client := GitHubCLI{Executor: executor}
 

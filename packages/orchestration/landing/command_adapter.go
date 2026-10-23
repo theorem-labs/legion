@@ -20,11 +20,12 @@ import (
 // receive their input in LAND_* environment variables and write a CheckResult
 // JSON object for Check.
 type CommandLedger struct {
-	Directory     string
-	CheckCommand  []string
-	LandCommand   []string
-	ReturnCommand []string
-	StatusCommand []string
+	Directory             string
+	CheckCommand          []string
+	LandCommand           []string
+	ReturnCommand         []string
+	StatusCommand         []string
+	MigrationStateCommand []string
 }
 
 func (l CommandLedger) Check(ctx context.Context, repository, migration string, generation int64, changed []string, hashes map[string]string) (CheckResult, error) {
@@ -79,7 +80,10 @@ func (l CommandLedger) OperationComplete(ctx context.Context, operation Operatio
 	output, err := runLandingCommand(ctx, l.Directory, l.StatusCommand, []string{
 		"LAND_OPERATION=" + operation.Key,
 		"LAND_OPERATION_KIND=" + operation.Kind,
+		"LAND_BATCH=" + operation.Batch,
+		"LAND_REPOSITORY=" + operation.Repository,
 		"LAND_MEMBER=" + operation.Member,
+		fmt.Sprintf("LAND_GENERATION=%d", operation.Generation),
 		"LAND_COMMIT=" + operation.Commit,
 	})
 	if err != nil {
@@ -97,6 +101,26 @@ func (l CommandLedger) OperationComplete(ctx context.Context, operation Operatio
 	return *wire.Complete, nil
 }
 
+func (l CommandLedger) MigrationState(ctx context.Context, repository, migration string) (string, string, error) {
+	output, err := runLandingCommand(ctx, l.Directory, l.MigrationStateCommand, []string{
+		"LAND_REPOSITORY=" + repository,
+		"LAND_MIGRATION=" + migration,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("read migration state: %w", err)
+	}
+	var wire struct {
+		State        string `json:"state"`
+		LandedCommit string `json:"landedCommit"`
+	}
+	if err := json.Unmarshal([]byte(output), &wire); err != nil || wire.State == "" {
+		if err != nil {
+			return "", "", fmt.Errorf("decode migration state: %w", err)
+		}
+		return "", "", fmt.Errorf("decode migration state: missing state")
+	}
+	return wire.State, wire.LandedCommit, nil
+}
 func ledgerEnvironment(repository, migration string, generation int64, changed []string, hashes map[string]string) []string {
 	changedJSON, _ := json.Marshal(changed)
 	hashesJSON, _ := json.Marshal(hashes)
@@ -138,6 +162,10 @@ func (b CommandBuilder) Build(ctx context.Context, tree Tree, modules []string) 
 	})
 	if err != nil {
 		result := blame.BuildResult{Green: false, Output: commandOutput(err)}
+		if strings.Contains(result.Output, "LAND_TARGET_ABSENT") {
+			result.Absent = true
+			return result, nil
+		}
 		result.InfraClass = classifyInfrastructure(ctx, err)
 		return result, nil
 	}
@@ -258,7 +286,10 @@ func commandOperationComplete(ctx context.Context, directory string, command []s
 	output, err := runLandingCommand(ctx, directory, command, []string{
 		"LAND_OPERATION=" + operation.Key,
 		"LAND_OPERATION_KIND=" + operation.Kind,
+		"LAND_BATCH=" + operation.Batch,
+		"LAND_REPOSITORY=" + operation.Repository,
 		"LAND_MEMBER=" + operation.Member,
+		fmt.Sprintf("LAND_GENERATION=%d", operation.Generation),
 		"LAND_COMMIT=" + operation.Commit,
 	})
 	if err != nil {
@@ -317,7 +348,8 @@ func classifyInfrastructure(ctx context.Context, err error) string {
 	if !errors.As(err, &exit) {
 		return "launch"
 	}
-	switch exit.ExitCode() {
+	code := exit.ExitCode()
+	switch code {
 	case -1:
 		return "killed"
 	case 124:
@@ -325,6 +357,9 @@ func classifyInfrastructure(ctx context.Context, err error) string {
 	case 125, 137:
 		return "resource-kill"
 	default:
+		if code > 128 {
+			return "signal"
+		}
 		return ""
 	}
 }

@@ -2,7 +2,6 @@ package landing
 
 import (
 	"context"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -254,6 +253,10 @@ func (f *ledgerFake) ReturnMember(_ context.Context, _ string, migration string,
 	return nil
 }
 
+func (f *ledgerFake) MigrationState(context.Context, string, string) (string, string, error) {
+	return "open", "", nil
+}
+
 type builderFake struct {
 	results map[string]blame.BuildResult
 	trees   []blame.Tree
@@ -388,5 +391,13 @@ func sameTrees(got, want []blame.Tree) bool {
 }
 
 func sameMembers(got, want []Member) bool {
-	return reflect.DeepEqual(got, want)
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index].Migration != want[index].Migration || got[index].Generation != want[index].Generation || got[index].Head != want[index].Head || got[index].ComparisonBase != want[index].ComparisonBase {
+			return false
+		}
+	}
+	return true
 }

@@ -27,3 +27,24 @@ func TestReviewRepositoryGitReturnsOnlyDeclarationLines(t *testing.T) {
 		t.Fatalf("DeclarationLines() = %#v, want %#v", got, want)
 	}
 }
+
+func TestReviewRepositoryGitResolvesQualifiedNameInNamespace(t *testing.T) {
+	repo := t.TempDir()
+	gitRun(t, repo, "init", "-q")
+	gitRun(t, repo, "config", "user.email", "test@example.invalid")
+	gitRun(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "Alpha.lean"), []byte("namespace Alpha\ndef Shared := 0\nend Alpha\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "Alpha.lean")
+	gitRun(t, repo, "commit", "-qm", "base")
+	commit := gitRun(t, repo, "rev-parse", "HEAD")
+
+	lines, err := (RepositoryGit{}).DeclarationLines(context.Background(), repo, Tree(commit), "Alpha.Shared")
+	if err != nil {
+		t.Fatalf("DeclarationLines() error = %v", err)
+	}
+	if got, want := lines, []string{"def Shared := 0"}; !sameStrings(got, want) {
+		t.Fatalf("DeclarationLines() = %#v, want %#v", got, want)
+	}
+}

@@ -119,6 +119,11 @@ type pullRequestDetails struct {
 				MergeCommit *struct {
 					OID string `json:"oid"`
 				} `json:"mergeCommit"`
+				TimelineItems struct {
+					Nodes []struct {
+						Reason string `json:"reason"`
+					} `json:"nodes"`
+				} `json:"timelineItems"`
 			} `json:"pullRequest"`
 		} `json:"repository"`
 	} `json:"data"`
@@ -129,7 +134,7 @@ func (c GitHubCLI) enrich(ctx context.Context, repository string, wire pullReque
 	if !found || owner == "" || name == "" {
 		return PullRequest{}, fmt.Errorf("repository %q is not owner/name", repository)
 	}
-	query := `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{state} mergeCommit{oid}}}}`
+	query := `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{state} mergeCommit{oid} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason}}}}}}`
 	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "api", "graphql", "-f", "query="+query, "-F", "owner="+owner, "-F", "name="+name, "-F", fmt.Sprintf("number=%d", wire.Number))
 	if err != nil {
 		return PullRequest{}, fmt.Errorf("read pull request queue state: %w", err)
@@ -146,6 +151,12 @@ func (c GitHubCLI) enrich(ctx context.Context, repository string, wire pullReque
 	if details.Data.Repository.PullRequest.MergeQueueEntry != nil {
 		queueState = details.Data.Repository.PullRequest.MergeQueueEntry.State
 	}
+	removalReason := ""
+	for _, item := range details.Data.Repository.PullRequest.TimelineItems.Nodes {
+		if item.Reason != "" {
+			removalReason = item.Reason
+		}
+	}
 	switch strings.ToUpper(wire.State) {
 	case "MERGED":
 		if result.MergedCommit == "" {
@@ -155,9 +166,9 @@ func (c GitHubCLI) enrich(ctx context.Context, repository string, wire pullReque
 	case "CLOSED":
 		result.State = PullRequestClosed
 	case "OPEN":
-		if queueState == "FAILED" || (queueState == "" && strings.EqualFold(wire.MergeStateStatus, "DIRTY")) {
+		if queueState == "" && removalReason != "" {
 			result.State = PullRequestRemoved
-			result.Reason = "checks failed"
+			result.Reason = removalReason
 		} else {
 			result.State = PullRequestOpen
 		}

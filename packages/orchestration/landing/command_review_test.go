@@ -22,6 +22,19 @@ func TestReviewCommandBuilderClassifiesKilledProcessAsInfrastructure(t *testing.
 	}
 }
 
+func TestReviewCommandBuilderClassifiesNestedSignalAsInfrastructure(t *testing.T) {
+	repo, commit := commandRepository(t, false)
+	builder := CommandBuilder{RepositoryPath: repo, Command: []string{"sh", "-c", "sh -c 'kill -11 $$'"}}
+
+	result, err := builder.Build(context.Background(), Tree(commit), nil)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if result.InfraClass == "" {
+		t.Fatalf("Build() = %#v, want nested signal infrastructure class", result)
+	}
+}
+
 func TestReviewCommandBuilderMaterializesSymlink(t *testing.T) {
 	repo, commit := commandRepository(t, true)
 	builder := CommandBuilder{RepositoryPath: repo, Command: []string{"sh", "-c", "test -L Link.lean"}}

@@ -15,7 +15,7 @@ func TestReviewConfiguredPublicationRequiresAndWiresScoreEvents(t *testing.T) {
 		Build:          []string{"sh", "-c", "true"},
 		Hasher:         []string{"sh", "-c", "true"},
 		Toolchain:      []string{"sh", "-c", "printf tool"},
-		Ledger:         ledgerConfig{Check: []string{"sh", "-c", "printf '{\"pass\":true}'"}, Land: []string{"sh", "-c", "true"}, Return: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}},
+		Ledger:         ledgerConfig{Check: []string{"sh", "-c", "printf '{\"pass\":true}'"}, Land: []string{"sh", "-c", "true"}, Return: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, MigrationState: []string{"sh", "-c", "printf '{\"state\":\"open\"}'"}},
 		GitHub:         githubConfig{Remote: "origin"},
 		Score:          scoreConfig{Command: []string{"sh", "-c", "printf score"}, Commit: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, Path: "scores/out"},
 		Event:          eventConfig{Command: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}},

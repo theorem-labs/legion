@@ -68,7 +68,19 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 		if err != nil {
 			return err
 		}
-		if batch.State == landing.Green && runner.GitHub != nil {
+		if batch.State != landing.Green && batch.State != landing.Landed && batch.State != landing.Failed {
+			batches, err := runner.Reconcile(ctx)
+			if err != nil {
+				return err
+			}
+			for _, resumed := range batches {
+				if resumed.ID == batch.ID {
+					batch = resumed
+					break
+				}
+			}
+		}
+		if (batch.State == landing.Green || batch.State == landing.Publishing) && runner.GitHub != nil {
 			batch, err = runner.Publish(ctx, batch)
 			if err != nil {
 				return err
@@ -116,10 +128,11 @@ type checkConfig struct {
 	Command []string `json:"command"`
 }
 type ledgerConfig struct {
-	Check  []string `json:"check"`
-	Land   []string `json:"land"`
-	Return []string `json:"return"`
-	Status []string `json:"status"`
+	Check          []string `json:"check"`
+	Land           []string `json:"land"`
+	Return         []string `json:"return"`
+	Status         []string `json:"status"`
+	MigrationState []string `json:"migrationState"`
 }
 
 type githubConfig struct {
@@ -161,13 +174,13 @@ func (c config) runner() (landing.Runner, landing.Input, *landing.JSONStore, err
 	if c.Repository == "" || c.RepositoryPath == "" || c.Base == "" || c.BaseBranch == "" || c.StatePath == "" {
 		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("repository, repositoryPath, base, baseBranch, and statePath are required")
 	}
-	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Check) == 0 || len(c.Ledger.Land) == 0 || len(c.Ledger.Return) == 0 || len(c.Ledger.Status) == 0 {
-		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build, hasher, toolchain, and every ledger command including status are required")
+	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Check) == 0 || len(c.Ledger.Land) == 0 || len(c.Ledger.Return) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
+		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build, hasher, toolchain, and every ledger command including state are required")
 	}
 	store := &landing.JSONStore{Path: c.StatePath}
 	runner := landing.Runner{
 		Store:        store,
-		Ledger:       landing.CommandLedger{Directory: c.RepositoryPath, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status},
+		Ledger:       landing.CommandLedger{Directory: c.RepositoryPath, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
 		Builder:      landing.CommandBuilder{RepositoryPath: c.RepositoryPath, Command: c.Build},
 		Hasher:       landing.CommandHasher{Command: c.Hasher, Directory: c.RepositoryPath},
 		Git:          landing.RepositoryGit{Path: c.RepositoryPath},
@@ -523,7 +536,8 @@ func archiveInfraClass(ctx context.Context, err error) string {
 	if !errors.As(err, &exit) {
 		return "launch"
 	}
-	switch exit.ExitCode() {
+	code := exit.ExitCode()
+	switch code {
 	case -1:
 		return "killed"
 	case 124:
@@ -531,6 +545,9 @@ func archiveInfraClass(ctx context.Context, err error) string {
 	case 125, 137:
 		return "resource-kill"
 	default:
+		if code > 128 {
+			return "signal"
+		}
 		return ""
 	}
 }

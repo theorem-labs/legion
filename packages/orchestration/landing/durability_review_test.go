@@ -44,6 +44,34 @@ func TestReviewMergedBatchRemainsReconciliableAfterLedgerFailure(t *testing.T) {
 	}
 }
 
+func TestReviewReconcileKeepsRetryablePublishingBatch(t *testing.T) {
+	ledger := &flakyLedger{failLand: true}
+	store := &MemoryStore{}
+	runner := Runner{
+		Store:   store,
+		Ledger:  ledger,
+		Builder: &builderFake{},
+		Hasher:  hasherFake{},
+		Git:     newGitFake(),
+		GitHub:  &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+	}
+	batch := greenBatch()
+	batch.State = Publishing
+	batch.PullRequest = PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}
+	batch.MergeValidated = true
+	if err := store.Save(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed, err := runner.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v, want retryable publishing result", err)
+	}
+	if got, want := resumed[0].State, Publishing; got != want {
+		t.Fatalf("state = %q, want %q", got, want)
+	}
+}
+
 func TestReviewRunDoesNotOverwriteExistingBatchIdentity(t *testing.T) {
 	store := &MemoryStore{}
 	ledger := &ledgerFake{}
@@ -85,3 +113,7 @@ func (f *flakyLedger) Land(context.Context, LandRequest) error {
 	return nil
 }
 func (f *flakyLedger) ReturnMember(context.Context, string, string, int64, string) error { return nil }
+
+func (f *flakyLedger) MigrationState(context.Context, string, string) (string, string, error) {
+	return "open", "", nil
+}

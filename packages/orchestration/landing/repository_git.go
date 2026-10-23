@@ -77,10 +77,15 @@ func (g RepositoryGit) Diff(ctx context.Context, repository, base string, member
 	return diff, nil
 }
 
-// DeclarationLines returns lines in a tree that mention a declaration name.
+// DeclarationLines resolves a diagnostic name by its final component, then
+// filters exact declaration names with the original suffix-match rule.
 func (g RepositoryGit) DeclarationLines(ctx context.Context, repository string, tree Tree, name string) ([]string, error) {
 	repository = g.path(repository)
-	command := exec.CommandContext(ctx, "git", "-C", repository, "grep", "-h", "-I", "-F", name, string(tree), "--")
+	search := name
+	if index := strings.LastIndex(search, "."); index >= 0 {
+		search = search[index+1:]
+	}
+	command := exec.CommandContext(ctx, "git", "-C", repository, "grep", "-h", "-I", "-F", search, string(tree), "--")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		var exit *exec.ExitError
