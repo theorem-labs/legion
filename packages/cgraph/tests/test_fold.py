@@ -223,3 +223,11 @@ def test_a_store_no_pass_of_a_loop_that_runs_once_reads_is_not_computed(fold_bui
 def test_a_store_a_break_carries_to_the_next_loop_stays(fold_build: dict[str, Any]) -> None:
     """fd_enqueue_break: the break after slice = fd_min_slice(q) takes it to the second loop."""
     assert {"curr", "on", "sl"} <= folded_fields(fold_build, "fd_enqueue_break")
+
+
+def test_a_pointer_a_loop_steps_from_a_pointer_stays_a_pointer(fold_build: dict[str, Any]) -> None:
+    """fd_table_sum walks from its parameter: managed is 136 from the stepped register, which is no
+    longer the parameter after the first pass."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_table_sum"]
+    (item,) = [item for item in accesses if item["field"] == "managed"]
+    assert (item["base"], item["displacement"], item.get("param")) == ("pointer", 136, None)

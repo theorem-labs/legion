@@ -3544,8 +3544,10 @@ class _FunctionWalk:
         and the machine code may keep the member's address instead. The members of the definitions
         are folded away when every other use of the local is the base of a member access. A local a
         ``for`` header's step only steps by a constant (for_each_managed_zone_pgdat's ``zone =
-        pgdat->node_zones; ...; zone++``) points, inside that loop, where its definitions point on the
-        first pass; the register the loop steps holds it after that."""
+        pgdat->node_zones; ...; zone++``, from a container_of) points, inside that loop, where its
+        definitions point on the first pass; the register the loop steps holds it after that. From a
+        pointer or a global (a linker table's walk) it stays a pointer, which the structure check
+        follows by the element's step."""
         uses = self.local_uses()
         stepped = uses["stepped"][variable.hash]
         if uses["written"][variable.hash] > stepped:
@@ -3566,7 +3568,7 @@ class _FunctionWalk:
             walked = _agree(assigned)
             if walked is not None and walked.base == "container_of":
                 address = replace(own, inner=walked.bits)
-        if address is None or address.base == "unknown":
+        if address is None or address.base == "unknown" or (stepped and address.base != "container_of"):
             return None
         if stepped:
             address = replace(address, inner=0)

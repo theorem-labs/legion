@@ -311,6 +311,19 @@ long fd_zone_sum(struct list_node *vec, int high)
 	return sum;
 }
 
+/* drivers/of/of_reserved_mem.c __reserved_mem_init_node: for (i = __reservedmem_of_table; i <
+ * &__rmem_of_table_sentinel; i++) i->compatible walks a table from its start, not from a
+ * container_of: the pointer stays the base, and the code may hold the next element. */
+long fd_table_sum(struct fd_zone *table, struct fd_zone *end)
+{
+	struct fd_zone *zone;
+	long sum = 0;
+
+	for (zone = table; zone < end; zone++)
+		sum += fd_managed(zone);
+	return sum;
+}
+
 /* fs/read_write.c pos_from_hilo(high, low): (((loff_t)high << HALF_LONG_BITS) << HALF_LONG_BITS) |
  * low on rv64, where high is shifted out: __riscv_sys_preadv never loads pos_h. */
 struct fd_regs {

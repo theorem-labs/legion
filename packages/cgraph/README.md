@@ -193,8 +193,10 @@ These rules follow what the machine code shows, each only where it shows it:
   stored in its body reaches a later such loop on the same variable only through a break or goto
   after the store, so a store no pass reads is not computed: `enqueue_task_fair`'s `slice =
   cfs_rq_min_slice(cfs_rq)`; a local the header's step only steps by a constant, as
-  `for_each_managed_zone_pgdat`'s `zone++`, is derived inside that loop as its first pass, with the
-  stepped register as `inner_displacement`), without null pointers (`for (; se; se = NULL)`, a
+  `for_each_managed_zone_pgdat`'s `zone++` from a container_of, is derived inside that loop as its
+  first pass, with the stepped register as `inner_displacement`; from a pointer or a global it stays a
+  pointer, which the check follows by the element's step), without null pointers (`for (; se; se =
+  NULL)`, a
   helper that returns
   NULL), through `?:`, `({ ... })`, `_Generic`, pointer arithmetic, an array's decay, and the return
   of any helper of the unit. A helper not declared inline, one that returns NULL or an address (a
