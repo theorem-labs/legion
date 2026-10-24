@@ -199,3 +199,16 @@ def test_a_value_whose_only_effects_the_image_decides_is_left_to_the_image(
     assert {(item["field"], item.get("conditional")) for item in events["field_accesses"]} == {("bits", True)}
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert "function:fd_cpu_dead" not in {entry["function"] for entry in offsets["misses"]}
+
+
+@pytest.mark.parametrize("function", ["fd_mkclean", "fd_mkclean_read"])
+def test_a_value_stored_only_into_a_local_nothing_reads_is_not_computed(
+    fold_build: dict[str, Any], function: str
+) -> None:
+    """fd_mkclean: ld a0, 0x0(a0); tail obj_free (llvm-objdump): range is never read, so the value
+    fd_address_end gives it, and that helper's read of nr, are not code. fd_mkclean_read returns
+    range.end, which needs nr: ld a1, 0x8(a0). The stores into range are the local object's either way,
+    which the frame check holds."""
+    fields = folded_fields(fold_build, function)
+    assert ("nr" in fields) == (function == "fd_mkclean_read")
+    assert "address" in fields

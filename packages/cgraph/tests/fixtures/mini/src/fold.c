@@ -426,3 +426,49 @@ int fd_cpu_dead(struct fd_cpus *online, int node)
 	fd_clear_state(node);
 	return 0;
 }
+
+/* mm/rmap.c page_vma_mkclean_one without MMU_NOTIFIER: mmu_notifier_range_init(&range, ..., address,
+ * vma_address_end(pvmw)) only stores into range, which nothing reads, so vma_address_end's reads are
+ * not computed (llvm-objdump: ld a0, 0x0(a0); tail obj_free). */
+struct fd_range {
+	unsigned long start;
+	unsigned long end;
+};
+struct fd_pvmw {
+	unsigned long address;
+	unsigned long nr;
+};
+
+static inline void fd_range_init(struct fd_range *r, unsigned long start, unsigned long end)
+{
+	r->start = start;
+	r->end = end;
+}
+
+static inline void fd_range_start(struct fd_range *r)
+{
+}
+
+static inline unsigned long fd_address_end(struct fd_pvmw *w)
+{
+	return w->address + (w->nr << 12);
+}
+
+void fd_mkclean(struct fd_pvmw *w)
+{
+	struct fd_range range;
+	unsigned long address = w->address;
+
+	fd_range_init(&range, address, fd_address_end(w));
+	fd_range_start(&range);
+	obj_free((void *)address);
+}
+
+/* The same range read afterwards: the stores and their values are code. */
+unsigned long fd_mkclean_read(struct fd_pvmw *w)
+{
+	struct fd_range range;
+
+	fd_range_init(&range, w->address, fd_address_end(w));
+	return range.end;
+}

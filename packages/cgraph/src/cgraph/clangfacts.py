@@ -473,6 +473,7 @@ class _Extractor:
         self.returned: dict[str, _Address | None] = {}
         self.returned_bits: dict[str, int | None] = {}
         self.cancel_cache: dict[tuple[str, int, int], bool] = {}
+        self.stored_cache: dict[str, tuple[frozenset[int], dict[int, frozenset[int]]]] = {}
         self.null_helpers: set[str] = set()  # the helpers whose every return is a null pointer
         self.nullable_helpers: set[str] = set()  # the helpers that return a null pointer or an address
         self.texts: dict[Path, bytes] = {}
@@ -997,6 +998,47 @@ class _Extractor:
         result = frozenset(position for position, parameter in enumerate(parameters) if parameter.hash in never_read)
         self.ignored_cache[name] = (result, self.horizon(start))
         return result
+
+    def stored_parameters(self, callee: ci.Cursor | None) -> tuple[frozenset[int], dict[int, frozenset[int]]]:
+        """An inline function's parameters that compiled code only stores through (``r->end = end``:
+        r), and the parameters it reads only as the value of such stores, each with the positions it
+        is stored through (end: {r}). Where a caller passes the address of a local nothing reads, those
+        stores and the values they store are not computed (page_vma_mkclean_one's
+        ``mmu_notifier_range_init(&range, ..., vma_address_end(pvmw))`` without MMU_NOTIFIER)."""
+        none: tuple[frozenset[int], dict[int, frozenset[int]]] = (frozenset(), {})
+        if callee is None or callee.kind != K.FUNCTION_DECL or not self.inline_function(callee.spelling):
+            return none
+        name = callee.spelling
+        if name in self.stored_cache:
+            return self.stored_cache[name]
+        definition = self.evaluator.definitions.get(name)
+        if definition is None or self.is_weak(definition) or not self.may_follow(name):
+            return none
+        self.nesting += 1
+        try:
+            walk = self.analysis(definition)
+        finally:
+            self.nesting -= 1
+        walk.local_uses()
+        parameters = list(definition.get_arguments() or [])
+        positions = {parameter.hash: index for index, parameter in enumerate(parameters)}
+        written = frozenset(
+            index
+            for index, parameter in enumerate(parameters)
+            if walk.read_sites.get(parameter.hash)
+            and all(walk.store_base(site) is not None for site in walk.read_sites[parameter.hash])
+        )
+        stored: dict[int, frozenset[int]] = {}
+        for index, parameter in enumerate(parameters):
+            sites = walk.read_sites.get(parameter.hash, [])
+            if index in written or not sites:
+                continue
+            through = [walk.stored_through(site) for site in sites]
+            bases = {positions.get(base.hash) if base is not None else None for base in through}
+            if bases and None not in bases and bases <= written:
+                stored[index] = frozenset(position for position in bases if position is not None)
+        self.stored_cache[name] = (written, stored)
+        return written, stored
 
     def may_follow(self, name: str) -> bool:
         """A call may be followed into its callee: not a recursion, and not past _EFFECT_DEPTH. A cut
@@ -1641,6 +1683,16 @@ _OVERFLOW_BUILTIN = re.compile(r"__builtin_[su]?(add|sub|mul)(l|ll)?_overflow")
 def _is_overflow_builtin(name: str) -> bool:
     """``__builtin_mul_overflow(a, b, &r)`` and its typed forms: a value, and a store into ``*r``."""
     return _OVERFLOW_BUILTIN.fullmatch(name) is not None
+
+
+def _whole_local_address(expression: ci.Cursor) -> ci.Cursor | None:
+    """The local ``v`` of ``&v``, a parameter or a local that is not static, or None."""
+    node = _strip(expression)
+    if node.kind != K.UNARY_OPERATOR or not libclang.is_address_of(node) or not _children(node):
+        return None
+    operand = _strip(_children(node)[0])
+    variable = operand.referenced if operand.kind == K.DECL_REF_EXPR else None
+    return variable if _is_local(variable) else None
 
 
 def _address_of_local(expression: ci.Cursor, own: set[int] | None) -> bool:
@@ -3755,6 +3807,57 @@ class _FunctionWalk:
         ]
         return bool(uses) and all(self.cancelled(node, bits, depth + 1) for node in uses)
 
+    def climb(self, node: ci.Cursor) -> tuple[ci.Cursor, ci.Cursor | None]:
+        """``node`` past the parentheses and implicit conversions around it, and its parent there."""
+        child, parent = node, self.parents.get(node.hash)
+        while parent is not None and parent.kind in (K.PAREN_EXPR, K.UNEXPOSED_EXPR) and len(_children(parent)) == 1:
+            child, parent = parent, self.parents.get(parent.hash)
+        return child, parent
+
+    def store_base(self, reference: ci.Cursor) -> ci.Cursor | None:
+        """The plain assignment a pointer ``reference`` is only the base of the target of (``p->a.b =
+        v``, ``*p = v``, ``p[i] = v``), or None."""
+        child, parent = self.climb(reference)
+        if parent is None:
+            return None
+        if parent.kind == K.MEMBER_REF_EXPR and child.type.get_canonical().kind != TK.POINTER:
+            return None
+        if not (
+            parent.kind == K.MEMBER_REF_EXPR
+            or (parent.kind == K.UNARY_OPERATOR and libclang.unary_kind(parent) == _DEREF)
+            or (parent.kind == K.ARRAY_SUBSCRIPT_EXPR and _children(parent)[0].hash == child.hash)
+        ):
+            return None
+        child, parent = self.climb(parent)
+        while parent is not None and (
+            (parent.kind == K.MEMBER_REF_EXPR and child.type.get_canonical().kind != TK.POINTER)
+            or (parent.kind == K.ARRAY_SUBSCRIPT_EXPR and _children(parent)[0].hash == child.hash)
+        ):
+            child, parent = self.climb(parent)
+        if parent is None or not _is_plain_assignment(parent) or _children(parent)[0].hash != child.hash:
+            return None
+        return parent
+
+    def stored_through(self, reference: ci.Cursor) -> ci.Cursor | None:
+        """The variable whose pointee ``reference`` is the stored value of (``r->end = end``: r), where
+        the value is exactly the reference, or None."""
+        child, parent = self.climb(reference)
+        while parent is not None and parent.kind == K.CSTYLE_CAST_EXPR:
+            child, parent = self.climb(parent)
+        if parent is None or not _is_plain_assignment(parent) or _children(parent)[1].hash != child.hash:
+            return None
+        node = _strip(_children(parent)[0])
+        while node.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR, K.UNARY_OPERATOR) and _children(node):
+            base = _strip(_children(node)[0])
+            if node.kind == K.UNARY_OPERATOR and libclang.unary_kind(node) != _DEREF:
+                return None
+            if base.kind == K.DECL_REF_EXPR and (
+                node.kind != K.MEMBER_REF_EXPR or base.type.get_canonical().kind == TK.POINTER
+            ):
+                return base.referenced
+            node = base
+        return None
+
     def same_value(self, left: ci.Cursor, right: ci.Cursor) -> bool:
         """Two locals or parameters that hold one value: the same one, or one whose every store in
         compiled code copies the other, whose own value no compiled store changes (page_cache_ra_order's
@@ -4885,11 +4988,25 @@ class _FunctionWalk:
             # The children are the callee, then the arguments in order: libclang's cursors for one
             # argument from get_arguments and from the children do not compare equal.
             offset = len(children) - len(arguments)
+            written, stored = self.x.stored_parameters(node.referenced) if reason is None else (frozenset(), {})
+            targets = {
+                position: local
+                for position, argument in enumerate(arguments)
+                if position in written and (local := _whole_local_address(argument)) is not None
+            }
+            dead_targets = {position for position, local in targets.items() if local.hash in self.dead_variables}
             for child_index, child in enumerate(children):
                 position = child_index - offset if child_index >= offset else None
                 if position is not None and reason is None and node.referenced is not None:
                     self.mark_cancelled(child, node.referenced.spelling, position)
-                if position is None or not (position in ignored or (variadic and position >= named)):
+                if position is not None and position in targets:
+                    # &local where the inline callee only stores through the parameter
+                    # (_mmu_notifier_range_init(&range, ...)): the local is not read there.
+                    self.walk(child, node, child_index, "stored_only", generic)
+                elif position is not None and position in stored and stored[position] <= dead_targets:
+                    # A value the inline callee only stores into a local nothing reads.
+                    self.discard(child, node, child_index, generic, "ignored_argument")
+                elif position is None or not (position in ignored or (variadic and position >= named)):
                     self.walk(child, node, child_index, reason, generic)
                 elif inline:
                     # A value only a parameter the inline callee never reads receives: only its
