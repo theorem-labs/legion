@@ -264,19 +264,21 @@ func TestDeclarationEvidenceReadsRemovalsFromRenamedFiles(t *testing.T) {
 	wantEvidence(t, evidence, blame.Name{Value: "keep1", Kind: blame.Added}, 2, "restated")
 }
 
-// Git quotes a path with non-ASCII bytes unless it is asked for raw paths;
-// the adapter reads such a file in a member's diff and in a tree.
+// Git quotes a path with non-ASCII bytes unless it is asked for raw paths,
+// as in the `---` and `+++` headers of the -U0 diff; the adapter reads such a
+// file in a member's diff and in a tree.
 func TestDeclarationEvidenceReadsNonASCIIPaths(t *testing.T) {
 	const path = "Alpha é.lean"
 	repo, baseCommit, head := memberRepository(t,
-		map[string]string{path: "def gone := 0\ndef kept := 1\n"},
-		map[string]string{path: "def kept := 1\n"},
+		map[string]string{path: "def gone := 0\ndef kept : Nat :=\n  1\n"},
+		map[string]string{path: "def kept : Nat :=\n  2\n"},
 	)
 	evidence, err := (RepositoryGit{}).DeclarationEvidence(context.Background(), repo, baseCommit, Member{Migration: "member", Head: head})
 	if err != nil {
 		t.Fatalf("DeclarationEvidence() error = %v", err)
 	}
 	wantEvidence(t, evidence, blame.Name{Value: "gone", Kind: blame.Unknown}, 3, "removed")
+	wantEvidence(t, evidence, blame.Name{Value: "kept", Kind: blame.Changed}, 2, "edited")
 
 	declarations, err := (RepositoryGit{}).TreeDeclarations(context.Background(), repo, Tree(baseCommit))
 	if err != nil {
