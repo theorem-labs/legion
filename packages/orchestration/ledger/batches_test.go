@@ -457,8 +457,8 @@ func TestListActiveBatchesListsWhatARestartMustFinish(t *testing.T) {
 	if successor := must(s.LoadBatch(ctx, "r", "declined-empty-successor")).Successor; successor != "" {
 		t.Fatalf("a batch stored with an empty successor loads with successor %q", successor)
 	}
-	// No call writes an effect yet: LandBatch and ResolveBatch record a landed batch's effects (plan task L8c). The
-	// test writes them directly to check the listing rule for a terminal batch with an effect still to do.
+	// No call writes an effect yet: LandBatch and ResolveBatch record a landed batch's effects. The test writes them
+	// directly to check the listing rule for a terminal batch with an effect still to do.
 	batchSQL(t, dsn, `INSERT INTO batch_effects (repo, batch, key, op, state) VALUES
 		('r', 'landed-with-effects', 'hook/landed-with-effects/1/score', 'hook', 'intent'),
 		('r', 'landed-with-effects', 'hook/landed-with-effects/0/report', 'hook', 'intent'),
