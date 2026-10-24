@@ -27,14 +27,15 @@ type batchCLI struct {
 }
 
 type cliBatch struct {
-	Repo           string          `json:"repo"`
-	ID             string          `json:"id"`
-	Phase          string          `json:"phase"`
-	Record         json.RawMessage `json:"record"`
-	RecordVersion  int64           `json:"record_version"`
-	Admission      string          `json:"admission"`
-	Successor      string          `json:"successor"`
-	PendingEffects []string        `json:"pending_effects"`
+	Repo            string          `json:"repo"`
+	ID              string          `json:"id"`
+	Phase           string          `json:"phase"`
+	Record          json.RawMessage `json:"record"`
+	RecordVersion   int64           `json:"record_version"`
+	Admission       string          `json:"admission"`
+	AdmissionDigest string          `json:"admission_digest"`
+	Successor       string          `json:"successor"`
+	PendingEffects  []string        `json:"pending_effects"`
 }
 
 type cliCreated struct {
