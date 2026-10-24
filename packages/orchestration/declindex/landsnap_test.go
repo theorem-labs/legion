@@ -2,6 +2,7 @@ package declindex
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -27,12 +28,12 @@ func TestLandSnapshotCarriesSourcesModulesAndRequestedDeclarations(t *testing.T)
 	if got, want := snapshot.Sources["Golden.lean"], gitIn(t, tree.Source, "hash-object", "--", "Golden.lean"); got != want {
 		t.Errorf("Golden.lean blob = %q, want %q", got, want)
 	}
-	if got := snapshot.Modules["Sub/Wrap"]; got.Module != "Sub.Wrap" {
-		t.Errorf("Sub/Wrap module = %+v, want Sub.Wrap", got)
+	if want := map[string]bool{"Golden": true, "Sub/Wrap": true}; !reflect.DeepEqual(snapshot.Modules, want) {
+		t.Errorf("modules = %v, want %v", snapshot.Modules, want)
 	}
 	decls := snapshot.Declarations["Gold2.FrameAt"]
-	if len(decls) != 1 || decls[0].Path != "Sub/Wrap.lean" || decls[0].StmtHash == "" {
-		t.Errorf("Gold2.FrameAt = %+v, want one hashed declaration in Sub/Wrap.lean", decls)
+	if len(decls) != 1 || decls[0].Module != "Sub.Wrap" || decls[0].Path != "Sub/Wrap.lean" || decls[0].StmtHash == "" {
+		t.Errorf("Gold2.FrameAt = %+v, want one hashed declaration of module Sub.Wrap in Sub/Wrap.lean", decls)
 	}
 	if got := snapshot.Declarations["Gold.Missing"]; len(got) != 0 {
 		t.Errorf("Gold.Missing = %+v, want none", got)

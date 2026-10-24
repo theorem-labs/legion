@@ -4,16 +4,22 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"os"
-	"os/exec"
+	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
@@ -40,9 +46,10 @@ Commands:
                                {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>}
   ledger [--dsn-file PATH | --contracts-file FILE --emit FILE]
                                check the ledger and newly landed registry concepts; file mode emits registrations
-                               for the landing program and never connects to the ledger
+                               and near pairs for the landing program and never connects to the ledger
   land-hash                    the landing program's hasher: LAND_TREE, LAND_GIT_DIR, LAND_NAMES or LAND_NAMES_FILE
-                               (a matching JSON array) in; name<TAB>hash<TAB>path out
+                               (a matching JSON array), and LAND_BUILD_DIR for changed sources in;
+                               name<TAB>hash<TAB>path out
 
 NAME is a full name or any dotted suffix of one. A name declared twice is answered once per declaration.
 Exit codes:
@@ -54,7 +61,7 @@ Exit codes:
   states: 0 answered; 1 name not found; 2 usage; 3 unable
   same: 0 answered; 1 name not found; 2 usage; 3 unable
   gate: 0 added; 1 duplicate; 2 usage; 3 unable; 4 near; 5 name taken
-  ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry
+  ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry (also when the registry recheck of a landing cannot run)
   land-hash: 0 answered; 2 usage; 3 unable`
 
 type usageError struct{ msg string }
@@ -67,13 +74,18 @@ type unableError struct{ err error }
 func (e *unableError) Error() string { return e.err.Error() }
 func (e *unableError) Unwrap() error { return e.err }
 
+// main cancels the command on SIGTERM, SIGINT or SIGHUP, so that the build and the toolchain processes it started
+// are killed with their process groups before it exits, rather than left running without it.
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	code := run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
 type globals struct {
-	config, db, tree string
-	json             bool
+	config, db string
+	json       bool
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
@@ -87,17 +99,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 			g.json = true
 			args = args[1:]
 			continue
-		case "--config", "--db", "--tree":
+		case "--config", "--db":
 			if len(args) < 2 {
 				return fail(stderr, &usageError{args[0] + " needs a value"})
 			}
-			switch args[0] {
-			case "--config":
+			if args[0] == "--config" {
 				g.config = args[1]
-			case "--db":
+			} else {
 				g.db = args[1]
-			default:
-				g.tree = args[1]
 			}
 			args = args[2:]
 			continue
@@ -124,13 +133,18 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if g.db != "" {
 		cfg.DB = g.db
 	}
-	if g.tree != "" {
-		cfg.Tree = g.tree
-	}
 	if cfg.DB == "" {
 		return fail(stderr, &usageError{declindex.ErrNoDB.Error()})
 	}
-	return commands[cmd](ctx, &env{g: g, cfg: cfg, stdout: stdout, stderr: stderr, getenv: getenv}, rest)
+	// A command writes its output here and returns, closing the index, before anything reads the output: a
+	// command's snapshot of the index holds up a refresh's write (declindex.OpenReadOnly), so a slow reader of the
+	// output must not hold the snapshot.
+	var out bytes.Buffer
+	code := commands[cmd](ctx, &env{g: g, cfg: cfg, stdout: &out, stderr: stderr, getenv: getenv}, rest)
+	if _, err := out.WriteTo(stdout); err != nil && code == 0 {
+		return fail(stderr, &unableError{err})
+	}
+	return code
 }
 
 type env struct {
@@ -142,12 +156,14 @@ type env struct {
 	store  *declindex.Store
 }
 
-func (e *env) open(needIndex bool) error {
-	return e.openWith(needIndex, declindex.Open)
+func (e *env) open() error {
+	return e.openWith(false, declindex.Open)
 }
 
-func (e *env) openReadOnly(needIndex bool) error {
-	return e.openWith(needIndex, declindex.OpenReadOnly)
+// openReadOnly opens the index without writing it or its directory, which the landing hooks mount read-only: one
+// snapshot of it, until close (declindex.OpenReadOnly). scope is what the command reads besides the index.
+func (e *env) openReadOnly(ctx context.Context, scope declindex.ReadScope, needIndex bool) error {
+	return e.openWith(needIndex, func(path string) (*declindex.Store, error) { return declindex.OpenReadOnly(ctx, path, scope) })
 }
 
 func (e *env) openWith(needIndex bool, open func(string) (*declindex.Store, error)) error {
@@ -159,17 +175,8 @@ func (e *env) openWith(needIndex bool, open func(string) (*declindex.Store, erro
 	if !needIndex {
 		return nil
 	}
-	built, err := s.Meta(context.Background(), "built")
-	if err != nil {
+	if err := s.CheckComplete(context.Background()); err != nil {
 		return &unableError{err}
-	}
-	if built == "" {
-		return &unableError{fmt.Errorf("the index at %s was never refreshed: run declindex refresh", e.cfg.DB)}
-	}
-	if n, err := s.Meta(context.Background(), "errors"); err != nil {
-		return &unableError{err}
-	} else if n != "0" {
-		return &unableError{fmt.Errorf("the index at %s is incomplete: %s modules' reference files could not be read", e.cfg.DB, n)}
 	}
 	return nil
 }
@@ -180,21 +187,17 @@ func (e *env) close() {
 	}
 }
 
-var commands map[string]func(context.Context, *env, []string) int
-
-func init() {
-	commands = map[string]func(context.Context, *env, []string) int{
-		"refresh":   cmdRefresh,
-		"status":    cmdStatus,
-		"where":     cmdWhere,
-		"users":     cmdUsers,
-		"hash":      cmdHash,
-		"states":    cmdStates,
-		"same":      cmdSame,
-		"gate":      cmdGate,
-		"ledger":    cmdLedger,
-		"land-hash": cmdLandHash,
-	}
+var commands = map[string]func(context.Context, *env, []string) int{
+	"refresh":   cmdRefresh,
+	"status":    cmdStatus,
+	"where":     cmdWhere,
+	"users":     cmdUsers,
+	"hash":      cmdHash,
+	"states":    cmdStates,
+	"same":      cmdSame,
+	"gate":      cmdGate,
+	"ledger":    cmdLedger,
+	"land-hash": cmdLandHash,
 }
 
 func fail(w io.Writer, err error) int {
@@ -215,14 +218,6 @@ func fail(w io.Writer, err error) int {
 	}
 }
 
-func treeHead(tree string) string {
-	out, err := exec.Command("git", "-C", tree, "rev-parse", "HEAD").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 func (e *env) printJSON(v any) int {
 	enc := json.NewEncoder(e.stdout)
 	enc.SetIndent("", " ")
@@ -232,42 +227,56 @@ func (e *env) printJSON(v any) int {
 	return 0
 }
 
+// printJSONOr prints v as JSON and gives rc, or the exit code of a failed print.
+func (e *env) printJSONOr(v any, rc int) int {
+	if c := e.printJSON(v); c != 0 {
+		return c
+	}
+	return rc
+}
+
+// resolve gives the declarations that q names. A name that names none is reported on stderr and sets *rc to 1;
+// the second result is non-zero, an exit code, only when the index cannot answer.
+func (e *env) resolve(ctx context.Context, q string, rc *int) ([]declindex.Found, int) {
+	found, err := e.store.Resolve(ctx, q)
+	if err != nil {
+		return nil, fail(e.stderr, &unableError{err})
+	}
+	if len(found) == 0 {
+		*rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
+	}
+	return found, 0
+}
+
 func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"refresh takes no arguments"})
 	}
-	if err := e.open(false); err != nil {
+	if err := e.open(); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
 	tree := e.cfg.TreeSpec()
-	opt := declindex.RefreshOptions{Commit: treeHead(e.cfg.Tree), Jobs: e.cfg.Jobs, Log: e.stderr}
+	opt := declindex.RefreshOptions{Jobs: e.cfg.Jobs, Log: e.stderr}
 	var sync func(context.Context) error
 	if commit := e.getenv("LAND_COMMIT"); commit != "" {
-		if !isCommitID(commit) {
-			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 hexadecimal characters"})
+		if !declindex.IsObjectID(commit) {
+			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 lowercase hexadecimal characters"})
 		}
-		previous, err := e.store.Meta(ctx, "commit")
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		opt.Commit, opt.PreviousCommit, opt.CheckLandedCoverage = commit, previous, true
+		opt.Commit, opt.CheckLandedCoverage = commit, true
 		sync = declindex.Sync(e.cfg, commit, e.stderr)
+	} else if head, err := declindex.TreeHead(ctx, e.cfg.Tree); err != nil {
+		// A build outside Git is indexed without a commit, which no ledger or gate check accepts.
+		fmt.Fprintf(e.stderr, "note: the index records no commit: %v\n", err)
+	} else {
+		opt.Commit = head
+	}
+	if e.cfg.Lean.Export {
+		opt.Compiled = func(ctx context.Context) (*declindex.CompiledOptions, error) { return compiledOptions(ctx, e) }
 	}
 	st, err := e.store.RefreshAt(ctx, tree, opt, sync)
 	if errors.Is(err, declindex.ErrAlreadyPast) {
 		return 0
-	}
-	if err == nil && e.cfg.Lean.Export {
-		// The forms module imports the registered concepts' modules, which the index knows only once the
-		// reference files are read: the compiled part runs second.
-		var co *declindex.CompiledOptions
-		if co, err = compiledOptions(ctx, e); err == nil {
-			opt.Compiled = co
-			var cst declindex.RefreshStats
-			cst, err = e.store.Refresh(ctx, tree, opt)
-			st.Exported, st.Rematched, st.Elapsed = cst.Exported, cst.Rematched, st.Elapsed+cst.Elapsed
-		}
 	}
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
@@ -283,18 +292,6 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	return 0
 }
 
-func isCommitID(commit string) bool {
-	if len(commit) != 40 {
-		return false
-	}
-	for _, r := range commit {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
-			return false
-		}
-	}
-	return true
-}
-
 type status struct {
 	Commit   string `json:"commit"`
 	Built    string `json:"built"`
@@ -307,7 +304,7 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"status takes no arguments"})
 	}
-	if err := e.open(false); err != nil {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, false); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -321,7 +318,9 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	if st.Modules, err = e.store.ModuleCount(ctx); err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	st.TreeHead = treeHead(e.cfg.Tree)
+	if st.TreeHead, err = declindex.TreeHead(ctx, e.cfg.Tree); err != nil {
+		fmt.Fprintf(e.stderr, "note: %v\n", err)
+	}
 	if e.g.json {
 		return e.printJSON(st)
 	}
@@ -330,13 +329,35 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	return 0
 }
 
-// staleNote warns when the build the index read is not the tree's current commit.
-func (e *env) staleNote(ctx context.Context) string {
-	c, _ := e.store.Meta(ctx, "commit")
-	if h := treeHead(e.cfg.Tree); h != "" && c != h {
+// staleNote reads the index's commit, and warns when the build the index read is not the tree's current commit, or
+// when the tree's commit cannot be read.
+func (e *env) staleNote(ctx context.Context) (string, error) {
+	c, err := e.store.Meta(ctx, "commit")
+	if err != nil {
+		return "", err
+	}
+	switch h, err := declindex.TreeHead(ctx, e.cfg.Tree); {
+	case err != nil:
+		fmt.Fprintf(e.stderr, "note: cannot compare the index's commit with the tree's: %v\n", err)
+	case c != h:
 		fmt.Fprintf(e.stderr, "note: the index is at %s, the tree at %s; run declindex refresh after the build\n", short(c), short(h))
 	}
-	return c
+	return c, nil
+}
+
+// openQuery opens the index read-only for a query and notes a stale commit (staleNote). It gives the index's commit
+// and -1, or the exit code of a failure that it has reported, having closed the index it opened.
+func (e *env) openQuery(ctx context.Context) (string, int) {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
+		return "", fail(e.stderr, err)
+	}
+	commit, err := e.staleNote(ctx)
+	if err != nil {
+		code := fail(e.stderr, &unableError{err})
+		e.close()
+		return "", code
+	}
+	return commit, -1
 }
 
 func short(c string) string { return c[:min(9, len(c))] }
@@ -358,29 +379,21 @@ func cmdWhere(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.open(true); err != nil {
-		return fail(e.stderr, err)
+	if _, code = e.openQuery(ctx); code >= 0 {
+		return code
 	}
 	defer e.close()
-	e.staleNote(ctx)
 	var all []declindex.Found
 	rc := 0
 	for _, q := range qs {
-		found, err := e.store.Resolve(ctx, q)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		if len(found) == 0 {
-			rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
-			continue
+		found, code := e.resolve(ctx, q, &rc)
+		if code != 0 {
+			return code
 		}
 		all = append(all, found...)
 	}
 	if e.g.json {
-		if c := e.printJSON(all); c != 0 {
-			return c
-		}
-		return rc
+		return e.printJSONOr(all, rc)
 	}
 	for _, f := range all {
 		fmt.Fprintf(e.stdout, "%s\t%s\t%s\t%s\n", f.Name, f.Kind, f.Module, f.At())
@@ -393,11 +406,10 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.open(true); err != nil {
-		return fail(e.stderr, err)
+	if _, code = e.openQuery(ctx); code >= 0 {
+		return code
 	}
 	defer e.close()
-	e.staleNote(ctx)
 	rc := 0
 	type hashed struct {
 		Declaration string `json:"declaration"`
@@ -406,13 +418,9 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 	}
 	var out []hashed
 	for _, q := range qs {
-		found, err := e.store.Resolve(ctx, q)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		if len(found) == 0 {
-			rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
-			continue
+		found, code := e.resolve(ctx, q, &rc)
+		if code != 0 {
+			return code
 		}
 		for _, f := range found {
 			out = append(out, hashed{f.Name, f.StmtHash, f.At()})
@@ -423,10 +431,7 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 		}
 	}
 	if e.g.json {
-		if c := e.printJSON(out); c != 0 {
-			return c
-		}
-		return rc
+		return e.printJSONOr(out, rc)
 	}
 	for _, h := range out {
 		hash := h.Hash
@@ -466,21 +471,17 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.open(true); err != nil {
-		return fail(e.stderr, err)
+	commit, code := e.openQuery(ctx)
+	if code >= 0 {
+		return code
 	}
 	defer e.close()
-	commit := e.staleNote(ctx)
 	rc := 0
 	var answers []declindex.Answer
 	for _, q := range qs {
-		found, err := e.store.Resolve(ctx, q)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		if len(found) == 0 {
-			rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
-			continue
+		found, code := e.resolve(ctx, q, &rc)
+		if code != 0 {
+			return code
 		}
 		if len(found) > 1 && !e.g.json {
 			fmt.Fprintf(e.stdout, "%s: %d declarations share this name; each is answered separately\n", q, len(found))
@@ -497,16 +498,14 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 		}
 	}
 	if e.g.json {
-		if c := e.printJSON(map[string]any{"index": commit, "answers": answers}); c != 0 {
-			return c
-		}
+		return e.printJSONOr(map[string]any{"index": commit, "answers": answers}, rc)
 	}
 	return rc
 }
 
 func show(w io.Writer, a declindex.Answer, limit int) {
 	if limit == 0 {
-		limit = int(^uint(0) >> 1)
+		limit = math.MaxInt
 	}
 	d, r := a.Direct, a.Reach
 	fmt.Fprintf(w, "%s  (%s)  %s\n", a.Declaration, a.Kind, a.At)
@@ -525,11 +524,8 @@ func show(w io.Writer, a declindex.Answer, limit int) {
 		}
 		dirs = append(dirs, dir{name, t, ks})
 	}
-	sort.Slice(dirs, func(i, j int) bool {
-		if dirs[i].total != dirs[j].total {
-			return dirs[i].total > dirs[j].total
-		}
-		return dirs[i].name < dirs[j].name
+	slices.SortFunc(dirs, func(a, b dir) int {
+		return cmp.Or(cmp.Compare(b.total, a.total), strings.Compare(a.name, b.name))
 	})
 	for i, dd := range dirs {
 		if i == limit {
@@ -546,19 +542,12 @@ func show(w io.Writer, a declindex.Answer, limit int) {
 	fmt.Fprintf(w, "  reach of a change to its statement: %d statements change (%d directories), %d proofs to redo "+
 		"(%d directories); %d directories in all\n", r.StatementsChanged, r.StatementDirectories, r.ProofsToRedo,
 		r.ProofDirectories, r.AllDirectories)
-	if r.Why != nil {
-		var ds []string
-		for k := range r.Why {
-			ds = append(ds, k)
+	for i, k := range slices.Sorted(maps.Keys(r.Why)) {
+		if i == limit {
+			fmt.Fprintf(w, "    ... %d more (--limit 0 for all)\n", len(r.Why)-limit)
+			break
 		}
-		sort.Strings(ds)
-		for i, k := range ds {
-			if i == limit {
-				fmt.Fprintf(w, "    ... %d more (--limit 0 for all)\n", len(ds)-limit)
-				break
-			}
-			fmt.Fprintf(w, "    %s: %s\n", k, r.Why[k])
-		}
+		fmt.Fprintf(w, "    %s: %s\n", k, r.Why[k])
 	}
 	for _, l := range a.Lines {
 		fmt.Fprintln(w, "    "+l)

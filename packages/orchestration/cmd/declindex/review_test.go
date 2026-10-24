@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +45,11 @@ func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 	if err := os.WriteFile(config, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The ledger compares the index's commit with the tree's, so the tree is a Git work tree.
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "one")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}
@@ -126,11 +132,15 @@ func TestAModuleNewerThanItsBuildStopsQueriesAndTheLedger(t *testing.T) {
 	}
 }
 
-// On a machine whose sandbox is unavailable (here Landlock ABI 2, which does not govern truncation), the gate is
-// unable to decide before it starts anything: no Lean process, no exporter build, even with nothing cached.
+// On a machine whose sandbox is unavailable (here as confine reports Landlock ABI 2, which does not govern
+// truncation; confine's TestALandlockWithoutTruncationIsNoSandbox shows that such a kernel has no sandbox), the
+// gate is unable to decide before it starts anything: no Lean process, no exporter build, even with nothing cached.
 func TestGateStartsNoLeanWithoutASandbox(t *testing.T) {
-	restore := confine.SetLandlockABIForTest(2, nil)
-	defer restore()
+	old := gateSandboxAvailable
+	gateSandboxAvailable = func() error {
+		return fmt.Errorf("%w: Landlock ABI 2 does not govern truncation; ABI 3 (Linux 6.2) is needed", confine.ErrUnavailable)
+	}
+	t.Cleanup(func() { gateSandboxAvailable = old })
 	config := fixture(t)
 	dir := filepath.Dir(config)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {

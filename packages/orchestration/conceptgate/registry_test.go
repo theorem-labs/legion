@@ -104,11 +104,75 @@ func TestLoadRefusesFormatOne(t *testing.T) {
 	}
 }
 
-func TestLoadRefusesInvalidCompiledHash(t *testing.T) {
+// A concept file with a malformed compiled hash is one concept's defect, as every refused concept file is.
+func TestLoadReportsAnInvalidCompiledHashAsADefect(t *testing.T) {
 	dir := writeRegistry(t, t.TempDir(), map[string]string{
 		"not-a-hash.yaml": "name: Fx.Bad\nhome: Bad.lean\nmeaning: A badly keyed fact.\ncompiled_hash: not-a-hash\n",
 	})
-	if _, _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "compiled hash") {
-		t.Fatalf("invalid compiled hash error: %v", err)
+	r, defects, err := Load(dir)
+	if err != nil || len(defects) != 1 || !strings.Contains(defects[0].Message, "compiled hash") || len(r.Concepts) != 0 {
+		t.Fatalf("invalid compiled hash: concepts %+v, defects %v, err %v", r.Concepts, defects, err)
+	}
+}
+
+// A concept file the loader refuses is a defect of that file, left out of the registry: the other concepts still
+// load, so one bad file cannot stop the gate, the ledger or a refresh for every owner.
+func TestLoadReportsARefusedConceptFileAsADefect(t *testing.T) {
+	good := "name: Fx.Frame\nhome: Fixture.lean\nmeaning: A window of n bytes below an aligned word.\n"
+	for name, body := range map[string]string{
+		"two sentences":  "name: Fx.Bad\nhome: Bad.lean\nmeaning: Register x2 is aligned. It stays so.\n",
+		"unknown key":    "name: Fx.Bad\nhome: Bad.lean\nmeaning: A fact with an unknown key.\ncolour: red\n",
+		"not YAML":       "name: [Fx.Bad\n",
+		"no home":        "name: Fx.Bad\nmeaning: A fact with no home.\n",
+		"malformed form": "name: Fx.Bad\nhome: Bad.lean\nmeaning: A fact with an empty form.\nforms: [\"\"]\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, defects, err := Load(writeRegistry(t, t.TempDir(), map[string]string{"Fx.Frame.yaml": good, "Fx.Bad.yaml": body}))
+			if err != nil {
+				t.Fatalf("one refused file stopped the loader: %v", err)
+			}
+			if len(defects) != 1 || defects[0].Path != "concepts/Fx.Bad.yaml" {
+				t.Fatalf("defects %v, want one for concepts/Fx.Bad.yaml", defects)
+			}
+			if _, ok := r.Find("Fx.Frame"); !ok || len(r.Concepts) != 1 {
+				t.Fatalf("concepts %+v, want only Fx.Frame", r.Concepts)
+			}
+		})
+	}
+}
+
+// A refused file still holds its path, and whatever name and compiled hash its YAML gives, so Load keeps them for
+// the gate.
+func TestLoadKeepsWhatARefusedConceptFileHolds(t *testing.T) {
+	const hash = "00112233445566778899aabbccddeeff"
+	r, defects, err := Load(writeRegistry(t, t.TempDir(), map[string]string{
+		"Fx.Two.yaml":   "name: Fx.Two\nhome: Two.lean\nmeaning: Register x2 is aligned. It stays so.\n",
+		hash + ".yaml":  "name: Fx.Keyed\nhome: Keyed.lean\nmeaning: A fact with an unknown key.\ncompiled_hash: " + hash + "\ncolour: red\n",
+		"Fx.Mess.yaml":  "name: [Fx.Mess\n",
+		"Fx.Frame.yaml": "name: Fx.Frame\nhome: Fixture.lean\nmeaning: A window of n bytes below an aligned word.\n",
+	}))
+	if err != nil || len(defects) != 3 || len(r.Concepts) != 1 {
+		t.Fatalf("load: concepts %+v, defects %v, %v", r.Concepts, defects, err)
+	}
+	got := map[string]RefusedFile{}
+	for _, refused := range r.Refused {
+		got[refused.Path] = refused
+	}
+	for path, want := range map[string]RefusedFile{
+		"concepts/Fx.Two.yaml":       {Name: "Fx.Two"},
+		"concepts/" + hash + ".yaml": {Name: "Fx.Keyed", CompiledHash: hash},
+		"concepts/Fx.Mess.yaml":      {},
+	} {
+		refused, ok := got[path]
+		if !ok {
+			t.Errorf("no refused file %s in %+v", path, r.Refused)
+			continue
+		}
+		if refused.Name != want.Name || refused.CompiledHash != want.CompiledHash || refused.Defect.Path != path || refused.Defect.Message == "" {
+			t.Errorf("refused file %s: %+v, want name %q and hash %q with its defect", path, refused, want.Name, want.CompiledHash)
+		}
+	}
+	if key := got["concepts/"+hash+".yaml"].Key(); key != hash {
+		t.Errorf("key %q, want %q", key, hash)
 	}
 }

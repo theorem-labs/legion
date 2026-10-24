@@ -13,11 +13,13 @@ import (
 
 	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/internal/testpg"
+	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
 func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only in Docker with DECLINDEX_SANDBOX_TEST=1")
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
 	}
 	if _, err := exec.LookPath("lake"); err != nil {
 		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
@@ -101,7 +103,7 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 	first := addition("first", "Fx.First", "theorem Fx.First (x : Nat) (_h : x < 3) : True := trivial\n")
 	second := addition("second", "Fx.Second", "def Fx.Second (x : Nat) : Prop := x < 3\n")
 	for _, addition := range []conceptgate.Addition{first, second} {
-		if err := os.WriteFile(addition.Path, []byte(addition.Content), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(tree, filepath.FromSlash(addition.Path)), []byte(addition.Content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -127,47 +129,104 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 	if err := os.WriteFile(contracts, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The landing hook mounts the index directory read-only; the recheck works in the temporary directory.
+	state := filepath.Join(dir, "state")
+	if err := os.Chmod(state, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(state, 0o755) })
+	t.Setenv("TMPDIR", t.TempDir())
 	emit := filepath.Join(dir, "operations.jsonl")
-	check := func() {
+	type registryReport struct {
+		Added []string `json:"added"`
+		Near  []struct {
+			ID    string `json:"id"`
+			Added string `json:"added"`
+		} `json:"near"`
+		Defects []struct {
+			Path    string `json:"path"`
+			Message string `json:"message"`
+		} `json:"defects"`
+		Unable string `json:"unable"`
+	}
+	report := func(result result) registryReport {
 		t.Helper()
-		result := invoke(t, "--config", config, "ledger", "--contracts-file", contracts, "--emit", emit)
 		if result.code != 1 {
 			t.Fatalf("ledger exit code %d, want 1: %+v", result.code, result)
 		}
 		var report struct {
-			Registry *struct {
-				Added []string `json:"added"`
-				Near  []struct {
-					ID string `json:"id"`
-				} `json:"near"`
-				Defects []struct {
-					Path    string `json:"path"`
-					Message string `json:"message"`
-				} `json:"defects"`
-				Unable string `json:"unable"`
-			} `json:"registry"`
+			Registry *registryReport `json:"registry"`
 		}
 		if err := json.Unmarshal([]byte(result.out), &report); err != nil {
 			t.Fatal(err)
 		}
-		wantAdded := []string{
-			filepath.ToSlash(filepath.Join("registry", "concepts", filepath.Base(first.Path))),
-			filepath.ToSlash(filepath.Join("registry", "concepts", filepath.Base(second.Path))),
-		}
+		// The ledger reports landed additions by the same repository-relative paths that the gate printed.
+		wantAdded := []string{first.Path, second.Path}
 		sort.Strings(wantAdded)
 		if report.Registry == nil || strings.Join(report.Registry.Added, "\x00") != strings.Join(wantAdded, "\x00") ||
 			len(report.Registry.Defects) != 0 || report.Registry.Unable != "" || len(report.Registry.Near) != 1 {
 			t.Fatalf("registry report %+v, want additions %v", report.Registry, wantAdded)
 		}
+		return *report.Registry
+	}
+	invocationsOf := func() []string {
+		t.Helper()
 		got, err := os.ReadFile(invocations)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		return strings.Fields(string(got))
+	}
+	// The hook has no network: in --emit mode each near pair is an operation for the landing program to deliver,
+	// after the registrations, and no librarian command runs.
+	checkEmitted := func() {
+		t.Helper()
+		r := report(invoke(t, "--config", config, "ledger", "--contracts-file", contracts, "--emit", emit))
+		raw, err := os.ReadFile(emit)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ids := strings.Fields(string(got)); len(ids) != 1 || ids[0] != report.Registry.Near[0].ID {
-			t.Fatalf("librarian invocations %q, want %q once", got, report.Registry.Near[0].ID)
+		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		if len(lines) != 1 {
+			t.Fatalf("emitted %q, want one librarian operation", raw)
+		}
+		var op struct {
+			Op       string `json:"op"`
+			ID       string `json:"id"`
+			Kind     string `json:"kind"`
+			Proposer string `json:"proposer"`
+			Envelope string `json:"envelope"`
+		}
+		if err := json.Unmarshal([]byte(lines[0]), &op); err != nil {
+			t.Fatal(err)
+		}
+		begin := strings.Index(op.Envelope, "-----BEGIN UNTRUSTED PROPOSAL ")
+		end := strings.Index(op.Envelope, "-----END UNTRUSTED PROPOSAL ")
+		if op.Op != "librarian" || op.ID != r.Near[0].ID || !strings.HasPrefix(op.ID, "recheck-"+r.Near[0].Added+"-") ||
+			op.Kind != "recheck" || op.Proposer != "role" || begin < 0 || end < begin ||
+			!strings.Contains(op.Envelope[begin:end], `"kind":"recheck"`) {
+			t.Fatalf("librarian operation %+v for near pair %+v", op, r.Near[0])
+		}
+		if ids := invocationsOf(); len(ids) != 0 {
+			t.Fatalf("the librarian command ran in --emit mode: %q", ids)
 		}
 	}
-	check()
+	checkEmitted()
+	t.Run("operator DSN", func(t *testing.T) {
+		dsn := testpg.Database(t, "declindex_recheck_librarian")
+		l, err := ledger.Open(context.Background(), dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := l.EnsureRepo(context.Background(), "r", 3); err != nil {
+			t.Fatal(err)
+		}
+		l.Close()
+		r := report(invokeLedger(t, config, dsn, ""))
+		if ids := invocationsOf(); len(ids) != 1 || ids[0] != r.Near[0].ID {
+			t.Fatalf("librarian invocations %q, want %q once", ids, r.Near[0].ID)
+		}
+	})
 
 	if err := os.WriteFile(invocations, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -185,10 +244,11 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(first.Path, body, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(tree, filepath.FromSlash(first.Path)), body, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		check()
+		// The check reads the registry as committed, so a working-tree edit changes nothing.
+		checkEmitted()
 		return
 	}
 	t.Fatal("Fx.First is absent from the mutable registry")

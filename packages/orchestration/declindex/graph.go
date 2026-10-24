@@ -2,14 +2,16 @@ package declindex
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
-	"sort"
-	"strings"
+	"slices"
 )
 
 // graph is the declaration graph in compressed sparse rows, written beside the index after each refresh so
@@ -34,11 +36,11 @@ const graphMagic = "declindex-graph-2\n"
 const propBit = uint32(1) << 31
 
 func (g *graph) id(name string) (uint32, bool) {
-	i := sort.SearchStrings(g.names, name)
-	if i < len(g.names) && g.names[i] == name {
-		return uint32(i), true
+	i, ok := slices.BinarySearch(g.names, name)
+	if !ok {
+		return 0, false
 	}
-	return 0, false
+	return uint32(i), true
 }
 
 // buildGraph reads the edges table into a graph. Each edge's target is counted as the longest declared name it
@@ -47,19 +49,15 @@ func (g *graph) id(name string) (uint32, bool) {
 func buildGraph(ctx context.Context, q querier) (*graph, error) {
 	declared := map[string]bool{}
 	rows, err := q.QueryContext(ctx, `SELECT name FROM decls`)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return nil, err
+		if err := r.Scan(&n); err != nil {
+			return err
 		}
 		declared[n] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	owner := map[string]string{}
@@ -68,23 +66,14 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 			return o
 		}
 		o := t
-		for o != "" && !declared[o] {
-			i := strings.LastIndexByte(o, '.')
-			if i < 0 {
-				o = ""
+		for p := range dottedPrefixes(t) {
+			if declared[p] {
+				o = p
 				break
 			}
-			o = o[:i]
-		}
-		if o == "" {
-			o = t
 		}
 		owner[t] = o
 		return o
-	}
-	rows, err = q.QueryContext(ctx, `SELECT target, dst, module, `+propagates+` FROM edges e`)
-	if err != nil {
-		return nil, err
 	}
 	type edge struct {
 		src, dst, mod string
@@ -92,24 +81,24 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 	}
 	var edges []edge
 	nameSet, modSet := map[string]bool{}, map[string]bool{}
-	for rows.Next() {
+	rows, err = q.QueryContext(ctx, `SELECT target, dst, module, `+propagates+` FROM edges e`)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var e edge
 		var target string
-		if err := rows.Scan(&target, &e.dst, &e.mod, &e.prop); err != nil {
-			rows.Close()
-			return nil, err
+		if err := r.Scan(&target, &e.dst, &e.mod, &e.prop); err != nil {
+			return err
 		}
 		if e.src = own(target); e.src == e.dst {
-			continue
+			return nil
 		}
 		nameSet[e.src], nameSet[e.dst], modSet[e.mod] = true, true, true
 		edges = append(edges, e)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	g := &graph{names: keys(nameSet), modules: keys(modSet)}
+	g := &graph{names: slices.Sorted(maps.Keys(nameSet)), modules: slices.Sorted(maps.Keys(modSet))}
 	modID := make(map[string]uint32, len(g.modules))
 	for i, m := range g.modules {
 		modID[m] = uint32(i)
@@ -126,14 +115,8 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 	for i, e := range edges {
 		ps[i] = packed{nodeID[e.src], nodeID[e.dst], modID[e.mod], e.prop}
 	}
-	sort.Slice(ps, func(i, j int) bool {
-		if ps[i].src != ps[j].src {
-			return ps[i].src < ps[j].src
-		}
-		if ps[i].dst != ps[j].dst {
-			return ps[i].dst < ps[j].dst
-		}
-		return ps[i].mod < ps[j].mod
+	slices.SortFunc(ps, func(a, b packed) int {
+		return cmp.Or(cmp.Compare(a.src, b.src), cmp.Compare(a.dst, b.dst), cmp.Compare(a.mod, b.mod))
 	})
 	// Two targets with one owner give one edge, which propagates when either use does.
 	merged := ps[:0]
@@ -158,15 +141,6 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 		g.offs[i] += g.offs[i-1]
 	}
 	return g, nil
-}
-
-func keys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func putStrings(b *bytes.Buffer, ss []string) {
@@ -268,11 +242,8 @@ func (r *reader) strings() []string {
 	return out
 }
 
-func loadGraph(path string) (*graph, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+// parseGraph reads the bytes of the graph file at path, which errors name.
+func parseGraph(path string, data []byte) (*graph, error) {
 	if !bytes.HasPrefix(data, []byte(graphMagic)) {
 		return nil, fmt.Errorf("%s is not a declaration graph of this version", path)
 	}

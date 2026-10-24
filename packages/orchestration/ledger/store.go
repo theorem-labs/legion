@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,18 +22,46 @@ import (
 //go:embed schema/*.sql
 var schemaFS embed.FS
 
-// ledgerTables is every table the embedded ledger schema needs. Add a table here with the migration that creates it
-// so OpenExisting rejects a database whose version record survived a damaged table.
-var ledgerTables = []string{
-	"repositories",
-	"work_items",
-	"migrations",
-	"migration_writes",
-	"migration_reads",
-	"contracts",
-	"agreements",
-	"agreement_reads",
-	"events",
+// tableStatement finds a migration's statements that create or drop a table, at the start of a line.
+var tableStatement = regexp.MustCompile(`(?im)^\s*(create|drop)\s+table\s+(?:if\s+(?:not\s+)?exists\s+)?([a-z_][a-z0-9_]*)`)
+
+// migrationTables are the tables that the migration scripts, applied in order, leave: those they create, less
+// those a later one drops. It does not follow a rename: the old name would stay required, and OpenExisting would
+// refuse every database until the rename is added here.
+func migrationTables(scripts ...string) []string {
+	var tables []string
+	for _, script := range scripts {
+		for _, m := range tableStatement.FindAllStringSubmatch(script, -1) {
+			name := strings.ToLower(m[2])
+			tables = slices.DeleteFunc(tables, func(t string) bool { return t == name })
+			if strings.EqualFold(m[1], "create") {
+				tables = append(tables, name)
+			}
+		}
+	}
+	return tables
+}
+
+// schemaTables is every table the embedded ledger schema needs, so that OpenExisting refuses a database whose
+// version record survived a damaged table.
+func schemaTables() ([]string, error) {
+	files, err := schemaFiles()
+	if err != nil {
+		return nil, err
+	}
+	scripts := make([]string, len(files))
+	for i, file := range files {
+		raw, err := schemaFS.ReadFile(file)
+		if err != nil {
+			return nil, err
+		}
+		scripts[i] = string(raw)
+	}
+	tables := migrationTables(scripts...)
+	if len(tables) == 0 {
+		return nil, errors.New("the embedded ledger schema creates no table")
+	}
+	return tables, nil
 }
 
 // Store is a connection pool to one ledger database.
@@ -55,25 +85,17 @@ func (e *SchemaError) Error() string {
 
 // Open connects to the database and applies any schema versions it lacks.
 func Open(ctx context.Context, dsn string) (*Store, error) {
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("parse DSN: %w", err)
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
-	}
-	s := &Store{pool: pool}
-	if err := s.migrate(ctx); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	return s, nil
+	return connect(ctx, dsn, (*Store).migrate)
 }
 
 // OpenExisting connects to an existing ledger database and verifies that it has every schema version embedded in
 // this binary. It never applies a migration.
 func OpenExisting(ctx context.Context, dsn string) (*Store, error) {
+	return connect(ctx, dsn, (*Store).checkSchema)
+}
+
+// connect opens a pool to dsn and gives its store once ready accepts it; it closes the pool that ready refuses.
+func connect(ctx context.Context, dsn string, ready func(*Store, context.Context) error) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse DSN: %w", err)
@@ -83,7 +105,7 @@ func OpenExisting(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 	s := &Store{pool: pool}
-	if err := s.checkSchema(ctx); err != nil {
+	if err := ready(s, ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -137,29 +159,25 @@ func (s *Store) checkSchema(ctx context.Context) error {
 		}
 		return fmt.Errorf("read schema versions: %w", err)
 	}
-	defer rows.Close()
-	have := make(map[int]bool, len(want))
-	for rows.Next() {
-		var version int
-		if err := rows.Scan(&version); err != nil {
-			return err
-		}
-		have[version] = true
-	}
-	if err := rows.Err(); err != nil {
+	versions, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	if err != nil {
 		return err
 	}
 	var missing []int
 	for _, version := range want {
-		if !have[version] {
+		if !slices.Contains(versions, version) {
 			missing = append(missing, version)
 		}
 	}
 	if len(missing) != 0 {
 		return &SchemaError{Missing: missing}
 	}
+	tables, err := schemaTables()
+	if err != nil {
+		return err
+	}
 	var missingTables []string
-	for _, table := range ledgerTables {
+	for _, table := range tables {
 		var exists bool
 		if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
 			return fmt.Errorf("check ledger table %s: %w", table, err)
@@ -175,7 +193,6 @@ func (s *Store) checkSchema(ctx context.Context) error {
 }
 
 // migrate applies schema/NNNN_*.sql files in order, each once, under an advisory lock so concurrent starts agree.
-
 func (s *Store) migrate(ctx context.Context) error {
 	files, err := schemaFiles()
 	if err != nil {

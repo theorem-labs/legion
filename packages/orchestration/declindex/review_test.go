@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -65,9 +66,10 @@ func TestEdgeOwnersFollowDeclarationsOfLaterModules(t *testing.T) {
 	}
 }
 
-// A graph file that failed to be written after the index committed must not be read as current: queries refuse
-// until a refresh writes it, and that refresh writes it though no module changed.
-func TestAFailedGraphWriteIsRepairedAndNeverAnswered(t *testing.T) {
+// The graph file is written before the commit of the reference part, so a refresh whose graph write fails commits
+// nothing: the index stays at the commit before, with that commit's graph, and answers from it. The next refresh
+// writes both, though no module changed since the failed one.
+func TestAFailedGraphWriteCommitsNothing(t *testing.T) {
 	tree := goldenTree(t)
 	path := filepath.Join(t.TempDir(), "index.sqlite")
 	s, err := Open(path)
@@ -78,10 +80,14 @@ func TestAFailedGraphWriteIsRepairedAndNeverAnswered(t *testing.T) {
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
 		t.Fatal(err)
 	}
+	atOne, err := s.Answer(ctx, "Gold.Frame", AnswerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(filepath.Join(tree.Lib, "Sub", "Wrap.ilean")); err != nil {
 		t.Fatal(err)
 	}
-	// The graph's temporary file cannot be created: the write fails after the commit.
+	// The graph's temporary file cannot be created: the write fails before the commit.
 	if err := os.Mkdir(path+".graph.tmp", 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -93,8 +99,11 @@ func TestAFailedGraphWriteIsRepairedAndNeverAnswered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, err := s.Answer(ctx, "Gold.Frame", AnswerOptions{}); err == nil {
-		t.Fatalf("answered from a stale graph: %+v", a.Reach)
+	if commit, err := s.Meta(ctx, "commit"); err != nil || commit != "one" {
+		t.Fatalf("the index after a failed graph write is at %q, %v; want one", commit, err)
+	}
+	if a, err := s.Answer(ctx, "Gold.Frame", AnswerOptions{}); err != nil || !reflect.DeepEqual(a, atOne) {
+		t.Fatalf("after a failed graph write: %+v, %v; want the answer at one, %+v", a, err, atOne)
 	}
 	if err := os.Remove(path + ".graph.tmp"); err != nil {
 		t.Fatal(err)

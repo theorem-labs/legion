@@ -2,6 +2,7 @@ package declindex
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,8 +25,9 @@ type ContractLedger interface {
 // Owners maps a contract's directory to its owner key (a graph node id such as function:open_file).
 type Owners map[string]string
 
-// LoadOwners reads an owner map: {"format": F, "owners": [{"id": <owner key>, "contract": <directory>|null}, …]}.
-// format is the F the deployment expects (its graph tool's format name); empty accepts any.
+// LoadOwners reads an owner map: {"format": F, "owners": [{"id": <owner key>, "contract": <directory>|[<directory>,
+// …]|null}, …]}. A list names every directory of one owner, such as a header helper's directory under each file
+// that includes it. format is the F the deployment expects (its graph tool's format name); empty accepts any.
 func LoadOwners(path, format string) (Owners, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -34,8 +36,8 @@ func LoadOwners(path, format string) (Owners, error) {
 	var f struct {
 		Format string `json:"format"`
 		Owners []struct {
-			ID       string  `json:"id"`
-			Contract *string `json:"contract"`
+			ID       string          `json:"id"`
+			Contract json.RawMessage `json:"contract"`
 		} `json:"owners"`
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
@@ -46,15 +48,42 @@ func LoadOwners(path, format string) (Owners, error) {
 	}
 	out := Owners{}
 	for _, o := range f.Owners {
-		if o.Contract == nil || *o.Contract == "" {
-			continue
+		dirs, err := contractDirs(o.Contract)
+		if err != nil {
+			return nil, fmt.Errorf("%s: owner %s: %w", path, o.ID, err)
 		}
-		if prev, ok := out[*o.Contract]; ok && prev != o.ID {
-			return nil, fmt.Errorf("%s: directory %s has two owners, %s and %s", path, *o.Contract, prev, o.ID)
+		for _, dir := range dirs {
+			if prev, ok := out[dir]; ok && prev != o.ID {
+				return nil, fmt.Errorf("%s: directory %s has two owners, %s and %s", path, dir, prev, o.ID)
+			}
+			out[dir] = o.ID
 		}
-		out[*o.Contract] = o.ID
 	}
 	return out, nil
+}
+
+// contractDirs reads an owner's contract field: null, one directory, or a list of directories.
+func contractDirs(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		if one == "" {
+			return nil, nil
+		}
+		return []string{one}, nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return nil, fmt.Errorf("contract must be a directory, a list of directories, or null: %s", raw)
+	}
+	for _, dir := range many {
+		if dir == "" {
+			return nil, errors.New("contract list has an empty directory")
+		}
+	}
+	return many, nil
 }
 
 // globRegexp turns a path glob into a regular expression: `**/` matches any number of directories, `*` any
@@ -95,30 +124,25 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 		}
 		globs = append(globs, re)
 	}
-	name := regexp.MustCompile(".*")
+	// No name rule selects every name.
+	var name *regexp.Regexp
 	if rule.Name != "" {
 		var err error
 		if name, err = regexp.Compile(rule.Name); err != nil {
 			return nil, fmt.Errorf("contract name rule: %w", err)
 		}
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT d.name, d.short, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
-		FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.kind IN (`+placeholders(len(rule.Kinds))+`)
-		ORDER BY d.name, d.module`, anys(rule.Kinds)...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []Found
-	for rows.Next() {
-		var f Found
-		var short, rel string
-		if err := rows.Scan(&f.Name, &short, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
-			return nil, err
+	rows, err := s.q.QueryContext(ctx, `SELECT `+foundColumns+`, d.short`+foundFrom+` WHERE d.kind IN (`+
+		placeholders(len(rule.Kinds))+`) ORDER BY d.name, d.module`, anys(rule.Kinds)...)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var short string
+		f, err := scanFound(r, &short)
+		if err != nil {
+			return err
 		}
-		f.Path = sourcePath(rel, f.Module)
-		if !name.MatchString(short) {
-			continue
+		if name != nil && !name.MatchString(short) {
+			return nil
 		}
 		for _, g := range globs {
 			if g.MatchString(f.Path) {
@@ -126,8 +150,12 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 				break
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // LedgerDefect is a contract whose hash in the ledger is not the index's hash at the index's commit: a landing
@@ -165,29 +193,17 @@ type ledgerDeclaration struct {
 
 func (s *Store) ledgerDeclarations(ctx context.Context, names []string) (map[string][]ledgerDeclaration, error) {
 	out := make(map[string][]ledgerDeclaration, len(names))
-	for i := 0; i < len(names); i += 500 {
-		chunk := names[i:min(i+500, len(names))]
-		rows, err := s.db.QueryContext(ctx, `SELECT name, module, stmt_hash FROM decls WHERE name IN (`+
-			placeholders(len(chunk))+`)`, anys(chunk)...)
-		if err != nil {
-			return nil, err
+	err := eachRowIn(ctx, s.q, `SELECT name, module, stmt_hash FROM decls WHERE name IN`, names, func(r *sql.Rows) error {
+		var name string
+		var declaration ledgerDeclaration
+		if err := r.Scan(&name, &declaration.module, &declaration.hash); err != nil {
+			return err
 		}
-		for rows.Next() {
-			var name string
-			var declaration ledgerDeclaration
-			if err := rows.Scan(&name, &declaration.module, &declaration.hash); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			out[name] = append(out[name], declaration)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
-			return nil, err
-		}
+		out[name] = append(out[name], declaration)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -258,21 +274,21 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 		if strings.Contains(c.Name, ":") {
 			continue
 		}
-		declarations := declarations[c.Name]
-		switch len(declarations) {
+		decls := declarations[c.Name]
+		switch len(decls) {
 		case 0:
 			r.Gone = append(r.Gone, c.Name)
 		case 1:
-			if c.StatementHash == declarations[0].hash {
+			if c.StatementHash == decls[0].hash {
 				r.Matching++
 				continue
 			}
-			at := sourcePath("", declarations[0].module)
+			at := sourcePath("", decls[0].module)
 			if found, ok := selected[c.Name]; ok {
 				at = found.At()
 			}
 			r.Defects = append(r.Defects, LedgerDefect{Contract: c.Name, At: at, LedgerHash: c.StatementHash,
-				Version: c.Version, IndexHash: declarations[0].hash})
+				Version: c.Version, IndexHash: decls[0].hash})
 		default:
 			r.Ambiguous = append(r.Ambiguous, c.Name)
 		}

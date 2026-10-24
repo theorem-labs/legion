@@ -40,6 +40,23 @@ type Registry struct {
 	Opens   []string `yaml:"opens,omitempty"`
 
 	Concepts []Concept `yaml:"-" json:"-"`
+	// Refused are the concept files that Load refused and left out of Concepts.
+	Refused []RefusedFile `yaml:"-" json:"-"`
+}
+
+// RefusedFile is a concept file that Load refused: its registry-relative path, the defect that says why, and the
+// name and compiled hash that its YAML gives, when it decodes that far. The file still holds its name and its path
+// in the registry, so the gate adds no concept that would take either (Gate.Decide).
+type RefusedFile struct {
+	Path         string
+	Name         string
+	CompiledHash string
+	Defect       Defect
+}
+
+// Key is the refused file's name without its concepts/ prefix or .yaml suffix.
+func (r RefusedFile) Key() string {
+	return strings.TrimSuffix(strings.TrimPrefix(r.Path, "concepts/"), ".yaml")
 }
 
 // Defect is a registry inconsistency that does not prevent the gate or refresh from using the registry.
@@ -55,11 +72,12 @@ func (d Defect) Error() string {
 	return d.Path + ": " + d.Message
 }
 
-// sentenceBreak finds the end of a sentence before the end of the text: a full stop, question or exclamation
-// mark followed by a space and a capital letter.
 var (
+	// sentenceBreak finds the end of a sentence before the end of the text: a full stop, question or exclamation
+	// mark followed by a space and a capital letter.
 	sentenceBreak = regexp.MustCompile(`[.!?]\s+\p{Lu}`)
-	statementHash = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	// compiledHash is the form of a concept's compiled hash (Concept.CompiledHash): 32 lowercase hexadecimal digits.
+	compiledHash = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
 
 func (c Concept) check() error {
@@ -72,7 +90,7 @@ func (c Concept) check() error {
 		return fmt.Errorf("concept %s has no meaning", c.Name)
 	case strings.Contains(c.Meaning, "\n") || sentenceBreak.MatchString(c.Meaning):
 		return fmt.Errorf("concept %s: its meaning is one sentence", c.Name)
-	case c.CompiledHash != "" && !statementHash.MatchString(c.CompiledHash):
+	case c.CompiledHash != "" && !compiledHash.MatchString(c.CompiledHash):
 		return fmt.Errorf("concept %s: compiled hash is not 32 lowercase hexadecimal characters", c.Name)
 	}
 	return nil
@@ -86,19 +104,44 @@ func Key(c Concept) string {
 	return c.Name
 }
 
+// checkForms refuses a form that is not one lambda term.
+func (c Concept) checkForms() error {
+	return declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}.Check()
+}
+
 // Render returns the canonical YAML for one concept file.
 func Render(c Concept) ([]byte, error) {
 	if err := c.check(); err != nil {
 		return nil, err
 	}
-	if err := (declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}).Check(); err != nil {
+	if err := c.checkForms(); err != nil {
 		return nil, err
 	}
 	return yaml.Marshal(c)
 }
 
-// Load reads a format-2 registry directory. Defects describe duplicate concepts, invalid file keys, and unknown
-// extensions; they do not stop callers from checking the valid entries.
+// decodeConcept reads one concept file: known keys only, and a concept that passes its checks.
+func decodeConcept(raw []byte) (Concept, error) {
+	var c Concept
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil {
+		return Concept{}, err
+	}
+	if err := c.check(); err != nil {
+		return Concept{}, err
+	}
+	if err := c.checkForms(); err != nil {
+		return Concept{}, err
+	}
+	return c, nil
+}
+
+// Load reads a format-2 registry directory. Defects describe the concept files that the loader refuses (YAML that
+// does not decode, an unknown key, a concept that fails its checks), which it leaves out, and duplicate names and
+// compiled hashes, wrongly keyed files and extends of concepts that are not registered; they do not stop callers
+// from checking the valid entries. Only a registry.yaml that is missing, malformed or of another format, or a file
+// that cannot be read, is an error.
 func Load(dir string) (Registry, []Defect, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -142,24 +185,24 @@ func Load(dir string) (Registry, []Defect, error) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yaml" {
 			continue
 		}
-		path := filepath.Join(concepts, entry.Name())
-		raw, err := os.ReadFile(path)
+		relative := filepath.ToSlash(filepath.Join("concepts", entry.Name()))
+		raw, err := os.ReadFile(filepath.Join(concepts, entry.Name()))
 		if err != nil {
 			return Registry{}, nil, err
 		}
-		var c Concept
-		dec := yaml.NewDecoder(bytes.NewReader(raw))
-		dec.KnownFields(true)
-		if err := dec.Decode(&c); err != nil {
-			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
+		c, err := decodeConcept(raw)
+		if err != nil {
+			defect := Defect{Path: relative, Message: err.Error()}
+			defects = append(defects, defect)
+			// Whatever name and hash the file gives, read without its checks; YAML that does not decode gives none.
+			var held struct {
+				Name         string `yaml:"name"`
+				CompiledHash string `yaml:"compiled_hash"`
+			}
+			_ = yaml.Unmarshal(raw, &held)
+			r.Refused = append(r.Refused, RefusedFile{Path: relative, Name: held.Name, CompiledHash: held.CompiledHash, Defect: defect})
+			continue
 		}
-		if err := c.check(); err != nil {
-			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
-		}
-		if err := (declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}).Check(); err != nil {
-			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
-		}
-		relative := filepath.ToSlash(filepath.Join("concepts", entry.Name()))
 		expected := filepath.ToSlash(filepath.Join("concepts", Key(c)+".yaml"))
 		if relative != expected {
 			defects = append(defects, Defect{Path: relative, Message: "file is named " + relative + ", want " + expected})
@@ -196,14 +239,4 @@ func (r Registry) Find(name string) (Concept, bool) {
 		}
 	}
 	return Concept{}, false
-}
-
-// FormsModule is the Lean module that the index compiles to match the registry's forms. Stored proposal source
-// never enters this module.
-func (r Registry) FormsModule() declindex.FormsModule {
-	fm := declindex.FormsModule{Imports: r.Imports, Opens: r.Opens}
-	for _, c := range r.Concepts {
-		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
-	}
-	return fm
 }

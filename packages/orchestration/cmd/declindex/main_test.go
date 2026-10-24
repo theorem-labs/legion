@@ -69,10 +69,25 @@ func TestHelpListsFinalCommandInterfacesAndExitCodes(t *testing.T) {
 		"gate --proposer OWNER [--accepted-by OWNER] PROPOSAL.json",
 		"ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry",
 		"LAND_NAMES or LAND_NAMES_FILE",
+		"LAND_BUILD_DIR for changed sources",
 		"name<TAB>hash<TAB>path",
 	} {
 		if !strings.Contains(r.out, want) {
 			t.Errorf("help does not list %q:\n%s", want, r.out)
+		}
+	}
+}
+
+// land-hash exits 3 for a changed source without LAND_BUILD_DIR, so its usage message names it with the rest of
+// its environment.
+func TestLandHashUsageNamesItsWholeEnvironment(t *testing.T) {
+	r := invoke(t, "--config", fixture(t), "land-hash", "unexpected")
+	if r.code != 2 {
+		t.Fatalf("land-hash with an argument exited %d, want 2: %+v", r.code, r)
+	}
+	for _, want := range []string{"LAND_TREE", "LAND_GIT_DIR", "LAND_NAMES_FILE", "LAND_BUILD_DIR for changed sources"} {
+		if !strings.Contains(r.errOut, want) {
+			t.Errorf("the usage message does not name %q: %s", want, r.errOut)
 		}
 	}
 }

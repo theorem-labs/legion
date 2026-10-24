@@ -2,6 +2,7 @@ package declindex
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -111,8 +111,8 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("%s: roots are required: the first components of the project's module names", path)
 	}
 	if y.Registry != "" {
-		clean := filepath.Clean(y.Registry)
-		if filepath.IsAbs(y.Registry) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		// IsLocal accepts "." (the tree itself), which is no registry directory below it.
+		if !filepath.IsLocal(y.Registry) || filepath.Clean(y.Registry) == "." {
 			return Config{}, fmt.Errorf("%s: registry must be a non-empty relative path below the tree", path)
 		}
 	}
@@ -126,17 +126,18 @@ func LoadConfig(path string) (Config, error) {
 			return Config{}, fmt.Errorf("%s: build_timeout %q: %w", path, y.BuildTimeout, err)
 		}
 	}
-	dir := filepath.Dir(path)
+	// Every path is absolute, so that a relative --config gives paths that filepath.Rel can compare.
+	dir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return Config{}, err
+	}
 	rel := func(base, p string) string {
 		if p == "" || filepath.IsAbs(p) {
 			return p
 		}
 		return filepath.Join(base, p)
 	}
-	libRel := y.Lib
-	if libRel == "" {
-		libRel = filepath.Join(".lake", "build", "lib", "lean")
-	}
+	libRel := cmp.Or(y.Lib, filepath.Join(".lake", "build", "lib", "lean"))
 	c := Config{
 		Tree:         rel(dir, y.Tree),
 		LibRel:       libRel,
@@ -173,21 +174,21 @@ func (c Config) GateRegistryDir() (string, error) {
 	return pathInside(c.Tree, c.Registry)
 }
 
-// GateStatePath resolves the configured index path through symlinks and requires it to remain outside the tree.
+// GateIndexPath resolves the configured index path through symlinks and requires it to remain outside the tree.
 // A gate opens this existing file read-only, so neither the index nor its scratch work can dirty the tree.
-func (c Config) GateStatePath() (string, error) {
+func (c Config) GateIndexPath() (string, error) {
 	tree, err := canonicalPath(c.Tree)
 	if err != nil {
 		return "", err
 	}
-	state, err := canonicalStatePath(c.DB)
+	index, err := canonicalIndexPath(c.DB)
 	if err != nil {
 		return "", err
 	}
-	if isInside(tree, state) {
-		return "", fmt.Errorf("the gate index state %s must be outside the tree %s", state, tree)
+	if isInside(tree, index) {
+		return "", fmt.Errorf("the gate index state %s must be outside the tree %s", index, tree)
 	}
-	return state, nil
+	return index, nil
 }
 
 func pathInside(tree, path string) (string, error) {
@@ -213,7 +214,7 @@ func canonicalPath(path string) (string, error) {
 	return filepath.EvalSymlinks(absolute)
 }
 
-func canonicalStatePath(path string) (string, error) {
+func canonicalIndexPath(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -244,7 +245,7 @@ func canonicalStatePath(path string) (string, error) {
 
 func isInside(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	return err == nil && filepath.IsLocal(rel) && rel != "."
 }
 
 // ErrNoDB is returned when no index path is configured.
@@ -256,7 +257,7 @@ func (c Config) TreeSpec() Tree {
 	for _, r := range c.Roots {
 		roots[r] = true
 	}
-	return Tree{Source: c.Tree, Lib: c.Lib, Roots: roots, FileKinds: c.FileKinds}
+	return Tree{Source: c.Tree, Lib: c.Lib, Roots: roots}
 }
 
 // Compiled gives the options of the compiled part for this configuration: the tree's toolchain, the exporter
@@ -276,17 +277,8 @@ func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) 
 		deps, _ := filepath.Glob(filepath.Join(c.Tree, ".lake", "packages", pattern, ".lake", "build", "lib", "lean"))
 		search = append(search, deps...)
 	}
-	jobs := c.Lean.Jobs
-	if jobs == 0 {
-		jobs = c.Jobs
-	}
-	if jobs == 0 {
-		jobs = min(48, runtime.NumCPU())
-	}
-	per := c.Lean.ModulesPerProcess
-	if per == 0 {
-		per = 400
-	}
+	jobs := cmp.Or(c.Lean.Jobs, c.Jobs, min(48, runtime.NumCPU()))
+	per := cmp.Or(c.Lean.ModulesPerProcess, 400)
 	return &CompiledOptions{
 		Exporter: &Exporter{Lean: l, Bin: bin, SearchPath: search, Jobs: jobs, ModulesPerProcess: per, Log: log},
 		Forms:    forms,

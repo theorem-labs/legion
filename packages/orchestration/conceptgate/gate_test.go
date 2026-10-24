@@ -32,7 +32,7 @@ func (r *recordingLibrarian) Review(_ context.Context, request ReviewRequest) er
 func requireSandboxTest(t *testing.T) {
 	t.Helper()
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only in Docker with DECLINDEX_SANDBOX_TEST=1")
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
 	}
 }
 
@@ -101,19 +101,19 @@ func gateWith(t *testing.T, compiled bool) (*Gate, *recordingLibrarian) {
 	}
 	co := &declindex.CompiledOptions{
 		Exporter: &declindex.Exporter{Lean: l, Bin: exporterBin, SearchPath: []string{tree}, Jobs: 1},
-		Forms:    r.FormsModule(),
+		Forms:    registryForms(r),
 		Dir:      t.TempDir(),
 	}
 	spec := declindex.Tree{Source: tree, Lib: tree, Roots: declindex.Roots{"Fixture": true}}
 	opt := declindex.RefreshOptions{Commit: gitHead(t, tree)}
 	if compiled {
-		opt.Compiled = co
+		opt.Compiled = func(context.Context) (*declindex.CompiledOptions, error) { return co, nil }
 	}
 	if _, err := s.Refresh(ctx, spec, opt); err != nil {
 		t.Fatal(err)
 	}
 	lib := &recordingLibrarian{}
-	return &Gate{Index: s, Tree: spec, Registry: registry, Compiled: co, Librarian: lib, WorkDir: t.TempDir()}, lib
+	return &Gate{Index: s, Tree: spec, Registry: registry, AdditionRoot: "registry", Compiled: co, Librarian: lib, WorkDir: t.TempDir()}, lib
 }
 
 func runGit(t *testing.T, dir string, args ...string) {
@@ -131,6 +131,16 @@ func gitHead(t *testing.T, dir string) string {
 		t.Fatal(err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// registryForms is the forms module of every concept of r, with no stored source in it: what a refresh's forms
+// module holds for a registry whose concepts the index all declares.
+func registryForms(r Registry) declindex.FormsModule {
+	fm := declindex.FormsModule{Imports: r.Imports, Opens: r.Opens}
+	for _, c := range r.Concepts {
+		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
+	}
+	return fm
 }
 
 func proposal(id, name, body string) Proposal {
@@ -163,16 +173,17 @@ func TestGateDecidesEachKindOfProposal(t *testing.T) {
 			t.Errorf("%s: %s naming %q (%s, %+v), want %s naming %q", c.p.ID, v.Outcome, v.Existing, v.Reason, v.Matches, c.outcome, c.existing)
 		}
 		if c.p.ID == "p7" {
-			if v.Addition == nil || v.Addition.Base != gitHead(t, g.Tree.Source) || !strings.HasSuffix(v.Addition.Path, "/registry/concepts/"+v.CompiledHash+".yaml") || !strings.Contains(v.Addition.Content, "source: |") {
+			if v.Addition == nil || v.Addition.Base != gitHead(t, g.Tree.Source) || v.Addition.Path != "registry/concepts/"+v.CompiledHash+".yaml" || !strings.Contains(v.Addition.Content, "source: |") {
 				t.Fatalf("addition: %+v", v.Addition)
 			}
-			if _, err := os.Stat(v.Addition.Path); !os.IsNotExist(err) {
+			file := filepath.Join(g.Tree.Source, filepath.FromSlash(v.Addition.Path))
+			if _, err := os.Stat(file); !os.IsNotExist(err) {
 				t.Fatalf("the gate wrote its addition: %v", err)
 			}
 			if status := exec.Command("git", "-C", g.Tree.Source, "status", "--porcelain").Run(); status != nil {
 				t.Fatal(status)
 			}
-			if err := os.WriteFile(v.Addition.Path, []byte(v.Addition.Content), 0o644); err != nil {
+			if err := os.WriteFile(file, []byte(v.Addition.Content), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			runGit(t, g.Tree.Source, "add", "registry")
@@ -250,5 +261,121 @@ func TestGateWithoutASandboxCannotDecide(t *testing.T) {
 	}
 	if _, defects, err := Load(g.Registry); err != nil || len(lib.got) != 0 || len(defects) != 0 {
 		t.Fatal("the gate acted without a sandbox")
+	}
+}
+
+// A pending concept whose stored source no longer compiles (here it names a constant the tree does not have) is a
+// defect of that concept, left out of the forms: it does not stop the gate from deciding an unrelated proposal.
+func TestAStalePendingConceptIsADefectNotAnInability(t *testing.T) {
+	g, _ := gateForTest(t)
+	ctx := context.Background()
+	options := DecideOptions{Proposer: "function:open_file", ProposalBytes: []byte(`{"id":"p"}`)}
+	fresh := proposal("p7", "Fresh", "def Fresh (x : Nat) : Prop := x < 3 ∧ x ≠ 1")
+	if v, err := g.Decide(ctx, fresh, options); err != nil || v.Outcome != Added || len(v.Defects) != 0 {
+		t.Fatalf("control: %+v, %v", v, err)
+	}
+	const key = "00112233445566778899aabbccddeeff"
+	pending := "name: Old.Pending\nhome: Old.lean\nmeaning: A concept that an earlier landing added.\nproposal: old\n" +
+		"proposer: function:old_owner\ncompiled_hash: " + key + "\nsource: |\n" +
+		"  import Fixture\n  def Old.Pending (x : Nat) : Prop := Fx.RenamedSince x\n"
+	if err := os.WriteFile(filepath.Join(g.Registry, "concepts", key+".yaml"), []byte(pending), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v, err := g.Decide(ctx, fresh, options)
+	if err != nil || v.Outcome != Added {
+		t.Fatalf("an unrelated proposal after one stale pending concept: %+v, %v", v, err)
+	}
+	if len(v.Defects) != 1 || v.Defects[0].Path != "concepts/"+key+".yaml" || !strings.Contains(v.Defects[0].Message, "Old.Pending") {
+		t.Fatalf("defects %+v, want the stale pending concept", v.Defects)
+	}
+}
+
+// accepted_near records a librarian's decision; a proposal cannot supply it. Without --accepted-by the addition
+// carries no accepted_near, whatever the proposal says, so it cannot suppress the post-landing recheck.
+func TestGateDropsAProposalsOwnAcceptedNear(t *testing.T) {
+	g, _ := gateForTest(t)
+	p := proposal("p8", "Fresh8", "def Fresh8 (x : Nat) : Prop := x < 5 ∧ x ≠ 2")
+	p.Concept.AcceptedNear = []string{"Fx.Frame"}
+	v, err := g.Decide(context.Background(), p, DecideOptions{Proposer: "role"})
+	if err != nil || v.Outcome != Added || v.Addition == nil {
+		t.Fatalf("decide: %+v, %v", v, err)
+	}
+	if strings.Contains(v.Addition.Content, "accepted_near") {
+		t.Fatalf("the addition keeps the proposal's accepted_near:\n%s", v.Addition.Content)
+	}
+}
+
+// OpenGate always sets AdditionRoot, the registry's path in the repository. A gate without one gives no addition
+// path: it does not derive one from Registry, which OpenGate reads from a snapshot outside the repository.
+func TestAnAdditionPathNeedsTheGatesAdditionRoot(t *testing.T) {
+	tree := t.TempDir()
+	g := &Gate{Tree: declindex.Tree{Source: tree}, Registry: filepath.Join(tree, "registry")}
+	if path, err := g.additionPath("k"); err == nil {
+		t.Errorf("a gate without AdditionRoot gave the addition path %q", path)
+	}
+	g.AdditionRoot = "proj/registry"
+	if path, err := g.additionPath("k"); err != nil || path != "proj/registry/concepts/k.yaml" {
+		t.Errorf("addition path %q, %v; want proj/registry/concepts/k.yaml", path, err)
+	}
+	g.AdditionRoot = "../registry"
+	if path, err := g.additionPath("k"); err == nil {
+		t.Errorf("an AdditionRoot outside the repository gave the addition path %q", path)
+	}
+}
+
+// A concept file that the loader refused still holds its name and its path in the registry. A proposal with its
+// name, by the file's key or by the name its YAML gives, is name-taken and names the file. A proposal whose compiled
+// statement is the file's key (its addition would replace the file) or the compiled hash that the file records is
+// unable to be decided until the file is repaired. In each case the refused file is a defect of the verdict, and
+// the librarian gets nothing.
+func TestGateKeepsARefusedConceptFilesNameAndPath(t *testing.T) {
+	g, lib := gateForTest(t)
+	ctx := context.Background()
+	options := DecideOptions{Proposer: "role"}
+	fresh := proposal("p7", "Fresh", "def Fresh (x : Nat) : Prop := x < 3 ∧ x ≠ 1")
+	control, err := g.Decide(ctx, fresh, options)
+	if err != nil || control.Outcome != Added || control.Addition == nil || len(control.Defects) != 0 {
+		t.Fatalf("control: %+v, %v", control, err)
+	}
+	hash := control.CompiledHash
+	hasDefect := func(v Verdict, path string) bool {
+		for _, d := range v.Defects {
+			if d.Path == path {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range []struct {
+		file, body string
+		unable     bool
+	}{
+		{"Fresh.yaml", "name: [Fresh\n", false},
+		{"Elsewhere.yaml", "name: Fresh\nhome: Fresh.lean\nmeaning: A concept. It has two sentences.\n", false},
+		{hash + ".yaml", "name: [broken\n", true},
+		{"Misnamed.yaml", "name: Old.Fresh\nhome: Old.lean\nmeaning: An older copy.\ncompiled_hash: " + hash + "\ncolour: red\n", true},
+	} {
+		path := filepath.Join(g.Registry, "concepts", c.file)
+		if err := os.WriteFile(path, []byte(c.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		at := "registry/concepts/" + c.file
+		v, err := g.Decide(ctx, fresh, options)
+		switch {
+		case c.unable && (err == nil || !strings.Contains(err.Error(), at)):
+			t.Errorf("%s: %+v, %v; want unable, naming %s", c.file, v, err, at)
+		case !c.unable && (err != nil || v.Outcome != NameTaken || v.Existing != "Fresh" || v.ExistingAt != at || !strings.Contains(v.Reason, "refused")):
+			t.Errorf("%s: %+v, %v; want name-taken at %s", c.file, v, err, at)
+		case v.Addition != nil:
+			t.Errorf("%s: an addition %+v", c.file, v.Addition)
+		case !hasDefect(v, "concepts/"+c.file):
+			t.Errorf("%s: defects %+v, want the refused file", c.file, v.Defects)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(lib.got) != 0 {
+		t.Fatalf("the librarian got %+v", lib.got)
 	}
 }

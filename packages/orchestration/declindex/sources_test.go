@@ -42,9 +42,9 @@ func TestReadSourcesUsesTheSourceBytes(t *testing.T) {
 	writeSource(t, dir, "Root/Changed.lean", "def changed := 2\n")
 	writeSource(t, dir, "Root/Untracked.lean", "def untracked := 3\n")
 
-	got, err := readSources(Tree{Source: dir, Roots: Roots{"Root": true}})
-	if err != nil {
-		t.Fatal(err)
+	got, prefix, err := readSources(Tree{Source: dir, Roots: Roots{"Root": true}})
+	if err != nil || prefix != "" {
+		t.Fatalf("prefix %q, %v; want the repository's root", prefix, err)
 	}
 	want := map[string]string{}
 	for _, rel := range []string{"Root/Clean.lean", "Root/Changed.lean", "Root/Untracked.lean"} {
@@ -61,12 +61,68 @@ func TestReadSourcesUsesTheSourceBytes(t *testing.T) {
 }
 
 func TestReadSourcesSkipsANonGitTree(t *testing.T) {
-	got, err := readSources(Tree{Source: t.TempDir(), Roots: Roots{"Root": true}})
+	got, _, err := readSources(Tree{Source: t.TempDir(), Roots: Roots{"Root": true}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != nil {
 		t.Fatalf("sources = %v, want nil", got)
+	}
+}
+
+// TestRefreshKeysSourcesRelativeToASubdirectoryTree catches a refresh of a tree below its repository's root that
+// keys a changed or untracked source by the repository-relative path git status prints: the index then keeps the
+// committed blob of a modified file and loses an untracked one.
+func TestRefreshKeysSourcesRelativeToASubdirectoryTree(t *testing.T) {
+	tree := goldenTree(t)
+	repo := t.TempDir()
+	proj := filepath.Join(repo, "proj")
+	if err := os.Rename(tree.Source, proj); err != nil {
+		t.Fatal(err)
+	}
+	tree.Source, tree.Lib = proj, proj
+	gitIn(t, repo, "init", "-q")
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "base")
+	golden, err := os.ReadFile(filepath.Join(proj, "Golden.lean"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSource(t, proj, "Golden.lean", string(golden)+"\n-- changed after the commit\n")
+	writeSource(t, proj, "Sub/Untracked.lean", "def untracked := 3\n")
+
+	s := openStore(t)
+	ctx := context.Background()
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "base"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var path, blob string
+		if err := rows.Scan(&path, &blob); err != nil {
+			t.Fatal(err)
+		}
+		got[path] = blob
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{}
+	for _, rel := range []string{"Golden.lean", "Sub/Wrap.lean", "Sub/Untracked.lean"} {
+		want[rel] = gitIn(t, proj, "hash-object", "--", rel)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("sources = %v, want %v", got, want)
+	}
+	for rel, blob := range want {
+		if got[rel] != blob {
+			t.Errorf("source %s = %q, want %q", rel, got[rel], blob)
+		}
 	}
 }
 
@@ -95,8 +151,8 @@ func TestRefreshStoresSourcesAndTheReplacedCommit(t *testing.T) {
 	if got, err := s.Meta(ctx, "sources"); err != nil || got != "git" {
 		t.Errorf("sources meta = %q, %v; want git", got, err)
 	}
-	if got, err := s.Meta(ctx, "prev_commit"); err != nil || got != "base" {
-		t.Errorf("prev_commit = %q, %v; want base", got, err)
+	if got, recorded, err := s.Landing(ctx, "candidate"); err != nil || !recorded || got != "base" {
+		t.Errorf("the landing of candidate replaced %q (recorded %v, %v); want base", got, recorded, err)
 	}
 }
 
@@ -138,5 +194,59 @@ func TestOpenRebuildsAnOlderSchema(t *testing.T) {
 	}
 	if sources != 0 {
 		t.Fatalf("sources after rebuild = %d, want 0", sources)
+	}
+}
+
+// An index that the previous schema's binary wrote has no landings table and no compiled_commit or source_prefix
+// key. Read as it is, it would answer the post-landing commands with "no such table", no record of a landing, or a
+// tree at the repository's root. A read-only open refuses it and names the refresh that rebuilds it, and the next
+// refresh rebuilds it from nothing: it reads the commit that the old index had read again, and records its landing.
+func TestAnIndexOfThePreviousSchemaIsRebuiltByTheNextRefresh(t *testing.T) {
+	ctx := context.Background()
+	tree := goldenTree(t)
+	path := filepath.Join(t.TempDir(), "index.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE landings`,
+		`DELETE FROM meta WHERE k IN ('compiled_commit', 'source_prefix')`,
+		`UPDATE meta SET v = '3' WHERE k = 'schema'`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reader, err := OpenReadOnly(ctx, path, IndexOnly); err == nil {
+		_ = reader.Close()
+		t.Errorf("opened an index of the previous schema read-only")
+	} else if !strings.Contains(err.Error(), "refresh") {
+		t.Errorf("the refusal of an index of the previous schema does not name the refresh that rebuilds it: %v", err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if previous, recorded, err := s.Landing(ctx, "one"); err != nil || !recorded || previous != "" {
+		t.Errorf("the landing of one after the rebuild: previous %q, recorded %v, %v; want recorded with no previous", previous, recorded, err)
+	}
+	reader, err := OpenReadOnly(ctx, path, IndexOnly)
+	if err != nil {
+		t.Fatalf("open the rebuilt index read-only: %v", err)
+	}
+	defer reader.Close()
+	if version, err := reader.Meta(ctx, "schema"); err != nil || version != SchemaVersion {
+		t.Errorf("the rebuilt index's schema: %q, %v; want %q", version, err, SchemaVersion)
 	}
 }

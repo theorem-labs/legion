@@ -26,7 +26,7 @@ func TestRefreshNeverCompilesStoredAddedSource(t *testing.T) {
 	if err != nil || len(defects) != 0 {
 		t.Fatalf("registry: %v, defects: %v", err, defects)
 	}
-	text, _ := reg.FormsModule().Source()
+	text, _ := registryForms(reg).Source()
 	if strings.Contains(text, source) || strings.Contains(text, "IO.FS.writeFile") {
 		t.Fatalf("FormsModule.Source contains stored source:\n%s", text)
 	}
@@ -41,7 +41,8 @@ func TestRefreshNeverCompilesStoredAddedSource(t *testing.T) {
 	compiled := *g.Compiled
 	compiled.Forms = forms
 	compiled.Dir = t.TempDir()
-	if _, err := g.Index.Refresh(context.Background(), g.Tree, declindex.RefreshOptions{Commit: gitHead(t, g.Tree.Source), Compiled: &compiled}); err != nil {
+	step := func(context.Context) (*declindex.CompiledOptions, error) { return &compiled, nil }
+	if _, err := g.Index.Refresh(context.Background(), g.Tree, declindex.RefreshOptions{Commit: gitHead(t, g.Tree.Source), Compiled: step}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(witness); err == nil {

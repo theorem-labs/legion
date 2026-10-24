@@ -47,6 +47,35 @@ func TestLoadOwners(t *testing.T) {
 	}
 }
 
+// The graph tool names a header helper's contract directory under each file that includes it: one owner, a list.
+func TestLoadOwnersReadsAListOfContractDirectories(t *testing.T) {
+	write := func(body string) string {
+		p := filepath.Join(t.TempDir(), "owners.json")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	o, err := LoadOwners(write(`{"format":"f","owners":[`+
+		`{"id":"function:helper@include/h.h","contract":["A/Helper","B/Helper"]},`+
+		`{"id":"function:frame_at","contract":"Sub"},{"id":"struct:mount","contract":null}]}`), "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (Owners{"A/Helper": "function:helper@include/h.h", "B/Helper": "function:helper@include/h.h", "Sub": "function:frame_at"}); !reflect.DeepEqual(o, want) {
+		t.Fatalf("owners %v, want %v", o, want)
+	}
+	for name, body := range map[string]string{
+		"a directory listed by two owners": `{"owners":[{"id":"function:a","contract":["D"]},{"id":"function:b","contract":"D"}]}`,
+		"an empty directory in a list":     `{"owners":[{"id":"function:a","contract":["D",""]}]}`,
+		"a number":                         `{"owners":[{"id":"function:a","contract":3}]}`,
+	} {
+		if _, err := LoadOwners(write(body), ""); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}
+
 // After a landing the index registers new contracts and checks the rest; a change lock opened with the index's
 // hashes records the ledger's versions; a landing that advances a contract to a hash the build lacks is reported.
 func TestCheckLedgerRegistersChecksAndReportsDefects(t *testing.T) {

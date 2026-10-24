@@ -85,8 +85,8 @@ func TestLandHashUsesAFreshCandidateBuild(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(build, "Golden.ilean"), ilean, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	trace := fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[[%q,%q]],"synthetic":false}`,
-		filepath.Join(build, "Golden.lean"), declindex.LakeTextHash([]byte(candidate)))
+	trace := fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[[%q,%q]],"outputs":{"i":%q},"synthetic":false}`,
+		filepath.Join(build, "Golden.lean"), declindex.LakeTextHash([]byte(candidate)), declindex.LakeTextHash(ilean)+".ilean")
 	if err := os.WriteFile(filepath.Join(build, "Golden.trace"), []byte(trace), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -166,6 +166,7 @@ func writeLandBuild(t *testing.T, build, rel string, source, ilean []byte, synth
 	trace, err := json.Marshal(map[string]any{
 		"schemaVersion": "2025-09-10",
 		"inputs":        inputs,
+		"outputs":       map[string]any{"i": declindex.LakeTextHash(ilean) + ".ilean"},
 		"synthetic":     synthetic,
 	})
 	if err != nil {
@@ -364,6 +365,181 @@ func TestLandHashNamesFileAndInputValidation(t *testing.T) {
 	}
 	if r := invokeLandHash(t, config, envValues{}, "unexpected"); r.code != 2 {
 		t.Fatalf("argument = %+v, want exit 2", r)
+	}
+}
+
+// TestLandHashAnswersADotlessName catches a request check that refuses a name without a dot, although the full
+// name of a top-level declaration has none.
+func TestLandHashAnswersADotlessName(t *testing.T) {
+	config, tree, treeID := landBase(t)
+	r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "frame_lo", "Gold.frame_lo"), ""))
+	const want = "frame_lo\tabsent\t-\nGold.frame_lo\t9d9fba31f41fc258\tGolden.lean\n"
+	if r.code != 0 || r.out != want {
+		t.Fatalf("dotless name = %+v, want %q", r, want)
+	}
+}
+
+// TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas catches a hasher that answers a declaration from the
+// index when neither the index's sources nor LAND_TREE have its source file: two missing blobs compare equal.
+func TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas(t *testing.T) {
+	config := fixture(t)
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	writeLandFile(t, filepath.Join(tree, ".gitignore"), []byte("/Golden.lean\n"))
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "base without Golden.lean")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	cfg, err := declindex.LoadConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := declindex.Open(cfg.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.LandSnapshot(context.Background(), []string{"Gold.frame_lo"})
+	store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, indexed := snapshot.Modules["Golden"]; !indexed || len(snapshot.Declarations["Gold.frame_lo"]) != 1 {
+		t.Fatalf("test setup: the index did not read Golden: %+v", snapshot)
+	}
+	if blob, ok := snapshot.Sources["Golden.lean"]; ok {
+		t.Fatalf("test setup: the index's sources have the ignored Golden.lean as %s", blob)
+	}
+	treeID := git(t, tree, "rev-parse", "HEAD^{tree}")
+	r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "Gold.frame_lo", "Gold2.FrameAt"), ""))
+	const want = "Gold.frame_lo\tabsent\t-\nGold2.FrameAt\t7f52be71a38bde18\tSub/Wrap.lean\n"
+	if r.code != 0 || r.out != want {
+		t.Fatalf("source missing from the index and LAND_TREE = %+v, want %q", r, want)
+	}
+}
+
+// TestLandHashRefusesOnlyAPrintedPathThatCannotBePrinted catches a hasher that fails the whole call for any
+// LAND_TREE source path with a tab, carriage return, newline or comma, rather than only for a path that an answer
+// line would print.
+func TestLandHashRefusesOnlyAPrintedPathThatCannotBePrinted(t *testing.T) {
+	t.Run("unrelated paths", func(t *testing.T) {
+		config := fixture(t)
+		tree := filepath.Join(filepath.Dir(config), "tree")
+		for _, rel := range []string{"Sub/Comma,Name.lean", "Sub/Tab\tName.lean"} {
+			writeLandFile(t, filepath.Join(tree, filepath.FromSlash(rel)), []byte("-- not a requested module\n"))
+		}
+		git(t, tree, "init", "-q")
+		git(t, tree, "add", "-A")
+		git(t, tree, "commit", "-q", "-m", "base")
+		if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+			t.Fatalf("refresh: %+v", r)
+		}
+		for _, rel := range []string{"Sub/Line\nName.lean", "Sub/Return\rName.lean"} {
+			writeLandFile(t, filepath.Join(tree, filepath.FromSlash(rel)), []byte("-- not a requested module\n"))
+		}
+		git(t, tree, "add", "-A")
+		git(t, tree, "commit", "-q", "-m", "candidate")
+		treeID := git(t, tree, "rev-parse", "HEAD^{tree}")
+		r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "Gold.frame_lo", "Gold2.FrameAt"), t.TempDir()))
+		const want = "Gold.frame_lo\t9d9fba31f41fc258\tGolden.lean\nGold2.FrameAt\t7f52be71a38bde18\tSub/Wrap.lean\n"
+		if r.code != 0 || r.out != want {
+			t.Fatalf("unrelated unprintable paths = %+v, want %q", r, want)
+		}
+	})
+	t.Run("printed path", func(t *testing.T) {
+		config, tree, _ := landBase(t)
+		source, err := os.ReadFile(filepath.Join(tree, "Golden.lean"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ilean, err := os.ReadFile(filepath.Join(tree, "Golden.ilean"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		git(t, tree, "mv", "Golden.lean", "Sub/Gold,en.lean")
+		git(t, tree, "commit", "-q", "-m", "move declaration to a path with a comma")
+		build := t.TempDir()
+		writeLandBuild(t, build, "Sub/Gold,en", source, ilean, false, declindex.LakeTextHash(source))
+		treeID := git(t, tree, "rev-parse", "HEAD^{tree}")
+		r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "Gold.frame_lo"), build))
+		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "Sub/Gold,en.lean") {
+			t.Fatalf("printed path with a comma = %+v, want exit 3, no stdout, and stderr naming the path", r)
+		}
+	})
+}
+
+// rewriteConfig replaces old with new in the fixture's configuration.
+func rewriteConfig(t *testing.T, config, old, new string) {
+	t.Helper()
+	raw, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(string(raw), old, new, 1)
+	if body == string(raw) {
+		t.Fatalf("configuration %q has no %q", raw, old)
+	}
+	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLandHashListsTheSourcesRefreshRecorded catches a hasher whose LAND_TREE pathspecs differ from the ones
+// refresh records sources with: refresh drops an empty root, and land-hash asked Git for the pathspec "/".
+func TestLandHashListsTheSourcesRefreshRecorded(t *testing.T) {
+	config := fixture(t)
+	rewriteConfig(t, config, "roots: [Golden, Sub]", `roots: [Golden, Sub, Sub, ""]`)
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "base")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	treeID := git(t, tree, "rev-parse", "HEAD^{tree}")
+	r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "Gold.frame_lo", "Gold2.FrameAt"), ""))
+	const want = "Gold.frame_lo\t9d9fba31f41fc258\tGolden.lean\nGold2.FrameAt\t7f52be71a38bde18\tSub/Wrap.lean\n"
+	if r.code != 0 || r.out != want {
+		t.Fatalf("empty and duplicate roots = %+v, want %q", r, want)
+	}
+}
+
+// TestLandHashAnswersATreeBelowTheRepositoryRoot catches a hasher that lists the configured roots at the root of
+// LAND_TREE when the configured tree is a directory below its repository's root, or that prints a tree-relative
+// path where the contract gives the repository-relative one.
+func TestLandHashAnswersATreeBelowTheRepositoryRoot(t *testing.T) {
+	config := fixture(t)
+	dir := filepath.Dir(config)
+	repo := filepath.Join(dir, "repo")
+	proj := filepath.Join(repo, "proj")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "tree"), proj); err != nil {
+		t.Fatal(err)
+	}
+	rewriteConfig(t, config, "tree: tree\n", "tree: repo/proj\n")
+	git(t, repo, "init", "-q")
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-q", "-m", "base")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+
+	base := invokeLandHash(t, config, landValues(repo, git(t, repo, "rev-parse", "HEAD^{tree}"),
+		namesJSON(t, "Gold.frame_lo", "Gold2.FrameAt"), ""))
+	const wantBase = "Gold.frame_lo\t9d9fba31f41fc258\tproj/Golden.lean\nGold2.FrameAt\t7f52be71a38bde18\tproj/Sub/Wrap.lean\n"
+	if base.code != 0 || base.out != wantBase {
+		t.Fatalf("base land-hash of a subdirectory tree = %+v, want %q", base, wantBase)
+	}
+
+	source, ilean, candidate := changeGolden(t, proj)
+	build := t.TempDir()
+	writeLandBuild(t, build, "Golden", source, ilean, false, declindex.LakeTextHash(source))
+	changed := invokeLandHash(t, config, landValues(repo, candidate, namesJSON(t, "Gold.frame_lo"), build))
+	const wantChanged = "Gold.frame_lo\tdd801c6f96a0e63c\tproj/Golden.lean\n"
+	if changed.code != 0 || changed.out != wantChanged {
+		t.Fatalf("candidate land-hash of a subdirectory tree = %+v, want %q", changed, wantChanged)
 	}
 }
 
