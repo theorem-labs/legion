@@ -35,6 +35,8 @@ const (
 	ViolationStatementUnreviewed = "statement_unreviewed"
 	// A migration that is not owned by the configured upstream owner carries upstream provenance.
 	ViolationUpstreamNotAllowed = "upstream_not_allowed"
+	// An admitted batch relies on the migration, or on a contract that the candidate advances.
+	ViolationBatchAdmitted = "batch_admitted"
 )
 
 var violationKinds = [...]string{
@@ -50,6 +52,7 @@ var violationKinds = [...]string{
 	ViolationPinned,
 	ViolationStatementUnreviewed,
 	ViolationUpstreamNotAllowed,
+	ViolationBatchAdmitted,
 }
 
 // Check outcomes classify a complete pass, a refusal, or a pre-build check with deferred reads.
@@ -547,6 +550,9 @@ func (s *Store) ExtendMigration(ctx context.Context, repo, id string, gen int64,
 		if err != nil {
 			return err
 		}
+		if err := fenceMigration(ctx, tx, repo, id); err != nil {
+			return err
+		}
 		sets, err := openWriteSets(ctx, tx, repo, id)
 		if err != nil {
 			return err
@@ -583,8 +589,14 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 	}
 	var m Migration
 	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
 		cur, err := lockOpenAt(ctx, tx, repo, id, gen)
 		if err != nil {
+			return err
+		}
+		if err := fenceMigration(ctx, tx, repo, id); err != nil {
 			return err
 		}
 		readyCleared, err := clearReady(ctx, tx, repo, id)
@@ -645,6 +657,9 @@ func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error
 		}
 		migration, err := lockOpenAt(ctx, tx, req.Repo, req.ID, req.Generation)
 		if err != nil {
+			return err
+		}
+		if err := fenceMigration(ctx, tx, req.Repo, req.ID); err != nil {
 			return err
 		}
 		if migration.EscalatedAt != nil {
@@ -821,6 +836,29 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 			}
 		}
 	}
+	fenced, err := fenceViolations(ctx, q, req.Repo, m.ID, sortedNames(req.ChangedContracts))
+	if err != nil {
+		return nil, err
+	}
+	return append(violations, fenced...), nil
+}
+
+// candidateViolations evaluates every rule of a cleaned candidate for migration m, which the caller has locked, after
+// the precondition: the shared rules, the contract rules and the upstream rule, in the order Check reports them.
+// Check and AdmitBatch both use it, so admission refuses exactly what Check reports.
+func candidateViolations(ctx context.Context, tx pgx.Tx, repository Repository, m Migration, req CheckRequest) ([]Violation, error) {
+	violations, err := checkViolations(ctx, tx, m, req)
+	if err != nil {
+		return nil, err
+	}
+	contract, err := checkContractViolations(ctx, tx, m, req)
+	if err != nil {
+		return nil, err
+	}
+	violations = append(violations, contract...)
+	if upstream, blocked := upstreamViolation(repository, m, req.Upstream); blocked {
+		violations = append(violations, upstream)
+	}
 	return violations, nil
 }
 
@@ -866,19 +904,11 @@ func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error
 		if hasPrecondition {
 			res.Violations = append(res.Violations, precondition)
 		}
-		violations, err := checkViolations(ctx, tx, migration, cleaned)
+		violations, err := candidateViolations(ctx, tx, repository, migration, cleaned)
 		if err != nil {
 			return err
 		}
 		res.Violations = append(res.Violations, violations...)
-		contract, err := checkContractViolations(ctx, tx, migration, cleaned)
-		if err != nil {
-			return err
-		}
-		res.Violations = append(res.Violations, contract...)
-		if upstream, blocked := upstreamViolation(repository, migration, cleaned.Upstream); blocked {
-			res.Violations = append(res.Violations, upstream)
-		}
 		switch {
 		case len(res.Violations) > 0:
 			res.Outcome = CheckOutcomeRefused
@@ -972,6 +1002,9 @@ func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, e
 		if err := requireOpenAt(cur, req.Generation); err != nil {
 			return err
 		}
+		if err := fenceMigration(ctx, tx, req.Repo, req.ID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key, generation, reason, batch)
 			VALUES ($1, $2, $3, $4, $5, $6)`, req.Repo, req.ID, req.Key, req.Generation, req.Reason, req.Batch); err != nil {
 			return err
@@ -1037,6 +1070,9 @@ func (s *Store) Escalate(ctx context.Context, repo, id string, maxRounds int) ([
 			if err != nil {
 				return err
 			}
+			if err := fenceMigration(ctx, tx, repo, id); err != nil {
+				return err
+			}
 			if m.State != StateOpen {
 				return refuse(ReasonNotOpen, "migration %s is %s", id, m.State)
 			}
@@ -1047,8 +1083,11 @@ func (s *Store) Escalate(ctx context.Context, repo, id string, maxRounds int) ([
 				ids = []string{id}
 			}
 		} else {
+			// A sweep passes over an admitted member: its batch's decline returns it, and the next sweep escalates it.
 			rows, err := tx.Query(ctx, `SELECT id FROM migrations WHERE repo = $1 AND state = 'open'
-				AND escalated_at IS NULL AND landing_rounds >= $2 ORDER BY id FOR UPDATE`, repo, n)
+				AND escalated_at IS NULL AND landing_rounds >= $2
+				AND NOT EXISTS (SELECT 1 FROM batch_members b WHERE b.repo = migrations.repo AND b.migration = migrations.id AND b.admitted)
+				ORDER BY id FOR UPDATE`, repo, n)
 			if err != nil {
 				return err
 			}
@@ -1115,6 +1154,9 @@ func (s *Store) Abandon(ctx context.Context, repo, id string, gen int64, reason 
 		}
 		cur, err := lockOpenAt(ctx, tx, repo, id, gen)
 		if err != nil {
+			return err
+		}
+		if err := fenceMigration(ctx, tx, repo, id); err != nil {
 			return err
 		}
 		readyCleared, err := clearReady(ctx, tx, repo, id)

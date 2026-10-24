@@ -30,6 +30,10 @@ const (
 	ReasonUpstreamNotAllowed = "upstream_not_allowed" // only the configured upstream owner may record provenance
 	ReasonRefusalConflict    = "refusal_conflict"     // the owner's work revision already has a refusal with another reason
 	ReasonStaleBatch         = "stale_batch"          // the batch is at another record version than the caller read
+	ReasonNotReady           = "not_ready"            // an admitted member has no ready record: it is not open, or it moved on
+	ReasonReadyChanged       = "ready_changed"        // an admitted member was readied again after the caller read it
+	ReasonBatchConflict      = "batch_conflict"       // two members of one batch change, or read and change, one contract
+	ReasonBatchAdmitted      = "batch_admitted"       // an admitted batch relies on the migration or contract
 	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.
 	ReasonStatementUnreviewed = "statement_unreviewed"
 )
@@ -38,9 +42,13 @@ const (
 type Refusal struct {
 	Reason  string `json:"reason"`
 	Message string `json:"message"`
-	// For an overlap: the other migration and the paths that overlap (ours -> theirs).
+	// For an overlap: the other migration and the paths that overlap (ours -> theirs). For a batch conflict: the
+	// earlier member.
 	Other    string      `json:"other,omitempty"`
 	Overlaps []PathClash `json:"overlaps,omitempty"`
+	// For a refused admission: the member it names, and for a member that Check refuses, every reason Check gives.
+	Member     string      `json:"member,omitempty"`
+	Violations []Violation `json:"violations,omitempty"`
 }
 
 func (r *Refusal) Error() string { return fmt.Sprintf("refused (%s): %s", r.Reason, r.Message) }
