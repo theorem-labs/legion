@@ -3862,6 +3862,22 @@ class _FunctionWalk:
                     self.walk(children[zero], node, zero, reason, generic)
                     self.discard(children[1 - zero], node, 1 - zero, generic)
                     return
+                guarded = next(
+                    (
+                        (side, guard)
+                        for side in (1, 0)
+                        if self.x.effect_free(children[1 - side], self.dead_variables)
+                        and (guard := self.guard_expression(children[side], truth=False)) is not None
+                    ),
+                    None,
+                )
+                if guarded is not None:
+                    # __fget_files_rcu's file->f_mode & mask, where fdget_raw passes mask 0: the other
+                    # operand, which has no effect, is read only where this one may be nonzero.
+                    side, guard = guarded
+                    self.walk(children[side], node, side, reason, generic)
+                    self.walk_guarded((guard, True), children[1 - side], node, 1 - side, reason, generic)
+                    return
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
                 right = self.x.evaluator.evaluate(children[1], truth=True)
                 if right is not None and bool(right) == (operator == libclang.LOGICAL_OR):

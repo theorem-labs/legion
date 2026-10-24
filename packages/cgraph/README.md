@@ -188,10 +188,12 @@ These rules follow what the machine code shows, each only where it shows it:
   edge needs that table's initializer; another unit's table of the same name does not count.
 - A folded helper's code that its caller's arguments decide against is dead for that caller: the facts
   give each function a table of `guards`, conditions on its parameters (if, `?:`, the right operand of
-  `&&`/`||`, switch cases, the statements after `if (c) return;`, and the code past a label that only
-  gotos before it reach, under the guards of those gotos; none across a label a later goto reaches),
-  and each event the guards it is compiled under. A guard states each variable as the values it may
-  hold: a parameter nothing writes (or whose address escapes only later in the text, outside any loop)
+  `&&`/`||`, the other operand of an `&` or `*` that a parameter may make 0 (`file->f_mode & mask`,
+  where fdget_raw passes mask 0), switch cases, the statements after `if (c) return;`, and the code
+  past a label that only gotos before it reach, under the guards of those gotos; none across a label
+  a later goto reaches), and each event the guards it is compiled under. A guard states each variable
+  as the values it may hold: a parameter nothing writes (or whose address escapes only later in the
+  text, outside any loop)
   is the caller's argument, a variable that plain assignments write is a choice among its first
   value and each value assigned, one that `|=`, `&=` or `^=` change also each value those make of
   it, and a call of a helper of the unit is its template with the arguments put in

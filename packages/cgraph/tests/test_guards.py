@@ -678,3 +678,31 @@ def test_a_call_through_a_parameter_gives_its_arguments_and_a_function_argument_
     (call,) = facts["functions"]["bdi_put"]["events"]["calls"]
     assert call["arguments"][1]["function"] == "release_bdi"
     assert (call["arguments"][0]["param"], call["arguments"][0]["displacement"]) == (0, 64)
+
+
+def test_an_operand_a_parameter_may_zero_is_read_only_where_it_does_not(tmp_path: Path) -> None:
+    """__fget_files_rcu: `if (unlikely(file->f_mode & mask))`, and fdget_raw passes mask 0: the
+    compiler never reads f_mode there. A call with an effect is made whatever the mask is."""
+    facts = facts_of(
+        tmp_path,
+        """
+        struct file { unsigned int f_mode; long f_count; };
+        unsigned int count(struct file *file);
+        static inline struct file *get(struct file *file, unsigned int mask)
+        {
+            if (__builtin_expect(!!(file->f_mode & mask), 0)) {
+                pr();
+                return (void *)0;
+            }
+            if (count(file) & mask)
+                return (void *)0;
+            return file;
+        }
+        """,
+    )
+    record = facts["functions"]["get"]
+    (mode,) = [item for item in record["events"]["field_accesses"] if item["field"] == "f_mode"]
+    guards = [record["guards"][index] for index in mode.get("guards", [])]
+    assert link._decided(guards, [unknown(), constant(0)]) is None
+    assert link._decided(guards, [unknown(), constant(2)]) == []
+    assert compiled(facts, "get", [unknown(), constant(0)]) == {"count"}
