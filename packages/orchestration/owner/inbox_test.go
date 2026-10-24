@@ -5,7 +5,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
@@ -13,10 +12,7 @@ import (
 func TestBuildInboxOrdersItemsAndNamesTheirRecords(t *testing.T) {
 	need := "need:function:caller->struct:state@r1"
 	offer := "offer:function:caller->struct:state@r1"
-	items := []ledger.QueuedItem{
-		{Item: ledger.Item{ID: need, Owner: "struct:state"}, Owner: "struct:state", EnqueuedAt: time.Date(2026, 10, 23, 12, 1, 0, 0, time.UTC)},
-		{Item: ledger.Item{ID: offer, Owner: "function:caller"}, Owner: "function:caller", EnqueuedAt: time.Date(2026, 10, 23, 12, 2, 0, 0, time.UTC)},
-	}
+	items := []ledger.Item{{ID: need, Owner: "struct:state"}, {ID: offer, Owner: "function:caller"}}
 	priorities := map[string]Priority{
 		need:  {StoppedInstructions: 10, CallHeight: 0},
 		offer: {StoppedInstructions: 50, CallHeight: 1},
@@ -33,6 +29,22 @@ func TestBuildInboxOrdersItemsAndNamesTheirRecords(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("inbox = %v, want %v", got, want)
+	}
+}
+
+// BuildInbox gives the rule the items in the ledger's order, so items whose stopped instructions and call height tie
+// stay in the order the ledger enqueued them, whatever their ids.
+func TestBuildInboxKeepsTheLedgerOrderOfTiedItems(t *testing.T) {
+	later, earlier := "need:function:caller->struct:state@r2", "need:function:caller->struct:state@r9"
+	items := []ledger.Item{{ID: earlier, Owner: "struct:state"}, {ID: later, Owner: "struct:state"}}
+	priorities := map[string]Priority{earlier: {StoppedInstructions: 10}, later: {StoppedInstructions: 10}}
+
+	inbox, err := BuildInbox(items, Config{RecordsRoot: "skeleton"}, priorities, loadRuleFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{inbox[0].ID, inbox[1].ID}; !reflect.DeepEqual(got, []string{earlier, later}) {
+		t.Fatalf("inbox order = %v, want the ledger's order %v", got, []string{earlier, later})
 	}
 }
 

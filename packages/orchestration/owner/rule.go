@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
@@ -28,12 +27,13 @@ type Priority struct {
 	CallHeight          int `json:"call_height"`
 }
 
-// PrioritizedItem is one item with every value the rule can order by.
+// PrioritizedItem is one item with every value the rule can order by. Position is the item's place in the order the
+// ledger lists an owner's open items (Store.OpenItems), which is the order it enqueued them: the rule's enqueued_at.
 type PrioritizedItem struct {
 	ID                  string
 	StoppedInstructions int
 	CallHeight          int
-	EnqueuedAt          time.Time
+	Position            int
 }
 
 var ruleKeys = map[string]bool{"stopped_instructions": true, "call_height": true, "enqueued_at": true}
@@ -66,7 +66,8 @@ func ParseRule(data []byte) (Rule, error) {
 	return rule, nil
 }
 
-// Sort orders items by the rule's keys; the item id breaks a full tie so the order is deterministic.
+// Sort orders items by the rule's keys. It is stable, so items the keys tie keep the order they are given in: the
+// ledger's order, when BuildInbox gives them.
 func (r Rule) Sort(items []PrioritizedItem) {
 	sort.SliceStable(items, func(i, j int) bool { return r.before(items[i], items[j]) })
 }
@@ -80,7 +81,7 @@ func (r Rule) before(left, right PrioritizedItem) bool {
 		case "call_height":
 			cmp = compareInts(left.CallHeight, right.CallHeight)
 		case "enqueued_at":
-			cmp = left.EnqueuedAt.Compare(right.EnqueuedAt)
+			cmp = compareInts(left.Position, right.Position)
 		}
 		if key.Direction == "descending" {
 			cmp = -cmp
@@ -89,7 +90,7 @@ func (r Rule) before(left, right PrioritizedItem) bool {
 			return cmp < 0
 		}
 	}
-	return left.ID < right.ID
+	return false
 }
 
 func compareInts(left, right int) int {
@@ -116,8 +117,8 @@ type RuleInputs struct {
 }
 
 // Priority computes the rule's values for one item.
-func (in RuleInputs) Priority(item ledger.QueuedItem) (Priority, error) {
-	priorities, err := in.Priorities([]ledger.QueuedItem{item})
+func (in RuleInputs) Priority(item ledger.Item) (Priority, error) {
+	priorities, err := in.Priorities([]ledger.Item{item})
 	if err != nil {
 		return Priority{}, err
 	}
@@ -125,7 +126,7 @@ func (in RuleInputs) Priority(item ledger.QueuedItem) (Priority, error) {
 }
 
 // Priorities computes the rule's values for every item, keyed by item id.
-func (in RuleInputs) Priorities(items []ledger.QueuedItem) (map[string]Priority, error) {
+func (in RuleInputs) Priorities(items []ledger.Item) (map[string]Priority, error) {
 	heights := in.callHeights()
 	out := make(map[string]Priority, len(items))
 	for _, item := range items {

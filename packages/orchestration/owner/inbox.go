@@ -14,7 +14,7 @@ import (
 // whose branch holds Record; an empty RecordOwner with a Record means main. Event is the ledger event a
 // returned item reads. Commit is filled by the caller from the branch.
 type InboxItem struct {
-	ledger.QueuedItem
+	ledger.Item
 	Record              string `json:"record"`
 	RecordOwner         string `json:"record_owner"`
 	Event               int64  `json:"event,omitempty"`
@@ -23,11 +23,12 @@ type InboxItem struct {
 	CallHeight          int    `json:"call_height"`
 }
 
-// BuildInbox names each item's record from config and orders the items by rule.
-func BuildInbox(items []ledger.QueuedItem, config Config, priorities map[string]Priority, rule Rule) ([]InboxItem, error) {
+// BuildInbox names each item's record from config and orders the items by rule. items are an owner's open items in
+// the ledger's order (Store.OpenItems), which is the order it enqueued them; items the rule's keys tie keep it.
+func BuildInbox(items []ledger.Item, config Config, priorities map[string]Priority, rule Rule) ([]InboxItem, error) {
 	byID := make(map[string]InboxItem, len(items))
 	order := make([]PrioritizedItem, 0, len(items))
-	for _, item := range items {
+	for position, item := range items {
 		entry, err := inboxEntry(item, config)
 		if err != nil {
 			return nil, err
@@ -36,7 +37,7 @@ func BuildInbox(items []ledger.QueuedItem, config Config, priorities map[string]
 		entry.StoppedInstructions, entry.CallHeight = priority.StoppedInstructions, priority.CallHeight
 		byID[item.ID] = entry
 		order = append(order, PrioritizedItem{
-			ID: item.ID, StoppedInstructions: priority.StoppedInstructions, CallHeight: priority.CallHeight, EnqueuedAt: item.EnqueuedAt,
+			ID: item.ID, StoppedInstructions: priority.StoppedInstructions, CallHeight: priority.CallHeight, Position: position,
 		})
 	}
 	rule.Sort(order)
@@ -68,8 +69,8 @@ func ReplyRecord(recordsRoot, replier, edge string, n int) string {
 // inboxEntry names the record an item asks its owner to read. A reply item's record is found by its
 // content hash in the parties' replies, so it is left for the caller; items whose input is not an owner
 // record (interfaces, scores, upstream merges, proposals, escalations) name none.
-func inboxEntry(item ledger.QueuedItem, config Config) (InboxItem, error) {
-	entry := InboxItem{QueuedItem: item}
+func inboxEntry(item ledger.Item, config Config) (InboxItem, error) {
+	entry := InboxItem{Item: item}
 	recordsRoot := config.RecordsRoot
 	ref, err := ParseItemID(item.ID)
 	if err != nil {

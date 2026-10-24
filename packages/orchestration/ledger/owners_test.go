@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
