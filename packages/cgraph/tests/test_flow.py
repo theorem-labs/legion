@@ -951,3 +951,30 @@ def test_each_declarator_of_a_declaration_has_its_own_cleanup_and_a_lock_names_i
     assert ("lockp", "local") in found and ("lockp", "unknown") not in found
     folded = fct_build["graph"]["analysis"]["field_accesses"]["function:fct_scoped_read"]
     assert {item["base"] for item in folded if item["struct"] == "fct_ss"} == {"local"}
+
+
+def test_a_call_whose_copy_dropped_a_parameter_places_its_objects_one_register_earlier(
+    fct_build: dict[str, Any],
+) -> None:
+    """fct_queue(mask, 7, &ms, &done): the image's static copy dropped fn, so &ms is in a1 and &done
+    in a2. The C positions 2 and 3 are matched to registers 1 and 2: ms's fields are held at its slot."""
+    analysis = fct_build["graph"]["analysis"]
+    given = analysis["image"]["frame_arguments"]["function:fct_shifted"]
+    assert sorted(position for callee, position, _ in given if callee == "fct_queue") == [1, 2]
+    offsets = fct_build["checks"]["structure_layer"]["field_offsets"]
+    assert not [miss for miss in offsets["misses"] if miss["function"] == "function:fct_shifted"]
+    excluded = [item for item in fct_build["exclusions"]["items"] if item["function"] == "function:fct_shifted"]
+    assert not [item for item in excluded if item["detail"]["struct"] == "fct_ms"]
+
+
+def test_the_shift_of_a_call_s_arguments_is_the_one_every_object_argument_agrees_on() -> None:
+    """Positions 2 and 3 in the C, registers 1 and 2 in the image: a shift of 1. With position 3 in a
+    register, no shift; with no shift every position fits, none is taken."""
+    analysis = {"object_arguments": {"f": [["q", 2, "ms", 0], ["q", 3, "done", 0]]}}
+    image = {"frame_arguments": {"f": [["q", 1, -128], ["q", 2, -88]]}}
+    assert frames.evidence("ms", "f", analysis, image) == {-128}
+    assert frames.evidence("done", "f", analysis, image) == {-88}
+    image = {"frame_arguments": {"f": [["q", 2, -128], ["q", 3, -88]]}}
+    assert frames.evidence("ms", "f", analysis, image) == {-128}
+    image = {"frame_arguments": {"f": [["q", 2, -128]]}}
+    assert frames.evidence("ms", "f", analysis, image) == {-128}

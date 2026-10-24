@@ -873,3 +873,31 @@ long fct_scoped_read(struct fct_locked *l)
 	}
 	return sum;
 }
+
+/* stop_machine_cpuslocked: queue_stop_cpus_work(mask, fn, &msdata, &done) is static, and the image's
+ * copy dropped the constant fn, so &msdata travels in a1 and &done in a2, one register earlier than
+ * the C positions. */
+struct fct_ms {
+	long pad;
+	int state;
+	int ack;
+};
+
+static __attribute__((noinline)) void fct_queue(int mask, int fn, struct fct_ms *ms, struct fct_inner *done)
+{
+	(void)fn;
+	ms->pad = mask;
+	done->a = ms->state;
+	fct_takes_inner(done);
+}
+
+int fct_shifted(int mask)
+{
+	struct fct_ms ms;
+	struct fct_inner done;
+
+	ms.state = mask;
+	ms.ack = mask + 1;
+	fct_queue(mask, 7, &ms, &done);
+	return ms.ack + done.b;
+}

@@ -185,7 +185,10 @@ These rules follow what the machine code shows, each only where it shows it:
   image call passes the frame address B + d in the argument register where the C passes
   `&object + d` (`analysis.object_arguments` against `frame_arguments`; a struct local's cleanup
   gets its address too, and a lock guard's destructor the guard's: the local its inline constructor
-  returns by value is the guard). The fields are then matched at B plus their displacement
+  returns by value is the guard). Where a static callee's image copy dropped leading parameters
+  (stop_machine_cpuslocked's `queue_stop_cpus_work(mask, fn, &msdata, &done)` takes `&msdata` in a1),
+  the register is the C position less the one shift (up to 2) at which every object the C passes to
+  that callee has a frame argument. The fields are then matched at B plus their displacement
   (`frame_slot_access`, a wider or narrower access over it, or, for an array member at a variable
   index, `frame_slot_indexed_access` or a formed address there). The frame alone decides no slot: on
   the kernel image (part `all`), a formed frame address where every accessed field is loaded or stored

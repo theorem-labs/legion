@@ -46,23 +46,44 @@ def _held(slot: int, fields: Fields, accesses: set[tuple[int, int]]) -> int:
     )
 
 
+# A static callee's copy may drop this many constant or unused parameters before the objects'.
+_MAX_SHIFT = 2
+
+
 def evidence(name: str, function: str, analysis: dict[str, Any], image: dict[str, Any]) -> set[int]:
     """The slots the image's calls give an object: a frame address B + d in the argument register
     where the C passes ``&object + d``. For a choice of objects (``a|b``), the slots of each, and those
-    of a call that passes the choice itself."""
+    of a call that passes the choice itself. The register is the C position less the callee's shift
+    (``_shift``)."""
     parts = set(name.split("|"))
+    objects = analysis.get("object_arguments", {}).get(function, [])
+    given = image.get("frame_arguments", {}).get(function, [])
     passed = [
         (callee, position, displacement)
-        for callee, position, held, displacement in analysis.get("object_arguments", {}).get(function, [])
+        for callee, position, held, displacement in objects
         if held == name or held in parts
     ]
-    given = image.get("frame_arguments", {}).get(function, [])
     return {
         offset - displacement
         for callee, position, displacement in passed
         for target, index, offset in given
-        if target == callee and index == position
+        if target == callee and index == position - _shift(callee, objects, given)
     }
+
+
+def _shift(callee: str, objects: list[list[Any]], given: list[list[Any]]) -> int:
+    """How many registers earlier than its C positions a callee's image copy takes its arguments:
+    stop_machine_cpuslocked's static queue_stop_cpus_work(mask, fn, &msdata, &done) dropped fn, so
+    &msdata and &done are in a1 and a2. Every object argument the C passes to the callee must have a
+    frame argument at its position less the shift; 0 while every one has one at its own position."""
+    positions = {position for target, position, _, _ in objects if target == callee}
+    registers = {index for target, index, _ in given if target == callee}
+    if not positions or positions <= registers:
+        return 0
+    for shift in range(1, _MAX_SHIFT + 1):
+        if all(position - shift in registers for position in positions):
+            return shift
+    return 0
 
 
 def fit(fields: Fields, size: int, accesses: set[tuple[int, int]], slots: set[int]) -> int | None:
