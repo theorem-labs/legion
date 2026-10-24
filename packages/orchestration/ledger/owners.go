@@ -148,13 +148,11 @@ type OwnerRefusal struct {
 	At       time.Time `json:"at"`
 }
 
-// RecordOwnerRefused records, once per owner and work revision, that the supervisor will not start
-// owner for the work at revision, and appends one owner.refused event. A repeat with the same reason
-// returns the stored refusal and appends nothing; one with another reason is refused
-// (ReasonRefusalConflict) and changes nothing. A revision below 1, or newer than the owner's
-// OwnerWorkRevision, refuses no work that exists, so it is invalid input. A refusal at an older
-// revision, or at a revision where the owner has no open work, is recorded but OwnerRefusals never
-// lists it.
+// RecordOwnerRefused records that the supervisor will not start owner for the work at revision, and appends one
+// owner.refused event. A repeat with the same reason returns the stored refusal and appends nothing; one with another
+// reason replaces the stored reason and appends one event with it, so OwnerRefusals shows the latest reason. A revision
+// below 1 is invalid input. A refusal at a revision that is not the owner's current work revision is recorded, but
+// OwnerRefusals never lists it.
 func (s *Store) RecordOwnerRefused(ctx context.Context, repo, owner string, revision int64, reason string) (OwnerRefusal, error) {
 	switch {
 	case strings.TrimSpace(owner) == "":
@@ -169,28 +167,15 @@ func (s *Store) RecordOwnerRefused(ctx context.Context, repo, owner string, revi
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		var current int64
-		if err := tx.QueryRow(ctx, ownerWorkRevisionQuery("$2"), repo, owner).Scan(&current); err != nil {
-			return err
-		}
-		if revision > current {
-			return invalid("refusal revision %d of owner %s is newer than its work revision %d", revision, owner, current)
-		}
+		// ON CONFLICT waits for a concurrent insert of this row to commit. A stored refusal with the same reason is
+		// left as it is, and under read committed the next statement's snapshot sees it.
 		err := tx.QueryRow(ctx, `INSERT INTO owner_refusals (repo, owner, revision, reason) VALUES ($1, $2, $3, $4)
-			ON CONFLICT DO NOTHING RETURNING at`, repo, owner, revision, reason).Scan(&refusal.At)
+			ON CONFLICT (repo, owner, revision) DO UPDATE SET reason = EXCLUDED.reason, at = clock_timestamp()
+			WHERE owner_refusals.reason <> EXCLUDED.reason
+			RETURNING at`, repo, owner, revision, reason).Scan(&refusal.At)
 		if errors.Is(err, pgx.ErrNoRows) {
-			// ON CONFLICT waited for a concurrent insert of this row to commit, and under read committed the next
-			// statement's snapshot sees the committed row.
-			var storedReason string
-			if err := tx.QueryRow(ctx, `SELECT reason, at FROM owner_refusals WHERE repo = $1 AND owner = $2 AND revision = $3`,
-				repo, owner, revision).Scan(&storedReason, &refusal.At); err != nil {
-				return err
-			}
-			if storedReason != reason {
-				return refuse(ReasonRefusalConflict, "owner %s is already refused at work revision %d for another reason: %s",
-					owner, revision, storedReason)
-			}
-			return nil
+			return tx.QueryRow(ctx, `SELECT at FROM owner_refusals WHERE repo = $1 AND owner = $2 AND revision = $3`,
+				repo, owner, revision).Scan(&refusal.At)
 		}
 		if err != nil {
 			return err

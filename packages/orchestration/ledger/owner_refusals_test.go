@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -86,19 +85,45 @@ func TestRecordOwnerRefusedAppendsOnePerRevision(t *testing.T) {
 	assertOwnerRefusals(t, s, first)
 }
 
-// A second refusal at the same revision with another reason is refused and changes nothing.
-func TestRecordOwnerRefusedRefusesAnotherReasonAtTheSameRevision(t *testing.T) {
+// A second refusal at the same revision with another reason replaces the stored reason and appends one owner.refused
+// event with it, so the latest reason the supervisor gives is the one OwnerRefusals shows. Repeating that reason
+// changes nothing more.
+func TestRecordOwnerRefusedTakesTheLatestReasonAtTheSameRevision(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	const owner = "struct:mount"
 	revision := enqueueFor(t, s, "item-1", owner)
-	first := must(s.RecordOwnerRefused(ctx, "r", owner, revision, "no template"))
+	must(s.RecordOwnerRefused(ctx, "r", owner, revision, "no template"))
 
-	_, err := s.RecordOwnerRefused(ctx, "r", owner, revision, "owner id outside the accepted forms")
-	wantRefusal(t, err, ledger.ReasonRefusalConflict)
-	assertOwnerRefusals(t, s, first)
+	latest := must(s.RecordOwnerRefused(ctx, "r", owner, revision, "owner id outside the accepted forms"))
+	if latest.Reason != "owner id outside the accepted forms" || latest.Revision != revision {
+		t.Fatalf("refusal with another reason = %+v", latest)
+	}
+	repeat := must(s.RecordOwnerRefused(ctx, "r", owner, revision, "owner id outside the accepted forms"))
+	if !repeat.At.Equal(latest.At) || repeat.Reason != latest.Reason {
+		t.Fatalf("repeated latest reason = %+v, want the stored %+v", repeat, latest)
+	}
+	assertOwnerRefusals(t, s, latest)
+	want := []ownerRefusedEvent{{owner, revision, "no template"}, {owner, revision, "owner id outside the accepted forms"}}
+	if got := ownerRefusedEvents(t, s); !slices.Equal(got, want) {
+		t.Fatalf("owner.refused events = %+v, want %+v", got, want)
+	}
+}
+
+// A refusal at a revision newer than the owner's work revision is recorded like any other: the ledger keeps what the
+// supervisor says, and OwnerRefusals lists only the refusal at the current work revision.
+func TestRecordOwnerRefusedAcceptsAnyRevision(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	const owner = "struct:mount"
+	revision := enqueueFor(t, s, "item-1", owner)
+	ahead := must(s.RecordOwnerRefused(ctx, "r", owner, revision+100, "no template"))
+	if ahead.Revision != revision+100 {
+		t.Fatalf("refusal ahead of the work = %+v", ahead)
+	}
+	assertOwnerRefusals(t, s)
 	if got := ownerRefusedEvents(t, s); len(got) != 1 {
-		t.Fatalf("a conflicting refusal appended events: %+v", got)
+		t.Fatalf("owner.refused events = %+v, want one", got)
 	}
 }
 
@@ -191,8 +216,7 @@ func TestOwnerRefusalsShowOnlyTheRefusalOfTheCurrentWork(t *testing.T) {
 	}
 }
 
-// An empty owner or reason, a revision below 1, and a revision newer than the owner's work revision are invalid input
-// and record nothing; the newer revision's error names the owner's current revision.
+// An empty owner or reason and a revision below 1 are invalid input and record nothing.
 func TestRecordOwnerRefusedRefusesInvalidInput(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
@@ -210,8 +234,6 @@ func TestRecordOwnerRefusedRefusesInvalidInput(t *testing.T) {
 		{"blank reason", owner, current, "  ", "empty reason"},
 		{"zero revision", owner, 0, "no template", "revision 0"},
 		{"negative revision", owner, -1, "no template", "revision -1"},
-		{"newer revision", owner, current + 1, "no template", fmt.Sprintf("work revision %d", current)},
-		{"owner without work", "global:idle", 1, "no template", "work revision 0"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := s.RecordOwnerRefused(ctx, "r", test.owner, test.revision, test.reason)

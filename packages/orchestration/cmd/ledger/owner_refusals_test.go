@@ -139,7 +139,8 @@ func (cli ownerRefusalCLI) assertOwners(want ...cliOwnerLine) {
 }
 
 // refuse-owner records one refusal per owner and revision, a repeat appends nothing, another reason at that revision
-// exits 1 with refusal_conflict, and owners shows each owner's refusal only while its work is the refused work.
+// replaces the stored one with one more event, and owners shows each owner's refusal only while its work is the refused
+// work.
 func TestRefuseOwnerCommandRecordsOneRefusalPerRevision(t *testing.T) {
 	cli := newOwnerRefusalCLI(t)
 	const refused, other = "function:get_mountpoint", "struct:mount"
@@ -159,27 +160,26 @@ func TestRefuseOwnerCommandRecordsOneRefusalPerRevision(t *testing.T) {
 	}
 	cli.assertOwners(cliOwnerLine{Owner: refused, Refusal: &first}, cliOwnerLine{Owner: other})
 
-	code, stdout, stderr := cli.call("--json", "refuse-owner", "r", refused, strconv.FormatInt(revision, 10), "owner id outside the accepted forms")
-	if code != 1 || !strings.Contains(stdout, `"reason":"refusal_conflict"`) {
-		t.Fatalf("conflicting refusal: code=%d stdout=%q stderr=%q, want exit 1 with refusal_conflict", code, stdout, stderr)
+	latest := cli.refuse(refused, revision, "owner id outside the accepted forms")
+	if latest.Revision != revision || latest.Reason != "owner id outside the accepted forms" {
+		t.Fatalf("refusal with another reason = %+v", latest)
 	}
-	if n := cli.refusedEvents(refused); n != 1 {
-		t.Fatalf("%d owner.refused events after a conflicting refusal, want 1", n)
+	if n := cli.refusedEvents(refused); n != 2 {
+		t.Fatalf("%d owner.refused events after another reason, want 2", n)
 	}
-	cli.assertOwners(cliOwnerLine{Owner: refused, Refusal: &first}, cliOwnerLine{Owner: other})
+	cli.assertOwners(cliOwnerLine{Owner: refused, Refusal: &latest}, cliOwnerLine{Owner: other})
 
 	newer := cli.enqueue("item-3", refused)
 	cli.assertOwners(cliOwnerLine{Owner: refused}, cliOwnerLine{Owner: other})
 	second := cli.refuse(refused, newer, "owner id outside the accepted forms")
 	cli.assertOwners(cliOwnerLine{Owner: refused, Refusal: &second}, cliOwnerLine{Owner: other})
-	if n := cli.refusedEvents(refused); n != 2 {
-		t.Fatalf("%d owner.refused events after a refusal at the new revision, want 2", n)
+	if n := cli.refusedEvents(refused); n != 3 {
+		t.Fatalf("%d owner.refused events after a refusal at the new revision, want 3", n)
 	}
 }
 
-// Every malformed refuse-owner exits 2 and records nothing: a wrong argument count, an empty owner or reason, a
-// revision below 1 or not an integer, and a revision newer than the owner's work revision, whose error names the current
-// one.
+// Every malformed refuse-owner exits 2 and records nothing: a wrong argument count, an empty owner or reason, and a
+// revision below 1 or not an integer.
 func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 	cli := newOwnerRefusalCLI(t)
 	const owner = "struct:mount"
@@ -197,7 +197,6 @@ func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 		{"zero revision", []string{"refuse-owner", "r", owner, "0", "no template"}, "revision 0"},
 		{"negative revision", []string{"refuse-owner", "r", owner, "-1", "no template"}, "revision -1"},
 		{"not a number", []string{"refuse-owner", "r", owner, canonical + "x", "no template"}, "revision"},
-		{"newer revision", []string{"refuse-owner", "r", owner, strconv.FormatInt(revision+1, 10), "no template"}, "work revision " + canonical},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			code, stdout, stderr := cli.call(test.args...)
