@@ -100,8 +100,9 @@ type Review struct {
 
 // ReadyRequest stores the exact landing records an owner offers for a migration.
 //
-// L4 validates upstream provenance and per-contract review authority. L9 settles who may provide reviews and
-// pinned approvals. Until then, Ready validates only these records' shape and stores them as given.
+// Ready refuses an upstream record unless the migration's owner is the repository's upstream owner. It checks the other
+// records' shape only and stores them as given, as Land records them: Land applies the review and pinned rules when the
+// migration lands.
 type ReadyRequest struct {
 	Repo               string            `json:"repo"`
 	ID                 string            `json:"id"`

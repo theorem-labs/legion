@@ -12,78 +12,78 @@ import (
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
-func TestL4RepoEnsureConfiguresAndClearsUpstreamOwner(t *testing.T) {
-	call := l4Command(t)
-	mustL4Code(t, call, 0, "repo", "ensure", "r", "1", "--upstream-owner", "upstream")
-	if got := l4UpstreamOwner(t, call); got != "upstream" {
+func TestRepoEnsureConfiguresAndClearsUpstreamOwner(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "1", "--upstream-owner", "upstream")
+	if got := statusUpstreamOwner(t, call); got != "upstream" {
 		t.Fatalf("upstream owner %q, want upstream", got)
 	}
-	mustL4Code(t, call, 0, "repo", "ensure", "r", "2")
-	if got := l4UpstreamOwner(t, call); got != "upstream" {
+	mustExit(t, call, 0, "repo", "ensure", "r", "2")
+	if got := statusUpstreamOwner(t, call); got != "upstream" {
 		t.Fatalf("upstream owner changed without its flag: %q", got)
 	}
-	mustL4Code(t, call, 0, "repo", "ensure", "r", "2", "--upstream-owner", "")
-	if got := l4UpstreamOwner(t, call); got != "" {
+	mustExit(t, call, 0, "repo", "ensure", "r", "2", "--upstream-owner", "")
+	if got := statusUpstreamOwner(t, call); got != "" {
 		t.Fatalf("upstream owner %q after clearing", got)
 	}
 }
 
-func TestL4ReadyRejectsNonUpstreamOwnersInBothCLIForms(t *testing.T) {
-	call := l4Command(t)
-	mustL4Code(t, call, 0, "repo", "ensure", "r", "0", "--upstream-owner", "upstream")
-	mustL4Code(t, call, 0, "open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
-	assertL4Refusal(t, call, []string{"--json", "ready", "r", "M-flag", "1", "--head", "head", "--upstream", "upstream-commit"})
+func TestReadyRejectsNonUpstreamOwnersInBothCLIForms(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0", "--upstream-owner", "upstream")
+	mustExit(t, call, 0, "open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
+	assertUpstreamNotAllowed(t, call, []string{"--json", "ready", "r", "M-flag", "1", "--head", "head", "--upstream", "upstream-commit"})
 
-	mustL4Code(t, call, 0, "open", "r", "M-file", "alice", "base", "branch", "--write", "b.lean")
+	mustExit(t, call, 0, "open", "r", "M-file", "alice", "base", "branch", "--write", "b.lean")
 	file := filepath.Join(t.TempDir(), "ready.json")
 	request := `{"repo":"r","id":"M-file","generation":1,"head":"head","upstream":"upstream-commit"}`
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	assertL4Refusal(t, call, []string{"--json", "ready", "--request-file", file})
+	assertUpstreamNotAllowed(t, call, []string{"--json", "ready", "--request-file", file})
 
-	mustL4Code(t, call, 0, "open", "r", "M-allowed", "upstream", "base", "branch", "--write", "c.lean")
-	mustL4Code(t, call, 0, "ready", "r", "M-allowed", "1", "--head", "head", "--upstream", "upstream-commit")
+	mustExit(t, call, 0, "open", "r", "M-allowed", "upstream", "base", "branch", "--write", "c.lean")
+	mustExit(t, call, 0, "ready", "r", "M-allowed", "1", "--head", "head", "--upstream", "upstream-commit")
 }
 
-func TestL4ContractListShowsProofReviewAndUpstreamRecords(t *testing.T) {
-	call := l4Command(t)
-	mustL4Code(t, call, 0, "repo", "ensure", "r", "0", "--upstream-owner", "upstream")
+func TestContractListShowsProofReviewAndUpstreamRecords(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0", "--upstream-owner", "upstream")
 
-	mustL4Code(t, call, 0, "contract", "register", "r", "Proof", "alice", "hash-1", "false")
-	mustL4Code(t, call, 0, "open", "r", "M-proof", "alice", "base", "branch", "--write", "a.lean", "--read", "Proof=hash-1")
-	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-proof", "--generation", "1", "--commit", "commit-proof",
+	mustExit(t, call, 0, "contract", "register", "r", "Proof", "alice", "hash-1", "false")
+	mustExit(t, call, 0, "open", "r", "M-proof", "alice", "base", "branch", "--write", "a.lean", "--read", "Proof=hash-1")
+	mustExit(t, call, 0, "land", "--repo", "r", "--migration", "M-proof", "--generation", "1", "--commit", "commit-proof",
 		"--path", "a.lean", "--current", "Proof=hash-1", "--changed-contract", "Proof=hash-2", "--head", "head-proof", "--compatibility-proof", "Spec.Proof.compat")
 
-	mustL4Code(t, call, 0, "contract", "register", "r", "Review", "alice", "hash-1", "false")
-	mustL4Code(t, call, 0, "open", "r", "M-review", "alice", "base", "branch", "--write", "b.lean", "--read", "Review=hash-1")
-	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-review", "--generation", "1", "--commit", "commit-review",
+	mustExit(t, call, 0, "contract", "register", "r", "Review", "alice", "hash-1", "false")
+	mustExit(t, call, 0, "open", "r", "M-review", "alice", "base", "branch", "--write", "b.lean", "--read", "Review=hash-1")
+	mustExit(t, call, 0, "land", "--repo", "r", "--migration", "M-review", "--generation", "1", "--commit", "commit-review",
 		"--path", "b.lean", "--current", "Review=hash-1", "--changed-contract", "Review=hash-2", "--head", "head-review", "--review", "Review=alice@head-review")
 
-	mustL4Code(t, call, 0, "contract", "register", "r", "Upstream", "alice", "hash-1", "false")
-	mustL4Code(t, call, 0, "open", "r", "M-upstream", "upstream", "base", "branch", "--write", "c.lean", "--read", "Upstream=hash-1")
-	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream", "--generation", "1", "--commit", "commit-upstream",
+	mustExit(t, call, 0, "contract", "register", "r", "Upstream", "alice", "hash-1", "false")
+	mustExit(t, call, 0, "open", "r", "M-upstream", "upstream", "base", "branch", "--write", "c.lean", "--read", "Upstream=hash-1")
+	mustExit(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream", "--generation", "1", "--commit", "commit-upstream",
 		"--path", "c.lean", "--current", "Upstream=hash-1", "--changed-contract", "Upstream=hash-2", "--head", "head-upstream", "--review", "Upstream=alice@head-upstream", "--upstream", "upstream-commit")
 
-	mustL4Code(t, call, 0, "contract", "register", "r", "ReviewedHead", "alice", "hash-1", "false")
-	mustL4Code(t, call, 0, "open", "r", "M-reviewed-head", "alice", "base", "branch", "--write", "d.lean", "--read", "ReviewedHead=hash-1")
-	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-reviewed-head", "--generation", "1", "--commit", "commit-reviewed-head",
+	mustExit(t, call, 0, "contract", "register", "r", "ReviewedHead", "alice", "hash-1", "false")
+	mustExit(t, call, 0, "open", "r", "M-reviewed-head", "alice", "base", "branch", "--write", "d.lean", "--read", "ReviewedHead=hash-1")
+	mustExit(t, call, 0, "land", "--repo", "r", "--migration", "M-reviewed-head", "--generation", "1", "--commit", "commit-reviewed-head",
 		"--path", "d.lean", "--current", "ReviewedHead=hash-1", "--changed-contract", "ReviewedHead=hash-2", "--head", "head-reviewed-head", "--reviewed-head", "head-reviewed-head")
 
-	mustL4Code(t, call, 0, "contract", "register", "r", "UpstreamReviewedHead", "alice", "hash-1", "false")
-	mustL4Code(t, call, 0, "open", "r", "M-upstream-reviewed-head", "upstream", "base", "branch", "--write", "e.lean", "--read", "UpstreamReviewedHead=hash-1")
-	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream-reviewed-head", "--generation", "1", "--commit", "commit-upstream-reviewed-head",
+	mustExit(t, call, 0, "contract", "register", "r", "UpstreamReviewedHead", "alice", "hash-1", "false")
+	mustExit(t, call, 0, "open", "r", "M-upstream-reviewed-head", "upstream", "base", "branch", "--write", "e.lean", "--read", "UpstreamReviewedHead=hash-1")
+	mustExit(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream-reviewed-head", "--generation", "1", "--commit", "commit-upstream-reviewed-head",
 		"--path", "e.lean", "--current", "UpstreamReviewedHead=hash-1", "--changed-contract", "UpstreamReviewedHead=hash-2", "--head", "head-upstream-reviewed-head", "--reviewed-head", "head-upstream-reviewed-head", "--upstream", "upstream-commit")
 
-	mustL4Code(t, call, 0, "contract", "register", "r", "UpstreamUnrelated", "alice", "hash-1", "false")
-	mustL4Code(t, call, 0, "open", "r", "M-upstream-unrelated", "upstream", "base", "branch", "--write", "f.lean", "--read", "UpstreamUnrelated=hash-1")
-	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream-unrelated", "--generation", "1", "--commit", "commit-upstream-unrelated",
+	mustExit(t, call, 0, "contract", "register", "r", "UpstreamUnrelated", "alice", "hash-1", "false")
+	mustExit(t, call, 0, "open", "r", "M-upstream-unrelated", "upstream", "base", "branch", "--write", "f.lean", "--read", "UpstreamUnrelated=hash-1")
+	mustExit(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream-unrelated", "--generation", "1", "--commit", "commit-upstream-unrelated",
 		"--path", "f.lean", "--current", "UpstreamUnrelated=hash-1", "--changed-contract", "UpstreamUnrelated=hash-2", "--head", "head-unrelated",
 		"--reviewed-head", "head-unrelated", "--review", "Other=bob@head-unrelated", "--upstream", "upstream-commit")
 
-	mustL4Code(t, call, 0, "contract", "register", "r", "UpstreamExplicit", "alice", "hash-1", "false")
-	mustL4Code(t, call, 0, "open", "r", "M-upstream-explicit", "upstream", "base", "branch", "--write", "g.lean", "--read", "UpstreamExplicit=hash-1")
-	mustL4Code(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream-explicit", "--generation", "1", "--commit", "commit-upstream-explicit",
+	mustExit(t, call, 0, "contract", "register", "r", "UpstreamExplicit", "alice", "hash-1", "false")
+	mustExit(t, call, 0, "open", "r", "M-upstream-explicit", "upstream", "base", "branch", "--write", "g.lean", "--read", "UpstreamExplicit=hash-1")
+	mustExit(t, call, 0, "land", "--repo", "r", "--migration", "M-upstream-explicit", "--generation", "1", "--commit", "commit-upstream-explicit",
 		"--path", "g.lean", "--current", "UpstreamExplicit=hash-1", "--changed-contract", "UpstreamExplicit=hash-2", "--head", "head-explicit",
 		"--reviewed-head", "head-explicit", "--review", "Other=bob@head-explicit", "--review", "UpstreamExplicit=alice@head-explicit", "--upstream", "upstream-commit")
 
@@ -122,17 +122,17 @@ func TestL4ContractListShowsProofReviewAndUpstreamRecords(t *testing.T) {
 
 // A mixed-owner landing through the command line, with both --reviewed-head and each owner's --review, is accepted, and
 // contract list shows each owner's own review as its contract's last_change.
-func TestL4MixedOwnerLandingRecordsEachExplicitReview(t *testing.T) {
-	call := l4Command(t)
-	mustL4Code(t, call, 0, "repo", "ensure", "r", "0")
-	mustL4Code(t, call, 0, "contract", "register", "r", "C", "alice", "hash-1", "false")
-	mustL4Code(t, call, 0, "contract", "register", "r", "D", "bob", "hash-1", "false")
-	mustL4Code(t, call, 0, "open", "r", "M-mixed", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1", "--read", "D=hash-1")
+func TestMixedOwnerLandingRecordsEachExplicitReview(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "contract", "register", "r", "C", "alice", "hash-1", "false")
+	mustExit(t, call, 0, "contract", "register", "r", "D", "bob", "hash-1", "false")
+	mustExit(t, call, 0, "open", "r", "M-mixed", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1", "--read", "D=hash-1")
 	candidate := []string{"--path", "a.lean", "--current", "C=hash-1", "--current", "D=hash-1",
 		"--changed-contract", "C=hash-2", "--changed-contract", "D=hash-2", "--head", "head-1", "--reviewed-head", "head-1",
 		"--review", "D=bob@head-1", "--review", "C=alice@head-1"}
-	mustL4Code(t, call, 0, append([]string{"--json", "check", "r", "M-mixed", "1", "--commit", "commit-1"}, candidate...)...)
-	mustL4Code(t, call, 0, append([]string{"land", "--repo", "r", "--migration", "M-mixed", "--generation", "1", "--commit", "commit-1"}, candidate...)...)
+	mustExit(t, call, 0, append([]string{"--json", "check", "r", "M-mixed", "1", "--commit", "commit-1"}, candidate...)...)
+	mustExit(t, call, 0, append([]string{"land", "--repo", "r", "--migration", "M-mixed", "--generation", "1", "--commit", "commit-1"}, candidate...)...)
 
 	code, stdout, stderr := call("--json", "contract", "list", "r")
 	if code != 0 {
@@ -162,11 +162,11 @@ func TestL4MixedOwnerLandingRecordsEachExplicitReview(t *testing.T) {
 	}
 }
 
-type l4Call func(args ...string) (int, string, string)
+type ledgerCall func(args ...string) (int, string, string)
 
-func l4Command(t *testing.T) l4Call {
+func ledgerCommand(t *testing.T) ledgerCall {
 	t.Helper()
-	dsn := testpg.Database(t, "ledger_l4_command")
+	dsn := testpg.Database(t, "ledger_contract_reviews_command")
 	return func(args ...string) (int, string, string) {
 		t.Helper()
 		var stdout, stderr bytes.Buffer
@@ -180,14 +180,14 @@ func l4Command(t *testing.T) l4Call {
 	}
 }
 
-func mustL4Code(t *testing.T, call l4Call, want int, args ...string) {
+func mustExit(t *testing.T, call ledgerCall, want int, args ...string) {
 	t.Helper()
 	if code, _, stderr := call(args...); code != want {
 		t.Fatalf("%v: code=%d stderr=%q, want %d", args, code, stderr, want)
 	}
 }
 
-func l4UpstreamOwner(t *testing.T, call l4Call) string {
+func statusUpstreamOwner(t *testing.T, call ledgerCall) string {
 	t.Helper()
 	code, stdout, stderr := call("--json", "status", "r")
 	if code != 0 {
@@ -204,7 +204,7 @@ func l4UpstreamOwner(t *testing.T, call l4Call) string {
 	return status.Repository.UpstreamOwner
 }
 
-func assertL4Refusal(t *testing.T, call l4Call, args []string) {
+func assertUpstreamNotAllowed(t *testing.T, call ledgerCall, args []string) {
 	t.Helper()
 	code, stdout, stderr := call(args...)
 	if code != 1 {

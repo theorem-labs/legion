@@ -10,7 +10,7 @@ import (
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
-func TestL4PerContractReviews(t *testing.T) {
+func TestPerContractReviews(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {
 		name          string
@@ -76,7 +76,7 @@ func TestL4PerContractReviews(t *testing.T) {
 				ReviewedHead:     test.reviewedHead,
 				Reviews:          test.reviews,
 			}
-			check := must(s.Check(ctx, l4CheckRequest(request)))
+			check := must(s.Check(ctx, checkRequestFor(request)))
 			if test.wantRefusal {
 				if check.Pass || len(check.Violations) != 1 || check.Violations[0].Kind != ledger.ReasonStatementUnreviewed {
 					t.Fatalf("check result: %+v", check)
@@ -86,7 +86,7 @@ func TestL4PerContractReviews(t *testing.T) {
 						t.Errorf("check message %q does not contain %q", check.Violations[0].Message, field)
 					}
 				}
-				refusal := wantRefusal(t, l4Land(s, request), ledger.ReasonStatementUnreviewed)
+				refusal := wantRefusal(t, landError(s, request), ledger.ReasonStatementUnreviewed)
 				for _, field := range test.messageFields {
 					if !strings.Contains(refusal.Message, field) {
 						t.Errorf("land message %q does not contain %q", refusal.Message, field)
@@ -104,7 +104,7 @@ func TestL4PerContractReviews(t *testing.T) {
 	}
 }
 
-func TestL4UpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
+func TestUpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	must(s.EnsureRepo(ctx, "r", 3, ledger.WithUpstreamOwner("upstream")))
@@ -118,11 +118,11 @@ func TestL4UpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
 		Repo: "r", ID: denied.ID, Generation: denied.Generation, Head: "head-denied", Upstream: "upstream-commit",
 	})
 	wantRefusal(t, err, ledger.ReasonUpstreamNotAllowed)
-	deniedCheck := must(s.Check(ctx, l4CheckRequest(deniedRequest)))
+	deniedCheck := must(s.Check(ctx, checkRequestFor(deniedRequest)))
 	if deniedCheck.Pass || len(deniedCheck.Violations) != 1 || deniedCheck.Violations[0].Kind != ledger.ReasonUpstreamNotAllowed {
 		t.Fatalf("denied upstream check: %+v", deniedCheck)
 	}
-	wantRefusal(t, l4Land(s, deniedRequest), ledger.ReasonUpstreamNotAllowed)
+	wantRefusal(t, landError(s, deniedRequest), ledger.ReasonUpstreamNotAllowed)
 
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 	unreviewed := must(open(t, s, "M-unreviewed", "upstream", []string{"b.lean"}, map[string]string{"C": "hash-1"}))
@@ -137,11 +137,11 @@ func TestL4UpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("ready accepts upstream owner provenance: %v", err)
 	}
-	unreviewedCheck := must(s.Check(ctx, l4CheckRequest(unreviewedRequest)))
+	unreviewedCheck := must(s.Check(ctx, checkRequestFor(unreviewedRequest)))
 	if unreviewedCheck.Pass || len(unreviewedCheck.Violations) != 1 || unreviewedCheck.Violations[0].Kind != ledger.ReasonStatementUnreviewed {
 		t.Fatalf("unreviewed upstream check: %+v", unreviewedCheck)
 	}
-	wantRefusal(t, l4Land(s, unreviewedRequest), ledger.ReasonStatementUnreviewed)
+	wantRefusal(t, landError(s, unreviewedRequest), ledger.ReasonStatementUnreviewed)
 
 	must(s.RegisterContract(ctx, "r", "P", "alice", "hash-p1", true))
 	pinned := must(open(t, s, "M-pinned", "upstream", []string{"c.lean"}, map[string]string{"P": "hash-p1"}))
@@ -150,14 +150,14 @@ func TestL4UpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
 		ChangedPaths: []string{"c.lean"}, Current: map[string]string{"P": "hash-p1"}, ChangedContracts: map[string]string{"P": "hash-p2"},
 		Head: "head-pinned", Upstream: "upstream-commit", Reviews: []ledger.Review{{Contract: "P", Reviewer: "alice", Head: "head-pinned"}},
 	}
-	pinnedCheck := must(s.Check(ctx, l4CheckRequest(pinnedRequest)))
+	pinnedCheck := must(s.Check(ctx, checkRequestFor(pinnedRequest)))
 	if pinnedCheck.Pass || len(pinnedCheck.Violations) != 1 || pinnedCheck.Violations[0].Kind != ledger.ReasonPinned {
 		t.Fatalf("pinned upstream check: %+v", pinnedCheck)
 	}
-	wantRefusal(t, l4Land(s, pinnedRequest), ledger.ReasonPinned)
+	wantRefusal(t, landError(s, pinnedRequest), ledger.ReasonPinned)
 }
 
-func TestL4ContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
+func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {
 		name       string
@@ -286,21 +286,21 @@ func TestL4ContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 				t.Fatal(err)
 			}
 			contract := must(s.Contract(ctx, "r", "C"))
-			assertL4JSON(t, contract.LastChange, test.wantChange)
+			assertLastChange(t, contract.LastChange, test.wantChange)
 			contracts := must(s.Contracts(ctx, "r"))
 			if len(contracts) != 1 {
 				t.Fatalf("contracts: %+v", contracts)
 			}
-			assertL4JSON(t, contracts[0].LastChange, test.wantChange)
+			assertLastChange(t, contracts[0].LastChange, test.wantChange)
 		})
 	}
 }
 
-// TestL4MixedOwnersRecordEachExplicitReview lands two contracts of two owners with both a reviewed head and each
+// TestMixedOwnersRecordEachExplicitReview lands two contracts of two owners with both a reviewed head and each
 // owner's explicit review. The reviewed head clears neither, because the owners differ, so the explicit reviews clear
 // them, and each contract's last_change records its own owner's review rather than a review derived from the reviewed
 // head.
-func TestL4MixedOwnersRecordEachExplicitReview(t *testing.T) {
+func TestMixedOwnersRecordEachExplicitReview(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
@@ -315,7 +315,7 @@ func TestL4MixedOwnersRecordEachExplicitReview(t *testing.T) {
 			{Contract: "C", Reviewer: "alice", Head: "head-1"},
 		},
 	}
-	if check := must(s.Check(ctx, l4CheckRequest(request))); !check.Pass {
+	if check := must(s.Check(ctx, checkRequestFor(request))); !check.Pass {
 		t.Fatalf("check of a mixed-owner change with each owner's review: %+v", check)
 	}
 	if _, err := s.Land(ctx, request); err != nil {
@@ -330,12 +330,12 @@ func TestL4MixedOwnersRecordEachExplicitReview(t *testing.T) {
 		t.Fatalf("contracts: %+v", contracts)
 	}
 	for _, contract := range contracts {
-		assertL4JSON(t, contract.LastChange, want[contract.Name])
-		assertL4JSON(t, must(s.Contract(ctx, "r", contract.Name)).LastChange, want[contract.Name])
+		assertLastChange(t, contract.LastChange, want[contract.Name])
+		assertLastChange(t, must(s.Contract(ctx, "r", contract.Name)).LastChange, want[contract.Name])
 	}
 }
 
-func l4CheckRequest(request ledger.LandRequest) ledger.CheckRequest {
+func checkRequestFor(request ledger.LandRequest) ledger.CheckRequest {
 	return ledger.CheckRequest{
 		Repo: request.Repo, ID: request.Migration, Generation: request.Generation, Commit: request.Commit,
 		Changed: request.ChangedPaths, Current: request.Current, ChangedContracts: request.ChangedContracts,
@@ -344,12 +344,12 @@ func l4CheckRequest(request ledger.LandRequest) ledger.CheckRequest {
 	}
 }
 
-func l4Land(s *ledger.Store, request ledger.LandRequest) error {
+func landError(s *ledger.Store, request ledger.LandRequest) error {
 	_, err := s.Land(context.Background(), request)
 	return err
 }
 
-func assertL4JSON(t *testing.T, got ledger.LastChange, want any) {
+func assertLastChange(t *testing.T, got ledger.LastChange, want any) {
 	t.Helper()
 	var actual any
 	if err := json.Unmarshal([]byte(got), &actual); err != nil {

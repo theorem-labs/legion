@@ -8,10 +8,10 @@ ALTER TABLE migrations
     ADD COLUMN ready_records jsonb;
 CREATE INDEX migrations_ready_event ON migrations (repo, ready_event) WHERE ready_event IS NOT NULL;
 
--- L4 configures and validates this owner for upstream provenance.
+-- The one migration owner whose landings may carry an upstream commit as their provenance.
 ALTER TABLE repositories ADD COLUMN upstream_owner text;
 
--- L5 records idempotency keys for landing rounds.
+-- The idempotency key of each recorded landing round, so a retried round counts once.
 CREATE TABLE round_keys (
     repo text NOT NULL,
     migration text NOT NULL,
@@ -20,7 +20,7 @@ CREATE TABLE round_keys (
     FOREIGN KEY (repo, migration) REFERENCES migrations(repo, id)
 );
 
--- L6 records once per owner revision why the supervisor declined to start it.
+-- Why the supervisor declined to start an owner, recorded once per owner and work revision.
 CREATE TABLE owner_refusals (
     repo text NOT NULL REFERENCES repositories(name),
     owner text NOT NULL,
