@@ -47,7 +47,7 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("parity", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	declindexPath := flags.String("declindex", "", "declindex users --json output")
+	declindexPath := flags.String("declindex", "", "declindex --json users output")
 	usesPath := flags.String("uses", "", "uses --json output")
 	namesPath := flags.String("names", "", "newline-delimited full declaration names")
 	if err := flags.Parse(args); err != nil {

@@ -52,7 +52,7 @@ The first four cases use Docker's default seccomp profile. The last passes `deny
 
 ## Recall
 
-`recall` measures unique files, not declarations. `truth.txt` is a newline-delimited list of paths relative to the indexed tree; blank lines and `#` comments are ignored. The `states` input is `declindex states --json` output. `extras.tsv` has one deterministic first declaration and location per file that `states` finds outside the ground truth.
+`recall` measures unique files, not declarations. `truth.txt` is a newline-delimited list of paths relative to the indexed tree; blank lines and `#` comments are ignored. The `states` input is the output of `declindex --config <cfg> --json states <concept>`. `extras.tsv` has one deterministic first declaration and location per file that `states` finds outside the ground truth.
 
 ```sh
 go run ./packages/orchestration/declindex/e2e/recall \
