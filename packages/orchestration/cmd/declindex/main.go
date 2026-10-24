@@ -44,7 +44,8 @@ Commands:
                                check the ledger and newly landed registry concepts; file mode emits registrations
                                and near pairs for the landing program and never connects to the ledger
   land-hash                    the landing program's hasher: LAND_TREE, LAND_GIT_DIR, LAND_NAMES or LAND_NAMES_FILE
-                               (a matching JSON array) in; name<TAB>hash<TAB>path out
+                               (a matching JSON array), and LAND_BUILD_DIR for changed sources in;
+                               name<TAB>hash<TAB>path out
 
 NAME is a full name or any dotted suffix of one. A name declared twice is answered once per declaration.
 Exit codes:

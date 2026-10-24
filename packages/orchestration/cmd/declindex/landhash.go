@@ -17,7 +17,7 @@ import (
 // configured tree.
 func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
-		return fail(e.stderr, &usageError{"land-hash takes no arguments; it reads LAND_TREE, LAND_GIT_DIR, and LAND_NAMES"})
+		return fail(e.stderr, &usageError{"land-hash takes no arguments; it reads LAND_TREE, LAND_GIT_DIR, LAND_NAMES or LAND_NAMES_FILE, and LAND_BUILD_DIR for changed sources"})
 	}
 	tree := strings.TrimSpace(e.getenv("LAND_TREE"))
 	// LAND_TREE goes only to Git, which reads an object id in either case, so it may be uppercase; LAND_COMMIT is
