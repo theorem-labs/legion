@@ -197,4 +197,8 @@ extern inline __attribute__((__gnu_inline__)) int box_inline_default(void)
 /* Per-CPU state: the current box lives in the thread pointer. */
 register struct box *current_box __asm__("tp");
 
+/* include/linux/list.h list_for_each_entry: a for loop a header's macro writes. */
+#define dd_first(head) ((head)->next)
+#define dd_for_each(pos, head) for (pos = dd_first(head); pos != (head); pos = pos->next)
+
 #endif

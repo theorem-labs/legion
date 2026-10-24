@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import collections
 import re
+import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -446,6 +447,7 @@ class _Extractor:
         self.analyzing: set[str] = set()
         self.effect_free_cache: dict[str, bool] = {}
         self.nesting = 0  # analyses under way, one inside another: bounded by _EFFECT_DEPTH
+        self.truncations = 0  # answers cut short by a recursion or the depth bound
         self.selections: dict[int, set[int] | None] = {}
         self.typedefs: dict[str, str] | None = None  # the unit's typedef names, read on demand
 
@@ -902,8 +904,14 @@ class _Extractor:
         if name in self.ignored_cache:
             return self.ignored_cache[name]
         definition = self.evaluator.definitions.get(name)
-        if definition is None or self.is_weak(definition) or name in self.analyzing or self.nesting >= _EFFECT_DEPTH:
+        if definition is None or self.is_weak(definition):
             return frozenset()
+        if name in self.analyzing or self.nesting >= _EFFECT_DEPTH:
+            # A recursion, or a chain past the depth bound: no parameter counts as ignored, and the
+            # answer is not kept.
+            self.truncations += 1
+            return frozenset()
+        truncations = self.truncations
         self.nesting += 1
         try:
             walk = self.analysis(definition)
@@ -912,7 +920,8 @@ class _Extractor:
         never_read = walk.never_read()
         parameters = list(definition.get_arguments() or [])
         result = frozenset(position for position, parameter in enumerate(parameters) if parameter.hash in never_read)
-        self.ignored_cache[name] = result
+        if self.truncations == truncations:
+            self.ignored_cache[name] = result
         return result
 
     def ignores_variadic(self, callee: ci.Cursor | None) -> bool:
@@ -929,16 +938,16 @@ class _Extractor:
             return False
         return not any(node.kind == K.CALL_EXPR and node.spelling in _VA_START for node in definition.walk_preorder())
 
-    def branches_without_effect(self, statement: ci.Cursor) -> bool:
+    def branches_without_effect(self, statement: ci.Cursor, dead: frozenset[int] = frozenset()) -> bool:
         """An ``if`` whose branches have no effect and leave only by their end: only what its
         condition does is code (__device_attach's ``if (dev->parent) pm_runtime_get_sync(dev->parent)``
-        without CONFIG_PM)."""
+        without CONFIG_PM). A store to a variable in ``dead``, which nothing reads, is no effect."""
         children = _children(statement)
         return (
             statement.kind == K.IF_STMT
             and len(children) >= 2
             and not _jumps_out(statement, 0)
-            and all(self.effect_free(branch) for branch in children[1:])
+            and all(self.effect_free(branch, dead) for branch in children[1:])
         )
 
     def analysis(self, definition: ci.Cursor) -> _FunctionWalk:
@@ -956,6 +965,7 @@ class _Extractor:
         if cached is not None:
             return cached
         self.analyzing.add(name)
+        truncations = self.truncations
         labels: frozenset[str] = frozenset()
         dead: frozenset[int] = frozenset()
         decided: frozenset[int] = frozenset()
@@ -976,7 +986,10 @@ class _Extractor:
             dead |= never_read
             decided |= image_read - dead
         self.analyzing.discard(name)
-        self.analyses[name] = walk
+        if self.truncations == truncations:
+            # A walk that met a recursion or the depth bound depends on where it was asked for: it
+            # is not kept, so each function's facts come from a walk with the full horizon.
+            self.analyses[name] = walk
         return walk
 
     def inline_function(self, name: str) -> bool:
@@ -984,14 +997,15 @@ class _Extractor:
         definition = self.evaluator.definitions.get(name)
         return definition is not None and _is_inline(definition)
 
-    def effect_free(self, expression: ci.Cursor) -> bool:
+    def effect_free(self, expression: ci.Cursor, dead: frozenset[int] = frozenset()) -> bool:
         """Computing ``expression`` changes nothing but its value, so the compiler removes it when
         the value is not used: no asm that is volatile or has no output, no volatile access, no store
-        except to a variable the expression declares, no loop that may not end, and calls only to
-        the builtins that compute a value and to functions of the unit that are themselves
-        effect-free. Operands that are never evaluated (sizeof, typeof) do not count."""
+        except to a variable the expression declares or one in ``dead`` (which nothing reads), no
+        loop that may not end, and calls only to the builtins that compute a value and to functions
+        of the unit that are themselves effect-free. Operands that are never evaluated (sizeof,
+        typeof) do not count."""
         own = {node.hash for node in _effect_nodes(expression) if node.kind == K.VAR_DECL and _is_local(node)}
-        return self._effect_free(expression, own, inlined=True)
+        return self._effect_free(expression, own | dead, inlined=True)
 
     def function_effect_free(self, name: str) -> bool:
         """A call of the function changes nothing but its result: its compiled code, as its settled
@@ -1000,7 +1014,7 @@ class _Extractor:
         has no effect. A function that is not inline and not static may not be inlined, and the
         compiler knows such a call returns only when the function has no loop. A function that
         calls itself again may not return, and a chain of calls deeper than _EFFECT_DEPTH is not
-        followed: both count as an effect."""
+        followed: both count as an effect, and the answer is not kept."""
         cached = self.effect_free_cache.get(name)
         if cached is not None:
             return cached
@@ -1009,7 +1023,9 @@ class _Extractor:
             self.effect_free_cache[name] = False
             return False
         if name in self.analyzing or self.nesting >= _EFFECT_DEPTH:
+            self.truncations += 1
             return False
+        truncations = self.truncations
         self.nesting += 1
         try:
             walk = self.analysis(definition)
@@ -1017,7 +1033,8 @@ class _Extractor:
             self.nesting -= 1
         inlined = _is_inline(definition) or definition.linkage == ci.LinkageKind.INTERNAL
         result = walk.effects == 0 and (inlined or walk.compiled_loops == 0)
-        self.effect_free_cache[name] = result
+        if self.truncations == truncations:
+            self.effect_free_cache[name] = result
         return result
 
     def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool) -> bool:
@@ -1068,14 +1085,22 @@ class _Extractor:
         elif loop.kind == K.DO_STMT:
             condition = children[-1] if len(children) == 2 else None
         else:
-            return self.for_condition_constant(loop)
+            return self.for_condition_constant(loop, children)
         value = libclang.constant_int(condition) if condition is not None else None
         return condition is None or (value is not None and value != 0)
 
-    def for_condition_constant(self, loop: ci.Cursor) -> bool:
-        """``for (init; condition; step)``: libclang leaves out the parts that are absent, so the
-        condition is read from the tokens between the two semicolons of the header."""
+    def for_condition_constant(self, loop: ci.Cursor, children: list[ci.Cursor]) -> bool:
+        """``for (init; condition; step)`` may not end: its condition is absent or a constant other
+        than 0. With all four parts libclang gives the condition second. Otherwise it leaves out the
+        parts that are absent, so the condition is read from the tokens between the two semicolons
+        of the header as written; a header a macro writes (list_for_each_entry) counts as one that
+        may not end unless libclang gives all four parts."""
+        if len(children) == 4:
+            value = libclang.constant_int(children[1])
+            return value is not None and value != 0
         tokens = self.written_tokens(loop, loop)
+        if not tokens or tokens[0] != "for":
+            return True
         depth, part, middle = 0, 0, []
         for token in tokens[1:]:
             if token in ("(", "[", "{"):
@@ -1330,10 +1355,11 @@ _VALUE_BUILTINS = frozenset(
         "__builtin_bswap64",
     }
 )  # fmt: skip
-# Walks of one function until its labels and dead stores settle, and calls followed into callees
-# to tell whether they have an effect.
+# Walks of one function until its labels and dead stores settle, and analyses nested one inside
+# another (a call followed into its callee to tell its effects or the parameters it ignores).
 _ANALYSIS_ROUNDS = 8
-_EFFECT_DEPTH = 8
+_EFFECT_DEPTH = 16
+_RECURSION_LIMIT = 100_000
 # What va_start expands to: a function that calls neither never reads its variable arguments.
 _VA_START = frozenset({"__builtin_va_start", "__builtin_c23_va_start", "__builtin_stdarg_start"})
 # The statements whose children are statements: an expression there is an expression statement.
@@ -1375,6 +1401,23 @@ def _address_of_local(expression: ci.Cursor, own: set[int] | None) -> bool:
 
 _LOOP_OR_SWITCH = (K.WHILE_STMT, K.FOR_STMT, K.DO_STMT, K.SWITCH_STMT)
 _LEAVES = (K.RETURN_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT, K.LABEL_STMT, K.CASE_STMT, K.DEFAULT_STMT)
+
+
+def _statement_position(parent: ci.Cursor, index: int) -> bool:
+    """The child at ``index`` of ``parent`` is a statement: one of a block, a labeled statement, an
+    if's branch, or a loop's body."""
+    kind = parent.kind
+    if kind in _STATEMENT_PARENTS:
+        return True
+    if kind == K.IF_STMT:
+        return index >= 1
+    if kind == K.WHILE_STMT:
+        return index == 1
+    if kind == K.DO_STMT:
+        return index == 0
+    if kind == K.FOR_STMT:
+        return index == len(_children(parent)) - 1
+    return False
 
 
 def _jumps_out(node: ci.Cursor, enclosing: int) -> bool:
@@ -1905,6 +1948,7 @@ class _FunctionWalk:
         # loop that may not end) and loops. A call of the function may go when it has neither.
         self.effects = 0
         self.compiled_loops = 0
+        self.statement_values: set[int] = set()  # the expression statements outside blocks, discarded
         # Field addresses: each member chain's topmost member gets the chain's address; the members
         # below it (and the ones a local's definition folds away) are addressed only through it.
         self.chained: set[int] = set()
@@ -2155,7 +2199,7 @@ class _FunctionWalk:
         (psi_sched_switch(..., !task_on_rq_queued(prev) || prev->se.sched_delayed): the READ_ONCE
         in task_on_rq_queued stays, and the read of the right operand of || goes). In ({ ... }) the
         statements before the value are code and the value is discarded."""
-        if self.x.effect_free(node):
+        if self.x.effect_free(node, self.dead_variables):
             self.walk(node, parent, index, reason, generic)
             return
         kind = node.kind
@@ -2168,7 +2212,7 @@ class _FunctionWalk:
                 else:
                     self.walk(statement, children[0], statement_index, None, generic)
             return
-        if kind == K.IF_STMT and self.x.branches_without_effect(node):
+        if kind == K.IF_STMT and self.x.branches_without_effect(node, self.dead_variables):
             # An if whose branches have no effect: only what its condition does is code.
             self.discard(children[0], node, 0, generic, reason)
             for child_index, child in enumerate(children[1:], 1):
@@ -2176,7 +2220,9 @@ class _FunctionWalk:
             return
         if kind == K.BINARY_OPERATOR and len(children) == 2:
             operator = libclang.binary_kind(node)
-            if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR, _COMMA) and self.x.effect_free(children[1]):
+            if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR, _COMMA) and self.x.effect_free(
+                children[1], self.dead_variables
+            ):
                 # The right operand only gives the unused value.
                 self.discard(children[0], node, 0, generic, reason)
                 self.walk(children[1], node, 1, reason, generic)
@@ -3254,6 +3300,20 @@ class _FunctionWalk:
         self, node: ci.Cursor, parent: ci.Cursor | None, index: int, reason: str | None, generic: bool = False
     ) -> None:
         kind = node.kind
+        if (
+            reason is None
+            and parent is not None
+            and parent.kind not in _STATEMENT_PARENTS
+            and kind.is_expression()
+            and node.hash not in self.statement_values
+            and _statement_position(parent, index)
+        ):
+            # An expression statement that is a loop's body or an if's branch (scoped_guard(mutex,
+            # &lock) val = ...): its value is discarded, so only its effects are code. A block's
+            # statements are discarded where the block is walked.
+            self.statement_values.add(node.hash)
+            self.discard(node, parent, index, generic)
+            return
         children = _children(node)
         if kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR) and reason is None and node.hash not in self.chained:
             # The top of a member chain: its topmost member gets the chain's address.
@@ -3290,7 +3350,7 @@ class _FunctionWalk:
         if stored is not None and _strip_parens(stored).kind == K.DECL_REF_EXPR:
             # v = e stores into v without reading it. v op= e and v++ read v only to store into it,
             # unless their own value is used (pcpu_dump_alloc_info's while (v /= 10)).
-            value_unused = parent is not None and parent.kind in _STATEMENT_PARENTS
+            value_unused = parent is not None and _statement_position(parent, index)
             if value_unused or (kind == K.BINARY_OPERATOR and libclang.is_assignment(node)):
                 self.stores.add(_strip_parens(stored).hash)
             variable = _strip_parens(stored).referenced
@@ -3298,7 +3358,7 @@ class _FunctionWalk:
                 reason is None
                 and len(children) == 2
                 and parent is not None
-                and parent.kind in _STATEMENT_PARENTS
+                and _statement_position(parent, index)
                 and variable is not None
                 and variable.hash in self.dead_variables | self.decided_variables
             ):
@@ -3417,6 +3477,13 @@ class _FunctionWalk:
                     self.discard(children[1 - zero], node, 1 - zero, generic)
                     return
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
+                right = self.x.evaluator.evaluate(children[1], truth=True)
+                if right is not None and bool(right) == (operator == libclang.LOGICAL_OR):
+                    # a || 1 is 1 and a && 0 is 0: a's value is unused (can_demote's !pgdat ||
+                    # !numa_demotion_enabled without NUMA), so only a's effects are code.
+                    self.discard(children[0], node, 0, generic)
+                    self.walk(children[1], node, 1, reason, generic)
+                    return
                 self.walk(children[0], node, 0, reason, generic)
                 if _mentions(children[0], _IMAGE_DECIDES):
                     # flush_workqueue's __builtin_constant_p(_wq == system_wq) && _wq == system_wq.
@@ -3496,7 +3563,7 @@ class _FunctionWalk:
                     self.walk(child, node, child_index, "after_exit", generic)
                 elif (
                     child.kind.is_expression() and not (value_last and child_index == len(children) - 1)
-                ) or self.x.branches_without_effect(child):
+                ) or self.x.branches_without_effect(child, self.dead_variables):
                     # An expression statement (get_user_ns(ns);, a call of a void function that only
                     # reads), or an if whose branches have no effect: its value is discarded, so only
                     # its effects are code. The last statement of ({ ... }) is that expression's
@@ -3837,6 +3904,9 @@ def _is_weak(extractor: _Extractor, cursor: ci.Cursor) -> bool:
 
 def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabulary) -> Facts:
     """Parse one C file of the tree and return its facts."""
+    # Each analysis nested inside another (up to _EFFECT_DEPTH) recurses through its function's
+    # syntax tree: room for that many walks.
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), _RECURSION_LIMIT))
     main = (c_tree / source).resolve()
     index = ci.Index.create()
     # The preprocessing record keeps the unit's macro definitions, which _Generic selection and

@@ -491,3 +491,82 @@ void dd_overflow(struct box *b)
 {
 	dd_mul(b->size, 2);
 }
+
+/* mm/vmscan.c can_demote: if (!pgdat || !numa_demotion_enabled) return false, with
+ * numa_demotion_enabled false without NUMA. a || 1 is 1, and a && 0 is 0, whatever a is: only a's
+ * effects are code (shrink_node's NODE_DATA read). */
+#define dd_demotion_enabled 0
+
+static inline int dd_split_init(struct box *b)
+{
+	return 1;
+}
+
+int dd_absorbed_or(struct box *b)
+{
+	if (!b->first || !dd_demotion_enabled)
+		return 0;
+	return 1;
+}
+
+int dd_absorbed_and(struct box *b)
+{
+	return b->size && !dd_split_init(b);
+}
+
+/* drivers/base/core.c fwnode_links_check_suppliers: list_for_each_entry(link, &fwnode->suppliers,
+ * c_hook) is a for loop a macro writes, with a condition that is not a constant: the compiler may
+ * assume it ends, so a call whose value is unused goes (waiting_for_supplier_show without SYSFS). */
+static int dd_count_links(struct list_node *head)
+{
+	struct list_node *pos;
+
+	for (pos = head->next; pos != head; pos = pos->next)
+		if (pos->prev == head)
+			return 1;
+	return 0;
+}
+
+/* dd_for_each is in mini.h, as list_for_each_entry is in include/linux/list.h. */
+
+static int dd_count_links_macro(struct list_node *head)
+{
+	struct list_node *pos;
+
+	dd_for_each(pos, head)
+		if (pos->prev == head)
+			return 1;
+	return 0;
+}
+
+void dd_unused_loop_call(struct list_node *head)
+{
+	int val;
+
+	val = dd_count_links(head) + dd_count_links_macro(head);
+	dd_emit((char *)0, (char *)0, val);
+}
+
+/* scoped_guard(mutex, &fwnode_link_lock) val = ...: a for loop whose body is an expression
+ * statement, a store nothing reads. */
+void dd_unused_in_body(struct box *b)
+{
+	long val;
+	int once;
+
+	for (once = 0; once < 1; once++)
+		val = b->size;
+	if (b->first)
+		val = b->size;
+	dd_emit((char *)0, (char *)0, val);
+}
+
+/* An if with one branch an expression statement without effect, the other with one: the
+ * condition is code, the branch without effect is not. */
+void dd_if_mixed(struct box *b)
+{
+	if (b->first)
+		dd_read_checked(b);
+	else
+		obj_free(b);
+}

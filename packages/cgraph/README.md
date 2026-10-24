@@ -32,11 +32,13 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   because another unit may replace it),
   the cases a `switch` on a value clang folds does not reach (`switch (sizeof(x))`,
   `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or `||`, an operand of `&` or `*`
-  whose other operand is 0 (`IS_DAX(inode)` without `CONFIG_FS_DAX`), discarded values
-  (`(void)x`, `(x, 0)`, an expression statement such as `get_user_ns(ns);`, an `if` whose branches
-  have no effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)` without `CONFIG_PM`,
-  stores to a local or a parameter that compiled code never reads, such as `local_lock`'s `__tl`,
-  and arguments to a parameter the callee never reads in compiled code), of which only the parts
+  whose other operand is 0 (`IS_DAX(inode)` without `CONFIG_FS_DAX`), the left operand of an `&&`
+  whose right one is 0 or of an `||` whose right one is 1 (`!pgdat || !numa_demotion_enabled`
+  without NUMA), discarded values (`(void)x`, `(x, 0)`, an expression statement such as
+  `get_user_ns(ns);`, also as an `if`'s branch or a loop's body, an `if` whose branches have no
+  effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)` without `CONFIG_PM`, stores to a
+  local or a parameter that compiled code never reads, such as `local_lock`'s `__tl`, and arguments
+  to a parameter the callee never reads in compiled code), of which only the parts
   with an effect are code (`psi_sched_switch(..., !task_on_rq_queued(prev) || p->x)` keeps the
   `READ_ONCE` and drops the read of `p->x`; the last statement of `({ ... })` is its value).
   A parameter is ignored transitively (`from_kuid_munged` passes its namespace only to
@@ -51,7 +53,8 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   code, as the rules above leave it, has none: no asm other than one without `volatile` that has an
   output (`RELOC_HIDE` under `this_cpu_ptr`), no volatile access, no store except to its own locals
   (also by `__builtin_mul_overflow` and its kind), no loop that may not end (a constant controlling
-  expression; C11 lets the compiler assume any other loop ends), no cleanup with an effect, and
+  expression, read from the parts libclang gives, or from the header as written where it leaves
+  some out; C11 lets the compiler assume any other loop ends), no cleanup with an effect, and
   calls only to such functions. So the `WARN_ON_ONCE` under `IS_ENABLED(CONFIG_DEBUG_ATOMIC)` in
   `instrument_atomic_check_alignment` is no effect. Branches of `__builtin_constant_p` and
   `__builtin_object_size`, also as the left operand of `&&` or `||`, are left to the machine code:

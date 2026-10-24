@@ -1019,3 +1019,38 @@ def test_a_helper_whose_effects_are_not_compiled_has_none(dead_facts: dict[str, 
 
 def test_a_helper_with_a_live_asm_volatile_is_kept(dead_facts: dict[str, Any]) -> None:
     assert callees(dead_facts, "dd_live_effect") == {"dd_read_fenced"}
+
+
+@pytest.mark.parametrize("function", ["dd_absorbed_or", "dd_absorbed_and"])
+def test_an_operand_the_other_operand_of_and_or_or_decides_is_not_read(
+    dead_facts: dict[str, Any], function: str
+) -> None:
+    """can_demote's !pgdat || !numa_demotion_enabled without NUMA (llvm-objdump: li a0, 0; ret)."""
+    events = fact_events(dead_facts, function)
+    assert (events["accesses"], events["field_accesses"]) == ([], [])
+    assert ("box", "discarded") in unevaluated(dead_facts, function)
+
+
+def test_a_call_whose_loops_may_be_assumed_to_end_goes_with_its_unused_value(dead_facts: dict[str, Any]) -> None:
+    """fwnode_links_check_suppliers' list_for_each_entry, written out and by a macro."""
+    events = fact_events(dead_facts, "dd_unused_loop_call")
+    assert (events["calls"], events["accesses"], events["field_accesses"]) == ([], [], [])
+    assert {"dd_count_links", "dd_count_links_macro"} <= {
+        item.get("call") for item in events["unevaluated"] if item["reason"] == "discarded"
+    }
+
+
+def test_a_store_nothing_reads_in_a_loop_body_or_an_if_arm_is_not_code(dead_facts: dict[str, Any]) -> None:
+    """scoped_guard(mutex, &lock) val = ...: the store is the body of a for loop. An if whose only
+    work is such a store has no effect either (llvm-objdump: dd_unused_in_body is a bare ret)."""
+    events = fact_events(dead_facts, "dd_unused_in_body")
+    assert (events["accesses"], events["field_accesses"]) == ([], [])
+    assert ("box", "discarded") in unevaluated(dead_facts, "dd_unused_in_body")
+
+
+def test_an_expression_statement_that_is_a_branch_is_discarded(dead_facts: dict[str, Any]) -> None:
+    """llvm-objdump of dd_if_mixed: ld first; beqz; j obj_free. The other branch reads nothing."""
+    events = fact_events(dead_facts, "dd_if_mixed")
+    assert {item["field"] for item in events["field_accesses"]} == {"first"}
+    assert callees(dead_facts, "dd_if_mixed") == {"obj_free"}
+    assert ("dd_read_checked", "discarded") in unevaluated(dead_facts, "dd_if_mixed")
