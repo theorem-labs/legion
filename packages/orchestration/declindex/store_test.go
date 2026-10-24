@@ -578,6 +578,59 @@ func TestAnIndexOnlyReaderReadsWhileARefreshSyncs(t *testing.T) {
 	}
 }
 
+// In a writable index directory too, a reader of the tree (the gate and the ledger, which compile against the build
+// that a refresh's sync checks out and rebuilds) waits for a running refresh, and a refresh waits for it. A reader of
+// the index alone still reads the index of the refresh before while the refresh syncs.
+func TestAReaderOfTheTreeAndARefreshExcludeEachOtherInAWritableDirectory(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "index.sqlite")
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	tree := goldenTree(t)
+	if _, err := writer.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = writer.RefreshAt(ctx, tree, RefreshOptions{Commit: "two"}, func(context.Context) error {
+		wait, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if reader, err := OpenReadOnly(wait, path, IndexOnly); err != nil {
+			t.Errorf("an index-only reader during a refresh's sync: %v; want it to read at once", err)
+		} else {
+			_ = reader.Close()
+		}
+		short, cancelShort := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer cancelShort()
+		if reader, err := OpenReadOnly(short, path, IndexAndTree); !errors.Is(err, context.DeadlineExceeded) {
+			if reader != nil {
+				_ = reader.Close()
+			}
+			t.Errorf("a reader of the index and the tree during a refresh's sync in a writable directory: %v; want it to wait", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("the refresh: %v", err)
+	}
+	reader, err := OpenReadOnly(ctx, path, IndexAndTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	if _, err := writer.Refresh(short, tree, RefreshOptions{Commit: "three"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a refresh while a reader of the tree holds the index: %v; want it to wait", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Refresh(ctx, tree, RefreshOptions{Commit: "three"}); err != nil {
+		t.Fatalf("the refresh after the reader closed: %v", err)
+	}
+}
+
 // Open rebuilds an index of another schema under the write lock, so that a rebuild never drops the tables under a
 // reader in a read-only directory. An index of this schema needs no write, so Open of it does not wait.
 func TestOpenRebuildsAnOlderSchemaOnlyUnderTheWriteLock(t *testing.T) {

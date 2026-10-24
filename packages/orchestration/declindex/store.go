@@ -161,8 +161,8 @@ const (
 	// reads the index of the refresh before while the refresh fetches, checks out and builds. land-hash reads so.
 	IndexOnly ReadScope = iota
 	// IndexAndTree also reads the configured tree (its HEAD, its commits or its build), which a refresh's sync
-	// checks out and builds, so it waits for the whole refresh, and a refresh waits for it. The ledger and the gate
-	// read so.
+	// checks out and builds, so in every directory it holds the refresh lock shared: it waits for the whole
+	// refresh, and a refresh waits for it. The ledger and the gate read so.
 	IndexAndTree
 )
 
@@ -182,7 +182,9 @@ const (
 // meanwhile and each write before it has checkpointed its write-ahead log into the file; and for IndexAndTree the
 // refresh lock before it, so that no refresh changes the tree meanwhile. A non-empty log left beside the file (a
 // write that did not finish) is refused, since the file alone would then be out of date. In a writable directory
-// the store holds no lock: a refresh can commit while it reads, and its checkpoint waits for the store to close.
+// the snapshot alone keeps the index consistent: an IndexOnly store holds no lock, and a refresh can commit while it
+// reads, its checkpoint waiting for the store to close; an IndexAndTree store holds the refresh lock shared, because
+// the tree and its build are not in the snapshot.
 func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, error) {
 	if info, err := os.Stat(path); err != nil {
 		return nil, err
@@ -208,6 +210,18 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 			return nil, err
 		}
 		dsn = "file:" + path + "?mode=ro&immutable=1&_pragma=query_only(ON)"
+	}
+	if release == nil && scope == IndexAndTree {
+		// The directory is writable, so a missing lock file (an index that no refresh of this declindex made) is
+		// created rather than refused.
+		f, err := os.OpenFile(path+refreshLockSuffix, os.O_CREATE|os.O_RDONLY, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		_ = f.Close()
+		if release, err = lockShared(ctx, []string{path + refreshLockSuffix}); err != nil {
+			return nil, fmt.Errorf("the index %s: %w", path, err)
+		}
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

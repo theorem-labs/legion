@@ -80,7 +80,7 @@ func readerAt(t *testing.T, path, commit string) *Store {
 	ctx := context.Background()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		r, err := OpenReadOnly(ctx, path, IndexAndTree)
+		r, err := OpenReadOnly(ctx, path, IndexOnly)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,9 +104,11 @@ func readerAt(t *testing.T, path, commit string) *Store {
 
 var errCompiledStepStopped = errors.New("the test stops the compiled step")
 
-// A reader in a writable index directory takes no lock, so a refresh can commit while it reads. It reads one state
-// of the index for its whole life: a reader opened before a refresh's commit keeps reading the old commit, its rows,
-// its compiled part and its declaration graph, and a reader opened after the commit reads the new ones. Between the
+// A reader of the index alone in a writable index directory takes no lock, so a refresh can commit while it reads
+// (a reader of the tree waits for the whole refresh instead: TestAReaderOfTheTreeAndARefreshExcludeEachOther…). It
+// reads one state of the index for its whole life: a reader opened before a refresh's commit keeps reading the old
+// commit, its rows, its compiled part and its declaration graph, and a reader opened after the commit reads the new
+// ones. Between the
 // refresh's write of the reference part and its write of the compiled part, a reader reads the new reference part
 // and the old compiled part, which the readers of the compiled part refuse (TestCompiledCommitRefuses…). The
 // refresh's write waits for the readers that still read the write-ahead log before it releases the write lock, so
@@ -130,7 +132,7 @@ func TestAReaderReadsOneStateOfTheIndexWhileARefreshWritesIt(t *testing.T) {
 	if err := writer.setMeta(ctx, writer.db, "compiled_commit", "one"); err != nil {
 		t.Fatal(err)
 	}
-	old, err := OpenReadOnly(ctx, path, IndexAndTree)
+	old, err := OpenReadOnly(ctx, path, IndexOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +196,7 @@ func TestAReaderReadsOneStateOfTheIndexWhileARefreshWritesIt(t *testing.T) {
 		t.Fatal("the refresh did not reach its compiled step after the readers closed")
 	}
 	// Between the two writes: the reference part of two, the compiled part of one.
-	mid, err := OpenReadOnly(ctx, path, IndexAndTree)
+	mid, err := OpenReadOnly(ctx, path, IndexOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
