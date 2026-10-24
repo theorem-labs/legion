@@ -1,6 +1,7 @@
 package owner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -50,18 +51,31 @@ type Notice struct {
 	Key            string
 }
 
-// Step writes one record, queues its consequences, reports them, and answers at most one work item.
+// Step is one record mutation of an owner: the record it writes, the items that record answers, and what follows
+// from it.
 type Step struct {
-	// Answers is the item the step answers, or "" for a step that answers none (a need, a spec revision with no
-	// open item): Run then writes the record, queues the follow-ups and publishes the notices, and reads, claims
-	// and completes no item.
-	Answers   string
-	Path      string
+	// Path is the record's path in the owner's worktree.
+	Path string
+	// Answers are the items the record answers. Run claims each open one (or adopts its owner's own live lease),
+	// commits the record with an Owner-Item trailer for each, and completes each with the record's commit once the
+	// follow-ups are queued and the notices sent. A done answer was answered by an earlier record: it gets neither
+	// trailer nor completion.
+	Answers []string
+	// Build makes the record from the bytes HEAD holds at Path (found is false when HEAD holds none). Run calls it
+	// once, with the worktree's commit lock held for the whole step, so the revision Build picks from those bytes is
+	// the one Run commits, and no other step of the owner writes in between. An error from Build stops the step
+	// before it claims or writes anything, and Run returns it as it is.
+	Build func(previous []byte, found bool) (Record, error)
+}
+
+// Record is what a step's Build makes: the record's bytes and commit subject, the files its commit writes beside it,
+// the items it makes ready, and its notices, which Notices builds once the record's commit is known.
+type Record struct {
 	Data      []byte
 	Subject   string
+	Also      []File // other files of the record's commit: an escalation beside its reply, an edge beside its accept
 	FollowUps []FollowUp
-	Notices   []Notice
-	Result    string // "" means the record's commit
+	Notices   func(commit string) []Notice
 }
 
 // Runner executes owner steps against one worktree, ledger repository, and Envoy publisher.
@@ -74,33 +88,58 @@ type Runner struct {
 	Journal string // absolute: the deployment's <state_dir>/undelivered.jsonl
 }
 
-// Outcome records the durable result of a step.
+// Outcome records the durable result of a step. AlreadyDone is a step whose every answer was done and whose record
+// HEAD held already: the repeat of the step that answered them, which changed nothing.
 type Outcome struct {
-	AlreadyDone    bool
-	Commit, Result string
-	Undelivered    []string
+	AlreadyDone bool
+	Commit      string
+	Undelivered []string
 }
 
-// Run completes a step in the protocol order. Repeating it after any failure reuses the record,
-// idempotent follow-ups, notice keys, and the already-completed answer.
+// Run completes a step in the protocol order, holding the worktree's commit lock throughout: it reads the answers,
+// builds the record from HEAD, claims the open answers, commits the record, queues the follow-ups, sends the notices
+// and completes the answers. Two steps of one owner therefore run one after the other, and each builds from the
+// record the other committed. Repeating a step after any failure reuses the record, the idempotent follow-ups, the
+// notice keys and the already-completed answers.
 func (r Runner) Run(ctx context.Context, s Step) (Outcome, error) {
-	var generation int64
-	trailers := map[string][]string{}
-	if s.Answers != "" {
-		item, err := r.Ledger.Item(ctx, r.Repo, s.Answers)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("read answer item %q: %w", s.Answers, err)
-		}
-		if item.State == "done" {
-			return Outcome{AlreadyDone: true, Result: item.Result}, nil
-		}
-		if generation, err = claimOrAdopt(ctx, r.Ledger, r.Repo, r.Owner, s.Answers, item); err != nil {
-			return Outcome{}, err
-		}
-		trailers["Owner-Item"] = []string{s.Answers}
+	var outcome Outcome
+	err := r.Tree.locked(ctx, func(git func(args ...string) (string, error)) error {
+		var err error
+		outcome, err = r.run(ctx, s, git)
+		return err
+	})
+	return outcome, err
+}
+
+func (r Runner) run(ctx context.Context, s Step, git func(args ...string) (string, error)) (Outcome, error) {
+	open, err := r.openAnswers(ctx, s.Answers)
+	if err != nil {
+		return Outcome{}, err
+	}
+	previous, found, err := r.Tree.BlobAtHead(s.Path)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("read record %s: %w", s.Path, err)
+	}
+	record, err := s.Build(previous, found)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if len(s.Answers) > 0 && len(open) == 0 && found && bytes.Equal(previous, record.Data) {
+		commit, err := r.Tree.LastCommitTouching(s.Path)
+		return Outcome{AlreadyDone: true, Commit: commit}, err
 	}
 
-	if _, err := r.Tree.CommitFile(ctx, s.Path, s.Data, s.Subject, trailers); err != nil {
+	answered := make([]string, 0, len(open))
+	generations := make(map[string]int64, len(open))
+	for _, item := range open {
+		generation, err := claimOrAdopt(ctx, r.Ledger, r.Repo, r.Owner, item.ID, item)
+		if err != nil {
+			return Outcome{}, err
+		}
+		answered, generations[item.ID] = append(answered, item.ID), generation
+	}
+	files := append([]File{{Path: s.Path, Data: record.Data}}, record.Also...)
+	if err := r.Tree.commitFiles(git, files, record.Subject, map[string][]string{"Owner-Item": answered}); err != nil {
 		return Outcome{}, fmt.Errorf("commit record %s: %w", s.Path, err)
 	}
 	commit, err := r.Tree.LastCommitTouching(s.Path)
@@ -110,51 +149,73 @@ func (r Runner) Run(ctx context.Context, s Step) (Outcome, error) {
 	if commit == "" {
 		return Outcome{}, fmt.Errorf("record %q has no commit", s.Path)
 	}
-	if err := r.checkAttributed(s, commit); err != nil {
+	if err := r.checkAttributed(s.Path, answered, commit); err != nil {
 		return Outcome{Commit: commit}, err
 	}
 
-	for _, followUp := range s.FollowUps {
+	for _, followUp := range record.FollowUps {
 		if err := r.enqueue(ctx, followUp); err != nil {
 			return Outcome{Commit: commit}, err
 		}
 	}
 
 	outcome := Outcome{Commit: commit}
-	for _, notice := range s.Notices {
-		if err := r.publish(ctx, notice); err != nil {
-			if journalErr := r.journal(notice, err); journalErr != nil {
-				return outcome, journalErr
+	if record.Notices != nil {
+		for _, notice := range record.Notices(commit) {
+			if err := r.publish(ctx, notice); err != nil {
+				if journalErr := r.journal(notice, err); journalErr != nil {
+					return outcome, journalErr
+				}
+				outcome.Undelivered = append(outcome.Undelivered, notice.Topic)
 			}
-			outcome.Undelivered = append(outcome.Undelivered, notice.Topic)
 		}
 	}
 
-	outcome.Result = s.Result
-	if outcome.Result == "" {
-		outcome.Result = commit
-	}
-	if s.Answers == "" {
-		return outcome, nil
-	}
-	if err := r.Ledger.Complete(ctx, r.Repo, s.Answers, r.Owner, generation, outcome.Result); err != nil {
-		return outcome, fmt.Errorf("complete answer item %q: %w", s.Answers, err)
+	for _, id := range answered {
+		if err := r.Ledger.Complete(ctx, r.Repo, id, r.Owner, generations[id], commit); err != nil {
+			return outcome, fmt.Errorf("complete answer item %q: %w", id, err)
+		}
 	}
 	return outcome, nil
 }
 
-// checkAttributed refuses to answer an item with a record commit that does not carry the item's Owner-Item
-// trailer: bytes that another step committed are no proof that this step answered it.
-func (r Runner) checkAttributed(s Step, commit string) error {
-	if s.Answers == "" {
+// openAnswers reads each answer and returns the open ones, in order. An open answer that another holder's live
+// lease holds is refused here, before the step claims any answer or writes anything.
+func (r Runner) openAnswers(ctx context.Context, answers []string) ([]ledger.Item, error) {
+	var open []ledger.Item
+	for _, id := range answers {
+		item, err := r.Ledger.Item(ctx, r.Repo, id)
+		if err != nil {
+			return nil, fmt.Errorf("read answer item %q: %w", id, err)
+		}
+		if item.State == "done" {
+			continue
+		}
+		if item.Holder != r.Owner && LeaseLive(item) {
+			return nil, fmt.Errorf("answer item %q: %w", id, &ledger.Refusal{
+				Reason: ledger.ReasonLeaseHeld, Message: fmt.Sprintf("item %s is held by %s", id, item.Holder),
+			})
+		}
+		item.ID = id
+		open = append(open, item)
+	}
+	return open, nil
+}
+
+// checkAttributed refuses to answer items with a record commit that does not carry each one's Owner-Item trailer:
+// bytes that another step committed are no proof that this step answered them.
+func (r Runner) checkAttributed(path string, answered []string, commit string) error {
+	if len(answered) == 0 {
 		return nil
 	}
 	trailers, err := r.Tree.Repo.CommitTrailers(commit)
 	if err != nil {
 		return fmt.Errorf("read the trailers of record commit %s: %w", commit, err)
 	}
-	if !slices.Contains(trailers["Owner-Item"], s.Answers) {
-		return fmt.Errorf("%w: %s was last committed at %s, which does not carry Owner-Item: %s", ErrUnattributed, s.Path, commit, s.Answers)
+	for _, id := range answered {
+		if !slices.Contains(trailers["Owner-Item"], id) {
+			return fmt.Errorf("%w: %s was last committed at %s, which does not carry Owner-Item: %s", ErrUnattributed, path, commit, id)
+		}
 	}
 	return nil
 }

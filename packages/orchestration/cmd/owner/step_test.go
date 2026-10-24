@@ -157,11 +157,12 @@ func TestOfferAnsweringSeveralItemsCommitsATrailerForEach(t *testing.T) {
 }
 
 // When every --answers item is done, the command repeats the revision that answered them, with that revision's
-// number and commit. A changed draft is a new revision, which answers nothing that is done, so the command refuses
-// it and writes nothing.
-func TestOfferWithEveryAnswerDoneRepeatsItsRevisionOrRefusesAChangedDraft(t *testing.T) {
+// number and commit, and publishes nothing again. A changed draft is a new revision: it answers nothing that is done,
+// but it lists each answered need again and offers it to the need's source again (offer:<edge>@r<n>).
+func TestOfferWithEveryAnswerDoneRepeatsItsRevisionOrOffersAChangedDraftAgain(t *testing.T) {
 	f := newCommandFixture(t)
-	need := "need:" + ownerpkg.EdgeID(caller, state) + "@r1"
+	edge := ownerpkg.EdgeID(caller, state)
+	need := "need:" + edge + "@r1"
 	f.as(caller).ok("need", state, f.write("need.md", needDraft))
 	offerFile := f.write("offer.md", offerDraft)
 	f.as(state).ok("offer", offerFile, "--answers", need)
@@ -175,16 +176,65 @@ func TestOfferWithEveryAnswerDoneRepeatsItsRevisionOrRefusesAChangedDraft(t *tes
 	if !again.AlreadyDone || again.Revision != 1 || again.Commit != specCommit {
 		t.Fatalf("the repeated offer = %+v, want already done at r1 with %s", again, specCommit)
 	}
-
-	changed := f.write("offer-2.md", strings.Replace(offerDraft, "the last value that a writer stored", "the value that the last writer stored", 1))
-	if code, stderr := f.as(state).fails("offer", changed, "--answers", need); code != 1 || !strings.Contains(stderr, need) {
-		t.Fatalf("a changed draft answering only done items exited %d: %s", code, stderr)
-	}
-	if got := f.lastCommit(state, specPath); got != specCommit {
-		t.Fatalf("the refused draft moved the spec to %s", got)
-	}
 	if posts := f.notices(); len(posts) != 2 {
 		t.Fatalf("listener got %d posts, want the need's and the first offer's only: %+v", len(posts), posts)
+	}
+
+	changed := f.write("offer-2.md", strings.Replace(offerDraft, "the last value that a writer stored", "the value that the last writer stored", 1))
+	var revised stepResult
+	if err := json.Unmarshal([]byte(f.as(state).ok("--json", "offer", changed, "--answers", need)), &revised); err != nil {
+		t.Fatal(err)
+	}
+	offer2 := "offer:" + edge + "@r2"
+	if revised.AlreadyDone || revised.Revision != 2 || revised.Commit == specCommit || !reflect.DeepEqual(revised.FollowUps, []string{offer2}) {
+		t.Fatalf("the changed draft = %+v, want r2 offering %s", revised, offer2)
+	}
+	if trailer := f.trailer(revised.Commit, "Owner-Item"); trailer != "" {
+		t.Fatalf("r2 answers no open item, but its commit carries Owner-Item %q", trailer)
+	}
+	if item := f.item(offer2); item.State != "open" || item.Owner != caller {
+		t.Fatalf("%s = %+v, want open for %s", offer2, item, caller)
+	}
+	front, _, err := ownerpkg.ParseSpec(f.show(state, specPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	needHash := ownerpkg.ContentHash(f.show(caller, ownerpkg.NeedRecord("skeleton", caller, state)))
+	if !reflect.DeepEqual(front.Answers, []string{"need:" + edge + "@" + needHash}) {
+		t.Fatalf("r2 answers %v, want the caller's need", front.Answers)
+	}
+	if last := f.notices()[len(f.notices())-1]; decodePayload(t, last).Item != offer2 {
+		t.Fatalf("the last notice = %+v, want the offer %s", last, offer2)
+	}
+}
+
+// A target with two callers answers the first caller's need with r1 and, before that caller accepts, the second's
+// with r2, which lists both needs. r2 offers itself to both sources, so each supersedes or accepts its offer and
+// both edges reach accepted.
+func TestOverlappingOffersLetEveryCallerAccept(t *testing.T) {
+	f := newCommandFixture(t)
+	fromCaller := "need:" + ownerpkg.EdgeID(caller, state) + "@r1"
+	fromSecond := "need:" + ownerpkg.EdgeID(second, state) + "@r1"
+	f.as(caller).ok("need", state, f.write("need-caller.md", needDraft))
+	f.as(second).ok("need", state, f.write("need-second.md", needDraft))
+	f.as(state).ok("offer", f.write("offer-1.md", offerDraft), "--answers", fromCaller)
+	revised := f.write("offer-2.md", strings.Replace(offerDraft, "the last value that a writer stored", "the value that the last writer stored", 1))
+	f.as(state).ok("offer", revised, "--answers", fromSecond, fromCaller)
+
+	callerOffer1 := "offer:" + ownerpkg.EdgeID(caller, state) + "@r1"
+	if code, stderr := f.as(caller).fails("accept", callerOffer1); code != 1 || !strings.Contains(stderr, "--superseded r2") {
+		t.Fatalf("accept of the superseded offer exited %d: %s", code, stderr)
+	}
+	f.as(caller).ok("done", callerOffer1, "--superseded", "r2")
+	for _, source := range []string{caller, second} {
+		f.as(source).ok("accept", "offer:"+ownerpkg.EdgeID(source, state)+"@r2")
+		var edgeRecord ownerpkg.EdgeRecord
+		if err := edgeRecord.Unmarshal(f.show(source, "skeleton/nodes/"+ownerpkg.Key(source)+"/edges/E"+ownerpkg.Hex16(state)+".yaml")); err != nil {
+			t.Fatal(err)
+		}
+		if edgeRecord.Status != "accepted" || edgeRecord.Offer.SpecHash != ownerpkg.ContentHash(f.show(state, ownerpkg.SpecRecord("skeleton", state))) {
+			t.Fatalf("%s's edge record = %+v, want accepted at r2", source, edgeRecord)
+		}
 	}
 }
 

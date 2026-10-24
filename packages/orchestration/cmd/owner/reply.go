@@ -44,31 +44,28 @@ func (s *session) accept(item string) (any, error) {
 		return nil, refusef("%s's spec r%d does not answer the current need %s; reply superseded or wait for the new offer", target, step.specFront.Revision, want)
 	}
 	reply := ownerpkg.Reply{Kind: "accept", Edge: ref.Subject, Answers: map[string]string{"need": step.needHash, "offer": step.specHash}, Epoch: p.epoch, Text: "Accepted."}
-	data, err := step.record(reply)
-	if err != nil {
-		return nil, err
-	}
 	edgePath := s.config.Paths.EdgeRecord(source, target)
-	record := ownerpkg.EdgeRecord{Edge: ref.Subject, Source: source, Target: target}
-	if existing, found, err := p.tree.BlobAtHead(edgePath); err != nil {
-		return nil, err
-	} else if found {
-		if err := record.Unmarshal(existing); err != nil {
-			return nil, fmt.Errorf("read the edge record %s: %w", edgePath, err)
+	// The accept's commit also records the edge as accepted, from the edge record HEAD holds under the step's lock.
+	edgeRecord := func(string) ([]ownerpkg.FollowUp, []ownerpkg.File, error) {
+		record := ownerpkg.EdgeRecord{Edge: ref.Subject, Source: source, Target: target}
+		if existing, found, err := p.tree.BlobAtHead(edgePath); err != nil {
+			return nil, nil, err
+		} else if found {
+			if err := record.Unmarshal(existing); err != nil {
+				return nil, nil, fmt.Errorf("read the edge record %s: %w", edgePath, err)
+			}
 		}
-	}
-	record.Status = "accepted"
-	record.Need = ownerpkg.EdgeNeed{Path: ownerpkg.NeedRecord(s.config.RecordsRoot, source, target), Hash: step.needHash}
-	record.Offer = ownerpkg.EdgeOffer{SpecHash: step.specHash}
-	edgeData, err := record.Marshal()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := p.tree.CommitFile(s.ctx, edgePath, edgeData, "owner: edge to "+target+" accepted", nil); err != nil {
-		return nil, err
+		record.Status = "accepted"
+		record.Need = ownerpkg.EdgeNeed{Path: ownerpkg.NeedRecord(s.config.RecordsRoot, source, target), Hash: step.needHash}
+		record.Offer = ownerpkg.EdgeOffer{SpecHash: step.specHash}
+		edgeData, err := record.Marshal()
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, []ownerpkg.File{{Path: edgePath, Data: edgeData}}, nil
 	}
 	route := ownerpkg.Route{Step: ownerpkg.RouteAccept, Source: source, Target: target, TargetKind: step.targetKind}
-	return s.finishReply(p, step, "accept", route, data, nil)
+	return s.finishReply(p, step, "accept", route, reply, edgeRecord)
 }
 
 func (s *session) reply(item, reason, file, premiseOwner string) (any, error) {
@@ -147,26 +144,23 @@ func (s *session) reply(item, reason, file, premiseOwner string) (any, error) {
 		answers["offer"] = step.specHash
 	}
 	reply := ownerpkg.Reply{Kind: "reply", Edge: ref.Subject, Reason: reason, PremiseOwner: premiseOwner, Answers: answers, Epoch: p.epoch, Text: draft.text}
-	data, err := step.record(reply)
-	if err != nil {
-		return nil, err
-	}
-	replyID := replyItem(ref.Subject, data)
-	var followUps []ownerpkg.FollowUp
-	for recipient := range recipients {
-		followUps = append(followUps, ownerpkg.FollowUp{Item: replyID, Owner: recipient})
-	}
-	if escalate {
+	// The reply item is named by the reply's bytes; an escalation of the reply is written in the reply's commit.
+	consequences := func(replyID string) ([]ownerpkg.FollowUp, []ownerpkg.File, error) {
+		var followUps []ownerpkg.FollowUp
+		for recipient := range recipients {
+			followUps = append(followUps, ownerpkg.FollowUp{Item: replyID, Owner: recipient})
+		}
+		if !escalate {
+			return followUps, nil, nil
+		}
 		escalation := ownerpkg.Escalation{Subject: replyID, Record: step.path, Reason: reason, Counterexample: draft.fields["counterexample"], BugsRow: draft.fields["bugs_row"]}
 		escalationData, err := escalation.Marshal()
 		if err != nil {
-			return nil, refusef("escalation record: %v", err)
+			return nil, nil, refusef("escalation record: %v", err)
 		}
 		escalationPath := ownerpkg.NodeRecord(s.config.RecordsRoot, p.ID, "escalations", ownerpkg.Hex16(replyID)+".yaml")
-		if _, err := p.tree.CommitFile(s.ctx, escalationPath, escalationData, "owner: escalate "+reason+" on "+ref.Subject, nil); err != nil {
-			return nil, err
-		}
 		followUps = append(followUps, ownerpkg.FollowUp{Item: "escalation:" + ownerpkg.Hex16(replyID), Owner: "escalations"})
+		return followUps, []ownerpkg.File{{Path: escalationPath, Data: escalationData}}, nil
 	}
 	row := ownerpkg.RouteReplyFromSource
 	if p.ID == target {
@@ -177,7 +171,7 @@ func (s *session) reply(item, reason, file, premiseOwner string) (any, error) {
 		// The reply item is the premise owner's, so its notice goes to that owner's needs topic, addressed to it.
 		route, step.to = ownerpkg.Route{Step: ownerpkg.RouteReplyToPremise, Owner: premiseOwner}, premiseOwner
 	}
-	return s.finishReply(p, step, "reply", route, data, followUps)
+	return s.finishReply(p, step, "reply", route, reply, consequences)
 }
 
 // replyStep is what accept and reply read before they write: the answered item, the need, the target's spec
@@ -188,7 +182,6 @@ type replyStep struct {
 	from, to   string
 	targetKind string
 	path       string
-	existing   []byte
 	needHash   string
 	needFront  ownerpkg.NeedFront
 	specFound  bool
@@ -222,9 +215,6 @@ func (s *session) replyContext(p party, item string, ref ownerpkg.ItemRef, sourc
 		step.done, step.result = true, stepResult{Answered: []string{item}, AlreadyDone: true, Record: step.path, Commit: commit}
 		return step, err
 	}
-	if err := s.checkNotHeldByOther(store, item); err != nil {
-		return replyStep{}, err
-	}
 	if step.targetKind, err = s.targetKind(target); err != nil {
 		return replyStep{}, err
 	}
@@ -240,20 +230,18 @@ func (s *session) replyContext(p party, item string, ref ownerpkg.ItemRef, sourc
 	if found {
 		step.specFound, step.specHash, step.specFront = true, ownerpkg.ContentHash(specData), specFront
 	}
-	if step.existing, _, err = p.tree.BlobAtHead(step.path); err != nil {
-		return replyStep{}, err
-	}
 	return step, nil
 }
 
-// record keeps an earlier run's reply when it says the same, so a repeated step writes the same bytes.
-func (step replyStep) record(reply ownerpkg.Reply) ([]byte, error) {
-	if step.existing != nil {
+// record keeps an earlier run's reply, the one HEAD holds, when it says the same, so a repeated step writes the same
+// bytes; a different reply to the same revision is refused.
+func (step replyStep) record(reply ownerpkg.Reply, previous []byte, found bool) ([]byte, error) {
+	if found {
 		var earlier ownerpkg.Reply
-		if err := earlier.Unmarshal(step.existing); err == nil {
+		if err := earlier.Unmarshal(previous); err == nil {
 			reply.At = earlier.At
 			if reflect.DeepEqual(earlier, reply) {
-				return step.existing, nil
+				return previous, nil
 			}
 		}
 		return nil, refusef("%s already holds a different reply to this revision", step.path)
@@ -266,32 +254,43 @@ func replyItem(edge string, data []byte) string {
 	return "reply:" + edge + "@" + ownerpkg.Hex16(string(data))[:12]
 }
 
-func (s *session) finishReply(p party, step replyStep, kind string, route ownerpkg.Route, data []byte, followUps []ownerpkg.FollowUp) (any, error) {
-	subject := fmt.Sprintf("owner: %s %s", kind, step.item)
-	if _, err := p.tree.CommitFile(s.ctx, step.path, data, subject, map[string][]string{"Owner-Item": {step.item}}); err != nil {
-		return nil, err
-	}
-	commit, err := p.tree.LastCommitTouching(step.path)
-	if err != nil {
-		return nil, err
-	}
-	replyID := replyItem(step.edge, data)
+// finishReply answers step.item with reply as one step: the reply record and the files consequences puts beside it
+// in one commit, the follow-ups consequences names for the reply item, and the notice on route.
+func (s *session) finishReply(p party, step replyStep, kind string, route ownerpkg.Route, reply ownerpkg.Reply,
+	consequences func(replyID string) ([]ownerpkg.FollowUp, []ownerpkg.File, error)) (any, error) {
 	versions := map[string]any{"need": step.needHash, "offer": nil}
 	models := map[string]any{"need": step.needFront.AuthorModel, "offer": nil}
 	if step.specFound {
 		versions["offer"], models["offer"] = step.specHash, step.specFront.AuthorModel
 	}
-	notices := ownerpkg.Notices(p.routing.Topics(route), ownerpkg.NoticeFields{
-		Type: kind, Epoch: p.epoch, From: step.from, To: step.to, Edge: step.edge, Item: replyID, Record: step.path, Commit: commit,
-		Versions: versions, Models: models,
-	})
-	outcome, err := s.runStep(p, ownerpkg.Step{Answers: step.item, Path: step.path, Data: data, Subject: subject, FollowUps: followUps, Notices: notices})
+	result := stepResult{Answered: []string{step.item}, Record: step.path}
+	build := func(previous []byte, found bool) (ownerpkg.Record, error) {
+		data, err := step.record(reply, previous, found)
+		if err != nil {
+			return ownerpkg.Record{}, err
+		}
+		replyID := replyItem(step.edge, data)
+		followUps, also, err := consequences(replyID)
+		if err != nil {
+			return ownerpkg.Record{}, err
+		}
+		result.Item = replyID
+		for _, followUp := range followUps {
+			result.FollowUps = append(result.FollowUps, followUp.Item)
+		}
+		return ownerpkg.Record{
+			Data: data, Subject: fmt.Sprintf("owner: %s %s", kind, step.item), Also: also, FollowUps: followUps,
+			Notices: func(commit string) []ownerpkg.Notice {
+				return ownerpkg.Notices(p.routing.Topics(route), ownerpkg.NoticeFields{
+					Type: kind, Epoch: p.epoch, From: step.from, To: step.to, Edge: step.edge, Item: replyID, Record: step.path, Commit: commit,
+					Versions: versions, Models: models,
+				})
+			},
+		}, nil
+	}
+	outcome, err := p.runner.Run(s.ctx, ownerpkg.Step{Path: step.path, Answers: []string{step.item}, Build: build})
 	if err != nil {
 		return nil, err
 	}
-	result := stepResult{Item: replyID, Answered: []string{step.item}, AlreadyDone: outcome.AlreadyDone, Record: step.path, Commit: commit, Undelivered: outcome.Undelivered}
-	for _, followUp := range followUps {
-		result.FollowUps = append(result.FollowUps, followUp.Item)
-	}
-	return result, nil
+	return result.of(outcome), nil
 }

@@ -97,41 +97,64 @@ func (w Worktree) BlobAtHead(path string) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
+// File is one file of a commit: its path in the worktree and its bytes.
+type File struct {
+	Path string
+	Data []byte
+}
+
 // CommitFile writes path and commits it unless HEAD already has the same bytes. Each value of a trailer key is its
 // own trailer line, so a record that answers several items carries one Owner-Item trailer for each. It holds the
 // worktree's commit lock (locked) from its read of HEAD to its commit.
 func (w Worktree) CommitFile(ctx context.Context, path string, data []byte, subject string, trailers map[string][]string) (string, error) {
 	var commit string
 	err := w.locked(ctx, func(git func(args ...string) (string, error)) error {
-		existing, found, err := w.BlobAtHead(path)
-		if err != nil {
+		if err := w.commitFiles(git, []File{{Path: path, Data: data}}, subject, trailers); err != nil {
 			return err
 		}
-		if !found || !bytes.Equal(existing, data) {
-			file := filepath.Join(w.Path, path)
-			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
-				return fmt.Errorf("make parent directory for %s: %w", path, err)
-			}
-			if err := os.WriteFile(file, data, 0o644); err != nil {
-				return fmt.Errorf("write %s: %w", path, err)
-			}
-			if _, err := git("add", "--", path); err != nil {
-				return err
-			}
-			args := []string{"commit", "--only", "-m", subject}
-			for _, key := range slices.Sorted(maps.Keys(trailers)) {
-				for _, value := range trailers[key] {
-					args = append(args, "--trailer", key+": "+value)
-				}
-			}
-			if _, err := git(append(args, "--", path)...); err != nil {
-				return err
-			}
-		}
+		var err error
 		commit, err = w.head(ctx)
 		return err
 	})
 	return commit, err
+}
+
+// commitFiles writes each of files that HEAD does not already hold with the same bytes, and commits them in one commit
+// with subject and trailers. It commits nothing when HEAD holds every file already. git is the git of locked, which
+// holds the worktree's commit lock.
+func (w Worktree) commitFiles(git func(args ...string) (string, error), files []File, subject string, trailers map[string][]string) error {
+	var changed []string
+	for _, f := range files {
+		existing, found, err := w.BlobAtHead(f.Path)
+		if err != nil {
+			return err
+		}
+		if found && bytes.Equal(existing, f.Data) {
+			continue
+		}
+		file := filepath.Join(w.Path, f.Path)
+		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+			return fmt.Errorf("make parent directory for %s: %w", f.Path, err)
+		}
+		if err := os.WriteFile(file, f.Data, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", f.Path, err)
+		}
+		changed = append(changed, f.Path)
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+	if _, err := git(append([]string{"add", "--"}, changed...)...); err != nil {
+		return err
+	}
+	args := []string{"commit", "--only", "-m", subject}
+	for _, key := range slices.Sorted(maps.Keys(trailers)) {
+		for _, value := range trailers[key] {
+			args = append(args, "--trailer", key+": "+value)
+		}
+	}
+	_, err := git(append(append(args, "--"), changed...)...)
+	return err
 }
 
 // MergeMain merges main into the worktree branch and returns the resulting HEAD. It holds the worktree's commit lock.

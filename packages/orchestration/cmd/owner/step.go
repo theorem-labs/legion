@@ -1,9 +1,6 @@
 package main
 
-import (
-	"github.com/sjawhar/legion/orchestration/ledger"
-	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
-)
+import ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 
 type stepResult struct {
 	Item        string   `json:"item,omitempty"`
@@ -14,6 +11,16 @@ type stepResult struct {
 	Commit      string   `json:"commit"`
 	FollowUps   []string `json:"follow_ups,omitempty"`
 	Undelivered []string `json:"undelivered,omitempty"`
+}
+
+// of is the result with what the step did: its commit, its undelivered notices, and whether it was the repeat of a
+// step that answered its items already, which queued nothing again.
+func (r stepResult) of(outcome ownerpkg.Outcome) stepResult {
+	r.Commit, r.AlreadyDone, r.Undelivered = outcome.Commit, outcome.AlreadyDone, outcome.Undelivered
+	if outcome.AlreadyDone {
+		r.FollowUps = nil
+	}
+	return r
 }
 
 // party is the owner of the session as a protocol participant, with what every step needs: its epoch, the routing
@@ -73,21 +80,4 @@ func (s *session) targetKind(target string) (string, error) {
 		return "", refusef("%s takes no needs", target)
 	}
 	return id.Kind, nil
-}
-
-func (s *session) checkNotHeldByOther(store *ledger.Store, item string) error {
-	current, err := store.Item(s.ctx, s.repo, item)
-	if err != nil {
-		return err
-	}
-	if current.Holder != s.owner && ownerpkg.LeaseLive(current) {
-		return refusef("%s is held by %s", item, current.Holder)
-	}
-	return nil
-}
-
-// runStep runs one step of p with its runner, which journals each notice the listener refuses in the deployment's
-// state_dir/undelivered.jsonl.
-func (s *session) runStep(p party, step ownerpkg.Step) (ownerpkg.Outcome, error) {
-	return p.runner.Run(s.ctx, step)
 }

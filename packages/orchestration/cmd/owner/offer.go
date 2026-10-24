@@ -14,21 +14,17 @@ type offered struct {
 	edge, source, needHash string
 }
 
-// specAnswer is one item that a spec revision answers, and the edge it offers, when it offers one.
-type specAnswer struct {
-	item string
-	open bool
-	edge string
-}
-
-// offer writes the owner's spec revision n. The revision answers each item of answers:
+// offer writes the owner's spec revision n, as one step. The revision answers each item of answers:
 //   - a need to the owner: it answers that need, and the source gets offer:<edge>@r<n>;
 //   - a reply about an edge whose target is the owner: it answers the reply, lists it in resolves, and the source
 //     gets offer:<edge>@r<n> for the edge's current need;
 //   - a reply that names the owner its premise owner: it answers the reply and lists it in resolves.
 //
-// The revision's commit carries an Owner-Item trailer for each open answered item and for the owner's open start
-// item, and each completes with that commit.
+// The revision lists each edge's need in answers and offers it to the need's source, also when the item is done
+// already: a later revision offers itself to every source it lists, so a source whose offer it supersedes gets the
+// new one. The revision's commit carries an Owner-Item trailer for each open answered item and for the owner's open
+// start item, and each completes with that commit. When every answered item is done and the draft is the revision
+// that answered them, the command repeats that revision.
 func (s *session) offer(file string, answers []string) (any, error) {
 	p, err := s.party()
 	if err != nil {
@@ -43,19 +39,18 @@ func (s *session) offer(file string, answers []string) (any, error) {
 		return nil, err
 	}
 
-	var items []specAnswer
-	offers := map[string]offered{}
-	var edges []string
+	var edges []offered
 	offer := func(edge, source string) error {
-		if _, ok := offers[edge]; ok {
-			return nil
+		for _, o := range edges {
+			if o.edge == edge {
+				return nil
+			}
 		}
 		needData, _, err := s.needAt(source, p.ID)
 		if err != nil {
 			return err
 		}
-		offers[edge] = offered{edge: edge, source: source, needHash: ownerpkg.ContentHash(needData)}
-		edges = append(edges, edge)
+		edges = append(edges, offered{edge: edge, source: source, needHash: ownerpkg.ContentHash(needData)})
 		return nil
 	}
 	resolves := draft.Resolves
@@ -75,7 +70,6 @@ func (s *session) offer(file string, answers []string) (any, error) {
 		if current.Owner != p.ID {
 			return nil, refusef("%s is in the queue of %s, not of %s", answer, current.Owner, p.ID)
 		}
-		item := specAnswer{item: answer, open: current.State == "open"}
 		switch {
 		case ref.Type == "need":
 			if target != p.ID {
@@ -95,162 +89,106 @@ func (s *session) offer(file string, answers []string) (any, error) {
 			if err := offer(ref.Subject, source); err != nil {
 				return nil, err
 			}
-			item.edge = ref.Subject
 		case source == p.ID:
 			return nil, refusef("%s is a reply about %s's own need to %s; answer it with owner need %s <file> --answers %s", answer, p.ID, target, target, answer)
 		case target == p.ID:
 			if err := offer(ref.Subject, source); err != nil {
 				return nil, err
 			}
-			item.edge = ref.Subject
 			resolves = appendNew(resolves, answer)
 		default: // the owner is the premise owner the reply names
 			resolves = appendNew(resolves, answer)
 		}
-		items = append(items, item)
 	}
 	versions := []string{}
 	for _, edge := range edges {
-		versions = append(versions, "need:"+edge+"@"+offers[edge].needHash)
+		versions = append(versions, "need:"+edge.edge+"@"+edge.needHash)
 	}
 
-	recordPath := ownerpkg.SpecRecord(s.config.RecordsRoot, p.ID)
-	previous, found, err := p.tree.BlobAtHead(recordPath)
-	if err != nil {
-		return nil, err
-	}
-	front := ownerpkg.SpecFront{Owner: p.ID, Epoch: p.epoch, Complete: draft.Complete, Answers: versions, Resolves: resolves, AuthorModel: draft.AuthorModel}
-	var prevFront ownerpkg.SpecFront
-	var prevClaims []ownerpkg.Claim
-	if found {
-		if prevFront, prevClaims, err = ownerpkg.ParseSpec(previous); err != nil {
-			return nil, fmt.Errorf("read the previous spec %s: %w", recordPath, err)
-		}
-	}
-	if lint := ownerpkg.LintClaims(draft.Claims, prevFront.Retired); len(lint) > 0 {
-		return nil, refusef("spec claim tree: %v", lint[0])
-	}
-	front.Retired = ownerpkg.RetiredIDs(prevFront.Retired, prevClaims, draft.Claims)
-	front.Revision = 1
-	if found {
-		front.Revision = prevFront.Revision
-		if same, err := marshalSpec(front, draft.Body); err != nil || !bytes.Equal(same, previous) {
-			front.Revision = prevFront.Revision + 1
-		}
-	}
-	data, err := marshalSpec(front, draft.Body)
-	if err != nil {
-		return nil, err
-	}
-	if _, _, err := ownerpkg.ParseSpec(data); err != nil {
-		return nil, fmt.Errorf("the spec revision does not parse: %w", err)
-	}
-	specHash := ownerpkg.ContentHash(data)
-	linked, err := s.changesLinkedClaim(p, draft.Claims, prevClaims)
-	if err != nil {
-		return nil, err
-	}
-	reviewers, err := s.reviewers(p.ID, "spec", front.Revision)
-	if err != nil {
-		return nil, err
-	}
-
-	var open []specAnswer
-	var answeredItems []string
-	for _, item := range items {
-		answeredItems = append(answeredItems, item.item)
-		if item.open {
-			open = append(open, item)
-		}
-	}
-	result := stepResult{Answered: answeredItems, Record: recordPath, Revision: front.Revision}
-	subject := fmt.Sprintf("owner: spec r%d", front.Revision)
-	if len(items) > 0 && len(open) == 0 {
-		// Every answered item is done. A run that repeats the revision that answered them repeats its result. A
-		// changed draft would be a new revision that answers none of them, so it is refused, never dropped.
-		if !found || !bytes.Equal(data, previous) {
-			return nil, refusef("%s: every --answers item is done, and this draft differs from the current spec r%d; "+
-				"to write it as a new revision, run owner offer %s without the done items", strings.Join(answeredItems, ", "), prevFront.Revision, file)
-		}
-		result.AlreadyDone = true
-		result.Commit, err = s.lastCommit(branch(p.ID), recordPath)
-		return result, err
-	}
 	// A spec revision is the owner's first spec while its start item is open, so it also answers that item.
+	answered := append([]string(nil), answers...)
 	start := "start:" + p.ID + "@1"
-	answerStart := false
 	switch item, err := store.Item(s.ctx, s.repo, start); {
 	case isNotFound(err):
 	case err != nil:
 		return nil, err
-	default:
-		answerStart = item.State == "open" && item.Owner == p.ID
+	case item.State == "open" && item.Owner == p.ID:
+		answered = append(answered, start)
 	}
-	// The revision is the record of every open item it answers and of the open start item, so its commit carries an
-	// Owner-Item trailer for each, and each of those items completes with that commit.
-	var attributed []string
-	for _, item := range open {
-		attributed = append(attributed, item.item)
-		if err := s.checkNotHeldByOther(store, item.item); err != nil {
-			return nil, err
+
+	recordPath := ownerpkg.SpecRecord(s.config.RecordsRoot, p.ID)
+	result := stepResult{Answered: answered, Record: recordPath}
+	build := func(previous []byte, found bool) (ownerpkg.Record, error) {
+		front := ownerpkg.SpecFront{Owner: p.ID, Epoch: p.epoch, Complete: draft.Complete, Answers: versions, Resolves: resolves, AuthorModel: draft.AuthorModel, Revision: 1}
+		var prevFront ownerpkg.SpecFront
+		var prevClaims []ownerpkg.Claim
+		if found {
+			var err error
+			if prevFront, prevClaims, err = ownerpkg.ParseSpec(previous); err != nil {
+				return ownerpkg.Record{}, fmt.Errorf("read the previous spec %s: %w", recordPath, err)
+			}
 		}
+		if lint := ownerpkg.LintClaims(draft.Claims, prevFront.Retired); len(lint) > 0 {
+			return ownerpkg.Record{}, refusef("spec claim tree: %v", lint[0])
+		}
+		front.Retired = ownerpkg.RetiredIDs(prevFront.Retired, prevClaims, draft.Claims)
+		if found {
+			front.Revision = prevFront.Revision
+			if same, err := marshalSpec(front, draft.Body); err != nil || !bytes.Equal(same, previous) {
+				front.Revision = prevFront.Revision + 1
+			}
+		}
+		data, err := marshalSpec(front, draft.Body)
+		if err != nil {
+			return ownerpkg.Record{}, err
+		}
+		if _, _, err := ownerpkg.ParseSpec(data); err != nil {
+			return ownerpkg.Record{}, fmt.Errorf("the spec revision does not parse: %w", err)
+		}
+		specHash := ownerpkg.ContentHash(data)
+		linked, err := s.changesLinkedClaim(p, draft.Claims, prevClaims)
+		if err != nil {
+			return ownerpkg.Record{}, err
+		}
+		reviewers, err := s.reviewers(p.ID, "spec", front.Revision)
+		if err != nil {
+			return ownerpkg.Record{}, err
+		}
+		models := map[string]any{"author": draft.AuthorModel, "reviewers": reviewers}
+		result.Revision = front.Revision
+
+		var followUps []ownerpkg.FollowUp
+		offerItems := make([]string, len(edges))
+		for index, edge := range edges {
+			offerItems[index] = fmt.Sprintf("offer:%s@r%d", edge.edge, front.Revision)
+			followUps = append(followUps, ownerpkg.FollowUp{Item: offerItems[index], Owner: edge.source})
+		}
+		result.FollowUps = offerItems
+		notices := func(commit string) []ownerpkg.Notice {
+			if len(edges) == 0 {
+				// The revision offers no edge: its notice goes to the users of the owner's spec. It queues no item for
+				// them, so it names none.
+				return ownerpkg.Notices(p.routing.Topics(ownerpkg.Route{Step: ownerpkg.RouteOffer, Target: p.ID, TargetKind: p.Kind, Linked: linked}), ownerpkg.NoticeFields{
+					Type: "offer", Epoch: p.epoch, From: p.ID, Version: fmt.Sprintf("r%d", front.Revision), Record: recordPath, Commit: commit,
+					Versions: map[string]any{"offer": specHash}, Models: models,
+				})
+			}
+			var out []ownerpkg.Notice
+			for index, edge := range edges {
+				out = append(out, ownerpkg.Notices(p.routing.Topics(ownerpkg.Route{Step: ownerpkg.RouteOffer, Source: edge.source, Target: p.ID, TargetKind: p.Kind, Linked: linked}), ownerpkg.NoticeFields{
+					Type: "offer", Epoch: p.epoch, From: p.ID, To: edge.source, Edge: edge.edge, Item: offerItems[index], Record: recordPath, Commit: commit,
+					Versions: map[string]any{"need": edge.needHash, "offer": specHash}, Models: models,
+				})...)
+			}
+			return out
+		}
+		return ownerpkg.Record{Data: data, Subject: fmt.Sprintf("owner: spec r%d", front.Revision), FollowUps: followUps, Notices: notices}, nil
 	}
-	if answerStart {
-		attributed = append(attributed, start)
-	}
-	if _, err := p.tree.CommitFile(s.ctx, recordPath, data, subject, map[string][]string{"Owner-Item": attributed}); err != nil {
-		return nil, err
-	}
-	commit, err := p.tree.LastCommitTouching(recordPath)
+	outcome, err := p.runner.Run(s.ctx, ownerpkg.Step{Path: recordPath, Answers: answered, Build: build})
 	if err != nil {
 		return nil, err
 	}
-	result.Commit = commit
-	models := map[string]any{"author": draft.AuthorModel, "reviewers": reviewers}
-
-	// One step for each open answered item. The first open item of each offered edge queues the edge's offer for
-	// its source and publishes its notice.
-	var steps []ownerpkg.Step
-	queued := map[string]bool{}
-	for _, item := range open {
-		step := ownerpkg.Step{Answers: item.item, Path: recordPath, Data: data, Subject: subject}
-		if item.edge != "" && !queued[item.edge] {
-			queued[item.edge] = true
-			edge := offers[item.edge]
-			offerItem := fmt.Sprintf("offer:%s@r%d", edge.edge, front.Revision)
-			step.FollowUps = []ownerpkg.FollowUp{{Item: offerItem, Owner: edge.source}}
-			step.Notices = ownerpkg.Notices(p.routing.Topics(ownerpkg.Route{Step: ownerpkg.RouteOffer, Source: edge.source, Target: p.ID, TargetKind: p.Kind, Linked: linked}), ownerpkg.NoticeFields{
-				Type: "offer", Epoch: p.epoch, From: p.ID, To: edge.source, Edge: edge.edge, Item: offerItem, Record: recordPath, Commit: commit,
-				Versions: map[string]any{"need": edge.needHash, "offer": specHash}, Models: models,
-			})
-			result.FollowUps = append(result.FollowUps, offerItem)
-		}
-		steps = append(steps, step)
-	}
-	if answerStart {
-		steps = append(steps, ownerpkg.Step{Answers: start, Path: recordPath, Data: data, Subject: subject})
-		result.Answered = append(result.Answered, start)
-	}
-	if len(queued) == 0 {
-		// The revision offers no edge: its notice goes to the users of the owner's spec, on the first step, or on a
-		// step that answers nothing. It queues no item for them, so it names none.
-		notices := ownerpkg.Notices(p.routing.Topics(ownerpkg.Route{Step: ownerpkg.RouteOffer, Target: p.ID, TargetKind: p.Kind, Linked: linked}), ownerpkg.NoticeFields{
-			Type: "offer", Epoch: p.epoch, From: p.ID, Version: fmt.Sprintf("r%d", front.Revision), Record: recordPath, Commit: commit,
-			Versions: map[string]any{"offer": specHash}, Models: models,
-		})
-		if len(steps) == 0 {
-			steps = append(steps, ownerpkg.Step{Path: recordPath, Data: data, Subject: subject})
-		}
-		steps[0].Notices = notices
-	}
-	for _, step := range steps {
-		outcome, err := s.runStep(p, step)
-		if err != nil {
-			return nil, err
-		}
-		result.Undelivered = append(result.Undelivered, outcome.Undelivered...)
-	}
-	return result, nil
+	return result.of(outcome), nil
 }
 
 // changesLinkedClaim reports whether a data-structure or subsystem revision adds or changes a claim that uses a

@@ -35,9 +35,18 @@ Inputs:
 
 Steps:
 
-- A record commit carries one `Owner-Item: <item>` trailer for each item it answers: a spec revision that answers
-  two needs and the open `start:` item carries three. An item never completes with a commit that lacks its
-  trailer (`ErrUnattributed`, exit 4).
+- Each command that writes records runs one step (`Runner.Run`): one record and the files its commit writes beside
+  it (an accept's edge record, a reply's escalation), the items the record answers, its follow-up items and its
+  notices. The step holds the worktree's commit lock, `flock(2)` on `owner.flock` in the worktree's git directory,
+  for all of it: it reads the answered items, builds the record from the one `HEAD` holds (the revision is picked
+  there), claims the open answers, commits, queues the follow-ups, sends the notices, which it builds once the commit
+  is known, and completes the answers. Two commands of one owner therefore run one after the other, and the second
+  builds from the record the first committed: two needs with different drafts are two revisions with two items.
+- A record commit carries one `Owner-Item: <item>` trailer for each open item it answers: a spec revision that
+  answers two needs and the open `start:` item carries three. An item never completes with a commit that lacks its
+  trailer (`ErrUnattributed`, exit 4). A step whose answers are all done repeats the step that answered them when
+  its record is the one `HEAD` holds, and changes nothing; with a changed record it is a new record that answers
+  none of them.
 - A step that answers no item (`need`, a spec revision with no open item) commits its record with no trailer,
   queues its follow-ups and sends its notices.
 - A notice about a work item carries the key `hex32(item)` (the first 32 hex digits of SHA-256) and names the item.
@@ -45,13 +54,11 @@ Steps:
   names the revision, and its key is `hex32(record@commit)`, one for each revision. A re-run repeats the key, and the
   listener's dedupe key `publish.<key>` has Envoy's minted shape (`MINTED_DEDUPE_KEY_PATTERN` in
   `packages/contracts`), so each subscribed session takes the repeated notice once.
-- Each commit holds the worktree's commit lock, `flock(2)` on `owner.flock` in the worktree's git directory, from
-  its read of `HEAD` to its commit. Its git commands inherit the lock, so it holds until the last of them exits, also
-  when the owner command is killed first. A command that holds the lock finds no live git of another owner command
-  in the worktree, so it removes the `index.lock`, `HEAD.lock` and branch ref lock that a killed command left: a
-  killed step does not wedge its owner, and two commands of one owner wait for each other instead of failing on
-  `index.lock`. A person's git command does not take the lock, so none runs in an owner's worktree while an owner
-  command does.
+- The commit lock's git commands inherit the lock, so it holds until the last of them exits, also when the owner
+  command is killed first. A command that holds the lock finds no live git of another owner command in the
+  worktree, so it removes the `index.lock`, `HEAD.lock` and branch ref lock that a killed command left: a killed
+  step does not wedge its owner. A person's git command does not take the lock, so none runs in an owner's worktree
+  while an owner command does.
 - A notice that the listener still refuses after retries at 1 s, 4 s and 16 s does not fail the step: the command
   prints `notice not delivered: <topic>` on stderr and appends the notice to `<state_dir>/undelivered.jsonl`.
 - A claim keeps its `[C<n>]` id while its owner revises it. An id that a revision removes is retired: the command
@@ -68,7 +75,7 @@ Steps:
 | `inbox` | Open items in `RULE.yaml` order, each with its record, the branch that holds it and the commit to read. The items come from the ledger's `Store.OpenItems` in enqueue order, and items the rule's keys tie keep that order; `enqueued_at` is the position in it |
 | `claim <item>` | A supervised lease on an existing item, for a person or an owner outside a step |
 | `need <target> <file> [--outside-part \| --answers <reply item>...]` | Writes `needs/E<hex16(target)>.md` (the draft sets `author_model`, `cites` and `resolves`), queues `need:<edge>@r<n>`, notifies by the routing table; `--outside-part` records the edge as `outside_part` with no item; `--answers` answers the target's replies about this need: the revision lists them in `resolves`, carries their trailers, and completes them |
-| `offer <file> [--answers <item>...]` | Writes `spec.md` revision n (the draft sets `author_model`, `complete` and `resolves`) and answers each item: a need to the owner, a reply about an edge whose target is the owner (both queue `offer:<edge>@r<n>`, n the spec revision, for the edge's source), or a reply that names the owner its premise owner; a reply is listed in `resolves`. It also answers an open `start:` item, and notifies. When every `--answers` item is done, it repeats the revision that answered them, or refuses a changed draft (exit 1), which would be a new revision that answers none of them |
+| `offer <file> [--answers <item>...]` | Writes `spec.md` revision n (the draft sets `author_model`, `complete` and `resolves`) and answers each item: a need to the owner, a reply about an edge whose target is the owner (both list the edge's current need in `answers` and queue `offer:<edge>@r<n>`, n the spec revision, for the edge's source), or a reply that names the owner its premise owner; a reply is listed in `resolves`. It also answers an open `start:` item, and notifies. A listed need is offered to its source also when its item is done, so a later revision that lists the needs of earlier callers reaches each caller whose offer it supersedes. When every `--answers` item is done, it repeats the revision that answered them, or writes a changed draft as a new revision that answers none of them and offers each listed need again |
 | `accept <item>` | Accepts `offer:<edge>@r<n>` while the target's spec is at r<n> and answers the current need; records the accept and the edge as `accepted`, answers the offer, notifies |
 | `reply <item> <reason> <file> [--premise-owner <id>]` | Records the reply, routes it by `PROTOCOL.yaml` `reasons`; a reason that goes to the premise owner queues the reply item for that owner and sends its notice to the premise owner's needs topic (`node.<id>.needs`, or `fact.<name>.needs`), with `to` the premise owner; `program-defect` and `false-shared-assumption` also write `escalations/<hex16>.yaml` and queue `escalation:` for `escalations` |
 | `done <need or offer item> --superseded r<n>` | Completes the item as `superseded:r<n>` with no record, when r<n> is later than the item's and exists: the source's need record, or the target's spec, is at r<n> or newer |
