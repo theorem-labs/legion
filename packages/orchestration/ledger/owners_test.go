@@ -20,7 +20,7 @@ func TestSupervisedLeaseNeverExpires(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	lease := must(s.Claim(ctx, "r", "item", "function:get_mountpoint", 0))
-	if !lease.ExpiresAt.IsZero() {
+	if lease.ExpiresAt != nil {
 		t.Fatalf("supervised lease has an end: %+v", lease)
 	}
 	if expired := must(s.Expire(ctx, "r")); len(expired) != 0 {
@@ -190,7 +190,7 @@ func TestOpenItemsListsOneOwnersOpenItemsInEnqueueOrder(t *testing.T) {
 	supervised := queued("a", owner)
 	supervised.Holder, supervised.Generation = holder, 1
 	leased := queued("b", owner)
-	leased.Holder, leased.Generation, leased.ExpiresAt = holder, 2, &fixed.ExpiresAt
+	leased.Holder, leased.Generation, leased.ExpiresAt = holder, 2, fixed.ExpiresAt
 	assertOpenItems(t, s, owner, free, supervised, leased)
 	assertOpenItems(t, s, other, queued("x", other), queued("y", other))
 	assertOpenItems(t, s, "global:nobody")

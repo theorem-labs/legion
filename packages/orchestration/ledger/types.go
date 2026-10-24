@@ -13,7 +13,8 @@ type Repository struct {
 }
 
 // Item is a work item and its lease. Owner is the standing owner whose queue carries it; Holder is
-// empty when nobody holds it.
+// empty when nobody holds it. ExpiresAt is nil when nobody holds it and for a supervised lease, which
+// has no end.
 type Item struct {
 	ID         string     `json:"id"`
 	Owner      string     `json:"owner,omitempty"`
@@ -24,12 +25,12 @@ type Item struct {
 	Result     string     `json:"result,omitempty"`
 }
 
-// Lease is a granted or renewed lease. ExpiresAt is zero for a supervised lease, which has no end.
+// Lease is a granted or renewed lease. ExpiresAt is nil for a supervised lease, which has no end.
 type Lease struct {
-	ID         string    `json:"id"`
-	Holder     string    `json:"holder"`
-	Generation int64     `json:"generation"`
-	ExpiresAt  time.Time `json:"expires_at,omitzero"`
+	ID         string     `json:"id"`
+	Holder     string     `json:"holder"`
+	Generation int64      `json:"generation"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 
 // PathClash is one overlap between two write sets: Ours covers or is covered by Theirs.

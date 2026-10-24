@@ -24,7 +24,7 @@ func TestClaimAllowsSupervisedLeaseAndRenewRefusesIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim a supervised lease: %v", err)
 	}
-	if !lease.ExpiresAt.IsZero() {
+	if lease.ExpiresAt != nil {
 		t.Fatalf("supervised lease expires at %s, want no expiry", lease.ExpiresAt)
 	}
 	if item := must(s.Item(ctx, "r", "item")); item.ExpiresAt != nil {

@@ -100,12 +100,12 @@ func TestRenewMovesAndPersistsExpiryByRequestedLength(t *testing.T) {
 	if r.Generation != l.Generation {
 		t.Fatalf("renew changed the generation: %d -> %d", l.Generation, r.Generation)
 	}
-	if got := r.ExpiresAt.Sub(l.ExpiresAt); got != ttl {
+	if got := r.ExpiresAt.Sub(*l.ExpiresAt); got != ttl {
 		t.Fatalf("renew moved expiry by %s, want %s", got, ttl)
 	}
 	waitForDatabaseExpiry(t, observer, l.ExpiresAt)
 	item := must(s.Item(ctx, "r", "item"))
-	if item.Holder != "alice" || item.ExpiresAt == nil || !item.ExpiresAt.Equal(r.ExpiresAt) {
+	if item.Holder != "alice" || item.ExpiresAt == nil || !item.ExpiresAt.Equal(*r.ExpiresAt) {
 		t.Fatalf("renewed expiry was not persisted: %+v; want %s", item, r.ExpiresAt)
 	}
 	if err := s.Complete(ctx, "r", "item", "alice", l.Generation, "ok"); err != nil {
@@ -398,8 +398,12 @@ func TestLeaseLivenessIsEvaluatedAfterTheItemRowLock(t *testing.T) {
 	}
 }
 
-func waitForDatabaseExpiry(t *testing.T, conn *pgx.Conn, expiresAt time.Time) {
+// waitForDatabaseExpiry waits until the database clock passes a fixed lease end; a lease with no end fails the test.
+func waitForDatabaseExpiry(t *testing.T, conn *pgx.Conn, expiresAt *time.Time) {
 	t.Helper()
+	if expiresAt == nil {
+		t.Fatal("waiting for the end of a lease that has none")
+	}
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)

@@ -48,7 +48,7 @@ type lease ledger.Lease
 
 func (l lease) String() string {
 	end := "supervised"
-	if !l.ExpiresAt.IsZero() {
+	if l.ExpiresAt != nil {
 		end = "expires_at=" + l.ExpiresAt.Format(time.RFC3339Nano)
 	}
 	return fmt.Sprintf("%s holder=%s generation=%d %s", l.ID, l.Holder, l.Generation, end)

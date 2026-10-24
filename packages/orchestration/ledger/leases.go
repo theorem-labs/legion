@@ -140,18 +140,16 @@ func (s *Store) Claim(ctx context.Context, repo, id, holder string, ttl time.Dur
 			return refuse(ReasonLeaseHeld, "item %s is held by %s (generation %d) %s",
 				id, *it.holder, it.generation, leaseEnd(it.expiresAt))
 		}
-		var expires *time.Time
 		if err := tx.QueryRow(ctx, `UPDATE work_items SET holder = $3, generation = generation + 1,
 				lease_granted_at = clock_timestamp(),
 				lease_expires_at = CASE WHEN $4::bigint = 0 THEN NULL ELSE clock_timestamp() + $4::bigint * interval '1 microsecond' END,
 				updated_at = clock_timestamp()
 			WHERE repo = $1 AND id = $2 RETURNING generation, lease_expires_at`,
-			repo, id, holder, ttl.Microseconds()).Scan(&l.Generation, &expires); err != nil {
+			repo, id, holder, ttl.Microseconds()).Scan(&l.Generation, &l.ExpiresAt); err != nil {
 			return err
 		}
-		data := map[string]any{"generation": l.Generation, "supervised": expires == nil}
-		if expires != nil {
-			l.ExpiresAt = *expires
+		data := map[string]any{"generation": l.Generation, "supervised": l.ExpiresAt == nil}
+		if l.ExpiresAt != nil {
 			data["expires_at"] = l.ExpiresAt
 		}
 		if it.holder != nil {
