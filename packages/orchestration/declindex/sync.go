@@ -182,7 +182,7 @@ func runGit(ctx context.Context, tree string, log io.Writer, args ...string) err
 // program runs it again.
 func runBuild(ctx context.Context, tree string, build []string, timeout time.Duration, log io.Writer) error {
 	if timeout <= 0 {
-		timeout = 6 * time.Hour
+		timeout = defaultBuildTimeout
 	}
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()

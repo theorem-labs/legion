@@ -12,7 +12,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -87,7 +86,7 @@ func (o RefreshOptions) jobs() int {
 	if o.Jobs > 0 {
 		return o.Jobs
 	}
-	return min(48, runtime.NumCPU())
+	return defaultJobs()
 }
 
 // scan lists the modules with a reference file below the tree's library directory and their keys, read in
