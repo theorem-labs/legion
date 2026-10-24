@@ -306,14 +306,15 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 continue
             size = max(1, item.get("size", 1) or 1)
             # Where the image may keep an inner address in a register instead of the folded sum: the
-            # element of a variable index (``element_displacement``), or a global's member (the field's
-            # own offset).
+            # element of a variable index (``element_displacement``), a rebased helper's member, a
+            # global's member (the field's own offset), or the container itself where container_of
+            # cancels against a pointer the code already holds (the field's own offset).
             alternates = [offset]
             if item.get("element_displacement") is not None:
                 alternates.append(item["element_displacement"])
             if item.get("inner_displacement") is not None:
                 alternates.append(item["inner_displacement"])
-            if base == "global" and item.get("offset", -1) >= 0:
+            if base in ("global", "container_of") and item.get("offset", -1) >= 0:
                 alternates.append(item["offset"])
             register = next(
                 (
@@ -334,6 +335,14 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             elif offset == 0 and item.get("address"):
                 # &p->m (or an array member decaying to a pointer) at offset 0 is the base pointer itself.
                 method = "member_address_at_zero"
+            elif item.get("address") and any(
+                candidate <= value < candidate + item.get("element_size", 0)
+                for candidate in alternates
+                for value in displacements
+            ):
+                # An array member's decayed address (info = same->info) is folded into the accesses
+                # the code makes through it: the first element's bytes.
+                method = "array_member_first_element"
             elif any(
                 own + place in image_offsets[function].get(name, ())
                 for own in [item["offset"] if item.get("offset", -1) >= 0 else offset]
@@ -356,6 +365,11 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 method = "no_match_beyond_12_bit_displacement"
             else:
                 method = "no_matching_offset"
+            if method.startswith("no_") and item.get("conditional"):
+                # Under a __builtin_constant_p choice the compiler made per call site: the image
+                # decides whether this code was compiled.
+                excluded["image_decided"] += 1
+                continue
             candidate = {
                 "function": function,
                 "struct": item["struct"],

@@ -55,6 +55,7 @@ def function(
     pointers: tuple[str, ...] = (),
     indirect: tuple[tuple[str, str], ...] = (),
     line: int | None = None,
+    guards: tuple[dict[str, Any], ...] = (),
 ) -> Facts:
     return {
         "name": name,
@@ -66,6 +67,7 @@ def function(
         "returns": None,
         "parameters": 1,
         "result_registers": 1,
+        "guards": list(guards),
         "events": {
             "calls": list(calls),
             "accesses": list(accesses),
@@ -140,9 +142,19 @@ def image_globals(*names: str, offset: int = 0) -> list[dict[str, Any]]:
     ]
 
 
+_EXCLUSIONS: dict[int, dict[str, Any]] = {}
+
+
 def build(tus: dict[str, Facts], image: StubImage, contracts: ContractGraph | None = None) -> dict[str, Any]:
-    graph, _ = link.build(CONFIG, "p", sorted(tus), tus, image, contracts or ContractGraph(), {})  # type: ignore[arg-type]
+    graph, exclusions = link.build(CONFIG, "p", sorted(tus), tus, image, contracts or ContractGraph(), {})  # type: ignore[arg-type]
+    _EXCLUSIONS[id(graph)] = exclusions
     return graph
+
+
+def exclusion_items(graph: dict[str, Any]) -> list[dict[str, Any]]:
+    """The exclusions of the build that gave ``graph``."""
+    items: list[dict[str, Any]] = _EXCLUSIONS[id(graph)]["items"]
+    return items
 
 
 def edges(graph: dict[str, Any], kind: str, source: str) -> list[dict[str, Any]]:
@@ -645,3 +657,161 @@ def test_a_c_global_at_the_start_of_a_merged_block_the_image_forms_is_addressed(
     assert graph["analysis"]["image"]["block_start_names"] == {"function:f": ["key", "power"]}
     layer = checks.accesses(graph)
     assert (layer["agree"], layer["only_c"]) == (1, 1)
+
+
+def test_a_name_at_a_code_marker_the_function_starts_at_is_addressed() -> None:
+    """__kernel_text_address names _sinittext, a zero-size marker at a function's first instruction."""
+    marker = {
+        "kind": "image_access",
+        "reason": "code_marker_at_function_start",
+        "function": "f",
+        "target": "0x9000",
+        "detail": {"function": "set_reset_devices", "names": ["_sinittext"]},
+        "provenance": [{"source": "image", "address": "0x104"}],
+    }
+    tus = {"a.c": unit(function("f", accesses=(read("_sinittext"),)))}
+    image = StubImage({"f": [(0x100, False, "")]}, {0x100: FunctionFacts(exclusions=[marker])})
+    image.map_source_names = frozenset({"_sinittext"})
+    graph = build(tus, image)
+    assert graph["analysis"]["image"]["block_start_names"] == {"function:f": ["_sinittext"]}
+    assert checks.accesses(graph)["agree"] == 1
+
+
+# Guards: a folded helper's code compiled only for some values of its parameters ---------------
+
+
+def P(index: int, width: int = 32) -> dict[str, Any]:
+    return {"p": index, "w": width, "s": True}
+
+
+def C(value: int) -> dict[str, Any]:
+    return {"c": value, "w": 32, "s": True}
+
+
+def op(name: str, *operands: Any) -> dict[str, Any]:
+    return {"op": name, "a": list(operands), "w": 32, "s": True}
+
+
+def given(expression: dict[str, Any] | None, param: int | None = None) -> dict[str, Any]:
+    """An argument whose value the facts express (a constant, or the caller's parameter)."""
+    return {"unit": None, "param": param, **({"expr": expression} if expression is not None else {})}
+
+
+def _guarded_program(*roots: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+    """change(dev, state): `if (state == 3) return; warn();` and `if (state && dev->x) note();`. mid(s)
+    passes its parameter on. Each root calls change or mid with the given argument."""
+    change = function(
+        "change",
+        static=True,
+        calls=({**call("warn", visible=False), "guards": [0]}, {**call("note", visible=False), "guards": [1]}),
+        guards=({"e": op("==", P(1), C(3)), "v": False}, {"e": op("&&", P(1), None), "v": True}),
+    )
+    mid = function("mid", static=True, calls=(call("change", given(None), given(P(1), param=1)),))
+    tus = {
+        "a.c": unit(
+            change,
+            mid,
+            *(function(name, calls=(call(callee, given(None), argument),)) for name, (callee, argument) in roots),
+        ),
+        "b.c": unit(function("warn", "b.c"), function("note", "b.c")),
+    }
+    copies = {name: [(0x100 + 16 * index, False, "")] for index, (name, _) in enumerate(roots)}
+    copies |= {"warn": [(0x900, False, "")], "note": [(0x910, False, "")]}
+    return build(tus, StubImage(copies, {}))
+
+
+def test_a_folded_helper_s_code_its_constant_argument_decides_against_is_excluded() -> None:
+    graph = _guarded_program(
+        ("dead", ("change", given(C(3)))),
+        ("live", ("change", given(C(1)))),
+        ("open", ("change", given(P(0), param=0))),
+        ("nested", ("mid", given(C(3)))),
+        ("zero", ("change", given(C(0)))),
+    )
+    assert c_calls(graph, "function:dead") == {"function:note"}
+    assert c_calls(graph, "function:live") == {"function:warn", "function:note"}
+    assert c_calls(graph, "function:open") == {"function:warn", "function:note"}
+    assert c_calls(graph, "function:nested") == {"function:note"}
+    # `state && dev->x` with state 0: decided by its left operand.
+    assert c_calls(graph, "function:zero") == {"function:warn"}
+    excluded = {
+        (item["function"], item["target"])
+        for item in exclusion_items(graph)
+        if (item["kind"], item["reason"]) == ("call", "constant_argument")
+    }
+    assert excluded == {
+        ("function:dead", "function:warn"),
+        ("function:nested", "function:warn"),
+        ("function:zero", "function:note"),
+    }
+    assert not any("guards" in edge for edge in graph["edges"])
+
+
+def test_a_constant_argument_is_taken_at_the_parameter_s_width() -> None:
+    """`if (flags & 0x100)` on a u8 parameter given 0x1ff: the parameter holds 0xff."""
+    helper = function(
+        "h",
+        static=True,
+        calls=({**call("warn", visible=False), "guards": [0]},),
+        guards=({"e": op("&", P(0, width=8), C(0x100)), "v": True},),
+    )
+    helper["guards"][0]["e"]["a"][0]["s"] = False
+    tus = {
+        "a.c": unit(helper, function("root", calls=(call("h", given(C(0x1FF))),))),
+        "b.c": unit(function("warn", "b.c")),
+    }
+    graph = build(tus, StubImage({"root": [(0x100, False, "")], "warn": [(0x900, False, "")]}, {}))
+    assert c_calls(graph, "function:root") == set()
+
+
+def test_a_conditional_fold_marks_field_accesses_and_an_unmatched_one_is_left_to_the_image() -> None:
+    """kmalloc_noprof's `__builtin_constant_p(size) && size` folds __kmalloc_cache_noprof: its fields
+    are compiled only where the compiler chose that branch."""
+    helper = function("h", static=True)
+    helper["events"]["field_accesses"] = [
+        {"struct": "cache", "field": "size", "offset": 28, "displacement": 28, "base": "pointer", "size": 4,
+         "bitfield": False, "provenance": where()}
+    ]  # fmt: skip
+    tus = {"a.c": unit(helper, function("root", calls=({**call("h"), "conditional": True},)))}
+    image = StubImage({"root": [(0x100, False, "")]}, {0x100: FunctionFacts(memory_offsets={8})})
+    graph = build(tus, image)
+    (item,) = graph["analysis"]["field_accesses"]["function:root"]
+    assert item["conditional"] is True
+    offsets = checks.structure(graph)["field_offsets"]
+    assert (offsets["candidates"], offsets["excluded"]) == (0, {"image_decided": 1})
+
+
+def test_a_container_of_field_also_matches_at_its_own_offset_where_the_image_holds_the_container() -> None:
+    """release_bdi folded into bdi_put: bdi->dev is 584 from &bdi->refcnt, 648 from bdi itself."""
+    item = {**_field(584, base="container_of"), "offset": 648}
+    graph = _structure_graph(item, [], {})
+    graph["analysis"]["image"]["memory_offsets"] = {"function:f": [648, 8]}
+    assert checks.structure(graph)["field_offsets"]["by_method"] == {"memory_displacement": 1}
+    graph["analysis"]["image"]["memory_offsets"] = {"function:f": [656, 8]}
+    assert checks.structure(graph)["field_offsets"]["matched"] == 0
+
+
+def test_an_array_member_s_address_matches_an_access_inside_its_first_element() -> None:
+    """vfs_dedupe_file_range: info = same->info (a flexible array at 24, elements of 32 bytes); the
+    image reads info->dest_offset at 32(same). An address-only member without an element size does not."""
+    item = {**_field(24), "offset": 24, "size": 0, "address": True, "element_size": 32}
+    graph = _structure_graph(item, [], {})
+    graph["analysis"]["image"]["memory_offsets"] = {"function:f": [32, 8]}
+    assert checks.structure(graph)["field_offsets"]["by_method"] == {"array_member_first_element": 1}
+    graph["analysis"]["image"]["memory_offsets"] = {"function:f": [56, 8]}
+    assert checks.structure(graph)["field_offsets"]["matched"] == 0
+    plain = {**_field(24), "offset": 24, "size": 0, "address": True}
+    graph = _structure_graph(plain, [], {})
+    graph["analysis"]["image"]["memory_offsets"] = {"function:f": [32, 8]}
+    assert checks.structure(graph)["field_offsets"]["matched"] == 0
+
+
+def test_link_carries_an_array_member_s_element_size() -> None:
+    f = function("f")
+    f["events"]["field_accesses"] = [
+        {"struct": "same", "field": "info", "offset": 24, "displacement": 24, "base": "pointer", "size": 0,
+         "bitfield": False, "address": True, "element_size": 32, "provenance": where()}
+    ]  # fmt: skip
+    graph = build({"a.c": unit(f)}, StubImage({"f": [(0x100, False, "")]}, {0x100: FunctionFacts(memory_offsets={32})}))
+    (item,) = graph["analysis"]["field_accesses"]["function:f"]
+    assert item["element_size"] == 32

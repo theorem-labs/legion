@@ -37,6 +37,11 @@ Unit = dict[str, Any]
 _EVENT_LISTS = ("accesses", "unevaluated", "list_calls", "indirect", "function_pointers", "field_accesses")
 _FIELD_KEYS = ("struct", "field", "offset", "displacement", "base", "size", "bitfield")
 _CORE_FORMAT = "cgraph/link-core/v1"
+# The events a fold under a __builtin_constant_p choice marks ``conditional``, besides calls.
+_MARKED = ("accesses", "field_accesses")
+# Image items naming every C name at an address the code forms, where the image cannot tell which
+# the C meant: the start of a merged-globals block, a zero-size marker at a function's start.
+_ADDRESS_NAMES = ("merged_globals_block_base", "code_marker_at_function_start")
 # Bounds on a struct's places inside a global: elements of one array, nesting depth, places kept.
 _MAX_ELEMENTS = 64
 _MAX_DEPTH = 8
@@ -456,12 +461,13 @@ class Linker:
         key = (tu, name, caller_key, pointers)
         if key in self.effective_cache:
             return self.effective_cache[key]
-        events = self.tus[tu]["functions"][name]["events"]
+        function = self.tus[tu]["functions"][name]
+        events, table = function["events"], function.get("guards", [])
         result = Effective()
         for kind in _EVENT_LISTS:
-            setattr(result, kind, list(events[kind]))
+            setattr(result, kind, _resolved(events[kind], table))
         callees = self.image_callees(caller)
-        for call in events["calls"]:
+        for call in _resolved(events["calls"], table):
             callee = call["callee"]
             if (
                 call.get("visible")
@@ -474,17 +480,19 @@ class Linker:
                 assert helper is not None
                 child = self.effective(tu, callee, caller, (*stack, name), pointers)
                 bound = _bind(child, call["arguments"])
-                # A helper folded under a __builtin_constant_p choice is itself left to the image.
+                # A helper folded under a __builtin_constant_p choice is itself left to the image: each
+                # of its events is marked. Each is also under the guards of the call.
                 mark = {"conditional": True} if call.get("conditional") else {}
-                result.calls += [{**_with_via(item, helper.id), **mark} for item in bound.calls]
+                guards = call.get("guards", [])
+                result.calls += [{**_under(_with_via(item, helper.id), guards), **mark} for item in bound.calls]
                 for kind in _EVENT_LISTS:
                     getattr(result, kind).extend(
-                        {**_with_via(item, helper.id), **(mark if kind == "accesses" else {})}
+                        {**_under(_with_via(item, helper.id), guards), **(mark if kind in _MARKED else {})}
                         for item in getattr(bound, kind)
                     )
                 result.folds.append({"helper": helper.id, "provenance": call["provenance"]})
                 result.folds += bound.folds
-                result.unbound += bound.unbound
+                result.unbound += [_under(item, guards) for item in bound.unbound]
             else:
                 result.calls.append({**call, "tu": tu})
                 if call.get("visible") and callee in callees and callee not in stack and callee != name:
@@ -502,9 +510,10 @@ class Linker:
                     assert helper is not None
                     child = self.effective(tu, callee, caller, (*stack, name), pointers)
                     bound = _bind(child, call["arguments"])
+                    guards = call.get("guards", [])
                     for item in bound.calls:
                         if item["callee"] in callees and item["callee"] not in own and item["callee"] != callee:
-                            result.calls.append({**_with_via(item, helper.id), "partial_inline": True})
+                            result.calls.append({**_under(_with_via(item, helper.id), guards), "partial_inline": True})
                     for item in bound.accesses:
                         unit = item.get("unit")
                         if (
@@ -513,7 +522,9 @@ class Linker:
                             and unit["name"] in addressed
                             and unit["name"] not in own_globals
                         ):
-                            result.accesses.append({**_with_via(item, helper.id), "partial_inline": True})
+                            result.accesses.append(
+                                {**_under(_with_via(item, helper.id), guards), "partial_inline": True}
+                            )
         if not pointers:
             self.effective_cache[key] = result
             return result
@@ -547,18 +558,28 @@ class Linker:
                 # The image calls the target or passes its address on, or shows nothing of it. Where it
                 # also inlined a copy (an action a helper calls through its parameter on an error
                 # path), the calls and globals that only that copy explains are the copy's.
-                result.calls += [{**_with_via(item, helper.id), "partial_inline": True} for item in calls_shown]
-                result.accesses += [{**_with_via(item, helper.id), "partial_inline": True} for item in globals_shown]
+                guards = pointer.get("guards", [])
+                result.calls += [
+                    {**_reframed(_with_via(item, helper.id), guards), "partial_inline": True} for item in calls_shown
+                ]
+                result.accesses += [
+                    {**_reframed(_with_via(item, helper.id), guards), "partial_inline": True} for item in globals_shown
+                ]
                 kept.append(pointer)
                 continue
-            result.calls += [_with_via(item, helper.id) for item in child.calls]
+            # The target's own guards are on its parameters, which no argument of this code binds:
+            # its events are under the guards of the pointer's use only.
+            guards = pointer.get("guards", [])
+            result.calls += [_reframed(_with_via(item, helper.id), guards) for item in child.calls]
             for kind in _EVENT_LISTS:
                 if kind != "function_pointers":
-                    getattr(result, kind).extend(_with_via(item, helper.id) for item in getattr(child, kind))
-            kept += [_with_via(item, helper.id) for item in child.function_pointers]
+                    getattr(result, kind).extend(
+                        _reframed(_with_via(item, helper.id), guards) for item in getattr(child, kind)
+                    )
+            kept += [_reframed(_with_via(item, helper.id), guards) for item in child.function_pointers]
             result.folds.append({"helper": helper.id, "provenance": pointer["provenance"], "through": "pointer"})
             result.folds += child.folds
-            result.unbound += child.unbound
+            result.unbound += [_reframed(item, guards) for item in child.unbound]
         result.function_pointers = kept
         self.effective_cache[key] = result
         return result
@@ -663,6 +684,172 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
                 # A value loaded through the parameter (p->q): another object.
                 rebound.append({**item, "param": None})
         bound.calls.append({**call, "arguments": rebound})
+    return _guarded(bound, child, arguments)
+
+
+# Guards: the code of a helper compiled only for some values of its parameters --------------------
+#
+# The facts give an event ``guards``: conditions on the function's parameters (C expressions as JSON:
+# {"c": int}, {"p": index}, null for a value the facts cannot name, or {"op": ..., "a": [...]}, each
+# with its type's width "w" and signedness "s"). An event is compiled only where every guard's
+# expression is truthy as its "v" says. At a fold the caller's arguments replace the parameters; a
+# guard decided against the event makes it dead code the compiler removed for these arguments.
+
+_BINARY: dict[str, Callable[[int, int], int | None]] = {
+    "+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
+    "/": lambda a, b: None if b == 0 else (abs(a) // abs(b)) * (1 if (a < 0) == (b < 0) else -1),
+    "%": lambda a, b: None if b == 0 else a - b * ((abs(a) // abs(b)) * (1 if (a < 0) == (b < 0) else -1)),
+    "<<": lambda a, b: a << b if 0 <= b < 128 else None, ">>": lambda a, b: a >> b if 0 <= b < 128 else None,
+    "&": lambda a, b: a & b, "|": lambda a, b: a | b, "^": lambda a, b: a ^ b,
+    "==": lambda a, b: int(a == b), "!=": lambda a, b: int(a != b), "<": lambda a, b: int(a < b),
+    ">": lambda a, b: int(a > b), "<=": lambda a, b: int(a <= b), ">=": lambda a, b: int(a >= b),
+}  # fmt: skip
+
+
+def _normalized(value: int | None, expression: dict[str, Any]) -> int | None:
+    """The value as the expression's C type holds it: ``w`` bits, signed when ``s``; a _Bool (``b``)
+    holds 1 for any value that is not 0."""
+    width = expression.get("w")
+    if value is not None and expression.get("b"):
+        return int(value != 0)
+    if value is None or not width:
+        return value
+    value &= (1 << width) - 1
+    if expression.get("s") and value >= 1 << (width - 1):
+        value -= 1 << width
+    return value
+
+
+def _evaluate(expression: dict[str, Any] | None) -> int | None:
+    """An expression's value, or None where it depends on something unknown. ``&&``, ``||`` and
+    ``?:`` are decided by the operand that decides them, as C evaluates them."""
+    if expression is None or "p" in expression:
+        return None
+    if "c" in expression:
+        return _normalized(int(expression["c"]), expression)
+    operator, operands = expression["op"], expression["a"]
+    if operator in ("&&", "||"):
+        decisive = 0 if operator == "&&" else 1
+        values = [_evaluate(operand) for operand in operands[:2]]
+        if any(value is not None and int(value != 0) == decisive for value in values):
+            return decisive
+        return None if any(value is None for value in values) else 1 - decisive
+    if operator == "?:":
+        condition = _evaluate(operands[0])
+        if condition is None:
+            first, second = _evaluate(operands[1]), _evaluate(operands[2])
+            return _normalized(first, expression) if first is not None and first == second else None
+        return _normalized(_evaluate(operands[1] if condition else operands[2]), expression)
+    value = _evaluate(operands[0])
+    if operator == "in":
+        return None if value is None else int(value in expression["set"])
+    if operator in ("!", "~", "neg", "cast"):
+        if value is None:
+            return None
+        result = {"!": int(value == 0), "~": ~value, "neg": -value, "cast": value}[operator]
+        return _normalized(result, expression)
+    other = _evaluate(operands[1])
+    if operator in ("*", "&") and 0 in (value, other):
+        return 0
+    if value is None or other is None:
+        return None
+    return _normalized(_BINARY[operator](value, other), expression)
+
+
+def _mentions_parameter(expression: dict[str, Any] | None) -> bool:
+    if expression is None:
+        return False
+    if "p" in expression:
+        return True
+    return any(_mentions_parameter(operand) for operand in expression.get("a", []))
+
+
+def _substitute(expression: dict[str, Any] | None, arguments: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The expression in the caller's terms: each parameter becomes its argument's value, as the
+    parameter's type holds it, or unknown where the facts do not express the argument."""
+    if expression is None or "c" in expression:
+        return expression
+    if "p" in expression:
+        index = expression["p"]
+        value = arguments[index].get("expr") if index < len(arguments) else None
+        if value is None:
+            return None
+        return {"op": "cast", "a": [value], "w": expression.get("w"), "s": expression.get("s")}
+    return {**expression, "a": [_substitute(operand, arguments) for operand in expression["a"]]}
+
+
+def _constant(argument: dict[str, Any] | None) -> int | None:
+    """The integer an argument always passes, or None."""
+    return _evaluate(argument.get("expr")) if argument is not None else None
+
+
+def _resolved(items: list[dict[str, Any]], table: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Events with their guard indexes replaced by the guards of the function's table."""
+    return [
+        {**item, "guards": [table[index] for index in item["guards"]]} if item.get("guards") else item for item in items
+    ]
+
+
+def _reframed(item: dict[str, Any], guards: list[dict[str, Any]]) -> dict[str, Any]:
+    """An event of a function folded through a pointer: its own guards name parameters no argument
+    binds, so it is under the given guards only."""
+    copied = {key: value for key, value in item.items() if key != "guards"}
+    return {**copied, "guards": list(guards)} if guards else copied
+
+
+def _under(item: dict[str, Any], guards: list[dict[str, Any]]) -> dict[str, Any]:
+    """An event of a folded helper, under the guards of the call that folded it."""
+    if not guards:
+        return item
+    return {**item, "guards": [*item.get("guards", []), *guards]}
+
+
+def _decided(guards: list[dict[str, Any]], arguments: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """The guards that still depend on a parameter once the arguments are bound, or None when one is
+    decided against the event."""
+    left = []
+    for guard in guards:
+        expression = _substitute(guard["e"], arguments)
+        value = _evaluate(expression)
+        if value is None:
+            if _mentions_parameter(expression):
+                left.append({"e": expression, "v": guard["v"]})
+        elif (value != 0) != guard["v"]:
+            return None
+    return left
+
+
+def _guarded(bound: Effective, child: Effective, arguments: list[dict[str, Any]]) -> Effective:
+    """The bound events with the arguments applied to their guards: an event a guard decides against
+    is dead for these arguments (a call or an access to state becomes unevaluated, with reason
+    ``constant_argument``; any other event is dropped). Each call's argument values are restated in
+    the caller's terms, for the folds below it."""
+    for original, call in zip(child.calls, bound.calls, strict=True):
+        restated = []
+        for item, argument in zip(original["arguments"], call["arguments"], strict=True):
+            value = _substitute(item["expr"], arguments) if "expr" in item else None
+            restated.append(
+                {**argument, "expr": value} if value is not None else {k: v for k, v in argument.items() if k != "expr"}
+            )
+        call["arguments"] = restated
+    dead: list[dict[str, Any]] = []
+    for kind in ("calls", *_EVENT_LISTS, "unbound"):
+        kept = []
+        for item in getattr(bound, kind):
+            if not item.get("guards"):
+                kept.append(item)
+                continue
+            left = _decided(item["guards"], arguments)
+            if left is not None:
+                kept.append({**item, "guards": left} if left else {k: v for k, v in item.items() if k != "guards"})
+            elif kind == "unevaluated":
+                kept.append({k: v for k, v in item.items() if k != "guards"})
+            elif kind == "calls":
+                dead.append({"call": item["callee"], "reason": "constant_argument", "provenance": item["provenance"]})
+            elif kind == "accesses" and item.get("unit") is not None:
+                dead.append({"unit": item["unit"], "reason": "constant_argument", "provenance": item["provenance"]})
+        setattr(bound, kind, kept)
+    bound.unevaluated += dead
     return bound
 
 
@@ -939,7 +1126,7 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                 if ":" not in function:
                     function = identity
                 detail = item.get("detail")
-                if item["reason"] == "merged_globals_block_base" and isinstance(detail, dict):
+                if item["reason"] in _ADDRESS_NAMES and isinstance(detail, dict):
                     block_start_names[identity] |= set(detail.get("names", []))
                 exclude(
                     item["kind"],
@@ -1495,7 +1682,10 @@ def _field_access(item: dict[str, Any]) -> dict[str, Any]:
     access = {key: item.get(key, -1) for key in _FIELD_KEYS}
     if item.get("address"):
         access["address"] = True
-    for key in ("element_displacement", "inner_displacement", "param"):
+    if item.get("conditional"):
+        # Under a __builtin_constant_p choice: the image decides whether it was compiled.
+        access["conditional"] = True
+    for key in ("element_displacement", "inner_displacement", "param", "element_size"):
         if item.get(key) is not None:
             access[key] = item[key]
     return access

@@ -114,6 +114,17 @@ These rules follow what the machine code shows, each only where it shows it:
 - A call through a slot of a table that the function's own unit defines is a `call_indirect` edge
   (`resolution: table_slot`) where the image calls the initializer's target. A contract graph's slot
   edge needs that table's initializer; another unit's table of the same name does not count.
+- A folded helper's code that its caller's arguments decide against is dead for that caller: the facts
+  give each function a table of `guards`, conditions on its parameters (if, `?:`, the right operand of
+  `&&`/`||`, switch cases, the statements after `if (c) return;`; none across a label control can enter
+  by), and each event the guards it is compiled under. A call argument gives the value it passes
+  (`expr`: a constant, or an expression on the caller's own parameters, at each type's width). At a
+  fold, link puts the arguments in; a call or an access a guard decides against becomes `unevaluated`
+  with reason `constant_argument` (an exclusion), other events are dropped, and the guards still open
+  carry up to the next fold.
+- A helper folded under a `__builtin_constant_p` choice marks all its events `conditional`, field
+  accesses too: the machine code decides whether that branch was compiled, so a conditional field
+  access with no match is counted apart as `image_decided`.
 
 ## Nodes and ids
 
@@ -155,20 +166,24 @@ topic, the id has every character outside `[A-Za-z0-9_:-]` percent-encoded, so i
 
 Each run writes `checks.json`: C calls against image calls (disagreements classified: a callback the
 compiler devirtualized, a caller with a weak alternate, a tail call), state accesses against image
-addresses (a C global at the start of a merged-globals block the function's machine code forms
-counts as addressed: `analysis.image.block_start_names`), embeddings against clang's layout, and
+addresses (a C global at the start of a merged-globals block the function's machine code forms, or a
+zero-size marker at the start of a function it addresses, counts as addressed:
+`analysis.image.block_start_names`), embeddings against clang's layout, and
 field accesses against the machine code. A field
 matches at its displacement from the base register: the sum of offsets along the member chain,
 through constant subscripts, through a local every definition of which points the same way
 (`d = &desc->irq_data`) and through an inline helper that returns such an address, less the member
 offset a `container_of` subtracts (negative included). Past a variable index the facts also give the
-displacement from the indexed element (`element_displacement`), and a global member's own offset
-stands for code that keeps the member's address in a register; both are tried after the sum. A field
+displacement from the indexed element (`element_displacement`), and a global member's own offset (or
+a `container_of` member's own offset, where the code holds the container itself) stands for code that
+keeps that address in a register; both are tried after the sum. A field
 access through a parameter names it (`param`), and so does a call argument that is a member's address
 (`displacement`), so a folded callee's offsets rebase onto its caller's. It matches as a load or
 store displacement, an `addi` constant or its negative, a global's address offset, a narrower access
 inside the field, a bitfield's storage unit, the base itself for a member whose address is taken at
-offset 0 (`member_address_at_zero`), or an address inside a global the function's C names: the
+offset 0 (`member_address_at_zero`), an access inside the first element of an array member whose
+address the code takes (`info = same->info`; the facts give `element_size`:
+`array_member_first_element`), or an address inside a global the function's C names: the
 field's own offset in its struct at a place that struct has there (`global_object_field`, or
 `global_object_narrower_access` inside the field's bytes). Link gives those places in
 `analysis.global_struct_offsets` from clang's layouts: the global's own struct, each struct it embeds
