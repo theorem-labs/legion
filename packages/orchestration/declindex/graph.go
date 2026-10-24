@@ -2,6 +2,7 @@ package declindex
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -11,7 +12,6 @@ import (
 	"maps"
 	"os"
 	"slices"
-	"sort"
 )
 
 // graph is the declaration graph in compressed sparse rows, written beside the index after each refresh so
@@ -36,11 +36,11 @@ const graphMagic = "declindex-graph-2\n"
 const propBit = uint32(1) << 31
 
 func (g *graph) id(name string) (uint32, bool) {
-	i := sort.SearchStrings(g.names, name)
-	if i < len(g.names) && g.names[i] == name {
-		return uint32(i), true
+	i, ok := slices.BinarySearch(g.names, name)
+	if !ok {
+		return 0, false
 	}
-	return 0, false
+	return uint32(i), true
 }
 
 // buildGraph reads the edges table into a graph. Each edge's target is counted as the longest declared name it
@@ -115,14 +115,8 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 	for i, e := range edges {
 		ps[i] = packed{nodeID[e.src], nodeID[e.dst], modID[e.mod], e.prop}
 	}
-	sort.Slice(ps, func(i, j int) bool {
-		if ps[i].src != ps[j].src {
-			return ps[i].src < ps[j].src
-		}
-		if ps[i].dst != ps[j].dst {
-			return ps[i].dst < ps[j].dst
-		}
-		return ps[i].mod < ps[j].mod
+	slices.SortFunc(ps, func(a, b packed) int {
+		return cmp.Or(cmp.Compare(a.src, b.src), cmp.Compare(a.dst, b.dst), cmp.Compare(a.mod, b.mod))
 	})
 	// Two targets with one owner give one edge, which propagates when either use does.
 	merged := ps[:0]

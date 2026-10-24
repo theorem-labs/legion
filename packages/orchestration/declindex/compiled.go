@@ -46,11 +46,7 @@ func compiledDigest(co *CompiledOptions, m Manifest, formsSource string) (string
 func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter, Manifest, string, error) {
 	src, forms := co.Forms.Source()
 	x := *co.Exporter
-	m := Manifest{Forms: forms, Types: true}
-	for r := range roots {
-		m.Roots = append(m.Roots, r)
-	}
-	sort.Strings(m.Roots)
+	m := Manifest{Forms: forms, Types: true, Roots: slices.Sorted(maps.Keys(roots))}
 	for _, c := range co.Forms.Concepts {
 		m.Concepts = append(m.Concepts, ConstRef{Concept: c.Concept, Const: c.Concept})
 	}
@@ -82,7 +78,7 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 				return nil, m, "", fmt.Errorf("compile the registry's forms: %w", err)
 			}
 		}
-		x.SearchPath = append(append([]string(nil), x.SearchPath...), dir)
+		x.SearchPath = slices.Concat(x.SearchPath, []string{dir})
 		m.Imports = []string{FormsModuleName}
 	}
 	return &x, m, src, nil
@@ -95,7 +91,7 @@ func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, ext
 	if err != nil {
 		return nil, err
 	}
-	x.SearchPath = append(append([]string(nil), x.SearchPath...), extra...)
+	x.SearchPath = slices.Concat(x.SearchPath, extra)
 	m.Modules = modules
 	return x.Run(ctx, m)
 }

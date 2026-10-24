@@ -3,7 +3,6 @@ package declindex
 import (
 	"context"
 	"database/sql"
-	"errors"
 )
 
 // LandSnapshot is the index state land-hash needs to answer one candidate tree. Its maps are read in one SQLite
@@ -40,39 +39,21 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 		tx = own
 	}
 	snapshot := LandSnapshot{
-		Sources:      map[string]string{},
 		Modules:      map[string]bool{},
 		Declarations: map[string][]LandDeclaration{},
 	}
-	meta := func(k string) (string, error) {
-		var v string
-		err := tx.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
-		}
-		return v, err
-	}
-	sourceKind, err := meta("sources")
+	sourceKind, err := readMeta(ctx, tx, "sources")
 	if err != nil {
 		return LandSnapshot{}, err
 	}
 	snapshot.HasSources = sourceKind == "git"
-	if snapshot.Prefix, err = meta("source_prefix"); err != nil {
+	if snapshot.Prefix, err = readMeta(ctx, tx, "source_prefix"); err != nil {
 		return LandSnapshot{}, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT path, blob FROM sources`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var path, blob string
-		if err := r.Scan(&path, &blob); err != nil {
-			return err
-		}
-		snapshot.Sources[path] = blob
-		return nil
-	})
-	if err != nil {
+	if snapshot.Sources, err = readSourceBlobs(ctx, tx); err != nil {
 		return LandSnapshot{}, err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT rel FROM modules`)
+	rows, err := tx.QueryContext(ctx, `SELECT rel FROM modules`)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var rel string
 		if err := r.Scan(&rel); err != nil {

@@ -4,13 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/fs"
 	"maps"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 )
 
@@ -63,19 +60,19 @@ func readSources(tree Tree) (blobs map[string]string, prefix string, err error) 
 
 	toHash := make([]string, 0, len(changed))
 	for _, p := range changed {
-		if _, err := os.Stat(filepath.Join(tree.Source, filepath.FromSlash(p))); err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				delete(sources, p)
-				continue
-			}
+		ok, err := fileExists(filepath.Join(tree.Source, filepath.FromSlash(p)))
+		if err != nil {
 			return nil, "", fmt.Errorf("stat changed source %s: %w", p, err)
+		}
+		if !ok {
+			delete(sources, p)
+			continue
 		}
 		toHash = append(toHash, p)
 	}
 	if len(toHash) == 0 {
 		return sources, prefix, nil
 	}
-	sort.Strings(toHash)
 	// hash-object resolves --stdin-paths from the work tree's root, not from a subdirectory given with -C, so it
 	// runs at that root with the repository-relative paths.
 	cmd := exec.Command("git", "-C", top, "hash-object", "--stdin-paths")

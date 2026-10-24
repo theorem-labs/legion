@@ -148,8 +148,7 @@ func TreeHead(ctx context.Context, tree string) (string, error) {
 
 // CommitIsAncestor reports whether ancestor is descendant or one of its ancestors, in the Git repository of tree.
 func CommitIsAncestor(ctx context.Context, tree, ancestor, descendant string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", tree, "merge-base", "--is-ancestor", ancestor, descendant)
-	err := cmd.Run()
+	err := runGit(ctx, tree, nil, "merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
 		return true, nil
 	}
@@ -161,8 +160,7 @@ func CommitIsAncestor(ctx context.Context, tree, ancestor, descendant string) (b
 }
 
 func hasCommit(ctx context.Context, tree, commit string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", tree, "cat-file", "-e", commit+"^{commit}")
-	err := cmd.Run()
+	err := runGit(ctx, tree, nil, "cat-file", "-e", commit+"^{commit}")
 	if err == nil {
 		return true, nil
 	}

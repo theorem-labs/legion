@@ -1,6 +1,7 @@
 package declindex
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
@@ -283,11 +284,8 @@ func (s *Store) Answer(ctx context.Context, name string, opt AnswerOptions) (Ans
 	a.Direct.Declarations = len(parents)
 	a.Direct.Directories = len(a.Direct.ByDirectory)
 	if opt.Lines {
-		sort.SliceStable(lines, func(i, j int) bool {
-			if lines[i].path != lines[j].path {
-				return lines[i].path < lines[j].path
-			}
-			return lines[i].u.line < lines[j].u.line
+		slices.SortStableFunc(lines, func(x, y line) int {
+			return cmp.Or(strings.Compare(x.path, y.path), cmp.Compare(x.u.line, y.u.line))
 		})
 		for _, l := range lines {
 			parent := l.u.parent

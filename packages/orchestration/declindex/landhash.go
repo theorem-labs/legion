@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -106,7 +107,7 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 
 	answers := make([]LandHashAnswer, 0, len(r.Names))
 	for _, name := range r.Names {
-		declarations := append([]landDeclaration(nil), changedDecls[name]...)
+		declarations := slices.Clone(changedDecls[name])
 		for _, declaration := range snapshot.Declarations[name] {
 			rel := strings.TrimSuffix(declaration.Path, ".lean")
 			if _, indexed := snapshot.Modules[rel]; !indexed {

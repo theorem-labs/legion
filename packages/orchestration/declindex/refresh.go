@@ -174,9 +174,10 @@ func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
 	return out, nil
 }
 
-func (s *Store) storedSources(ctx context.Context) (map[string]string, error) {
+// readSourceBlobs reads the sources table through q: each source's path and the blob the index read.
+func readSourceBlobs(ctx context.Context, q querier) (map[string]string, error) {
 	out := map[string]string{}
-	rows, err := s.q.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	rows, err := q.QueryContext(ctx, `SELECT path, blob FROM sources`)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var path, blob string
 		if err := r.Scan(&path, &blob); err != nil {
@@ -258,7 +259,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	if err != nil {
 		return st, err
 	}
-	storedSourceBlobs, err := s.storedSources(ctx)
+	storedSourceBlobs, err := readSourceBlobs(ctx, s.q)
 	if err != nil {
 		return st, err
 	}

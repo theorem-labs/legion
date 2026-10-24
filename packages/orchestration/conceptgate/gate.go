@@ -8,12 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
@@ -313,10 +313,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 		for _, m := range v.Matches {
 			seen[m.Concept] = true
 		}
-		for name := range seen {
-			c.AcceptedNear = append(c.AcceptedNear, name)
-		}
-		sort.Strings(c.AcceptedNear)
+		c.AcceptedNear = slices.Sorted(maps.Keys(seen))
 	}
 	content, err := Render(c)
 	if err != nil {

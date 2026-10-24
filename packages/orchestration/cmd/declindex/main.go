@@ -5,14 +5,17 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -519,11 +522,8 @@ func show(w io.Writer, a declindex.Answer, limit int) {
 		}
 		dirs = append(dirs, dir{name, t, ks})
 	}
-	sort.Slice(dirs, func(i, j int) bool {
-		if dirs[i].total != dirs[j].total {
-			return dirs[i].total > dirs[j].total
-		}
-		return dirs[i].name < dirs[j].name
+	slices.SortFunc(dirs, func(a, b dir) int {
+		return cmp.Or(cmp.Compare(b.total, a.total), strings.Compare(a.name, b.name))
 	})
 	for i, dd := range dirs {
 		if i == limit {
@@ -540,19 +540,12 @@ func show(w io.Writer, a declindex.Answer, limit int) {
 	fmt.Fprintf(w, "  reach of a change to its statement: %d statements change (%d directories), %d proofs to redo "+
 		"(%d directories); %d directories in all\n", r.StatementsChanged, r.StatementDirectories, r.ProofsToRedo,
 		r.ProofDirectories, r.AllDirectories)
-	if r.Why != nil {
-		var ds []string
-		for k := range r.Why {
-			ds = append(ds, k)
+	for i, k := range slices.Sorted(maps.Keys(r.Why)) {
+		if i == limit {
+			fmt.Fprintf(w, "    ... %d more (--limit 0 for all)\n", len(r.Why)-limit)
+			break
 		}
-		sort.Strings(ds)
-		for i, k := range ds {
-			if i == limit {
-				fmt.Fprintf(w, "    ... %d more (--limit 0 for all)\n", len(ds)-limit)
-				break
-			}
-			fmt.Fprintf(w, "    %s: %s\n", k, r.Why[k])
-		}
+		fmt.Fprintf(w, "    %s: %s\n", k, r.Why[k])
 	}
 	for _, l := range a.Lines {
 		fmt.Fprintln(w, "    "+l)

@@ -2,6 +2,7 @@ package declindex
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -279,17 +280,8 @@ func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) 
 		deps, _ := filepath.Glob(filepath.Join(c.Tree, ".lake", "packages", pattern, ".lake", "build", "lib", "lean"))
 		search = append(search, deps...)
 	}
-	jobs := c.Lean.Jobs
-	if jobs == 0 {
-		jobs = c.Jobs
-	}
-	if jobs == 0 {
-		jobs = min(48, runtime.NumCPU())
-	}
-	per := c.Lean.ModulesPerProcess
-	if per == 0 {
-		per = 400
-	}
+	jobs := cmp.Or(c.Lean.Jobs, c.Jobs, min(48, runtime.NumCPU()))
+	per := cmp.Or(c.Lean.ModulesPerProcess, 400)
 	return &CompiledOptions{
 		Exporter: &Exporter{Lean: l, Bin: bin, SearchPath: search, Jobs: jobs, ModulesPerProcess: per, Log: log},
 		Forms:    forms,

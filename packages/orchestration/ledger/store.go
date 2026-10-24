@@ -85,25 +85,17 @@ func (e *SchemaError) Error() string {
 
 // Open connects to the database and applies any schema versions it lacks.
 func Open(ctx context.Context, dsn string) (*Store, error) {
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("parse DSN: %w", err)
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
-	}
-	s := &Store{pool: pool}
-	if err := s.migrate(ctx); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	return s, nil
+	return connect(ctx, dsn, (*Store).migrate)
 }
 
 // OpenExisting connects to an existing ledger database and verifies that it has every schema version embedded in
 // this binary. It never applies a migration.
 func OpenExisting(ctx context.Context, dsn string) (*Store, error) {
+	return connect(ctx, dsn, (*Store).checkSchema)
+}
+
+// connect opens a pool to dsn and gives its store once ready accepts it; it closes the pool that ready refuses.
+func connect(ctx context.Context, dsn string, ready func(*Store, context.Context) error) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse DSN: %w", err)
@@ -113,7 +105,7 @@ func OpenExisting(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 	s := &Store{pool: pool}
-	if err := s.checkSchema(ctx); err != nil {
+	if err := ready(s, ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -167,21 +159,13 @@ func (s *Store) checkSchema(ctx context.Context) error {
 		}
 		return fmt.Errorf("read schema versions: %w", err)
 	}
-	defer rows.Close()
-	have := make(map[int]bool, len(want))
-	for rows.Next() {
-		var version int
-		if err := rows.Scan(&version); err != nil {
-			return err
-		}
-		have[version] = true
-	}
-	if err := rows.Err(); err != nil {
+	versions, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	if err != nil {
 		return err
 	}
 	var missing []int
 	for _, version := range want {
-		if !have[version] {
+		if !slices.Contains(versions, version) {
 			missing = append(missing, version)
 		}
 	}

@@ -181,16 +181,14 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	if c := e.printJSON(v); c != 0 {
-		return c
-	}
+	rc := 0
 	switch v.Outcome {
 	case conceptgate.Refused:
-		return 1
+		rc = 1
 	case conceptgate.Near:
-		return 4
+		rc = 4
 	case conceptgate.NameTaken:
-		return 5
+		rc = 5
 	}
-	return 0
+	return e.printJSONOr(v, rc)
 }

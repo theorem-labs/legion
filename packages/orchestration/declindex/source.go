@@ -186,7 +186,7 @@ func bodyStart(text string, i, end int) (int, bool) {
 			if r == '|' && strings.TrimFunc(text[strings.LastIndexByte(text[:i], '\n')+1:i], isSpace) == "" {
 				return i, true
 			}
-			if strings.HasPrefix(rest, "where") && wordBoundaryBefore(text, i, true) && wordBoundaryAfter(text, i+5, len(text)) {
+			if strings.HasPrefix(rest, "where") && wordBoundaryBefore(text, i, true) && wordBoundaryAfter(text, i+5, len(text), false) {
 				return i, true
 			}
 		}
@@ -204,13 +204,13 @@ func wordBoundaryBefore(text string, i int, dot bool) bool {
 	return !(isWord(r) || (dot && r == '.'))
 }
 
-// wordBoundaryAfter: the rune at i is not a word character, or i is at end.
-func wordBoundaryAfter(text string, i, end int) bool {
+// wordBoundaryAfter: the rune at i is not a word character (nor a dot, when dot is true), or i is at end.
+func wordBoundaryAfter(text string, i, end int, dot bool) bool {
 	if i >= end {
 		return true
 	}
 	r, _ := utf8.DecodeRuneInString(text[i:end])
-	return !isWord(r)
+	return !(isWord(r) || (dot && r == '.'))
 }
 
 // stripComments drops `--` line comments and nested `/- -/` block comments (docstrings included) and keeps strings.
@@ -230,16 +230,9 @@ func stripComments(s string) string {
 		case strings.HasPrefix(s[i:], "/-"):
 			i = skipBlockComment(s, i, n)
 		case s[i] == '"':
-			j := i + 1
-			for j < n && s[j] != '"' {
-				if s[j] == '\\' {
-					j = next(s, j+1)
-				} else {
-					j = next(s, j)
-				}
-			}
-			out.WriteString(s[i:min(j+1, n)])
-			i = j + 1
+			j := skipString(s, i, n)
+			out.WriteString(s[i:min(j, n)])
+			i = j
 		default:
 			out.WriteByte(s[i])
 			i++
@@ -255,7 +248,7 @@ func declKind(text string, a, end int) string {
 		for _, kw := range keywords {
 			j := i + len(kw)
 			if j <= end && strings.HasPrefix(text[i:], kw) && wordBoundaryBefore(text, i, true) &&
-				(j >= end || wordBoundaryAfterDot(text, j, end)) {
+				wordBoundaryAfter(text, j, end, true) {
 				kind = kw
 				i = j - 1
 				break
@@ -263,11 +256,6 @@ func declKind(text string, a, end int) string {
 		}
 	}
 	return kind
-}
-
-func wordBoundaryAfterDot(text string, i, end int) bool {
-	r, _ := utf8.DecodeRuneInString(text[i:end])
-	return !(isWord(r) || r == '.')
 }
 
 // StatementText is a declaration's statement as written, comments dropped and white space collapsed: its signature

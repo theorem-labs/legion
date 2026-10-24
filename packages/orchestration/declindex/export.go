@@ -73,10 +73,8 @@ func run(ctx context.Context, dir string, env []string, name string, args ...str
 	cmd.Dir = dir
 	cmd.Env = env
 	InGroup(cmd)
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, out.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, out)
 	}
 	return nil
 }
@@ -194,7 +192,7 @@ func NewScratch(base string) (string, error) { return confine.NewScratch(base) }
 // inputs are copied), starts no other process and opens no socket. It fails when the sandbox is unavailable,
 // and then nothing runs.
 func (l Lean) confined(ctx context.Context, argv []string, scratch string, inputs []confine.Input, searchPath, read []string) (*confine.Cmd, error) {
-	reads := append(append([]string{l.Prefix}, searchPath...), read...)
+	reads := slices.Concat([]string{l.Prefix}, searchPath, read)
 	return confine.Command(ctx, confine.Spec{Argv: argv, Env: l.env(searchPath, scratch), Scratch: scratch, Inputs: inputs, Read: reads})
 }
 
@@ -213,18 +211,16 @@ func CompileConfined(ctx context.Context, l Lean, searchPath []string, scratch, 
 	if err != nil {
 		return err
 	}
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err = cmd.Run()
+	out, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
 	switch {
 	case err == nil:
 		return nil
 	case errors.As(err, &ee) && ee.ExitCode() == 1 && ctx.Err() == nil:
 		// Lean exits 1 when the file has errors; the launcher's own failures exit 126.
-		return fmt.Errorf("%w: lean %s: %v\n%s", ErrSourceFailed, base+".lean", err, out.String())
+		return fmt.Errorf("%w: lean %s: %v\n%s", ErrSourceFailed, base+".lean", err, out)
 	default:
-		return fmt.Errorf("lean %s: %w\n%s", base+".lean", err, out.String())
+		return fmt.Errorf("lean %s: %w\n%s", base+".lean", err, out)
 	}
 }
 
@@ -258,17 +254,15 @@ func (x *Exporter) CheckSource(ctx context.Context, source []byte, searchPath []
 	if err != nil {
 		return err
 	}
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err = cmd.Run()
+	out, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
 	switch {
 	case err == nil:
 		return nil
 	case errors.As(err, &ee) && ee.ExitCode() == 1:
-		return fmt.Errorf("%w: %s", ErrRefusedSource, strings.TrimSpace(out.String()))
+		return fmt.Errorf("%w: %s", ErrRefusedSource, strings.TrimSpace(string(out)))
 	default:
-		return fmt.Errorf("%w: the source check failed: %v: %s", ErrExporter, err, strings.TrimSpace(out.String()))
+		return fmt.Errorf("%w: the source check failed: %v: %s", ErrExporter, err, strings.TrimSpace(string(out)))
 	}
 }
 
@@ -381,11 +375,7 @@ func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-	var out []Constant
-	for _, r := range results {
-		out = append(out, r...)
-	}
-	return out, nil
+	return slices.Concat(results...), nil
 }
 
 // started is a program the exporter reads: exec.Cmd, or confine.Cmd, whose Start also lets its one exec through.

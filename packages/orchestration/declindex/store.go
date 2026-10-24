@@ -350,9 +350,12 @@ func (s *Store) setMeta(ctx context.Context, x execer, k, v string) error {
 }
 
 // Meta reads one value the index keeps about itself (commit, built, schema, errors); empty when unset.
-func (s *Store) Meta(ctx context.Context, k string) (string, error) {
+func (s *Store) Meta(ctx context.Context, k string) (string, error) { return readMeta(ctx, s.q, k) }
+
+// readMeta is Meta through q: the store's reader, or a read transaction of its own (LandSnapshot).
+func readMeta(ctx context.Context, q dbReader, k string) (string, error) {
 	var v string
-	err := s.q.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
+	err := q.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}

@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
@@ -79,7 +79,7 @@ func landNames(getenv func(string) string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("LAND_NAMES_FILE: %w", err)
 		}
-		if hasEnv && !reflect.DeepEqual(names, fromFile) {
+		if hasEnv && !slices.Equal(names, fromFile) {
 			return nil, fmt.Errorf("LAND_NAMES and LAND_NAMES_FILE differ")
 		}
 		names = fromFile

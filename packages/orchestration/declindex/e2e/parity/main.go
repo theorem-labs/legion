@@ -2,12 +2,14 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -107,12 +109,7 @@ func readNames(path string) ([]string, error) {
 	if len(set) == 0 {
 		return nil, fmt.Errorf("names has no declarations")
 	}
-	names := make([]string, 0, len(set))
-	for name := range set {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names, nil
+	return slices.Sorted(maps.Keys(set)), nil
 }
 
 func readAnswers(path string) (map[string]answer, error) {
@@ -185,15 +182,7 @@ func directoryKeys(left, right map[string]map[string]int) []directoryKey {
 			set[directoryKey{directory, kind}] = struct{}{}
 		}
 	}
-	keys := make([]directoryKey, 0, len(set))
-	for key := range set {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].directory != keys[j].directory {
-			return keys[i].directory < keys[j].directory
-		}
-		return keys[i].kind < keys[j].kind
+	return slices.SortedFunc(maps.Keys(set), func(a, b directoryKey) int {
+		return cmp.Or(strings.Compare(a.directory, b.directory), strings.Compare(a.kind, b.kind))
 	})
-	return keys
 }
