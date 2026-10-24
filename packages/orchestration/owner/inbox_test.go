@@ -48,6 +48,38 @@ func TestBuildInboxKeepsTheLedgerOrderOfTiedItems(t *testing.T) {
 	}
 }
 
+// A concept item waits for its input: the gate's verdict record on the proposer's branch (near), or the intake's record
+// on inbox/librarian (recheck). BuildInbox names that record and its branch; the caller, which reads the branch, marks
+// the item ready once the record is there. Every other item is ready.
+func TestBuildInboxNamesTheRecordAConceptItemWaitsFor(t *testing.T) {
+	proposer := "function:alloc_frame@kernel/frame.c"
+	recheckID := "recheck-6b1f0c2d9e8a7f3b4c5d6e7f8a9b0c1d-name.46782e5370416c69676e6564"
+	near, recheck := ConceptItem(proposer, "near-35f57eb44edf2d11"), ConceptItem(proposer, recheckID)
+	need := "need:function:caller->struct:state@r1"
+	items := []ledger.Item{{ID: near, Owner: "librarian"}, {ID: recheck, Owner: "librarian"}, {ID: need, Owner: "struct:state"}}
+
+	inbox, err := BuildInbox(items, Config{RecordsRoot: "skeleton"}, map[string]Priority{}, loadRuleFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	type entry struct {
+		ID, Record, RecordOwner, Branch string
+		Ready, Waits                    bool
+	}
+	var got []entry
+	for _, item := range inbox {
+		got = append(got, entry{item.ID, item.Record, item.RecordOwner, item.Branch, item.Ready, item.WaitsForRecord()})
+	}
+	want := []entry{
+		{near, "skeleton/nodes/" + Key(proposer) + "/concepts/35f57eb44edf2d11.verdict.json", proposer, "", false, true},
+		{recheck, "inbox/" + recheckID + ".json", "", "inbox/librarian", false, true},
+		{need, "skeleton/nodes/" + Key("function:caller") + "/needs/E" + Hex16("struct:state") + ".md", "function:caller", "", true, false},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("inbox =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
 func TestReturnFromEventReadsEveryC13Field(t *testing.T) {
 	event := ledger.Event{ID: 9, Kind: "migration.round_failed", Data: json.RawMessage(`{"generation":1,"landing_rounds":1,"reason":"check_refused:skeleton","batch":"b-1","key":"b-1/m-2/1","detail":"edge proof uses sorry","log":"logs/b-1/check.log","ready_cleared":true}`)}
 	got, err := ReturnFromEvent(event)

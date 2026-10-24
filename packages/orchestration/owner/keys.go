@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -145,8 +146,10 @@ func validVersionedItem(typ, subject, version string) bool {
 		return validEdge(subject) && positiveDecimal(version)
 	case "returned":
 		return validMigration(subject) && positiveDecimal(version)
-	case "rebuild", "produce", "concept", "concept-answer":
+	case "rebuild", "produce":
 		return lowerHex(version, 12)
+	case "concept", "concept-answer":
+		return ValidOwnerID(subject) && GateIDKind(version) != ""
 	case "interface":
 		return lowerHex(subject, 16) && version == "1"
 	}
@@ -172,6 +175,45 @@ func validMigration(value string) bool {
 func validEdge(value string) bool {
 	_, _, err := ParseEdgeID(value)
 	return err == nil
+}
+
+// The concept gate's owner-id rule (conceptgate/gate.go:85-96): a node id of the supervisor's node kinds, whose name
+// has no white space and may hold @, or a role name.
+var (
+	nodeOwnerID = regexp.MustCompile(`^(function|struct|global|percpu|subsystem):\S+$`)
+	roleOwnerID = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+)
+
+// ValidOwnerID reports whether id passes the concept gate's owner-id rule, as a proposer must.
+func ValidOwnerID(id string) bool { return nodeOwnerID.MatchString(id) || roleOwnerID.MatchString(id) }
+
+// GateIDKind is the kind of a concept gate id: "near" for near-<hex16 of the proposal bytes> (conceptgate/gate.go:164-165),
+// "recheck" for recheck-<key>-<key> (conceptgate/recheck.go:121-131), each key a compiled hash (32 lowercase hex digits)
+// or name. and the lowercase hex of a concept name's bytes; "" for any other text. A gate id holds no @, so it is the
+// version of a concept item, after the item's last @.
+func GateIDKind(id string) string {
+	if digest, found := strings.CutPrefix(id, "near-"); found {
+		if lowerHex(digest, 16) {
+			return "near"
+		}
+		return ""
+	}
+	if keys, found := strings.CutPrefix(id, "recheck-"); found {
+		added, other, found := strings.Cut(keys, "-")
+		if found && conceptKey(added) && conceptKey(other) {
+			return "recheck"
+		}
+	}
+	return ""
+}
+
+// conceptKey is a key of a recheck id: a compiled hash, or name. and the hex of the bytes of a name.
+func conceptKey(key string) bool {
+	if lowerHex(key, 32) {
+		return true
+	}
+	name, found := strings.CutPrefix(key, "name.")
+	return found && name != "" && len(name)%2 == 0 && lowerHex(name, len(name))
 }
 
 func revision(value string) bool {

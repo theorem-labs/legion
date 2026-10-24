@@ -156,8 +156,9 @@ func (s *session) interfaces() (map[string][]string, error) {
 	return out, nil
 }
 
-// fillRecord names the commit to read. A reply item's record is the reply of either party whose content hash
-// starts with the item's version.
+// fillRecord names the commit to read, and marks an item that waits for its record (a concept item) ready once its
+// branch holds that record. A reply item's record is the reply of either party whose content hash starts with the
+// item's version.
 func (s *session) fillRecord(entry *ownerpkg.InboxItem) error {
 	ref, err := ownerpkg.ParseItemID(entry.ID)
 	if err != nil {
@@ -193,10 +194,16 @@ func (s *session) fillRecord(entry *ownerpkg.InboxItem) error {
 		return nil
 	}
 	rev := "main"
-	if entry.RecordOwner != "" {
+	switch {
+	case entry.RecordOwner != "":
 		rev = branch(entry.RecordOwner)
+	case entry.Branch != "":
+		rev = "refs/heads/" + entry.Branch
 	}
 	commit, err := s.lastCommit(rev, entry.Record)
 	entry.Commit = commit
+	if entry.WaitsForRecord() {
+		entry.Ready = commit != ""
+	}
 	return err
 }

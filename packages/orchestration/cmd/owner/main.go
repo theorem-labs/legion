@@ -3,7 +3,8 @@
 // steps, each as one record commit, its follow-up items, its Envoy notices and the completion of the item it
 // answers.
 //
-// Exit codes: 0 done, 1 refused, 2 usage, 3 unable to check, 4 protocol error.
+// Exit codes: 0 done, 1 refused, 2 usage, 3 unable to check, 4 protocol error; librarian-intake also exits 75 when the
+// ledger cannot be reached, so that its caller retries.
 package main
 
 import (
@@ -24,13 +25,15 @@ const usage = "usage: owner [--json] [--deploy PATH] <command> ...\n" +
 	"  need <target> <file> [--outside-part | --answers <reply item>...] | offer <file> [--answers <need or reply item>...] |\n" +
 	"  accept <item> | reply <item> <reason> <file> [--premise-owner <id>] |\n" +
 	"  done <need or offer item> --superseded r<n> | returned <item> |\n" +
+	"  " + librarianIntakeUsage + " |\n" +
 	"  " + messageTestUsage
 
 const (
-	exitRefused  = 1
-	exitUsage    = 2
-	exitUnable   = 3
-	exitProtocol = 4
+	exitRefused     = 1
+	exitUsage       = 2
+	exitUnable      = 3
+	exitProtocol    = 4
+	exitUnreachable = 75 // EX_TEMPFAIL: the ledger could not be reached; the caller retries
 )
 
 type usageError struct{ message string }
@@ -46,6 +49,16 @@ type unableError struct{ err error }
 
 func (e *unableError) Error() string { return e.err.Error() }
 func (e *unableError) Unwrap() error { return e.err }
+
+// exitError carries the exit code that a command chose for err, which writeError keeps: librarian-intake's codes are
+// its caller's contract.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string { return e.err.Error() }
+func (e *exitError) Unwrap() error { return e.err }
 
 func usagef(format string, args ...any) error { return &usageError{fmt.Sprintf(format, args...)} }
 func refusef(format string, args ...any) error {
@@ -95,10 +108,17 @@ func run(ctx context.Context, args []string, getenv func(string) string, cwd str
 	if err != nil {
 		return writeError(stderr, jsonOutput, err)
 	}
-	// A refused notice does not fail a step: the runner journaled it, and the command names it.
-	if result, ok := value.(stepResult); ok {
+	// A refused notice does not fail a step: the runner journaled it, and the command names it. librarian-intake
+	// prints each whole notice, with the journal that kept it.
+	switch result := value.(type) {
+	case stepResult:
 		for _, topic := range result.Undelivered {
 			fmt.Fprintln(stderr, "notice not delivered:", topic)
+		}
+	case intakeResult:
+		for _, notice := range result.notices {
+			data, _ := json.Marshal(map[string]any{"message": notice.Message, "payload": notice.Payload, "key": notice.Key})
+			fmt.Fprintf(stderr, "notice not delivered: %s %s (journal %s)\n", notice.Topic, data, result.Journal)
 		}
 	}
 	if jsonOutput {
@@ -184,6 +204,8 @@ func parseCommand(args []string) (func(*session) (any, error), error) {
 		return func(s *session) (any, error) { return s.returned(args[0]) }, nil
 	case "message-test":
 		return parseMessageTest(args)
+	case "librarian-intake":
+		return parseLibrarianIntake(args)
 	}
 	return nil, usagef("unknown command %q", name)
 }
@@ -196,7 +218,10 @@ func writeError(stderr io.Writer, jsonOutput bool, err error) int {
 	var unableErr *unableError
 	var refusal *ledger.Refusal
 	var notFound *ledger.NotFoundError
+	var coded *exitError
 	switch {
+	case errors.As(err, &coded):
+		code = coded.code
 	case errors.As(err, &usageErr), errors.As(err, &missing):
 		code = exitUsage
 	case errors.As(err, &refused), errors.As(err, &refusal), errors.As(err, &notFound), errors.Is(err, ownerpkg.ErrIDOwner):

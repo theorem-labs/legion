@@ -53,7 +53,7 @@ Steps:
 | `whoami` | The owner's id, role, key, kind, Lean directory, C file, active set and active epoch |
 | `topics` | `topics.json`'s list, plus `concepts` for the librarian, `fact.<name>.needs` for a fact owner, `fact.<name>.users` for each fact the owner states, and `all` for every owner |
 | `worktree` | Creates or reuses `./wt` on `owner/<Key>` of the bare repository |
-| `inbox` | Open items in `RULE.yaml` order, each with its record, the branch that holds it and the commit to read. The items come from the ledger's `Store.OpenItems` in enqueue order, and items the rule's keys tie keep that order; `enqueued_at` is the position in it |
+| `inbox` | Open items in `RULE.yaml` order, each with its record, the branch that holds it (`record_owner`'s `owner/<Key>`, or `branch` for a branch that is no owner's), the commit to read, and `ready`. The items come from the ledger's `Store.OpenItems` in enqueue order, and items the rule's keys tie keep that order; `enqueued_at` is the position in it. Every item is ready except a `concept:` item whose record is not yet on its branch (below); the text output marks such an item `not ready` |
 | `claim <item>` | A supervised lease on an existing item, for a person or an owner outside a step |
 | `need <target> <file> [--outside-part \| --answers <reply item>...]` | Writes `needs/E<hex16(target)>.md` (the draft sets `author_model`, `cites` and `resolves`), queues `need:<edge>@r<n>`, notifies by the routing table; `--outside-part` records the edge as `outside_part` with no item; `--answers` answers the target's replies about this need: the revision lists them in `resolves`, carries their trailers, and completes them |
 | `offer <file> [--answers <item>...]` | Writes `spec.md` revision n (the draft sets `author_model`, `complete` and `resolves`) and answers each item: a need to the owner, a reply about an edge whose target is the owner (both queue `offer:<edge>@r<n>`, n the spec revision, for the edge's source), or a reply that names the owner its premise owner; a reply is listed in `resolves`. It also answers an open `start:` item, and notifies. When every `--answers` item is done, it repeats the revision that answered them, or refuses a changed draft (exit 1), which would be a new revision that answers none of them |
@@ -66,10 +66,68 @@ Steps:
 | `message-test subscribed` | Records the topics the test owner subscribed to, at `message-test/subscribed.yaml` |
 | `message-test saw <delivery id> <topic>` | Records one delivery once, at `message-test/saw/<hex16(id)>.yaml`, with `Owner-Delivery` and `Owner-Topic` trailers |
 | `message-test answer <item>` | Answers a `start:`, `need:` or `offer:` item with an offer record of fixed text as one step (record, the need's follow-up `offer:`, completion). The record has a revision, as a spec does: 1, and one more each time a newer version rewrites it; a need's follow-up is `offer:<edge>@r<n>`, n that revision, as production's `offer` numbers it. An item older than the version already answered completes as `superseded:<newer>` with no record |
+| `librarian-intake --id <id> --proposer <owner id> --proposal <file> --ledger-dsn-file <path> --repository <name> [--git-dir <repo.git>] [--envoy-config <path>] [--topic-prefix <prefix>] [--deploy <path>]` | The concept gate's `librarian` command: queues the gate's near match or post-landing recheck for the librarian (below). It needs no `LEGION_OWNER` |
 
 Exit codes: 0 done, 1 refused, 2 usage (a missing launch variable included), 3 unable to check (an unreadable graph,
-rule, manifest, score, reviews or listener configuration input), 4 protocol error. Item versions are canonical: a
-decimal has no leading zero, so `@r01` is no item id.
+rule, manifest, score, reviews or listener configuration input), 4 protocol error; `librarian-intake` also exits 75
+(below). Item versions are canonical: a decimal has no leading zero, so `@r01` is no item id.
+
+## The librarian's intake
+
+The concept gate (`declindex gate`, and `declindex ledger`'s recheck of a landing) delivers each near match to its
+configured `librarian` command, here `owner librarian-intake`, with `--id`, `--proposer` and `--proposal <file>`
+appended, no stdin and 120 s (`conceptgate/librarian.go`). The gate removes the file when the command exits, so the
+command reads it whole at once, and it never reads stdin. It acts for the gate: it needs no `LEGION_OWNER`, and it
+queues for `librarian`.
+
+- **The ids.** `--id` is `near-<hex16 of the proposal file's bytes>` (the gate) or `recheck-<key>-<key>` (the
+  recheck), each key a compiled hash (32 lowercase hex digits) or `name.` and the lowercase hex of a concept name's
+  bytes. It holds no `@`. `--proposer` passes the gate's owner-id rule: a `function:`, `struct:`, `global:`,
+  `percpu:` or `subsystem:` node id whose name has no white space, or a role name (`[a-z][a-z0-9-]*`).
+- **The envelope is untrusted data.** The file is the gate's text: header lines with exactly one `id:` line equal to
+  `--id` and one `proposer:` line equal to `--proposer`; one `-----BEGIN UNTRUSTED PROPOSAL <nonce>-----` line and one
+  `-----END UNTRUSTED PROPOSAL <nonce>-----` line with the same 32-digit lowercase hex nonce, the end marker the last
+  line; and exactly one line between them, the JSON object `{kind, verdict, proposal}` with each key once, `kind` the
+  id's kind (`near` or `recheck`) and `verdict` and `proposal` objects. Any line that starts like a marker is one, so a
+  second marker is refused; marker text inside the JSON line is data, since the gate's JSON escapes every newline.
+  Anything else is exit 2, and nothing is queued or written.
+- **The item** is `concept:<proposer>@<id>` for `librarian` in `--repository` (its version is after the last `@`, so
+  a proposer may hold `@`). The command reads it first. A missing item is queued and its notice published. One that
+  exists for `librarian`, open or done (also the ledger's `ReasonExists` when another delivery queued it first), is a
+  success that adds and publishes nothing, whatever the envelope says now. One in another owner's queue is exit 4.
+- **A near delivery** records nothing: the proposer's own command keeps the proposal on its branch at
+  `skeleton/nodes/<Key>/concepts/<hex16>.json`, `<hex16>` the id after `near-`, and the gate's verdict beside it as
+  `<hex16>.verdict.json`.
+- **A recheck delivery** has no proposer copy, so it needs `--git-dir`, the librarian's bare repository (exit 2
+  without it). Before it queues the item, the command writes `inbox/<id>.json` on `inbox/librarian` with plumbing
+  only, no worktree: a private index from the branch's tip, `commit-tree` on that tip with the repository's identity,
+  then `update-ref <new> <old>`, again from the new tip when another writer moved it first. The record is
+  `{"untrusted": true, "id", "proposer", "kind", "verdict", "proposal"}`, the verdict and the proposal as the gate
+  wrote them. A record of that id is never rewritten: the first envelope stays. Only this command writes the branch.
+- **The inbox.** `owner inbox` lists a `concept:` item as ready, with its record's path and commit, once a near item's
+  proposer branch `owner/<Key(proposer)>` holds `<records_root>/nodes/<Key>/concepts/<hex16>.verdict.json`, or a
+  recheck item's `inbox/librarian` holds `inbox/<id>.json`; until then it is listed as not ready.
+- **The notice.** A queued item's notice goes to `<topic prefix>concepts` (the routing table's concept row) with the
+  payload of the notices above (`type: concept`, `from` the proposer, `to: librarian`, the item, and for a recheck its
+  inbox record and commit) and the key `c-<hex16(item)>`. The topic prefix is `--topic-prefix`, else `topic_prefix`
+  of `skeleton/owner.yaml` at `main` of `--git-dir`; with neither, the command exits 2 before it queues anything.
+  The listener is `ResolveListener`'s, with `--envoy-config` as `ENVOY_CONFIG_FILE`.
+- **The journal.** When no listener resolves, or the listener still refuses after the retries at 1 s, 4 s and 16 s,
+  the command prints `notice not delivered: <topic> <notice>` on stderr, appends the notice to the host's journal and
+  exits 0: the ledger item is the record. The journal is `<state_dir>/undelivered.jsonl` of the deployment file
+  (`--deploy`, else `owner --deploy`, else `~/.config/owner/deploy.yaml`) when there is one, else
+  `<user cache directory>/owner/undelivered/undelivered.jsonl` (Go's `os.UserCacheDir`: `$XDG_CACHE_HOME`, else
+  `~/.cache`). The command resolves it before it writes anything; a named deployment file that is missing, or one
+  that does not load, is exit 3.
+- **The ledger** is the DSN in `--ledger-dsn-file`, opened as every owner command opens it (`OpenLedgerFile`, which
+  `ledger.Open` migrates to the schema it lacks).
+- **Time.** The ledger has 20 s to open and 20 s more to read and queue; a notice's four attempts take at most 61 s;
+  the whole command stops at 110 s, inside the gate's 120 s.
+
+Exit codes of `librarian-intake`: 0 delivered (queued now, or already there); 2 usage or a malformed envelope; 3
+unable to check (a DSN file that cannot be read, no such ledger repository, a query the server refuses, a deployment
+file that does not load); 4 protocol error (the item is another owner's); 75 when the ledger cannot be reached (a
+refused, broken or timed-out connection), so that the caller retries. The gate fails the delivery on any code but 0.
 
 ## The message test
 

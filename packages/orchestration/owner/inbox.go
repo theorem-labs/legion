@@ -11,17 +11,26 @@ import (
 )
 
 // InboxItem is one open item of an owner's queue with the record that explains it. RecordOwner is the owner
-// whose branch holds Record; an empty RecordOwner with a Record means main. Event is the ledger event a
-// returned item reads. Commit is filled by the caller from the branch.
+// whose branch holds Record; Branch names a branch that is no owner's (LibrarianInboxBranch); a Record with neither
+// means main. Event is the ledger event a returned item reads. Commit is filled by the caller from the branch. Ready
+// is false for an item whose input is not there yet: a concept item before its record is on its branch
+// (WaitsForRecord), which the caller decides once it read the branch.
 type InboxItem struct {
 	ledger.Item
 	Record              string `json:"record"`
 	RecordOwner         string `json:"record_owner"`
+	Branch              string `json:"branch,omitempty"`
 	Event               int64  `json:"event,omitempty"`
 	Commit              string `json:"commit"`
+	Ready               bool   `json:"ready"`
 	StoppedInstructions int    `json:"stopped_instructions"`
 	CallHeight          int    `json:"call_height"`
 }
+
+// WaitsForRecord reports whether the item is ready only once its record is on its branch: a concept item, whose
+// record the gate (near: the verdict beside the proposal on the proposer's branch) or the intake (recheck: the
+// envelope on LibrarianInboxBranch) writes.
+func (i InboxItem) WaitsForRecord() bool { return strings.HasPrefix(i.ID, "concept:") }
 
 // BuildInbox names each item's record from config and orders the items by rule. items are an owner's open items in
 // the ledger's order (Store.OpenItems), which is the order it enqueued them; items the rule's keys tie keep it.
@@ -68,9 +77,11 @@ func ReplyRecord(recordsRoot, replier, edge string, n int) string {
 
 // inboxEntry names the record an item asks its owner to read. A reply item's record is found by its
 // content hash in the parties' replies, so it is left for the caller; items whose input is not an owner
-// record (interfaces, scores, upstream merges, proposals, escalations) name none.
+// record (interfaces, scores, upstream merges, proposals, escalations) name none. A concept item names the record it
+// waits for, and is not ready until the caller finds it.
 func inboxEntry(item ledger.Item, config Config) (InboxItem, error) {
 	entry := InboxItem{Item: item}
+	entry.Ready = !entry.WaitsForRecord()
 	recordsRoot := config.RecordsRoot
 	ref, err := ParseItemID(item.ID)
 	if err != nil {
@@ -115,6 +126,12 @@ func inboxEntry(item ledger.Item, config Config) (InboxItem, error) {
 			return InboxItem{}, fmt.Errorf("returned item %q event: %w", item.ID, err)
 		}
 		entry.Event = event
+	case "concept":
+		if digest, near := strings.CutPrefix(ref.Version, "near-"); near {
+			entry.Record, entry.RecordOwner = NodeRecord(recordsRoot, ref.Subject, "concepts", digest+".verdict.json"), ref.Subject
+		} else {
+			entry.Record, entry.Branch = LibrarianInboxRecord(ref.Version), LibrarianInboxBranch
+		}
 	}
 	return entry, nil
 }

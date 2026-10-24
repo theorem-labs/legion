@@ -310,16 +310,22 @@ func OpenLedger(ctx context.Context, env func(string) string) (*ledger.Store, er
 	if err != nil {
 		return nil, err
 	}
+	return OpenLedgerFile(ctx, "LEGION_LEDGER_DSN_FILE", dsnFile)
+}
+
+// OpenLedgerFile opens the ledger whose DSN dsnFile holds; source names the file in errors. ledger.Open applies the
+// schema versions the database lacks.
+func OpenLedgerFile(ctx context.Context, source, dsnFile string) (*ledger.Store, error) {
 	dsn, err := os.ReadFile(dsnFile)
 	if err != nil {
-		return nil, fmt.Errorf("read LEGION_LEDGER_DSN_FILE %q: %w", dsnFile, err)
+		return nil, fmt.Errorf("read %s %q: %w", source, dsnFile, err)
 	}
 	if strings.TrimSpace(string(dsn)) == "" {
-		return nil, fmt.Errorf("LEGION_LEDGER_DSN_FILE %q is empty", dsnFile)
+		return nil, fmt.Errorf("%s %q is empty", source, dsnFile)
 	}
 	store, err := ledger.Open(ctx, strings.TrimSpace(string(dsn)))
 	if err != nil {
-		return nil, fmt.Errorf("open ledger from LEGION_LEDGER_DSN_FILE: %w", err)
+		return nil, fmt.Errorf("open ledger from %s: %w", source, err)
 	}
 	return store, nil
 }

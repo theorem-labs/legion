@@ -181,6 +181,24 @@ func TestNewRoutingRefusesAPrefixOutsideTheNamespace(t *testing.T) {
 	}
 }
 
+// A notice names the commit of its record. The gate's near verdict has none yet (the proposer's branch takes the
+// record later), so its message ends at the epoch.
+func TestNoticesNameACommitOnlyWhenTheRecordHasOne(t *testing.T) {
+	concept := Notices([]Delivery{{Topic: "notifications.example.concepts"}}, NoticeFields{
+		Type: "concept", From: "function:a@x/y.c", To: "librarian", Item: "concept:function:a@x/y.c@near-0123456789abcdef",
+	})
+	if got := concept[0].Message; got != "concept function:a@x/y.c near-0123456789abcdef (epoch 0)" {
+		t.Fatalf("message without a commit = %q", got)
+	}
+	need := Notices([]Delivery{{Topic: "notifications.example.node.struct:b.needs"}}, NoticeFields{
+		Type: "need", Epoch: 1, From: "function:a", To: "struct:b", Edge: "function:a->struct:b", Item: "need:function:a->struct:b@r1",
+		Commit: "3f2a9c1d0e7b5a4c3f2a9c1d0e7b5a4c3f2a9c1d",
+	})
+	if got := need[0].Message; got != "need function:a -> struct:b r1 (epoch 1) at 3f2a9c1d0e7b" {
+		t.Fatalf("message with a commit = %q", got)
+	}
+}
+
 func TestLoadGraphDocumentsRefuseAnotherFormat(t *testing.T) {
 	if _, err := LoadOwners(filepath.Join("testdata", "graph.json")); err == nil {
 		t.Fatal("LoadOwners accepted a graph document")

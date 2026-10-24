@@ -21,7 +21,11 @@ func text(value any) string {
 	case []ownerpkg.InboxItem:
 		lines := make([]string, 0, len(v))
 		for _, item := range v {
-			lines = append(lines, strings.Join([]string{item.ID, item.Record, item.Commit}, "\t"))
+			line := strings.Join([]string{item.ID, item.Record, item.Commit}, "\t")
+			if !item.Ready {
+				line += "\tnot ready"
+			}
+			lines = append(lines, line)
 		}
 		return strings.Join(lines, "\n")
 	case ownerpkg.ReturnFields:
@@ -42,6 +46,16 @@ func text(value any) string {
 		return fmt.Sprintf("%s %s %s", v.ID, v.State, v.Result)
 	case messageTestResult:
 		return "message test passed: report " + v.Report
+	case intakeResult:
+		state := "queued"
+		if !v.Added {
+			state = "already queued"
+		}
+		line := fmt.Sprintf("%s %s for %s", state, v.Item, ownerpkg.Librarian)
+		if v.Record != "" {
+			line += fmt.Sprintf("; record %s at %s", v.Record, v.Commit)
+		}
+		return line
 	}
 	data, _ := json.Marshal(value)
 	return string(data)
