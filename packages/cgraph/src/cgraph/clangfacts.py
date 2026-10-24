@@ -1371,6 +1371,8 @@ _COMMA = 33
 _ASSIGN = 22
 # CXBinaryOperatorKind Mul and And: with an operand 0, the result is 0 whatever the other one is.
 _ZEROING = (3, 17)
+# CXBinaryOperatorKind EQ and NE.
+_EQUALITY = (15, 16)
 
 
 def _is_plain_assignment(node: ci.Cursor) -> bool:
@@ -2090,6 +2092,8 @@ class _Evaluator:
             return self.member(cursor, inner[0], resolve, depth, typed)
         if typed is None:
             return None
+        if kind == K.UNARY_OPERATOR and inner and libclang.is_address_of(cursor):
+            return self.object_address(inner[0], typed)
         if kind == K.UNARY_OPERATOR and inner:
             name = _UNARY_NAMES.get(libclang.unary_kind(cursor))
             operand = self.expression(inner[0], resolve, depth + 1, truth=name == "!")
@@ -2139,6 +2143,18 @@ class _Evaluator:
         if struct is None or not _is_struct(struct):
             return None
         return {"op": ".", "a": [struct], "o": offset, **(typed or {})}
+
+    def object_address(self, operand: ci.Cursor, typed: dict[str, Any]) -> dict[str, Any] | None:
+        """``&g`` of a global no declaration the unit sees makes weak: an address that is not 0
+        (pagetable_pte_ctor's ``mm != &init_mm`` holds for NULL), named so that two are compared alike."""
+        node = _strip_parens(operand)
+        variable = node.referenced if node.kind == K.DECL_REF_EXPR else None
+        if variable is None or not _is_global_var(variable):
+            return None
+        declarations = (variable, variable.canonical, variable.get_definition())
+        if any(self.weak(declaration) for declaration in declarations if declaration is not None):
+            return None
+        return {"g": variable.get_usr(), **typed}
 
     def struct_reference(self, cursor: ci.Cursor, resolve: _Resolve, depth: int) -> dict[str, Any] | None:
         """A struct a reference names: a parameter passed by value, as itself, or a const global, as its
@@ -2440,8 +2456,11 @@ class _Evaluator:
         return held if _size(held) <= _TEMPLATE_NODES else None
 
 
-def _any_way(ways: list[list[dict[str, Any]]]) -> dict[str, Any]:
-    """The condition that holds where every guard of at least one of ``ways`` holds."""
+def _any_way(ways: list[list[dict[str, Any]]]) -> dict[str, Any] | None:
+    """The condition that holds where every guard of at least one of ``ways`` holds; None where a way
+    has a guard that is no condition (``u``: compiled where its expression is not decided)."""
+    if any("v" not in guard for way in ways for guard in way):
+        return None
     typed = {"w": 32, "s": True}
     terms = []
     for way in ways:
@@ -2583,7 +2602,7 @@ class _FunctionWalk:
         if () in ways:
             return shared
         either = _any_way([[self.guard_table[index] for index in way] for way in sorted(ways)])
-        return [*shared, self.guard_id(either, True)]
+        return shared if either is None else [*shared, self.guard_id(either, True)]
 
     def walk_held(self, variable: ci.Cursor, value: ci.Cursor, parent: ci.Cursor, index: int, generic: bool) -> None:
         """Walk the value a local is given, as code. Where it is a member's address (``remove =
@@ -2861,6 +2880,10 @@ class _FunctionWalk:
         expression = self.x.evaluator.expression(condition, self.held, truth=truth)
         return expression if expressions.mentions_parameter(expression) else None
 
+    def object_operand(self, operand: ci.Cursor) -> bool:
+        """The operand is the address of an object the program defines (``&init_mm``), never 0."""
+        return expressions.nonzero(self.x.evaluator.expression(operand, self.held))
+
     def label_guard(self, label: ci.Cursor, fallthrough: list[dict[str, Any]] | None) -> dict[str, Any] | None:
         """The guard on a label's code: reached by the gotos met before it and, unless ``fallthrough`` is
         None, by control falling into it under those guards; so compiled where any of them is. None
@@ -2913,21 +2936,23 @@ class _FunctionWalk:
             self.labelled[key] = found
         return self.labelled[key]
 
-    def guard_id(self, expression: dict[str, Any], value: bool) -> int:
-        """The guard's index in the function's table, added once."""
-        guard = {"e": expression, "v": value}
+    def guard_id(self, expression: dict[str, Any], value: bool | None) -> int:
+        """The guard's index in the function's table, added once. A guard with no ``value`` holds where
+        its expression is not decided (``u``): what only computes an operand of a comparison the caller's
+        constants fold."""
+        guard = {"e": expression, "v": value} if value is not None else {"e": expression, "u": True}
         key = jsonio.canonical(guard)
         if key not in self.guard_ids:
             self.guard_ids[key] = len(self.guard_table)
             self.guard_table.append(guard)
         return self.guard_ids[key]
 
-    def push_guard(self, expression: dict[str, Any], value: bool) -> None:
+    def push_guard(self, expression: dict[str, Any], value: bool | None) -> None:
         self.guard_stack.append(self.guard_id(expression, value))
 
     def walk_guarded(
         self,
-        guard: tuple[dict[str, Any] | None, bool] | None,
+        guard: tuple[dict[str, Any] | None, bool | None] | None,
         node: ci.Cursor,
         parent: ci.Cursor | None,
         index: int,
@@ -4308,6 +4333,14 @@ class _FunctionWalk:
                     self.walk(children[side], node, side, reason, generic)
                     self.walk_guarded((guard, True), children[1 - side], node, 1 - side, reason, generic)
                     return
+            compared = self.guard_expression(node, truth=False) if operator in _EQUALITY else None
+            addressed = [i for i in (1, 0) if compared is not None and self.object_operand(children[i])]
+            if compared is not None and addressed:
+                # pagetable_pte_ctor's mm != &init_mm: the compiler folds it where the caller passes
+                # a constant (alloc_pte_late's NULL) or &init_mm itself, and forms &init_mm only where not.
+                self.walk(children[1 - addressed[0]], node, 1 - addressed[0], reason, generic)
+                self.walk_guarded((compared, None), children[addressed[0]], node, addressed[0], reason, generic)
+                return
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
                 right = self.x.evaluator.evaluate(children[1], truth=True)
                 if (

@@ -811,3 +811,48 @@ def test_an_address_a_local_holds_is_formed_only_where_a_read_of_the_local_is_co
     assert link._decided(rm_guards("either"), [unknown(), constant(3)]) is None
     assert link._decided(rm_guards("either"), [unknown(), constant(2)]) == []
     assert link._decided(rm_guards("always"), [unknown(), constant(0)]) == []
+
+
+GLOBAL_ADDRESS = """
+    struct mm { long x; };
+    extern struct mm init_mm;
+    extern struct mm weak_mm __attribute__((weak));
+    struct pt { int lock; };
+    static inline int lock_init(struct pt *p) { p->lock = 0; return 1; }
+    static inline int ctor(struct mm *mm, struct pt *p)
+    {
+        if (mm != &init_mm && !lock_init(p))
+            return 0;
+        note();
+        return 1;
+    }
+    static inline int weak_ctor(struct mm *mm, struct pt *p)
+    {
+        if (mm != &weak_mm && !lock_init(p))
+            return 0;
+        note();
+        return 1;
+    }
+    void alloc_late(struct pt *p) { if (!ctor((void *)0, p)) warn(); }
+    void alloc_init(struct pt *p) { if (!ctor(&init_mm, p)) warn(); }
+    void alloc_given(struct mm *mm, struct pt *p) { if (!ctor(mm, p)) warn(); }
+    void alloc_weak(struct pt *p) { if (!weak_ctor((void *)0, p)) warn(); }
+"""
+
+
+def test_a_global_s_address_a_constant_argument_compares_with_is_not_formed(tmp_path: Path) -> None:
+    """alloc_pte_late: `pagetable_pte_ctor(NULL, ptdesc)`, whose `mm != &init_mm && !ptlock_init(ptdesc)`
+    is true for NULL (llvm-objdump of alloc_late: sw zero, 0x0(a0); tail note). A weak object's address
+    may be NULL, so alloc_weak forms &weak_mm and tests it (auipc, ld, beqz)."""
+    facts = facts_of(tmp_path, GLOBAL_ADDRESS)
+
+    def globals_read(*chain: str) -> set[str]:
+        return {item["unit"]["name"] for item in fold(facts, *chain).accesses if item["unit"]["kind"] == "global"}
+
+    assert globals_read("alloc_late", "ctor") == set()
+    assert "init_mm" in {(item.get("unit") or {}).get("name") for item in fold(facts, "alloc_late", "ctor").unevaluated}
+    assert globals_read("alloc_given", "ctor") == {"init_mm"}
+    assert globals_read("alloc_weak", "weak_ctor") == {"weak_mm"}
+    # &init_mm != &init_mm is false: the right operand is not computed.
+    assert "lock_init" not in {call["callee"] for call in fold(facts, "alloc_init", "ctor").calls}
+    assert "lock_init" in {call["callee"] for call in fold(facts, "alloc_late", "ctor").calls}

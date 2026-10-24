@@ -1,14 +1,15 @@
 """Guard expressions: the C integer expressions the facts state and link decides at a fold.
 
 An expression is JSON: ``{"c": n}`` a constant, ``{"p": i}`` the function's parameter ``i``, ``{"v":
-name}`` the one value a variable holds that the facts cannot state, ``None`` a value the facts cannot
-name, or ``{"op": name, "a": [operands]}``: a C operator by its spelling (``"neg"`` and ``"~"`` and
-``"!"`` unary, ``"cast"`` a conversion), ``"in"`` (the operand is one of ``"set"``), ``"."`` (the
-member ``"o"`` bits into the struct its operand is), or ``"?:"``, whose None condition makes it a
-choice between its two values. Each carries its C type: its width ``w`` in bits, its signedness ``s``,
-and ``b`` for _Bool. A struct has no type keys: a parameter passed by value, a member that is itself a
-struct, or ``{"struct": [[bits, expression], ...]}``, a constant struct's scalar members (a member it
-does not list is 0).
+name}`` the one value a variable holds that the facts cannot state, ``{"g": name}`` the address of an
+object the program defines (not weak, so not 0), ``None`` a value the facts cannot name, or ``{"op":
+name, "a": [operands]}``: a C operator by its spelling (``"neg"`` and ``"~"`` and ``"!"`` unary,
+``"cast"`` a conversion), ``"in"`` (the operand is one of ``"set"``), ``"."`` (the member ``"o"`` bits
+into the struct its operand is), or ``"?:"``, whose None condition makes it a choice between its two
+values. Each carries its C type: its width ``w`` in bits, its signedness ``s``, and ``b`` for _Bool. A
+struct has no type keys: a parameter passed by value, a member that is itself a struct, or
+``{"struct": [[bits, expression], ...]}``, a constant struct's scalar members (a member it does not
+list is 0).
 """
 
 from __future__ import annotations
@@ -54,6 +55,27 @@ def _bounded(found: set[int]) -> frozenset[int] | None:
     return frozenset(found) if len(found) <= _LIMIT else None
 
 
+def nonzero(expression: Expression | None) -> bool:
+    """An object's address, also converted to a type that keeps all its bits: never 0."""
+    if expression is None:
+        return False
+    if "g" in expression:
+        return True
+    if expression.get("op") != "cast":
+        return False
+    operand = expression["a"][0]
+    keeps = expression.get("b") or expression.get("w", 0) >= (operand or {}).get("w", 0)
+    return bool(keeps) and nonzero(operand)
+
+
+def _truths(expression: Expression | None) -> set[int] | None:
+    """The truth values the expression may take (an object's address is true), or None."""
+    if nonzero(expression):
+        return {1}
+    found = values(expression)
+    return None if found is None else {int(value != 0) for value in found}
+
+
 def member(struct: Expression | None, bits: int) -> Expression | None:
     """The member ``bits`` into a struct value: what a constant struct lists there (0 where it lists
     nothing), also through the members that are structs themselves; None where the struct is unknown."""
@@ -72,7 +94,7 @@ def values(expression: Expression | None) -> frozenset[int] | None:
     parameter, a value the facts cannot name) or there are too many to keep. ``&&``, ``||`` and ``?:``
     take what the operand that decides them gives, as C evaluates them; ``x & 0`` and ``x * 0`` are 0
     whatever ``x`` is. A struct has no integer value."""
-    if expression is None or "p" in expression or "v" in expression or "struct" in expression:
+    if expression is None or any(key in expression for key in ("p", "v", "g", "struct")):
         return None
     if "c" in expression:
         return frozenset({normalized(int(expression["c"]), expression)})
@@ -82,8 +104,7 @@ def values(expression: Expression | None) -> frozenset[int] | None:
         return None if held is None else _bounded({normalized(value, expression) for value in held})
     if operator in ("&&", "||"):
         decisive = int(operator == "||")
-        sides = [values(operand) for operand in operands[:2]]
-        truths = [None if side is None else {int(value != 0) for value in side} for side in sides]
+        truths = [_truths(operand) for operand in operands[:2]]
         if {decisive} in truths:
             return frozenset({decisive})
         if truths[0] is None or truths[1] is None:
@@ -92,14 +113,16 @@ def values(expression: Expression | None) -> frozenset[int] | None:
             return frozenset({left & right for left in truths[0] for right in truths[1]})
         return frozenset({left | right for left in truths[0] for right in truths[1]})
     if operator == "?:":
-        condition = values(operands[0])
+        condition = _truths(operands[0])
         found: set[int] = set()
-        for truth in {int(value != 0) for value in condition} if condition is not None else {0, 1}:
+        for truth in condition if condition is not None else {0, 1}:
             arm = values(operands[1] if truth else operands[2])
             if arm is None:
                 return None
             found |= {normalized(value, expression) for value in arm}
         return _bounded(found)
+    if operator == "!" and nonzero(operands[0]):
+        return frozenset({0})
     first = values(operands[0])
     if operator == "in":
         return None if first is None else frozenset({int(value in expression["set"]) for value in first})
@@ -109,6 +132,11 @@ def values(expression: Expression | None) -> frozenset[int] | None:
     second = values(operands[1])
     if operator in ("*", "&") and frozenset({0}) in (first, second):
         return frozenset({0})
+    if operator in ("==", "!=") and (
+        (nonzero(operands[0]) and second == frozenset({0})) or (nonzero(operands[1]) and first == frozenset({0}))
+    ):
+        # An object's address is not NULL: alloc_pte_late's pagetable_pte_ctor(NULL, …) tests mm != &init_mm.
+        return frozenset({int(operator == "!=")})
     if (first is None or second is None) and operator in ("==", "!=") and same(operands[0], operands[1]):
         # Two reads of one value: switch_hrtimer_base's new_cpu_base, set from this_cpu_base.
         return frozenset({int(operator == "==")})
@@ -133,8 +161,7 @@ def evaluate(expression: Expression | None) -> int | None:
 
 def truth(expression: Expression | None) -> int | None:
     """1 where every value the expression may take is true, 0 where every one is false, else None."""
-    found = values(expression)
-    truths = {int(value != 0) for value in found} if found is not None else set()
+    truths = _truths(expression) or set()
     return truths.pop() if len(truths) == 1 else None
 
 
@@ -177,7 +204,7 @@ def stated(expression: Expression | None) -> bool:
 def substitute(expression: Expression | None, arguments: list[Expression | None]) -> Expression | None:
     """The expression in the caller's terms: each parameter becomes its argument, as the parameter's
     type holds it (a struct as it is), or unknown where no argument is stated."""
-    if expression is None or "c" in expression or "v" in expression or "struct" in expression:
+    if expression is None or ("op" not in expression and "p" not in expression):
         return expression
     if "p" in expression:
         index = expression["p"]

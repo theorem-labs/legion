@@ -818,9 +818,11 @@ def _fix_index(item: dict[str, Any], arguments: list[dict[str, Any]]) -> dict[st
 # Guards: the code of a helper compiled only for some values of its parameters --------------------
 #
 # The facts give an event ``guards``: conditions on the function's parameters (expressions.py states
-# them). An event is compiled only where every guard's expression is truthy as its "v" says. At a fold
-# the caller's arguments replace the parameters; a guard every value of which is decided against the
-# event makes it dead code the compiler removed for these arguments.
+# them). An event is compiled only where every guard's expression is truthy as its "v" says, or, for a
+# guard with "u", where its expression is not decided (what only computes an operand of a comparison
+# the compiler folds for constant arguments). At a fold the caller's arguments replace the parameters;
+# a guard every value of which is decided against the event makes it dead code the compiler removed
+# for these arguments.
 
 
 def _argument_values(arguments: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
@@ -878,10 +880,14 @@ def _decided(
 
 def _decision(guard: dict[str, Any], values: list[dict[str, Any] | None]) -> Any:
     """One guard with the arguments' values put in: ``_AGAINST`` where every value it may take is
-    against the event, None where every one is for it or it no longer names a parameter, else the
-    guard on the caller's parameters."""
+    against the event (for a ``u`` guard: where its truth is decided), None where every one is for it
+    or it no longer names a parameter, else the guard on the caller's parameters."""
     expression = expressions.substitute(guard["e"], values)
     truth = expressions.truth(expression)
+    if "u" in guard:
+        if truth is not None:
+            return _AGAINST
+        return {"e": expression, "u": True} if expressions.mentions_parameter(expression) else None
     if truth is not None:
         return None if bool(truth) == guard["v"] else _AGAINST
     return {"e": expression, "v": guard["v"]} if expressions.mentions_parameter(expression) else None
