@@ -337,11 +337,12 @@ func (s *Store) Complete(ctx context.Context, repo, id, holder string, gen int64
 	})
 }
 
-// Expire frees every item whose lease has ended and returns them as they were (holder and generation).
+// Expire frees every item whose lease has ended and returns them as they were (holder and generation), or an empty
+// list when none has.
 func (s *Store) Expire(ctx context.Context, repo string) ([]Item, error) {
 	var out []Item
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		out = nil
+		out = []Item{}
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}

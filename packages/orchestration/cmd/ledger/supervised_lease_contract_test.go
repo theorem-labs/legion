@@ -45,3 +45,33 @@ func TestSupervisedLeaseCommandsCatchExpiryAndRenewalRegressions(t *testing.T) {
 		t.Fatalf("renew supervised lease exited %d with %s, want supervised_lease refusal", code, out)
 	}
 }
+
+// TestExpireCommandPrintsAnEmptyListWhenNothingExpires catches a sweep that frees nothing printing null instead of a
+// list. A supervised lease never expires, so a sweep beside one frees nothing, and its output is still a list.
+func TestExpireCommandPrintsAnEmptyListWhenNothingExpires(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_expire_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		code := run(context.Background(), args, getenv, &out, &err)
+		return code, out.String(), err.String()
+	}
+	if code, _, stderr := call("repo", "ensure", "r", "3"); code != 0 {
+		t.Fatalf("ensure exited %d: %s", code, stderr)
+	}
+	if code, stdout, stderr := call("--json", "expire", "r"); code != 0 || stdout != "[]\n" {
+		t.Fatalf("expire with no lease: code=%d stdout=%q stderr=%q, want []", code, stdout, stderr)
+	}
+	if code, _, stderr := call("claim", "r", "item", "supervisor:worker", "0"); code != 0 {
+		t.Fatalf("supervised claim exited %d: %s", code, stderr)
+	}
+	if code, stdout, stderr := call("--json", "expire", "r"); code != 0 || stdout != "[]\n" {
+		t.Fatalf("expire beside a supervised lease: code=%d stdout=%q stderr=%q, want []", code, stdout, stderr)
+	}
+}
