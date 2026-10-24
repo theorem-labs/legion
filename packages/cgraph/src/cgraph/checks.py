@@ -280,6 +280,11 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
     for function, entries in analysis.get("global_struct_offsets", {}).items():
         for entry in entries:
             places[function][entry["struct"]].append((entry["global"], entry["offsets"]))
+    # The sizes clang gives each struct name (a name some files define differently has several).
+    struct_sizes: dict[str, set[int]] = collections.defaultdict(set)
+    for node in graph["nodes"]:
+        if node["kind"] == "struct" and node.get("size", -1) > 0:
+            struct_sizes[node["name"]].add(node["size"])
     candidates = []
     excluded: collections.Counter[str] = collections.Counter()
     for function, fields in sorted(analysis["field_accesses"].items()):
@@ -361,6 +366,16 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 for place in at
             ):
                 method = "global_object_narrower_access"
+            elif base == "pointer" and any(
+                _register_relative(own - step, size, item, displacements, [])
+                or (item.get("address") and own - step in constants.get(function, []))
+                for own in [item["offset"] if item.get("offset", -1) >= 0 else offset]
+                for step in struct_sizes.get(item["struct"], ())
+                if step in constants.get(function, [])
+            ):
+                # A loop walking an array (for (i = table; …; i++) i->data) whose code keeps i + 1 in a
+                # register and steps it by the element's size: the field is that size before it.
+                method = "next_element_displacement"
             elif offset >= 2048:
                 method = "no_match_beyond_12_bit_displacement"
             else:

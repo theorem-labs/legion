@@ -815,3 +815,22 @@ def test_link_carries_an_array_member_s_element_size() -> None:
     graph = build({"a.c": unit(f)}, StubImage({"f": [(0x100, False, "")]}, {0x100: FunctionFacts(memory_offsets={32})}))
     (item,) = graph["analysis"]["field_accesses"]["function:f"]
     assert item["element_size"] == 32
+
+
+def _walk_graph(item: dict[str, Any], memory: list[int], addi: list[int]) -> dict[str, Any]:
+    graph = _structure_graph(item, [], {})
+    graph["nodes"].append({"id": "struct:tk", "kind": "struct", "name": "tk", "size": 200})
+    graph["analysis"]["image"]["memory_offsets"] = {"function:f": memory}
+    graph["analysis"]["image"]["addi_constants"] = {"function:f": addi}
+    return graph
+
+
+def test_a_field_matches_from_the_next_element_where_the_code_walks_an_array_one_ahead() -> None:
+    """__reserved_mem_init_node: for (i = table; …; i++) i->data (192 of a 200-byte of_device_id). The
+    code keeps i + 1 in a register, steps it by 200, and loads -8(i + 1)."""
+    walk = _walk_graph(_field(192), [-8, 0], [200])
+    assert checks.structure(walk)["field_offsets"]["by_method"] == {"next_element_displacement": 1}
+    address = _walk_graph({**_field(64), "address": True}, [0, 16], [200, -136])
+    assert checks.structure(address)["field_offsets"]["by_method"] == {"next_element_displacement": 1}
+    # Without the step by the element's size, -8 is no evidence.
+    assert checks.structure(_walk_graph(_field(192), [-8, 0], [64]))["field_offsets"]["matched"] == 0

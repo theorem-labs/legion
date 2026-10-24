@@ -213,8 +213,10 @@ field's own offset in its struct at a place that struct has there (`global_objec
 `global_object_narrower_access` inside the field's bytes). Link gives those places in
 `analysis.global_struct_offsets` from clang's layouts: the global's own struct, each struct it embeds
 at any depth, and each element of an embedded array or of the global's own array (counted from the
-image symbol's size). Accesses to objects on the stack or in registers, and functions whose machine
-code makes no memory access, are counted apart.
+image symbol's size). A field reached through a pointer that walks an array also matches one element
+ahead (`next_element_displacement`: its offset less the struct's size, where the function steps a
+register by that size, so the code keeps `i + 1`). Accesses to objects on the stack or in registers,
+and functions whose machine code makes no memory access, are counted apart.
 
 The hard checks fail the run (exit 1), each with a test that makes it fail alone: a parse error; a
 function of the part's files that the image holds but the graph lacks; a global the part's code
