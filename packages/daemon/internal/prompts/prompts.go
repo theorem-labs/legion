@@ -160,3 +160,31 @@ func (c *Composer) Compose(role claim.Role, isRoot bool) (Parts, error) {
 	}
 	return Parts{RolePromptPaths: slices.Clone(paths)}, nil
 }
+
+// OwnerStart is a standing owner's first turn, which the daemon writes to the file the owner's
+// launch names as LEGION_OWNER_START_FILE: its template prompt, then its owner key, its ledger
+// repository and the ledger commands that find, claim and complete its items, each spelled with
+// the global flags before the command, as the ledger CLI reads them, and the owner key as the
+// holder of every lease it takes, so the daemon's release of a stopped owner frees them.
+func OwnerStart(prompt, key, repository string) string {
+	ledger := `ledger --dsn-file "$LEGION_LEDGER_DSN_FILE"`
+	owner := `"$LEGION_OWNER"`
+	lines := []string{
+		strings.TrimRight(prompt, "\n"),
+		"",
+		"## Your work",
+		"",
+		fmt.Sprintf("Your owner key is `%s` (LEGION_OWNER), and your work items are in the ledger repository `%s`", key, repository),
+		"(LEGION_LEDGER_REPOSITORY). Hold every lease under your owner key, and nothing else, so the daemon",
+		"frees your leases when your process stops.",
+		"",
+		fmt.Sprintf("1. List your open items: `%s --json items %s --owner %s`.", ledger, repository, owner),
+		fmt.Sprintf("2. For each item, claim it with no lease end: `%s --json claim %s <item> %s 0`. The answer", ledger, repository, owner),
+		"   carries the lease's generation.",
+		"3. Do the item's work.",
+		fmt.Sprintf("4. Record its result: `%s complete %s <item> %s <generation> <result>`.", ledger, repository, owner),
+		"",
+		"When no open item is left, end your session; the daemon starts you again when new work arrives.",
+	}
+	return strings.Join(lines, "\n") + "\n"
+}

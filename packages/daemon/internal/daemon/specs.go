@@ -260,7 +260,7 @@ func (s specs) standingOwnerSpawnSpec(c supervise.Claim) (runtime.SpawnSpec, err
 	if err := os.MkdirAll(filepath.Dir(startFile), 0o700); err != nil {
 		return runtime.SpawnSpec{}, fmt.Errorf("the directory of standing owner %s: %w", key, err)
 	}
-	if err := podsafety.WriteReadOnly(startFile, []byte(ownerStartMessage(string(prompt), key, s.ledgerRepository))); err != nil {
+	if err := podsafety.WriteReadOnly(startFile, []byte(prompts.OwnerStart(string(prompt), key, s.ledgerRepository))); err != nil {
 		return runtime.SpawnSpec{}, fmt.Errorf("the start file of standing owner %s: %w", key, err)
 	}
 	return runtime.SpawnSpec{
@@ -277,32 +277,6 @@ func (s specs) standingOwnerSpawnSpec(c supervise.Claim) (runtime.SpawnSpec, err
 			DeploymentInstructionsPath: s.instructions,
 		},
 	}, nil
-}
-
-// ownerStartMessage is a standing owner's first turn: its template prompt, then where its work is
-// and the ledger commands, each spelled with the global flags before the command, as the ledger CLI
-// reads them, and the owner key as the holder of every lease it takes.
-func ownerStartMessage(prompt, key, repository string) string {
-	ledger := `ledger --dsn-file "$LEGION_LEDGER_DSN_FILE"`
-	owner := `"$LEGION_OWNER"`
-	lines := []string{
-		strings.TrimRight(prompt, "\n"),
-		"",
-		"## Your work",
-		"",
-		fmt.Sprintf("Your owner key is `%s` (LEGION_OWNER), and your work items are in the ledger repository `%s`", key, repository),
-		"(LEGION_LEDGER_REPOSITORY). Hold every lease under your owner key, and nothing else, so the daemon",
-		"frees your leases when your process stops.",
-		"",
-		fmt.Sprintf("1. List your open items: `%s --json items %s --owner %s`.", ledger, repository, owner),
-		fmt.Sprintf("2. For each item, claim it with no lease end: `%s --json claim %s <item> %s 0`. The answer", ledger, repository, owner),
-		"   carries the lease's generation.",
-		"3. Do the item's work.",
-		fmt.Sprintf("4. Record its result: `%s complete %s <item> %s <generation> <result>`.", ledger, repository, owner),
-		"",
-		"When no open item is left, end your session; the daemon starts you again when new work arrives.",
-	}
-	return strings.Join(lines, "\n") + "\n"
 }
 
 // rolePromptPaths keeps an explicit operator prompt as a narrow test override. Every ordinary
