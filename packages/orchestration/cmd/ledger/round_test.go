@@ -239,12 +239,14 @@ func TestRoundCommandRefusesSameKeyWithDifferentBody(t *testing.T) {
 
 func TestRoundCommandEmptyKeyExitsTwo(t *testing.T) {
 	runRoundCLITests(t, func(t *testing.T, cli roundCLI) {
-		code, stdout, stderr := cli.call(cli.roundArgs(cliRoundRequest(1, "", "build failed"))...)
-		if code != 2 || !strings.Contains(stderr, "key") {
-			t.Fatalf("empty key: code=%d stdout=%q stderr=%q; want exit 2 naming the key", code, stdout, stderr)
+		for _, key := range []string{"", " "} {
+			code, stdout, stderr := cli.call(cli.roundArgs(cliRoundRequest(1, key, "build failed"))...)
+			if code != 2 || !strings.Contains(stderr, "key") {
+				t.Fatalf("key %q: code=%d stdout=%q stderr=%q; want exit 2 naming the key", key, code, stdout, stderr)
+			}
 		}
 		if events := cli.events("migration.round_failed"); len(events) != 0 {
-			t.Fatalf("empty key appended %d round events", len(events))
+			t.Fatalf("blank keys appended %d round events", len(events))
 		}
 	})
 }

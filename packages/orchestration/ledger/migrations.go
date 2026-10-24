@@ -942,9 +942,10 @@ func holderOf(sets map[string][]writePath, p string) string {
 
 // RecordRound records one landing round the migration failed (its candidate was sent back). A repeated key returns
 // the migration as it is now, even after a takeover, without counting or recording a second failure. When the
-// repository's limit is set and the migration has now used that many rounds, it is escalated to the steward.
+// repository's limit is set and the migration has now used that many rounds, it is escalated to the steward. A blank
+// key is invalid input.
 func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, error) {
-	if req.Key == "" {
+	if strings.TrimSpace(req.Key) == "" {
 		return Migration{}, invalid("a round needs an idempotency key")
 	}
 

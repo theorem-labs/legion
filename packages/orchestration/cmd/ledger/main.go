@@ -741,7 +741,7 @@ func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
 			return ledger.RoundRequest{}, usagef("unknown round flag %q", flag)
 		}
 	}
-	if request.Key == "" {
+	if strings.TrimSpace(request.Key) == "" {
 		return ledger.RoundRequest{}, usagef("round needs --key")
 	}
 	return request, nil

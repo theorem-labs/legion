@@ -212,10 +212,15 @@ func TestRecordRoundRefusesSameKeyWithDifferentBody(t *testing.T) {
 func TestRecordRoundRequiresKey(t *testing.T) {
 	s := newStore(t)
 	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
-	_, err := s.RecordRound(context.Background(), roundRequest(1, "", "build failed"))
-	var invalid *ledger.InvalidError
-	if !errors.As(err, &invalid) {
-		t.Fatalf("empty key: want invalid input, got %v", err)
+	for _, key := range []string{"", " ", "\t"} {
+		_, err := s.RecordRound(context.Background(), roundRequest(1, key, "build failed"))
+		var invalid *ledger.InvalidError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("key %q: want invalid input, got %v", key, err)
+		}
+	}
+	if events := roundEvents(t, s); len(events) != 0 {
+		t.Fatalf("blank keys appended round events: %+v", events)
 	}
 }
 
