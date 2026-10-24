@@ -147,9 +147,10 @@ func (e *env) open(needIndex bool) error {
 	return e.openWith(needIndex, declindex.Open)
 }
 
-// openReadOnly opens the index without writing it or its directory, which the landing hooks mount read-only.
-func (e *env) openReadOnly(ctx context.Context, needIndex bool) error {
-	return e.openWith(needIndex, func(path string) (*declindex.Store, error) { return declindex.OpenReadOnly(ctx, path) })
+// openReadOnly opens the index without writing it or its directory, which the landing hooks mount read-only; scope
+// is what the command reads besides the index (declindex.OpenReadOnly).
+func (e *env) openReadOnly(ctx context.Context, scope declindex.ReadScope, needIndex bool) error {
+	return e.openWith(needIndex, func(path string) (*declindex.Store, error) { return declindex.OpenReadOnly(ctx, path, scope) })
 }
 
 func (e *env) openWith(needIndex bool, open func(string) (*declindex.Store, error)) error {

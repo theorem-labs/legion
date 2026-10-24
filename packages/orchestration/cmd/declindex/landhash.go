@@ -33,7 +33,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	if err := e.openReadOnly(ctx, true); err != nil {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()

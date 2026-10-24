@@ -118,7 +118,8 @@ func OpenGate(ctx context.Context, cfg declindex.Config, opts Options) (_ *Gate,
 	if err != nil {
 		return nil, err
 	}
-	index, err := declindex.OpenReadOnly(ctx, state)
+	// The gate also reads the tree: its HEAD, its registry's commit and its build.
+	index, err := declindex.OpenReadOnly(ctx, state, declindex.IndexAndTree)
 	if err != nil {
 		return nil, err
 	}

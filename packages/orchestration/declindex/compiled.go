@@ -164,7 +164,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			// Nothing was read with the new exporter or forms: the compiled part is not complete for commit.
 			return 0, 0, nil
 		}
-		return 0, 0, s.setMeta(ctx, s.db, "compiled_commit", commit)
+		return 0, 0, s.write(ctx, func() error { return s.setMeta(ctx, s.db, "compiled_commit", commit) })
 	}
 	sort.Strings(todo)
 	before, err := s.defHashes(ctx, todo)
@@ -193,50 +193,56 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			logf(log, "index: %d modules re-matched, reached from changed definitions", len(again))
 		}
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	for _, mod := range slices.Concat(todo, again) {
-		if err := deleteCompiled(ctx, tx, mod); err != nil {
-			return 0, 0, err
+	// The exporter ran without the write lock; only the write of what it read holds it.
+	if err := s.write(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
 		}
-	}
-	cb, ab, fb := newBatch(tx, "consts", 5), newBatch(tx, "atoms", 3), newBatch(tx, "facts", 4)
-	cb.verb = "INSERT OR REPLACE"
-	for _, c := range consts {
-		if err := cb.add(ctx, c.Name, c.Module, c.Kind, c.Type, c.Hash); err != nil {
-			return 0, 0, err
-		}
-		for _, a := range c.Atoms {
-			if err := ab.add(ctx, c.Name, c.Module, a); err != nil {
-				return 0, 0, err
+		defer func() { _ = tx.Rollback() }()
+		for _, mod := range slices.Concat(todo, again) {
+			if err := deleteCompiled(ctx, tx, mod); err != nil {
+				return err
 			}
 		}
-		for _, f := range c.Facts {
-			if err := fb.add(ctx, c.Name, c.Module, f.Concept, f.How); err != nil {
-				return 0, 0, err
+		cb, ab, fb := newBatch(tx, "consts", 5), newBatch(tx, "atoms", 3), newBatch(tx, "facts", 4)
+		cb.verb = "INSERT OR REPLACE"
+		for _, c := range consts {
+			if err := cb.add(ctx, c.Name, c.Module, c.Kind, c.Type, c.Hash); err != nil {
+				return err
+			}
+			for _, a := range c.Atoms {
+				if err := ab.add(ctx, c.Name, c.Module, a); err != nil {
+					return err
+				}
+			}
+			for _, f := range c.Facts {
+				if err := fb.add(ctx, c.Name, c.Module, f.Concept, f.How); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	for _, b := range []*batch{cb, ab, fb} {
-		if err := b.flush(ctx); err != nil {
-			return 0, 0, err
+		for _, b := range []*batch{cb, ab, fb} {
+			if err := b.flush(ctx); err != nil {
+				return err
+			}
 		}
-	}
-	for _, mod := range todo {
-		if _, err := tx.ExecContext(ctx, `UPDATE modules SET olean_key = ? WHERE module = ?`, keys[mod], mod); err != nil {
-			return 0, 0, err
+		for _, mod := range todo {
+			if _, err := tx.ExecContext(ctx, `UPDATE modules SET olean_key = ? WHERE module = ?`, keys[mod], mod); err != nil {
+				return err
+			}
 		}
-	}
-	if err := s.setMeta(ctx, tx, "compiled", digest); err != nil {
+		if err := s.setMeta(ctx, tx, "compiled", digest); err != nil {
+			return err
+		}
+		if err := s.setMeta(ctx, tx, "compiled_commit", commit); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}); err != nil {
 		return 0, 0, err
 	}
-	if err := s.setMeta(ctx, tx, "compiled_commit", commit); err != nil {
-		return 0, 0, err
-	}
-	return len(todo), len(again), tx.Commit()
+	return len(todo), len(again), nil
 }
 
 // defHashes are the compiled hashes of the definitions of the modules, before they are read again.

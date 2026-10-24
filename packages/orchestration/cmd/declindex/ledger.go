@@ -122,8 +122,9 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 			return fail(e.stderr, &unableError{err})
 		}
 	}
-	// The landing hook mounts the index directory read-only.
-	if err := e.openReadOnly(ctx, true); err != nil {
+	// The landing hook mounts the index directory read-only. The ledger also reads the tree: its HEAD, its
+	// registry's commits and, for the recheck, its build.
+	if err := e.openReadOnly(ctx, declindex.IndexAndTree, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()

@@ -224,7 +224,7 @@ func TestAnIndexOfThePreviousSchemaIsRebuiltByTheNextRefresh(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if reader, err := OpenReadOnly(ctx, path); err == nil {
+	if reader, err := OpenReadOnly(ctx, path, IndexOnly); err == nil {
 		_ = reader.Close()
 		t.Errorf("opened an index of the previous schema read-only")
 	} else if !strings.Contains(err.Error(), "refresh") {
@@ -241,7 +241,7 @@ func TestAnIndexOfThePreviousSchemaIsRebuiltByTheNextRefresh(t *testing.T) {
 	if previous, recorded, err := s.Landing(ctx, "one"); err != nil || !recorded || previous != "" {
 		t.Errorf("the landing of one after the rebuild: previous %q, recorded %v, %v; want recorded with no previous", previous, recorded, err)
 	}
-	reader, err := OpenReadOnly(ctx, path)
+	reader, err := OpenReadOnly(ctx, path, IndexOnly)
 	if err != nil {
 		t.Fatalf("open the rebuilt index read-only: %v", err)
 	}
