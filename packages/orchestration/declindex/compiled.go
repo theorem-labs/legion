@@ -86,15 +86,16 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 	return &x, m, src, nil
 }
 
-// Export reads the given compiled modules with the registry's forms: the gate's view of a proposal. extra lists
-// further library directories (the proposal's) and roots the project's roots plus the proposal's.
-func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, extra []string) ([]Constant, error) {
+// Export reads the given compiled modules with the registry's forms: the gate's view of a proposal or of a landed
+// module. extra lists further library directories (the proposal's), roots the project's roots plus the proposal's,
+// and home, when set, the module that the hashes count the modules' constants as declared in (Manifest.Home).
+func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, extra []string, home string) ([]Constant, error) {
 	x, m, _, err := co.prepare(ctx, roots)
 	if err != nil {
 		return nil, err
 	}
 	x.SearchPath = slices.Concat(x.SearchPath, extra)
-	m.Modules = modules
+	m.Modules, m.Home = modules, home
 	return x.Run(ctx, m)
 }
 
@@ -385,7 +386,8 @@ type Compiled struct {
 	Type   string `json:"type"`
 	// Hash is the compiled statement hash: equal for two declarations whose elaborated statements are equal up to
 	// the names of their binders and of the declaration itself, and up to how a numeral of core Lean's Nat and
-	// BitVec instances is written. Any other numeral counts with its type and instance, which give its value.
+	// BitVec instances is written. Any other numeral counts with its type and instance, which give its value. Each
+	// constant that a statement names counts with the module that declares it.
 	Hash  string   `json:"compiled_hash"`
 	Atoms []string `json:"atoms,omitempty"`
 	Facts []Fact   `json:"facts,omitempty"`
@@ -426,55 +428,41 @@ func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, er
 	return c, err
 }
 
-// DeclarationConstants are the compiled constants of the declaration d, one that Resolve gave: d's own, and those
-// that Lean generated from it (a structure's constructor and fields), each with its facts. It is empty when the
-// index read d's module without its compiled part.
-func (s *Store) DeclarationConstants(ctx context.Context, d Found) ([]Constant, error) {
-	byName := map[string]*Constant{}
+// DeclarationParts are the names of the compiled constants of module that belong to one of the declarations of
+// names in module: each declaration's own, and those that Lean generated from it (a structure's constructor and
+// fields), not another declaration in its namespace. It is empty when the index read module without its compiled
+// part.
+func (s *Store) DeclarationParts(ctx context.Context, module string, names []string) ([]string, error) {
+	decls := map[declRef]bool{}
+	seen := map[string]bool{}
 	var consts []declRef
-	rows, err := s.q.QueryContext(ctx, `SELECT name, kind, cstmt FROM consts WHERE module = ? AND
-		(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, d.Module, d.Name, d.Name+".", d.Name+"/")
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		c := &Constant{Module: d.Module}
-		if err := r.Scan(&c.Name, &c.Kind, &c.Hash); err != nil {
-			return err
+	for _, n := range names {
+		decls[declRef{module, n}] = true
+		rows, err := s.q.QueryContext(ctx, `SELECT name FROM consts WHERE module = ? AND
+			(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, module, n, n+".", n+"/")
+		err = eachRow(rows, err, func(r *sql.Rows) error {
+			c := declRef{module: module}
+			if err := r.Scan(&c.name); err != nil {
+				return err
+			}
+			if !seen[c.name] {
+				seen[c.name] = true
+				consts = append(consts, c)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		byName[c.Name] = c
-		consts = append(consts, declRef{d.Module, c.Name})
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	owner, err := s.owners(ctx, consts)
 	if err != nil {
 		return nil, err
 	}
-	var out []Constant
+	var out []string
 	for _, c := range consts {
-		if o := owner[c]; o.Name != d.Name || o.Module != d.Module {
-			delete(byName, c.name)
-		}
-	}
-	rows, err = s.q.QueryContext(ctx, `SELECT name, concept, how FROM facts WHERE module = ? AND
-		(name = ? OR (name >= ? AND name < ?)) ORDER BY name, concept, how`, d.Module, d.Name, d.Name+".", d.Name+"/")
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var n string
-		var f Fact
-		if err := r.Scan(&n, &f.Concept, &f.How); err != nil {
-			return err
-		}
-		if c, ok := byName[n]; ok {
-			c.Facts = append(c.Facts, f)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	for _, c := range consts {
-		if k, ok := byName[c.name]; ok {
-			out = append(out, *k)
+		if o := owner[c]; decls[declRef{o.Module, o.Name}] {
+			out = append(out, c.name)
 		}
 	}
 	return out, nil
@@ -581,13 +569,16 @@ func (s *Store) distinctOwners(ctx context.Context, query string, args ...any) (
 	return out, nil
 }
 
-// Stating is one statement that states a registered concept's fact.
+// Stating is one statement that states a registered concept's fact: the declaration that its constant belongs to,
+// by name and module, and the constant, by name and module (an equation lemma that Lean made in the module that
+// uses it is recorded there, and belongs to a declaration of that module's imports).
 type Stating struct {
-	Decl   string `json:"declaration"`
-	Const  string `json:"constant"`
-	Module string `json:"module"`
-	How    string `json:"how"`
-	At     string `json:"at,omitempty"`
+	Decl       string `json:"declaration"`
+	DeclModule string `json:"declaration_module"`
+	Const      string `json:"constant"`
+	Module     string `json:"module"`
+	How        string `json:"how"`
+	At         string `json:"at,omitempty"`
 }
 
 // States lists the statements that state a concept's fact, directly, through a definition, or by using it.
@@ -617,7 +608,7 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	out := make([]Stating, 0, len(rs))
 	for _, r := range rs {
 		f := owner[declRef{r.module, r.name}]
-		st := Stating{Decl: f.Name, Const: r.name, Module: r.module, How: r.how}
+		st := Stating{Decl: f.Name, DeclModule: f.Module, Const: r.name, Module: r.module, How: r.how}
 		if f.Path != "" {
 			st.At = f.At()
 		}

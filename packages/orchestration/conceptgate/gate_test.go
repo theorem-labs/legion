@@ -306,6 +306,29 @@ func TestGateRefusesAProposalThatRunsCode(t *testing.T) {
 	}
 }
 
+// A proposal's home is the path of a .lean file relative to the tree, where its declaration lands: the gate refuses
+// any other home before it compiles anything, and the error names it. The gate's sandbox check fails, to show that
+// the refusal comes before it.
+func TestGateRefusesAProposalWhoseHomeIsNotALeanFileInTheTree(t *testing.T) {
+	g := &Gate{
+		Compiled:     &declindex.CompiledOptions{Exporter: &declindex.Exporter{}},
+		CheckSandbox: func(context.Context, declindex.Lean) error { return errors.New("the gate reached its sandbox check") },
+	}
+	for _, home := range []string{"Fresh.md", "../Fresh.lean", "/Fresh.lean", "./Fresh.lean", "Sub//Fresh.lean", "Sub/.lean", `Sub\Fresh.lean`} {
+		p := proposal("p", "Fresh", "def Fresh : Prop := True")
+		p.Concept.Home = home
+		v, err := g.Decide(context.Background(), p, DecideOptions{Proposer: "role"})
+		if err == nil || !strings.Contains(err.Error(), "home") || !strings.Contains(err.Error(), home) || v.Outcome != "" {
+			t.Errorf("home %q: %+v, %v; want an error that names the home", home, v, err)
+		}
+	}
+	p := proposal("p", "Fresh", "def Fresh : Prop := True")
+	p.Concept.Home = "Sub/Fresh.lean"
+	if err := p.Concept.check(); err != nil {
+		t.Errorf("a home in a directory of the tree: %v", err)
+	}
+}
+
 func TestGateWithoutASandboxCannotDecide(t *testing.T) {
 	g, lib := gateForTest(t)
 	g.CheckSandbox = func(context.Context, declindex.Lean) error { return errors.New("no sandbox here") }

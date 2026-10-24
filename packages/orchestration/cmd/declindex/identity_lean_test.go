@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
@@ -106,6 +109,120 @@ func TestSameNamedDeclarationsOfTwoModulesAreAnsweredApart(t *testing.T) {
 	}
 	if len(same) != 2 || !slices.Equal(got["A"], []string{"UseA.lowA"}) || !slices.Equal(got["B"], []string{"UseB.lowB"}) {
 		t.Errorf("same bound: %+v; want A's bound to share an atom with UseA's lowA only, and B's with UseB's lowB only", same)
+	}
+}
+
+// A compiled hash counts each constant that a statement names with the module that declares it. A proposal that
+// defines B's `Value` again is not an exact duplicate of A's definition of A's `Value`, though both read `Value`:
+// the gate adds it. One that defines A's `Value` again is: the gate refuses it.
+func TestTheGateHashesAConstantWithItsModule(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	config, tree, lean := leanRegistryTree(t, "A", "B")
+	for _, m := range []struct{ name, source string }{
+		{"A", "def Value : Nat := 1\ndef Original : Nat := Value\nexample : Original = 1 := rfl\n"},
+		{"B", "def Value : Nat := 2\n"},
+	} {
+		writeTestFile(t, filepath.Join(tree, m.name+".lean"), m.source)
+		if err := declindex.CompileModule(context.Background(), lean, nil, tree, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	land(t, config, tree, "add A and B")
+	gateAddition(t, config, "different", "Different", "Different.lean", "import B\n\ndef Different : Nat := Value\nexample : Different = 2 := rfl\n")
+	proposal := filepath.Join(t.TempDir(), "copy.json")
+	writeTestFile(t, proposal, `{"id":"copy","concept":{"name":"Copy","home":"Copy.lean","meaning":"A copy of A's value."},`+
+		`"source":"import A\n\ndef Copy : Nat := Value\n"}`)
+	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+	var v conceptgate.Verdict
+	if err := json.Unmarshal([]byte(r.out), &v); err != nil || r.code != 1 || v.Outcome != conceptgate.Refused || v.Existing != "Original" {
+		t.Fatalf("gate a copy of A's Original: want exit 1, refused as Original, got %+v, %+v (%v)", r, v, err)
+	}
+}
+
+// A name whose source writes it with a leading `_` is a declaration like any other: two modules that each declare
+// `_Value` are never imported together, and a refresh with the compiled part reads them in two exporter groups, as
+// it reads two modules that each declare `Value`.
+func TestTwoModulesThatEachDeclareAnUnderscoreNameAreReadApart(t *testing.T) {
+	requireLake(t)
+	ctx := context.Background()
+	lean, err := declindex.FindLean(ctx, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "tree")
+	for _, m := range []struct{ name, source string }{
+		{"A", "def _Value : Nat := 1\ndef Original : Nat := _Value\n"},
+		{"B", "def _Value : Nat := 2\n"},
+	} {
+		writeTestFile(t, filepath.Join(tree, m.name+".lean"), m.source)
+		if err := declindex.CompileModule(ctx, lean, nil, tree, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	config := filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B]\nlean:\n  export: true\n  jobs: 1\n")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 || !strings.Contains(r.errOut, "2 of 2 module groups") {
+		t.Fatalf("refresh with the compiled part: want exit 0 after two exporter groups, got %+v", r)
+	}
+	var where []declindex.Found
+	decode(t, invoke(t, "--config", config, "--json", "where", "_Value"), &where)
+	if len(where) != 2 || where[0].Module != "A" || where[1].Module != "B" {
+		t.Fatalf("where _Value: %+v; want A's and B's declarations", where)
+	}
+}
+
+// `states` counts the declarations that state a concept's fact, each by its module and its name: A's `shared` and
+// B's are two, and a structure whose constructor and field state the fact is its one declaration. Its JSON gives the
+// module of each statement's declaration.
+func TestStatesCountsEachDeclarationByItsModuleAndName(t *testing.T) {
+	requireLake(t)
+	ctx := context.Background()
+	lean, err := declindex.FindLean(ctx, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "tree")
+	for _, m := range []struct{ name, source string }{
+		{"A", "theorem shared (n : Nat) : n = n := rfl\nstructure S where\n  x : Nat\n  h : x = x\n"},
+		{"B", "theorem shared (n : Nat) : n = n := rfl\n"},
+	} {
+		writeTestFile(t, filepath.Join(tree, m.name+".lean"), m.source)
+		if err := declindex.CompileModule(ctx, lean, nil, tree, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
+	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: A.lean\n"+
+		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
+	config := filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh with the compiled part: %+v", r)
+	}
+	if r := invoke(t, "--config", config, "states", "Reflexive"); r.code != 0 || !strings.HasPrefix(r.out, "Reflexive: 3 declarations\n") {
+		t.Errorf("states Reflexive: %+v; want 3 declarations: A's shared and S, and B's shared", r)
+	}
+	var states map[string][]struct {
+		Declaration string `json:"declaration"`
+		Module      string `json:"declaration_module"`
+	}
+	decode(t, invoke(t, "--config", config, "--json", "states", "Reflexive"), &states)
+	var got []string
+	for _, s := range states["Reflexive"] {
+		if d := s.Module + "." + s.Declaration; !slices.Contains(got, d) {
+			got = append(got, d)
+		}
+	}
+	slices.Sort(got)
+	if want := []string{"A.S", "A.shared", "B.shared"}; !slices.Equal(got, want) {
+		t.Errorf("states --json Reflexive: declarations %q of %+v, want %q", got, states, want)
 	}
 }
 

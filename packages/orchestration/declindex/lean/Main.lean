@@ -6,7 +6,8 @@ open Lean Meta DeclExport
 constant of the target modules: its name `n`, module `m`, kind `k`, printed type `t`, compiled statement hash `h`,
 value hash `vh` (definitions), relation atom hashes `a`, the registered facts it states `f`, and `tr` when the walk
 hit its node budget. The manifest names the target modules, extra modules to import, the project's roots, the
-forms (`{concept, const}`: a constant whose value is a form lambda) and the concepts' own declarations. -/
+forms (`{concept, const}`: a constant whose value is a form lambda), the concepts' own declarations, and the module
+that the hashes count the target modules' constants as declared in (`home`). -/
 
 structure ConstRef where
   concept : String
@@ -21,6 +22,9 @@ structure Manifest where
   concepts : Array ConstRef := #[]
   types : Bool := true
   budget : Nat := 3000000
+  /-- When not empty, the module that the hashes count the constants of the target modules as declared in: a
+  proposal, compiled as a module of its own, is hashed as of the module of its home file, where it lands. -/
+  home : String := ""
   deriving FromJson
 
 /-- A dotted name as Lean prints it: a component in `«…»` may hold dots and other characters. -/
@@ -68,10 +72,11 @@ partial def binderNames : Expr → List String
   | .forallE n _ b _ => n.toString :: binderNames b
   | _ => []
 
-def record (cfg : MatchConfig) (types : Bool) (m : Name) (c : Name) (ci : ConstantInfo) : StateRefT St MetaM Json := do
+def record (cfg : MatchConfig) (moduleOf : Name → Name) (types : Bool) (m : Name) (c : Name) (ci : ConstantInfo) :
+    StateRefT St MetaM Json := do
   let env ← getEnv
   let exprs := statementExprs env ci
-  let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci, env? := some env }
+  let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci, env? := some env, moduleOf := moduleOf }
   let fields : List String := match ci with
     | .inductInfo v => v.ctors.flatMap fun k =>
         match env.find? k with
@@ -85,7 +90,7 @@ def record (cfg : MatchConfig) (types : Bool) (m : Name) (c : Name) (ci : Consta
   let fs := facts cfg w
   let mut atoms : Array String := #[]
   for a in w.atoms do
-    let s := (atomHash a).hex
+    let s := (atomHash moduleOf a).hex
     if !atoms.contains s then atoms := atoms.push s
   let ty ← if types then
       try pure (truncate (toString (← ppExpr ci.type)))
@@ -135,6 +140,13 @@ def main (args : List String) : IO UInt32 := do
     conceptDecls := manifest.concepts.foldl (fun m r => m.insert (toName r.const) r.concept) {}
     roots := manifest.roots.toList.map toName
     budget := manifest.budget }
+  -- The module of a constant as the hashes count it: the one that declares it, or `home` for a target module.
+  let targets : NameSet := manifest.modules.foldl (fun s t => s.insert (toName t)) {}
+  let moduleOf : Name → Name := fun n =>
+    let m := match env.getModuleIdxFor? n with
+      | some idx => env.header.moduleNames[idx.toNat]!
+      | none => env.mainModule
+    if !manifest.home.isEmpty && targets.contains m then toName manifest.home else m
   let ctx : Core.Context := { fileName := "<declexport>", fileMap := default, maxHeartbeats := 0 }
   let out ← IO.getStdout
   let act : StateRefT St MetaM Nat := do
@@ -145,7 +157,7 @@ def main (args : List String) : IO UInt32 := do
       for c in env.header.moduleData[idx.toNat]!.constNames do
         let some ci := env.find? c | continue
         if auxiliary env c ci then continue
-        let j ← record cfg manifest.types m c ci
+        let j ← record cfg moduleOf manifest.types m c ci
         out.putStrLn j.compress
         n := n + 1
     return n

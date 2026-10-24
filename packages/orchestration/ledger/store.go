@@ -27,6 +27,7 @@ var schemaFS embed.FS
 var schemaTables = []string{
 	"repositories", "work_items", "migrations", "migration_writes", "migration_reads",
 	"contracts", "agreements", "agreement_reads", "events",
+	"ready_keys", "round_keys", "owner_refusals",
 }
 
 // Store is a connection pool to one ledger database.
@@ -152,7 +153,10 @@ func (s *Store) checkSchema(ctx context.Context) error {
 	return nil
 }
 
-// migrate applies schema/NNNN_*.sql files in order, each once, under an advisory lock so concurrent starts agree.
+// migrate applies schema/NNNN_*.sql files in order, each once, under an advisory lock so concurrent starts agree. A
+// version is applied when schema_versions records it, so a recorded version must name this binary's file for that
+// number: a database that another file set migrated (an earlier build's 0003) is refused here, by name, rather than
+// failing later on a missing column.
 func (s *Store) migrate(ctx context.Context) error {
 	files, err := schemaFiles()
 	if err != nil {
@@ -166,17 +170,34 @@ func (s *Store) migrate(ctx context.Context) error {
 			version integer PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 			return err
 		}
+		rows, err := tx.Query(ctx, `SELECT version, name FROM schema_versions`)
+		if err != nil {
+			return err
+		}
+		applied := map[int]string{}
+		for rows.Next() {
+			var version int
+			var name string
+			if err := rows.Scan(&version, &name); err != nil {
+				rows.Close()
+				return err
+			}
+			applied[version] = name
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 		for _, f := range files {
 			base := strings.TrimPrefix(f, "schema/")
 			n, err := schemaFileVersion(f)
 			if err != nil {
 				return err
 			}
-			var done bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_versions WHERE version = $1)`, n).Scan(&done); err != nil {
-				return err
-			}
-			if done {
+			if name, done := applied[n]; done {
+				if name != base {
+					return fmt.Errorf("schema %d is %s, this binary has %s; recreate the database", n, name, base)
+				}
 				continue
 			}
 			sql, err := schemaFS.ReadFile(f)

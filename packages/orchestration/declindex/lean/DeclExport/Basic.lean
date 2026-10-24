@@ -3,7 +3,7 @@ open Lean
 
 /-! Shared pieces of the exporter: structural hashes of expressions that do not depend on binder names, binder
 kinds, metadata, the names of universe parameters, or how a numeral of core Lean's `Nat` and `BitVec` instances is
-written. -/
+written, and that count each constant with the module that declares it. -/
 
 namespace DeclExport
 
@@ -44,11 +44,19 @@ def H.hex (h : H) : String := hex64 h.a ++ hex64 h.b
 generates from it (`X.eq_1`, `X._unfold`, `X.rec`, `X.match_1`), by a placeholder and the generated suffix, so
 that a copy under a new name hashes equal; an auxiliary definition Lean makes while elaborating (a matcher, an
 abstracted proof) by its content, since a copy elsewhere gets its own or reuses an existing one; any other
-constant, a sub-declaration the user wrote (`X.base`) included, by its name. -/
+constant, a sub-declaration the user wrote (`X.base`) included, by its name as its source writes it (a private
+name without its module's prefix) and the module that `moduleOf` gives it, since two modules that are never
+imported together can each declare one name. -/
 structure HashCtx where
   levels : List Name := []
   self : List Name := []
   env? : Option Environment := none
+  moduleOf : Name → Name := fun _ => .anonymous
+
+/-- The constant `n` as a hash counts it: its name as its source writes it, and its module. A private name holds
+the module that compiled it, which `moduleOf` already gives (and can count as another, see `Manifest.home`). -/
+def constId (ctx : HashCtx) (n : Name) : List H :=
+  [H.ofString ((privateToUserName? n).getD n).toString, H.ofString (ctx.moduleOf n).toString]
 
 /-- An auxiliary definition that elaboration made: a matcher, or a proof abstracted out of a body. -/
 def isElabAux (env : Environment) (n : Name) : Bool :=
@@ -118,7 +126,7 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
         | some i =>
           let suffix := (n.replacePrefix ctx.self[i]! .anonymous).toString
           pure (H.tag "self" (H.ofU i.toUInt64 :: H.ofString suffix :: ls.map (hashLevel ctx)))
-        | none => pure (H.tag "c" (H.ofString n.toString :: ls.map (hashLevel ctx)))
+        | none => pure (H.tag "c" (constId ctx n ++ ls.map (hashLevel ctx)))
     | .app .. =>
       match unfoldNumeral? e with
       | some u => hashExpr ctx u
@@ -129,7 +137,7 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
     | .lit (.natVal n) => pure (H.tag "n" [H.ofString (toString n)])
     | .lit (.strVal s) => pure (H.tag "str" [H.ofString s])
     | .mdata _ b => hashExpr ctx b
-    | .proj s i b => do pure (H.tag "pj" [H.ofString s.toString, H.ofU i.toUInt64, ← hashExpr ctx b])
+    | .proj s i b => do pure (H.tag "pj" (constId ctx s ++ [H.ofU i.toUInt64, ← hashExpr ctx b]))
   -- A free variable's hash depends on the order of first occurrence, so terms with free variables are not memoised.
   if !e.hasFVar then modify fun s => { s with memo := s.memo.insert e h }
   return h
@@ -143,11 +151,12 @@ def relationHeads : List Name :=
 
 def symmetricHeads : List Name := [``Eq, ``Ne, ``Iff, ``HEq]
 
-/-- The canonical hash of one atom: free variables by first occurrence, and a symmetric relation hashed in the
-order of its two hashes, so that `a = b` and `b = a` agree. -/
-def atomHash (e : Expr) : H :=
+/-- The canonical hash of one atom: free variables by first occurrence, each constant with the module that
+`moduleOf` gives it, and a symmetric relation hashed in the order of its two hashes, so that `a = b` and `b = a`
+agree. -/
+def atomHash (moduleOf : Name → Name) (e : Expr) : H :=
   let e := e.consumeMData
-  let one (x : Expr) : H := hashOf {} [x]
+  let one (x : Expr) : H := hashOf { moduleOf := moduleOf } [x]
   match e.getAppFn.consumeMData with
   | .const n _ =>
     if symmetricHeads.contains n && e.getAppNumArgs ≥ 2 then
