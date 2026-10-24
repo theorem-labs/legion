@@ -20,6 +20,8 @@ var (
 	// ErrIDOwner reports a work item that is in another owner's queue: an item id belongs to one owner for its whole
 	// history.
 	ErrIDOwner = errors.New("work item belongs to another owner")
+	// ErrNoListener reports a host whose Envoy listener did not resolve: NoListener refuses every notice with it.
+	ErrNoListener = errors.New("no Envoy listener")
 
 	noticeRetryDelays = [...]time.Duration{time.Second, 4 * time.Second, 16 * time.Second}
 )
@@ -34,10 +36,20 @@ type Notice struct {
 	Key            string
 }
 
+// NoListener is the Publisher of a host whose Envoy listener did not resolve: it refuses every notice with
+// ErrNoListener and Reason, why no listener resolved.
+type NoListener struct{ Reason error }
+
+// Publish refuses the notice: there is no listener to take it.
+func (n NoListener) Publish(context.Context, string, string, any, string) error {
+	return fmt.Errorf("%w: %v", ErrNoListener, n.Reason)
+}
+
 // Deliver sends each notice through envoy, retrying a refused one at 1 s, 4 s and 16 s, and appends each one that
 // envoy still refuses to the journal of undelivered notices at journal: an absolute path, a deployment's
-// <state_dir>/undelivered.jsonl. It returns the notices envoy refused, in order. Its error is a journal it could not
-// write, and the notices it returns then end with the one that journal lost.
+// <state_dir>/undelivered.jsonl. A refusal of NoListener (ErrNoListener) is not retried: no listener can take the notice
+// later. It returns the notices envoy refused, in order. Its error is a journal it could not write, and the notices it
+// returns then end with the one that journal lost.
 func Deliver(ctx context.Context, envoy Publisher, journal string, notices []Notice) ([]Notice, error) {
 	var undelivered []Notice
 	for _, notice := range notices {
@@ -63,6 +75,9 @@ func publish(ctx context.Context, envoy Publisher, notice Notice) error {
 		err = envoy.Publish(ctx, notice.Topic, notice.Message, notice.Payload, notice.Key)
 		if err == nil {
 			return nil
+		}
+		if errors.Is(err, ErrNoListener) {
+			return fmt.Errorf("publish notice on %q: %w", notice.Topic, err)
 		}
 		if attempt == len(noticeRetryDelays) {
 			break

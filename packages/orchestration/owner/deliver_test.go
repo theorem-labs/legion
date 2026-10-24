@@ -95,6 +95,36 @@ func TestDeliverReturnsTheJournalErrorWithTheNoticeItLost(t *testing.T) {
 	}
 }
 
+// A host whose listener did not resolve has no listener to try again: Deliver journals each notice at once, with the
+// reason no listener resolved, and returns it as undelivered.
+func TestDeliverJournalsTheNoticesOfAHostWithNoListenerAtOnce(t *testing.T) {
+	notices := deliveryNotices()
+	journal := filepath.Join(t.TempDir(), "state", "undelivered.jsonl")
+	started := time.Now()
+	undelivered, err := Deliver(context.Background(), NoListener{Reason: errors.New("Envoy URL is unset")}, journal, notices)
+	if elapsed := time.Since(started); elapsed >= noticeRetryDelays[0] {
+		t.Fatalf("Deliver took %s, want no retry (the first is at %s)", elapsed, noticeRetryDelays[0])
+	}
+	if err != nil || len(undelivered) != len(notices) {
+		t.Fatalf("Deliver = %+v, %v; want every notice undelivered", undelivered, err)
+	}
+	data, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != len(notices) {
+		t.Fatalf("journal = %q, want one line for each notice", data)
+	}
+	for index, line := range lines {
+		var entry struct{ Topic, Key, Error string }
+		if json.Unmarshal([]byte(line), &entry) != nil || entry.Key != notices[index].Key ||
+			!strings.Contains(entry.Error, ErrNoListener.Error()) || !strings.Contains(entry.Error, "Envoy URL is unset") {
+			t.Fatalf("journal line %d = %s, want notice %s with the reason no listener resolved", index, line, notices[index].Key)
+		}
+	}
+}
+
 // A failure to reach the ledger is one the caller retries; an answer from the server, or a refusal, is not.
 func TestLedgerUnreachableIsAConnectionFailureOrADeadline(t *testing.T) {
 	closed, err := net.Listen("tcp", "127.0.0.1:0")

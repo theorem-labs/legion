@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 )
@@ -267,12 +268,17 @@ func TestLibrarianIntakeRecordsARecheckOnTheLibrariansInboxBranch(t *testing.T) 
 }
 
 // With no listener, the notice is undelivered: the command prints it, appends it to the deployment's journal, and
-// still exits 0, since the ledger item is the record.
+// still exits 0, since the ledger item is the record. No listener can take the notice later, so the command does not
+// wait for the retries of a listener that refused it (1 s, 4 s and 16 s).
 func TestLibrarianIntakeWithoutAListenerJournalsTheNotice(t *testing.T) {
 	f := newCommandFixture(t)
 	item := ownerpkg.ConceptItem(intakeProposer, intakeNearID)
 	args := f.intakeArgs(intakeNearID, f.envelope("near-envelope.txt"), "--topic-prefix", "notifications.example.", "--deploy", f.deploy)
+	started := time.Now()
 	out, stderr, code := f.intake(map[string]string{"HOME": f.root}, args...)
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("the intake with no listener took %s, want no retries", elapsed)
+	}
 	journal := filepath.Join(f.stateDir(), "undelivered.jsonl")
 	if code != 0 || !out.Added || len(out.Undelivered) != 1 || out.Undelivered[0] != conceptsTopic || out.Journal != journal {
 		t.Fatalf("intake exited %d with %+v: %s", code, out, stderr)
@@ -286,7 +292,7 @@ func TestLibrarianIntakeWithoutAListenerJournalsTheNotice(t *testing.T) {
 		Payload                    map[string]any
 	}
 	if len(lines) != 1 || json.Unmarshal([]byte(lines[0]), &entry) != nil || entry.Topic != conceptsTopic ||
-		entry.Key != ownerpkg.NoticeKey(item) || entry.Payload["item"] != item || entry.Error == "" {
+		entry.Key != ownerpkg.NoticeKey(item) || entry.Payload["item"] != item || !strings.Contains(entry.Error, "no Envoy listener") {
 		t.Fatalf("journal = %q", lines)
 	}
 	if got := f.item(item); got.Owner != "librarian" || got.State != "open" {

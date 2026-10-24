@@ -124,7 +124,7 @@ func (s *session) librarianIntake(flags intakeFlags) (any, error) {
 		}
 	}
 	if url, token, err := ownerpkg.ResolveListener(s.listenerEnv(flags.envoyConfig)); err != nil {
-		intake.NoListener = fmt.Errorf("no Envoy listener: %w", err)
+		intake.Envoy = ownerpkg.NoListener{Reason: err}
 	} else {
 		intake.Envoy = ownerpkg.NewHTTPPublisher(url, token)
 	}

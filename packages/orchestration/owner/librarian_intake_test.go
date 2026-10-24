@@ -327,7 +327,7 @@ func newTestIntake(t *testing.T, l *fakeIntakeLedger, inbox *Repo) LibrarianInta
 	if err != nil {
 		t.Fatal(err)
 	}
-	return LibrarianIntake{Ledger: l, Repo: "r", Inbox: inbox, Routing: routing, NoListener: errors.New("no listener"),
+	return LibrarianIntake{Ledger: l, Repo: "r", Inbox: inbox, Routing: routing, Envoy: NoListener{Reason: errors.New("no listener")},
 		Journal: filepath.Join(t.TempDir(), "undelivered.jsonl")}
 }
 

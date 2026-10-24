@@ -337,9 +337,8 @@ type IntakeLedger interface {
 	Enqueue(ctx context.Context, repo, id, owner string) error
 }
 
-// LibrarianIntake queues the concept gate's deliveries for the librarian (plan Task 1.10). Envoy is nil when no listener
-// resolved; NoListener then says why, and every notice is undelivered. LedgerTimeout bounds each ledger call
-// (IntakeLedgerTimeout when zero).
+// LibrarianIntake queues the concept gate's deliveries for the librarian (plan Task 1.10). Envoy is the host's listener,
+// or NoListener when none resolved. LedgerTimeout bounds each ledger call (IntakeLedgerTimeout when zero).
 type LibrarianIntake struct {
 	Ledger        IntakeLedger
 	LedgerTimeout time.Duration
@@ -347,7 +346,6 @@ type LibrarianIntake struct {
 	Inbox         *Repo  // the librarian's bare repository, which holds LibrarianInboxBranch; required for a recheck
 	Routing       Routing
 	Envoy         Publisher
-	NoListener    error
 	Journal       string // absolute: the host's undelivered.jsonl
 }
 
@@ -367,8 +365,8 @@ type IntakeOutcome struct {
 // writes and publishes nothing. A missing item is queued; a recheck first writes its inbox record, which keeps the first
 // envelope of an id (a record of another proposer is ErrRecordProposer). The notice of a missing or still open item is
 // then published under its one key NoticeKey(item): a delivery whose item is open may follow one that queued it and
-// then lost its notice, and the listener drops a copy it has. The host's journal keeps a notice no listener takes.
-// Each ledger call has a deadline of its own.
+// then lost its notice, and the listener drops a copy it has. The package's Deliver sends it, and the host's journal
+// keeps it when no listener takes it. Each ledger call has a deadline of its own.
 func (in LibrarianIntake) Deliver(ctx context.Context, envelope GateEnvelope) (IntakeOutcome, error) {
 	outcome := IntakeOutcome{Item: ConceptItem(envelope.Proposer, envelope.ID), Kind: envelope.Kind}
 	if err := in.call(ctx, func(ctx context.Context) error {
@@ -410,22 +408,11 @@ func (in LibrarianIntake) Deliver(ctx context.Context, envelope GateEnvelope) (I
 		outcome.Added = true
 	}
 
-	for _, notice := range Notices(in.Routing.Topics(Route{Step: RouteConcept}), NoticeFields{
+	notices := Notices(in.Routing.Topics(Route{Step: RouteConcept}), NoticeFields{
 		Type: "concept", From: envelope.Proposer, To: Librarian, Item: outcome.Item, Record: outcome.Record, Commit: outcome.Commit,
-	}) {
-		publishErr := in.NoListener
-		if in.Envoy != nil {
-			publishErr = publish(ctx, in.Envoy, notice)
-		}
-		if publishErr == nil {
-			continue
-		}
-		outcome.Undelivered = append(outcome.Undelivered, notice)
-		if err := appendJournal(in.Journal, notice, publishErr); err != nil {
-			return outcome, err
-		}
-	}
-	return outcome, nil
+	})
+	outcome.Undelivered, err = Deliver(ctx, in.Envoy, in.Journal, notices)
+	return outcome, err
 }
 
 // record keeps a recheck's envelope as inbox/<id>.json on LibrarianInboxBranch, or finds the record a first delivery
