@@ -11,6 +11,8 @@ The index has two parts in one SQLite file next to the build:
 
 The index metadata has `commit`, the Git commit it read, and `compiled_commit`, the commit whose compiled part it holds; the gate and the post-landing recheck refuse an index whose two differ. The `landings` table records each refresh that moved the index to another commit: that commit and the commit it replaced. The post-landing registry check of a landing compares those two commits, however many landings came after it. A module whose source is newer than its build, or whose recorded declaration position no longer holds its name, is unreadable until a build replaces the output; affected queries exit 3. A tree that is not a Git work tree has no commit: `refresh` reads it and records no commit, the queries and `status` print a note, and `gate` and `ledger`, which compare the index's commit with the tree's, exit 3.
 
+The index records its schema version, which changes whenever what an index holds changes. After an upgrade to a `declindex` of another schema version, the next `refresh` rebuilds the index from nothing; until it has, `gate`, `ledger` and `land-hash` refuse the index with exit 3 and name that refresh.
+
 The declaration graph is intentionally not in the Postgres ledger. SQLite stores the declaration, use, edge, compiled-constant, atom, fact, source, and metadata tables, with the reach graph in a sibling file. Postgres stores contract owners, statement hashes, versions, and change-lock reads. This keeps index queries local to the build and keeps ledger transactions limited to the data that coordinates landings.
 
 ## Concept registry

@@ -196,3 +196,57 @@ func TestOpenRebuildsAnOlderSchema(t *testing.T) {
 		t.Fatalf("sources after rebuild = %d, want 0", sources)
 	}
 }
+
+// An index that the previous schema's binary wrote has no landings table and no compiled_commit or source_prefix
+// key. Read as it is, it would answer the post-landing commands with "no such table", no record of a landing, or a
+// tree at the repository's root. A read-only open refuses it and names the refresh that rebuilds it, and the next
+// refresh rebuilds it from nothing: it reads the commit that the old index had read again, and records its landing.
+func TestAnIndexOfThePreviousSchemaIsRebuiltByTheNextRefresh(t *testing.T) {
+	ctx := context.Background()
+	tree := goldenTree(t)
+	path := filepath.Join(t.TempDir(), "index.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE landings`,
+		`DELETE FROM meta WHERE k IN ('compiled_commit', 'source_prefix')`,
+		`UPDATE meta SET v = '3' WHERE k = 'schema'`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reader, err := OpenReadOnly(ctx, path); err == nil {
+		_ = reader.Close()
+		t.Errorf("opened an index of the previous schema read-only")
+	} else if !strings.Contains(err.Error(), "refresh") {
+		t.Errorf("the refusal of an index of the previous schema does not name the refresh that rebuilds it: %v", err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if previous, recorded, err := s.Landing(ctx, "one"); err != nil || !recorded || previous != "" {
+		t.Errorf("the landing of one after the rebuild: previous %q, recorded %v, %v; want recorded with no previous", previous, recorded, err)
+	}
+	reader, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("open the rebuilt index read-only: %v", err)
+	}
+	defer reader.Close()
+	if version, err := reader.Meta(ctx, "schema"); err != nil || version != SchemaVersion {
+		t.Errorf("the rebuilt index's schema: %q, %v; want %q", version, err, SchemaVersion)
+	}
+}

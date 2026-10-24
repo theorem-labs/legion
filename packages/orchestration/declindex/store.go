@@ -21,9 +21,10 @@ import (
 	_ "modernc.org/sqlite" // the database/sql driver "sqlite"
 )
 
-// SchemaVersion changes when a table changes; an index of another version is rebuilt from nothing. A new table
-// that older binaries do not read (landings) is added by Open, without a change of version.
-const SchemaVersion = "3"
+// SchemaVersion changes whenever what an index holds changes: a table, a column, or a meta key that a reader needs.
+// An index of another version is rebuilt from nothing (Open), and OpenReadOnly refuses it. Version 4 added the
+// landings table and the compiled_commit and source_prefix keys.
+const SchemaVersion = "4"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
@@ -181,7 +182,7 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 	}
 	if version != SchemaVersion {
 		_ = s.Close()
-		return nil, fmt.Errorf("index schema %q, want %q", version, SchemaVersion)
+		return nil, fmt.Errorf("index %s has schema %q, and this declindex reads schema %q: run declindex refresh, which rebuilds it", path, version, SchemaVersion)
 	}
 	return s, nil
 }
