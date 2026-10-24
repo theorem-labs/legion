@@ -84,7 +84,7 @@ The landing program's container contract decides each container's mounts and net
 | Command | Writes |
 | --- | --- |
 | `refresh` with `LAND_COMMIT` | The tree (fetch from `remote`, checkout, `build`) and the index directory. |
-| `ledger` | The `--emit` file. The index directory can be read-only. |
+| `ledger` | The `--emit` file, and the index directory only when its recheck of an added concept builds the exporter there, because no refresh with `lean.export` built it first. Otherwise the index directory can be read-only. |
 | `gate` | The index directory only to build the exporter, when no refresh with `lean.export` built it there first. |
 | `land-hash` | Nothing. It reads the index, `LAND_GIT_DIR` and `LAND_BUILD_DIR`; the index directory can be read-only. |
 
