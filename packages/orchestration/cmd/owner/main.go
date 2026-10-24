@@ -64,12 +64,12 @@ func unable(err error) error {
 }
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, ".", os.Stdout, os.Stderr))
+	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 }
 
-func run(ctx context.Context, args []string, getenv func(string) string, cwd string, stdout, stderr io.Writer) int {
+func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	jsonOutput := false
-	s := &session{ctx: ctx, getenv: getenv, cwd: cwd}
+	s := &session{ctx: ctx, getenv: getenv}
 	defer s.close()
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
 		var value *string

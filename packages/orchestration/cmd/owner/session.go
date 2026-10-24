@@ -19,7 +19,6 @@ import (
 type session struct {
 	ctx        context.Context
 	getenv     func(string) string
-	cwd        string
 	deployPath string // --deploy
 	owner      string // --owner: the owner (or the person) the command acts for
 	dsnFile    string // --ledger-dsn-file, which replaces the deployment's ledger_dsn_file
@@ -142,14 +141,14 @@ func (s *session) lastCommit(rev, file string) (string, error) {
 	return strings.TrimSpace(out), err
 }
 
-// worktree creates or reuses ./wt on the owner's branch. The path is absolute because git runs each worktree
-// command from the bare repository.
+// worktree creates or reuses the owner's worktree, ownerpkg.WorktreeDir of the deployment's state_dir, on the owner's
+// branch. The path never depends on the working directory: a region architect runs the command from its own jj
+// workspace, which is no owner's, and acts for several owners from there.
 func (s *session) worktree() (ownerpkg.Worktree, error) {
-	cwd, err := filepath.Abs(s.cwd)
-	if err != nil {
-		return ownerpkg.Worktree{}, err
+	if !filepath.IsAbs(s.deploy.StateDir) {
+		return ownerpkg.Worktree{}, fmt.Errorf("the deployment's state_dir %q is not an absolute path", s.deploy.StateDir)
 	}
-	dir := filepath.Join(cwd, "wt")
+	dir := ownerpkg.WorktreeDir(s.deploy.StateDir, s.owner)
 	want := branch(s.owner)
 	if _, err := os.Stat(dir); err == nil {
 		command := exec.CommandContext(s.ctx, "git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD", "--git-common-dir")

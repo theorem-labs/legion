@@ -129,8 +129,13 @@ func newCommandFixture(t *testing.T) *commandFixture {
 	return f
 }
 
-// stateDir is the deployment's state_dir, which holds undelivered.jsonl.
+// stateDir is the deployment's state_dir, which holds undelivered.jsonl and the owners' worktrees.
 func (f *commandFixture) stateDir() string { return filepath.Join(f.root, "state") }
+
+// wt is owner's worktree, where the command commits its records.
+func (f *commandFixture) wt(owner string) string {
+	return filepath.Join(f.stateDir(), "owners", ownerpkg.Key(owner), "wt")
+}
 
 func (f *commandFixture) refuseNotices() {
 	f.mu.Lock()
@@ -145,32 +150,24 @@ type ownerRun struct {
 
 func (f *commandFixture) as(owner string) ownerRun { return ownerRun{f: f, owner: owner} }
 
-func (o ownerRun) runIn(dir string, args ...string) (string, string, int) {
-	return o.runContext(o.f.ctx, dir, args...)
+func (o ownerRun) call(args ...string) (string, string, int) {
+	return o.runContext(o.f.ctx, args...)
 }
 
 // runContext runs the command under ctx as --owner o.owner: cancelling it stops the command as a killed session
 // stops its process.
-func (o ownerRun) runContext(ctx context.Context, dir string, args ...string) (string, string, int) {
+func (o ownerRun) runContext(ctx context.Context, args ...string) (string, string, int) {
 	var stdout, stderr bytes.Buffer
-	code := run(ctx, append([]string{"--deploy", o.f.deploy, "--owner", o.owner}, args...), o.f.getenv, dir, &stdout, &stderr)
+	code := run(ctx, append([]string{"--deploy", o.f.deploy, "--owner", o.owner}, args...), o.f.getenv, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
 
 // getenv is the command's environment: the listener and HOME, and no owner variable.
 func (f *commandFixture) getenv(key string) string { return f.env[key] }
 
-func (o ownerRun) dir() string {
-	dir := filepath.Join(o.f.root, "owners", ownerpkg.Key(o.owner))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		o.f.t.Fatal(err)
-	}
-	return dir
-}
-
 func (o ownerRun) ok(args ...string) string {
 	o.f.t.Helper()
-	stdout, stderr, code := o.runIn(o.dir(), args...)
+	stdout, stderr, code := o.call(args...)
 	if code != 0 {
 		o.f.t.Fatalf("%s: owner %v exited %d: %s", o.owner, args, code, stderr)
 	}
@@ -179,7 +176,7 @@ func (o ownerRun) ok(args ...string) string {
 
 func (o ownerRun) fails(args ...string) (int, string) {
 	o.f.t.Helper()
-	_, stderr, code := o.runIn(o.dir(), args...)
+	_, stderr, code := o.call(args...)
 	if code == 0 {
 		o.f.t.Fatalf("%s: owner %v succeeded", o.owner, args)
 	}

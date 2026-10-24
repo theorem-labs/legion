@@ -11,45 +11,43 @@ import (
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 )
 
-func TestWorktreeRefusesAnotherOwnersCheckout(t *testing.T) {
+// The owner's worktree path is the owner's own, so whatever is there must be a checkout of the owner's branch of
+// the deployment's bare repository.
+func TestWorktreeRefusesACheckoutOfAnotherBranch(t *testing.T) {
 	f := newCommandFixture(t)
-	dir := filepath.Join(f.root, "shared")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, stderr, code := f.as(caller).runIn(dir, "worktree"); code != 0 {
-		t.Fatalf("first worktree exited %d: %s", code, stderr)
-	}
-	if _, stderr, code := f.as(state).runIn(dir, "worktree"); code != 1 || !strings.Contains(stderr, "owner/"+ownerpkg.Key(caller)) {
-		t.Fatalf("worktree on another owner's checkout exited %d: %s", code, stderr)
+	wt := f.wt(state)
+	f.git(f.root, "--git-dir="+f.bare, "worktree", "add", "-q", "-b", "other", wt, "main")
+	if code, stderr := f.as(state).fails("worktree"); code != 1 || !strings.Contains(stderr, "other") {
+		t.Fatalf("worktree on a checkout of another branch exited %d: %s", code, stderr)
 	}
 }
 
-// main runs every command in ".", so the worktree must be the owner's ./wt however git resolves paths.
-func TestWorktreeIsTheWorkingDirectorysWtWhenRunInDot(t *testing.T) {
+// A region architect runs the command from its own jj workspace, which is no owner's: the owner's worktree is
+// <state_dir>/owners/<Key(owner)>/wt of the deployment, whichever directory the command runs in, and every command
+// that writes records commits there.
+func TestWorktreeIsUnderTheDeploymentsStateDirWhereverTheCommandRuns(t *testing.T) {
 	f := newCommandFixture(t)
-	dir := filepath.Join(f.root, "owners", "relative")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
+	want := filepath.Join(f.stateDir(), "owners", ownerpkg.Key(caller), "wt")
+	for _, dir := range []string{"workspace-a", "workspace-b"} {
+		dir = filepath.Join(f.root, dir)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(dir)
+		var tree struct{ Path, Branch string }
+		if err := json.Unmarshal([]byte(f.as(caller).ok("--json", "worktree")), &tree); err != nil {
+			t.Fatal(err)
+		}
+		if tree.Path != want || tree.Branch != ownerpkg.Branch(caller) {
+			t.Fatalf("worktree run in %s = %+v, want %s on %s", dir, tree, want, ownerpkg.Branch(caller))
+		}
+		f.as(caller).ok("need", state, f.write("need.md", needDraft))
+		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+			t.Fatalf("the command wrote into its working directory %s: %v, %v", dir, entries, err)
+		}
 	}
-	t.Chdir(dir)
-	out, stderr, code := f.as(caller).runIn(".", "--json", "worktree")
-	if code != 0 {
-		t.Fatalf("worktree exited %d: %s", code, stderr)
-	}
-	var tree struct{ Path string }
-	if err := json.Unmarshal([]byte(out), &tree); err != nil {
-		t.Fatal(err)
-	}
-	if want := filepath.Join(dir, "wt"); tree.Path != want {
-		t.Fatalf("worktree path = %q, want %q", tree.Path, want)
-	}
-	f.as(caller).runIn(".", "need", state, f.write("need.md", needDraft))
-	if _, stderr, code := f.as(caller).runIn(".", "need", state, f.write("need.md", needDraft)); code != 0 {
-		t.Fatalf("need in the same directory exited %d: %s", code, stderr)
-	}
-	if got := f.lastCommit(caller, ownerpkg.NeedRecord("skeleton", caller, state)); got == "" {
-		t.Fatal("need did not commit on the owner's branch")
+	if got := f.git(want, "log", "-1", "--format=%H", "--", ownerpkg.NeedRecord("skeleton", caller, state)); got == "" || got != f.lastCommit(caller, ownerpkg.NeedRecord("skeleton", caller, state)) {
+		t.Fatalf("the need's commit in %s is %q, not the owner branch's", want, got)
 	}
 }
 
@@ -61,7 +59,7 @@ func TestCommandsActForTheOwnerFlagNotALaunchVariable(t *testing.T) {
 	f.env["LEGION_OWNER"] = caller
 	for _, command := range [][]string{{"whoami"}, {"inbox"}, {"worktree"}, {"need", state, f.write("need.md", needDraft)}} {
 		var stdout, stderr strings.Builder
-		code := run(f.ctx, append([]string{"--deploy", f.deploy}, command...), f.getenv, f.root, &stdout, &stderr)
+		code := run(f.ctx, append([]string{"--deploy", f.deploy}, command...), f.getenv, &stdout, &stderr)
 		if code != exitUsage || !strings.Contains(stderr.String(), "--owner") {
 			t.Errorf("%v with LEGION_OWNER and no --owner exited %d: %s", command, code, stderr.String())
 		}
@@ -73,7 +71,7 @@ func TestCommandsActForTheOwnerFlagNotALaunchVariable(t *testing.T) {
 	migration := "m:" + ownerpkg.Key(caller) + ":1"
 	event := f.insertEvent(migration, `{"generation":1,"landing_rounds":1,"reason":"head_unavailable","batch":"","detail":"","log":"","key":"b-7/m-2/1","ready_cleared":true}`)
 	var stdout, stderr strings.Builder
-	if code := run(f.ctx, []string{"--deploy", f.deploy, "returned", "returned:" + migration + "@" + strconv.FormatInt(event, 10)}, f.getenv, f.root, &stdout, &stderr); code != 0 {
+	if code := run(f.ctx, []string{"--deploy", f.deploy, "returned", "returned:" + migration + "@" + strconv.FormatInt(event, 10)}, f.getenv, &stdout, &stderr); code != 0 {
 		t.Fatalf("returned with no --owner exited %d: %s", code, stderr.String())
 	}
 }

@@ -50,7 +50,8 @@ Steps:
   when the owner command is killed first. A command that holds the lock finds no live git of another owner command
   in the worktree, so it removes the `index.lock`, `HEAD.lock` and branch ref lock that a killed command left: a
   killed step does not wedge its owner, and two commands of one owner wait for each other instead of failing on
-  `index.lock`. A person's git command does not take the lock, so none runs in `./wt` while an owner command does.
+  `index.lock`. A person's git command does not take the lock, so none runs in an owner's worktree while an owner
+  command does.
 - A notice that the listener still refuses after retries at 1 s, 4 s and 16 s does not fail the step: the command
   prints `notice not delivered: <topic>` on stderr and appends the notice to `<state_dir>/undelivered.jsonl`.
 - A claim keeps its `[C<n>]` id while its owner revises it. An id that a revision removes is retired: the command
@@ -63,7 +64,7 @@ Steps:
 | --- | --- |
 | `whoami` | The owner's id, role, key, kind, Lean directory, C file, active set and active epoch |
 | `topics` | `topics.json`'s list, plus `concepts` for the librarian, `fact.<name>.needs` for a fact owner, `fact.<name>.users` for each fact the owner states, and `all` for every owner |
-| `worktree` | Creates or reuses `./wt` on `owner/<Key>` of the bare repository |
+| `worktree` | Creates or reuses the owner's worktree `<state_dir>/owners/<Key>/wt` of the deployment, on `owner/<Key>` of the bare repository. The path does not depend on the working directory: a region architect runs the command from its own jj workspace. Every command that writes records commits there |
 | `inbox` | Open items in `RULE.yaml` order, each with its record, the branch that holds it and the commit to read. The items come from the ledger's `Store.OpenItems` in enqueue order, and items the rule's keys tie keep that order; `enqueued_at` is the position in it |
 | `claim <item>` | A supervised lease on an existing item, for a person or an owner outside a step |
 | `need <target> <file> [--outside-part \| --answers <reply item>...]` | Writes `needs/E<hex16(target)>.md` (the draft sets `author_model`, `cites` and `resolves`), queues `need:<edge>@r<n>`, notifies by the routing table; `--outside-part` records the edge as `outside_part` with no item; `--answers` answers the target's replies about this need: the revision lists them in `resolves`, carries their trailers, and completes them |

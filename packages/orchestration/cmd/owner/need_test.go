@@ -93,8 +93,7 @@ func TestNeedJournalsANoticeTheListenerRefuses(t *testing.T) {
 	need := "need:" + ownerpkg.EdgeID(caller, state) + "@r1"
 	topic := "notifications.example.node.struct:state.needs"
 
-	run := f.as(caller)
-	stdout, stderr, code := run.runIn(run.dir(), "--json", "need", state, f.write("need.md", needDraft))
+	stdout, stderr, code := f.as(caller).call("--json", "need", state, f.write("need.md", needDraft))
 	if code != 0 {
 		t.Fatalf("need with a refusing listener exited %d: %s", code, stderr)
 	}
@@ -136,8 +135,7 @@ func TestNeedStopsBeforeWritingWhenTheListenerConfigurationCannotBeRead(t *testi
 	f := newCommandFixture(t)
 	delete(f.env, "ENVOY_URL")
 	delete(f.env, "ENVOY_TOKEN")
-	run := f.as(caller)
-	_, stderr, code := run.runIn(run.dir(), "need", state, f.write("need.md", needDraft))
+	_, stderr, code := f.as(caller).call("need", state, f.write("need.md", needDraft))
 	if code != 3 || !strings.Contains(stderr, "envoy.json") {
 		t.Fatalf("need with no listener configuration exited %d: %s", code, stderr)
 	}
@@ -150,7 +148,7 @@ func TestNeedStopsBeforeWritingWhenTheListenerConfigurationCannotBeRead(t *testi
 	if _, err := os.Stat(filepath.Join(f.stateDir(), "undelivered.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("a notice was journaled: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(run.dir(), "wt")); !os.IsNotExist(err) {
+	if _, err := os.Stat(f.wt(caller)); !os.IsNotExist(err) {
 		t.Fatalf("the worktree was created: %v", err)
 	}
 	if err := exec.Command("git", "--git-dir="+f.bare, "rev-parse", "--verify", "--quiet", "refs/heads/owner/"+ownerpkg.Key(caller)).Run(); err == nil {
@@ -163,7 +161,7 @@ func TestNeedStopsBeforeWritingWhenTheListenerConfigurationCannotBeRead(t *testi
 func TestNeedRunsAgainAfterAStepKilledInItsCommit(t *testing.T) {
 	f := newCommandFixture(t)
 	f.as(caller).ok("worktree")
-	wt := filepath.Join(f.as(caller).dir(), "wt")
+	wt := f.wt(caller)
 	lock := f.git(wt, "rev-parse", "--git-path", "index.lock")
 	if !filepath.IsAbs(lock) {
 		lock = filepath.Join(wt, lock)
@@ -182,7 +180,7 @@ func TestNeedRunsAgainAfterAStepKilledInItsCommit(t *testing.T) {
 func TestNeedRefusesAReviewsPathItCannotRead(t *testing.T) {
 	f := newCommandFixture(t)
 	f.as(caller).ok("worktree")
-	wt := filepath.Join(f.as(caller).dir(), "wt")
+	wt := f.wt(caller)
 	f.writeFile(filepath.Join(wt, "skeleton", "nodes", ownerpkg.Key(caller), "reviews"), "not a directory\n")
 	f.git(wt, "add", ".")
 	f.git(wt, "commit", "-q", "-m", "a file where the reviews directory belongs")

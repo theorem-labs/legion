@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -29,6 +30,10 @@ func Key(id string) string { return "K" + Hex16(id) }
 
 // Branch is an owner's branch in the copy: owner/<Key(id)>.
 func Branch(id string) string { return "owner/" + Key(id) }
+
+// WorktreeDir is an owner's worktree in a deployment, <state_dir>/owners/<Key(id)>/wt: the one checkout of the owner's
+// branch where its commands commit records.
+func WorktreeDir(stateDir, id string) string { return filepath.Join(stateDir, "owners", Key(id), "wt") }
 
 // EdgeID is the stable identifier for a directed edge.
 func EdgeID(source, target string) string { return source + "->" + target }
