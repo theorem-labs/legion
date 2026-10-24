@@ -465,11 +465,29 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 		parseErr = err
 	}
 	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("%w on %d modules (first %s): %v: %s", ErrExporter, len(m.Modules), m.Modules[0], err,
+		first := ""
+		if names := slices.Concat(m.Modules, m.Imports); len(names) > 0 {
+			first = names[0]
+		}
+		return nil, fmt.Errorf("%w on %d modules (first %s): %v: %s", ErrExporter, len(m.Modules), first, err,
 			strings.TrimSpace(stderr.String()))
 	}
 	if parseErr != nil {
 		return nil, parseErr
 	}
 	return out, nil
+}
+
+// loadsTogether reports whether one Lean environment imports modules, with roots as the project's roots: false when
+// Lean refuses it because two of them declare a name and neither declaration subsumes the other (Environment.lean,
+// subsumesInfo). The exporter imports them and reads nothing.
+func (x *Exporter) loadsTogether(ctx context.Context, roots, modules []string) (bool, error) {
+	_, err := x.runOne(ctx, Manifest{Imports: modules, Roots: roots})
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, ErrExporter) && strings.Contains(err.Error(), "environment already contains"):
+		return false, nil
+	}
+	return false, err
 }

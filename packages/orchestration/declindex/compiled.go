@@ -34,7 +34,8 @@ type CompiledOptions struct {
 }
 
 // compiledDigest names what the compiled part was read with: the exporter's version (not its path, which differs
-// between the paths that name one index) and the forms. When it changes, every module is read again.
+// between the paths that name one index) and the forms, their text and their import closure (formsClosure). When it
+// changes, every module is read again.
 func compiledDigest(co *CompiledOptions, m Manifest, formsSource string) (string, error) {
 	j, err := json.Marshal(m.complete())
 	if err != nil {
@@ -105,11 +106,12 @@ func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) 
 	return s.distinctOwners(ctx, `SELECT name, module FROM consts WHERE cstmt = ? ORDER BY name, module`, hash)
 }
 
-// FormsClash is why the compiled step reads Module without the registry's forms: its imports declare Name only in
-// DeclaredIn, and the forms' imports declare it only in FormsDeclaredIn, other modules. Lean imports two
-// declarations of one name together only when one subsumes the other (two theorems with one statement), which the
-// index cannot know before it reads them, so no environment is known to hold both: the module states no fact of a
-// written form. It is a defect of the tree, which declares one name in two modules.
+// FormsClash is why the compiled step reads Module without the registry's forms: its imports declare Name in
+// DeclaredIn, and the forms' imports declare it in FormsDeclaredIn, and the two sets may not load together in one
+// environment (exportGroups): they share no declaration, or they hold two axioms between them and differ. Lean
+// imports a second declaration of a name only when one of the two subsumes the other (two theorems with one
+// statement), which the index cannot know before it reads them, so the module states no fact of a written form. It
+// is a defect of the tree, which declares one name in two modules.
 type FormsClash struct {
 	Module          string   `json:"module"`
 	Name            string   `json:"name"`
@@ -153,9 +155,10 @@ func ClashModules(clashes []FormsClash) int {
 	return n
 }
 
-// refreshCompiled re-reads the compiled modules whose .olean changed (all of them when the exporter or the
-// forms changed), then the statements that a changed definition reaches, since a definition's facts pass to
-// every statement that applies it. It records commit as the commit whose compiled part the index holds.
+// refreshCompiled re-reads the compiled modules whose .olean changed (all of them when the exporter, the forms or
+// the build of a module in the forms' import closure changed), then the statements that a changed definition
+// reaches, since a definition's facts pass to every statement that applies it. It records commit as the commit
+// whose compiled part the index holds.
 func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOptions, files []moduleFile, commit string, log io.Writer) (int, int, error) {
 	t0 := time.Now()
 	x, m, src, err := co.prepare(ctx, tree.Roots)
@@ -166,7 +169,23 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	if err != nil {
 		return 0, 0, err
 	}
-	digest, err := compiledDigest(co, m, src+"\x00"+bodies)
+	old, err := s.storedModules(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	keys := map[string]string{} // module -> its .olean key now
+	for _, f := range files {
+		if o, ok := old[f.rel]; ok && f.oleanKey != "" {
+			keys[o.module] = f.oleanKey
+		}
+	}
+	var closure string
+	if len(m.Imports) > 0 {
+		if closure, err = s.formsClosure(ctx, co.Forms.Imports, keys); err != nil {
+			return 0, 0, err
+		}
+	}
+	digest, err := compiledDigest(co, m, src+"\x00"+bodies+"\x00"+closure)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -175,11 +194,6 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		return 0, 0, err
 	}
 	full := prev != digest
-	old, err := s.storedModules(ctx)
-	if err != nil {
-		return 0, 0, err
-	}
-	keys := map[string]string{} // module -> its .olean key now
 	var todo []string
 	reading := map[string]bool{}
 	for _, f := range files {
@@ -187,7 +201,6 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		if !ok || f.oleanKey == "" {
 			continue
 		}
-		keys[o.module] = f.oleanKey
 		if full || o.oleanKey != f.oleanKey {
 			todo = append(todo, o.module)
 			reading[o.module] = true
@@ -217,7 +230,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	if err != nil {
 		return 0, 0, err
 	}
-	runs, withoutForms, err := s.exportRuns(ctx, m, co.Forms.Imports, todo)
+	runs, withoutForms, err := s.exportRuns(ctx, x, m, co.Forms.Imports, todo, log)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -233,7 +246,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			return 0, 0, err
 		}
 		if len(again) > 0 {
-			runs, more, err := s.exportRuns(ctx, m, co.Forms.Imports, again)
+			runs, more, err := s.exportRuns(ctx, x, m, co.Forms.Imports, again, log)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -256,20 +269,44 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	return len(todo), len(again), nil
 }
 
+// formsClosure names the forms' resolved import closure: each module that the forms' imports import, directly or
+// not, with the key of its build now (keys; none for a module outside the library directory). What a module states
+// of a written form, and whether it loads with the forms at all, depends on every one of them, not only on the
+// forms' text: a module of that closure that imports another module, or is built anew, changes it.
+func (s *Store) formsClosure(ctx context.Context, forms []string, keys map[string]string) (string, error) {
+	g, err := loadImports(ctx, s.q)
+	if err != nil {
+		return "", err
+	}
+	all := map[string]bool{}
+	for _, f := range forms {
+		maps.Copy(all, g.closure(f))
+	}
+	var b strings.Builder
+	for _, mod := range slices.Sorted(maps.Keys(all)) {
+		fmt.Fprintf(&b, "%s=%s\n", mod, keys[mod])
+	}
+	return b.String(), nil
+}
+
 // exportRuns gives the exporter runs that read modules with the manifest m, whose forms module imports forms: one
 // run for each group of modules that one Lean environment can import with those modules (exportGroups). A module
 // whose imports and the forms' imports hold declarations of one name that share none is read without the forms
 // module, keeping only the concepts matched by their own declaration whose name no two modules declare: no
 // environment is known to hold both, so it states no fact of a written form, and its environment's declaration of a
 // concept's name can be another module's. clashes are those modules' clashes (FormsClash).
-func (s *Store) exportRuns(ctx context.Context, m Manifest, forms, modules []string) (runs []Manifest, clashes []FormsClash, err error) {
+func (s *Store) exportRuns(ctx context.Context, x *Exporter, m Manifest, forms, modules []string, log io.Writer) (runs []Manifest, clashes []FormsClash, err error) {
 	var base []string
 	if len(m.Imports) > 0 {
 		base = forms
 	}
-	plan, err := exportGroups(ctx, s.q, modules, base)
+	loads := func(ctx context.Context, pair []string) (bool, error) { return x.loadsTogether(ctx, m.Roots, pair) }
+	plan, err := exportGroups(ctx, s.q, modules, base, loads)
 	if err != nil {
 		return nil, nil, err
+	}
+	if plan.checks > 0 {
+		logf(log, "index: %d pairs of modules that declare one name checked with Lean, %d import together", plan.checks, plan.loaded)
 	}
 	for _, g := range plan.groups {
 		mm := m

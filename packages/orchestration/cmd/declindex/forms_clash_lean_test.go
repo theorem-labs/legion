@@ -130,6 +130,149 @@ func TestRefreshReadsADuplicateThatTheFormsImportsHoldWithTheForms(t *testing.T)
 	checkDefect("refresh after UseA changed", invoke(t, "--config", config, "refresh"))
 }
 
+// Lean merges two axioms of one name only when a cheap check finds their type a proposition, which it does not for
+// `∀ (p : Nat → Prop) (n : Nat), p n → p n`, and a theorem of that type subsumes each axiom. Home imports Thm's
+// theorem `dup` and then A's and B's axiom `dup`, and builds; an environment that imports A and B before Thm does
+// not. Refresh reads A, B and Thm without the forms, each alone, and names them; Home, whose declarations of `dup`
+// are the forms' own, is read with them.
+func TestRefreshKeepsApartTwoAxiomsThatOnlyATheoremReconciles(t *testing.T) {
+	requireLake(t)
+	ctx := context.Background()
+	lean, err := declindex.FindLean(ctx, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "tree")
+	for _, m := range []struct{ name, source string }{
+		{"A", "axiom dup : ∀ (p : Nat → Prop) (n : Nat), p n → p n\n"},
+		{"B", "axiom dup : ∀ (p : Nat → Prop) (n : Nat), p n → p n\n"},
+		{"Thm", "theorem dup : ∀ (p : Nat → Prop) (n : Nat), p n → p n := fun _ _ h => h\n"},
+		{"Home", "import Thm\nimport A\nimport B\ntheorem Reflexive (n : Nat) : n = n := rfl\n"},
+	} {
+		writeTestFile(t, filepath.Join(tree, m.name+".lean"), m.source)
+		if err := declindex.CompileModule(ctx, lean, nil, tree, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
+	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
+		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
+	config := filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Thm, Home]\nregistry: registry\n"+
+		"lean:\n  export: true\n  jobs: 1\n")
+	r := invoke(t, "--config", config, "refresh")
+	if r.code != 0 || !strings.Contains(r.errOut, "declindex: index defect: 3 modules are read without the registry's forms") {
+		t.Fatalf("refresh: want exit 0 and A, B and Thm named as read without the forms, got %+v", r)
+	}
+	// Thm's theorem is one of the forms' declarations of dup, so it is on both sides of its clash.
+	const thm = "declindex: index defect: Thm is read without the registry's forms: its imports declare dup in Thm, and the forms' imports declare it in A, B, Thm\n"
+	if !strings.Contains(r.errOut, thm) {
+		t.Errorf("refresh: stderr lacks %q:\n%s", thm, r.errOut)
+	}
+	var st struct {
+		WithoutForms []struct {
+			Module string `json:"module"`
+		} `json:"without_forms"`
+	}
+	decode(t, invoke(t, "--config", config, "--json", "status"), &st)
+	var got []string
+	for _, w := range st.WithoutForms {
+		got = append(got, w.Module)
+	}
+	if want := []string{"A", "B", "Thm"}; !slices.Equal(got, want) {
+		t.Errorf("status --json: modules read without the forms %q, want %q", got, want)
+	}
+}
+
+// What the compiled part read with the forms depends on the forms' whole import closure, not only on the forms'
+// text. A and B each declare a definition `dup`, which Lean cannot import together. Home, which the forms import,
+// first imports A, and M, which imports A, is read with the forms and states Reflexive's fact. Then Home imports B
+// instead, with the same forms text, and M and A, which did not change, no longer load with the forms: the next
+// refresh reads them again, without the forms, and names them, and `states` no longer gives M's statement.
+func TestRefreshReadsAgainWhenTheFormsImportsChange(t *testing.T) {
+	requireLake(t)
+	ctx := context.Background()
+	lean, err := declindex.FindLean(ctx, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "tree")
+	compile := func(name, source string) {
+		t.Helper()
+		writeTestFile(t, filepath.Join(tree, name+".lean"), source)
+		if err := declindex.CompileModule(ctx, lean, nil, tree, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compile("A", "def dup : Nat := 3\n")
+	compile("B", "def dup : Nat := 4\n")
+	compile("Home", "import A\ntheorem Reflexive (n : Nat) : n = n := rfl\n")
+	compile("M", "import A\ntheorem useM (k : Nat) : k = k := rfl\n")
+	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
+	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
+		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
+	config := filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, M]\nregistry: registry\n"+
+		"lean:\n  export: true\n  jobs: 1\n")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-qm", "forms import A")
+	stating := func(label string) []string {
+		t.Helper()
+		var states map[string][]struct {
+			Declaration string `json:"declaration"`
+			Module      string `json:"declaration_module"`
+		}
+		decode(t, invoke(t, "--config", config, "--json", "states", "Reflexive"), &states)
+		var got []string
+		for _, s := range states["Reflexive"] {
+			if d := s.Module + "." + s.Declaration; !slices.Contains(got, d) {
+				got = append(got, d)
+			}
+		}
+		slices.Sort(got)
+		return got
+	}
+	apart := func() []string {
+		t.Helper()
+		var st struct {
+			WithoutForms []struct {
+				Module string `json:"module"`
+			} `json:"without_forms"`
+		}
+		decode(t, invoke(t, "--config", config, "--json", "status"), &st)
+		var got []string
+		for _, w := range st.WithoutForms {
+			if !slices.Contains(got, w.Module) {
+				got = append(got, w.Module)
+			}
+		}
+		return got
+	}
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	if got, want := stating("first"), []string{"Home.Reflexive", "M.useM"}; !slices.Equal(got, want) {
+		t.Fatalf("states Reflexive with the forms importing A: %q, want %q", got, want)
+	}
+	if got := apart(); !slices.Equal(got, []string{"B"}) {
+		t.Fatalf("modules without the forms importing A: %q, want [B]", got)
+	}
+	compile("Home", "import B\ntheorem Reflexive (n : Nat) : n = n := rfl\n")
+	git(t, tree, "commit", "-qam", "forms import B")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh after Home imports B: %+v", r)
+	}
+	if got, want := stating("after"), []string{"Home.Reflexive"}; !slices.Equal(got, want) {
+		t.Errorf("states Reflexive after Home imports B: %q, want %q (M no longer loads with the forms)", got, want)
+	}
+	if got := apart(); !slices.Equal(got, []string{"A", "M"}) {
+		t.Errorf("modules without the forms after Home imports B: %q, want [A M]", got)
+	}
+}
+
 // The gate reads the index's facts, so its verdict gives the count of the modules read without the registry's
 // forms, and its stderr names the index defect.
 func TestTheGateGivesTheCountOfModulesReadWithoutTheForms(t *testing.T) {

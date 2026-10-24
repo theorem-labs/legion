@@ -216,66 +216,55 @@ type exportPlan struct {
 	clashes []FormsClash
 	// clashing are the names that more than one module declares.
 	clashing map[string]bool
+	// checks counts the pairs of modules whose import together the plan asked Lean about, and loaded those that Lean
+	// imported.
+	checks, loaded int
 }
 
-// declSets maps a name to the modules that declare it, in some import closure: each list sorted, without repeats,
-// and never changed once made, so that the maps of many modules share them.
+// declSets maps a name to the modules that declare it in one import closure: each list sorted, without repeats, and
+// never changed once made, so that the closures of many modules share them.
 type declSets map[string][]string
 
-// merge adds o's declarations to d.
-func (d declSets) merge(o declSets) {
-	for n, ms := range o {
-		d[n] = union(d[n], ms)
+// mergeAll gives the union of parts. For each name it copies the lists once, or shares the one that holds the
+// others, so a module that imports N declarers of one name costs about N, not N².
+func mergeAll(parts []declSets) declSets {
+	switch len(parts) {
+	case 0:
+		return nil
+	case 1:
+		return parts[0]
 	}
-}
-
-// fits reports whether d and o share a declaration of every name that both hold.
-func (d declSets) fits(o declSets) bool {
-	for n, ms := range o {
-		if have, ok := d[n]; ok && disjoint(have, ms) {
-			return false
+	lists := map[string][][]string{}
+	for _, p := range parts {
+		for n, ms := range p {
+			lists[n] = append(lists[n], ms)
 		}
 	}
-	return true
-}
-
-// clashes gives the names, sorted, for which d and o each hold declarations and share none.
-func (d declSets) clashes(o declSets) []string {
-	var out []string
-	for n, ms := range o {
-		if have, ok := d[n]; ok && disjoint(have, ms) {
-			out = append(out, n)
-		}
+	out := make(declSets, len(lists))
+	for n, ls := range lists {
+		out[n] = unionAll(ls)
 	}
-	slices.Sort(out)
 	return out
 }
 
-// union gives the sorted union of the sorted lists a and b: a or b itself, not a copy, when it holds the other.
-func union(a, b []string) []string {
-	switch {
-	case subset(b, a):
-		return a
-	case subset(a, b):
-		return b
-	}
-	out := make([]string, 0, len(a)+len(b))
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		switch c := cmp.Compare(a[i], b[j]); {
-		case c < 0:
-			out = append(out, a[i])
-			i++
-		case c > 0:
-			out = append(out, b[j])
-			j++
-		default:
-			out = append(out, a[i])
-			i++
-			j++
+// unionAll gives the sorted union of the sorted lists ls: the longest of them, not a copy, when it holds the others.
+func unionAll(ls [][]string) []string {
+	longest, total := ls[0], 0
+	for _, l := range ls {
+		total += len(l)
+		if len(l) > len(longest) {
+			longest = l
 		}
 	}
-	return append(append(out, a[i:]...), b[j:]...)
+	if !slices.ContainsFunc(ls, func(l []string) bool { return !subset(l, longest) }) {
+		return longest
+	}
+	out := make([]string, 0, total)
+	for _, l := range ls {
+		out = append(out, l...)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // subset reports whether the sorted list a holds no element that the sorted list b does not.
@@ -293,34 +282,141 @@ func subset(a, b []string) bool {
 	return true
 }
 
-// disjoint reports whether the sorted lists a and b share no element.
-func disjoint(a, b []string) bool {
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		switch c := cmp.Compare(a[i], b[j]); {
-		case c < 0:
-			i++
-		case c > 0:
-			j++
-		default:
+// loadRule decides whether two sets of declarations of one name, each of which Lean loaded together, load together
+// in one environment (exportGroups).
+type loadRule struct {
+	ctx context.Context
+	// axioms gives, for each name that two modules declare, the modules whose declaration of it is an axiom.
+	axioms map[string]map[string]bool
+	// loads asks Lean whether one environment imports two modules (Exporter.loadsTogether); nil answers no.
+	loads func(ctx context.Context, modules []string) (bool, error)
+	// loaded holds each answer of loads, by the two modules in order.
+	loaded map[[2]string]bool
+	// err is the first error of loads: the plan is not made.
+	err error
+}
+
+// joins reports whether the declarations have (a group's) and ms (a module's, sorted) of the name n load together.
+// Where the two hold two axioms between them, they must be the same declarations. Else they must share one, or Lean
+// must import a module of each together: with at most one axiom, Lean's relation is transitive, so one such pair
+// joins the two sets.
+func (r *loadRule) joins(n string, have map[string]bool, ms []string) bool {
+	shared := 0
+	for _, m := range ms {
+		if have[m] {
+			shared++
+		}
+	}
+	count := 0
+	if ax := r.axioms[n]; len(ax) >= 2 {
+		for m := range have {
+			if ax[m] {
+				count++
+			}
+		}
+		for _, m := range ms {
+			if ax[m] && !have[m] {
+				count++
+			}
+		}
+	}
+	switch {
+	case count >= 2:
+		return shared == len(ms) && len(have) == len(ms)
+	case shared > 0:
+		return true
+	}
+	for _, h := range slices.Sorted(maps.Keys(have)) {
+		for _, m := range ms {
+			if r.loadTogether(h, m) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// loadTogether asks loads, once for each pair, whether Lean imports the modules a and b together.
+func (r *loadRule) loadTogether(a, b string) bool {
+	if r.loads == nil || r.err != nil {
+		return false
+	}
+	key := [2]string{min(a, b), max(a, b)}
+	if ok, asked := r.loaded[key]; asked {
+		return ok
+	}
+	ok, err := r.loads(r.ctx, key[:])
+	if err != nil {
+		r.err = err
+	}
+	r.loaded[key] = ok
+	return ok
+}
+
+// declGroup is the modules of one exporter environment and, for each name, the modules that declare it in their
+// import closures.
+type declGroup struct {
+	sets    map[string]map[string]bool
+	modules []string
+}
+
+func newDeclGroup(seed declSets) *declGroup {
+	g := &declGroup{sets: map[string]map[string]bool{}}
+	g.add(seed)
+	return g
+}
+
+func (g *declGroup) add(c declSets) {
+	for n, ms := range c {
+		set := g.sets[n]
+		if set == nil {
+			set = make(map[string]bool, len(ms))
+			g.sets[n] = set
+		}
+		for _, m := range ms {
+			set[m] = true
+		}
+	}
+}
+
+// fits reports whether every declaration set of c joins the group's (loadRule.joins).
+func (g *declGroup) fits(r *loadRule, c declSets) bool {
+	for n, ms := range c {
+		if have, ok := g.sets[n]; ok && !r.joins(n, have, ms) {
 			return false
 		}
 	}
 	return true
 }
 
+// clashes gives the names, sorted, whose declaration sets in c do not join the group's.
+func (g *declGroup) clashes(r *loadRule, c declSets) []string {
+	var out []string
+	for n, ms := range c {
+		if have, ok := g.sets[n]; ok && !r.joins(n, have, ms) {
+			out = append(out, n)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // exportGroups splits modules into the groups that one Lean environment can import together with base (the
-// modules that the registry's forms import). Lean imports two declarations of one name together only when one
-// subsumes the other: the same type, both theorems (Environment.lean, subsumesInfo). That relation is transitive,
-// and each module's import closure built, so all of its declarations of a name load together, as do base's. Two
-// sets of declarations of a name that share one therefore load together. Two that share none may not, and the index
-// cannot tell without their elaborated statements, so they clash. A module joins a group when, for every name that
-// both declare, the group's declarations and the module's share one. A module that clashes with base goes into a
-// group of apart, to be read without base, and each name that clashes is recorded with it. A project that declares
-// no name twice gives one group. Every declaration that a reference file records counts, also a name with a
-// component that starts with `_`: a user can write one (`_Value`), and the names that Lean makes there hold their
-// module (`_private.M.0.x`, `_aux_M_…`), so no two modules declare them.
-func exportGroups(ctx context.Context, q querier, modules, base []string) (exportPlan, error) {
+// modules that the registry's forms import). Lean imports a second declaration of a name only when one of the two
+// subsumes the other (Environment.lean, subsumesInfo): the same type, and both theorems or a theorem and an axiom;
+// two axioms only when a cheap check finds their type a proposition. Each module's import closure built, so its
+// declarations of a name loaded together, in its import order, as did base's. Among theorems and at most one axiom
+// that relation is transitive and does not depend on the order, so two such sets of declarations of a name load
+// together when they share one, or when Lean imports a module of each together (loads, an import that reads nothing:
+// the index cannot compare elaborated statements). Two axioms may have loaded only because a theorem came before
+// them, so two sets that hold two axioms between them load together only when they are the same set: the first
+// module of the environment that imports any of them then imports them all in the order it built with. A module
+// joins a group when, for every name that both declare, the two sets load together. A module that does not load
+// with base goes into a group of apart, to be read without base, and each name that clashes is recorded with it. A
+// project that declares no name twice gives one group. Every declaration that a reference file records counts, also
+// a name with a component that starts with `_`: a user can write one (`_Value`), and the names that Lean makes there
+// hold their module (`_private.M.0.x`, `_aux_M_…`), so no two modules declare them.
+func exportGroups(ctx context.Context, q querier, modules, base []string, loads func(context.Context, []string) (bool, error)) (exportPlan, error) {
 	plan := exportPlan{clashing: map[string]bool{}}
 	all, err := allDeclaring(ctx, q)
 	if err != nil {
@@ -344,6 +440,23 @@ func exportGroups(ctx context.Context, q querier, modules, base []string) (expor
 	if err != nil {
 		return plan, err
 	}
+	rule := &loadRule{ctx: ctx, axioms: map[string]map[string]bool{}, loads: loads, loaded: map[[2]string]bool{}}
+	rows, err := q.QueryContext(ctx, `SELECT name, module FROM decls WHERE kind = 'axiom'`)
+	if err := eachRow(rows, err, func(r *sql.Rows) error {
+		var n, m string
+		if err := r.Scan(&n, &m); err != nil {
+			return err
+		}
+		if plan.clashing[n] {
+			if rule.axioms[n] == nil {
+				rule.axioms[n] = map[string]bool{}
+			}
+			rule.axioms[n][m] = true
+		}
+		return nil
+	}); err != nil {
+		return plan, err
+	}
 	// claims is, for a module, the modules of its import closure that declare each name declared twice.
 	memo := map[string]declSets{}
 	var claims func(m string) declSets
@@ -352,41 +465,46 @@ func exportGroups(ctx context.Context, q querier, modules, base []string) (expor
 			return c
 		}
 		memo[m] = nil // a cycle, which Lean refuses, ends here
-		c := declSets{}
-		for _, n := range twice[m] {
-			c[n] = []string{m}
+		var parts []declSets
+		if own := twice[m]; len(own) > 0 {
+			o := make(declSets, len(own))
+			for _, n := range own {
+				o[n] = []string{m}
+			}
+			parts = append(parts, o)
 		}
 		for _, i := range imports[m] {
-			c.merge(claims(i))
+			if c := claims(i); len(c) > 0 {
+				parts = append(parts, c)
+			}
 		}
+		c := mergeAll(parts)
 		memo[m] = c
 		return c
 	}
-	baseClaims := declSets{}
+	var baseParts []declSets
 	for _, b := range base {
-		baseClaims.merge(claims(b))
+		baseParts = append(baseParts, claims(b))
 	}
-	type group struct {
-		claims  declSets
-		modules []string
-	}
-	var with, without []*group
-	place := func(gs []*group, seed declSets, m string, c declSets) []*group {
+	baseClaims := mergeAll(baseParts)
+	baseGroup := newDeclGroup(baseClaims)
+	var with, without []*declGroup
+	place := func(gs []*declGroup, seed declSets, m string, c declSets) []*declGroup {
 		for _, g := range gs {
-			if g.claims.fits(c) {
-				g.claims.merge(c)
+			if g.fits(rule, c) {
+				g.add(c)
 				g.modules = append(g.modules, m)
 				return gs
 			}
 		}
-		g := &group{claims: declSets{}, modules: []string{m}}
-		g.claims.merge(seed)
-		g.claims.merge(c)
+		g := newDeclGroup(seed)
+		g.add(c)
+		g.modules = []string{m}
 		return append(gs, g)
 	}
 	for _, m := range modules {
 		c := claims(m)
-		names := baseClaims.clashes(c)
+		names := baseGroup.clashes(rule, c)
 		if len(names) == 0 {
 			with = place(with, baseClaims, m, c)
 			continue
@@ -396,11 +514,20 @@ func exportGroups(ctx context.Context, q querier, modules, base []string) (expor
 			plan.clashes = append(plan.clashes, FormsClash{Module: m, Name: n, DeclaredIn: c[n], FormsDeclaredIn: baseClaims[n]})
 		}
 	}
+	if rule.err != nil {
+		return plan, rule.err
+	}
 	for _, g := range with {
 		plan.groups = append(plan.groups, g.modules)
 	}
 	for _, g := range without {
 		plan.apart = append(plan.apart, g.modules)
+	}
+	for _, ok := range rule.loaded {
+		plan.checks++
+		if ok {
+			plan.loaded++
+		}
 	}
 	slices.SortFunc(plan.clashes, func(a, b FormsClash) int {
 		return cmp.Or(cmp.Compare(a.Module, b.Module), cmp.Compare(a.Name, b.Name))

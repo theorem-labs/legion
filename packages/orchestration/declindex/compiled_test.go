@@ -156,14 +156,20 @@ func contains(ss []string, s string) bool {
 }
 
 // A definition's facts pass to every statement that applies it. When a landing changes the definition, a module
-// that applies it is matched again even if its own compiled module is byte for byte the same.
+// that applies it is matched again even if its own compiled module is byte for byte the same. The definition is in
+// Wrap, which the forms do not import: a change in the forms' import closure reads every module again
+// (TestRefreshReadsAgainWhenTheFormsImportsChange in cmd/declindex).
 func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 	tree, co := compiledTree(t)
 	l, ctx := co.Exporter.Lean, context.Background()
-	user := "import Fixture\n\ntheorem user_frame (R : BitVec 5 → BitVec 64) (_h : Fx.Frame (R 2#5) 8) : True := trivial\n"
-	if err := os.WriteFile(filepath.Join(tree.Source, "User.lean"), []byte(user), 0o644); err != nil {
-		t.Fatal(err)
+	write := func(rel, src string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(tree.Source, rel+".lean"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
+	write("Wrap", "import Fixture\n\ndef Fx.Aligned8 (sp : BitVec 64) : Prop := sp &&& 7#64 = 0#64\n")
+	write("User", "import Wrap\n\ntheorem user_aligned (R : BitVec 5 → BitVec 64) (_h : Fx.Aligned8 (R 2#5)) : True := trivial\n")
 	stamp := func(rel, h string) {
 		t.Helper()
 		for _, ext := range []string{".ilean.hash", ".olean.hash"} {
@@ -172,30 +178,29 @@ func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 			}
 		}
 	}
-	if err := CompileModule(ctx, l, nil, tree.Source, "User"); err != nil {
-		t.Fatal(err)
-	}
-	stamp("Fixture", "a")
-	stamp("User", "u")
-	tree.Roots["User"] = true
-	s := openStore(t)
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
-		t.Fatal(err)
-	}
-	if c, err := s.Constant(ctx, "user_frame", "User"); err != nil || len(c.Facts) != 1 || c.Facts[0].How != "via:Fx.Frame" {
-		t.Fatalf("before the change: %+v %v", c, err)
-	}
-	src, _ := os.ReadFile(filepath.Join(tree.Source, "Fixture.lean"))
-	changed := []byte(string(src[:0]) + strings.Replace(string(src), "n ≤ 64 ∧ sp &&& 7#64 = 0#64", "n ≤ 64 ∧ sp.toNat ≥ 0", 1))
-	if err := os.WriteFile(filepath.Join(tree.Source, "Fixture.lean"), changed, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for _, rel := range []string{"Fixture", "User"} {
+	for _, rel := range []string{"Wrap", "User"} {
 		if err := CompileModule(ctx, l, nil, tree.Source, rel); err != nil {
 			t.Fatal(err)
 		}
 	}
-	stamp("Fixture", "b")
+	stamp("Fixture", "a")
+	stamp("Wrap", "w")
+	stamp("User", "u")
+	tree.Roots["Wrap"], tree.Roots["User"] = true, true
+	s := openStore(t)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := s.Constant(ctx, "user_aligned", "User"); err != nil || len(c.Facts) != 1 || c.Facts[0].How != "via:Fx.Aligned8" {
+		t.Fatalf("before the change: %+v %v", c, err)
+	}
+	write("Wrap", "import Fixture\n\ndef Fx.Aligned8 (sp : BitVec 64) : Prop := sp.toNat ≥ 0\n")
+	for _, rel := range []string{"Wrap", "User"} {
+		if err := CompileModule(ctx, l, nil, tree.Source, rel); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stamp("Wrap", "w2")
 	stamp("User", "u")
 	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: compiledWith(co)})
 	if err != nil {
@@ -204,7 +209,7 @@ func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 	if st.Exported != 1 || st.Rematched != 1 {
 		t.Fatalf("exported %d and re-matched %d modules, want 1 and 1", st.Exported, st.Rematched)
 	}
-	if c, err := s.Constant(ctx, "user_frame", "User"); err != nil || len(c.Facts) != 0 {
+	if c, err := s.Constant(ctx, "user_aligned", "User"); err != nil || len(c.Facts) != 0 {
 		t.Fatalf("after the change the user still states the fact: %+v %v", c, err)
 	}
 }

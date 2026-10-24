@@ -25,7 +25,7 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
-const SchemaVersion = "8"
+const SchemaVersion = "9"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
@@ -106,13 +106,13 @@ CREATE INDEX IF NOT EXISTS facts_name ON facts (name);
 CREATE INDEX IF NOT EXISTS facts_module ON facts (module);
 -- The modules that the compiled step read without the registry's forms (FormsClash), each with a name that kept it
 -- from them: one row for each module (declarer) that declares the name in the module's import closure (forms 0) or in
--- the forms' imports' closure (forms 1). The two sides share no declarer.
+-- the forms' imports' closure (forms 1). A declarer can be on both sides, when the two sides hold two axioms.
 CREATE TABLE IF NOT EXISTS without_forms (
     module   TEXT NOT NULL,
     name     TEXT NOT NULL,
     declarer TEXT NOT NULL,
     forms    INTEGER NOT NULL,
-    PRIMARY KEY (module, name, declarer)
+    PRIMARY KEY (module, name, forms, declarer)
 ) WITHOUT ROWID;
 -- Each refresh that moved the index to another commit: landed, the commit it read, and previous, the commit it
 -- replaced ('' for the first). The post-landing registry check of a landing compares those two commits.

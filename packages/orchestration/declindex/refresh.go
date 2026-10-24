@@ -373,8 +373,9 @@ func writeSources(ctx context.Context, tx *sql.Tx, stored, current map[string]st
 	return sources.flush(ctx)
 }
 
-// writeModules replaces the reference rows of the changed and gone modules (and the compiled rows of the gone ones)
-// with those of the re-read modules: their imports, declarations, uses, modules rows and edges.
+// writeModules replaces the reference rows of the changed and gone modules (and the compiled rows of the gone ones,
+// and of the changed ones that could not be read, which leave the index) with those of the re-read modules: their
+// imports, declarations, uses, modules rows and edges.
 func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 	if err := deleteModules(ctx, tx, slices.Concat(r.gone, relsOf(r.changed)), r.old); err != nil {
 		return err
@@ -382,6 +383,13 @@ func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 	for _, rel := range r.gone {
 		if err := deleteCompiled(ctx, tx, r.old[rel].module); err != nil {
 			return err
+		}
+	}
+	for i, err := range r.errs {
+		if old, ok := r.old[r.changed[i].rel]; ok && err != nil {
+			if err := deleteCompiled(ctx, tx, old.module); err != nil {
+				return err
+			}
 		}
 	}
 	decls := newBatch(tx, "INSERT", "decls", 6)
