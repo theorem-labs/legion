@@ -190,6 +190,60 @@ def test_trap_table_is_checked(tmp_path: Path, change: str, replacement: str, me
         config.load(write(tmp_path, MINIMAL + TRAP_TABLE.replace(change, replacement)))
 
 
+PATCH_TABLE = """[image.patch_table]
+section = ".alternative"
+entry_size = 16
+site_offset = 0
+replacement_offset = 4
+address_size = 4
+relative = true
+length_offset = 10
+length_size = 2
+"""
+
+
+def test_patch_table_is_read(tmp_path: Path) -> None:
+    loaded = config.load(write(tmp_path, MINIMAL + PATCH_TABLE))
+    assert loaded.image.patch_table == config.PatchTable(
+        section=".alternative",
+        entry_size=16,
+        site_offset=0,
+        replacement_offset=4,
+        address_size=4,
+        relative=True,
+        length_offset=10,
+        length_size=2,
+    )
+    assert config.load(write(tmp_path, MINIMAL)).image.patch_table is None
+
+
+@pytest.mark.parametrize(
+    ("change", "replacement", "message"),
+    [
+        ("length_size = 2\n", "", r"image\.patch_table\.length_size is required"),
+        (
+            "replacement_offset = 4\n",
+            "replacement_offset = 13\n",
+            r"image\.patch_table's replacement field ends at byte 17, past entry_size 16",
+        ),
+        (
+            "length_offset = 10\n",
+            "length_offset = 15\n",
+            r"image\.patch_table's length field ends at byte 17, past entry_size 16",
+        ),
+        ("address_size = 4\n", "address_size = 2\n", r"image\.patch_table\.address_size must be 4 or 8"),
+        ("length_size = 2\n", "length_size = 3\n", r"image\.patch_table\.length_size must be 1, 2, 4 or 8"),
+        ("site_offset = 0\n", "site_offset = -1\n", r"image\.patch_table\.site_offset must be an integer"),
+        ("relative = true\n", "relative = 1\n", r"image\.patch_table\.relative must be a boolean"),
+        ('section = ".alternative"\n', 'section = ""\n', r"image\.patch_table\.section must name a section"),
+        ("length_size = 2\n", "length_size = 2\nvendor_offset = 8\n", r"image\.patch_table has unknown key vendor"),
+    ],
+)
+def test_patch_table_is_checked(tmp_path: Path, change: str, replacement: str, message: str) -> None:
+    with pytest.raises(config.ConfigError, match=message):
+        config.load(write(tmp_path, MINIMAL + PATCH_TABLE.replace(change, replacement)))
+
+
 def test_new_shadowing_header_reparses_all_units_that_include_it(copy: Path, tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     before, incremental_out, full_out = tmp_path / "before", tmp_path / "incremental", tmp_path / "full"

@@ -3,9 +3,9 @@
 /* Code whose facts depend on what the code around it does with it: mostly helpers the image inlines,
  * as link folds them into their callers, where what a caller does with a call decides which of the
  * helper's events are code there. Each function is a shape the kernel has; the comment names one
- * kernel site. The image links this file last, after the stubs, so the code of the files before it
- * keeps its addresses. It has no constant data, which would come before them, and no global, as the
- * image's .bss ends with the stubs' heap, which the image tests read. */
+ * kernel site. The image links this file after the stubs, followed only by src/patch.c, so the code
+ * of the files before it keeps its addresses. It has no constant data, which would come before
+ * them, and no global, as the image's .bss ends with the stubs' heap, which the image tests read. */
 
 /* include/linux/container_of.h, as src/facts.c gives it. */
 #define container_of(ptr, type, member) ({ \

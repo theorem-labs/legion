@@ -105,6 +105,25 @@ class TrapTable:
 
 
 @dataclass(frozen=True)
+class PatchTable:
+    """Where the image lists code it may replace when it starts (the kernel's alternatives, patched
+    at boot for the CPU's extensions and errata): one entry per replacement, ``entry_size`` bytes
+    each, little-endian, holding the address of the code it replaces (the site), the address of the
+    replacement, and the replacement's length in bytes, which the site has too. Each address is
+    ``address_size`` bytes, absolute or with ``relative`` a signed offset from its own field. The
+    kernel's ``.alternative`` holds ``struct alt_entry``."""
+
+    section: str
+    entry_size: int
+    site_offset: int
+    replacement_offset: int
+    address_size: int
+    relative: bool
+    length_offset: int
+    length_size: int
+
+
+@dataclass(frozen=True)
 class ImageRules:
     thread_pointer: str | None = None
     percpu_sections: tuple[str, ...] = ()
@@ -112,6 +131,7 @@ class ImageRules:
     # Image callee -> the C function it stands for.
     call_aliases: dict[str, str] = field(default_factory=dict)
     trap_table: TrapTable | None = None
+    patch_table: PatchTable | None = None
 
     def symbol_class(self, name: str, section: str = "") -> str:
         """``per_cpu``, ``compiler_symbol``, ``constant_data`` or ``state`` for a data symbol."""
@@ -219,6 +239,27 @@ def _unknown(table: dict[str, Any], allowed: set[str], where: str) -> None:
         raise ConfigError(f"{where} has unknown key {extra[0]}")
 
 
+def _entry_number(table: dict[str, Any], key: str, where: str) -> int:
+    value = _expect(table, key, int, where, required=True)
+    if isinstance(value, bool) or value < 0:
+        raise ConfigError(f"{where}.{key} must be an integer")
+    return int(value)
+
+
+def _entry_section(table: dict[str, Any], where: str) -> str:
+    section = _expect(table, "section", str, where, required=True)
+    if not section:
+        raise ConfigError(f"{where}.section must name a section")
+    return str(section)
+
+
+def _entry_fields(where: str, entry_size: int, fields: tuple[tuple[str, int, int], ...]) -> None:
+    """Each field of a table's entry (its name, offset and size) lies inside the entry."""
+    for name, offset, size in fields:
+        if offset + size > entry_size:
+            raise ConfigError(f"{where}'s {name} field ends at byte {offset + size}, past entry_size {entry_size}")
+
+
 def _trap_table(table: dict[str, Any]) -> TrapTable:
     where = "image.trap_table"
     _unknown(
@@ -227,26 +268,17 @@ def _trap_table(table: dict[str, Any]) -> TrapTable:
         | {"resume_flags"},
         where,
     )
-
-    def number(key: str) -> int:
-        value = _expect(table, key, int, where, required=True)
-        if isinstance(value, bool) or value < 0:
-            raise ConfigError(f"{where}.{key} must be an integer")
-        return int(value)
-
-    section = _expect(table, "section", str, where, required=True)
-    if not section:
-        raise ConfigError(f"{where}.section must name a section")
+    section = _entry_section(table, where)
     relative = _expect(table, "relative", bool, where, required=True)
     trap = TrapTable(
         section=section,
-        entry_size=number("entry_size"),
-        address_offset=number("address_offset"),
-        address_size=number("address_size"),
+        entry_size=_entry_number(table, "entry_size", where),
+        address_offset=_entry_number(table, "address_offset", where),
+        address_size=_entry_number(table, "address_size", where),
         relative=relative,
-        flags_offset=number("flags_offset"),
-        flags_size=number("flags_size"),
-        resume_flags=number("resume_flags"),
+        flags_offset=_entry_number(table, "flags_offset", where),
+        flags_size=_entry_number(table, "flags_size", where),
+        resume_flags=_entry_number(table, "resume_flags", where),
     )
     if trap.address_size not in (4, 8):
         raise ConfigError(f"{where}.address_size must be 4 or 8")
@@ -254,13 +286,48 @@ def _trap_table(table: dict[str, Any]) -> TrapTable:
         raise ConfigError(f"{where}.flags_size must be 1, 2, 4 or 8")
     if not trap.resume_flags:
         raise ConfigError(f"{where}.resume_flags must be a nonzero bit mask")
-    for name, offset, size in (
-        ("address", trap.address_offset, trap.address_size),
-        ("flags", trap.flags_offset, trap.flags_size),
-    ):
-        if offset + size > trap.entry_size:
-            raise ConfigError(f"{where}'s {name} field ends at byte {offset + size}, past entry_size {trap.entry_size}")
+    _entry_fields(
+        where,
+        trap.entry_size,
+        (("address", trap.address_offset, trap.address_size), ("flags", trap.flags_offset, trap.flags_size)),
+    )
     return trap
+
+
+def _patch_table(table: dict[str, Any]) -> PatchTable:
+    where = "image.patch_table"
+    _unknown(
+        table,
+        {"section", "entry_size", "site_offset", "replacement_offset", "address_size", "relative", "length_offset"}
+        | {"length_size"},
+        where,
+    )
+    section = _entry_section(table, where)
+    relative = _expect(table, "relative", bool, where, required=True)
+    patch = PatchTable(
+        section=section,
+        entry_size=_entry_number(table, "entry_size", where),
+        site_offset=_entry_number(table, "site_offset", where),
+        replacement_offset=_entry_number(table, "replacement_offset", where),
+        address_size=_entry_number(table, "address_size", where),
+        relative=relative,
+        length_offset=_entry_number(table, "length_offset", where),
+        length_size=_entry_number(table, "length_size", where),
+    )
+    if patch.address_size not in (4, 8):
+        raise ConfigError(f"{where}.address_size must be 4 or 8")
+    if patch.length_size not in (1, 2, 4, 8):
+        raise ConfigError(f"{where}.length_size must be 1, 2, 4 or 8")
+    _entry_fields(
+        where,
+        patch.entry_size,
+        (
+            ("site", patch.site_offset, patch.address_size),
+            ("replacement", patch.replacement_offset, patch.address_size),
+            ("length", patch.length_offset, patch.length_size),
+        ),
+    )
+    return patch
 
 
 def load(path: Path, root: Path | None = None) -> Config:
@@ -415,7 +482,7 @@ def load(path: Path, root: Path | None = None) -> Config:
     image_table = _expect(data, "image", dict, "configuration") or {}
     _unknown(
         image_table,
-        {"arch", "thread_pointer", "percpu_sections", "symbol_classes", "call_aliases", "trap_table"},
+        {"arch", "thread_pointer", "percpu_sections", "symbol_classes", "call_aliases", "trap_table", "patch_table"},
         "image",
     )
     aliases = _expect(image_table, "call_aliases", dict, "image") or {}
@@ -435,12 +502,14 @@ def load(path: Path, root: Path | None = None) -> Config:
             except re.error as error:
                 raise ConfigError(f"image.symbol_classes.{kind} is not a valid regular expression: {error}") from error
     trap_table = _expect(image_table, "trap_table", dict, "image")
+    patch_table = _expect(image_table, "patch_table", dict, "image")
     image_rules = ImageRules(
         thread_pointer=_expect(image_table, "thread_pointer", str, "image"),
         percpu_sections=tuple(_strings(image_table, "percpu_sections", "image")),
         symbol_classes=symbol_classes,
         call_aliases=dict(aliases),
         trap_table=None if trap_table is None else _trap_table(trap_table),
+        patch_table=None if patch_table is None else _patch_table(patch_table),
     )
 
     contract_table = _expect(data, "contract_graph", dict, "configuration") or {}

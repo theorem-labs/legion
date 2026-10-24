@@ -21,7 +21,7 @@ from elftools.elf.constants import SH_FLAGS
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 
-from .config import ImageRules, TrapTable
+from .config import ImageRules, PatchTable, TrapTable
 from .errors import InputError
 from .imagecache import ImageCache
 
@@ -331,18 +331,47 @@ def _chosen_value(instruction: Any, operands: list[Any], state: _State) -> tuple
     return operands[0].reg, frozenset((address + immediate) & _MASK for address in state.choices[source])
 
 
-def _flow(decoder: Any, instructions: list[Any], never_returns: Any = None, halts: Any = None) -> list[list[int]]:
+@dataclass(frozen=True)
+class _Patch:
+    """A replacement the image may patch over a site of a function when it starts: the site is the
+    function's instructions from index ``site`` up to ``after`` (the function's length where the site
+    ends it), and the replacement's instructions are ``first`` to ``last``, after the function's own."""
+
+    site: int
+    after: int
+    first: int
+    last: int
+
+
+def _roots(patches: tuple[_Patch, ...]) -> tuple[int, ...]:
+    """Where a function's code may start: its first instruction, and a replacement patched over it."""
+    return (0, *(patch.first for patch in patches if patch.site == 0))
+
+
+def _flow(
+    decoder: Any,
+    instructions: list[Any],
+    never_returns: Any = None,
+    halts: Any = None,
+    patches: tuple[_Patch, ...] = (),
+) -> list[list[int]]:
     """The successors of each instruction: the next one, a branch target, none after a return, an
     indirect jump, a jump to an address outside the function, a trap that does not resume
     (``halts(address)``; a BUG, where a WARN's trap resumes), or a call to a function that never
     returns (``never_returns(address)``; panic, rest_init), after which the compiler places code
-    that only other paths reach."""
+    that only other paths reach. Where the image may patch a site (``patches``), whatever leads to
+    the site leads to its replacement too, which continues after the site where it does not jump."""
     index_of = {instruction.address: index for index, instruction in enumerate(instructions)}
+    own = patches[0].first if patches else len(instructions)
+    resume = {patch.last: patch.after for patch in patches}
     successors: list[list[int]] = []
     for index, instruction in enumerate(instructions):
         mnemonic = instruction.mnemonic
         operands = list(instruction.operands)
-        following = [index + 1] if index + 1 < len(instructions) else []
+        if index in resume:
+            following = [resume[index]] if resume[index] < own else []
+        else:
+            following = [index + 1] if index + 1 < len(instructions) and index + 1 != own else []
         target = None
         if (mnemonic in _BRANCHES or mnemonic in {"j", "c.j"}) and operands and operands[-1].type == CS_OP_IMM:
             target = index_of.get((instruction.address + operands[-1].imm) & _MASK)
@@ -360,6 +389,10 @@ def _flow(decoder: Any, instructions: list[Any], never_returns: Any = None, halt
             successors.append([] if never_returns(callee) else following)
         else:
             successors.append(following)
+    for patch in patches:
+        for following in successors:
+            if patch.site in following and patch.first not in following:
+                following.append(patch.first)
     return successors
 
 
@@ -569,6 +602,31 @@ def read_trap_table(data: bytes, section_address: int, table: TrapTable) -> dict
     return traps
 
 
+def read_patch_table(data: bytes, section_address: int, table: PatchTable) -> list[tuple[int, int, int]]:
+    """Each replacement the table at ``section_address`` lists, in its order: the address of the site
+    it replaces, its own address, and its length in bytes, which the site has too."""
+    if len(data) % table.entry_size:
+        raise InputError(
+            f"patch table {table.section} holds {len(data)} bytes, not a whole number of {table.entry_size}-byte entries"
+        )
+
+    def address(position: int) -> int:
+        value = int.from_bytes(data[position : position + table.address_size], "little", signed=table.relative)
+        return (section_address + position + value) & _MASK if table.relative else value
+
+    def length(position: int) -> int:
+        return int.from_bytes(data[position : position + table.length_size], "little")
+
+    return [
+        (
+            address(start + table.site_offset),
+            address(start + table.replacement_offset),
+            length(start + table.length_offset),
+        )
+        for start in range(0, len(data), table.entry_size)
+    ]
+
+
 def code_symbol(kind: str, size: int, *, executable: bool) -> bool:
     """Whether a symbol is a routine the C can call or take the address of. An assembly routine
     (handle_exception, ret_from_fork_kernel_asm) carries a size but no function type, and a
@@ -622,19 +680,41 @@ class Image:
         self.no_return: dict[int, bool] = {}
         # Each trap the image's trap table lists, and whether it resumes ([image] trap_table).
         self.traps: dict[int, bool] = {} if rules.trap_table is None else self._read_traps(image, rules.trap_table)
+        # Each site the image may patch when it starts, with the address and the code of each of its
+        # replacements ([image] patch_table).
+        self.patches: dict[int, list[tuple[int, bytes]]] = (
+            {} if rules.patch_table is None else self._read_patches(image, rules.patch_table)
+        )
         self.image_cache = ImageCache(cache_directory, image, system_map, rules, Path(__file__))
 
-    def _read_traps(self, image: Path, table: TrapTable) -> dict[int, bool]:
-        section = self.elf.get_section_by_name(table.section)
+    def _table(self, image: Path, name: str, key: str) -> tuple[bytes, int]:
+        """The bytes and the address of the section an ``[image]`` table names."""
+        section = self.elf.get_section_by_name(name)
         if section is None:
             self.handle.close()
-            raise InputError(f"image {image} has no section {table.section}, which [image] trap_table names")
+            raise InputError(f"image {image} has no section {name}, which [image] {key} names")
         try:
             data = section.data()
         except (OSError, ELFError) as error:
             self.handle.close()
-            raise InputError(f"cannot read section {table.section} of {image}: {error}") from error
-        return read_trap_table(data, int(section["sh_addr"]), table)
+            raise InputError(f"cannot read section {name} of {image}: {error}") from error
+        return data, int(section["sh_addr"])
+
+    def _read_traps(self, image: Path, table: TrapTable) -> dict[int, bool]:
+        return read_trap_table(*self._table(image, table.section, "trap_table"), table)
+
+    def _read_patches(self, image: Path, table: PatchTable) -> dict[int, list[tuple[int, bytes]]]:
+        patches: dict[int, list[tuple[int, bytes]]] = {}
+        for site, replacement, length in read_patch_table(*self._table(image, table.section, "patch_table"), table):
+            code = self._text(replacement, length)
+            if code is None or len(code) != length:
+                self.handle.close()
+                raise InputError(
+                    f"patch table {table.section} lists a replacement of {length} bytes at {_hex(replacement)} "
+                    f"outside the code of image {image}"
+                )
+            patches.setdefault(site, []).append((replacement, code))
+        return patches
 
     def _halts(self, address: int) -> bool:
         """Whether the trap at ``address`` stops: the trap table lists it, without the resume flag."""
@@ -765,7 +845,12 @@ class Image:
 
     def _code(self, symbol: Symbol) -> bytes | None:
         """A function's machine code, or None where it lies outside executable sections."""
-        section = self.section_of(symbol.address)
+        return self._text(symbol.address, max(0, self._end(symbol) - symbol.address))
+
+    def _text(self, address: int, length: int) -> bytes | None:
+        """Up to ``length`` bytes of the executable section at ``address``, or None where no
+        executable section holds the address."""
+        section = self.section_of(address)
         if section is None or not section[3]:
             return None
         data = self.section_data.get(section[2])
@@ -773,8 +858,8 @@ class Image:
             elf_section = self.elf.get_section_by_name(section[2])
             data = elf_section.data() if elf_section is not None else b""
             self.section_data[section[2]] = data
-        start = symbol.address - section[0]
-        return data[start : start + max(0, self._end(symbol) - symbol.address)]
+        start = address - section[0]
+        return data[start : start + length]
 
     def never_returns(self, address: int) -> bool:
         """Whether the function that starts at ``address`` cannot return to its caller: its code
@@ -832,8 +917,8 @@ class Image:
                         raise self.image_cache.malformed(facts_key)
                     self.cache[symbol.address] = loaded
                     return loaded
-        instructions = list(self.decoder.disasm(code, symbol.address))
-        facts = self._decode(symbol.name, instructions)
+        instructions, patches = self._patched(list(self.decoder.disasm(code, symbol.address)))
+        facts = self._decode(symbol.name, instructions, patches)
         self.cache[symbol.address] = facts
         if self.image_cache.enabled:
             callees = self._direct_callees(instructions)
@@ -874,16 +959,44 @@ class Image:
 
     def decode(self, name: str, code: bytes, address: int) -> FunctionFacts:
         """The facts of a function's machine code that starts at ``address``."""
-        return self._decode(name, list(self.decoder.disasm(code, address)))
+        return self._decode(name, *self._patched(list(self.decoder.disasm(code, address))))
 
-    def _decode(self, name: str, instructions: list[Any]) -> FunctionFacts:
+    def _patched(self, instructions: list[Any]) -> tuple[list[Any], tuple[_Patch, ...]]:
+        """A function's instructions, then those of each replacement the image may patch over one of
+        its sites (``[image] patch_table``), decoded where the replacement lies, and where each runs.
+        A replacement the decoder cannot decode whole, or whose site does not start and end at the
+        function's instructions, is left out: the function's decoding cannot place it."""
+        if not instructions:
+            return instructions, ()
+        start, end = instructions[0].address, instructions[-1].address + instructions[-1].size
+        sites = sorted(site for site in self.patches if start <= site < end)
+        if not sites:
+            return instructions, ()
+        index_of = {instruction.address: index for index, instruction in enumerate(instructions)}
+        extended = list(instructions)
+        patches: list[_Patch] = []
+        for site in (site for site in sites if site in index_of):
+            for replacement, code in self.patches[site]:
+                decoded = list(self.decoder.disasm(code, replacement))
+                after = site + len(code)
+                if not decoded or sum(item.size for item in decoded) != len(code):
+                    continue
+                if after != end and after not in index_of:
+                    continue
+                first = len(extended)
+                extended += decoded
+                patches.append(_Patch(index_of[site], index_of.get(after, len(instructions)), first, len(extended) - 1))
+        return extended, tuple(patches)
+
+    def _decode(self, name: str, instructions: list[Any], patches: tuple[_Patch, ...]) -> FunctionFacts:
         facts = FunctionFacts()
-        successors = _flow(self.decoder, instructions, self.never_returns, self._halts)
-        states = self._block_states(instructions, successors)
+        successors = _flow(self.decoder, instructions, self.never_returns, self._halts, patches)
+        roots = _roots(patches)
+        states = self._block_states(instructions, successors, roots=roots)
         before = dict(states)
-        first = dict(self._block_states(instructions, successors, _retreating(successors)))
+        first = dict(self._block_states(instructions, successors, _retreating(successors), roots))
         returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
-        frame = _frame(self.decoder, instructions, successors)
+        frame = _frame(self.decoder, instructions, successors, patches)
         self.frame_rooted = frame.rooted
         for index, state in states:
             instruction = instructions[index]
@@ -1047,6 +1160,7 @@ class Image:
         instructions: list[Any],
         successors: list[list[int]],
         ignored: frozenset[tuple[int, int]] = frozenset(),
+        roots: tuple[int, ...] = (0,),
     ) -> list[tuple[int, _State]]:
         """Each instruction's index with the register state before it, from a forward must-analysis
         over the function's basic blocks: a register holds a value at a block's start only when every
@@ -1054,10 +1168,11 @@ class Image:
         a join is followed, and one formed on only one path is not. Blocks no instruction leads to are
         reached through an indirect jump (a jump table): they start from the state those jumps leave.
         The ``ignored`` edges (a loop's back edges) carry no state: then a loop's head holds what the
-        loop enters with, the state of its first pass."""
+        loop enters with, the state of its first pass. The ``roots`` start with no register known:
+        the function's entry, and a replacement the image may patch over it (``_roots``)."""
         if not instructions:
             return []
-        leaders = {0}
+        leaders = set(roots)
         for index, following in enumerate(successors):
             if following != [index + 1]:
                 leaders.update(following)
@@ -1068,7 +1183,8 @@ class Image:
         ends = {start: (starts[position + 1] if position + 1 < len(starts) else len(instructions))
                 for position, start in enumerate(starts)}  # fmt: skip
         entry: dict[int, _State | None] = {start: None for start in starts}
-        entry[0] = _State()
+        for root in roots:
+            entry[root] = _State()
         indirect: list[_State] = []
 
         def settle(pending: list[int]) -> None:
@@ -1096,7 +1212,7 @@ class Image:
                         entry[successor] = merged
                         pending.append(successor)
 
-        settle([0])
+        settle(list(roots))
         orphans = [start for start in starts if entry[start] is None and start not in reached]
         if orphans and indirect:
             seed = indirect[0]
@@ -1649,7 +1765,9 @@ def _frame_join(states: list[_Rooted]) -> _Rooted:
     return joined
 
 
-def _frame(decoder: Any, instructions: list[Any], successors: list[list[int]]) -> _Frame:
+def _frame(
+    decoder: Any, instructions: list[Any], successors: list[list[int]], patches: tuple[_Patch, ...] = ()
+) -> _Frame:
     """The frame accesses, the frame addresses, the frame addresses passed in argument registers to
     calls (the call's address, the argument's position, the offset), and the frame accesses past a
     variable index of a function, as offsets from the value sp had on entry (``_frame_deltas``).
@@ -1660,14 +1778,17 @@ def _frame(decoder: Any, instructions: list[Any], successors: list[list[int]]) -
     (fbatch.folios[i]), a call keeps only the callee-saved ones, and a join keeps a register only
     where every incoming path holds a frame address in it (do_sys_poll's s1 is the frame's list head
     on entry to its loop, a heap list after it), with every offset those paths give
-    (sched_balance_find_dst_cpu's &local_sgs or &idlest_sgs)."""
-    prologue, saved = _frame_deltas(decoder, instructions)
-    count = len(instructions)
-    entry: dict[int, _Rooted] = {0: {}} if count else {}
-    pending = [0] if count else []
+    (sched_balance_find_dst_cpu's &local_sgs or &idlest_sgs). A replacement the image may patch over a
+    site (``patches``) runs where the site is: before the prologue sets s0, s0 is the caller's."""
+    own = patches[0].first if patches else len(instructions)
+    prologue, saved = _frame_deltas(decoder, instructions[:own])
+    position = list(range(own)) + [patch.site for patch in patches for _ in range(patch.first, patch.last + 1)]
+    roots = _roots(patches) if instructions else ()
+    entry: dict[int, _Rooted] = {root: {} for root in roots}
+    pending = list(roots)
     while pending:
         index = pending.pop()
-        deltas = {name: offset for name, (offset, start) in prologue.items() if start <= index}
+        deltas = {name: offset for name, (offset, start) in prologue.items() if start <= position[index]}
         call = _frame_call(decoder, instructions[index], successors[index])
         after = _frame_step(decoder, instructions[index], entry[index], deltas, call)
         for following in successors[index]:
@@ -1682,7 +1803,7 @@ def _frame(decoder: Any, instructions: list[Any], successors: list[list[int]]) -
     indexed_accesses: set[tuple[int, int]] = set()
     rooted: dict[int, frozenset[str]] = {}
     for index, instruction in enumerate(instructions):
-        deltas = {name: offset for name, (offset, start) in prologue.items() if start <= index}
+        deltas = {name: offset for name, (offset, start) in prologue.items() if start <= position[index]}
         state = entry.get(index, {})
         operands = list(instruction.operands)
         mnemonic = instruction.mnemonic

@@ -50,6 +50,7 @@ def _rules(rules: ImageRules) -> dict[str, Any]:
         "symbol_classes": {name: pattern.pattern for name, pattern in sorted(rules.symbol_classes.items())},
         "call_aliases": dict(sorted(rules.call_aliases.items())),
         "trap_table": None if rules.trap_table is None else dataclasses.asdict(rules.trap_table),
+        "patch_table": None if rules.patch_table is None else dataclasses.asdict(rules.patch_table),
     }
 
 

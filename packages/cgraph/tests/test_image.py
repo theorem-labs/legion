@@ -162,13 +162,14 @@ def test_image_cache_key_covers_each_decoder_input(tmp_path: Path, monkeypatch: 
         key(arities={"callee": 2}),
         key(arities={"other": 1}),
         key(rules=dataclasses.replace(loaded.image, trap_table=_bug_table())),
+        key(rules=dataclasses.replace(loaded.image, patch_table=None)),
     }
     monkeypatch.setattr(imagecache.capstone, "__version__", "changed")
     keys.add(key())
     monkeypatch.undo()
     monkeypatch.setattr(imagecache.elftools, "__version__", "changed")
     keys.add(key())
-    assert len(keys) == 14
+    assert len(keys) == 15
 
 
 def test_disabled_image_cache_does_not_read_inputs(tmp_path: Path) -> None:
@@ -813,6 +814,155 @@ def test_code_after_a_trap_that_resumes_is_reached_from_it(image: Image) -> None
     """A WARN (flags 0x909, the resume bit set) continues, so the load reads pair_a or pair_b."""
     facts = _after_a_trap(image, flags=0x909)
     assert {("pair_a", "load_or_store_some_path"), ("pair_b", "load_or_store_some_path")} <= _operations(facts)
+
+
+NOP = 0x00000013
+
+
+def _alternatives() -> config.PatchTable:
+    """The kernel's .alternative (struct alt_entry): the site and the replacement as offsets from
+    their own fields, then a u16 vendor, the u16 length of the replacement, and a u32 patch number."""
+    return config.PatchTable(
+        section=".alternative",
+        entry_size=16,
+        site_offset=0,
+        replacement_offset=4,
+        address_size=4,
+        relative=True,
+        length_offset=10,
+        length_size=2,
+    )
+
+
+def _alternative_entries(section: int, entries: list[tuple[int, int, int]]) -> bytes:
+    return b"".join(
+        struct.pack("<iiHHI", site - (section + 16 * index), replacement - (section + 16 * index + 4), 0, length, 52)
+        for index, (site, replacement, length) in enumerate(entries)
+    )
+
+
+def test_a_patch_table_lists_each_site_with_its_replacement() -> None:
+    """extract_entropy's site and its replacement, both before the table, and one after it."""
+    section = 0xFFFFFFFF80A00000
+    entries = [(0xFFFFFFFF800FDA3A, 0xFFFFFFFF800FDFE8, 4), (0xFFFFFFFF80A10000, 0xFFFFFFFF80A20000, 8)]
+    assert image_module.read_patch_table(_alternative_entries(section, entries), section, _alternatives()) == entries
+
+
+def test_an_absolute_patch_table_is_read() -> None:
+    table = dataclasses.replace(
+        _alternatives(), entry_size=24, replacement_offset=8, address_size=8, relative=False, length_offset=16
+    )
+    data = struct.pack("<QQH6x", 0x1000, 0x2000, 4) + struct.pack("<QQH6x", 0x3000, 0x4000, 8)
+    assert image_module.read_patch_table(data, 0x5000, table) == [(0x1000, 0x2000, 4), (0x3000, 0x4000, 8)]
+
+
+def test_a_patch_table_of_partial_entries_is_an_input_error() -> None:
+    with pytest.raises(InputError, match=r"\.alternative holds 20 bytes, not a whole number of 16-byte entries"):
+        image_module.read_patch_table(bytes(20), 0x5000, _alternatives())
+
+
+def test_a_patch_table_the_image_lacks_is_an_input_error() -> None:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    rules = dataclasses.replace(loaded.image, patch_table=dataclasses.replace(_alternatives(), section=".altinstr"))
+    with pytest.raises(InputError, match=r"has no section \.altinstr, which \[image\] patch_table names"):
+        Image(loaded.inputs.image, loaded.inputs.system_map, rules)
+
+
+def test_a_replacement_outside_the_images_code_is_an_input_error() -> None:
+    """Read as absolute, the fixture's relative offsets are small addresses that no section holds."""
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    rules = dataclasses.replace(loaded.image, patch_table=dataclasses.replace(_alternatives(), relative=False))
+    with pytest.raises(InputError, match=r"\.alternative lists a replacement of 4 bytes at 0x[0-9a-f]+ outside"):
+        Image(loaded.inputs.image, loaded.inputs.system_map, rules)
+
+
+def test_the_patch_table_gives_each_site_its_replacement_code(image: Image) -> None:
+    """The fixture's one site: patch_fill's ``j``, which the program replaces with a ``nop``."""
+    (symbol,) = image.functions["patch_fill"]
+    ((site, replacements),) = image.patches.items()
+    assert symbol.address <= site < symbol.address + symbol.size
+    assert [code for _, code in replacements] == [struct.pack("<I", NOP)]
+
+
+def test_a_global_read_only_on_the_path_a_patch_opens_is_accessed(image: Image) -> None:
+    """patch_fill tests a feature with the kernel's riscv_has_extension_likely: ``j no``, which the
+    program replaces with a ``nop`` on a CPU that has it. The read and the store of patch_reported
+    are only on that path, through the register an ``auipc`` set before the loop, as
+    extract_entropy reads csr_seed_long.__already_done."""
+    (symbol,) = image.functions["patch_fill"]
+    assert ("patch_reported", "load_or_store") in _operations(image.facts(symbol))
+
+
+def _patched(
+    image: Image, monkeypatch: pytest.MonkeyPatch, words: list[int], site: int, replacement: list[int]
+) -> FunctionFacts:
+    """Decode ``words`` at anchor_pair's address, where the word at index ``site`` may be replaced
+    by ``replacement``, which lies 0x1000 bytes after the function."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack(f"<{len(replacement)}I", *replacement)
+    monkeypatch.setattr(image, "patches", {start + 4 * site: [(start + 0x1000, code)]})
+    return image.decode("synthetic", struct.pack(f"<{len(words)}I", *words), start)
+
+
+def test_code_a_jump_skips_is_reached_where_a_patch_replaces_the_jump(
+    image: Image, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``auipc s1``, then ``j`` over ``ld a1, lo(s1)``: unpatched, nothing reaches the load; the
+    program may replace the jump with a ``nop``, and then the load reads pair_a."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    words = [_u(0x17, S1, high), _jump(12), _load(A1, S1, low), RET, RET]
+    unpatched = image.decode("synthetic", struct.pack("<5I", *words), start)
+    assert "pair_a" not in {name for name, _ in _operations(unpatched)}
+    assert ("pair_a", "load_or_store") in _operations(_patched(image, monkeypatch, words, 1, [NOP]))
+
+
+def test_code_only_a_patch_jumps_to_is_reached_with_the_registers_at_the_site(
+    image: Image, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """riscv_has_extension_unlikely: a ``nop`` the program may replace with a ``j`` to code no other
+    instruction reaches; there the load through s1 reads pair_b."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_b"][0].address - start)
+    words = [_u(0x17, S1, high), NOP, RET, _load(A1, S1, low), RET]
+    facts = _patched(image, monkeypatch, words, 1, [_jump(start + 12 - (start + 0x1000))])
+    assert ("pair_b", "load_or_store") in _operations(facts)
+
+
+def test_a_replacement_that_sets_a_register_gives_its_value_on_its_path(
+    image: Image, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """s1 = &pair_a, then a ``nop`` the program may replace with ``addi s1, s1, 8``: the load after
+    the site reads pair_a or pair_b."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    words = [_u(0x17, S1, high), _addi(S1, S1, low), NOP, _load(A1, S1, 0), RET]
+    facts = _patched(image, monkeypatch, words, 2, [_addi(S1, S1, 8)])
+    assert {("pair_a", "load_or_store_some_path"), ("pair_b", "load_or_store_some_path")} <= _operations(facts)
+
+
+def test_a_patch_at_the_first_instruction_is_a_path_from_the_entry(
+    image: Image, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``nop`` at the entry the program may replace with a ``j`` past ``s1 = &pair_a`` to the load:
+    on that path s1 is what the caller left, so the load claims no object, and the ``addi`` whose
+    address the join loses is the access."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - (start + 4))
+    words = [NOP, _u(0x17, S1, high), _addi(S1, S1, low), _load(A1, S1, 0), RET]
+    facts = _patched(image, monkeypatch, words, 0, [_jump(start + 12 - (start + 0x1000))])
+    assert _operations(facts) == {("pair_a", "addi_address")}
+
+
+def test_a_replacement_runs_where_its_site_is_in_the_prologue(image: Image, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A replacement ``ld a0, -24(s0)`` at a site before ``addi s0, sp, 64`` reads through the
+    caller's s0, a field offset; at a site after it, the function's frame."""
+    early = [_addi(SP, SP, -64), _store(S0, SP, 48), NOP, _addi(S0, SP, 64), RET]
+    facts = _patched(image, monkeypatch, early, 2, [_load(A0, S0, -24)])
+    assert -24 in facts.memory_offsets and (-24, 8) not in facts.frame_accesses
+    late = [_addi(SP, SP, -64), _store(S0, SP, 48), _addi(S0, SP, 64), NOP, RET]
+    facts = _patched(image, monkeypatch, late, 3, [_load(A0, S0, -24)])
+    assert -24 not in facts.memory_offsets and (-24, 8) in facts.frame_accesses
 
 
 def _at(image: Image, register: int, address: int, *tail: int) -> FunctionFacts:

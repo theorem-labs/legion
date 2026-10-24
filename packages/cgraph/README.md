@@ -107,7 +107,11 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   (`buf[len - 1]`). A call to a function whose code has no return and no jump out of itself
   (`rest_init`, `panic`) does not continue, so code the compiler places after it is reached only
   by its other paths. Nor does an `ebreak` that `[image.trap_table]` lists without the resume flag
-  (a BUG); a WARN's resumes, as does any trap the table does not list.
+  (a BUG); a WARN's resumes, as does any trap the table does not list. Code that
+  `[image.patch_table]` lists as patched when the program starts (the kernel's alternatives: a `j`
+  past an extension's code that boot code replaces with a `nop`, or a `nop` it replaces with a `j`
+  to it) has two paths: whatever reaches a site also reaches its replacement, decoded where it
+  lies, which runs at the site and continues after it unless it jumps.
   Thread-pointer accesses are per-CPU state. Globals the machine code addresses but the C does not
   name become nodes with image-only access edges.
 - **What the image cannot tell apart is named by every name it has.** A loop's bound, an address
@@ -467,6 +471,15 @@ flags_offset = 4
 flags_size = 2
 resume_flags = 1                    # a trap whose flags share a bit resumes (WARN); one listed
                                      #   without it stops there (BUG), and the flow ends after it
+[image.patch_table]                  # optional: code patched when the program starts (the kernel's
+section = ".alternative"             #   .alternative, struct alt_entry); a missing section stops the run
+entry_size = 16                      # one entry per replacement
+site_offset = 0                      # the address of the code replaced, and of its replacement:
+replacement_offset = 4               #   absolute, or with relative = true a signed offset from the
+address_size = 4                     #   field itself
+relative = true
+length_offset = 10                   # the replacement's length in bytes, which the site has too
+length_size = 2
 
 [contract_graph]
 function_prefix = "Prog/"            # a function node <prefix><dir>/<file>/<Fn> is <dir>/<file>.c

@@ -66,6 +66,17 @@ percpu_sections = [".data..percpu"]
 [image.symbol_classes]
 compiler_symbol = "^__key$"
 
+# src/patch.c's table: the kernel's .alternative, struct alt_entry.
+[image.patch_table]
+section = ".alternative"
+entry_size = 16
+site_offset = 0
+replacement_offset = 4
+address_size = 4
+relative = true
+length_offset = 10
+length_size = 2
+
 [contract_graph]
 function_prefix = "Prog/"
 
