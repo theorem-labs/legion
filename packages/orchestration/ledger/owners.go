@@ -15,6 +15,78 @@ import (
 // holder's leases freed.
 var reopeningKinds = []string{"item.enqueued", "item.released", "item.expired", "item.holder_stopped"}
 
+// Enqueue creates an open work item for owner. Repeating an open enqueue for the same owner is
+// idempotent; an existing item belongs to one owner for its whole history.
+func (s *Store) Enqueue(ctx context.Context, repo, id, owner string) error {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(owner) == "" {
+		return invalid("an enqueued item needs an id and an owner")
+	}
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		var existingOwner, state string
+		err := tx.QueryRow(ctx, `INSERT INTO work_items (repo, id, owner) VALUES ($1, $2, $3)
+			ON CONFLICT DO NOTHING RETURNING owner, state`, repo, id, owner).Scan(&existingOwner, &state)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := tx.QueryRow(ctx, `SELECT owner, state FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`,
+				repo, id).Scan(&existingOwner, &state); err != nil {
+				return err
+			}
+			if existingOwner == owner && state == "open" {
+				return nil
+			}
+			return refuse(ReasonExists, "item %s already belongs to owner %s in state %s", id, existingOwner, state)
+		}
+		if err != nil {
+			return err
+		}
+		return event(ctx, tx, repo, "item.enqueued", id, owner, map[string]any{"owner": owner})
+	})
+}
+
+// HasOpenWork reports whether owner names at least one open item in repository.
+func (s *Store) HasOpenWork(ctx context.Context, repo, owner string) (bool, error) {
+	if strings.TrimSpace(owner) == "" {
+		return false, invalid("empty owner")
+	}
+	var open bool
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM work_items WHERE repo = $1 AND owner = $2 AND state = 'open'
+		)`, repo, owner).Scan(&open)
+	})
+	return open, err
+}
+
+// OwnerWorkRevision is the newest durable queue-change event of owner. Leasing an item does not
+// change its work, while enqueueing and completing one do; callers use the revision to distinguish
+// new work from the same work that exhausted a retry budget.
+func (s *Store) OwnerWorkRevision(ctx context.Context, repo, owner string) (int64, error) {
+	if strings.TrimSpace(owner) == "" {
+		return 0, invalid("empty owner")
+	}
+	var revision int64
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, ownerWorkRevisionQuery("$2"), repo, owner).Scan(&revision)
+	})
+	return revision, err
+}
+
+// ownerWorkRevisionQuery selects OwnerWorkRevision, zero for an owner with no work, of the owner that the SQL
+// expression owner names in repository $1: a parameter, or a column of an enclosing query.
+func ownerWorkRevisionQuery(owner string) string {
+	return `SELECT coalesce(max(e.id), 0)
+		FROM events e JOIN work_items item ON item.repo = e.repo AND item.id = e.subject
+		WHERE e.repo = $1 AND item.owner = ` + owner + ` AND e.kind IN ('item.enqueued', 'item.completed')`
+}
+
 // OpenOwners lists, in order and once each, the owners that open items in repo name.
 func (s *Store) OpenOwners(ctx context.Context, repo string) ([]string, error) {
 	owners := []string{}
@@ -168,14 +240,6 @@ func (s *Store) OwnerRefusals(ctx context.Context, repo string) ([]OwnerRefusal,
 	return refusals, err
 }
 
-// LatestEventID is the id of repo's newest event, or zero when it has none: the cursor a reader of
-// OwnerWakes starts from to see only what happens next.
-func (s *Store) LatestEventID(ctx context.Context, repo string) (int64, error) {
-	var id int64
-	err := s.pool.QueryRow(ctx, `SELECT coalesce(max(id), 0) FROM events WHERE repo = $1`, repo).Scan(&id)
-	return id, err
-}
-
 // OwnerWakes reads, in one snapshot, the owners of the items that the events after cursor reopened
 // (reopeningKinds), in order and once each, and the cursor that reading moves to: the newest event
 // it saw of any kind. Event ids commit in order within a repository, so no event at or below that
@@ -194,35 +258,3 @@ func (s *Store) OwnerWakes(ctx context.Context, repo string, cursor int64) ([]st
 		), '{}') FROM upto`, repo, cursor, reopeningKinds).Scan(&last, &owners)
 	return owners, last, err
 }
-
-// Listener is one connection listening on EventsChannel. A notification names the repository whose
-// events changed and carries nothing else: a reader reads the events themselves (OwnerWakes), so a
-// notification that is lost delays work rather than losing it.
-type Listener struct {
-	conn *pgx.Conn
-}
-
-// Listen opens a connection of its own and listens on EventsChannel.
-func Listen(ctx context.Context, dsn string) (*Listener, error) {
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{EventsChannel}.Sanitize()); err != nil {
-		_ = conn.Close(ctx)
-		return nil, err
-	}
-	return &Listener{conn: conn}, nil
-}
-
-// Wait returns the repository of the next notification, or ctx's error once ctx ends first.
-func (l *Listener) Wait(ctx context.Context) (string, error) {
-	n, err := l.conn.WaitForNotification(ctx)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(n.Payload), nil
-}
-
-// Close ends the listening connection.
-func (l *Listener) Close(ctx context.Context) error { return l.conn.Close(ctx) }

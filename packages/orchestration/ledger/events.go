@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -64,3 +65,43 @@ func (s *Store) Events(ctx context.Context, repo string, after int64, subject st
 		return e, err
 	})
 }
+
+// LatestEventID is the id of repo's newest event, or zero when it has none: the cursor a reader of
+// OwnerWakes starts from to see only what happens next.
+func (s *Store) LatestEventID(ctx context.Context, repo string) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx, `SELECT coalesce(max(id), 0) FROM events WHERE repo = $1`, repo).Scan(&id)
+	return id, err
+}
+
+// Listener is one connection listening on EventsChannel. A notification names the repository whose
+// events changed and carries nothing else: a reader reads the events themselves (OwnerWakes), so a
+// notification that is lost delays work rather than losing it.
+type Listener struct {
+	conn *pgx.Conn
+}
+
+// Listen opens a connection of its own and listens on EventsChannel.
+func Listen(ctx context.Context, dsn string) (*Listener, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{EventsChannel}.Sanitize()); err != nil {
+		_ = conn.Close(ctx)
+		return nil, err
+	}
+	return &Listener{conn: conn}, nil
+}
+
+// Wait returns the repository of the next notification, or ctx's error once ctx ends first.
+func (l *Listener) Wait(ctx context.Context) (string, error) {
+	n, err := l.conn.WaitForNotification(ctx)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(n.Payload), nil
+}
+
+// Close ends the listening connection.
+func (l *Listener) Close(ctx context.Context) error { return l.conn.Close(ctx) }
