@@ -8,8 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestHTTPPublisherSendsListenerEnvelope(t *testing.T) {
@@ -130,7 +133,7 @@ func TestResolveListenerUsesEnvironmentThenConfig(t *testing.T) {
 	}
 
 	t.Run("environment wins", func(t *testing.T) {
-		url, token, err := ResolveListener(func(name string) string {
+		url, token, err := ResolveListener(context.Background(), func(name string) string {
 			return map[string]string{
 				"ENVOY_URL":         "http://environment.test",
 				"ENVOY_TOKEN_FILE":  tokenFile,
@@ -144,7 +147,7 @@ func TestResolveListenerUsesEnvironmentThenConfig(t *testing.T) {
 	})
 
 	t.Run("config fallback", func(t *testing.T) {
-		url, token, err := ResolveListener(func(name string) string {
+		url, token, err := ResolveListener(context.Background(), func(name string) string {
 			if name == "ENVOY_CONFIG_FILE" {
 				return config
 			}
@@ -161,7 +164,7 @@ func TestResolveListenerDoesNotSendConfiguredTokenToAnotherListener(t *testing.T
 	if err := os.WriteFile(config, []byte(`{"envoy":{"url":"http://configured.test","token":"configured-token"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := ResolveListener(func(name string) string {
+	_, _, err := ResolveListener(context.Background(), func(name string) string {
 		return map[string]string{
 			"ENVOY_URL":         "http://other.test",
 			"ENVOY_CONFIG_FILE": config,
@@ -180,7 +183,7 @@ func TestResolveListenerCredentialAndConfigurationPrecedence(t *testing.T) {
 	}
 
 	t.Run("environment token wins", func(t *testing.T) {
-		url, token, err := ResolveListener(func(name string) string {
+		url, token, err := ResolveListener(context.Background(), func(name string) string {
 			return map[string]string{
 				"ENVOY_URL":         "http://environment.test",
 				"ENVOY_TOKEN":       "environment-token",
@@ -193,7 +196,7 @@ func TestResolveListenerCredentialAndConfigurationPrecedence(t *testing.T) {
 	})
 
 	t.Run("token command resolves", func(t *testing.T) {
-		url, token, err := ResolveListener(func(name string) string {
+		url, token, err := ResolveListener(context.Background(), func(name string) string {
 			return map[string]string{
 				"ENVOY_URL":   "http://environment.test",
 				"ENVOY_TOKEN": "!printf command-token",
@@ -234,7 +237,7 @@ func TestResolveListenerCredentialAndConfigurationPrecedence(t *testing.T) {
 				t.Fatal(err)
 			}
 			env := tc.env(home)
-			url, token, err := ResolveListener(func(name string) string { return env[name] })
+			url, token, err := ResolveListener(context.Background(), func(name string) string { return env[name] })
 			if err != nil || url != "http://configured.test" || token != "configured-token" {
 				t.Fatalf("ResolveListener = (%q, %q, %v)", url, token, err)
 			}
@@ -243,7 +246,7 @@ func TestResolveListenerCredentialAndConfigurationPrecedence(t *testing.T) {
 }
 
 func TestResolveListenerAllowsUnauthenticatedNamedListenerWithoutConfiguration(t *testing.T) {
-	url, token, err := ResolveListener(func(name string) string {
+	url, token, err := ResolveListener(context.Background(), func(name string) string {
 		return map[string]string{
 			"ENVOY_URL": "http://listener.test",
 			"HOME":      t.TempDir(),
@@ -256,7 +259,7 @@ func TestResolveListenerAllowsUnauthenticatedNamedListenerWithoutConfiguration(t
 
 func TestResolveListenerDoesNotExposeURLUserinfo(t *testing.T) {
 	const secret = "top-secret-listener-token"
-	_, _, err := ResolveListener(func(name string) string {
+	_, _, err := ResolveListener(context.Background(), func(name string) string {
 		return map[string]string{
 			"ENVOY_URL": "http://owner:" + secret + "@listener.test",
 			"HOME":      t.TempDir(),
@@ -268,7 +271,7 @@ func TestResolveListenerDoesNotExposeURLUserinfo(t *testing.T) {
 }
 
 func TestResolveListenerRejectsRelativeConfigurationPath(t *testing.T) {
-	_, _, err := ResolveListener(func(name string) string {
+	_, _, err := ResolveListener(context.Background(), func(name string) string {
 		if name == "ENVOY_CONFIG_FILE" {
 			return "envoy.json"
 		}
@@ -284,7 +287,7 @@ func TestResolveListenerRejectsUnknownEnvoyConfigurationKey(t *testing.T) {
 	if err := os.WriteFile(config, []byte(`{"envoy":{"url":"http://configured.test","tokne":"misspelled"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := ResolveListener(func(name string) string {
+	_, _, err := ResolveListener(context.Background(), func(name string) string {
 		if name == "ENVOY_CONFIG_FILE" {
 			return config
 		}
@@ -300,7 +303,7 @@ func TestResolveListenerReportsMissingURLForAnEmptyConfiguration(t *testing.T) {
 	if err := os.WriteFile(config, []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := ResolveListener(func(name string) string {
+	_, _, err := ResolveListener(context.Background(), func(name string) string {
 		if name == "ENVOY_CONFIG_FILE" {
 			return config
 		}
@@ -314,7 +317,7 @@ func TestResolveListenerReportsMissingURLForAnEmptyConfiguration(t *testing.T) {
 func TestResolveListenerRejectsInvalidURL(t *testing.T) {
 	for _, value := range []string{"ftp://listener.test", "http:///missing-host", "http://user@listener.test"} {
 		t.Run(value, func(t *testing.T) {
-			_, _, err := ResolveListener(func(name string) string {
+			_, _, err := ResolveListener(context.Background(), func(name string) string {
 				return map[string]string{
 					"ENVOY_URL":   value,
 					"ENVOY_TOKEN": "environment-token",
@@ -325,4 +328,112 @@ func TestResolveListenerRejectsInvalidURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// holdingTokenCommand is a token command whose shell starts a child that keeps the command's output open after the
+// shell is killed, and the file that the child's PID goes to. The child sleeps 300 s, so a caller that waits for the
+// output to close waits that long; the test's cleanup kills it, so a failing run leaves nothing behind.
+func holdingTokenCommand(t *testing.T) (command, pidFile string) {
+	t.Helper()
+	pidFile = filepath.Join(t.TempDir(), "child.pid")
+	t.Cleanup(func() {
+		if pid, err := readPID(pidFile); err == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	return "sleep 300 & echo $! > " + pidFile + "; wait; printf token", pidFile
+}
+
+func readPID(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
+// processRunning reports whether pid is a process that has not exited: one with a /proc entry that is not a zombie.
+func processRunning(pid int) bool {
+	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return false
+	}
+	_, after, found := strings.Cut(string(stat), ") ")
+	return found && !strings.HasPrefix(after, "Z")
+}
+
+// requireChildGone fails the test unless the child whose PID is in pidFile has exited within a second.
+func requireChildGone(t *testing.T, pidFile string) {
+	t.Helper()
+	pid, err := readPID(pidFile)
+	if err != nil {
+		t.Fatalf("the token command's child wrote no PID: %v", err)
+	}
+	for deadline := time.Now().Add(time.Second); processRunning(pid); {
+		if time.Now().After(deadline) {
+			t.Fatalf("the token command's child %d still runs after the command returned", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// tokenWithin runs resolve in the background and fails the test unless it returns an error within limit.
+func tokenWithin(t *testing.T, limit time.Duration, resolve func() error) time.Duration {
+	t.Helper()
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- resolve() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the token command succeeded, want it stopped")
+		}
+		return time.Since(started)
+	case <-time.After(limit):
+		t.Fatalf("the token command still ran after %s", limit)
+	}
+	return 0
+}
+
+// A token command stops when its caller's context ends: its whole process group is killed, so a child that holds the
+// output open dies with the shell, and the command returns within a second or so of the deadline.
+func TestCommandTokenStopsWithItsChildrenAtTheCallersDeadline(t *testing.T) {
+	command, pidFile := holdingTokenCommand(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	elapsed := tokenWithin(t, 6*time.Second, func() error {
+		_, err := commandToken(ctx, command)
+		return err
+	})
+	t.Logf("the token command returned %s after it started, its caller's deadline 1s", elapsed)
+	requireChildGone(t, pidFile)
+}
+
+// A token command runs for at most 10 s (tokenCommandTimeout), also when its caller gives it longer, and its children
+// stop with it.
+func TestCommandTokenStopsWithItsChildrenAtTenSeconds(t *testing.T) {
+	command, pidFile := holdingTokenCommand(t)
+	elapsed := tokenWithin(t, tokenCommandTimeout+5*time.Second, func() error {
+		_, err := commandToken(context.Background(), command)
+		return err
+	})
+	if elapsed < tokenCommandTimeout {
+		t.Fatalf("the token command stopped after %s, before its %s", elapsed, tokenCommandTimeout)
+	}
+	t.Logf("the token command returned %s after it started", elapsed)
+	requireChildGone(t, pidFile)
+}
+
+// ResolveListener runs a token command under its caller's context.
+func TestResolveListenerRunsTheTokenCommandUnderTheCallersContext(t *testing.T) {
+	command, pidFile := holdingTokenCommand(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	tokenWithin(t, 6*time.Second, func() error {
+		_, _, err := ResolveListener(ctx, func(name string) string {
+			return map[string]string{"ENVOY_URL": "http://listener.test", "ENVOY_TOKEN": "!" + command}[name]
+		})
+		return err
+	})
+	requireChildGone(t, pidFile)
 }

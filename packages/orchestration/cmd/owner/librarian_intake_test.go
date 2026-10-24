@@ -315,6 +315,32 @@ func TestLibrarianIntakeWithoutADeploymentJournalsInTheUserCache(t *testing.T) {
 	}
 }
 
+// A token command that would run past the intake's deadline (here 125 s, its shell's child holding the output open) is
+// stopped at its own 10 s, so the delivery ends inside its 110 s with the notice undelivered and journaled, not after
+// the token command's 125 s.
+func TestLibrarianIntakeWithASlowTokenCommandFinishesWithinItsDeadline(t *testing.T) {
+	f := newCommandFixture(t)
+	env := map[string]string{"HOME": f.root, "ENVOY_URL": f.listener.URL, "ENVOY_TOKEN": "!sleep 125; printf x"}
+	args := f.intakeArgs(intakeNearID, f.envelope("near-envelope.txt"), "--topic-prefix", "notifications.example.", "--deploy", f.deploy)
+	started := time.Now()
+	out, stderr, code := f.intake(env, args...)
+	elapsed := time.Since(started)
+	t.Logf("the intake took %s", elapsed)
+	if elapsed >= intakeDeadline {
+		t.Fatalf("the intake took %s, past its %s deadline", elapsed, intakeDeadline)
+	}
+	if code != 0 || !out.Added || len(out.Undelivered) != 1 || out.Undelivered[0] != conceptsTopic {
+		t.Fatalf("intake exited %d with %+v, want the notice undelivered: %s", code, out, stderr)
+	}
+	lines := journalLines(t, filepath.Join(f.stateDir(), "undelivered.jsonl"))
+	if len(lines) != 1 || !strings.Contains(lines[0], "token command") {
+		t.Fatalf("journal = %q, want the notice with the token command's failure", lines)
+	}
+	if notices := f.notices(); len(notices) != 0 {
+		t.Fatalf("the listener got %d notices without a token", len(notices))
+	}
+}
+
 func TestLibrarianIntakeRefusesAMalformedProposalAndQueuesNothing(t *testing.T) {
 	f := newCommandFixture(t)
 	near := string(f.read(filepath.Join("..", "..", "owner", "testdata", "librarian", "near-envelope.txt")))

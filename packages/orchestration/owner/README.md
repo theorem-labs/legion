@@ -70,9 +70,11 @@ no `LEGION_OWNER`, and it queues for `librarian`.
   command exits 3.
 - **The ledger** is the DSN in `--ledger-dsn-file`, opened with `OpenLedgerFile` (`ledger.Open`, which applies the
   schema versions the database lacks).
-- **Time.** Each ledger call (the open, the repository check, the item's read, the enqueue) has 20 s; a notice's four
-  attempts take at most 61 s; the whole command stops at 110 s, inside the gate's 120 s, and a delivery that its own
-  deadline ended is exit 75.
+- **Time.** Each ledger call (the open, the repository check, the item's read, the enqueue) has 20 s. An Envoy token
+  command (a token that starts with `!`) runs with `/bin/sh -c` under the command's deadline for at most 10 s, as the
+  leader of a process group of its own; the whole group is killed then, so a child that holds its output open cannot
+  keep the command waiting, and the notice is journaled with no listener. A notice's four attempts take at most 61 s.
+  The whole command stops at 110 s, inside the gate's 120 s, and a delivery that its own deadline ended is exit 75.
 
 The librarian reads its queue from the ledger: `ledger items <repository> --owner librarian` lists its open items in
 enqueue order, a recheck item's record is `inbox/<id>.json` on `inbox/librarian` of the librarian's bare repository,

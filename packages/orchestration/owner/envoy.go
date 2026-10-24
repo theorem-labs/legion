@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +21,7 @@ const (
 	listenerRequestTimeout = 10 * time.Second
 	listenerReplyLimit     = 64 << 10 // the envelope a publish returns, or the listener's error
 	tokenCommandTimeout    = 10 * time.Second
+	tokenCommandWaitDelay  = time.Second // the wait for a killed token command's output to close
 )
 
 // Publisher delivers an owner notice through the Envoy listener.
@@ -103,8 +105,9 @@ func (p *HTTPPublisher) post(ctx context.Context, topic, message string, payload
 	return nil, fmt.Errorf("publish Envoy notice: listener returned %s: %s", response.Status, detail)
 }
 
-// ResolveListener applies the owner command's listener URL and bearer precedence.
-func ResolveListener(getenv func(string) string) (url, token string, err error) {
+// ResolveListener applies the owner command's listener URL and bearer precedence. A token that starts with ! is a
+// command, which runs under ctx (commandToken).
+func ResolveListener(ctx context.Context, getenv func(string) string) (url, token string, err error) {
 	namedURL := strings.TrimSpace(getenv("ENVOY_URL"))
 	tokenFile := strings.TrimSpace(getenv("ENVOY_TOKEN_FILE"))
 	namedToken := strings.TrimSpace(getenv("ENVOY_TOKEN"))
@@ -150,7 +153,7 @@ func ResolveListener(getenv func(string) string) (url, token string, err error) 
 		token = configured.Token
 	}
 	if strings.HasPrefix(token, "!") {
-		token, err = commandToken(token[1:])
+		token, err = commandToken(ctx, token[1:])
 		if err != nil {
 			return "", "", err
 		}
@@ -259,10 +262,23 @@ func readTokenFile(path string) (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-func commandToken(command string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), tokenCommandTimeout)
+// commandToken runs command with /bin/sh -c and returns its output, trimmed. It runs for at most tokenCommandTimeout,
+// and no longer than ctx. The shell leads a process group of its own, and the whole group is killed when the time is
+// up, so a child that holds the output open dies with the shell; a process that left the group can hold the output
+// for tokenCommandWaitDelay more, and then the pipes are closed.
+func commandToken(ctx context.Context, command string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, tokenCommandTimeout)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, "/bin/sh", "-c", command).Output()
+	shell := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	shell.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	shell.Cancel = func() error {
+		if err := syscall.Kill(-shell.Process.Pid, syscall.SIGKILL); !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return os.ErrProcessDone
+	}
+	shell.WaitDelay = tokenCommandWaitDelay
+	output, err := shell.Output()
 	if err != nil {
 		return "", fmt.Errorf("run Envoy token command: %w", err)
 	}
