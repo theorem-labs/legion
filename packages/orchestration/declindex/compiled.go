@@ -105,6 +105,54 @@ func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) 
 	return s.distinctOwners(ctx, `SELECT name, module FROM consts WHERE cstmt = ? ORDER BY name, module`, hash)
 }
 
+// FormsClash is why the compiled step reads Module without the registry's forms: its imports declare Name only in
+// DeclaredIn, and the forms' imports declare it only in FormsDeclaredIn, other modules. Lean imports two
+// declarations of one name together only when one subsumes the other (two theorems with one statement), which the
+// index cannot know before it reads them, so no environment is known to hold both: the module states no fact of a
+// written form. It is a defect of the tree, which declares one name in two modules.
+type FormsClash struct {
+	Module          string   `json:"module"`
+	Name            string   `json:"name"`
+	DeclaredIn      []string `json:"declared_in"`
+	FormsDeclaredIn []string `json:"forms_declared_in"`
+}
+
+// WithoutForms lists, by module and name, the clashes of the modules that the index's compiled part read without the
+// registry's forms: none when every module was read with them.
+func (s *Store) WithoutForms(ctx context.Context) ([]FormsClash, error) {
+	out := []FormsClash{}
+	rows, err := s.q.QueryContext(ctx, `SELECT module, name, declarer, forms FROM without_forms ORDER BY module, name, declarer`)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var module, name, declarer string
+		var forms bool
+		if err := r.Scan(&module, &name, &declarer, &forms); err != nil {
+			return err
+		}
+		if n := len(out); n == 0 || out[n-1].Module != module || out[n-1].Name != name {
+			out = append(out, FormsClash{Module: module, Name: name})
+		}
+		c := &out[len(out)-1]
+		if forms {
+			c.FormsDeclaredIn = append(c.FormsDeclaredIn, declarer)
+		} else {
+			c.DeclaredIn = append(c.DeclaredIn, declarer)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// ClashModules counts the modules of clashes, which are sorted by module.
+func ClashModules(clashes []FormsClash) int {
+	n := 0
+	for i, c := range clashes {
+		if i == 0 || clashes[i-1].Module != c.Module {
+			n++
+		}
+	}
+	return n
+}
+
 // refreshCompiled re-reads the compiled modules whose .olean changed (all of them when the exporter or the
 // forms changed), then the statements that a changed definition reaches, since a definition's facts pass to
 // every statement that applies it. It records commit as the commit whose compiled part the index holds.
@@ -133,6 +181,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	}
 	keys := map[string]string{} // module -> its .olean key now
 	var todo []string
+	reading := map[string]bool{}
 	for _, f := range files {
 		o, ok := old[f.rel]
 		if !ok || f.oleanKey == "" {
@@ -141,6 +190,19 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		keys[o.module] = f.oleanKey
 		if full || o.oleanKey != f.oleanKey {
 			todo = append(todo, o.module)
+			reading[o.module] = true
+		}
+	}
+	// A module read without the forms is read again each time: the clash that kept it from them can leave the
+	// forms' imports while the module itself does not change.
+	clashed, err := s.WithoutForms(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, c := range clashed {
+		if _, ok := keys[c.Module]; ok && !reading[c.Module] {
+			todo = append(todo, c.Module)
+			reading[c.Module] = true
 		}
 	}
 	if len(todo) == 0 {
@@ -155,7 +217,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	if err != nil {
 		return 0, 0, err
 	}
-	runs, err := s.exportRuns(ctx, m, co.Forms.Imports, todo, log)
+	runs, withoutForms, err := s.exportRuns(ctx, m, co.Forms.Imports, todo)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -171,21 +233,23 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			return 0, 0, err
 		}
 		if len(again) > 0 {
-			runs, err := s.exportRuns(ctx, m, co.Forms.Imports, again, log)
+			runs, more, err := s.exportRuns(ctx, m, co.Forms.Imports, again)
 			if err != nil {
 				return 0, 0, err
 			}
-			more, err := x.RunEach(ctx, runs)
+			withoutForms = append(withoutForms, more...)
+			read, err := x.RunEach(ctx, runs)
 			if err != nil {
 				return 0, 0, err
 			}
-			consts = append(consts, more...)
+			consts = append(consts, read...)
 			logf(log, "index: %d modules re-matched, reached from changed definitions", len(again))
 		}
 	}
 	// The exporter ran without the write lock; only the write of what it read holds it.
 	if err := s.writeTx(ctx, log, func(tx *sql.Tx) error {
-		return s.writeCompiled(ctx, tx, compiledRead{read: todo, rematched: again, oleanKeys: keys, consts: consts, digest: digest, commit: commit})
+		return s.writeCompiled(ctx, tx, compiledRead{read: todo, rematched: again, oleanKeys: keys, consts: consts,
+			withoutForms: withoutForms, digest: digest, commit: commit})
 	}); err != nil {
 		return 0, 0, err
 	}
@@ -194,21 +258,20 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 
 // exportRuns gives the exporter runs that read modules with the manifest m, whose forms module imports forms: one
 // run for each group of modules that one Lean environment can import with those modules (exportGroups). A module
-// whose imports declare a name that the forms' imports declare in another module is read without the forms module,
-// keeping only the concepts matched by their own declaration whose name no two modules declare: no environment holds
-// both, so it states no fact of a written form, and its environment's declaration of a concept's name can be another
-// module's.
-func (s *Store) exportRuns(ctx context.Context, m Manifest, forms, modules []string, log io.Writer) ([]Manifest, error) {
+// whose imports and the forms' imports hold declarations of one name that share none is read without the forms
+// module, keeping only the concepts matched by their own declaration whose name no two modules declare: no
+// environment is known to hold both, so it states no fact of a written form, and its environment's declaration of a
+// concept's name can be another module's. clashes are those modules' clashes (FormsClash).
+func (s *Store) exportRuns(ctx context.Context, m Manifest, forms, modules []string) (runs []Manifest, clashes []FormsClash, err error) {
 	var base []string
 	if len(m.Imports) > 0 {
 		base = forms
 	}
-	groups, apart, clashing, err := exportGroups(ctx, s.q, modules, base)
+	plan, err := exportGroups(ctx, s.q, modules, base)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var runs []Manifest
-	for _, g := range groups {
+	for _, g := range plan.groups {
 		mm := m
 		mm.Modules = g
 		runs = append(runs, mm)
@@ -216,23 +279,18 @@ func (s *Store) exportRuns(ctx context.Context, m Manifest, forms, modules []str
 	own := func(refs []ConstRef) []ConstRef {
 		var out []ConstRef
 		for _, r := range refs {
-			if r.Const == r.Concept && !clashing[r.Concept] {
+			if r.Const == r.Concept && !plan.clashing[r.Concept] {
 				out = append(out, r)
 			}
 		}
 		return out
 	}
-	without := 0
-	for _, g := range apart {
+	for _, g := range plan.apart {
 		mm := m
 		mm.Modules, mm.Imports, mm.Forms, mm.Concepts = g, nil, own(m.Forms), own(m.Concepts)
 		runs = append(runs, mm)
-		without += len(g)
 	}
-	if without > 0 {
-		logf(log, "index: %d modules read without the registry's forms: they import a declaration of a name that the forms' imports declare in another module", without)
-	}
-	return runs, nil
+	return runs, plan.clashes, nil
 }
 
 // conceptBodies names the bodies of the concepts with no written form, which are matched by their declaration's
@@ -265,12 +323,15 @@ type compiledRead struct {
 	rematched []string          // the modules read again because a definition they use changed
 	oleanKeys map[string]string // the .olean key now of each module of read
 	consts    []Constant
-	digest    string // what the compiled part was read with
-	commit    string // the commit the compiled part is of
+	// withoutForms are the clashes of the modules of read and rematched that were read without the forms.
+	withoutForms []FormsClash
+	digest       string // what the compiled part was read with
+	commit       string // the commit the compiled part is of
 }
 
-// writeCompiled replaces the compiled rows of the modules read (read, and rematched) with consts, records the .olean
-// key now of each module of read, and the digest and the commit that the compiled part is of.
+// writeCompiled replaces the compiled rows of the modules read (read, and rematched) with consts and their clashes
+// with the forms, records the .olean key now of each module of read, and the digest and the commit that the
+// compiled part is of.
 func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, w compiledRead) error {
 	for _, mod := range slices.Concat(w.read, w.rematched) {
 		if err := deleteCompiled(ctx, tx, mod); err != nil {
@@ -294,7 +355,20 @@ func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, w compiledRead) e
 			}
 		}
 	}
-	for _, b := range []*batch{cb, ab, fb} {
+	wb := newBatch(tx, "INSERT OR REPLACE", "without_forms", 4)
+	for _, c := range w.withoutForms {
+		for _, d := range c.DeclaredIn {
+			if err := wb.add(ctx, c.Module, c.Name, d, false); err != nil {
+				return err
+			}
+		}
+		for _, d := range c.FormsDeclaredIn {
+			if err := wb.add(ctx, c.Module, c.Name, d, true); err != nil {
+				return err
+			}
+		}
+	}
+	for _, b := range []*batch{cb, ab, fb, wb} {
 		if err := b.flush(ctx); err != nil {
 			return err
 		}

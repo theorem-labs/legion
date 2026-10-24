@@ -60,6 +60,10 @@ type RefreshStats struct {
 	Exported  int           `json:"exported"`
 	Rematched int           `json:"rematched"`
 	Elapsed   time.Duration `json:"elapsed_ns"`
+	// WithoutForms are the clashes of the modules that the compiled part read without the registry's forms
+	// (Store.WithoutForms), from this refresh and earlier ones: an index defect, which the tree's duplicate
+	// declarations cause. Empty without the compiled part.
+	WithoutForms []FormsClash `json:"without_forms"`
 }
 
 type moduleFile struct {
@@ -236,7 +240,7 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 // index under the write lock.
 func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
-	var st RefreshStats
+	st := RefreshStats{WithoutForms: []FormsClash{}}
 	r, err := s.readReference(ctx, tree, opt.jobs())
 	if err != nil {
 		return st, err
@@ -277,6 +281,9 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 			return st, err
 		}
 		if st.Exported, st.Rematched, err = s.refreshCompiled(ctx, tree, co, r.files, opt.Commit, opt.Log); err != nil {
+			return st, err
+		}
+		if st.WithoutForms, err = s.WithoutForms(ctx); err != nil {
 			return st, err
 		}
 	}

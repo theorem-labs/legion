@@ -74,6 +74,10 @@ type Verdict struct {
 	// not registered), and each pending concept whose stored source no longer compiles, which the decision leaves
 	// out of the forms.
 	Defects []Defect `json:"defects,omitempty"`
+	// WithoutForms counts the modules that the index's compiled part read without the registry's forms
+	// (declindex.FormsClash), an index defect: no fact of a written form is known in them, so `states` and the
+	// index's facts miss any statement there.
+	WithoutForms int `json:"modules_without_forms,omitempty"`
 }
 
 // DecideOptions are the identity and source bytes that bind a decision to the command invocation.
@@ -218,6 +222,11 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	if err != nil {
 		return v, err
 	}
+	clashes, err := g.Index.WithoutForms(ctx)
+	if err != nil {
+		return v, err
+	}
+	v.WithoutForms = declindex.ClashModules(clashes)
 	reg, defects, err := Load(g.Registry)
 	if err != nil {
 		return v, err

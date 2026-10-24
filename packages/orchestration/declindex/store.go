@@ -25,7 +25,7 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
-const SchemaVersion = "7"
+const SchemaVersion = "8"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
@@ -104,12 +104,22 @@ CREATE TABLE IF NOT EXISTS facts (name TEXT NOT NULL, module TEXT NOT NULL, conc
 CREATE INDEX IF NOT EXISTS facts_concept ON facts (concept);
 CREATE INDEX IF NOT EXISTS facts_name ON facts (name);
 CREATE INDEX IF NOT EXISTS facts_module ON facts (module);
+-- The modules that the compiled step read without the registry's forms (FormsClash), each with a name that kept it
+-- from them: one row for each module (declarer) that declares the name in the module's import closure (forms 0) or in
+-- the forms' imports' closure (forms 1). The two sides share no declarer.
+CREATE TABLE IF NOT EXISTS without_forms (
+    module   TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    declarer TEXT NOT NULL,
+    forms    INTEGER NOT NULL,
+    PRIMARY KEY (module, name, declarer)
+) WITHOUT ROWID;
 -- Each refresh that moved the index to another commit: landed, the commit it read, and previous, the commit it
 -- replaced ('' for the first). The post-landing registry check of a landing compares those two commits.
 CREATE TABLE IF NOT EXISTS landings (landed TEXT PRIMARY KEY, previous TEXT NOT NULL) WITHOUT ROWID;
 `
 
-var tables = []string{"meta", "sources", "modules", "imports", "decls", "uses", "edges", "consts", "atoms", "facts", "landings"}
+var tables = []string{"meta", "sources", "modules", "imports", "decls", "uses", "edges", "consts", "atoms", "facts", "without_forms", "landings"}
 
 // The index's two lock files, beside it. A refresh holds the refresh lock exclusive across its sync (fetch,
 // checkout and build) and its reads of the tree, so that two refreshes never interleave. Every write of the index
@@ -551,9 +561,9 @@ func lockFile(ctx context.Context, path string, exclusive bool) (func(), error) 
 	}
 }
 
-// deleteCompiled drops what the exporter read from one module.
+// deleteCompiled drops what the exporter read from one module, and its clashes with the forms.
 func deleteCompiled(ctx context.Context, x execer, module string) error {
-	for _, t := range []string{"consts", "atoms", "facts"} {
+	for _, t := range []string{"consts", "atoms", "facts", "without_forms"} {
 		if _, err := x.ExecContext(ctx, "DELETE FROM "+t+" WHERE module = ?", module); err != nil {
 			return err
 		}

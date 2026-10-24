@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
@@ -33,6 +34,27 @@ func compiledOptions(ctx context.Context, e *env) (*declindex.CompiledOptions, e
 	return e.cfg.Compiled(ctx, forms, e.stderr)
 }
 
+// writeWithoutForms reports, as an index defect, the n modules that the compiled part read without the registry's
+// forms (declindex.FormsClash): their count, then each clash of clashes, or where to read them when clashes is nil.
+func writeWithoutForms(w io.Writer, n int, clashes []declindex.FormsClash) {
+	switch n {
+	case 0:
+		return
+	case 1:
+		fmt.Fprintln(w, "declindex: index defect: 1 module is read without the registry's forms and states no fact of a written form")
+	default:
+		fmt.Fprintf(w, "declindex: index defect: %d modules are read without the registry's forms and state no fact of a written form\n", n)
+	}
+	if clashes == nil {
+		fmt.Fprintln(w, "declindex: index defect: `declindex status` names each of them and the declarations that keep it from the forms")
+		return
+	}
+	for _, c := range clashes {
+		fmt.Fprintf(w, "declindex: index defect: %s is read without the registry's forms: its imports declare %s in %s, and the forms' imports declare it in %s\n",
+			c.Module, c.Name, strings.Join(c.DeclaredIn, ", "), strings.Join(c.FormsDeclaredIn, ", "))
+	}
+}
+
 func cmdStates(ctx context.Context, e *env, args []string) int {
 	concepts, code := names(e, "states", args)
 	if code != 0 {
@@ -46,6 +68,11 @@ func cmdStates(ctx context.Context, e *env, args []string) int {
 	if _, err := e.store.CompiledCommit(ctx, false); err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
+	clashes, err := e.store.WithoutForms(ctx)
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	writeWithoutForms(e.stderr, declindex.ClashModules(clashes), nil)
 	out := map[string][]declindex.Stating{}
 	rc := 0
 	for _, c := range concepts {
@@ -194,6 +221,7 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	for _, defect := range v.Defects {
 		fmt.Fprintf(e.stderr, "declindex: registry defect: %s\n", defect)
 	}
+	writeWithoutForms(e.stderr, v.WithoutForms, nil)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}

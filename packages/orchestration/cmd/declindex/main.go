@@ -274,11 +274,19 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	}
 	st, err := e.store.Refresh(ctx, tree, opt)
 	if errors.Is(err, declindex.ErrAlreadyPast) {
+		if e.cfg.Lean.Export {
+			clashes, err := e.store.WithoutForms(ctx)
+			if err != nil {
+				return fail(e.stderr, &unableError{err})
+			}
+			writeWithoutForms(e.stderr, declindex.ClashModules(clashes), clashes)
+		}
 		return 0
 	}
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
+	writeWithoutForms(e.stderr, declindex.ClashModules(st.WithoutForms), st.WithoutForms)
 	n, err := e.store.ModuleCount(ctx)
 	if err != nil || n == 0 || st.Unreadable > 0 {
 		fmt.Fprintf(e.stderr, "declindex: the index is incomplete: %d modules, %d unreadable reference files\n", n, st.Unreadable)
@@ -296,6 +304,8 @@ type status struct {
 	Modules  int    `json:"modules"`
 	Errors   string `json:"errors"`
 	TreeHead string `json:"tree_head"`
+	// WithoutForms are the clashes of the modules that the compiled part read without the registry's forms.
+	WithoutForms []declindex.FormsClash `json:"without_forms"`
 }
 
 func cmdStatus(ctx context.Context, e *env, args []string) int {
@@ -316,6 +326,9 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	if st.Modules, err = e.store.ModuleCount(ctx); err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
+	if st.WithoutForms, err = e.store.WithoutForms(ctx); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
 	if st.TreeHead, err = declindex.TreeHead(ctx, e.cfg.Tree); err != nil {
 		fmt.Fprintf(e.stderr, "note: %v\n", err)
 	}
@@ -324,6 +337,7 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	}
 	fmt.Fprintf(e.stdout, "index at %s, built %s, %d modules, %s unreadable; tree at %s\n", st.Commit, st.Built,
 		st.Modules, st.Errors, st.TreeHead)
+	writeWithoutForms(e.stderr, declindex.ClashModules(st.WithoutForms), st.WithoutForms)
 	return 0
 }
 
