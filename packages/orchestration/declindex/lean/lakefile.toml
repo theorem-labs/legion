@@ -1,0 +1,10 @@
+name = "declexport"
+defaultTargets = ["declexport"]
+
+[[lean_lib]]
+name = "DeclExport"
+
+[[lean_exe]]
+name = "declexport"
+root = "Main"
+supportInterpreter = true
