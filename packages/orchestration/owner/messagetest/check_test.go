@@ -3,6 +3,7 @@ package messagetest
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -59,14 +60,21 @@ func (r *recording) answer(item, owner string) string {
 	return sha
 }
 
+// saw is the owner model's record of a delivery, which decides nothing.
 func (r *recording) saw(owner, id, topic string) {
 	r.commit(owner, map[string][]string{DeliveryTrailer: {id}, TopicTrailer: {topic}})
 }
 
+// arrive is the owner session's transcript recording one of the driver's notices.
+func (r *recording) arrive(owner, id, topic string) {
+	r.recorded.Arrivals = append(r.recorded.Arrivals, Arrival{Owner: owner, ID: id, Type: noticeType, Run: "r", Topic: topic,
+		Transcript: "/sessions/" + owner + ".jsonl", Line: len(r.recorded.Arrivals) + 1})
+}
+
 // passingRun is the recorded state of a run where every step happened once: an arrival notice on all that both
-// owners recorded, the need r1 enqueued twice and its notice published twice under two keys (Envoy's at-least-once
-// delivery), both recorded and the need answered once, r3 answered and r2 superseded. The notice of a killed
-// owner's need is optional: the kill may end the session before it records it.
+// owners' sessions recorded, the need r1 enqueued twice and its notice published twice under two keys (Envoy's
+// at-least-once delivery), both in the session and the need answered once, r3 answered and r2 superseded. The notice
+// of a killed owner's need is optional: the kill may end the session before the notice reaches it.
 func passingRun() (Expected, *recording) {
 	expected := Expected{
 		Deliveries: []ExpectedDelivery{
@@ -90,13 +98,13 @@ func passingRun() (Expected, *recording) {
 	for _, owner := range []string{fn, st} {
 		r.enqueue("start:"+owner+"@1", owner)
 		r.answer("start:"+owner+"@1", owner)
-		r.saw(owner, "evt-all", all)
+		r.arrive(owner, "evt-all", all)
 	}
 	r.enqueue(needR1, st)
-	r.saw(st, "evt-dup-1", needs)
+	r.arrive(st, "evt-dup-1", needs)
 	r.enqueue(offrR1, fn)
 	r.answer(needR1, st)
-	r.saw(st, "evt-dup-2", needs)
+	r.arrive(st, "evt-dup-2", needs)
 	r.answer(offrR1, fn)
 	r.enqueue(needR3, st)
 	r.enqueue(needR2, st)
@@ -128,41 +136,63 @@ func TestCheckFailsAMissedDelivery(t *testing.T) {
 
 func TestCheckFailsADeliveryRecordedTwice(t *testing.T) {
 	expected, r := passingRun()
-	r.saw(st, "evt-all", all)
+	r.arrive(st, "evt-all", all)
 	requireOnly(t, Check(expected, r.recorded), FailDuplicate, "evt-all")
 }
 
+// A notice of another run, or one the driver never published, reaching an owner's session fails the run; a delivery
+// that is not the driver's notice is not the run's to judge.
 func TestCheckFailsADeliveryThatWasNeverPublished(t *testing.T) {
 	expected, r := passingRun()
-	r.saw(fn, "evt-stranger", all)
-	requireOnly(t, Check(expected, r.recorded), FailUnexpected, "evt-stranger")
+	r.recorded.Arrivals = append(r.recorded.Arrivals, Arrival{Owner: fn, ID: "evt-role", Topic: "notifications.role.x"})
+	r.recorded.Arrivals = append(r.recorded.Arrivals, Arrival{Owner: fn, ID: "evt-stranger", Type: noticeType, Run: "another run", Topic: all})
+	failures := Check(expected, r.recorded)
+	requireOnly(t, failures, FailUnexpected, "evt-stranger")
+	if !strings.Contains(failures[0].Detail, "another run") {
+		t.Fatalf("the failure %+v does not name the run that published it", failures[0])
+	}
 }
 
 func TestCheckFailsADeliveryRecordedOnTheWrongTopic(t *testing.T) {
 	expected, r := passingRun()
-	retopic(r.recorded.Commits, fn, "evt-all", needs)
-	failures := Check(expected, r.recorded)
-	if len(failures) != 2 || failures[0].Kind != FailMissed || failures[1].Kind != FailUnexpected {
-		t.Fatalf("failures = %+v, want the all notice missed and a delivery on the wrong topic", failures)
-	}
+	retopic(r.recorded.Arrivals, fn, "evt-all", needs)
+	requireOnly(t, Check(expected, r.recorded), FailUnexpected, "evt-all on "+needs)
 }
 
-// A notice delivered a second time under another key is a second delivery: the owner records both, and still
-// answers the need once.
+// A notice delivered a second time under another key is a second delivery: both reach the session, and the owner
+// still answers the need once.
 func TestCheckFailsADuplicateNoticeRecordedOnlyOnce(t *testing.T) {
 	expected, r := passingRun()
-	r.recorded.Commits = without(r.recorded.Commits, "evt-dup-2")
+	r.recorded.Arrivals = without(r.recorded.Arrivals, "evt-dup-2")
 	requireOnly(t, Check(expected, r.recorded), FailMissed, "evt-dup-2")
 }
 
 func TestCheckAcceptsAnOptionalNoticeRecordedOnce(t *testing.T) {
 	expected, r := passingRun()
-	r.saw(st, "evt-kill", needs)
+	r.arrive(st, "evt-kill", needs)
 	if failures := Check(expected, r.recorded); len(failures) != 0 {
 		t.Fatalf("failures = %+v", failures)
 	}
-	r.saw(st, "evt-kill", needs)
+	r.arrive(st, "evt-kill", needs)
 	requireOnly(t, Check(expected, r.recorded), FailDuplicate, "evt-kill")
+}
+
+// The verdict reads the sessions' transcripts, never the owner model's records: a delivery the model recorded and the
+// session did not is missed, and one the session recorded and the model did not is no failure (acceptance run 1 failed,
+// and run 7 stalled, on a delivery that reached the session and that the model did not record).
+func TestCheckJudgesDeliveriesByTheSessionNotByTheOwnersRecord(t *testing.T) {
+	expected, r := passingRun()
+	r.recorded.Arrivals = without(r.recorded.Arrivals, "evt-dup-1")
+	r.saw(st, "evt-dup-1", needs)
+	requireOnly(t, Check(expected, r.recorded), FailMissed, "evt-dup-1")
+
+	expected, r = passingRun()
+	r.saw(st, "evt-dup-2", needs)
+	r.saw(st, "evt-dup-2", needs)
+	r.saw(fn, "evt-stranger", needs)
+	if failures := Check(expected, r.recorded); len(failures) != 0 {
+		t.Fatalf("failures = %+v; the owner's own records decide nothing", failures)
+	}
 }
 
 func TestCheckFailsADuplicatedRecord(t *testing.T) {
@@ -264,15 +294,8 @@ func TestCheckFailsARecordOnAnotherOwnersBranch(t *testing.T) {
 	requireOnly(t, Check(expected, r.recorded), FailUnexpected, needR3)
 }
 
-func without(commits []Commit, delivery string) []Commit {
-	var kept []Commit
-	for _, commit := range commits {
-		if len(commit.Trailers[DeliveryTrailer]) == 1 && commit.Trailers[DeliveryTrailer][0] == delivery {
-			continue
-		}
-		kept = append(kept, commit)
-	}
-	return kept
+func without(arrivals []Arrival, delivery string) []Arrival {
+	return slices.DeleteFunc(slices.Clone(arrivals), func(arrival Arrival) bool { return arrival.ID == delivery })
 }
 
 func withoutEvent(events []ledger.Event, kind, subject string) []ledger.Event {
@@ -286,10 +309,10 @@ func withoutEvent(events []ledger.Event, kind, subject string) []ledger.Event {
 	return kept
 }
 
-func retopic(commits []Commit, owner, delivery, topic string) {
-	for index, commit := range commits {
-		if commit.Owner == owner && len(commit.Trailers[DeliveryTrailer]) == 1 && commit.Trailers[DeliveryTrailer][0] == delivery {
-			commits[index].Trailers = map[string][]string{DeliveryTrailer: {delivery}, TopicTrailer: {topic}}
+func retopic(arrivals []Arrival, owner, delivery, topic string) {
+	for index, arrival := range arrivals {
+		if arrival.Owner == owner && arrival.ID == delivery {
+			arrivals[index].Topic = topic
 		}
 	}
 }

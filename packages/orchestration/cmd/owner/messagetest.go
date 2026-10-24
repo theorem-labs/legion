@@ -126,8 +126,8 @@ func (s *session) messageTestTopics() (any, error) {
 	return topicsResult{Owner: s.owner, Topics: topics}, nil
 }
 
-// messageTestSubscribed records the topics the owner subscribed to. The driver publishes only after it reads this
-// record, because a notice reaches only the sessions subscribed when it is published.
+// messageTestSubscribed records the topics the owner subscribed to. The report shows it beside the listener's record of
+// the session's subscriptions, which is what the driver waits for before it publishes.
 func (s *session) messageTestSubscribed() (any, error) {
 	p, err := s.party()
 	if err != nil {

@@ -114,10 +114,11 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 	command := exec.CommandContext(ctx, filepath.Join(bin, "owner"), "--deploy", deploy, "message-test",
 		"--prefix", "notifications.example-message-test.", "--kills", "3", "--out", out)
 	// The driver reads its ledger from the deployment's ledger_dsn_file alone: a launch variable in the operator's
-	// shell names no ledger of the run.
+	// shell names no ledger of the run. The owners take the out-of-order notices without recording them, as an owner
+	// model did in acceptance run 7: the run judges deliveries by the sessions' transcripts.
 	command.Env = append(os.Environ(), "PATH="+bin+string(filepath.ListSeparator)+os.Getenv("PATH"), "HOME="+root,
 		"ENVOY_URL="+listener.URL, "ENVOY_TOKEN=message-test-token", "LEGION_POSTGRES_DSN=postgres://legion@127.0.0.1/legion",
-		"OWNER_HARNESS_STEP_DELAY=300ms", "LEGION_LEDGER_DSN_FILE="+filepath.Join(root, "not-the-deployment-ledger"))
+		"OWNER_HARNESS_STEP_DELAY=300ms", "OWNER_HARNESS_SKIP_SAW=out of order", "LEGION_LEDGER_DSN_FILE="+filepath.Join(root, "not-the-deployment-ledger"))
 	output, err := command.CombinedOutput()
 	reportText, _ := os.ReadFile(filepath.Join(out, "report.md"))
 	if err != nil {
@@ -139,6 +140,11 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 		if pane.Env["LEGION_OWNER"] != pane.Owner || pane.Env["LEGION_LEDGER_REPOSITORY"] != report.Run || pane.Env["LEGION_LEDGER_DSN_FILE"] != dsnFile ||
 			!strings.HasSuffix(pane.Dir, messagetest.EncodeOwnerName(pane.Owner)) || pane.StartSeconds > 60 {
 			t.Fatalf("pane = %+v", pane)
+		}
+		// The driver published once the listener listed the session with every topic, under the run's own prefix.
+		if len(pane.Sessions) == 0 || len(pane.Transcripts) != 1 || len(pane.Subscribed) == 0 || !sameTopics(pane.Subscribed, pane.Topics) ||
+			!strings.HasPrefix(pane.Subscribed[0], "notifications.example-message-test."+report.Run+".") {
+			t.Fatalf("pane %s: sessions %v, transcripts %v, the listener's topics %v, its subscribed record %v", pane.Owner, pane.Sessions, pane.Transcripts, pane.Subscribed, pane.Topics)
 		}
 	}
 	kinds := map[string]bool{}
@@ -216,14 +222,15 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 	}
 }
 
-// A notice delivered twice under two keys is recorded twice and answered once; the out-of-order notices and the
-// restart's notice to its running owner are required deliveries, each recorded.
+// A notice delivered twice under two keys reaches the session twice and is answered once; the out-of-order notices
+// and the restart's notice to its running owner are required deliveries, each in the session's transcript, and the
+// out-of-order ones are in no record of the owner's (OWNER_HARNESS_SKIP_SAW), which decides nothing.
 func assertDuplicatesAndOrderRecorded(t *testing.T, report messagetest.Report) {
 	t.Helper()
-	recorded := map[string]bool{}
+	arrived, saw := map[string]bool{}, map[string]bool{}
 	for _, delivery := range report.Deliveries {
 		if delivery.Owner == mtStruct {
-			recorded[delivery.ID] = true
+			arrived[delivery.ID], saw[delivery.ID] = delivery.Arrived, delivery.Saw
 		}
 	}
 	required := map[string]bool{}
@@ -256,8 +263,14 @@ func assertDuplicatesAndOrderRecorded(t *testing.T, report messagetest.Report) {
 		if publication.Step != "restart" && !required[publication.ID] {
 			t.Errorf("the %s notice %s is not a required delivery", publication.Step, publication.ID)
 		}
-		if required[publication.ID] && !recorded[publication.ID] {
-			t.Errorf("the %s notice %s was not recorded", publication.Step, publication.ID)
+		if required[publication.ID] && !arrived[publication.ID] {
+			t.Errorf("the %s notice %s is not in the session's transcript", publication.Step, publication.ID)
+		}
+		if publication.Step == "out of order" && saw[publication.ID] {
+			t.Errorf("the out-of-order notice %s has a saw record the owner was told not to make", publication.ID)
+		}
+		if publication.Step == "duplicates" && !saw[publication.ID] {
+			t.Errorf("the duplicate notice %s has no saw record: the report must show the owner's records beside", publication.ID)
 		}
 	}
 	answers := 0
@@ -274,4 +287,8 @@ func assertDuplicatesAndOrderRecorded(t *testing.T, report messagetest.Report) {
 	if answers != 1 {
 		t.Errorf("the duplicated need is expected %d times, want once", answers)
 	}
+}
+
+func sameTopics(a, b []string) bool {
+	return slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
 }

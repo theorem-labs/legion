@@ -33,7 +33,7 @@ type Report struct {
 	Steps      []StepTiming  `json:"steps"`
 	Panes      []PaneCheck   `json:"panes"`
 	Published  []Publication `json:"published"`
-	Deliveries []Latency     `json:"deliveries"`
+	Deliveries []Delivery    `json:"deliveries"`
 	KillLog    []Kill        `json:"kills"`
 	Restart    *Restart      `json:"restart,omitempty"`
 	Expected   Expected      `json:"expected"`
@@ -61,7 +61,9 @@ type StepTiming struct {
 }
 
 // PaneCheck is an owner pane the supervisor started: how long it took after the start item, the launch variables of
-// its process, the directory it works in and the topics it recorded.
+// its process and the directory it works in; the sessions whose transcripts its processes held open and the
+// directories of those transcripts; the run's topics the listener lists for its session (the subscription the driver
+// waits for); and the topics the owner recorded with `owner message-test subscribed`, a second signal.
 type PaneCheck struct {
 	Owner        string            `json:"owner"`
 	Pane         string            `json:"pane"`
@@ -69,6 +71,9 @@ type PaneCheck struct {
 	StartSeconds float64           `json:"start_seconds"`
 	Env          map[string]string `json:"env"`
 	Dir          string            `json:"dir"`
+	Sessions     []string          `json:"sessions"`
+	Transcripts  []string          `json:"transcript_dirs"`
+	Subscribed   []string          `json:"subscribed"`
 	Topics       []string          `json:"topics"`
 }
 
@@ -83,12 +88,20 @@ type Publication struct {
 	Receivers []string  `json:"receivers"`
 }
 
-// Latency is the time from a notice's publication to the owner's record of it.
-type Latency struct {
-	Owner   string  `json:"owner"`
-	ID      string  `json:"id"`
-	Topic   string  `json:"topic"`
-	Seconds float64 `json:"seconds"`
+// Delivery is one notice an owner was expected to receive. Arrived, the verdict's evidence, says whether the owner
+// session's transcript records it, at which line, and how long after the publication. Saw says whether the owner
+// model also recorded it with `owner message-test saw`, and when: a second signal, which no verdict reads.
+type Delivery struct {
+	Owner          string  `json:"owner"`
+	ID             string  `json:"id"`
+	Topic          string  `json:"topic"`
+	Required       bool    `json:"required"`
+	Arrived        bool    `json:"arrived"`
+	Transcript     string  `json:"transcript,omitempty"`
+	Line           int     `json:"line,omitempty"`
+	ArrivalSeconds float64 `json:"arrival_seconds,omitempty"`
+	Saw            bool    `json:"saw"`
+	SawSeconds     float64 `json:"saw_seconds,omitempty"`
 }
 
 // Kill is one owner pane the driver killed, at the drawn moment of the owner's progress and the one it observed.
@@ -148,7 +161,7 @@ func (r Report) markdown() string {
 	for _, step := range r.Steps {
 		fmt.Fprintf(&b, "| %s | %s | %s |\n", step.Name, seconds(step.Seconds), cell(step.Error))
 	}
-	b.WriteString("\n## Owner panes\n\n| Owner | Pane | PID | Start (s) | Launch variables | Directory |\n| --- | --- | --- | --- | --- | --- |\n")
+	b.WriteString("\n## Owner panes\n\n| Owner | Pane | PID | Start (s) | Launch variables | Directory | Sessions | Subscribed (listener) | Subscribed record |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
 	for _, pane := range r.Panes {
 		names := make([]string, 0, len(pane.Env))
 		for name := range pane.Env {
@@ -159,15 +172,24 @@ func (r Report) markdown() string {
 		for _, name := range names {
 			vars = append(vars, fmt.Sprintf("`%s=%s`", name, pane.Env[name]))
 		}
-		fmt.Fprintf(&b, "| `%s` | %s | %d | %s | %s | `%s` |\n", pane.Owner, pane.Pane, pane.PID, seconds(pane.StartSeconds), strings.Join(vars, "<br>"), pane.Dir)
+		fmt.Fprintf(&b, "| `%s` | %s | %d | %s | %s | `%s` | %s | %d topics | %d topics |\n", pane.Owner, pane.Pane, pane.PID, seconds(pane.StartSeconds),
+			strings.Join(vars, "<br>"), pane.Dir, code(pane.Sessions), len(pane.Subscribed), len(pane.Topics))
 	}
 	b.WriteString("\n## Notices\n\n| Step | Kind | Topic | Event | Receivers |\n| --- | --- | --- | --- | --- |\n")
 	for _, p := range r.Published {
 		fmt.Fprintf(&b, "| %s | %s | `%s` | `%s` | %s |\n", p.Step, p.Kind, p.Topic, p.ID, code(p.Receivers))
 	}
-	b.WriteString("\n## Deliveries\n\n| Owner | Event | Topic | Latency (s) |\n| --- | --- | --- | --- |\n")
+	b.WriteString("\n## Deliveries\n\nThe verdict reads each owner session's transcript. The owner's own `saw` record is shown beside it and decides nothing.\n\n" +
+		"| Owner | Event | Topic | Required | Session transcript | Arrival (s) | Saw record | Saw (s) |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
 	for _, d := range r.Deliveries {
-		fmt.Fprintf(&b, "| `%s` | `%s` | `%s` | %s |\n", d.Owner, d.ID, d.Topic, seconds(d.Seconds))
+		arrived, arrival, saw, sawAt := "no", "", "no", ""
+		if d.Arrived {
+			arrived, arrival = fmt.Sprintf("`%s:%d`", filepath.Base(d.Transcript), d.Line), seconds(d.ArrivalSeconds)
+		}
+		if d.Saw {
+			saw, sawAt = "yes", seconds(d.SawSeconds)
+		}
+		fmt.Fprintf(&b, "| `%s` | `%s` | `%s` | %t | %s | %s | %s | %s |\n", d.Owner, d.ID, d.Topic, d.Required, arrived, arrival, saw, sawAt)
 	}
 	b.WriteString("\n## Kills\n\n| Item | Drawn | Observed | Pane | Relaunch (s) |\n| --- | --- | --- | --- | --- |\n")
 	for _, k := range r.KillLog {

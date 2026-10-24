@@ -32,16 +32,17 @@ type Commit struct {
 	Trailers map[string][]string `json:"trailers"`
 }
 
-// Recorded is the durable state a run left: the events of its ledger repository and the commits of each owner's
-// branch, oldest first.
+// Recorded is the durable state a run left: the events of its ledger repository, the commits of each owner's branch,
+// oldest first, and every delivery the owners' session transcripts record.
 type Recorded struct {
-	Events  []ledger.Event
-	Commits []Commit
+	Events   []ledger.Event
+	Commits  []Commit
+	Arrivals []Arrival
 }
 
-// ExpectedDelivery is one notice the driver published that one owner must record at most once. A Required notice
-// must be recorded: the owner's session was running and subscribed when it was published. An optional one went to
-// a session the driver kills, which can end before it records it; the ledger item is then the wake that lasts.
+// ExpectedDelivery is one notice the driver published that must reach one owner's session at most once. A Required
+// notice must reach it: the owner's session was running and subscribed when it was published. An optional one went to
+// a session the driver kills, which can end before the notice reaches it; the ledger item is then the wake that lasts.
 type ExpectedDelivery struct {
 	Owner    string `json:"owner"`
 	Topic    string `json:"topic"`
@@ -76,15 +77,16 @@ type Failure struct {
 }
 
 // Check compares the recorded state of a run with what it must show. It names every missed, duplicate and
-// unexpected delivery; every item completed twice or never, recorded twice or not at all, or completed with another
-// result; every out-of-order item answered as if it were current; every follow-up enqueued twice, never or for
-// another owner; and every record, completion or item of an item the run did not expect.
+// unexpected delivery, by the owner sessions' transcripts; every item completed twice or never, recorded twice or not
+// at all, or completed with another result; every out-of-order item answered as if it were current; every follow-up
+// enqueued twice, never or for another owner; and every record, completion or item of an item the run did not
+// expect. The owners' own records of their deliveries decide nothing.
 func Check(expected Expected, recorded Recorded) []Failure {
 	var failures []Failure
 	fail := func(kind, subject, format string, args ...any) {
 		failures = append(failures, Failure{Kind: kind, Subject: subject, Detail: fmt.Sprintf(format, args...)})
 	}
-	checkDeliveries(expected.Deliveries, recorded.Commits, fail)
+	checkDeliveries(expected.Deliveries, recorded.Arrivals, fail)
 
 	completions, enqueues := map[string][]string{}, map[string][]string{}
 	var completedOrder, enqueuedOrder []string
@@ -152,48 +154,43 @@ func Check(expected Expected, recorded Recorded) []Failure {
 	return failures
 }
 
-func checkDeliveries(deliveries []ExpectedDelivery, commits []Commit, fail func(kind, subject, format string, args ...any)) {
+// checkDeliveries compares the notices each owner's session had to receive with the deliveries its transcripts
+// record. Only the driver's notices take part (their payload's type): a session also receives other deliveries.
+func checkDeliveries(deliveries []ExpectedDelivery, arrivals []Arrival, fail func(kind, subject, format string, args ...any)) {
 	type key struct{ owner, id string }
-	type recording struct {
-		topic, commit string
-	}
-	recorded := map[key][]recording{}
+	arrived := map[key][]Arrival{}
 	var order []key
-	for _, commit := range commits {
-		ids, topics := commit.Trailers[DeliveryTrailer], commit.Trailers[TopicTrailer]
-		if len(ids) == 0 {
+	for _, arrival := range arrivals {
+		if arrival.Type != noticeType {
 			continue
 		}
-		topic := ""
-		if len(topics) > 0 {
-			topic = topics[0]
-		}
-		k := key{commit.Owner, ids[0]}
-		if _, seen := recorded[k]; !seen {
+		k := key{arrival.Owner, arrival.ID}
+		if _, seen := arrived[k]; !seen {
 			order = append(order, k)
 		}
-		recorded[k] = append(recorded[k], recording{topic: topic, commit: commit.SHA})
+		arrived[k] = append(arrived[k], arrival)
 	}
 	expected := map[key]string{}
 	for _, delivery := range deliveries {
 		k := key{delivery.Owner, delivery.ID}
 		expected[k] = delivery.Topic
-		if !delivery.Required || slices.ContainsFunc(recorded[k], func(r recording) bool { return r.topic == delivery.Topic }) {
+		if !delivery.Required || len(arrived[k]) > 0 {
 			continue
 		}
 		fail(FailMissed, fmt.Sprintf("%s on %s for %s", delivery.ID, delivery.Topic, delivery.Owner),
-			"the owner's session was running and subscribed when the driver published it, and it recorded no delivery of it")
+			"the owner's session was running and subscribed when the driver published it, and its transcript records no delivery of it")
 	}
 	for _, k := range order {
 		topic, ok := expected[k]
-		for _, r := range recorded[k] {
-			if !ok || r.topic != topic {
-				fail(FailUnexpected, fmt.Sprintf("%s on %s for %s", k.id, r.topic, k.owner),
-					"recorded at %s; the driver published no such notice for this owner on this topic", r.commit)
+		for _, a := range arrived[k] {
+			if !ok || a.Topic != topic {
+				fail(FailUnexpected, fmt.Sprintf("%s on %s for %s", k.id, a.Topic, k.owner),
+					"the session recorded it at %s:%d (run %s, step %s); the driver published no such notice for this owner on this topic",
+					a.Transcript, a.Line, a.Run, a.Step)
 			}
 		}
-		if n := len(recorded[k]); ok && n > 1 {
-			fail(FailDuplicate, fmt.Sprintf("%s on %s for %s", k.id, topic, k.owner), "recorded %d times", n)
+		if n := len(arrived[k]); ok && n > 1 {
+			fail(FailDuplicate, fmt.Sprintf("%s on %s for %s", k.id, topic, k.owner), "the session recorded it %d times", n)
 		}
 	}
 }

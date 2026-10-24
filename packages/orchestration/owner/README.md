@@ -105,24 +105,37 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
 3. **Wake.** `start:<node>@1` for each; both panes must start within 60 s on the tmux socket
    `legion-<project token>`, each process with `LEGION_OWNER`, `LEGION_LEDGER_REPOSITORY` and
    `LEGION_LEDGER_DSN_FILE` (C8; a `_KEY` name is credential-shaped and the daemon strips it from panes) and working
-   in `<state_dir>/owners/<claim token ending in the C9 encoding of the id>`; each must record its subscriptions.
+   in `<state_dir>/owners/<claim token ending in the C9 encoding of the id>`. The driver finds each owner's omp
+   session transcript among the files its pane's processes hold open, and publishes only once the listener's
+   `GET /v1/sessions` lists that session with every topic the owner must subscribe to: a session registers its topics
+   after it opened its subscriptions to them.
 4. **Arrival.** One notice on each topic kind the two hold, then on `fact.stack-alignment.users`,
-   `fact.stack-alignment.needs` and `concepts` (the source node also subscribes to the last two). Every receiver must
-   record each notice, by its Envoy `event_id`.
+   `fact.stack-alignment.needs` and `concepts` (the source node also subscribes to the last two). Each must reach
+   every receiver's session, by its Envoy `event_id`.
 5. **Duplicates, out of order, kills, restart** as the plan says. The duplicate need's notice is published twice
-   under two idempotency keys, as Envoy may deliver one message twice: the owner records both and answers once. The
-   need itself is enqueued twice; when the owner answers it between the two calls, the ledger refuses the second as
-   an existing item, which is a duplicate too. The driver expects each answered need's offer by production's
-   numbering: the n-th need the target answers queues `offer:<edge>@r<n>`.
+   under two idempotency keys, as Envoy may deliver one message twice: both reach the session and the owner answers
+   once. The need itself is enqueued twice; when the owner answers it between the two calls, the ledger refuses the
+   second as an existing item, which is a duplicate too. The driver expects each answered need's offer by
+   production's numbering: the n-th need the target answers queues `offer:<edge>@r<n>`.
    Every notice to a running, subscribed owner is a required delivery: arrival, duplicates, out of order, the
    restart's need when the target's pane runs, and a notice after the daemon restart to the pane it left running.
-   A killed owner's need notice is optional, because the kill can end the session before it records it.
+   A killed owner's need notice is optional, because the kill can end the session before the notice reaches it.
    `--kills` (default 5) panes are killed at a moment drawn from the owner's progress, and the daemon is restarted
-   once while an owner runs.
-6. **Check.** `messagetest.Check` reads the ledger's events and the owners' branches and fails on a missed,
-   duplicate or unexpected delivery, an item completed twice or never, recorded twice or not at all, an out-of-order
-   item answered as current, a follow-up enqueued twice, never or for another owner, and a record or completion of an
-   item the run did not expect.
+   once while an owner runs. Each step ends when the ledger shows its items' outcomes and the sessions' transcripts
+   show its notices.
+6. **Check.** `messagetest.Check` reads the ledger's events, the owners' branches and the deliveries the owners'
+   session transcripts record, and fails on a missed, duplicate or unexpected delivery (a notice of another run
+   included), an item completed twice or never, recorded twice or not at all, an out-of-order item answered as
+   current, a follow-up enqueued twice, never or for another owner, and a record or completion of an item the run did
+   not expect.
+
+A delivery's evidence is the owner session's own record of it: pi-envoy hands each Envoy delivery to the session as
+an Oh My Pi custom message of type `envoy-message`, which Oh My Pi appends to the session's JSONL transcript under
+`.omp/agent/sessions/`. pi-envoy's `envoy_inbox` list lives in its process's memory, and the listener does not push to
+a session that holds its own NATS connection, so neither keeps a record. Every transcript of the owner's sessions in
+that directory counts (a relaunch's and a fork's; a fork's copy of its parent's entries counts once); a subagent's
+does not. The owners' own `message-test saw` and `subscribed` records are shown in the report beside the evidence,
+and decide nothing: an owner model can handle a burst of deliveries and end its turn without recording one.
 
 `messagetest/owner.md` is the test owners' prompt. Owners publish under the copy's `topic_prefix`, which the
 deployment graph's `topics.json` repeats; both accept any prefix under `notifications.` that ends in a dot. A test run
@@ -133,8 +146,10 @@ production owner; the run's own name under it keeps one run's traffic from anoth
 builds it. The `cmd/owner` test binary runs it when linked as `legion` (a stand-in supervisor in the shape of the
 agreed contracts C8, C9 and C33, which refuses to start, as the daemon does, without a readable, non-empty
 `operator_token_file` or without the omp that `LEGION_OMP_PATH` names, and never looks omp up on `PATH`) or `omp` (a
-scripted owner that follows `owner.md`; `OWNER_HARNESS_STEP_DELAY` paces it), with an HTTP stand-in for the
-listener. Each stand-in answers a version request as a test-only stand-in, so the report of a run against it says
+scripted owner that follows `owner.md` and keeps an omp-shaped session transcript under `HOME`;
+`OWNER_HARNESS_STEP_DELAY` paces it, and `OWNER_HARNESS_SKIP_SAW=<step>` makes it take that step's notices without
+recording them), with an HTTP stand-in for the listener's publish and sessions routes. Each stand-in answers a version
+request as a test-only stand-in, so the report of a run against it says
 so. A run against the harness checks the driver and the owner command; it is neither production nor acceptance
 evidence for C8, C9 or C33. Against the real daemon the same run fails at `start the daemon` until the daemon
 implements those contracts.

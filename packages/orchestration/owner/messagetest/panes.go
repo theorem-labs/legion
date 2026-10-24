@@ -16,10 +16,11 @@ import (
 // the daemon strips from every pane, so the node id travels as LEGION_OWNER.)
 var LaunchVariables = []string{"LEGION_OWNER", "LEGION_LEDGER_REPOSITORY", "LEGION_LEDGER_DSN_FILE"}
 
-// pane is one tmux pane of the daemon's socket that runs an owner: the process that holds the launch variables,
-// its environment's launch variables and its working directory.
+// pane is one tmux pane of the daemon's socket that runs an owner: the pane's own process (Root), the process that
+// holds the launch variables, its environment's launch variables and its working directory.
 type pane struct {
 	ID    string
+	Root  int
 	PID   int
 	Owner string
 	Env   map[string]string
@@ -50,7 +51,7 @@ func ownerPanes(ctx context.Context, socket string) (map[string]pane, error) {
 			continue
 		}
 		if found, ok := ownerProcess(pid); ok {
-			found.ID = id
+			found.ID, found.Root = id, pid
 			panes[found.Owner] = found
 		}
 	}

@@ -1,8 +1,9 @@
 // Package messagetest is the owner message test (plan Task 1.8): before any production owner starts, it shows
 // that a notice on each topic kind reaches real owner sessions that the supervisor starts from their ledger queues,
 // and that duplicate notices and items, items out of order, killed owner sessions and a supervisor restart still
-// leave each step done once. The driver reads every assertion from durable state: the ledger's events and the
-// owners' branches.
+// leave each step done once. The driver reads every assertion from durable state: the ledger's events, the owners'
+// branches, the owner sessions' own transcripts of the deliveries they took, and the listener's record of each
+// session's subscriptions. No step waits on the owner model recording a delivery.
 package messagetest
 
 import (
@@ -13,8 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,14 +86,23 @@ type driver struct {
 	tokenDir       string // the private directory of the bearer files the run wrote, removed at teardown
 	omp            string // the omp the owner panes run, which the supervisor gets as LEGION_OMP_PATH
 
-	store     *ledger.Store
-	publisher *ownerpkg.HTTPPublisher
-	routing   ownerpkg.Routing
-	topics    ownerpkg.Topics     // the test graph's topics.json
-	subscribe map[string][]string // the topics each owner's subscribed record must list
-	expected  Expected
-	offers    map[string]string // need version → the offer its answer queues (expectAnswered)
-	failures  []Failure
+	store         *ledger.Store
+	publisher     *ownerpkg.HTTPPublisher
+	listener      string // the Envoy listener's URL, and its bearer
+	listenerToken string
+	routing       ownerpkg.Routing
+	topics        ownerpkg.Topics     // the test graph's topics.json
+	subscribe     map[string][]string // the topics each owner must subscribe to
+	expected      Expected
+	offers        map[string]string // need version → the offer its answer queues (expectAnswered)
+	failures      []Failure
+
+	// What the driver saw of the owner panes' processes: the directories each owner's session transcripts are in
+	// (Oh My Pi keeps one working directory's sessions in one), the session ids of the transcripts its processes held
+	// open, in the order seen, and every owner process of the run, for the teardown.
+	transcriptDirs map[string][]string
+	sessionIDs     map[string][]string
+	ownerPIDs      map[int]string
 
 	daemon     *exec.Cmd
 	daemonDone chan error
@@ -345,7 +357,7 @@ func (d *driver) setup(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	d.publisher = ownerpkg.NewHTTPPublisher(url, token)
+	d.publisher, d.listener, d.listenerToken = ownerpkg.NewHTTPPublisher(url, token), url, token
 	natsURLs, err := ownerpkg.ListenerNATSURLs(d.opts.Getenv)
 	if err != nil {
 		return err
@@ -534,8 +546,8 @@ func tail(path string) string {
 }
 
 // wake enqueues each owner's start item, and checks that the supervisor starts both owner panes within the pane
-// timeout, with the launch variables of C8 and the working directory its claim names (C9), and that each owner
-// records the topics it subscribed to.
+// timeout, with the launch variables of C8 and the working directory its claim names (C9), and that each owner's
+// session subscribes to its topics.
 func (d *driver) wake(ctx context.Context) error {
 	start := time.Now()
 	for _, node := range d.nodes {
@@ -545,7 +557,7 @@ func (d *driver) wake(ctx context.Context) error {
 		}
 		d.expected.Outcomes = append(d.expected.Outcomes, Outcome{Item: item, Owner: node})
 	}
-	panes, seen, err := d.awaitPanes(ctx, ownerPanes, start)
+	panes, seen, err := d.awaitPanes(ctx, func(ctx context.Context, _ string) (map[string]pane, error) { return d.panes(ctx) }, start)
 	if err != nil {
 		return fmt.Errorf("%w; the panes on tmux socket %s: %s", err, d.socket, paneCommands(ctx, d.socket))
 	}
@@ -563,23 +575,90 @@ func (d *driver) wake(ctx context.Context) error {
 			d.fail(FailLaunch, node, "the pane works in %s, want %s/<claim token ending %s>", p.Dir, ownersDir, EncodeOwnerName(node))
 		}
 	}
-	return d.wait(ctx, d.opts.Timeouts.Subscribed, "both subscribed records", func() (bool, error) {
+	return d.awaitSubscriptions(ctx)
+}
+
+// awaitSubscriptions waits until each owner's session has subscribed to every topic the owner must: a notice reaches
+// only the sessions subscribed when it is published, so the driver publishes after this. The evidence is the
+// listener's record of the session's topics, which the session registers once it has opened its subscriptions, read
+// for the session whose transcript the owner's pane holds open. The owner's own subscribed record is no evidence; the
+// report shows it beside.
+func (d *driver) awaitSubscriptions(ctx context.Context) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	dir := "legion-" + projectToken(d.run) + "-owner-" // the claim token in each owner's working directory (C9)
+	var read time.Time
+	pending := "; the listener was not read yet"
+	err := d.wait(ctx, d.opts.Timeouts.Subscribed, "each owner session to subscribe to its topics", func() (bool, error) {
+		if _, err := d.panes(ctx); err != nil {
+			return false, err
+		}
+		if time.Since(read) < listenerReadInterval {
+			return false, nil
+		}
+		read = time.Now()
+		registered, err := listenerTopics(ctx, client, d.listener, d.listenerToken, dir)
+		if err != nil {
+			pending = "; " + err.Error()
+			return false, nil
+		}
+		pending = ""
 		for index, node := range d.nodes {
-			if d.report.Panes[index].Topics != nil {
+			sessions := d.sessionIDs[node]
+			check := &d.report.Panes[index]
+			check.Sessions, check.Transcripts = sessions, d.transcriptDirs[node]
+			if len(sessions) == 0 {
+				pending += fmt.Sprintf("; %s: its pane holds no session transcript open", node)
 				continue
 			}
-			var record Subscribed
-			found, err := readRecord(ctx, d.bare, node, SubscribedRecord(d.root, node), &record)
-			if err != nil || !found {
-				return false, err
-			}
-			d.report.Panes[index].Topics = record.Topics
-			if !sameSet(record.Topics, d.subscribe[node]) {
-				d.fail(FailSubscription, node, "the subscribed record lists %v, want the topics of owner topics and the test: %v", record.Topics, d.subscribe[node])
+			topics := registered[sessions[len(sessions)-1]]
+			check.Subscribed = slices.DeleteFunc(slices.Clone(topics), func(topic string) bool { return !strings.HasPrefix(topic, d.prefix) })
+			if missing := slices.DeleteFunc(slices.Clone(d.subscribe[node]), func(topic string) bool { return slices.Contains(topics, topic) }); len(missing) > 0 {
+				pending += fmt.Sprintf("; %s: the listener lists session %s without %v", node, sessions[len(sessions)-1], missing)
 			}
 		}
-		return true, nil
+		return pending == "", nil
 	})
+	if errors.Is(err, errTimedOut) {
+		d.fail(FailSubscription, strings.Join(d.nodes, ", "), "%s", strings.TrimPrefix(pending, "; "))
+		return fmt.Errorf("%w%s", err, pending)
+	}
+	return err
+}
+
+// panes lists the owner panes and notes what their processes show: every owner process of the run, which the
+// teardown stops, and the session transcripts they hold open, whose directory holds every transcript of that owner.
+func (d *driver) panes(ctx context.Context) (map[string]pane, error) {
+	panes, err := ownerPanes(ctx, d.socket)
+	if err != nil {
+		return nil, err
+	}
+	for owner, p := range panes {
+		d.watch(owner, p.Root)
+	}
+	return panes, nil
+}
+
+// watch notes, in the process tree under root, each process of the run (its LEGION_LEDGER_REPOSITORY is the run's)
+// and each session transcript a process holds open.
+func (d *driver) watch(owner string, root int) {
+	if d.ownerPIDs == nil {
+		d.ownerPIDs, d.transcriptDirs, d.sessionIDs = map[int]string{}, map[string][]string{}, map[string][]string{}
+	}
+	for queue := []int{root}; len(queue) > 0; queue = queue[1:] {
+		pid := queue[0]
+		if processEnv(pid)["LEGION_LEDGER_REPOSITORY"] == d.run {
+			d.ownerPIDs[pid] = owner
+		}
+		for _, transcript := range openTranscripts(pid) {
+			if dir := filepath.Dir(transcript.Path); !slices.Contains(d.transcriptDirs[owner], dir) {
+				d.transcriptDirs[owner] = append(d.transcriptDirs[owner], dir)
+			}
+			if ids := d.sessionIDs[owner]; len(ids) == 0 || ids[len(ids)-1] != transcript.SessionID {
+				d.sessionIDs[owner] = append(ids, transcript.SessionID)
+			}
+		}
+		queue = append(queue, children(pid)...)
+	}
 }
 
 // ownersDir is the supervisor's directory of owner working directories, links resolved as /proc shows a working
@@ -621,11 +700,54 @@ func (d *driver) awaitPanes(ctx context.Context, list func(context.Context, stri
 	return panes, seen, err
 }
 
-func sameSet(a, b []string) bool {
-	return slices.Equal(slices.Compact(slices.Sorted(slices.Values(a))), slices.Compact(slices.Sorted(slices.Values(b))))
+// arrivals reads every delivery that each owner session's transcripts record, by owner and event id. A fork of a
+// session starts with a copy of its parent's entries, each under the entry id it had there; a copy is one delivery,
+// not another, so each owner's entry ids count once.
+func (d *driver) arrivals() (map[string]map[string][]Arrival, error) {
+	out := map[string]map[string][]Arrival{}
+	for _, node := range d.nodes {
+		out[node] = map[string][]Arrival{}
+		entries := map[string]bool{}
+		for _, dir := range d.transcriptDirs[node] {
+			transcripts, err := sessionTranscripts(dir)
+			if err != nil {
+				return nil, err
+			}
+			for _, transcript := range transcripts {
+				arrivals, err := readArrivals(node, transcript.Path)
+				if err != nil {
+					return nil, err
+				}
+				for _, arrival := range arrivals {
+					if arrival.Entry != "" && entries[arrival.Entry] {
+						continue
+					}
+					entries[arrival.Entry] = true
+					out[node][arrival.ID] = append(out[node][arrival.ID], arrival)
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
-// receivers are the owners whose subscribed record must hold topic.
+// arrived reports whether the session of every receiver of each publication recorded it.
+func (d *driver) arrived(publications ...Publication) (bool, error) {
+	arrivals, err := d.arrivals()
+	if err != nil {
+		return false, err
+	}
+	for _, publication := range publications {
+		for _, receiver := range publication.Receivers {
+			if len(arrivals[receiver][publication.ID]) == 0 {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+// receivers are the owners that must subscribe to topic.
 func (d *driver) receivers(topic string) []string {
 	var out []string
 	for _, node := range d.nodes {
@@ -654,26 +776,8 @@ func (d *driver) publish(ctx context.Context, step, kind, topic, item string) (P
 	return publication, nil
 }
 
-// recordedDeliveries are the deliveries each owner has recorded so far, by event id.
-func (d *driver) recordedDeliveries(ctx context.Context) (map[string]map[string]bool, error) {
-	out := map[string]map[string]bool{}
-	for _, node := range d.nodes {
-		commits, err := branchCommits(ctx, d.bare, node)
-		if err != nil {
-			return nil, err
-		}
-		out[node] = map[string]bool{}
-		for _, commit := range commits {
-			for _, id := range commit.Trailers[DeliveryTrailer] {
-				out[node][id] = true
-			}
-		}
-	}
-	return out, nil
-}
-
 // arrival publishes one notice on each topic kind the two owners hold, then on the fact and concept topics the
-// source owner subscribed to, and waits until every receiver recorded each of them.
+// source owner subscribed to, and waits until the session of every receiver recorded each of them.
 func (d *driver) arrival(ctx context.Context) error {
 	var held []string
 	for _, node := range d.nodes {
@@ -707,19 +811,8 @@ func (d *driver) arrival(ctx context.Context) error {
 		}
 		publications = append(publications, publication)
 	}
-	return d.wait(ctx, d.opts.Timeouts.Delivery, "every arrival notice to be recorded", func() (bool, error) {
-		recorded, err := d.recordedDeliveries(ctx)
-		if err != nil {
-			return false, err
-		}
-		for _, publication := range publications {
-			for _, receiver := range publication.Receivers {
-				if !recorded[receiver][publication.ID] {
-					return false, nil
-				}
-			}
-		}
-		return true, nil
+	return d.wait(ctx, d.opts.Timeouts.Delivery, "every arrival notice to reach its receivers' sessions", func() (bool, error) {
+		return d.arrived(publications...)
 	})
 }
 
@@ -767,20 +860,6 @@ func (d *driver) notifyTarget(ctx context.Context, step, item string, required b
 	return publication, nil
 }
 
-// recorded reports whether the target recorded every one of publications.
-func (d *driver) recorded(ctx context.Context, publications ...Publication) (bool, error) {
-	recorded, err := d.recordedDeliveries(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, publication := range publications {
-		if !recorded[d.target][publication.ID] {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 func (d *driver) itemDone(ctx context.Context, item string) (bool, error) {
 	current, err := d.store.Item(ctx, d.run, item)
 	var notFound *ledger.NotFoundError
@@ -809,7 +888,7 @@ func (d *driver) answered(ctx context.Context, version string) (bool, error) {
 }
 
 // duplicates enqueues the need r1 twice, and publishes its notice twice under two idempotency keys, as Envoy may
-// deliver one message twice: the owner must record both deliveries and answer the need once.
+// deliver one message twice: both deliveries must reach the owner's session and the need be answered once.
 func (d *driver) duplicates(ctx context.Context) error {
 	item := d.need("r1")
 	if err := enqueueTwice(ctx, d.store, d.run, item, d.target); err != nil {
@@ -824,12 +903,12 @@ func (d *driver) duplicates(ctx context.Context) error {
 		copies = append(copies, publication)
 	}
 	d.expectAnswered("r1")
-	return d.wait(ctx, d.opts.Timeouts.Item, item+" to be answered and both of its notices recorded", func() (bool, error) {
+	return d.wait(ctx, d.opts.Timeouts.Item, item+" to be answered and both of its notices to reach the session", func() (bool, error) {
 		done, err := d.answered(ctx, "r1")
 		if err != nil || !done {
 			return false, err
 		}
-		return d.recorded(ctx, copies...)
+		return d.arrived(copies...)
 	})
 }
 
@@ -863,7 +942,9 @@ func enqueueTwice(ctx context.Context, q queue, repo, item, owner string) error 
 }
 
 // outOfOrder enqueues r3 and then r2 with their notices: r3 must be answered, r2 completed as superseded:r3 with no
-// record, and both notices recorded by the running owner.
+// record, and both notices must reach the running owner's session. Each condition is the ledger's or the session
+// transcript's, never the owner model's record of a notice: the model may handle a burst of deliveries and end its turn
+// without recording one.
 func (d *driver) outOfOrder(ctx context.Context) error {
 	var notices []Publication
 	for _, version := range []string{"r3", "r2"} {
@@ -875,7 +956,7 @@ func (d *driver) outOfOrder(ctx context.Context) error {
 	}
 	d.expectAnswered("r3")
 	d.expected.Outcomes = append(d.expected.Outcomes, Outcome{Item: d.need("r2"), Owner: d.target, Superseded: "r3"})
-	return d.wait(ctx, d.opts.Timeouts.Item, "r3 to be answered, r2 to be done and both notices recorded", func() (bool, error) {
+	return d.wait(ctx, d.opts.Timeouts.Item, "r3 to be answered, r2 to be done and both notices to reach the session", func() (bool, error) {
 		done, err := d.answered(ctx, "r3")
 		if err != nil || !done {
 			return false, err
@@ -883,7 +964,7 @@ func (d *driver) outOfOrder(ctx context.Context) error {
 		if done, err = d.itemDone(ctx, d.need("r2")); err != nil || !done {
 			return false, err
 		}
-		return d.recorded(ctx, notices...)
+		return d.arrived(notices...)
 	})
 }
 
@@ -926,7 +1007,7 @@ func (d *driver) kill(index int) func(context.Context) error {
 		kill := Kill{Item: item, Drawn: drawn}
 		doneAtKill, killedPID := false, 0
 		err := d.wait(ctx, d.opts.Timeouts.Item, "the "+drawn+" moment of "+item, func() (bool, error) {
-			panes, err := ownerPanes(ctx, d.socket)
+			panes, err := d.panes(ctx)
 			if err != nil {
 				return false, err
 			}
@@ -956,7 +1037,7 @@ func (d *driver) kill(index int) func(context.Context) error {
 		d.logf("killed %s of %s at %s (drawn %s)", kill.Pane, d.target, kill.Observed, drawn)
 		err = d.wait(ctx, d.opts.Timeouts.Item, item+" to be answered after the kill", func() (bool, error) {
 			if kill.RelaunchSeconds == 0 && !doneAtKill {
-				panes, err := ownerPanes(ctx, d.socket)
+				panes, err := d.panes(ctx)
 				if err != nil {
 					return false, err
 				}
@@ -979,7 +1060,7 @@ func (d *driver) kill(index int) func(context.Context) error {
 func (d *driver) restart(ctx context.Context) error {
 	version := fmt.Sprintf("r%d", 4+d.opts.Kills)
 	item := d.need(version)
-	panes, err := ownerPanes(ctx, d.socket)
+	panes, err := d.panes(ctx)
 	if err != nil {
 		return err
 	}
@@ -992,7 +1073,7 @@ func (d *driver) restart(ctx context.Context) error {
 	restart := &Restart{Item: item}
 	d.report.Restart = restart
 	if err := d.wait(ctx, d.opts.Timeouts.PaneStart, "the pane of "+d.target, func() (bool, error) {
-		panes, err := ownerPanes(ctx, d.socket)
+		panes, err := d.panes(ctx)
 		if err != nil {
 			return false, err
 		}
@@ -1016,7 +1097,7 @@ func (d *driver) restart(ctx context.Context) error {
 		return d.answered(ctx, version)
 	})
 	restart.ItemSeconds = time.Since(start).Seconds()
-	if panes, listErr := ownerPanes(ctx, d.socket); listErr == nil {
+	if panes, listErr := d.panes(ctx); listErr == nil {
 		restart.PanesAfter = paneIDs(panes)
 	}
 	if err != nil {
@@ -1030,8 +1111,8 @@ func (d *driver) restart(ctx context.Context) error {
 	if running {
 		notices = append(notices, wake)
 	}
-	return d.wait(ctx, d.opts.Timeouts.Delivery, "the restart's notices to be recorded", func() (bool, error) {
-		return d.recorded(ctx, notices...)
+	return d.wait(ctx, d.opts.Timeouts.Delivery, "the restart's notices to reach the session", func() (bool, error) {
+		return d.arrived(notices...)
 	})
 }
 
@@ -1044,7 +1125,9 @@ func paneIDs(panes map[string]pane) []string {
 	return ids
 }
 
-// collect reads the run's ledger events and the owners' branches, and each delivery's latency.
+// collect reads the run's ledger events, the owners' branches and every delivery the owners' session transcripts
+// record, and reports each expected delivery: whether and where the session recorded it, and whether the owner model
+// also recorded it with `owner message-test saw`, a second signal that decides nothing.
 func (d *driver) collect(ctx context.Context) (Recorded, error) {
 	var recorded Recorded
 	if d.store == nil {
@@ -1062,17 +1145,45 @@ func (d *driver) collect(ctx context.Context) (Recorded, error) {
 		}
 		recorded.Commits = append(recorded.Commits, commits...)
 	}
-	for _, publication := range d.report.Published {
-		for _, receiver := range publication.Receivers {
-			var saw Saw
-			found, err := readRecord(ctx, d.bare, receiver, SawRecord(d.root, receiver, publication.ID), &saw)
-			if err != nil {
-				return recorded, err
-			}
-			if found {
-				d.report.Deliveries = append(d.report.Deliveries, Latency{Owner: receiver, ID: publication.ID, Topic: saw.Topic, Seconds: saw.ReceivedAt.Sub(publication.At).Seconds()})
-			}
+	arrivals, err := d.arrivals()
+	if err != nil {
+		return recorded, err
+	}
+	for _, node := range d.nodes {
+		for _, id := range slices.Sorted(maps.Keys(arrivals[node])) {
+			recorded.Arrivals = append(recorded.Arrivals, arrivals[node][id]...)
 		}
+	}
+	for index, node := range d.nodes {
+		var record Subscribed
+		found, err := readRecord(ctx, d.bare, node, SubscribedRecord(d.root, node), &record)
+		if err != nil {
+			return recorded, err
+		}
+		if found && index < len(d.report.Panes) {
+			d.report.Panes[index].Topics = record.Topics
+		}
+	}
+	published := map[string]Publication{}
+	for _, publication := range d.report.Published {
+		published[publication.ID] = publication
+	}
+	for _, expected := range d.expected.Deliveries {
+		delivery := Delivery{Owner: expected.Owner, ID: expected.ID, Topic: expected.Topic, Required: expected.Required}
+		at := published[expected.ID].At
+		if arrived := arrivals[expected.Owner][expected.ID]; len(arrived) > 0 {
+			delivery.Arrived, delivery.Transcript, delivery.Line = true, arrived[0].Transcript, arrived[0].Line
+			delivery.ArrivalSeconds = arrived[0].At.Sub(at).Seconds()
+		}
+		var saw Saw
+		found, err := readRecord(ctx, d.bare, expected.Owner, SawRecord(d.root, expected.Owner, expected.ID), &saw)
+		if err != nil {
+			return recorded, err
+		}
+		if found {
+			delivery.Saw, delivery.SawSeconds = true, saw.ReceivedAt.Sub(at).Seconds()
+		}
+		d.report.Deliveries = append(d.report.Deliveries, delivery)
 	}
 	return recorded, nil
 }

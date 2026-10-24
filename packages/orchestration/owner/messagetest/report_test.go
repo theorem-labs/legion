@@ -14,12 +14,15 @@ func sampleReport() Report {
 	return Report{
 		Run: "message-test-20261023t180000z", Prefix: "notifications.example-message-test.", Nodes: []string{fn, st},
 		StartedAt: start, FinishedAt: start.Add(90 * time.Second), Daemon: Daemon{Executable: "/opt/bin/legion", Omp: "/opt/omp/bin/omp"},
-		Steps:      []StepTiming{{Name: "setup", StartedAt: start, Seconds: 1.5}, {Name: "wake", StartedAt: start.Add(2 * time.Second), Seconds: 3}},
-		Panes:      []PaneCheck{{Owner: st, Pane: "%3", StartSeconds: 0.8, Env: map[string]string{"LEGION_OWNER": st}}},
-		Published:  []Publication{{Step: "arrival", Kind: "all", Topic: all, ID: "evt-all", Receivers: []string{fn, st}}},
-		Deliveries: []Latency{{Owner: st, ID: "evt-all", Topic: all, Seconds: 0.25}},
-		KillLog:    []Kill{{Item: needR1, Drawn: MomentAfterClaim, Observed: MomentAfterClaim, Pane: "%3", RelaunchSeconds: 1.2}},
-		Restart:    &Restart{Item: needR3, StopSeconds: 0.1, StartSeconds: 0.4, ItemSeconds: 2},
+		Steps:     []StepTiming{{Name: "setup", StartedAt: start, Seconds: 1.5}, {Name: "wake", StartedAt: start.Add(2 * time.Second), Seconds: 3}},
+		Panes:     []PaneCheck{{Owner: st, Pane: "%3", StartSeconds: 0.8, Env: map[string]string{"LEGION_OWNER": st}}},
+		Published: []Publication{{Step: "arrival", Kind: "all", Topic: all, ID: "evt-all", Receivers: []string{fn, st}}},
+		Deliveries: []Delivery{
+			{Owner: st, ID: "evt-all", Topic: all, Required: true, Arrived: true, Transcript: "/sessions/2026-10-23T18-00-01_s.jsonl", Line: 41, ArrivalSeconds: 0.25},
+			{Owner: fn, ID: "evt-all", Topic: all, Required: true, Saw: true, SawSeconds: 3.5},
+		},
+		KillLog: []Kill{{Item: needR1, Drawn: MomentAfterClaim, Observed: MomentAfterClaim, Pane: "%3", RelaunchSeconds: 1.2}},
+		Restart: &Restart{Item: needR3, StopSeconds: 0.1, StartSeconds: 0.4, ItemSeconds: 2},
 		Revisions: Revisions{
 			Owner:        Build{Path: "github.com/sjawhar/legion/orchestration", Revision: "0123456789abcdef0123456789abcdef01234567", Modified: "false", GoVersion: "go1.27"},
 			Dependencies: []Module{{Path: "gopkg.in/yaml.v3", Version: "v3.0.1"}},
@@ -68,7 +71,10 @@ func TestReportWritesJSONAndMarkdown(t *testing.T) {
 	}
 	for _, want := range []string{"FAILED", "| setup | 1.5 |", "%3", "evt-all", "0.25", MomentAfterClaim, needR1, "completed 2 times", "message-test-20261023t180000z",
 		"## Revisions", "0123456789abcdef0123456789abcdef01234567", "gopkg.in/yaml.v3 v3.0.1", "legion v9 (fedcba9876543210)", "omp 1.57.0", "tmux 3.4", "git version 2.43.0", "sha256:cc",
-		"panes running `/opt/omp/bin/omp`"} {
+		"panes running `/opt/omp/bin/omp`",
+		// Each delivery's verdict evidence, the session transcript's line, and the owner's own record beside it.
+		"| `" + st + "` | `evt-all` | `" + all + "` | true | `2026-10-23T18-00-01_s.jsonl:41` | 0.25 | no |  |",
+		"| `" + fn + "` | `evt-all` | `" + all + "` | true | no |  | yes | 3.5 |"} {
 		if !strings.Contains(string(markdown), want) {
 			t.Errorf("report.md does not contain %q:\n%s", want, markdown)
 		}
