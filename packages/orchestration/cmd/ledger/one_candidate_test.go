@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
 // One candidate gets the same exit code from check and from land, through flags and through one request file, also
@@ -93,5 +99,56 @@ func TestReadyCheckAndLandAgreeOnRecordFlags(t *testing.T) {
 					probe.name, args[1], code, stdout, stderr, probe.refused)
 			}
 		}
+	}
+}
+
+func TestDeferredCheckExitsFiveAndRequestFilesRejectUnknownFields(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		code := run(context.Background(), args, getenv, &out, &err)
+		return code, out.String(), err.String()
+	}
+	if code, _, stderr := call("repo", "ensure", "r", "0"); code != 0 {
+		t.Fatalf("ensure: code=%d stderr=%q", code, stderr)
+	}
+	if code, _, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1"); code != 0 {
+		t.Fatalf("open: code=%d stderr=%q", code, stderr)
+	}
+	assertIncomplete := func(code int, stdout, stderr string) {
+		t.Helper()
+		var result struct {
+			Outcome  string   `json:"outcome"`
+			Pass     bool     `json:"pass"`
+			Deferred []string `json:"deferred"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil || code != 5 || result.Outcome != "incomplete" ||
+			result.Pass || !slices.Equal(result.Deferred, []string{"C"}) {
+			t.Fatalf("deferred check: code=%d result=%+v stdout=%q stderr=%q err=%v", code, result, stdout, stderr, err)
+		}
+	}
+	code, stdout, stderr := call("--json", "check", "r", "M-1", "1", "--commit", "candidate", "--path", "a.lean", "--defer-reads")
+	assertIncomplete(code, stdout, stderr)
+
+	request := filepath.Join(t.TempDir(), "check.json")
+	if err := os.WriteFile(request, []byte(`{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a.lean"],"defer_reads":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr = call("--json", "check", "--request-file", request)
+	assertIncomplete(code, stdout, stderr)
+
+	unknown := filepath.Join(t.TempDir(), "unknown.json")
+	if err := os.WriteFile(unknown, []byte(`{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a.lean"],"unknown":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := call("check", "--request-file", unknown); code != 2 || !strings.Contains(stderr, "unknown field") {
+		t.Fatalf("unknown request field: code=%d stderr=%q", code, stderr)
 	}
 }
