@@ -8,8 +8,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/conceptgate"
@@ -68,28 +66,9 @@ func (l *emittedLibrarian) Review(_ context.Context, r conceptgate.ReviewRequest
 }
 
 type ledgerCommandReport struct {
-	Commit    string                       `json:"commit"`
-	Contracts declindex.LedgerReport       `json:"contracts"`
-	Registry  *ledgerRegistryCommandReport `json:"registry"`
-}
-
-type ledgerRegistryCommandReport struct {
-	Added   []string                  `json:"added"`
-	Defects []conceptgate.Defect      `json:"defects"`
-	Near    []conceptgate.RecheckNear `json:"near"`
-	Unable  string                    `json:"unable"`
-}
-
-func newLedgerRegistryCommandReport() *ledgerRegistryCommandReport {
-	return &ledgerRegistryCommandReport{
-		Added:   []string{},
-		Defects: []conceptgate.Defect{},
-		Near:    []conceptgate.RecheckNear{},
-	}
-}
-
-func (r *ledgerRegistryCommandReport) Defective() bool {
-	return len(r.Defects) != 0 || len(r.Near) != 0
+	Commit    string                     `json:"commit"`
+	Contracts declindex.LedgerReport     `json:"contracts"`
+	Registry  *conceptgate.LandingReport `json:"registry"`
 }
 
 // cmdLedger runs after a landing. With a contracts file, it emits the registrations that the landing program
@@ -172,13 +151,10 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 
 	var l declindex.ContractLedger
 	var emitted *contractsFileLedger
+	// The recheck's librarian: in emit mode the landing program delivers each request; else (nil) the configured
+	// command receives it.
 	var librarian conceptgate.Librarian
 	var emittedReviews *emittedLibrarian
-	work, err := os.MkdirTemp("", "declindex-ledger-")
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	defer os.RemoveAll(work)
 	if contractsFile != "" {
 		raw, err := os.ReadFile(contractsFile)
 		if err != nil {
@@ -202,7 +178,6 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		}
 		defer existing.Close()
 		l = existing
-		librarian = conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: filepath.Join(work, "librarian")}
 	}
 	r, err := e.store.CheckLedger(ctx, l, e.cfg.Repo, e.cfg.Contracts, owners)
 	if err != nil {
@@ -212,7 +187,7 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		}
 		return fail(e.stderr, &unableError{err})
 	}
-	registry := recheckLedgerRegistry(ctx, e, r.Commit, landed, librarian, work)
+	registry := conceptgate.RecheckLanding(ctx, e.cfg, e.store, r.Commit, landed, conceptgate.Options{Librarian: librarian, Log: e.stderr})
 	if emitted != nil {
 		operations := make([]any, 0, len(emitted.operations)+len(emittedReviews.operations))
 		for _, op := range emitted.operations {
@@ -245,142 +220,6 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		return 1
 	}
 	return 0
-}
-
-// recheckLedgerRegistry rechecks the registry concepts that the landing of landed (the index's commit when empty)
-// added, as committed at the index's commit. A cause that stops the recheck is the report's Unable.
-func recheckLedgerRegistry(ctx context.Context, e *env, indexCommit, landed string, librarian conceptgate.Librarian, work string) *ledgerRegistryCommandReport {
-	if e.cfg.Registry == "" {
-		return nil
-	}
-	report := newLedgerRegistryCommandReport()
-	if err := fillRegistryRecheck(ctx, e, indexCommit, landed, librarian, work, report); err != nil {
-		report.Unable = err.Error()
-	}
-	return report
-}
-
-func fillRegistryRecheck(ctx context.Context, e *env, indexCommit, landed string, librarian conceptgate.Librarian, work string, report *ledgerRegistryCommandReport) error {
-	tree, err := filepath.EvalSymlinks(e.cfg.Tree)
-	if err != nil {
-		return fmt.Errorf("resolve tree: %w", err)
-	}
-	registry, err := e.cfg.GateRegistryDir()
-	if err != nil {
-		return err
-	}
-	relative, err := registryPathRelativeToTree(tree, registry)
-	if err != nil {
-		return err
-	}
-	// The tree's path in its repository, which refresh recorded: Git prints the paths of a diff from the
-	// repository's root, and the report names an added file by that repository-relative path, as the gate does.
-	prefix, err := e.store.Meta(ctx, "source_prefix")
-	if err != nil {
-		return err
-	}
-	if landed == "" {
-		landed = indexCommit
-	}
-	previous, recorded, err := e.store.Landing(ctx, landed)
-	if err != nil {
-		return err
-	}
-	switch {
-	case recorded:
-		if report.Added, err = addedRegistryConcepts(ctx, tree, prefix, relative, previous, landed); err != nil {
-			return err
-		}
-	case landed == indexCommit:
-		return fmt.Errorf("the index has no record of the landing of its commit %s: refresh the index", landed)
-	default:
-		// A later landing's refresh read this commit; the check of that landing rechecks this one's additions.
-		fmt.Fprintf(e.stderr, "note: no refresh stopped at %s; the check of the landing that read it rechecks its additions\n", short(landed))
-	}
-	snapshot, cleanup, err := snapshotGateRegistry(ctx, tree, indexCommit, relative, work)
-	if err != nil {
-		return fmt.Errorf("snapshot registry: %w", err)
-	}
-	defer cleanup()
-	reg, defects, err := conceptgate.Load(snapshot)
-	if err != nil {
-		return fmt.Errorf("load registry: %w", err)
-	}
-	report.Defects = append(report.Defects, defects...)
-	// An added file that the loader refused or keyed wrongly is already a defect; the rest are rechecked.
-	loaded := map[string]bool{}
-	for _, c := range reg.Concepts {
-		loaded[prefix+filepath.ToSlash(filepath.Join(relative, "concepts", conceptgate.Key(c)+".yaml"))] = true
-	}
-	var recheck []string
-	for _, path := range report.Added {
-		if loaded[path] {
-			recheck = append(recheck, path)
-		}
-	}
-	if len(recheck) == 0 {
-		return nil
-	}
-	compiled, err := e.cfg.Compiled(ctx, declindex.FormsModule{}, e.stderr)
-	if err != nil {
-		return fmt.Errorf("prepare registry recheck: %w", err)
-	}
-	spec := e.cfg.TreeSpec()
-	spec.Source = tree
-	gate := &conceptgate.Gate{
-		Index:     e.store,
-		Tree:      spec,
-		Registry:  snapshot,
-		Compiled:  compiled,
-		Librarian: librarian,
-		WorkDir:   filepath.Join(work, "proposals"),
-	}
-	rechecked, err := conceptgate.Recheck(ctx, gate, reg, recheck)
-	report.Defects = append(report.Defects, rechecked.Defects...)
-	report.Near = append(report.Near, rechecked.Near...)
-	return err
-}
-
-func registryPathRelativeToTree(tree, registry string) (string, error) {
-	relative, err := filepath.Rel(tree, registry)
-	if err != nil {
-		return "", fmt.Errorf("find registry relative to tree: %w", err)
-	}
-	relative = filepath.Clean(relative)
-	if relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("registry %s is outside tree %s", registry, tree)
-	}
-	return filepath.ToSlash(relative), nil
-}
-
-// addedRegistryConcepts lists the concept files (the .yaml files directly under concepts/, which the loader
-// reads) that the commits previous..commit added, by their paths from the repository's root. registry is the
-// registry's path in the tree, and prefix the tree's path in the repository (empty at its root, else ending in a
-// slash). Rename detection is off: a file added in the landing that deleted a similar one is an addition.
-func addedRegistryConcepts(ctx context.Context, tree, prefix, registry, previous, commit string) ([]string, error) {
-	added := []string{}
-	if previous == "" || commit == "" {
-		return added, nil
-	}
-	concepts := filepath.ToSlash(filepath.Join(registry, "concepts"))
-	// The pathspec is relative to the tree, where git runs; the paths it prints are relative to the repository.
-	raw, err := exec.CommandContext(ctx, "git", "-C", tree, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", previous, commit, "--", concepts).Output()
-	if err != nil {
-		return nil, fmt.Errorf("list registry additions from %s to %s: %w", previous, commit, err)
-	}
-	prefix += concepts + "/"
-	for _, path := range strings.Split(string(raw), "\x00") {
-		if !strings.HasPrefix(path, prefix) {
-			continue
-		}
-		name := strings.TrimPrefix(path, prefix)
-		if strings.Contains(name, "/") || filepath.Ext(name) != ".yaml" {
-			continue
-		}
-		added = append(added, path)
-	}
-	sort.Strings(added)
-	return added, nil
 }
 
 func ledgerCommitCovers(ctx context.Context, tree, landed, indexed string) (bool, error) {

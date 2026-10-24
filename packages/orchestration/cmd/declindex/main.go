@@ -169,17 +169,8 @@ func (e *env) openWith(needIndex bool, open func(string) (*declindex.Store, erro
 	if !needIndex {
 		return nil
 	}
-	built, err := s.Meta(context.Background(), "built")
-	if err != nil {
+	if err := s.CheckComplete(context.Background()); err != nil {
 		return &unableError{err}
-	}
-	if built == "" {
-		return &unableError{fmt.Errorf("the index at %s was never refreshed: run declindex refresh", e.cfg.DB)}
-	}
-	if n, err := s.Meta(context.Background(), "errors"); err != nil {
-		return &unableError{err}
-	} else if n != "0" {
-		return &unableError{fmt.Errorf("the index at %s is incomplete: %s modules' reference files could not be read", e.cfg.DB, n)}
 	}
 	return nil
 }

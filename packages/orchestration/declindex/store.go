@@ -239,6 +239,26 @@ func (s *Store) Meta(ctx context.Context, k string) (string, error) {
 	return v, err
 }
 
+// CheckComplete refuses an index that no refresh has read, or whose last refresh could not read every module's
+// reference file: its answers would be incomplete.
+func (s *Store) CheckComplete(ctx context.Context) error {
+	built, err := s.Meta(ctx, "built")
+	if err != nil {
+		return err
+	}
+	if built == "" {
+		return fmt.Errorf("the index at %s was never refreshed: run declindex refresh", s.path)
+	}
+	n, err := s.Meta(ctx, "errors")
+	if err != nil {
+		return err
+	}
+	if n != "0" {
+		return fmt.Errorf("the index at %s is incomplete: %s modules' reference files could not be read", s.path, n)
+	}
+	return nil
+}
+
 // lock takes the index's exclusive writer lock, a file beside it, so that two refreshes never interleave. It waits
 // for the lock until ctx ends.
 func (s *Store) lock(ctx context.Context) (func(), error) {

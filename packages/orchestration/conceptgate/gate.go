@@ -99,7 +99,7 @@ type Gate struct {
 	Tree     declindex.Tree
 	Registry string
 	// AdditionRoot is the registry directory relative to the repository root, slash-separated, as additions name
-	// it; empty is Registry relative to Tree.Source. The command sets it because it reads Registry from a snapshot.
+	// it; empty is Registry relative to Tree.Source. OpenGate sets it because it reads Registry from a snapshot.
 	AdditionRoot string
 	// Compiled reads the proposal; its Forms are replaced by the registry's at each decision.
 	Compiled  *declindex.CompiledOptions
@@ -108,6 +108,8 @@ type Gate struct {
 	WorkDir string
 	// CheckSandbox is declindex.CheckSandbox, unless a test replaces it.
 	CheckSandbox func(context.Context, declindex.Lean) error
+	// release closes what OpenGate opened for the gate (see Close).
+	release func()
 }
 
 // ProposalModule is the module name a proposal is compiled as.

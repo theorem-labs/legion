@@ -1,15 +1,11 @@
 package main
 
 import (
-	"archive/tar"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"maps"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -128,126 +124,9 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 	return rc
 }
 
-var (
-	gateSandboxAvailable    = confine.Available
-	gateAfterRegistryStatus func()
-)
-
-func gateRegistryClean(tree, rel string) error {
-	status, err := exec.Command("git", "-C", tree, "status", "--porcelain", "--untracked-files=all", "--", rel).Output()
-	if err != nil {
-		return fmt.Errorf("check registry changes: %w", err)
-	}
-	if len(status) != 0 {
-		return fmt.Errorf("the registry has local changes")
-	}
-	return nil
-}
-
-// snapshotGateRegistry extracts the registry from the verified index commit outside the tree. All gate reads use
-// this immutable snapshot, never the caller's mutable working-tree directory.
-func snapshotGateRegistry(ctx context.Context, tree, commit, rel, base string) (string, func(), error) {
-	root, err := os.MkdirTemp(base, "registry-snapshot-")
-	if err != nil {
-		return "", nil, err
-	}
-	cleanup := func() { _ = os.RemoveAll(root) }
-	cmd := exec.CommandContext(ctx, "git", "-C", tree, "archive", "--format=tar", commit, "--", rel)
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	fail := func(err error) (string, func(), error) {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		cleanup()
-		return "", nil, err
-	}
-	if err := extractRegistryArchive(out, root, rel); err != nil {
-		return fail(err)
-	}
-	if _, err := io.Copy(io.Discard, out); err != nil {
-		return fail(err)
-	}
-	if err := cmd.Wait(); err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	registry := filepath.Join(root, rel)
-	if info, err := os.Stat(registry); err != nil || !info.IsDir() {
-		cleanup()
-		if err != nil {
-			return "", nil, err
-		}
-		return "", nil, fmt.Errorf("the index commit has no registry directory %s", rel)
-	}
-	return registry, cleanup, nil
-}
-
-// extractRegistryArchive writes the directories and regular files of a `git archive` tar of rel below root. An
-// entry whose name is not local (absolute, or leaving the root through `..`) or lies outside rel is refused before
-// anything is written for it, and links and other entry types are refused, so no entry writes outside root.
-func extractRegistryArchive(archive io.Reader, root, rel string) error {
-	prefix := filepath.ToSlash(filepath.Clean(rel))
-	reader := tar.NewReader(archive)
-	for {
-		header, err := reader.Next()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if header.Typeflag == tar.TypeXGlobalHeader || header.Typeflag == tar.TypeXHeader {
-			continue
-		}
-		name := filepath.Clean(filepath.FromSlash(header.Name))
-		if !filepath.IsLocal(name) {
-			return fmt.Errorf("git archive returned unsafe registry path: %s", header.Name)
-		}
-		slash := filepath.ToSlash(name)
-		if header.Typeflag == tar.TypeDir && strings.HasPrefix(prefix, slash+"/") {
-			// `git archive` also lists the directories that lead to a nested registry.
-			if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
-				return err
-			}
-			continue
-		}
-		if slash != prefix && !strings.HasPrefix(slash, prefix+"/") {
-			return fmt.Errorf("git archive returned path outside registry: %s", header.Name)
-		}
-		target := filepath.Join(root, name)
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(file, reader)
-			closeErr := file.Close()
-			if copyErr != nil {
-				return copyErr
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-		default:
-			return fmt.Errorf("git archive returned unsupported registry entry %s", header.Name)
-		}
-	}
-}
+// gateSandboxAvailable is the gate's cheap check that this machine can build the sandbox
+// (conceptgate.Options.SandboxAvailable); a test replaces it.
+var gateSandboxAvailable = confine.Available
 
 // cmdGate decides one proposal. Exit codes: 0 added, 1 refused (an exact duplicate), 4 near (sent to the
 // librarian), 5 the name is taken, 3 unable to decide.
@@ -284,67 +163,6 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if e.cfg.Registry == "" {
 		return fail(e.stderr, &usageError{"the configuration names no registry"})
 	}
-	if err := gateSandboxAvailable(); err != nil {
-		return fail(e.stderr, &unableError{fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)})
-	}
-	registry, err := e.cfg.GateRegistryDir()
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	state, err := e.cfg.GateStatePath()
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	tree, err := filepath.EvalSymlinks(e.cfg.Tree)
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	e.cfg.Tree, e.cfg.Registry, e.cfg.DB = tree, registry, state
-	if err := e.openReadOnly(ctx, true); err != nil {
-		return fail(e.stderr, err)
-	}
-	defer e.close()
-	commit, err := e.store.Meta(ctx, "commit")
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	head, err := declindex.TreeHead(ctx, e.cfg.Tree)
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	if head != commit {
-		return fail(e.stderr, &unableError{fmt.Errorf("the tree HEAD %s differs from the index commit %s", head, commit)})
-	}
-	rel, err := filepath.Rel(e.cfg.Tree, registry)
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	// An addition names its file from the repository's root: the tree's path in its repository, which refresh
-	// recorded in the index, then the registry's path in the tree.
-	prefix, err := e.store.Meta(ctx, "source_prefix")
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	if err := gateRegistryClean(e.cfg.Tree, rel); err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	if gateAfterRegistryStatus != nil {
-		gateAfterRegistryStatus()
-	}
-	work, err := os.MkdirTemp("", "declindex-gate-")
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	defer os.RemoveAll(work)
-	snapshot, cleanup, err := snapshotGateRegistry(ctx, e.cfg.Tree, commit, rel, work)
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	defer cleanup()
-	if err := gateRegistryClean(e.cfg.Tree, rel); err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	e.cfg.Registry = snapshot
 	raw, err := os.ReadFile(args[0])
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
@@ -353,13 +171,11 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fail(e.stderr, &usageError{fmt.Sprintf("%s: %v", args[0], err)})
 	}
-	co, err := e.cfg.Compiled(ctx, declindex.FormsModule{}, e.stderr)
+	g, err := conceptgate.OpenGate(ctx, e.cfg, conceptgate.Options{Log: e.stderr, SandboxAvailable: gateSandboxAvailable})
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	proposals := filepath.Join(work, "proposals")
-	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, AdditionRoot: prefix + filepath.ToSlash(rel), Compiled: co,
-		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: proposals}, WorkDir: proposals}
+	defer g.Close()
 	v, err := g.Decide(ctx, p, conceptgate.DecideOptions{Proposer: proposer, AcceptedBy: acceptedBy, ProposalBytes: raw})
 	for _, defect := range v.Defects {
 		fmt.Fprintf(e.stderr, "declindex: registry defect: %s\n", defect)
