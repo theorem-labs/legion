@@ -35,10 +35,10 @@ func compiledOptions(ctx context.Context, e *env) (*declindex.CompiledOptions, e
 
 func cmdStates(ctx context.Context, e *env, args []string) int {
 	concepts, code := names(e, "states", args)
-	if code >= 0 {
+	if code != 0 {
 		return code
 	}
-	if _, code = e.openQuery(ctx); code >= 0 {
+	if _, code = e.openQuery(ctx); code != 0 {
 		return code
 	}
 	defer e.close()
@@ -77,10 +77,10 @@ func cmdStates(ctx context.Context, e *env, args []string) int {
 
 func cmdSame(ctx context.Context, e *env, args []string) int {
 	qs, code := names(e, "same", args)
-	if code >= 0 {
+	if code != 0 {
 		return code
 	}
-	if _, code = e.openQuery(ctx); code >= 0 {
+	if _, code = e.openQuery(ctx); code != 0 {
 		return code
 	}
 	defer e.close()
