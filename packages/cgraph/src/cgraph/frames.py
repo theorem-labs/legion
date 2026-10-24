@@ -10,7 +10,7 @@ register i and the C passes ``&object + d`` as argument i to that callee (link's
 address too); its fields are then held at B plus their displacement.
 
 Without such a call the frame shows nothing the fields alone decide: a frame address the code forms
-where every accessed field is loaded or stored fits another struct's fields by chance 19% of the time
+where every accessed field is loaded or stored fits another struct's fields by chance 20% of the time
 with two fields and 7% with four (kernel image, ``frames.decoys``' method). Such an object is
 recorded as an exclusion, as is every other access no displacement can show: a zero-size member
 (``struct pin_cookie {}`` without lockdep), a function whose machine code makes no memory access with
@@ -21,6 +21,7 @@ not compute.
 from __future__ import annotations
 
 import collections
+from collections.abc import Collection
 from typing import Any
 
 KIND = "field_access"
@@ -91,6 +92,11 @@ def frame_of(image: dict[str, Any], function: str) -> tuple[set[tuple[int, int]]
     return accesses, set(image.get("frame_addresses", {}).get(function, []))
 
 
+def indexed_of(image: dict[str, Any], function: str) -> set[int]:
+    """The frame offsets the function's loads and stores reach past a variable index."""
+    return {offset for offset, _ in image.get("frame_indexed", {}).get(function, [])}
+
+
 def _objects(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
     for item in items:
@@ -131,7 +137,9 @@ def annotate(field_accesses: dict[str, list[dict[str, Any]]], analysis: dict[str
     return exclusions
 
 
-def method(item: dict[str, Any], accesses: set[tuple[int, int]], addresses: set[int]) -> str:
+def method(
+    item: dict[str, Any], accesses: set[tuple[int, int]], addresses: set[int], indexed: Collection[int] = ()
+) -> str:
     """How the frame holds a field of an object at its slot."""
     at, size = item["frame_slot"] + item["displacement"], max(1, item.get("size", 1))
     if (at, size) in accesses:
@@ -141,7 +149,13 @@ def method(item: dict[str, Any], accesses: set[tuple[int, int]], addresses: set[
         return "frame_slot_wider_access"
     if any(at <= offset < at + size for offset, _ in accesses):
         return "frame_slot_narrower_access"
-    if item.get("address") and at in addresses:
+    if item.get("element_displacement") is not None and any(at <= offset < at + size for offset in indexed):
+        # An array member at a variable index (fbatch.folios[i]): the element's address is the array's
+        # plus the index, added in a register.
+        return "frame_slot_indexed_access"
+    if (item.get("address") or item.get("element_displacement") is not None) and at in addresses:
+        # &object.m, or an array member at a variable index walked through a register the code forms
+        # at the member's address (kmem_dump_obj's kp_stack[i]).
         return "frame_slot_address"
     return "no_access_at_frame_slot"
 

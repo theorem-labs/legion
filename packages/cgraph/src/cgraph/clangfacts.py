@@ -208,6 +208,16 @@ _DEREF = 6
 # Bases that name an object the function itself names; a pointer value (given, loaded, or less a
 # container_of offset) is "pointer" or "container_of".
 _OBJECT_BASES = ("global", "local", "other", "unknown")
+# What an argument says of the address it passes (argument()), which a value standing for it lacks.
+_ADDRESS_KEYS = frozenset({"displacement", "base", "object", "object_size", "element", "index", "inner"})
+
+
+def _bare(node: ci.Cursor) -> ci.Cursor:
+    """An expression without its parentheses and implicit conversions."""
+    node = _strip_parens(node)
+    while node.kind == K.UNEXPOSED_EXPR and len(_children(node)) == 1:
+        node = _strip_parens(_children(node)[0])
+    return node
 
 
 @dataclass(frozen=True)
@@ -421,6 +431,7 @@ class _Extractor:
         self.ignored_cache: dict[str, frozenset[int]] = {}
         self.returned: dict[str, _Address | None] = {}
         self.null_helpers: set[str] = set()  # the helpers whose every return is a null pointer
+        self.nullable_helpers: set[str] = set()  # the helpers that return a null pointer or an address
         self.texts: dict[Path, bytes] = {}
         # Each function's settled walk, the functions whose walk is under way, the functions whose
         # calls compute only their result, and each _Generic's selection, read once per node.
@@ -519,6 +530,8 @@ class _Extractor:
                     found.add(walk.pointer(values[0], 0, [], 0))
         if null and not found:
             self.null_helpers.add(name)
+        elif null:
+            self.nullable_helpers.add(name)
         address = _agree(found)
         if address is None or address.base in ("unknown", "local"):
             return None
@@ -1481,6 +1494,10 @@ class _Evaluator:
                 if left is not None and bool(left) == (operator == libclang.LOGICAL_OR):
                     return int(bool(left))
                 right = self.evaluate(inner[1], depth, truth=True)
+                if right is not None and bool(right) == (operator == libclang.LOGICAL_OR):
+                    # oom's `cur() && sysctl_oom_kill_allocating_task && ...`: the right side decides,
+                    # whatever the left gives (its calls stay code; the walk keeps them).
+                    return int(bool(right))
                 return None if left is None or right is None else int(bool(right))
             left = self.evaluate(inner[0], depth)
             right = self.evaluate(inner[1], depth)
@@ -1492,7 +1509,7 @@ class _Evaluator:
             parent = cursor.referenced.semantic_parent
             if parent is not None and parent.kind == K.FUNCTION_DECL:
                 return self.local(cursor.referenced, depth)
-            return None
+            return self.static_value(cursor.referenced, depth)
         if kind == K.CALL_EXPR and cursor.referenced is not None:
             if cursor.referenced.spelling == "__builtin_expect":
                 arguments = list(cursor.get_arguments() or [])
@@ -1508,9 +1525,12 @@ class _Evaluator:
         helper always takes (``if (IS_ENABLED(CONFIG_SLUB_TINY) || …) return 0;``) is not reached."""
         if name in self.helpers:
             return self.helpers[name]
-        self.helpers[name] = (None, None)
         definition = self.definitions.get(name)
-        if definition is None or depth > 3 or self.weak(definition):
+        if depth > 3:
+            # Too deep to fold here; a shallower use may still fold it, so nothing is kept.
+            return (None, None)
+        self.helpers[name] = (None, None)
+        if definition is None or self.weak(definition):
             return (None, None)
         body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
         returns = self.live_returns(body) if body is not None else []
@@ -1557,6 +1577,21 @@ class _Evaluator:
         # Inside an expression only a statement expression (``({ … })``) holds a return.
         return [node for node in statement.walk_preorder() if node.kind == K.RETURN_STMT]
 
+    def static_value(self, variable: ci.Cursor, depth: int) -> int | None:
+        """A file-scope static scalar's value where nothing in the unit writes it or takes its address:
+        its initializer, or 0 (mm/oom_kill.c's sysctl_oom_kill_allocating_task without CONFIG_SYSCTL)."""
+        if variable.storage_class != ci.StorageClass.STATIC or variable.type.is_volatile_qualified():
+            return None
+        if variable.type.get_canonical().kind not in _SCALAR_KINDS:
+            return None
+        # A static declared before its definition (kernel/rcu/tree.h's uses of tree.c's statics): the
+        # canonical declaration names it, and the definition holds its initializer.
+        stores, other = self.stores_in(variable.translation_unit.cursor)
+        if variable.canonical.hash in other or stores.get(variable.canonical.hash):
+            return None
+        initializer = libclang.var_initializer(variable.get_definition() or variable)
+        return self.evaluate(initializer, depth + 1) if initializer is not None else 0
+
     def kept_initializer(self, variable: ci.Cursor) -> ci.Cursor | None:
         """A local's initializer when nothing writes the local or takes its address."""
         initializer = libclang.var_initializer(variable)
@@ -1584,10 +1619,13 @@ class _Evaluator:
                     continue
                 if node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node) and len(operands) == 2:
                     stores[target.referenced.hash].append(operands[1])
+                    if target.referenced.canonical.hash != target.referenced.hash:
+                        # A file-scope static declared before its definition: one variable.
+                        stores[target.referenced.canonical.hash].append(operands[1])
                 elif node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR or (
                     node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node))
                 ):
-                    other.add(target.referenced.hash)
+                    other.update((target.referenced.hash, target.referenced.canonical.hash))
             self.written[key] = (dict(stores), frozenset(other))
         return self.written[key]
 
@@ -2148,6 +2186,11 @@ class _FunctionWalk:
         if container is not None:
             contained = self.pointer(container[0], bits - container[1] * 8, members, depth + 1)
             return contained if contained.base in _OBJECT_BASES else replace(contained, base="container_of")
+        if node.kind == K.StmtExpr and children and children[0].kind == K.COMPOUND_STMT:
+            # ({ ...; value; }): to_swnode's ({ ... is_software_node(__f) ? container_of(...) : NULL; }).
+            statements = _children(children[0])
+            if statements and statements[-1].kind.is_expression():
+                return self.pointer(statements[-1], bits, members, depth + 1)
         if node.type.get_canonical().kind in _ARRAY_TYPES:
             # An array that decays to its address (sb->s_writers.rw_sem): the array's own address.
             return self.lvalue(node, bits, members, depth + 1)
@@ -2168,7 +2211,12 @@ class _FunctionWalk:
         if node.kind == K.CONDITIONAL_OPERATOR and len(children) == 3:
             # to_software_node(fwnode): is_software_node(fwnode) ? container_of(fwnode, ...) : NULL.
             # A null arm is never dereferenced; arms that point the same way give that address.
-            agreed = _agree({self.pointer(arm, bits, members, depth + 1) for arm in children[1:] if not _is_null(arm)})
+            arms = [arm for arm in children[1:] if not _is_null(arm)]
+            agreed = _agree({self.pointer(arm, bits, members, depth + 1) for arm in arms})
+            if agreed is not None and len(arms) < 2 and agreed.base not in _OBJECT_BASES:
+                # Where nothing tests the result for null, the compiler keeps the selected value (the
+                # container, or NULL) in a register and adds the access's whole offset to it.
+                agreed = replace(agreed, inner=bits)
             return agreed if agreed is not None else _Address(bits, "pointer")
         if node.kind == K.GENERIC_SELECTION_EXPR and children:
             # container_of_const(ptr, type, member): the association the control type selects.
@@ -2219,9 +2267,11 @@ class _FunctionWalk:
                     found = replace(found, index=(*found.index, *returned.index))
             if found is not None:
                 definition = self.x.evaluator.definitions.get(node.referenced.spelling)
-                if definition is not None and not _is_inline(definition) and found.base != "unknown":
-                    # A helper not declared inline may stay a call: then its result is a register,
-                    # and the access adds only its own offset to it.
+                nullable = node.referenced.spelling in self.x.nullable_helpers
+                if found.base != "unknown" and (nullable or (definition is not None and not _is_inline(definition))):
+                    # A helper not declared inline may stay a call, and one that returns NULL or an
+                    # address becomes a select (-fno-delete-null-pointer-checks keeps the test): then
+                    # its result is a register, and the access adds only its own offset to it.
                     found = replace(found, inner=bits)
                 return found
         return _Address(bits, "pointer")
@@ -2310,12 +2360,10 @@ class _FunctionWalk:
         entry = variable.kind == K.PARM_DECL
         dominating = self.dominating(variable, use)
         if dominating is not None:
-            value, after, until = dominating
-            # Only the assignments between that one and the end of the statement that holds the use.
+            value, keep = dominating
+            # Only the assignments that can still come after that one on the way to the use.
             values = [(value, None)] + [
-                (other, place)
-                for other, place in values
-                if place is not None and place[0] == after[0] and after[2] < place[1] <= until[2]
+                (other, place) for other, place in values if other.hash != value.hash and keep(other, place)
             ]
             initializer, entry = None, False
         found = [value for value, _ in values] + ([initializer] if initializer is not None else [])
@@ -2326,36 +2374,144 @@ class _FunctionWalk:
             return True
         return any(loop[0] == use[0] and loop[1] <= use[1] and definition[2] <= loop[2] for loop in self.loops)
 
-    def dominating(self, variable: ci.Cursor, use: ci.Cursor) -> tuple[ci.Cursor, _Place, _Place] | None:
-        """The last plain assignment to the variable that every path to ``use`` passes: a statement of
-        a block that holds the use, before the statement the use is in, with no label or case from
-        there to the use. Its value, where it is, and where the statement that holds the use is."""
+    def dominating(
+        self, variable: ci.Cursor, use: ci.Cursor
+    ) -> tuple[ci.Cursor, Callable[[ci.Cursor, _Place | None], bool]] | None:
+        """The last plain assignment to the variable that every path to ``use`` passes, and which of the
+        other assignments can still come after it: a statement of a block that holds the use, before
+        the statement the use is in, with no label or case from there to the use (then the assignments
+        between the two); or a ``for`` header's (``loop_header``)."""
         node = use
         while node.hash != self.cursor.hash:
             parent = self.parents.get(node.hash)
             if parent is None or node.hash in self.label_holders:
                 return None
+            if parent.kind == K.FOR_STMT:
+                found = self.loop_header(variable, parent, node)
+                if found is not None:
+                    return found
             if parent.kind == K.COMPOUND_STMT:
                 siblings = _children(parent)
                 index = next((at for at, sibling in enumerate(siblings) if sibling.hash == node.hash), None)
                 for sibling in reversed(siblings[:index] if index is not None else []):
                     if sibling.hash in self.label_holders:
                         return None
-                    operands = _children(sibling)
-                    if (
-                        sibling.kind == K.BINARY_OPERATOR
-                        and libclang.binary_kind(sibling) == 22
-                        and len(operands) == 2
-                        and _strip(operands[0]).kind == K.DECL_REF_EXPR
-                        and _strip(operands[0]).referenced is not None
-                        and _strip(operands[0]).referenced.hash == variable.hash
-                    ):
+                    if self.assigns(sibling, variable):
                         after, until = _place(sibling), _place(node)
                         if after is None or until is None or after[0] != until[0]:
                             return None
-                        return operands[1], after, until
+                        start: _Place = after
+                        end: _Place = until
+
+                        def between(
+                            _: ci.Cursor, place: _Place | None, start: _Place = start, end: _Place = end
+                        ) -> bool:
+                            return place is not None and place[0] == start[0] and start[2] < place[1] <= end[2]
+
+                        return _children(sibling)[1], between
             node = parent
         return None
+
+    def assigns(self, node: ci.Cursor, variable: ci.Cursor) -> bool:
+        """``node`` is a plain assignment to the variable."""
+        operands = _children(node)
+        if node.kind != K.BINARY_OPERATOR or libclang.binary_kind(node) != 22 or len(operands) != 2:
+            return False
+        target = _strip(operands[0])
+        return (
+            target.kind == K.DECL_REF_EXPR and target.referenced is not None and target.referenced.hash == variable.hash
+        )
+
+    def loop_header(
+        self, variable: ci.Cursor, loop: ci.Cursor, node: ci.Cursor
+    ) -> tuple[ci.Cursor, Callable[[ci.Cursor, _Place | None], bool]] | None:
+        """An assignment of a ``for`` header that every path to ``node`` (the body, or a part of the
+        header) passes. In the body: one the condition makes whenever it holds (for_each_process's
+        ``(p = next_task(p)) != &init_task``, hlist_bl's ``pos && ({ tpos = ...; 1; })``), after which
+        only the body's assignments come. In the body, the condition or the step: the init's
+        (list_for_each_entry's ``pos = list_first_entry(...)``), after which only the loop's come. None
+        when a label inside the loop lets control enter it past the init. libclang leaves absent parts
+        of the header out, so a part is told by its shape when not all three are there."""
+        if loop.hash in self.label_holders:
+            return None
+        parts = _children(loop)
+        body, header = parts[-1], parts[:-1]
+        roles = self.header_roles(header)
+        if roles is None:
+            return None
+        role = {part.hash: name for part, name in zip(header, roles, strict=True)}
+        where = "body" if node.hash == body.hash else role.get(node.hash)
+        condition = next((part for part in header if role[part.hash] == "condition"), None)
+        initial = next((part for part in header if role[part.hash] == "init"), None)
+        if where == "body" and condition is not None:
+            found = self.assigned_when_true(condition, variable)
+            if found:
+                return _children(found[-1])[1], lambda other, _: self.within(other, body)
+        if where in ("body", "condition", "step") and initial is not None:
+            found = self.assigned_at_top(initial, variable)
+            if found:
+                return _children(found[-1])[1], lambda other, _: self.within(other, loop)
+        return None
+
+    @staticmethod
+    def header_roles(header: list[ci.Cursor]) -> list[str] | None:
+        if len(header) == 3:
+            return ["init", "condition", "step"]
+        shapes = [
+            _bare(part).kind == K.DECL_STMT
+            or (_bare(part).kind == K.BINARY_OPERATOR and libclang.binary_kind(_bare(part)) in (22, _COMMA))
+            for part in header
+        ]
+        if len(header) == 2:
+            return {
+                (True, False): ["init", "condition"],
+                (False, True): ["condition", "step"],
+                (True, True): ["init", "step"],
+            }.get((shapes[0], shapes[1]))
+        if len(header) == 1 and not shapes[0]:
+            return ["condition"]
+        return None
+
+    def assigned_at_top(self, expression: ci.Cursor, variable: ci.Cursor) -> list[ci.Cursor]:
+        """The assignments to the variable an expression always makes: itself, or a comma's operands."""
+        node = _bare(expression)
+        if node.kind == K.BINARY_OPERATOR and libclang.binary_kind(node) == _COMMA:
+            left, right = _children(node)
+            return self.assigned_at_top(left, variable) + self.assigned_at_top(right, variable)
+        return [node] if self.assigns(node, variable) else []
+
+    def assigned_when_true(self, condition: ci.Cursor, variable: ci.Cursor) -> list[ci.Cursor]:
+        """The assignments to the variable a condition makes whenever it holds: at its top, in either
+        side of a comparison or ``&&``, the left of ``||``, or a statement of ``({ ... })``."""
+        found = self.assigned_at_top(condition, variable)
+        if found:
+            return found
+        node = _bare(condition)
+        operands = _children(node)
+        if node.kind == K.BINARY_OPERATOR and len(operands) == 2:
+            operator = libclang.binary_kind(node)
+            # CXBinaryOperatorKind LT 11 ... NE 16 (Cmp, <=>, is 10).
+            if operator == libclang.LOGICAL_AND or 11 <= operator <= 16:
+                return self.assigned_when_true(operands[0], variable) + self.assigned_when_true(operands[1], variable)
+            if operator == libclang.LOGICAL_OR:
+                return self.assigned_when_true(operands[0], variable)
+        if node.kind == K.StmtExpr and operands and operands[0].kind == K.COMPOUND_STMT:
+            return [
+                assignment
+                for statement in _children(operands[0])
+                if statement.kind.is_expression()
+                for assignment in self.assigned_when_true(statement, variable)
+            ]
+        return []
+
+    def within(self, node: ci.Cursor, scope: ci.Cursor) -> bool:
+        """``node`` is inside ``scope`` (by the walk's parents)."""
+        current: ci.Cursor | None = node
+        while current is not None:
+            if current.hash == scope.hash:
+                return True
+            current = self.parents.get(current.hash)
+        return False
 
     def local_uses(self) -> dict[str, collections.Counter[int]]:
         """Per local or parameter, by its cursor's hash: references, plain assignments to it (each kept
@@ -2490,6 +2646,10 @@ class _FunctionWalk:
             if "displacement" in item and address.element is not None:
                 # Past a variable index (&cpu_base->clock_base[idx]): the bits from the indexed element.
                 item["element"] = address.element // 8
+            if "displacement" in item and address.inner is not None:
+                # A register the machine code may hold instead (devres_remove's result, a walk's
+                # rb_entry): the bytes from it.
+                item["inner"] = address.inner // 8
             if "displacement" in item and address.index:
                 # sb->s_writers.rw_sem + level - 1: the steps of parameters a caller may pass constants.
                 item["index"] = _index_terms(address)
@@ -2737,6 +2897,11 @@ class _FunctionWalk:
             self.events["unevaluated"].append({"call": callee, "reason": reason, "provenance": [self.x.location(node)]})
             return
         event: dict[str, Any] = {"callee": callee, "arguments": described, "provenance": [self.x.location(node)]}
+        initialized = self.initialized_object(node)
+        if initialized is not None:
+            # The call's value initializes a struct local (guard = class_X_constructor(p)): a helper
+            # that returns its own local by value returns that object.
+            event["result_object"] = initialized
         if generic:
             # In a _Generic association whose selection could not be read: the image decides.
             event["generic"] = True
@@ -2854,17 +3019,18 @@ class _FunctionWalk:
     def cleanup(self, node: ci.Cursor, initializer: ci.Cursor | None) -> None:
         """A local with a cleanup calls a destructor when its scope ends.
 
-        A local of a cleanup class (``guard(...)``) calls the class's destructor with the
-        arguments the constructor got: the local holds what the constructor took, such as the
-        lock a guard holds. Any other local with a ``cleanup`` attribute (``__free(x)``,
-        ``LOCK_MOUNT(...)``) calls the function the attribute names with the local's address, which
-        holds what its initializer gave, or an object of the local's type.
+        A local of a cleanup class (``guard(...)``, ``CLASS(fd_prepare, fdf)``, a local with the
+        class's ``cleanup`` attribute; the constructor's own ``class_X_t _t`` is none) calls the class's
+        destructor with its address. A class of a named struct is that struct; a lock guard's unnamed
+        struct holds what the constructor took, so the destructor's argument stands for the
+        constructor's first argument too (the lock it releases). Any other local with a ``cleanup``
+        attribute (``__free(x)``, ``LOCK_MOUNT(...)``) calls the function the attribute names with the
+        local's address: a struct local is that object, any other holds what its initializer gave.
         """
         pattern = self.x.vocabulary.cleanup_class
-        match = pattern.fullmatch(node.type.spelling) if pattern is not None else None
+        attributed = any(child.kind == K.UNEXPOSED_ATTR for child in node.get_children())
+        match = pattern.fullmatch(node.type.spelling) if pattern is not None and attributed else None
         record, pointer, _ = _canonical_record(node.type)
-        # A local of a struct type (CLASS(fd_prepare, fdf), struct pinned_mountpoint mp __cleanup(...))
-        # is the object the destructor gets the address of and reads: its fields are the local's.
         own = (
             {
                 "unit": self.x.record_unit(record, None),
@@ -2888,9 +3054,14 @@ class _FunctionWalk:
                 else []
             )
             if own is not None and own["unit"] is not None:
-                # A class of a named struct (not a lock guard's unnamed one): the destructor reads it.
+                # A class of a named struct: the destructor reads the local.
                 arguments = [own]
-        elif any(child.kind == K.UNEXPOSED_ATTR for child in node.get_children()):
+            elif own is not None and arguments:
+                # A lock guard: its struct, and the lock the constructor took (guard(task_rq_lock)(p)
+                # unlocks p's rq through &guard.rf, a field of the local).
+                value = {key: item for key, item in arguments[0].items() if key not in _ADDRESS_KEYS}
+                arguments = [{**value, **{key: item for key, item in own.items() if key not in ("unit", "param")}}]
+        elif attributed:
             function = self.x.cleanup_function(node, self.cursor)
             if function is None:
                 return
@@ -3201,6 +3372,37 @@ class _FunctionWalk:
         for child_index, child in enumerate(children):
             self.walk(child, node, child_index, reason, generic)
 
+    def returned_object(self) -> str | None:
+        """The struct local every return of the function returns by value (``return _t;``)."""
+        names = set()
+        for child in self.cursor.walk_preorder():
+            if child.kind == K.RETURN_STMT:
+                values = _children(child)
+                value = _strip(values[0]) if values else None
+                variable = value.referenced if value is not None and value.kind == K.DECL_REF_EXPR else None
+                if variable is None or variable.kind != K.VAR_DECL or _is_global_var(variable):
+                    return None
+                if variable.type.get_canonical().kind != TK.RECORD:
+                    return None
+                names.add(self.x.object_name(variable))
+        return names.pop() if len(names) == 1 else None
+
+    def initialized_object(self, call: ci.Cursor) -> str | None:
+        """The struct local a call's value initializes or is assigned to, if any."""
+        self.local_uses()
+        parent = self.parents.get(call.hash)
+        while parent is not None and parent.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR, K.CSTYLE_CAST_EXPR):
+            parent = self.parents.get(parent.hash)
+        target = None
+        if parent is not None and parent.kind == K.VAR_DECL:
+            target = parent
+        elif parent is not None and parent.kind == K.BINARY_OPERATOR and libclang.binary_kind(parent) == 22:
+            left = _strip(_children(parent)[0])
+            target = left.referenced if left.kind == K.DECL_REF_EXPR else None
+        if target is None or target.kind != K.VAR_DECL or _is_global_var(target):
+            return None
+        return self.x.object_name(target) if target.type.get_canonical().kind == TK.RECORD else None
+
     def returns(self) -> Unit | None:
         """The state a helper returns an address inside, such as one bucket of a hash table."""
         for child in self.cursor.walk_preorder():
@@ -3506,6 +3708,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             "result_registers": result_registers,
             "owned": name in owned,
             "returns": walk.returns(),
+            **({"returns_object": walk.returned_object()} if walk.returned_object() is not None else {}),
             "events": walk.events,
             # The conditions on the parameters that events' ``guards`` index (link._bind decides them).
             **({"guards": walk.guard_table} if walk.guard_table else {}),

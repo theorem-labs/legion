@@ -272,7 +272,9 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
     image_offsets: dict[str, dict[str, set[int]]] = collections.defaultdict(lambda: collections.defaultdict(set))
     for entry in analysis["image"]["globals"]:
         global_offsets[entry["function"]].add(entry["offset"])
-        for name in {entry["global"], *entry.get("aliases", [])}:
+        # Every name of the global, and the zero-size names at its start (a linker table's
+        # __start_x, which the C may name the table by): field offsets only.
+        for name in {entry["global"], *entry.get("aliases", []), *entry.get("start_names", [])}:
             image_offsets[entry["function"]][name].add(entry["offset"])
     # Where each struct sits inside each global the function's C names (link, from clang's layouts).
     places: dict[str, dict[str, list[tuple[str, list[int]]]]] = collections.defaultdict(
@@ -296,6 +298,7 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             continue
         displacements = set(offsets[function])
         frame_accesses, frame_addresses = frames.frame_of(analysis["image"], function)
+        frame_indexed = frames.indexed_of(analysis["image"], function)
         for item in fields:
             if item.get("excluded"):
                 excluded[item["excluded"]] += 1
@@ -333,7 +336,7 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             )
             if "frame_slot" in item:
                 # A field of a local object the frame holds at the object's slot (frames.py).
-                method = frames.method(item, frame_accesses, frame_addresses)
+                method = frames.method(item, frame_accesses, frame_addresses, frame_indexed)
             elif base == "global" and offset in global_offsets[function]:
                 method = "global_address_offset"
             elif register is not None:

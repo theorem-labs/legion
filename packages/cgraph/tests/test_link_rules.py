@@ -627,6 +627,21 @@ def test_a_folded_callee_s_field_takes_the_base_its_caller_passed() -> None:
     assert nested["arguments"] == [{"unit": None, "param": None, "displacement": 8, "base": "local"}]
 
 
+def test_a_folded_field_is_that_far_from_the_register_an_argument_names() -> None:
+    """devres_free(devres_remove(...)): the argument is 56 into the node from the register the call
+    returns, so the free's container_of field at -32 is -32 from it. prev_cputime_init(&p->prev_cputime)
+    with p a call's result: the register is p itself, so the member's own register stays the inner one."""
+    access = {"struct": "o", "field": "free", "offset": 24, "displacement": -32, "base": "container_of",
+              "size": 8, "bitfield": False, "param": 0, "provenance": where()}  # fmt: skip
+    returned = {"unit": None, "param": None, "displacement": 56, "base": "pointer", "inner": 0}
+    (freed,) = link._bind(link.Effective(field_accesses=[access]), [returned]).field_accesses
+    assert (freed["displacement"], freed["inner_displacement"]) == (24, -32)
+    member = {**access, "displacement": 8, "base": "pointer", "offset": 8}
+    through_p = {"unit": None, "param": None, "displacement": 1336, "base": "pointer", "inner": 1336}
+    (stime,) = link._bind(link.Effective(field_accesses=[member]), [through_p]).field_accesses
+    assert (stime["displacement"], stime["inner_displacement"]) == (1344, 8)
+
+
 def test_a_constant_argument_fixes_the_parameter_index_of_a_folded_address() -> None:
     """__sb_end_write(sb, SB_FREEZE_WRITE): sb->s_writers.rw_sem + level - 1 is 560 + 96 * (level - 1)
     from sb; the facts give 464 and a step of 96 per level, which the caller's constant 1 fixes."""

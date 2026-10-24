@@ -582,3 +582,240 @@ long fct_cleanup_object(int v)
 
 	return held.b;
 }
+
+/* guard(task_rq_lock)(p): the constructor fills its own _t (passing &_t.rf to the lock call) and
+ * returns it into the guard; the destructor writes and passes &guard.rf. One object after inlining. */
+struct fct_rf {
+	long flags;
+	int clock;
+};
+struct fct_rq {
+	long lock;
+};
+struct fct_rq *fct_rq_lock(struct fct_outer *p, struct fct_rf *rf);
+void fct_rq_unlock(struct fct_rq *rq, struct fct_rf *rf);
+typedef struct {
+	struct fct_rq *rq;
+	struct fct_rf rf;
+} class_fct_rq_t;
+
+static inline class_fct_rq_t class_fct_rq_constructor(struct fct_outer *p)
+{
+	class_fct_rq_t _t = { 0 }, *_T = &_t;
+
+	_T->rq = fct_rq_lock(p, &_T->rf);
+	return _t;
+}
+
+static inline void class_fct_rq_destructor(class_fct_rq_t *_T)
+{
+	_T->rf.clock = 0;
+	fct_rq_unlock(_T->rq, &_T->rf);
+}
+
+int fct_guarded(struct fct_outer *p)
+{
+	class_fct_rq_t guard __attribute__((cleanup(class_fct_rq_destructor))) = class_fct_rq_constructor(p);
+
+	return guard.rf.flags ? 1 : 0;
+}
+
+/* for_each_process(p): for (p = &init_task; (p = next_task(p)) != &init_task; ). In the body p is
+ * always next_task's container_of, never &init_task. */
+struct fct_task {
+	long pad[4];
+	int flags;
+	struct list_node tasks;
+};
+struct fct_task fct_init;
+
+static inline struct fct_task *fct_next(struct fct_task *p)
+{
+	return container_of(p->tasks.next, struct fct_task, tasks);
+}
+
+int fct_each_task(void)
+{
+	struct fct_task *p;
+	int n = 0;
+
+	for (p = &fct_init; (p = fct_next(p)) != &fct_init;)
+		n += p->flags;
+	return n;
+}
+
+/* device_links_purge: a second list walk over the same local; its init, not the first walk's
+ * values, reaches its body. */
+long fct_two_walks(struct list_node *a, struct list_node *b)
+{
+	struct fct_outer *o;
+	long sum = 0;
+
+	for (o = container_of(a->next, struct fct_outer, link); &o->link != a;
+	     o = container_of(o->link.next, struct fct_outer, link))
+		sum += o->x;
+	for (o = container_of(b->next, struct fct_outer, link); &o->link != b;
+	     o = container_of(o->link.next, struct fct_outer, link))
+		sum += o->in.a;
+	return sum;
+}
+
+/* to_software_node(): ({ ...; is_software_node(fwnode) ? container_of(fwnode, ...) : NULL; }). */
+int fct_is_link(const struct list_node *n);
+#define fct_to_outer(n) ({ struct list_node *__n = (n); fct_is_link(__n) ? container_of(__n, struct fct_outer, link) : NULL; })
+
+long fct_select_container(struct list_node *n)
+{
+	struct fct_outer *o = fct_to_outer(n);
+
+	return o ? o->x : 0;
+}
+
+/* devres_free(devres_remove(...)): devres_remove is no inline helper and returns &dr->data; the
+ * folded free's container_of is that far below the register the call returns. */
+struct fct_res {
+	struct fct_inner node;
+	long data[2];
+};
+struct fct_res *fct_find(void);
+
+__attribute__((noinline)) long (*fct_remove_res(void))[2]
+{
+	struct fct_res *r = fct_find();
+
+	return r ? &r->data : NULL;
+}
+
+static inline void fct_res_free(long (*p)[2])
+{
+	struct fct_res *r = container_of(p, struct fct_res, data);
+
+	r->node.b = 0;
+}
+
+int fct_destroy(void)
+{
+	long (*p)[2] = fct_remove_res();
+
+	if (!p)
+		return -1;
+	fct_res_free(p);
+	return 0;
+}
+
+/* inode_init_always_gfp without CONFIG_SECURITY: the ENOMEM return is under a constant-false test,
+ * so the helper always returns 0 and the caller's error branch is no code. */
+static inline int fct_security(void)
+{
+	return 0;
+}
+
+int fct_init_always(struct fct_inner *i)
+{
+	if (__builtin_expect(fct_security(), 0))
+		return -12;
+	i->a = 1;
+	return 0;
+}
+
+long fct_alloc_object(struct fct_outer *o)
+{
+	if (fct_init_always(&o->in)) {
+		o->x = 1;
+		return 0;
+	}
+	return 1;
+}
+
+/* mm/oom_kill.c's sysctl_oom_kill_allocating_task without CONFIG_SYSCTL: a static nothing writes is
+ * its initializer, 0, and decides the && whatever the call before it returns. */
+static int fct_never_set;
+struct fct_outer *fct_cur(void);
+
+void fct_maybe_use(struct fct_outer *o)
+{
+	if (fct_cur() && fct_never_set && o->x)
+		obj_free(o);
+}
+
+/* kernel/nstree.c's node_to_ns: NULL or a container_of, which the compiler keeps as a select (the
+ * kernel builds with -fno-delete-null-pointer-checks); the access adds its offset to the result. */
+static inline struct fct_outer *fct_node_to(struct list_node *n)
+{
+	if (!n)
+		return NULL;
+	return container_of(n, struct fct_outer, link);
+}
+
+long fct_nullable_helper(struct list_node *n)
+{
+	return fct_node_to(n)->x;
+}
+
+/* lib/sys_info.c: __sys_info(si_mask ?: kernel_si_mask). GNU's `a ?: b` is a when a is set: not the
+ * unwritten static's 0, whatever a is. */
+static unsigned long fct_default_mask;
+void fct_show(unsigned long mask);
+
+void fct_report(unsigned long mask)
+{
+	fct_show(mask ?: fct_default_mask);
+}
+
+/* mm/gup.c's memfd_pin_folios without CONFIG_SHMEM: !shmem_file(memfd) always holds, so the code
+ * after its return is dead. shmem_file returns shmem_mapping(), which the same walk reaches first
+ * below other helpers' conditions, too deep to fold there (as fct_d1 reaches fct_mapping); it must
+ * still fold for the shallow use. */
+static inline int fct_mapping(void);
+static inline int fct_d2(void);
+static inline int fct_d3(void);
+static inline int fct_d4(void);
+
+static inline int fct_d1(void)
+{
+	if (fct_d2())
+		return 1;
+	return 0;
+}
+
+static inline int fct_d2(void)
+{
+	if (fct_d3())
+		return 1;
+	return 0;
+}
+
+static inline int fct_d3(void)
+{
+	if (fct_d4())
+		return 1;
+	return 0;
+}
+
+static inline int fct_d4(void)
+{
+	if (fct_mapping())
+		return 1;
+	return 0;
+}
+
+static inline int fct_mapping(void)
+{
+	return 0;
+}
+
+static inline int fct_file(struct fct_outer *o)
+{
+	if (!o)
+		return 0;
+	return fct_mapping();
+}
+
+void fct_off_later(struct fct_outer *o)
+{
+	if (fct_d1())
+		o->x = 1;
+	if (!fct_file(o))
+		return;
+	obj_free(o);
+}

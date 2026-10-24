@@ -94,12 +94,16 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   `detail.names` a C access to one of them matches.
 - **Field offsets** come from every offset from a base the machine code forms, not only from the
   ones it dereferences: the displacement of a load or store, the immediate of an `addi`, the constant
-  a register already carries (with the shift that forms the size of an array element), and the sum of
-  the two where a load or store splits one offset over both. The frame is kept apart: each load and
-  store through sp or s0 (`frame_accesses`, without the prologue's saves of callee-saved registers
-  and their restores), each frame address the code forms (`frame_addresses`), and each it passes in
-  an argument register to a direct call (`frame_arguments`), as offsets from the value sp had on
-  entry.
+  a register already carries (with the shift that forms the size of an array element; on a loop's
+  first pass, the constant a register was biased by before the loop, as `addi s1, a0, 0x40`), and the
+  sum of the two where a load or store splits one offset over both. A displacement from a linker
+  table's start symbol (`__start_x`, zero-size at the table's first object) counts for that name. The
+  frame is kept apart, and adds no field offset: each load and store through sp, through s0 where the
+  prologue sets it from sp, or through a register holding a frame address (`frame_accesses`, without
+  the prologue's saves of callee-saved registers and their restores), each frame address the code
+  forms (`frame_addresses`), each it passes in an argument register to a call (`frame_arguments`),
+  and each load or store past a variable index added to a frame address (`frame_indexed`, at the
+  address's offset), as offsets from the value sp had on entry.
 - **The contract graph** (optional): the proof's own graph. Its function nodes are joined to the graph's
   functions by image address (below); it confirms callback tables a C initializer also names, and
   gives the interfaces the measures map onto groups.
@@ -140,9 +144,16 @@ These rules follow what the machine code shows, each only where it shows it:
   address a function passes to a call.
 - A local's or parameter's address is derived from the values that reach each use: the assignments
   before it (or after it, around a loop or a backward goto), less those an assignment on every path
-  overwrites, without null pointers (`for (; se; se = NULL)`, a helper that returns NULL), through
-  `?:`, `_Generic`, pointer arithmetic, an array's decay, and the return of any helper of the unit (one
-  not declared inline also gives `inner_displacement`, for a call that stays).
+  overwrites (also a `for` header's: the condition's `(p = next_task(p)) != &init_task` in the body,
+  the init in the whole loop), without null pointers (`for (; se; se = NULL)`, a helper that returns
+  NULL), through `?:`, `({ ... })`, `_Generic`, pointer arithmetic, an array's decay, and the return
+  of any helper of the unit. A helper not declared inline, one that returns NULL or an address (a
+  select the compiler keeps), and a `c ? container_of(...) : NULL` nothing tests also give
+  `inner_displacement`, from the register that holds the result.
+- The evaluator folds what the compiler does: a helper whose every live return gives one value (a
+  return under a constant-false test is no return), a file-scope static nothing in the unit writes
+  or takes the address of (its initializer), and `x && 0` / `x || 1` whatever `x` is. GNU's `a ?: b`
+  is no constant.
 - A read of a global whose file-scope initializer stores other globals' addresses reaches each of
   those globals the machine code forms (the compiler folded the field's value); the edge names the
   holder in `initializer`.
@@ -168,9 +179,15 @@ These rules follow what the machine code shows, each only where it shows it:
 - A field of a local object is held against the frame (`frames.py`). The object's slot B is where an
   image call passes the frame address B + d in the argument register where the C passes
   `&object + d` (`analysis.object_arguments` against `frame_arguments`; a struct local's cleanup
-  gets its address too). The fields are then matched at B plus their displacement
-  (`frame_slot_access`, or a wider or narrower access over it). The frame alone decides no slot: a
-  formed frame address where every accessed field is fits another struct's fields by chance too often.
+  gets its address too, and a lock guard's destructor the guard's: the local its inline constructor
+  returns by value is the guard). The fields are then matched at B plus their displacement
+  (`frame_slot_access`, a wider or narrower access over it, or, for an array member at a variable
+  index, `frame_slot_indexed_access` or a formed address there). The frame alone decides no slot: on
+  the kernel image (part `all`), a formed frame address where every accessed field is loaded or stored
+  fits the fields of another function's object of another struct 20% of the time with two fields, 9%
+  with three and 7% with four, so the 1,491 objects no call places are excluded as
+  `local_object_without_frame_slot`. Of the 615 objects a call places, the 309 whose function passes
+  other frame addresses too hold 926 fields at their slot and 410 at the best other frame argument.
 - Every field access no displacement can show is an exclusion of kind `field_access`, the access
   itself as its detail, and the structure check counts each reason as often as it is recorded:
   `local_object_without_frame_slot`, `zero_size_member` (an empty struct member, as `struct

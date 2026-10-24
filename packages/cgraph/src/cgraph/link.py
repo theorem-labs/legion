@@ -37,7 +37,7 @@ Unit = dict[str, Any]
 _EVENT_LISTS = ("accesses", "unevaluated", "list_calls", "indirect", "function_pointers", "field_accesses")
 _FIELD_KEYS = ("struct", "field", "offset", "displacement", "base", "size", "bitfield")
 # What a call argument says of the address it passes, which a value standing for it does not keep.
-_ADDRESS_KEYS = frozenset({"displacement", "base", "object", "object_size", "element", "index"})
+_ADDRESS_KEYS = frozenset({"displacement", "base", "object", "object_size", "element", "index", "inner"})
 _CORE_FORMAT = "cgraph/link-core/v1"
 # The events a fold under a __builtin_constant_p choice marks ``conditional``, besides calls.
 _MARKED = ("accesses", "field_accesses")
@@ -482,6 +482,10 @@ class Linker:
                 assert helper is not None
                 child = self.effective(tu, callee, caller, (*stack, name), pointers)
                 bound = _bind(child, call["arguments"])
+                returned = self.tus[tu]["functions"][callee].get("returns_object")
+                if returned is not None and call.get("result_object") is not None:
+                    # class_task_rq_lock_constructor returns its local _t, which is the caller's guard.
+                    bound = _renamed(bound, returned, call["result_object"])
                 # A helper folded under a __builtin_constant_p choice is itself left to the image: each
                 # of its events is marked. Each is also under the guards of the call.
                 mark = {"conditional": True} if call.get("conditional") else {}
@@ -635,7 +639,11 @@ def _rebase(access: dict[str, Any], argument: dict[str, Any] | None) -> dict[str
             "param": argument.get("param"),
             "base": _rebased_base(argument.get("base"), access["base"]),
         }
-        if argument["displacement"] != 0 and known:
+        if argument.get("inner", argument["displacement"]) != argument["displacement"] and known:
+            # The caller's register that holds the argument's base (a helper's result, a walk's
+            # member address) other than the base itself: the access is this far from it.
+            rebased["inner_displacement"] = access["displacement"] + argument["inner"]
+        elif argument["displacement"] != 0 and known:
             # The machine code may keep the member's address in a register: the access's own
             # displacement from it, the innermost one.
             rebased["inner_displacement"] = access.get("inner_displacement", access["displacement"])
@@ -645,7 +653,9 @@ def _rebase(access: dict[str, Any], argument: dict[str, Any] | None) -> dict[str
         if argument.get("index"):
             # The argument's own parameter indices, in the caller's parameters.
             rebased["index"] = [*access.get("index", []), *argument["index"]]
-        return {**rebased, **_object_of(argument)}
+        held = _object_of(argument)
+        # The address of a local object is no parameter, whatever value it stands for besides.
+        return {**rebased, **held, "param": None} if held else rebased
     unit = argument.get("unit")
     if unit is not None and unit["kind"] == "global" and unit.get("field") is None and argument.get("param") is None:
         # The address of a whole global: the field is that far into the global.
@@ -701,9 +711,12 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
                     }
                     if "element" in outer and "element" not in item:
                         nested["element"] = outer["element"] + item["displacement"]
+                    if outer.get("inner", outer["displacement"]) != outer["displacement"]:
+                        nested["inner"] = item["displacement"] + outer["inner"]
                     if outer.get("index"):
                         nested["index"] = [*item.get("index", []), *outer["index"]]
-                    rebound.append({**nested, **_object_of(outer)})
+                    held = _object_of(outer)
+                    rebound.append({**nested, **held, "param": None} if held else nested)
                 elif item["displacement"] == 0:
                     rebound.append(outer)
                 else:
@@ -717,6 +730,20 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
                 rebound.append({**item, "param": None})
         bound.calls.append({**call, "arguments": rebound})
     return _guarded(bound, child, arguments)
+
+
+def _renamed(bound: Effective, returned: str, result: str) -> Effective:
+    """A folded helper's events, with the local object it returns by value named as the caller's
+    local it initializes: after inlining they are one object."""
+
+    def rename(item: dict[str, Any]) -> dict[str, Any]:
+        return {**item, "object": result} if item.get("object") == returned else item
+
+    return dataclasses.replace(
+        bound,
+        field_accesses=[rename(item) for item in bound.field_accesses],
+        calls=[{**call, "arguments": [rename(item) for item in call["arguments"]]} for call in bound.calls],
+    )
 
 
 def _object_of(argument: dict[str, Any]) -> dict[str, Any]:
@@ -1695,6 +1722,7 @@ def _image_analysis(
     frame_accesses: dict[str, list[list[int]]] = {}
     frame_addresses: dict[str, list[int]] = {}
     frame_arguments: dict[str, list[list[Any]]] = {}
+    frame_indexed: dict[str, list[list[int]]] = {}
     for identity, definition in sorted(functions.items()):
         facts = linker.image_facts(definition)
         for fact in facts:
@@ -1714,6 +1742,9 @@ def _image_analysis(
                 list(item) for item in sorted({item for fact in facts for item in fact.frame_accesses})
             ]
             frame_addresses[identity] = sorted({value for fact in facts for value in fact.frame_addresses})
+            frame_indexed[identity] = [
+                list(item) for item in sorted({item for fact in facts for item in fact.frame_indexed})
+            ]
             targets = {call["provenance"][0]["address"]: call["target"] for fact in facts for call in fact.calls}
             frame_arguments[identity] = [
                 [targets[_hex(address)], position, offset]
@@ -1737,6 +1768,7 @@ def _image_analysis(
         "frame_accesses": frame_accesses,
         "frame_addresses": frame_addresses,
         "frame_arguments": frame_arguments,
+        "frame_indexed": frame_indexed,
     }
 
 

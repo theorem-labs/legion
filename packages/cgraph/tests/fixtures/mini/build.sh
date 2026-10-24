@@ -29,6 +29,12 @@ void fct_takes_inner(void *in) { (void)in; }
 void fct_takes_node(void *n) { (void)n; }
 void *fct_other(int k) { (void)k; return heap; }
 void fct_release(void *in) { (void)in; }
+void *fct_rq_lock(void *p, void *rf) { (void)p; (void)rf; return heap; }
+void fct_rq_unlock(void *rq, void *rf) { (void)rq; (void)rf; }
+int fct_is_link(const void *n) { return n != 0; }
+void *fct_find(void) { return heap; }
+void *fct_cur(void) { return heap; }
+void fct_show(unsigned long m) { (void)m; }
 void _start(void) { for (;;) ; }
 EOF
 "$CLANG" "${FLAGS[@]}" -c "$work/stubs.c" -o "$work/stubs.o"

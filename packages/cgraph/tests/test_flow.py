@@ -833,6 +833,16 @@ def test_only_a_call_s_frame_argument_places_a_local_object() -> None:
     assert frames.fit({(0, 8)}, 8, accesses, {8}) is None
 
 
+def test_an_array_member_at_a_variable_index_is_held_where_the_frame_indexes_or_forms_it() -> None:
+    """fbatch.folios[i] at slot -320 + 8: a store past an index added to -312, or a register formed
+    at -312 that the code walks (kmem_dump_obj's kp_stack[i]); a plain field needs its own access."""
+    item = {"frame_slot": -320, "displacement": 8, "size": 120, "element_displacement": 0}
+    assert frames.method(item, set(), set(), {-312}) == "frame_slot_indexed_access"
+    assert frames.method(item, set(), {-312}) == "frame_slot_address"
+    plain = {"frame_slot": -320, "displacement": 8, "size": 8}
+    assert frames.method(plain, set(), {-312}, {-312}) == "no_access_at_frame_slot"
+
+
 def test_a_cleanup_of_a_struct_local_gets_the_local_s_address(fct_facts: dict[str, Any]) -> None:
     """fct_release(&held) runs when held's scope ends: its fields through the parameter are held's."""
     (call,) = [
@@ -840,3 +850,73 @@ def test_a_cleanup_of_a_struct_local_gets_the_local_s_address(fct_facts: dict[st
     ]
     (argument,) = call["arguments"]
     assert (argument["base"], argument["displacement"], argument["object"].split("@")[0]) == ("local", 0, "held")
+
+
+def test_a_lock_guard_s_fields_are_the_guard_local_its_constructor_returns(fct_build: dict[str, Any]) -> None:
+    """guard = class_fct_rq_constructor(p) returns its own _t, whose &_t.rf goes to fct_rq_lock; the
+    destructor writes guard.rf.clock: one local object, which the frame holds where the call passes it.
+    The constructor's own _t calls no destructor."""
+    analysis = fct_build["graph"]["analysis"]
+    accesses = analysis["field_accesses"]["function:fct_guarded"]
+    assert {(item["field"], item["base"], item["object"].split("@")[0]) for item in accesses} == {
+        ("flags", "local", "guard"),
+        ("clock", "local", "guard"),
+    }
+    # &guard.rf to the lock call (the constructor's _t, renamed) and to the unlock call (the destructor).
+    assert sorted(item[:2] for item in analysis["object_arguments"]["function:fct_guarded"]) == [
+        ["fct_rq_lock", 1],
+        ["fct_rq_unlock", 1],
+    ]
+    offsets = fct_build["checks"]["structure_layer"]["field_offsets"]
+    assert not [item for item in offsets["misses"] if item["function"] == "function:fct_guarded"]
+
+
+def _fields_of(facts: dict[str, Any], function: str) -> set[tuple[Any, ...]]:
+    return {
+        (item["field"], item["displacement"], item["base"], item.get("inner_displacement"))
+        for item in fact_events(facts, function)["field_accesses"]
+    }
+
+
+def test_an_assignment_in_a_for_header_is_what_reaches_the_body(fct_facts: dict[str, Any]) -> None:
+    """for (p = &init; (p = next(p)) != &init;): p->flags is 32 - 40 below next's tasks pointer. A
+    second walk's init, not the first walk's values, reaches its body: o->in.a is 16 - 160."""
+    assert ("flags", -8, "container_of", None) in _fields_of(fct_facts, "fct_each_task")
+    walked = _fields_of(fct_facts, "fct_two_walks")
+    assert ("x", -160, "container_of", None) in walked
+    assert ("a", -144, "container_of", None) in walked
+
+
+def test_a_statement_expression_s_null_select_gives_its_container(fct_facts: dict[str, Any]) -> None:
+    """({ ...; is_link(n) ? container_of(n, ...) : NULL; }): o->x is 160 below n, or 0 from the selected
+    register where nothing tests it first."""
+    assert _fields_of(fct_facts, "fct_select_container") == {("x", -160, "container_of", 0)}
+
+
+def test_a_helper_that_returns_null_or_a_container_gives_the_register_it_selects(fct_facts: dict[str, Any]) -> None:
+    assert _fields_of(fct_facts, "fct_nullable_helper") == {("x", -160, "container_of", 0)}
+
+
+def test_a_folded_callee_s_field_is_that_far_from_the_register_a_call_returns(fct_build: dict[str, Any]) -> None:
+    """fct_res_free(fct_remove_res()): node.b is 12 into fct_res, which is 16 below the returned &r->data."""
+    (item,) = fct_build["graph"]["analysis"]["field_accesses"]["function:fct_destroy"]
+    assert (item["field"], item["base"], item["inner_displacement"]) == ("b", "container_of", -4)
+
+
+def test_a_constant_helper_result_and_an_unwritten_static_decide_branches(fct_facts: dict[str, Any]) -> None:
+    """fct_init_always always returns 0 (its -12 is under a false test); fct_never_set is always 0."""
+    assert "x" not in {field for field, *_ in _fields_of(fct_facts, "fct_alloc_object")}
+    assert "x" not in {field for field, *_ in _fields_of(fct_facts, "fct_maybe_use")}
+    assert "fct_cur" in {call["callee"] for call in fact_events(fct_facts, "fct_maybe_use")["calls"]}
+
+
+def test_gnu_conditional_with_an_omitted_middle_is_no_conversion_of_its_last_operand(fct_facts: dict[str, Any]) -> None:
+    """fct_show(mask ?: fct_default_mask): the argument is the mask where it is set, not the static's 0."""
+    argument = call_argument(fct_facts, "fct_report", "fct_show")
+    assert (argument.get("expr") or {}).get("c") is None
+
+
+def test_a_helper_first_folded_too_deep_still_folds_for_a_shallow_use(fct_facts: dict[str, Any]) -> None:
+    """fct_d1 reaches fct_off five helpers deep before fct_off_later tests it: !fct_off() still holds,
+    so the free after the return is dead."""
+    assert "obj_free" not in {call["callee"] for call in fact_events(fct_facts, "fct_off_later")["calls"]}
