@@ -97,6 +97,113 @@ func TestDeclarationEvidenceComparesWholeSignature(t *testing.T) {
 	wantEvidence(t, evidence, blame.Name{Value: "Target", Kind: blame.Changed}, 3, "signature changed")
 }
 
+// candidateTree builds the candidate of base and members through the real Git
+// adapter, and fails the test when a member is dropped.
+func candidateTree(t *testing.T, repo, base string, members ...Member) Tree {
+	t.Helper()
+	result, err := (RepositoryGit{}).Candidate(context.Background(), repo, base, members)
+	if err != nil {
+		t.Fatalf("Candidate() error = %v", err)
+	}
+	if len(result.Dropped) != 0 {
+		t.Fatalf("Candidate() dropped %+v", result.Dropped)
+	}
+	return Tree(result.Tree)
+}
+
+// A stale member, branched before the base added a declaration, re-adds the
+// same declaration with a signature that spans lines. It restates the base,
+// so it is not blamed for the duplicate.
+func TestDeclarationEvidenceSuppressesMultiLineRestatement(t *testing.T) {
+	const restated = "theorem T (n : Nat)\n    (h : n = 0) : True := trivial\n"
+	repo, root := commandRepository(t, false)
+	writeSource(t, repo, "T.lean", restated)
+	commandReviewGit(t, repo, "add", "T.lean")
+	commandReviewGit(t, repo, "commit", "-qm", "base")
+	base := commandReviewGit(t, repo, "rev-parse", "HEAD")
+	commandReviewGit(t, repo, "checkout", "-q", "-b", "stale", root)
+	writeSource(t, repo, "T.lean", restated)
+	commandReviewGit(t, repo, "add", "T.lean")
+	commandReviewGit(t, repo, "commit", "-qm", "stale")
+	stale := Member{Migration: "stale", Head: commandReviewGit(t, repo, "rev-parse", "HEAD")}
+
+	report := blame.Report{Blocks: []blame.Block{{Module: "T", Message: "environment already contains 'T'"}}}
+	got := attribute(t, repo, base, map[string]string{stale.Migration: stale.Head}, candidateTree(t, repo, base, stale), report)
+	if len(got) != 0 {
+		t.Fatalf("attributions = %+v, want the stale restatement suppressed", got)
+	}
+}
+
+// A member that changes a continuation line of a signature changes the
+// declaration in the candidate, so its evidence is promoted.
+func TestDeclarationEvidencePromotesMultiLineChange(t *testing.T) {
+	repo, base, head := memberRepository(t,
+		map[string]string{"T.lean": "theorem T (n : Nat)\n    (h : n = 0) : True := trivial\n"},
+		map[string]string{"T.lean": "theorem T (n : Nat)\n    (h : n = 1) : True := trivial\n"},
+	)
+	member := Member{Migration: "member", Head: head}
+
+	report := blame.Report{Blocks: []blame.Block{{Module: "T", Message: "environment already contains 'T'"}}}
+	got := attribute(t, repo, base, map[string]string{member.Migration: member.Head}, candidateTree(t, repo, base, member), report)
+	want := blame.Attribution{Module: "T", Name: "T", Kind: blame.Added, Member: "member", Strength: 3, Evidence: "changed in candidate"}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("attributions = %+v, want [%+v]", got, want)
+	}
+}
+
+// A match arm of a definition is its body, not its signature: editing one arm
+// is an edit inside the definition.
+func TestDeclarationEvidenceMatchArmIsBody(t *testing.T) {
+	base := "def f : Nat → Nat\n  | 0 => 1\n  | n + 1 => n\n"
+	member := "def f : Nat → Nat\n  | 0 => 2\n  | n + 1 => n\n"
+	evidence := memberEvidence(t, map[string]string{"Alpha.lean": base}, map[string]string{"Alpha.lean": member})
+
+	wantEvidence(t, evidence, blame.Name{Value: "f", Kind: blame.Changed}, 2, "edited")
+	wantEvidence(t, evidence, blame.Name{Value: "f", Kind: blame.Unknown}, 1, "edited")
+}
+
+// Git names a hunk's enclosing declaration by the line it finds above the
+// hunk. Two declarations share the short name Changed, and the hunk lies
+// inside Beta's: the evidence belongs to Beta.Changed, not to the first
+// Changed in the file. A context line that is not a declaration, such as
+// `namespace Beta`, names no declaration.
+func TestDeclarationEvidenceHunkHeaderResolvesPosition(t *testing.T) {
+	base := "namespace Alpha\ndef Changed := 0\nend Alpha\nnamespace Beta\ndef Changed := 1\nend Beta\n"
+
+	// The hunk adds Beta.Extra after Beta.Changed; git's context is
+	// `def Changed := 1`.
+	added := memberEvidence(t, map[string]string{"Alpha.lean": base}, map[string]string{"Alpha.lean": "namespace Alpha\ndef Changed := 0\nend Alpha\nnamespace Beta\ndef Changed := 1\ndef Extra := 2\nend Beta\n"})
+	wantEvidence(t, added, blame.Name{Value: "Beta.Changed", Kind: blame.Changed}, 2, "edited")
+	wantEvidence(t, added, blame.Name{Value: "Alpha.Changed", Kind: blame.Changed}, 0, "")
+
+	// The hunk edits Beta.Changed itself; git's context is `namespace Beta`.
+	edited := memberEvidence(t, map[string]string{"Alpha.lean": base}, map[string]string{"Alpha.lean": "namespace Alpha\ndef Changed := 0\nend Alpha\nnamespace Beta\ndef Changed := 2\nend Beta\n"})
+	wantEvidence(t, edited, blame.Name{Value: "Beta.Changed", Kind: blame.Changed}, 3, "signature changed")
+	wantEvidence(t, edited, blame.Name{Value: "Alpha.Changed", Kind: blame.Changed}, 0, "")
+}
+
+// A `namespace` line inside a block comment opens no namespace, so removing
+// the comment closes none.
+func TestDeclarationEvidenceIgnoresNamespaceInComment(t *testing.T) {
+	base := "/-\nnamespace Ghost\n-/\ndef kept := 0\n"
+	member := "def kept := 0\n"
+	evidence := memberEvidence(t, map[string]string{"Alpha.lean": base}, map[string]string{"Alpha.lean": member})
+
+	wantEvidence(t, evidence, blame.Name{Value: "Ghost.x", Kind: blame.Unknown}, 0, "")
+	wantEvidence(t, evidence, blame.Name{Value: "kept", Kind: blame.Changed}, 0, "")
+}
+
+// A removed line comment is `--- …` in the diff, and an added line that
+// starts with `++` is `+++ …`: inside a hunk they are changed lines, not the
+// file headers of the next file.
+func TestDeclarationEvidenceReadsChangedLinesThatLookLikeFileHeaders(t *testing.T) {
+	base := "-- note\nnamespace Closed\ndef member := 0\nend Closed\n"
+	member := "++ added\ndef member := 0\n"
+	evidence := memberEvidence(t, map[string]string{"Alpha.lean": base}, map[string]string{"Alpha.lean": member})
+
+	wantEvidence(t, evidence, blame.Name{Value: "Closed.elsewhere", Kind: blame.Unknown}, 2, "namespace closed")
+}
+
 // A removed or added structure field is recorded under the structure's fully
 // qualified name.
 func TestDeclarationEvidenceRecordsStructureFields(t *testing.T) {

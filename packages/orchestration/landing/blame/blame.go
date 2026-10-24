@@ -72,7 +72,6 @@ var (
 	blockEndRE     = regexp.MustCompile(`^(?:error:|warning:|info:|trace:|✔|✖|⚠|\[|-- build round|Build completed|Some required|Some builds)`)
 	identifier     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.'!?-]*$`)
 	fieldRE        = regexp.MustCompile(`^\s+([A-Za-z_][A-Za-z0-9_']*)\s*:`)
-	hunkRE         = regexp.MustCompile(`^@@ [^@]*@@ ?(.*)$`)
 	unknownRE      = regexp.MustCompile("(?i)(?:unknown identifier|unknown constant|the environment does not contain|unknown namespace)\\s*[`']([^`']+)[`']")
 	addedRE        = regexp.MustCompile(`environment already contains '([^']+)'`)
 	fieldOfRE      = regexp.MustCompile("is not a field of structure `([^`]+)`")
@@ -231,7 +230,8 @@ type Evidence struct {
 	Declarations  declarationSet
 }
 
-// Line is one normalised declaration line added to or removed from a diff.
+// Line is one declaration's normalised signature, removed from or added to a
+// member's sources.
 type Line struct {
 	Sign string
 	Text string

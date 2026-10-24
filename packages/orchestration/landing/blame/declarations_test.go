@@ -136,3 +136,31 @@ func TestScanDeclarationsCarriesModifierLines(t *testing.T) {
 		t.Errorf("open_ = %+v, want neither modifier", got[2])
 	}
 }
+
+// A declaration's Text is its whole signature: the header and every
+// continuation line up to the body, joined with single spaces. Comments and
+// blank lines inside the signature are not part of it, and a match arm of a
+// definition starts its body.
+func TestScanDeclarationsJoinsSignatureLines(t *testing.T) {
+	source := "theorem T (n : Nat)\n    (h : n = 0) -- why\n\n    : True := by\n  trivial\n" +
+		"def f : Nat → Nat\n  | 0 => 1\n  | n + 1 => n\n" +
+		"structure Point (α : Type)\n    (β : Type) where\n  x : α\n" +
+		"inductive Tree\n  | leaf\n  | node (l r : Tree)\n" +
+		"theorem open_ (n : Nat)\n    (h : n = 0)\n"
+	got := ScanDeclarations("Signatures.lean", source)
+	want := map[string]string{
+		"T":     "theorem T (n : Nat) (h : n = 0) : True := by",
+		"f":     "def f : Nat → Nat",
+		"Point": "structure Point (α : Type) (β : Type) where",
+		"Tree":  "inductive Tree | leaf | node (l r : Tree)",
+		"open_": "theorem open_ (n : Nat) (h : n = 0)",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ScanDeclarations() = %+v, want %d declarations", got, len(want))
+	}
+	for _, declaration := range got {
+		if declaration.Text != want[declaration.Name] {
+			t.Errorf("%s Text = %q, want %q", declaration.Name, declaration.Text, want[declaration.Name])
+		}
+	}
+}

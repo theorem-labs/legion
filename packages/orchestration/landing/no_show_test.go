@@ -12,28 +12,38 @@ import (
 )
 
 // TestNoGitShowInEvidenceOrTreePath puts a wrapper git on PATH that rejects
-// `git show` and bare `git cat-file` (without --batch). It creates a
-// repository where two members share one unchanged blob (Shared.lean) and
-// each changes a different file. DeclarationEvidence and TreeDeclarations
-// must succeed without git show.
+// `git show` and any `git cat-file` without --batch, the per-file reads. It
+// creates a repository where two members share one unchanged blob
+// (Shared.lean) and each changes a different file. DeclarationEvidence and
+// TreeDeclarations must succeed through the wrapper.
 func TestNoGitShowInEvidenceOrTreePath(t *testing.T) {
 	// Find the real git binary.
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatalf("cannot find git: %v", err)
 	}
-	// Write a wrapper that rejects show and bare cat-file.
+	// Write a wrapper that rejects show and cat-file without --batch.
 	binDir := t.TempDir()
 	wrapper := filepath.Join(binDir, "git")
 	script := `#!/bin/sh
+show=no
+catfile=no
+batch=no
 for arg in "$@"; do
   case "$arg" in
-    show)
-      echo "FATAL: git show is forbidden" >&2
-      exit 1
-      ;;
+    show) show=yes ;;
+    cat-file) catfile=yes ;;
+    --batch) batch=yes ;;
   esac
 done
+if [ "$show" = yes ]; then
+  echo "FATAL: git show is forbidden" >&2
+  exit 1
+fi
+if [ "$catfile" = yes ] && [ "$batch" = no ]; then
+  echo "FATAL: git cat-file without --batch is forbidden" >&2
+  exit 1
+fi
 exec ` + realGit + ` "$@"
 `
 	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
@@ -74,6 +84,13 @@ exec ` + realGit + ` "$@"
 	headB := git("rev-parse", "HEAD")
 
 	ctx := context.Background()
+	// The wrapper refuses the per-file reads it guards against.
+	for _, args := range [][]string{{"show", base + ":Shared.lean"}, {"cat-file", "-p", base + ":Shared.lean"}, {"cat-file", "blob", base + ":Shared.lean"}} {
+		if output, err := exec.Command(wrapper, append([]string{"-C", repo}, args...)...).CombinedOutput(); err == nil {
+			t.Fatalf("wrapper ran git %s, want it refused:\n%s", strings.Join(args, " "), output)
+		}
+	}
+
 	g := RepositoryGit{}
 
 	// DeclarationEvidence must work through the wrapper (no git show).

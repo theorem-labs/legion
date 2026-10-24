@@ -4,9 +4,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
+	"maps"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -156,10 +157,60 @@ func (g RepositoryGit) DeclarationEvidence(ctx context.Context, repository, base
 }
 
 // TreeDeclarations scans every Lean declaration in one immutable tree. It
-// streams blobs through one git cat-file --batch process and scans them in
-// parallel.
+// streams the tree's Lean blobs through one git cat-file --batch process and
+// hands each blob to a pool of scanning workers as it is read, so only the
+// blobs in flight are held in memory.
 func (g RepositoryGit) TreeDeclarations(ctx context.Context, repository string, tree Tree) ([]blame.Declaration, error) {
-	return g.scanTree(ctx, g.path(repository), string(tree), nil)
+	repository = g.path(repository)
+	listing, err := repositoryGit(ctx, repository, "ls-tree", "-r", "-z", string(tree))
+	if err != nil {
+		return nil, fmt.Errorf("list files at %q: %w", tree, err)
+	}
+	var paths, ids []string
+	for entry := range strings.SplitSeq(listing, "\x00") {
+		meta, path, found := strings.Cut(entry, "\t")
+		if !found {
+			continue
+		}
+		fields := strings.Fields(meta)
+		if len(fields) != 3 || fields[1] != "blob" || !strings.HasSuffix(path, ".lean") {
+			continue
+		}
+		paths = append(paths, path)
+		ids = append(ids, fields[2])
+	}
+	type scanJob struct {
+		index  int
+		source string
+	}
+	workers := min(runtime.GOMAXPROCS(0), len(paths))
+	jobs := make(chan scanJob, workers)
+	results := make([][]blame.Declaration, len(paths))
+	var group sync.WaitGroup
+	for range workers {
+		group.Go(func() {
+			for job := range jobs {
+				results[job.index] = blame.ScanDeclarations(paths[job.index], job.source)
+			}
+		})
+	}
+	err = catFileBatch(ctx, repository, ids, func(index int, source string) {
+		jobs <- scanJob{index: index, source: source}
+	})
+	close(jobs)
+	group.Wait()
+	if err != nil {
+		return nil, fmt.Errorf("read files at %q: %w", tree, err)
+	}
+	total := 0
+	for _, declarations := range results {
+		total += len(declarations)
+	}
+	all := make([]blame.Declaration, 0, total)
+	for _, declarations := range results {
+		all = append(all, declarations...)
+	}
+	return all, nil
 }
 
 // Declarations finds the declarations a diagnostic can name in one immutable
@@ -173,167 +224,87 @@ func (g RepositoryGit) Declarations(ctx context.Context, repository string, tree
 	return blame.DeclarationsFor(name, declarations), nil
 }
 
-type blobEntry struct {
-	path string
-	id   string
+// readBlobs batch-reads a set of blob IDs through one git cat-file --batch
+// process and returns their contents keyed by blob ID.
+func readBlobs(ctx context.Context, repository string, ids map[string]struct{}) (map[string]string, error) {
+	list := slices.Collect(maps.Keys(ids))
+	blobs := make(map[string]string, len(list))
+	if err := catFileBatch(ctx, repository, list, func(index int, source string) {
+		blobs[list[index]] = source
+	}); err != nil {
+		return nil, err
+	}
+	return blobs, nil
 }
 
-// scanTree lists Lean blobs with ls-tree -z, streams them through one
-// cat-file --batch process, and scans them in parallel. When only is non-nil,
-// only the named files are scanned.
-func (g RepositoryGit) scanTree(ctx context.Context, repository, revision string, only map[string]struct{}) ([]blame.Declaration, error) {
-	listing, err := repositoryGit(ctx, repository, "ls-tree", "-r", "-z", revision)
-	if err != nil {
-		return nil, fmt.Errorf("list files at %q: %w", revision, err)
+// catFileBatch reads each blob in ids, in order, through one git cat-file
+// --batch process, and passes each blob's index in ids and its contents to
+// each as soon as it is read.
+func catFileBatch(ctx context.Context, repository string, ids []string, each func(index int, source string)) error {
+	if len(ids) == 0 {
+		return nil
 	}
-	var entries []blobEntry
-	for _, raw := range strings.Split(listing, "\x00") {
-		meta, path, found := strings.Cut(raw, "\t")
-		if !found {
-			continue
-		}
-		fields := strings.Fields(meta)
-		if len(fields) != 3 || fields[1] != "blob" || !strings.HasSuffix(path, ".lean") {
-			continue
-		}
-		if only != nil {
-			if _, ok := only[path]; !ok {
-				continue
-			}
-		}
-		entries = append(entries, blobEntry{path: path, id: fields[2]})
-	}
-	if len(entries) == 0 {
-		return nil, nil
-	}
-	// Stream blobs through one cat-file --batch process.
-	ids := make([]string, len(entries))
-	for i, e := range entries {
-		ids[i] = e.id
-	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	command := exec.CommandContext(ctx, "git", "-C", repository, "cat-file", "--batch")
 	command.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
 	stdout, err := command.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("cat-file pipe: %w", err)
+		return fmt.Errorf("cat-file pipe: %w", err)
 	}
 	if err := command.Start(); err != nil {
-		return nil, fmt.Errorf("cat-file start: %w", err)
+		return fmt.Errorf("cat-file start: %w", err)
 	}
 	reader := bufio.NewReaderSize(stdout, 1<<20)
-	type scanJob struct {
-		path   string
-		source string
-	}
-	jobs := make([]scanJob, 0, len(entries))
-	for _, e := range entries {
-		header, err := reader.ReadString('\n')
+	for index, id := range ids {
+		source, err := readBatchBlob(reader)
 		if err != nil {
+			// Stop git before waiting, since it may be blocked writing.
+			cancel()
 			_ = command.Wait()
-			return nil, fmt.Errorf("read blob header for %q: %w", e.path, err)
+			return fmt.Errorf("read blob %s: %w", id, err)
 		}
-		headerFields := strings.Fields(header)
-		if len(headerFields) < 3 {
-			_ = command.Wait()
-			return nil, fmt.Errorf("unexpected blob header for %q: %q", e.path, header)
-		}
-		size, err := strconv.Atoi(headerFields[2])
-		if err != nil {
-			_ = command.Wait()
-			return nil, fmt.Errorf("parse blob size for %q: %w", e.path, err)
-		}
-		body := make([]byte, size+1) // +1 for trailing newline from cat-file
-		if _, err := io.ReadFull(reader, body); err != nil {
-			_ = command.Wait()
-			return nil, fmt.Errorf("read blob body for %q: %w", e.path, err)
-		}
-		jobs = append(jobs, scanJob{path: e.path, source: string(body[:size])})
+		each(index, source)
 	}
 	if err := command.Wait(); err != nil {
-		return nil, fmt.Errorf("cat-file: %w", err)
+		return fmt.Errorf("cat-file: %w", err)
 	}
-	// Scan in parallel.
-	type scanResult struct {
-		declarations []blame.Declaration
-	}
-	results := make([]scanResult, len(jobs))
-	work := make(chan int)
-	var group sync.WaitGroup
-	workers := runtime.GOMAXPROCS(0)
-	if workers > len(jobs) {
-		workers = len(jobs)
-	}
-	for range workers {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			for index := range work {
-				results[index] = scanResult{
-					declarations: blame.ScanDeclarations(jobs[index].path, jobs[index].source),
-				}
-			}
-		}()
-	}
-	for i := range jobs {
-		work <- i
-	}
-	close(work)
-	group.Wait()
-	var all []blame.Declaration
-	for _, r := range results {
-		all = append(all, r.declarations...)
-	}
-	return all, nil
+	return nil
 }
 
-// readBlobs batch-reads a set of blob IDs through one git cat-file --batch
-// process and returns their contents keyed by blob ID.
-func readBlobs(ctx context.Context, repository string, ids map[string]struct{}) (map[string]string, error) {
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	idList := make([]string, 0, len(ids))
-	for id := range ids {
-		idList = append(idList, id)
-	}
-	command := exec.CommandContext(ctx, "git", "-C", repository, "cat-file", "--batch")
-	command.Stdin = strings.NewReader(strings.Join(idList, "\n") + "\n")
-	stdout, err := command.StdoutPipe()
+// readBatchBlob reads one blob from git cat-file --batch output: a header
+// `<id> blob <size>`, the contents and a newline.
+func readBatchBlob(reader *bufio.Reader) (string, error) {
+	header, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, fmt.Errorf("cat-file pipe: %w", err)
+		return "", fmt.Errorf("read header: %w", err)
 	}
-	if err := command.Start(); err != nil {
-		return nil, fmt.Errorf("cat-file start: %w", err)
+	fields := strings.Fields(header)
+	if len(fields) != 3 || fields[1] != "blob" {
+		return "", fmt.Errorf("unexpected header %q", header)
 	}
-	reader := bufio.NewReaderSize(stdout, 1<<20)
-	blobs := make(map[string]string, len(idList))
-	for _, id := range idList {
-		header, err := reader.ReadString('\n')
+	size, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return "", fmt.Errorf("parse size in header %q: %w", header, err)
+	}
+	// Copy the contents straight from the reader's buffer, so each blob is
+	// held once.
+	var body strings.Builder
+	body.Grow(size)
+	for body.Len() < size {
+		chunk, err := reader.Peek(min(size-body.Len(), reader.Size()))
+		body.Write(chunk)
+		if _, discardErr := reader.Discard(len(chunk)); discardErr != nil {
+			return "", fmt.Errorf("read contents: %w", discardErr)
+		}
 		if err != nil {
-			_ = command.Wait()
-			return nil, fmt.Errorf("read blob header for %q: %w", id, err)
+			return "", fmt.Errorf("read contents: %w", err)
 		}
-		headerFields := strings.Fields(header)
-		if len(headerFields) < 3 {
-			_ = command.Wait()
-			return nil, fmt.Errorf("unexpected blob header for %q: %q", id, header)
-		}
-		size, err := strconv.Atoi(headerFields[2])
-		if err != nil {
-			_ = command.Wait()
-			return nil, fmt.Errorf("parse blob size for %q: %w", id, err)
-		}
-		body := make([]byte, size+1)
-		if _, err := io.ReadFull(reader, body); err != nil {
-			_ = command.Wait()
-			return nil, fmt.Errorf("read blob body for %q: %w", id, err)
-		}
-		blobs[id] = string(body[:size])
 	}
-	if err := command.Wait(); err != nil {
-		return nil, fmt.Errorf("cat-file: %w", err)
+	if _, err := reader.Discard(1); err != nil {
+		return "", fmt.Errorf("read contents: %w", err)
 	}
-	return blobs, nil
+	return body.String(), nil
 }
 
 func (g RepositoryGit) path(repository string) string {

@@ -55,7 +55,7 @@ func TestNamesRecognizeBuildErrorShapes(t *testing.T) {
 	}
 }
 
-func TestIndexDiffRecordsDeclarationEvidence(t *testing.T) {
+func TestEvidenceForScoresDeclarationEvidence(t *testing.T) {
 	before := []Declaration{
 		{Name: "Removed", Text: "def Removed := 0"},
 		{Name: "Record", Text: "structure Record where"},

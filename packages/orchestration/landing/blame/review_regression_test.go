@@ -2,7 +2,7 @@ package blame
 
 import "testing"
 
-func TestReviewHunkHeaderCreatesInsideEvidence(t *testing.T) {
+func TestEvidenceForScoresInsideEvidence(t *testing.T) {
 	evidence := newEvidence()
 	evidence.Inside[DeclarationID{Name: "Changed"}] = Declaration{Name: "Changed"}
 	strength, label := EvidenceFor(Name{Value: "Changed", Kind: Changed}, evidence)
