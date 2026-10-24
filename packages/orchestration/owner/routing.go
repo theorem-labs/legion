@@ -343,9 +343,9 @@ type NoticeFields struct {
 	Models   map[string]any
 }
 
-// Notices builds one notice per delivery. Every notice of an item carries the key c-<hex16(item)>. A notice of a record
-// that queues no item names no item: its subject is its sender, and its key is c-<hex16(record@commit)>, one for each
-// revision of the record, which a re-run of the step repeats.
+// Notices builds one notice per delivery. Every notice of an item carries the key NoticeKey(item). A notice of a record
+// that queues no item names no item: its subject is its sender, and its key is NoticeKey(record@commit), one for each
+// revision of the record. A re-run of the step repeats the key, so each subscribed session takes the notice once.
 func Notices(deliveries []Delivery, fields NoticeFields) []Notice {
 	short := fields.Commit
 	if len(short) > 12 {
@@ -374,7 +374,7 @@ func Notices(deliveries []Delivery, fields NoticeFields) []Notice {
 		if fields.Item != "" {
 			payload["item"] = fields.Item
 		}
-		notices = append(notices, Notice{Topic: delivery.Topic, Message: message, Payload: payload, Key: "c-" + Hex16(key)})
+		notices = append(notices, Notice{Topic: delivery.Topic, Message: message, Payload: payload, Key: NoticeKey(key)})
 	}
 	return notices
 }

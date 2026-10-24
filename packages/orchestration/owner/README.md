@@ -31,9 +31,11 @@ Steps:
   trailer (`ErrUnattributed`, exit 4).
 - A step that answers no item (`need`, a spec revision with no open item) commits its record with no trailer,
   queues its follow-ups and sends its notices.
-- A notice about a work item carries the key `c-<hex16(item)>` and names the item. A spec revision that offers no
-  edge queues no item for the users of the spec, so its notice names none: its message names the revision, and its
-  key is `c-<hex16(record@commit)>`, one for each revision, which a re-run repeats.
+- A notice about a work item carries the key `hex32(item)` (the first 32 hex digits of SHA-256) and names the item.
+  A spec revision that offers no edge queues no item for the users of the spec, so its notice names none: its message
+  names the revision, and its key is `hex32(record@commit)`, one for each revision. A re-run repeats the key, and the
+  listener's dedupe key `publish.<key>` has Envoy's minted shape (`MINTED_DEDUPE_KEY_PATTERN` in
+  `packages/contracts`), so each subscribed session takes the repeated notice once.
 - Each commit holds the worktree's commit lock, `flock(2)` on `owner.flock` in the worktree's git directory, from
   its read of `HEAD` to its commit. Its git commands inherit the lock, so it holds until the last of them exits, also
   when the owner command is killed first. A command that holds the lock finds no live git of another owner command

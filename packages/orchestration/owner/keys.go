@@ -14,6 +14,16 @@ func Hex16(s string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// NoticeKey is the Envoy idempotency key of a notice about s (an item id, or record@commit): the first 32 lowercase
+// hexadecimal characters of SHA-256 over s's UTF-8 bytes. The listener makes its dedupe key publish.<key>, the shape
+// of a key minted once for its message (MINTED_DEDUPE_KEY_PATTERN in packages/contracts), which Envoy's hosts drop a
+// second copy of inside their duplicate window. So the notice that a repeated step publishes again reaches each
+// subscribed session once; a key of another shape is no dedupe key to a host, and the session got both copies.
+func NoticeKey(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:16])
+}
+
 // Key is the stable filesystem key for an owner id.
 func Key(id string) string { return "K" + Hex16(id) }
 

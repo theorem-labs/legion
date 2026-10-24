@@ -195,18 +195,23 @@ func (s Session) Run(ctx context.Context) error {
 		return err
 	}
 	s.inbox(ctx)
-	seen := map[string]bool{}
+	seenEvents, seenKeys := map[string]bool{}, map[string]bool{}
 	for lines.Scan() {
 		var envelope Envelope
 		if err := json.Unmarshal(lines.Bytes(), &envelope); err != nil {
 			return fmt.Errorf("a delivery that is not an envelope: %q", lines.Text())
 		}
-		// A host drops a repeat of a dedupe key it has seen, as the Envoy plugin does.
-		if seen[envelope.DedupeKey] {
+		// A host drops a second copy of one event, and a repeat of a dedupe key that names its message (Envoy's
+		// minted shape), as pi-envoy's claim does; a repeat of a key of any other shape is a new delivery to it.
+		named := mintedDedupeKey.MatchString(envelope.DedupeKey)
+		if seenEvents[envelope.EventID] || (named && seenKeys[envelope.DedupeKey]) {
 			s.logf("dropped %s, a repeat of %s", envelope.EventID, envelope.DedupeKey)
 			continue
 		}
-		seen[envelope.DedupeKey] = true
+		seenEvents[envelope.EventID] = true
+		if named {
+			seenKeys[envelope.DedupeKey] = true
+		}
 		if err := session.delivered(envelope); err != nil {
 			return fmt.Errorf("record the delivery %s in the transcript: %w", envelope.EventID, err)
 		}

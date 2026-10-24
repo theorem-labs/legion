@@ -6,11 +6,31 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/sjawhar/legion/orchestration/internal/ownerharness"
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 )
+
+// A repeated `owner need` with the same draft publishes its notice again, under the same idempotency key, and the
+// dedupe key the listener makes of it, publish.<key> (packages/envoy/cmd/listener/api.go), is one that Envoy's hosts
+// drop a second copy of: a key of Envoy's minted shape. A key of any other shape is no dedupe key to pi-envoy
+// (dedupeKeyNamesItsEvent), so the subscribed owner got the notice twice, under two event ids.
+func TestRepeatedNeedPublishesOneKeyThatEnvoyHostsDrop(t *testing.T) {
+	f := newCommandFixture(t)
+	needFile := f.write("need.md", needDraft)
+	f.as(caller).ok("--json", "need", state, needFile)
+	f.as(caller).ok("--json", "need", state, needFile)
+	posts := f.notices()
+	if len(posts) != 2 || posts[0].IdempotencyKey != posts[1].IdempotencyKey {
+		t.Fatalf("a repeated need published %+v, want its notice twice under one key", posts)
+	}
+	if dedupe := "publish." + posts[0].IdempotencyKey; !regexp.MustCompile(ownerharness.MintedDedupeKeyPattern).MatchString(dedupe) {
+		t.Fatalf("the need's dedupe key %q is not one Envoy's hosts drop a repeat of (%s)", dedupe, ownerharness.MintedDedupeKeyPattern)
+	}
+}
 
 func TestNeedOutsideTheActiveSetIsRefusedOrRecordedOutsidePart(t *testing.T) {
 	f := newCommandFixture(t)
@@ -69,7 +89,7 @@ func TestNeedJournalsANoticeTheListenerRefuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	var entry struct{ Topic, Key string }
-	if err := json.Unmarshal(journal, &entry); err != nil || entry.Topic != topic || entry.Key != "c-"+ownerpkg.Hex16(need) {
+	if err := json.Unmarshal(journal, &entry); err != nil || entry.Topic != topic || entry.Key != ownerpkg.NoticeKey(need) {
 		t.Fatalf("journal %q: %+v, %v", journal, entry, err)
 	}
 }
