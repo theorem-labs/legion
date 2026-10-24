@@ -1047,9 +1047,14 @@ class _Extractor:
 
     def cleanup_function(self, node: ci.Cursor, bound: ci.Cursor) -> str | None:
         """The function a ``cleanup`` attribute on a local names, read from the declaration as
-        written and from the macros it expands (``__free(x)``, ``LOCK_MOUNT(...)``)."""
+        written and from the macros it expands (``__free(x)``, ``LOCK_MOUNT(...)``). A declaration
+        of several cleanup locals (scoped_seqlock_read's ``struct ss_tmp _s __cleanup(a) = ...,
+        *ctx __cleanup(b) = ...``) names one per declarator, in order: the local's rank among them
+        picks its own."""
         templates = self.vocabulary.cleanup_macros
+        rank = self.cleanup_rank(node, bound)
         for parameters, body in self.expansion_bodies(node, bound, limit=32):
+            found: list[str] = []
             for index, token in enumerate(body[:-3]):
                 if body[index + 1] != "(" or body[index + 3] != ")" or not _IDENTIFIER.match(body[index + 2]):
                     continue
@@ -1057,10 +1062,27 @@ class _Extractor:
                 if argument in parameters:
                     continue
                 if token in ("cleanup", "__cleanup__"):
-                    return self.macro_alias(argument)
-                if token in templates:
-                    return self.macro_alias(templates[token].format(arg=argument))
+                    found.append(self.macro_alias(argument))
+                elif token in templates:
+                    found.append(self.macro_alias(templates[token].format(arg=argument)))
+            if len(found) > rank:
+                return found[rank]
         return None
+
+    @staticmethod
+    def cleanup_rank(node: ci.Cursor, bound: ci.Cursor) -> int:
+        """The local's position among the cleanup locals its declaration statement declares."""
+        for statement in bound.walk_preorder():
+            if statement.kind != K.DECL_STMT:
+                continue
+            declared = [
+                child.hash
+                for child in statement.get_children()
+                if child.kind == K.VAR_DECL and any(part.kind == K.UNEXPOSED_ATTR for part in child.get_children())
+            ]
+            if node.hash in declared:
+                return declared.index(node.hash)
+        return 0
 
     def macro_alias(self, name: str) -> str:
         """The function an object-like macro that is one identifier names (include/linux/path.h:
@@ -2581,6 +2603,22 @@ class _FunctionWalk:
         self.uses = uses
         return uses
 
+    def passed_through(self, node: ci.Cursor) -> ci.Cursor:
+        """An expression past the helper calls that return their argument unchanged
+        (spin_lock_irqsave's spinlock_check(lock)): spin_lock_irqsave(sst->lock_irqsave, ...) names
+        the lock by the pointer field it reads, as kfree(p->buf) does."""
+        for _ in range(8):
+            if node.kind != K.CALL_EXPR or node.referenced is None or node.referenced.kind != K.FUNCTION_DECL:
+                return node
+            returned = self.x.returned_address(node.referenced.spelling)
+            arguments = list(node.get_arguments() or [])
+            if returned is None or returned.param is None or returned.bits or returned.param >= len(arguments):
+                return node
+            if returned.base != "pointer":
+                return node
+            node = _strip(arguments[returned.param])
+        return node
+
     def tested(self, reference: ci.Cursor) -> bool:
         """A pointer only tested for null (``for (; se; se = NULL)``, ``if (!p)``, ``p && ...``): the
         machine code needs no address for it when it folds the definition into the accesses."""
@@ -2749,7 +2787,7 @@ class _FunctionWalk:
         self.events["accesses"].append(item)
         if unit["kind"] == "struct" and unit.get("field") is not None:
             known = self.field_address.get(where.hash)
-            member = _strip(where)
+            member = self.passed_through(_strip(where))
             if known is None:
                 # An action's argument (spin_lock(&p->lock), kfree(p->buf)) names its member directly.
                 addressed = where.hash in self.addressed

@@ -834,3 +834,42 @@ void fct_choice(int k)
 	fct_takes_inner(&a);
 	fct_takes_inner(&b);
 }
+
+/* include/linux/seqlock.h's scoped_seqlock_read: one for-declaration with two cleanup locals, the
+ * state _s (whose cleanup unlocks the lock it holds) and a context pointer at the seqlock whose
+ * cleanup is empty; the body locks through spin_lock_irqsave(sst->lock_irqsave, ...), which names
+ * the lock through spinlock_check() and the pointer field. */
+struct fct_ss {
+	int state;
+	long data;
+	struct spin *lockp;
+};
+
+static inline void fct_ss_cleanup(struct fct_ss *s)
+{
+	if (s->lockp)
+		spin_unlock(s->lockp);
+}
+
+static inline void fct_ss_cleanup_ctx(struct fct_ss **s)
+{
+	(void)s;
+}
+
+#define __fct_scoped(lk, s)                                                  \
+	for (struct fct_ss s __cleanup(fct_ss_cleanup) = { .state = 1 },      \
+			   *s##_c __cleanup(fct_ss_cleanup_ctx) = (struct fct_ss *)(lk); \
+	     s.state; s.state = 0)
+#define fct_scoped(lk) __fct_scoped(lk, _s)
+
+long fct_scoped_read(struct fct_locked *l)
+{
+	long sum = 0;
+
+	fct_scoped(&l->lock) {
+		_s.lockp = &l->lock;
+		spin_lock(fct_check(_s.lockp));
+		sum += l->pad;
+	}
+	return sum;
+}

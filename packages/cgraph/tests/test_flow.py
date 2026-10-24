@@ -936,3 +936,18 @@ def test_a_slot_is_scored_by_the_fields_its_accesses_cover() -> None:
     interior address -64 is another call's slot, which holds one field exactly."""
     fields = {(0, 4), (4, 4), (8, 4)}
     assert frames.fit(fields, 48, {(-72, 8), (-64, 4)}, {-72, -64}) == -72
+
+
+def test_each_declarator_of_a_declaration_has_its_own_cleanup_and_a_lock_names_its_pointer_field(
+    fct_facts: dict[str, Any], fct_build: dict[str, Any]
+) -> None:
+    """thread_group_cputime's scoped_seqlock_read: the context pointer's cleanup is the empty
+    fct_ss_cleanup_ctx, not the state's, so nothing reads fct_ss through (struct fct_ss *)&l->lock;
+    spin_lock(fct_check(_s.lockp)) reads the local's lockp field, not an address it cannot tell."""
+    events = fact_events(fct_facts, "fct_scoped_read")
+    destructors = [call["callee"] for call in events["calls"] if call["callee"].startswith("fct_ss_cleanup")]
+    assert sorted(destructors) == ["fct_ss_cleanup", "fct_ss_cleanup_ctx"]
+    found = {(item["field"], item["base"]) for item in events["field_accesses"] if item["struct"] == "fct_ss"}
+    assert ("lockp", "local") in found and ("lockp", "unknown") not in found
+    folded = fct_build["graph"]["analysis"]["field_accesses"]["function:fct_scoped_read"]
+    assert {item["base"] for item in folded if item["struct"] == "fct_ss"} == {"local"}

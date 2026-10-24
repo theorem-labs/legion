@@ -51,10 +51,15 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   `__builtin_object_size`, also as the left operand of `&&` or `||`, are left to the machine code:
   their calls, global accesses and field accesses (marked `conditional`) stay only where the image
   has them.
-- **Implied calls**: a local of a cleanup class (`c.cleanup.class_type`) calls its destructor with
-  the constructor's arguments; a local with any other cleanup attribute calls the function it names
-  (`c.cleanup.attribute_macros` maps macros such as `__free(x)` to that function, and a macro that is
-  only another function's name, such as `#define __free_path_put path_put`, names that function).
+- **Implied calls**: a local of a cleanup class (`c.cleanup.class_type`) calls its destructor, with
+  the local's address where the class is a struct (a lock guard's also standing for the lock its
+  constructor took) and with the constructor's arguments otherwise; a local with any other
+  cleanup attribute calls the function it names (`c.cleanup.attribute_macros` maps macros such as
+  `__free(x)` to that function, and a macro that is only another function's name, such as
+  `#define __free_path_put path_put`, names that function). A declaration of several cleanup locals
+  (`scoped_seqlock_read`'s state and context pointer) names one function per declarator, in order.
+  A lock or free action through a helper that returns its argument (`spinlock_check(sst->lock)`)
+  names the member that argument is, as `kfree(p->buf)` does.
 - **The image** (ELF and `System.map`), decoded with capstone. Calls come from `jal`/`j` and from
   `auipc`+`jalr`, named by the code symbol at the target (`image.call_aliases` maps a library
   call the compiler substitutes, such as `bcmp`, to the one C names). An assembly routine, which the
