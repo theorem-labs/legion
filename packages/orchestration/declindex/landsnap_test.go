@@ -18,7 +18,12 @@ func TestLandSnapshotCarriesSourcesModulesAndRequestedDeclarations(t *testing.T)
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "base"}); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := s.LandSnapshot(ctx, []string{"Gold.frame_lo", "Gold2.FrameAt", "Gold.Missing"})
+	reader, err := OpenReadOnly(ctx, s.path, IndexOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	snapshot, err := reader.LandSnapshot(ctx, []string{"Gold.frame_lo", "Gold2.FrameAt", "Gold.Missing"})
 	if err != nil {
 		t.Fatal(err)
 	}

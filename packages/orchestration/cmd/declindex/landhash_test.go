@@ -395,7 +395,7 @@ func TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := declindex.Open(cfg.DB)
+	store, err := declindex.OpenReadOnly(context.Background(), cfg.DB, declindex.IndexOnly)
 	if err != nil {
 		t.Fatal(err)
 	}

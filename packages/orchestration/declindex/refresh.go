@@ -173,10 +173,10 @@ func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
 	return out, nil
 }
 
-// readSourceBlobs reads the sources table through q: each source's path and the blob the index read.
-func readSourceBlobs(ctx context.Context, q querier) (map[string]string, error) {
+// sourceBlobs reads the sources table: each source's path and the blob the index read.
+func (s *Store) sourceBlobs(ctx context.Context) (map[string]string, error) {
 	out := map[string]string{}
-	rows, err := q.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	rows, err := s.q.QueryContext(ctx, `SELECT path, blob FROM sources`)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var path, blob string
 		if err := r.Scan(&path, &blob); err != nil {
@@ -254,7 +254,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	if err != nil {
 		return st, err
 	}
-	storedSourceBlobs, err := readSourceBlobs(ctx, s.q)
+	storedSourceBlobs, err := s.sourceBlobs(ctx)
 	if err != nil {
 		return st, err
 	}
@@ -412,7 +412,6 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 			if err := g.write(s.path + ".graph"); err != nil {
 				return fmt.Errorf("write the declaration graph: %w", err)
 			}
-			s.graphOnce, s.g, s.graphErr = sync.Once{}, nil, nil
 			logf(opt.Log, "index: declaration graph of %d declarations and %d edges written in %s", len(g.names), len(g.dst),
 				time.Since(t1).Round(time.Millisecond))
 		}
@@ -420,6 +419,9 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	}); err != nil {
 		return st, err
 	}
+	// The write rewrote the modules and the graph: the store's answers, and the compiled step's walk
+	// (reachedModules), read them anew.
+	s.reload()
 	if opt.Compiled != nil {
 		co, err := opt.Compiled(ctx)
 		if err != nil {
