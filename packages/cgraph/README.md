@@ -300,6 +300,10 @@ These rules follow what the machine code shows, each only where it shows it:
   `parameter_calls` item with that `member`; at the fold whose arguments make the member a function of
   the unit (simple_xattr_params' simple_xattr_obj_hashfn) that function is one the code passes, called
   with the call's arguments, and folded where the image shows it (its inlined jhash).
+- A const global (also an array of structs) whose initializer the facts state whole is known data: an
+  access of it is `conditional` (the compiler may fold every read, so the image decides), and a call
+  through a member the initializer gives as a function, reached through a local that points into it
+  (fdt_translate_address's `bus = &of_busses[0]; bus->count_cells(…)`), reads no table.
 - A helper folded under a `__builtin_constant_p` choice marks all its events `conditional`, field
   accesses too: the machine code decides whether that branch was compiled, so a conditional field
   access with no match is excluded as `image_decided` (below).

@@ -72,20 +72,21 @@ def nonzero(expression: Expression | None) -> bool:
     return bool(keeps) and nonzero(operand)
 
 
-def _address(expression: Expression | None) -> Expression | None:
-    """The object or function an address names (``{"g": …}``), through casts and constant members."""
+def address_of(expression: Expression | None) -> Expression | None:
+    """The object or function an address names (``{"g": …}``, with the constant ``data`` it is a place
+    ``at`` bits into, for a const global), through casts and constant members."""
     if expression is None or "g" in expression:
         return expression
     if expression.get("op") == "cast":
-        return _address(expression["a"][0])
+        return address_of(expression["a"][0])
     if expression.get("op") == ".":
-        return _address(member(expression["a"][0], expression["o"]))
+        return address_of(member(expression["a"][0], expression["o"]))
     return None
 
 
 def function_named(expression: Expression | None) -> str | None:
     """The function of the unit an address names (a constant struct's member that holds it), or None."""
-    found = _address(expression)
+    found = address_of(expression)
     return found.get("function") if found is not None else None
 
 
@@ -125,7 +126,7 @@ def values(expression: Expression | None) -> frozenset[int] | None:
         return None if held is None else _bounded({normalized(value, expression) for value in held})
     if operator == "ignores":
         # simple_xattr_obj_hashfn never reads the key_len rht_head_hashfn passes it.
-        target = _address(operands[0])
+        target = address_of(operands[0])
         ignored = target.get("ignored") if target is not None else None
         return None if ignored is None else frozenset({int(expression["k"] in ignored)})
     if operator in ("&&", "||"):

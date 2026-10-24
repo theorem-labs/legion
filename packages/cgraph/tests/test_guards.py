@@ -1071,3 +1071,52 @@ def test_a_function_a_const_struct_member_names_is_folded_where_a_helper_calls_t
     graph = build({"src/g.c": facts}, image)
     assert "function:inner" in c_calls(graph, "function:find")
     assert call_pairs(graph)["only_image"] == []
+
+
+CONST_TABLE = """
+    struct of_bus { void (*count_cells)(const void *blob, int parent, int *na, int *ns); int (*map)(int); };
+    void default_count(const void *blob, int parent, int *na, int *ns);
+    static const struct of_bus busses[] = { { .count_cells = default_count } };
+    struct of_bus live_busses[2];
+    int translate(const void *blob, int parent)
+    {
+        const struct of_bus *bus;
+        int na, ns;
+        bus = &busses[0];
+        bus->count_cells(blob, parent, &na, &ns);
+        return na;
+    }
+    int translate_live(const void *blob, int parent, int k)
+    {
+        const struct of_bus *bus;
+        int na, ns;
+        bus = &live_busses[k];
+        bus->count_cells(blob, parent, &na, &ns);
+        return na;
+    }
+"""
+
+
+def test_a_const_table_s_known_data_is_read_only_where_the_image_has_it(tmp_path: Path) -> None:
+    """fdt_translate_address: `bus = &of_busses[0]; bus->count_cells(…)` with the static const of_busses
+    naming fdt_bus_default_count_cells: the compiler calls it directly and never loads of_busses (nor
+    forms its address, as fdt_translate_one, which takes bus, is inlined). An access of a const global
+    whose initializer the facts state is left to the image (``conditional``); a call through its member
+    reads no table."""
+    facts = facts_of(tmp_path, CONST_TABLE)
+
+    def globals_read(function: str) -> dict[str, set[Any]]:
+        found: dict[str, set[Any]] = {}
+        for item in facts["functions"][function]["events"]["accesses"]:
+            if item["unit"]["kind"] == "global":
+                found.setdefault(item["unit"]["name"], set()).add(item.get("conditional"))
+        return found
+
+    # Here only the call reads bus, so its store, and the table's address, are not computed at all.
+    assert "busses" not in globals_read("translate")
+    assert globals_read("translate_live") == {"live_busses": {None}}
+    passed = facts_of(
+        tmp_path, CONST_TABLE + "int pass_bus(const struct of_bus *b); int t2(void) { return pass_bus(&busses[0]); }"
+    )
+    (access,) = [item for item in passed["functions"]["t2"]["events"]["accesses"] if item["unit"]["name"] == "busses"]
+    assert access.get("conditional") is True

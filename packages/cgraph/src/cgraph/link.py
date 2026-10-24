@@ -663,7 +663,9 @@ class Linker:
             if not live:
                 continue
             member = expressions.substitute(item["member"], values)
-            target = expressions.function_named(member)
+            found = expressions.address_of(member)
+            # A function the unit defines (it gives what it ignores): one link can fold.
+            target = found["function"] if found is not None and "ignored" in found else None
             guards = [*live[0].get("guards", []), *call.get("guards", [])]
             if target is not None:
                 result.pointer_calls.setdefault(target, []).append(live[0]["arguments"])

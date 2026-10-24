@@ -2357,7 +2357,8 @@ class _Evaluator:
     ) -> dict[str, Any] | None:
         """``s.m`` of a struct the expressions state (a parameter passed by value, a constant struct, a
         member that is a struct of one): rht_head_hashfn's ``params.obj_hashfn``, which a caller's
-        constant params decides. A bit-field, or a member reached through a pointer, is unknown."""
+        constant params decides; and ``p->m`` where ``p`` points into a const global the initializer
+        gives (fdt_translate_address's ``bus = &of_busses[0]; bus->count_cells``). A bit-field is unknown."""
         field = cursor.referenced
         if field is None or field.kind != K.FIELD_DECL or field.is_bitfield():
             return None
@@ -2365,8 +2366,13 @@ class _Evaluator:
             return None
         below = _unnamed_base(base)
         record = below.type.get_canonical()
+        through = record.kind == TK.POINTER
+        record = record.get_pointee().get_canonical() if through else record
         offset = record.get_offset(field.spelling) if record.kind == TK.RECORD else -1
         struct = self.expression(below, resolve, depth + 1) if offset >= 0 else None
+        if through:
+            place = expressions.address_of(struct)
+            struct = {"op": ".", "a": [place["data"]], "o": place["at"]} if place and "data" in place else None
         if struct is None or not _is_struct(struct):
             return None
         return {"op": ".", "a": [struct], "o": offset, **(typed or {})}
@@ -2377,16 +2383,38 @@ class _Evaluator:
         compared alike. A function of the unit gives its name (``function``) and the parameters it never
         reads (``ignored``)."""
         node = _strip(operand)
+        bits = 0
+        while node.kind in (K.ARRAY_SUBSCRIPT_EXPR, K.MEMBER_REF_EXPR) and len(_children(node)) >= 1:
+            # &of_busses[0], &g.m: a place in the global, at constant bits.
+            inner = _children(node)
+            if node.kind == K.ARRAY_SUBSCRIPT_EXPR:
+                index = libclang.constant_int(inner[1]) if len(inner) == 2 else None
+                size = node.type.get_canonical().get_size()
+                if index is None or size <= 0 or _strip(inner[0]).type.get_canonical().kind not in _ARRAY_TYPES:
+                    return None
+                bits += index * size * 8
+            else:
+                record = _unnamed_base(inner[0]).type.get_canonical()
+                field = node.referenced
+                if record.kind != TK.RECORD or field is None or record.get_offset(field.spelling) < 0:
+                    return None
+                bits += record.get_offset(field.spelling)
+            node = _strip(inner[0])
         named = node.referenced if node.kind == K.DECL_REF_EXPR else None
         if named is None or not (_is_global_var(named) or named.kind == K.FUNCTION_DECL):
             return None
         declarations = (named, named.canonical, named.get_definition())
         if any(self.weak(declaration) for declaration in declarations if declaration is not None):
             return None
-        if named.kind == K.FUNCTION_DECL and named.spelling in self.definitions:
-            ignored = sorted(self.ignored(named))
-            return {"g": named.get_usr(), "function": named.spelling, "ignored": ignored, **typed}
-        return {"g": named.get_usr(), **typed}
+        if named.kind == K.FUNCTION_DECL:
+            ignored = sorted(self.ignored(named)) if named.spelling in self.definitions else None
+            found = {"g": named.get_usr(), "function": named.spelling, **typed}
+            return {**found, "ignored": ignored} if ignored is not None else found
+        data = self.struct_value(named) if named.kind == K.VAR_DECL else None
+        place = {"data": data, "at": bits} if data is not None else {}
+        if bits and not place:
+            return None
+        return {"g": named.get_usr(), **place, **typed}
 
     def struct_reference(self, cursor: ci.Cursor, resolve: _Resolve, depth: int) -> dict[str, Any] | None:
         """A struct a reference names: a parameter passed by value, as itself, or a const global, as its
@@ -2422,13 +2450,16 @@ class _Evaluator:
             self.structs[key] = None  # a member's function that names the global again: unknown there
             definition = variable.get_definition() or variable
             typ = definition.type
+            canonical = typ.get_canonical()
+            # The canonical array type drops its element's const: the declared one keeps it.
+            elements = [kind.get_array_element_type() for kind in (typ, canonical) if kind.kind in _ARRAY_TYPES]
             initializer = libclang.var_initializer(definition)
             members: dict[int, dict[str, Any] | None] = {}
             complete = (
-                typ.is_const_qualified()
+                (typ.is_const_qualified() or any(element.is_const_qualified() for element in elements))
                 and not typ.is_volatile_qualified()
                 and initializer is not None
-                and self.record_values(initializer, typ.get_canonical(), 0, members)
+                and self.record_values(initializer, canonical, 0, members)
                 and len(members) <= _STRUCT_MEMBERS
             )
             self.structs[key] = {"struct": [[bits, members[bits]] for bits in sorted(members)]} if complete else None
@@ -2439,7 +2470,17 @@ class _Evaluator:
     ) -> bool:
         """The scalar members a struct's initializer list gives, by their bits from the global's start
         (a later designator of a member replaces an earlier one): a constant, or the address of an
-        object or a function (``object_address``); False for another shape."""
+        object or a function (``object_address``); for an array of structs, each element's (of_busses);
+        False for another shape."""
+        if node.kind == K.INIT_LIST_EXPR and record.kind in _ARRAY_TYPES:
+            element = record.get_array_element_type().get_canonical()
+            size = element.get_size() * 8
+            entries = _children(node)
+            if element.kind != TK.RECORD or size <= 0 or any(_designation(entry)[0] for entry in entries):
+                return False
+            return all(
+                self.record_values(entry, element, bits + index * size, members) for index, entry in enumerate(entries)
+            )
         declaration = record.get_declaration()
         if node.kind != K.INIT_LIST_EXPR or declaration is None or declaration.kind != K.STRUCT_DECL:
             return False
@@ -3308,6 +3349,11 @@ class _FunctionWalk:
             return self.flowed(variable, reference, depth)
 
         return expressions.truth(self.x.evaluator.expression(condition, entry, truth=True)) == 0
+
+    def constant_callee(self, callee: ci.Cursor) -> bool:
+        """A call's callee expression that a const global's initializer gives as one function (a member
+        of a const table a local points into), so the compiler calls that function directly."""
+        return expressions.function_named(self.x.evaluator.expression(callee, self.flowed)) is not None
 
     def object_operand(self, operand: ci.Cursor) -> bool:
         """The operand is the address of an object the program defines (``&init_mm``), never 0."""
@@ -4303,6 +4349,16 @@ class _FunctionWalk:
             libclang.LOGICAL_OR,
         )
 
+    def known_data(self, where: ci.Cursor, name: str) -> bool:
+        """``where`` names the global ``name``, a const one whose initializer the facts state whole."""
+        return any(
+            node.kind == K.DECL_REF_EXPR
+            and node.spelling == name
+            and _is_global_var(node.referenced)
+            and self.x.evaluator.struct_value(node.referenced) is not None
+            for node in where.walk_preorder()
+        )
+
     def ignored_address(self, address: ci.Cursor) -> bool:
         """``&local`` passed straight to an inline callee that never reads that parameter
         (find_matching_se(&se, &pse), empty without group scheduling): the local stays unwritten."""
@@ -4450,7 +4506,9 @@ class _FunctionWalk:
         if generic:
             # An association of a _Generic whose selection could not be read: the image decides.
             item["generic"] = True
-        if self.conditional and unit["kind"] == "global":
+        if unit["kind"] == "global" and (self.conditional or self.known_data(where, unit["name"])):
+            # A const global whose initializer the facts state: the compiler may fold every read of it
+            # (of_busses[0].count_cells, pidfs_ino_ht_params passed by value), so the image decides.
             item["conditional"] = True
         self.events["accesses"].append(item)
         if unit["kind"] == "struct" and unit.get("field") is not None:
@@ -5318,11 +5376,16 @@ class _FunctionWalk:
                 if position in written and (local := _whole_local_address(argument)) is not None
             }
             dead_targets = {position for position, local in targets.items() if local.hash in self.dead_variables}
+            direct = node.referenced is not None and node.referenced.kind == K.FUNCTION_DECL
             for child_index, child in enumerate(children):
                 position = child_index - offset if child_index >= offset else None
                 if position is not None and reason is None and node.referenced is not None:
                     self.mark_cancelled(child, node.referenced.spelling, position)
-                if position is not None and position in targets:
+                if position is None and not direct and reason is None and self.constant_callee(child):
+                    # fdt_translate_address's bus->count_cells with bus = &of_busses[0]: the compiler
+                    # calls the function the const table names and reads no table.
+                    self.walk(child, node, child_index, "constant_data", generic)
+                elif position is not None and position in targets:
                     # &local where the inline callee only stores through the parameter
                     # (_mmu_notifier_range_init(&range, ...)): the local is not read there.
                     self.walk(child, node, child_index, "stored_only", generic)
