@@ -384,6 +384,28 @@ func sourceFailed(err error) bool {
 	return errors.Is(err, declindex.ErrRefusedSource) || errors.Is(err, declindex.ErrSourceFailed)
 }
 
+// admit runs untrusted source through the gate's two steps for it, each in the sandbox with a fresh scratch
+// directory below run: Lean's parser allow-list (CheckSource), and only once that passed, the compile of source as
+// module against ex's search path. It gives the directory that holds the compiled module. When the source itself is
+// refused or does not compile, the error satisfies sourceFailed.
+func admit(ctx context.Context, ex *declindex.Exporter, run, module, source string) (string, error) {
+	check, err := declindex.NewScratch(run)
+	if err != nil {
+		return "", err
+	}
+	if err := ex.CheckSource(ctx, []byte(source), ex.SearchPath, check); err != nil {
+		return "", err
+	}
+	dir, err := declindex.NewScratch(run)
+	if err != nil {
+		return "", err
+	}
+	if err := declindex.CompileConfined(ctx, ex.Lean, ex.SearchPath, dir, module, []byte(source)); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 // pendingForms compiles the sources of registry concepts that are not yet declared by the index. It runs only
 // from the gate's confined export path; refresh and FormsModule never receive those source bytes. A pending
 // concept whose source the text filter or Lean refuses is a defect of that concept, left out of the forms.
@@ -419,27 +441,13 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 			defect(c, "%v", err)
 			continue
 		}
-		check, err := declindex.NewScratch(run)
+		module := "DeclIndexPending" + c.CompiledHash
+		dir, err := admit(ctx, ex, run, module, c.Source)
 		if err != nil {
-			return fm, defects, err
-		}
-		if err := ex.CheckSource(ctx, []byte(c.Source), ex.SearchPath, check); err != nil {
 			if !sourceFailed(err) {
-				return fm, defects, fmt.Errorf("check pending concept %s: %w", c.Name, err)
+				return fm, defects, fmt.Errorf("pending concept %s: %w", c.Name, err)
 			}
 			defect(c, "%v", err)
-			continue
-		}
-		dir, err := declindex.NewScratch(run)
-		if err != nil {
-			return fm, defects, err
-		}
-		module := "DeclIndexPending" + c.CompiledHash
-		if err := declindex.CompileConfined(ctx, ex.Lean, ex.SearchPath, dir, module, []byte(c.Source)); err != nil {
-			if !sourceFailed(err) {
-				return fm, defects, fmt.Errorf("compile pending concept %s: %w", c.Name, err)
-			}
-			defect(c, "its stored source no longer compiles: %v", err)
 			continue
 		}
 		ex.SearchPath = append(ex.SearchPath, dir)
@@ -474,19 +482,9 @@ func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declinde
 		return nil, defects, err
 	}
 	co.Forms = forms
-	check, err := declindex.NewScratch(run)
+	compiled, err := admit(ctx, &ex, run, ProposalModule, p.Source)
 	if err != nil {
 		return nil, defects, err
-	}
-	if err := ex.CheckSource(ctx, []byte(p.Source), ex.SearchPath, check); err != nil {
-		return nil, defects, err
-	}
-	compiled, err := declindex.NewScratch(run)
-	if err != nil {
-		return nil, defects, err
-	}
-	if err := declindex.CompileConfined(ctx, ex.Lean, ex.SearchPath, compiled, ProposalModule, []byte(p.Source)); err != nil {
-		return nil, defects, fmt.Errorf("the proposal does not compile: %w", err)
 	}
 	roots := declindex.Roots{ProposalModule: true}
 	for r := range g.Tree.Roots {
