@@ -217,6 +217,12 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		value, err := s.Item(ctx, args[0], args[1])
 		return value, true, err
+	case "items":
+		if len(args) != 3 || args[1] != "--owner" {
+			return nil, true, usagef("items <repo> --owner <key>")
+		}
+		value, err := s.OpenItems(ctx, args[0], args[2])
+		return value, true, err
 	case "open":
 		if request, jsonInput, err := requestFile[ledger.OpenRequest](args); jsonInput {
 			if err != nil {
