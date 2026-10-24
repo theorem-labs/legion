@@ -176,6 +176,11 @@ func TestGateRejectsRegistryMutationAfterInitialStatus(t *testing.T) {
 	}
 }
 
+// An addition is the repository file registry/concepts/<compiled hash>.yaml, which its proposer writes in its own
+// worktree and opens with `ledger open --write <addition.path>` (declindex/README.md, "Concept registry"). The
+// ledger refuses an absolute write path ("path ... is absolute; give it relative to the repository root",
+// ledger/paths.go), and an absolute path would name the gate's tree, not the proposer's worktree, so two exact
+// duplicates proposed from different trees would not overlap. The gate prints the repository-relative path.
 func TestGatePrintsCanonicalAdditionPathAfterSnapshotCleanup(t *testing.T) {
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
 		t.Skip("the successful gate path compiles untrusted source: set DECLINDEX_SANDBOX_TEST=1 in a disposable container or CI runner")
