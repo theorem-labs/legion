@@ -613,3 +613,77 @@ void fd_enqueue_break(struct fd_queue *q, struct fd_sched *se)
 	fd_each_entity(se)
 		se->slice = slice;
 }
+
+/* drivers/base/cpu.c print_cpus_offline without CONFIG_SYSFS: len += sysfs_emit_at(...) adds 0, so
+ * the if around it has no effect, and drivers/base/core.c uevent_show's loop of such stores neither
+ * (llvm-objdump: no load of n or of count). */
+static inline int fd_emit_at(char *buf, int at, const char *fmt, ...)
+{
+	return 0;
+}
+
+struct fd_cpus_info {
+	unsigned int n;
+	unsigned int total;
+	int count;
+};
+
+int fd_print_offline(struct fd_cpus_info *c, char *buf)
+{
+	int len = 0;
+
+	if (c->total && c->n < c->total)
+		len += fd_emit_at(buf, len, "%u", c->n);
+	len += fd_emit_at(buf, len, "\n");
+	return len;
+}
+
+int fd_print_each(struct fd_cpus_info *c, char *buf)
+{
+	int len = 0;
+	int i;
+
+	for (i = 0; i < c->count; i++)
+		len += fd_emit_at(buf, len, "%d", i);
+	return len;
+}
+
+/* fs/mnt_idmapping.c make_vfsuid without CONFIG_USER_NS: if (initial_idmapping(fs_userns)) uid =
+ * __kuid_val(kuid); else uid = from_kuid(fs_userns, kuid);, where from_kuid returns __kuid_val(kuid):
+ * the condition decides nothing (llvm-objdump: no load of level). */
+typedef struct {
+	unsigned int val;
+} fd_kuid_t;
+
+struct fd_user_ns {
+	long pad;
+	int level;
+};
+
+static inline unsigned int fd_kuid_val(fd_kuid_t k)
+{
+	return k.val;
+}
+
+static inline unsigned int fd_from_kuid(struct fd_user_ns *to, fd_kuid_t k)
+{
+	return fd_kuid_val(k);
+}
+
+static inline int fd_initial(const struct fd_user_ns *ns)
+{
+	return ns->level == 0;
+}
+
+long fd_make_vfsuid(struct fd_user_ns *ns, fd_kuid_t k)
+{
+	unsigned int uid;
+
+	if (fd_initial(ns))
+		uid = fd_kuid_val(k);
+	else
+		uid = fd_from_kuid(ns, k);
+	if (uid == (unsigned int)-1)
+		return -1;
+	return uid;
+}

@@ -1161,7 +1161,7 @@ class _Extractor:
             return False
         stored: set[int] = set()
         for node in _effect_nodes(loop, self.live_children):
-            target = _store_target(node)
+            target = _store_target(node) if not self.unchanging(node) else None
             variable = _stored_variable(target) if target is not None else None
             if variable is not None and _is_local(variable):
                 stored.add(variable.hash)
@@ -1324,12 +1324,21 @@ class _Extractor:
             ):
                 return False
             else:
-                target = _store_target(node)
+                target = _store_target(node) if not self.unchanging(node) else None
                 if target is not None:
                     variable = _stored_variable(target)
                     if variable is None or variable.hash not in own:
                         return False
         return True
+
+    def unchanging(self, node: ci.Cursor) -> bool:
+        """``v op= e`` that leaves ``v`` as it is: ``e`` folds to 0 for ``+=``, ``-=``, ``<<=``, ``>>=``,
+        ``^=`` or ``|=`` (print_cpus_offline's ``len += sysfs_emit_at(...)`` without CONFIG_SYSFS). Only
+        what computing ``e`` does besides is code."""
+        if node.kind != K.COMPOUND_ASSIGNMENT_OPERATOR or libclang.binary_kind(node) not in _IDENTITY_WITH_ZERO:
+            return False
+        operands = _children(node)
+        return len(operands) == 2 and self.evaluator.evaluate(operands[1]) == 0
 
     def asm_removable(self, node: ci.Cursor) -> bool:
         """An asm statement that is not volatile, has no goto labels and has an output operand: it
@@ -1924,6 +1933,23 @@ def _asm_statements(tokens: list[str]) -> Iterator[bool]:
             if colons == 1 and depth >= 1:
                 outputs += 1
         yield not kept and colons >= 1 and outputs > 0
+
+
+def _without_casts(expression: Any) -> Any:
+    """An expression without the casts to the width and signedness its operand already has."""
+    if not isinstance(expression, dict):
+        return expression
+    operands = [_without_casts(operand) for operand in expression.get("a", [])]
+    if expression.get("op") == "cast" and len(operands) == 1 and isinstance(operands[0], dict):
+        inner = operands[0]
+        if inner.get("w") == expression.get("w") and inner.get("s") == expression.get("s"):
+            return inner
+    return {**expression, "a": operands} if "a" in expression else expression
+
+
+# CXBinaryOperatorKind AddAssign, SubAssign, ShlAssign, ShrAssign, XorAssign and OrAssign: with 0 on
+# the right, the variable keeps its value.
+_IDENTITY_WITH_ZERO = (26, 27, 28, 29, 31, 32)
 
 
 def _store_target(node: ci.Cursor) -> ci.Cursor | None:
@@ -3126,6 +3152,32 @@ class _FunctionWalk:
             self.same_outcomes.add(statement.hash)
             return True
         return False
+
+    def same_store(self, statement: ci.Cursor) -> bool:
+        """``if (c) v = a; else v = b;`` where ``a`` and ``b`` have no effect and are one value as the
+        evaluator states them on the parameters (make_vfsuid's ``uid = __kuid_val(kuid)`` and ``uid =
+        from_kuid(fs_userns, kuid)``, which returns ``__kuid_val(kuid)`` without CONFIG_USER_NS), so
+        ``c`` decides nothing."""
+        parts = _children(statement)
+        if statement.kind != K.IF_STMT or len(parts) != 3 or _mentions(parts[0], _IMAGE_DECIDES):
+            return False
+        if self.x.evaluator.evaluate(parts[0], truth=True) is not None:
+            return False
+        stores = []
+        for branch in parts[1:]:
+            body = _children(branch) if branch.kind == K.COMPOUND_STMT else [branch]
+            store = _bare(body[0]) if len(body) == 1 else None
+            if store is None or not _is_plain_assignment(store):
+                return False
+            target, value = _children(store)
+            target = _bare(target)
+            if target.kind != K.DECL_REF_EXPR or target.referenced is None or not _is_local(target.referenced):
+                return False
+            if not self.x.effect_free(value, self.dead_variables):
+                return False
+            stores.append((target.referenced.hash, self.x.evaluator.expression(value, self.held)))
+        (first, a), (second, b) = stores
+        return first == second and a is not None and expressions.stated(a) and _without_casts(a) == _without_casts(b)
 
     def same_outcome(self, statement: ci.Cursor, block: ci.Cursor, index: int) -> bool:
         """``if (c) return v;`` whose return and the rest of its block give the same, neither with an
@@ -5429,6 +5481,14 @@ class _FunctionWalk:
                 case_guard = self.case_guards.get(child.hash)
                 if dead:
                     self.walk(child, node, child_index, "after_exit", generic)
+                elif case_guard is None and self.same_store(child):
+                    # if (c) v = a; else v = b; where a and b are one value (make_vfsuid's uid =
+                    # __kuid_val(kuid) or from_kuid(fs_userns, kuid) without CONFIG_USER_NS): c
+                    # decides nothing, and the store is the first branch's.
+                    parts = _children(child)
+                    self.discard(parts[0], child, 0, generic)
+                    self.walk(parts[1], child, 1, None, generic)
+                    self.walk(parts[2], child, 2, "dead_branch", generic)
                 elif (
                     child.kind.is_expression() and not (value_last and child_index == len(children) - 1)
                 ) or self.statement_without_effect(child, node, child_index):

@@ -42,6 +42,10 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   left operand decides whether the lock is initialized), discarded values (`(void)x`, `(x, 0)`, an
   expression statement such as `get_user_ns(ns);`, also as an `if`'s branch, a loop's body or a
   label's or a case's statement, which holds for the statements without effect below too, an
+  `if (c) v = a; else v = b;` whose two values are one as the evaluator states them (`make_vfsuid`'s
+  `__kuid_val(kuid)` and `from_kuid(fs_userns, kuid)` without `CONFIG_USER_NS`), whose condition
+  decides nothing, a `v += e` (or `-=`, `|=`, `^=`, a shift) with `e` folding to 0, which stores
+  nothing (`len += sysfs_emit_at(...)` without `CONFIG_SYSFS`), an
   `if` whose branches have no effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)`
   without `CONFIG_PM`, an `if (c) return v;` whose return and the rest of its block give the same
   without an effect (`rcutree_online_cpu`'s `return 0` before `tick_dep_clear(); return 0;`), a loop

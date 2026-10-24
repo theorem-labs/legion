@@ -273,3 +273,11 @@ def test_a_pointer_a_loop_steps_from_a_pointer_stays_a_pointer(fold_build: dict[
     accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_table_sum"]
     (item,) = [item for item in accesses if item["field"] == "managed"]
     assert (item["base"], item["displacement"], item.get("param")) == ("pointer", 136, None)
+
+
+@pytest.mark.parametrize("function", ["fd_print_offline", "fd_print_each", "fd_make_vfsuid"])
+def test_a_condition_whose_outcomes_store_alike_is_not_read(fold_build: dict[str, Any], function: str) -> None:
+    """fd_print_offline and fd_print_each: len += 0 changes nothing, so neither the if nor the loop is
+    code (llvm-objdump: li a0, 0x0; ret). fd_make_vfsuid: both branches store k.val, so ns->level is
+    not read."""
+    assert not folded_fields(fold_build, function) & {"n", "total", "count", "level"}
