@@ -560,12 +560,13 @@ func (g *Gate) export(ctx context.Context, reg Registry, p Proposal, home string
 }
 
 // homeModule is the module of the concept c's home file, where its declaration lands: the module that the index
-// read there, else the one that a Lean file at that path builds.
+// read there, else the one that a Lean file at that path builds. Concept.check has made the home a clean,
+// tree-relative .lean path (homeFile).
 func homeModule(ctx context.Context, s *declindex.Store, c Concept) (string, error) {
 	if m, err := s.ModuleAt(ctx, c.Home); err != nil || m != "" {
 		return m, err
 	}
-	return strings.ReplaceAll(strings.TrimSuffix(path.Clean(c.Home), ".lean"), "/", "."), nil
+	return strings.ReplaceAll(strings.TrimSuffix(c.Home, ".lean"), "/", "."), nil
 }
 
 // landedNames are the names of a proposal's constants, own, as they are once it lands in the module home: a private

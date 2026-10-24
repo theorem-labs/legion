@@ -125,6 +125,13 @@ func TestLoadReportsARefusedConceptFileAsADefect(t *testing.T) {
 		"not YAML":       "name: [Fx.Bad\n",
 		"no home":        "name: Fx.Bad\nmeaning: A fact with no home.\n",
 		"malformed form": "name: Fx.Bad\nhome: Bad.lean\nmeaning: A fact with an empty form.\nforms: [\"\"]\n",
+		// A home is the path of a .lean file relative to the tree: slash-separated, inside it, and clean.
+		"home not a Lean file":       "name: Fx.Bad\nhome: Bad.md\nmeaning: A fact homed in a text file.\n",
+		"home outside the tree":      "name: Fx.Bad\nhome: ../Bad.lean\nmeaning: A fact homed outside the tree.\n",
+		"absolute home":              "name: Fx.Bad\nhome: /Bad.lean\nmeaning: A fact homed at an absolute path.\n",
+		"home with a dot step":       "name: Fx.Bad\nhome: Sub/../Bad.lean\nmeaning: A fact homed through a dot step.\n",
+		"home with no module name":   "name: Fx.Bad\nhome: Sub/.lean\nmeaning: A fact homed in a file with no name.\n",
+		"home with a back separator": "name: Fx.Bad\nhome: Sub\\Bad.lean\nmeaning: A fact homed with a backslash.\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			r, defects, err := Load(writeRegistry(t, t.TempDir(), map[string]string{"Fx.Frame.yaml": good, "Fx.Bad.yaml": body}))

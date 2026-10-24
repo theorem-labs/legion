@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -18,7 +19,8 @@ import (
 // RegistryVersion is the registry directory's format version.
 const RegistryVersion = 2
 
-// Concept is one registered shared concept.
+// Concept is one registered shared concept. Its Home is the path of its home file, a .lean file, relative to the
+// tree (homeFile).
 type Concept struct {
 	Name         string   `yaml:"name" json:"name"`
 	Home         string   `yaml:"home" json:"home"`
@@ -88,6 +90,8 @@ func (c Concept) check() error {
 		return fmt.Errorf("concept %q: the name is one Lean declaration name", c.Name)
 	case strings.TrimSpace(c.Home) == "":
 		return fmt.Errorf("concept %s has no home file", c.Name)
+	case !homeFile(c.Home):
+		return fmt.Errorf("concept %s: its home %s is not the path of a .lean file relative to the tree (slash-separated, inside the tree, with no . or .. step)", c.Name, c.Home)
 	case strings.TrimSpace(c.Meaning) == "":
 		return fmt.Errorf("concept %s has no meaning", c.Name)
 	case strings.Contains(c.Meaning, "\n") || sentenceBreak.MatchString(c.Meaning):
@@ -96,6 +100,15 @@ func (c Concept) check() error {
 		return fmt.Errorf("concept %s: compiled hash is not 32 lowercase hexadecimal characters", c.Name)
 	}
 	return nil
+}
+
+// homeFile says whether home is the path of a Lean source file relative to the tree, as the index names the file of
+// a module: slash-separated and clean (no `.` or `..` step, no repeated or trailing slash), inside the tree, with a
+// name before its `.lean`. The module of that file is the path without `.lean`, its slashes dots.
+func homeFile(home string) bool {
+	stem, ok := strings.CutSuffix(home, ".lean")
+	return ok && !strings.HasSuffix(stem, "/") && stem != "" && !strings.Contains(home, `\`) &&
+		path.Clean(home) == home && filepath.IsLocal(home)
 }
 
 // Key is the name of a concept's file without its concepts/ prefix or .yaml suffix.
