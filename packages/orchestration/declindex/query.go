@@ -28,18 +28,15 @@ func (f Found) At() string { return f.Path + ":" + strconv.Itoa(f.Line) }
 func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 	short := q[strings.LastIndexByte(q, '.')+1:]
 	var out []Found
-	rows, err := s.db.QueryContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
-		FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.short = ?`, short)
+	rows, err := s.db.QueryContext(ctx, foundSelect+` WHERE d.short = ?`, short)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var f Found
-		var rel string
-		if err := r.Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
+		f, err := scanFound(r)
+		if err != nil {
 			return err
 		}
 		if f.Name != q && !strings.HasSuffix(f.Name, "."+q) {
 			return nil
 		}
-		f.Path = sourcePath(rel, f.Module)
 		out = append(out, f)
 		return nil
 	})
@@ -118,36 +115,18 @@ type useRow struct {
 
 func (s *Store) declared(ctx context.Context, q querier, names []string) (map[string]bool, error) {
 	out := map[string]bool{}
-	for i := 0; i < len(names); i += 500 {
-		chunk := names[i:min(i+500, len(names))]
-		rows, err := q.QueryContext(ctx, `SELECT name FROM decls WHERE name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			var n string
-			if err := r.Scan(&n); err != nil {
-				return err
-			}
-			out[n] = true
-			return nil
-		})
-		if err != nil {
-			return nil, err
+	err := eachRowIn(ctx, q, `SELECT name FROM decls WHERE name IN`, names, func(r *sql.Rows) error {
+		var n string
+		if err := r.Scan(&n); err != nil {
+			return err
 		}
+		out[n] = true
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
-}
-
-type querier interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
-
-func placeholders(n int) string { return strings.TrimSuffix(strings.Repeat("?,", n), ",") }
-
-func anys(ss []string) []any {
-	out := make([]any, len(ss))
-	for i, s := range ss {
-		out[i] = s
-	}
-	return out
 }
 
 // usersOf gives the uses of name and of its generated parts: names Lean made from the declaration that the
@@ -178,21 +157,16 @@ func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 		}
 	}
 	var out []useRow
-	for i := 0; i < len(keys); i += 500 {
-		chunk := keys[i:min(i+500, len(keys))]
-		rows, err := s.db.QueryContext(ctx, `SELECT module, line, col, parent, cls FROM uses WHERE target IN (`+
-			placeholders(len(chunk))+`)`, anys(chunk)...)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			u := useRow{target: name}
-			if err := r.Scan(&u.module, &u.line, &u.col, &u.parent, &u.class); err != nil {
-				return err
-			}
-			out = append(out, u)
-			return nil
-		})
-		if err != nil {
-			return nil, err
+	err = eachRowIn(ctx, s.db, `SELECT module, line, col, parent, cls FROM uses WHERE target IN`, keys, func(r *sql.Rows) error {
+		u := useRow{target: name}
+		if err := r.Scan(&u.module, &u.line, &u.col, &u.parent, &u.class); err != nil {
+			return err
 		}
+		out = append(out, u)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

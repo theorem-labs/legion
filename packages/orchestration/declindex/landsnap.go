@@ -84,23 +84,17 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 	if err != nil {
 		return LandSnapshot{}, err
 	}
-	for i := 0; i < len(names); i += 500 {
-		chunk := names[i:min(i+500, len(names))]
-		rows, err = tx.QueryContext(ctx, `SELECT d.name, d.module, d.stmt_hash, COALESCE(m.rel, '')
-			FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			var declaration LandDeclaration
-			var rel string
-			if err := r.Scan(&declaration.Name, &declaration.Module, &declaration.StmtHash, &rel); err != nil {
-				return err
-			}
-			declaration.Path = sourcePath(rel, declaration.Module)
-			snapshot.Declarations[declaration.Name] = append(snapshot.Declarations[declaration.Name], declaration)
-			return nil
-		})
+	err = eachRowIn(ctx, tx, foundSelect+` WHERE d.name IN`, names, func(r *sql.Rows) error {
+		f, err := scanFound(r)
 		if err != nil {
-			return LandSnapshot{}, err
+			return err
 		}
+		snapshot.Declarations[f.Name] = append(snapshot.Declarations[f.Name],
+			LandDeclaration{Name: f.Name, Module: f.Module, Path: f.Path, StmtHash: f.StmtHash})
+		return nil
+	})
+	if err != nil {
+		return LandSnapshot{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return LandSnapshot{}, err

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"path/filepath"
 	"sort"
@@ -239,21 +240,16 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 // defHashes are the compiled hashes of the definitions of the modules, before they are read again.
 func (s *Store) defHashes(ctx context.Context, modules []string) (map[string]string, error) {
 	out := map[string]string{}
-	for i := 0; i < len(modules); i += 500 {
-		chunk := modules[i:min(i+500, len(modules))]
-		rows, err := s.db.QueryContext(ctx, `SELECT name, cstmt FROM consts WHERE kind = 'def' AND module IN (`+
-			placeholders(len(chunk))+`)`, anys(chunk)...)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			var n, h string
-			if err := r.Scan(&n, &h); err != nil {
-				return err
-			}
-			out[n] = h
-			return nil
-		})
-		if err != nil {
-			return nil, err
+	err := eachRowIn(ctx, s.db, `SELECT name, cstmt FROM consts WHERE kind = 'def' AND module IN`, modules, func(r *sql.Rows) error {
+		var n, h string
+		if err := r.Scan(&n, &h); err != nil {
+			return err
 		}
+		out[n] = h
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -355,57 +351,56 @@ func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
 	return c, err
 }
 
-// owners maps each constant name to the declaration it belongs to: the longest declared name it extends (`X.mk`
-// is X's constructor), or the name alone when it extends none. It resolves all the names at once: one query per
-// 500 candidate names (each name and its dotted prefixes), not one lookup per name. A wide concept has tens of
-// thousands of statements.
-func (s *Store) owners(ctx context.Context, names []string) (map[string]Found, error) {
-	cands := map[string]bool{}
-	for _, n := range names {
-		for p := n; p != ""; {
-			cands[p] = true
+// dottedPrefixes yields name, then each shorter prefix that ends before one of its dots, while the prefix is not
+// empty: A.B.c, A.B, A.
+func dottedPrefixes(name string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for p := name; p != ""; {
+			if !yield(p) {
+				return
+			}
 			i := strings.LastIndexByte(p, '.')
 			if i < 0 {
-				break
+				return
 			}
 			p = p[:i]
 		}
 	}
-	list := keys(cands)
-	found := map[string]Found{}
-	for i := 0; i < len(list); i += 500 {
-		chunk := list[i:min(i+500, len(list))]
-		rows, err := s.db.QueryContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
-			FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			var f Found
-			var rel string
-			if err := r.Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
-				return err
-			}
-			f.Path = sourcePath(rel, f.Module)
-			if _, ok := found[f.Name]; !ok {
-				found[f.Name] = f
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
+}
+
+// owners maps each constant name to the declaration it belongs to: the longest declared name it extends (`X.mk`
+// is X's constructor), or the name alone when it extends none. It resolves all the names at once: one query per
+// maxInParams candidate names (each name and its dotted prefixes), not one lookup per name. A wide concept has
+// tens of thousands of statements.
+func (s *Store) owners(ctx context.Context, names []string) (map[string]Found, error) {
+	cands := map[string]bool{}
+	for _, n := range names {
+		for p := range dottedPrefixes(n) {
+			cands[p] = true
 		}
+	}
+	found := map[string]Found{}
+	err := eachRowIn(ctx, s.db, foundSelect+` WHERE d.name IN`, keys(cands), func(r *sql.Rows) error {
+		f, err := scanFound(r)
+		if err != nil {
+			return err
+		}
+		if _, ok := found[f.Name]; !ok {
+			found[f.Name] = f
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	out := make(map[string]Found, len(names))
 	for _, n := range names {
 		out[n] = Found{Name: n}
-		for p := n; p != ""; {
+		for p := range dottedPrefixes(n) {
 			if f, ok := found[p]; ok {
 				out[n] = f
 				break
 			}
-			i := strings.LastIndexByte(p, '.')
-			if i < 0 {
-				break
-			}
-			p = p[:i]
 		}
 	}
 	return out, nil

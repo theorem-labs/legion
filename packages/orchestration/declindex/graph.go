@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strings"
 )
 
 // graph is the declaration graph in compressed sparse rows, written beside the index after each refresh so
@@ -65,16 +64,11 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 			return o
 		}
 		o := t
-		for o != "" && !declared[o] {
-			i := strings.LastIndexByte(o, '.')
-			if i < 0 {
-				o = ""
+		for p := range dottedPrefixes(t) {
+			if declared[p] {
+				o = p
 				break
 			}
-			o = o[:i]
-		}
-		if o == "" {
-			o = t
 		}
 		owner[t] = o
 		return o

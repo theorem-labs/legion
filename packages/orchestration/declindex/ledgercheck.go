@@ -132,16 +132,14 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 		}
 	}
 	var out []Found
-	rows, err := s.db.QueryContext(ctx, `SELECT d.name, d.short, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
-		FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.kind IN (`+placeholders(len(rule.Kinds))+`)
-		ORDER BY d.name, d.module`, anys(rule.Kinds)...)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+foundColumns+`, d.short`+foundFrom+` WHERE d.kind IN (`+
+		placeholders(len(rule.Kinds))+`) ORDER BY d.name, d.module`, anys(rule.Kinds)...)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var f Found
-		var short, rel string
-		if err := r.Scan(&f.Name, &short, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
+		var short string
+		f, err := scanFound(r, &short)
+		if err != nil {
 			return err
 		}
-		f.Path = sourcePath(rel, f.Module)
 		if !name.MatchString(short) {
 			return nil
 		}
@@ -194,22 +192,17 @@ type ledgerDeclaration struct {
 
 func (s *Store) ledgerDeclarations(ctx context.Context, names []string) (map[string][]ledgerDeclaration, error) {
 	out := make(map[string][]ledgerDeclaration, len(names))
-	for i := 0; i < len(names); i += 500 {
-		chunk := names[i:min(i+500, len(names))]
-		rows, err := s.db.QueryContext(ctx, `SELECT name, module, stmt_hash FROM decls WHERE name IN (`+
-			placeholders(len(chunk))+`)`, anys(chunk)...)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			var name string
-			var declaration ledgerDeclaration
-			if err := r.Scan(&name, &declaration.module, &declaration.hash); err != nil {
-				return err
-			}
-			out[name] = append(out[name], declaration)
-			return nil
-		})
-		if err != nil {
-			return nil, err
+	err := eachRowIn(ctx, s.db, `SELECT name, module, stmt_hash FROM decls WHERE name IN`, names, func(r *sql.Rows) error {
+		var name string
+		var declaration ledgerDeclaration
+		if err := r.Scan(&name, &declaration.module, &declaration.hash); err != nil {
+			return err
 		}
+		out[name] = append(out[name], declaration)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
