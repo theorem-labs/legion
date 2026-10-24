@@ -76,8 +76,8 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 			if err != nil {
 				return nil, fmt.Errorf("read %s from LAND_TREE: %w", prefix+path, err)
 			}
-			// The .ilean that ParseModule reads is the one whose hash fresh checked against the build trace.
-			freshness, ilean, err := fresh(r.BuildDir, r.LibRel, rel, blob)
+			// The .ilean that ParseModule reads is the one whose hash Fresh checked against the build trace.
+			freshness, ilean, err := Fresh(r.BuildDir, r.LibRel, rel, blob)
 			if err != nil {
 				return nil, fmt.Errorf("check %s: %w", rel, err)
 			}

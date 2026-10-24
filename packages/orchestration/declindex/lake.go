@@ -113,17 +113,12 @@ type lakeTraceMetadata struct {
 	Synthetic *bool `json:"synthetic"`
 }
 
-// Fresh reports whether the .ilean at root/libRel/rel came from blob. A module with no candidate output is not
-// built; malformed, missing, or mismatched Lake metadata is stale with its reason. The build directory's own
-// source must be blob, and the .ilean must be the output its trace records. A build trace also binds that source
-// by its hash; a fetch trace (an artifact-cache hit) binds the outputs only, and the source by age.
-func Fresh(root, libRel, rel string, blob []byte) (Freshness, error) {
-	freshness, _, err := fresh(root, libRel, rel, blob)
-	return freshness, err
-}
-
-// fresh is Fresh, and for a fresh module also the .ilean bytes whose hash it checked.
-func fresh(root, libRel, rel string, blob []byte) (Freshness, []byte, error) {
+// Fresh reports whether the .ilean at root/libRel/rel came from blob, and for a fresh module gives the .ilean bytes
+// whose hash it checked. A module with no candidate output is not built; malformed, missing, or mismatched Lake
+// metadata is stale with its reason. The build directory's own source must be blob, and the .ilean must be the
+// output its trace records. A build trace also binds that source by its hash; a fetch trace (an artifact-cache hit)
+// binds the outputs only, and the source by age.
+func Fresh(root, libRel, rel string, blob []byte) (Freshness, []byte, error) {
 	base := filepath.Join(root, filepath.FromSlash(libRel), filepath.FromSlash(rel))
 	ilean, err := fileExists(base + ".ilean")
 	if err != nil {

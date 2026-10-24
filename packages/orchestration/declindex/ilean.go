@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unicode/utf8"
 )
 
 // IleanVersion is the version of Lean's reference-file format (`Lean/Data/Lsp/Internal.lean`) that this reader
@@ -85,53 +84,17 @@ func (u *ileanUsage) UnmarshalJSON(b []byte) error {
 	if len(raw) < 2 {
 		return fmt.Errorf("usage %s has fewer than two positions", b)
 	}
-	if err := decodeInt(raw[0], &u.Line); err != nil {
+	if err := json.Unmarshal(raw[0], &u.Line); err != nil {
 		return err
 	}
-	if err := decodeInt(raw[1], &u.Col); err != nil {
+	if err := json.Unmarshal(raw[1], &u.Col); err != nil {
 		return err
 	}
 	if len(raw) > 4 && string(raw[4]) != "null" {
-		if err := decodeString(raw[4], &u.Parent); err != nil {
+		if err := json.Unmarshal(raw[4], &u.Parent); err != nil {
 			return err
 		}
 	}
-	return nil
-}
-
-// decodeInt is json.Unmarshal(m, dst) for a position, which is nearly always a JSON integer of a few digits: such
-// a literal is read here, every other one by json.Unmarshal.
-func decodeInt(m json.RawMessage, dst *int) error {
-	if len(m) == 0 || len(m) > 9 || (m[0] == '0' && len(m) > 1) {
-		return json.Unmarshal(m, dst)
-	}
-	v := 0
-	for _, c := range m {
-		if c < '0' || c > '9' {
-			return json.Unmarshal(m, dst)
-		}
-		v = v*10 + int(c-'0')
-	}
-	*dst = v
-	return nil
-}
-
-// decodeString is json.Unmarshal(m, dst) for a declaration name, which is nearly always a JSON string of valid
-// UTF-8 with no escape: such a literal is read here, every other one by json.Unmarshal.
-func decodeString(m json.RawMessage, dst *string) error {
-	if len(m) < 2 || m[0] != '"' || m[len(m)-1] != '"' {
-		return json.Unmarshal(m, dst)
-	}
-	inner := m[1 : len(m)-1]
-	for _, c := range inner {
-		if c < 0x20 || c == '"' || c == '\\' {
-			return json.Unmarshal(m, dst)
-		}
-	}
-	if !utf8.Valid(inner) {
-		return json.Unmarshal(m, dst)
-	}
-	*dst = string(inner)
 	return nil
 }
 
