@@ -30,23 +30,26 @@ type Worktree struct {
 
 var autoGCConfigMu sync.Mutex
 
-// Worktree creates a worktree at dir on branch from base, or reuses an existing directory.
+// Worktree creates a worktree at dir on branch from base, or reuses an existing directory. Creation holds the
+// repository's worktree lock (<repo>/owner-worktree.flock): git does not lock `git worktree add`, and an add that runs
+// beside another reads that one's half-written administrative files and fails, so owners whose first commands run at
+// once make their worktrees one at a time.
 func (r Repo) Worktree(ctx context.Context, dir, branch, base string) (Worktree, error) {
 	if err := r.disableAutoGC(ctx); err != nil {
 		return Worktree{}, err
 	}
-
-	info, err := os.Stat(dir)
-	if err == nil {
-		if !info.IsDir() {
-			return Worktree{}, fmt.Errorf("worktree path %s is not a directory", dir)
-		}
-		return Worktree{Repo: r, Path: dir, Branch: branch}, nil
+	if worktree, found, err := r.existingWorktree(dir, branch); err != nil || found {
+		return worktree, err
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return Worktree{}, fmt.Errorf("stat worktree %s: %w", dir, err)
+	lock, err := flock(ctx, filepath.Join(r.Path, "owner-worktree.flock"), "another owner command is making a worktree")
+	if err != nil {
+		return Worktree{}, err
 	}
-
+	defer lock.Close()
+	// Another command of the same owner may have made it while this one waited.
+	if worktree, found, err := r.existingWorktree(dir, branch); err != nil || found {
+		return worktree, err
+	}
 	exists, err := r.branchExists(ctx, branch)
 	if err != nil {
 		return Worktree{}, err
@@ -65,6 +68,21 @@ func (r Repo) Worktree(ctx context.Context, dir, branch, base string) (Worktree,
 		return Worktree{}, err
 	}
 	return Worktree{Repo: r, Path: dir, Branch: branch}, nil
+}
+
+// existingWorktree is the worktree at dir when dir is there already, as a directory; any other thing at dir is an
+// error.
+func (r Repo) existingWorktree(dir, branch string) (Worktree, bool, error) {
+	info, err := os.Stat(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return Worktree{}, false, nil
+	case err != nil:
+		return Worktree{}, false, fmt.Errorf("stat worktree %s: %w", dir, err)
+	case !info.IsDir():
+		return Worktree{}, false, fmt.Errorf("worktree path %s is not a directory", dir)
+	}
+	return Worktree{Repo: r, Path: dir, Branch: branch}, true, nil
 }
 
 // BlobAtHead reads path from the worktree's HEAD. It reports found false when the path is absent.
@@ -157,35 +175,47 @@ func (w Worktree) locked(ctx context.Context, fn func(git func(args ...string) (
 			paths[index] = filepath.Join(w.Path, path)
 		}
 	}
-	lock, err := os.OpenFile(paths[0], os.O_RDWR|os.O_CREATE, 0o600)
+	lock, err := flock(ctx, paths[0], "another owner command has held "+paths[0])
 	if err != nil {
-		return fmt.Errorf("open the commit lock: %w", err)
+		return err
 	}
 	defer lock.Close()
-	deadline := time.Now().Add(commitLockWait)
-	for {
-		err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
-			return fmt.Errorf("lock %s: %w", paths[0], err)
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("another owner command has held %s for %s", paths[0], commitLockWait)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
 	for _, stale := range paths[1:] {
 		if err := os.Remove(stale); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove the lock %s that a killed command left: %w", stale, err)
 		}
 	}
 	return fn(func(args ...string) (string, error) { return runGitHolding(ctx, w.Path, lock, args...) })
+}
+
+// flock opens path and takes an exclusive lock on it, waiting up to commitLockWait for a holder to let go (busy names
+// that holder in the error), or until ctx ends. The lock holds until the returned file is closed.
+func flock(ctx context.Context, path, busy string) (*os.File, error) {
+	lock, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open the lock %s: %w", path, err)
+	}
+	deadline := time.Now().Add(commitLockWait)
+	for {
+		err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return lock, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			lock.Close()
+			return nil, fmt.Errorf("lock %s: %w", path, err)
+		}
+		if time.Now().After(deadline) {
+			lock.Close()
+			return nil, fmt.Errorf("%s for %s", busy, commitLockWait)
+		}
+		select {
+		case <-ctx.Done():
+			lock.Close()
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // LastCommitTouching returns the newest commit that changed path on this worktree's branch.
