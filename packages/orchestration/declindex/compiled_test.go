@@ -100,8 +100,8 @@ func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	if again.Exported != 0 {
 		t.Fatalf("an unchanged build was exported again: %d", again.Exported)
 	}
-	// Changed exporter sources build to another path (BuildExporter names its directory by their digest), and the
-	// compiled part's digest covers that path: every module is read again, so no hash of the old exporter stays.
+	// The same exporter at another path (the exporter beside a symlinked index's link, or its target) reads nothing
+	// again: the compiled part's digest covers what the exporter was built from (Exporter.Version), not its path.
 	bin, err := os.ReadFile(co.Exporter.Bin)
 	if err != nil {
 		t.Fatal(err)
@@ -110,6 +110,16 @@ func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	if err := os.WriteFile(co.Exporter.Bin, bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	moved, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.Exported != 0 {
+		t.Fatalf("the same exporter at another path exported again: %d", moved.Exported)
+	}
+	// Changed exporter sources or another toolchain give another version: every module is read again, so no hash of
+	// the old exporter stays.
+	co.Exporter.Version = "another build"
 	rebuilt, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)

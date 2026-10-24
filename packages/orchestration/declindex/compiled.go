@@ -33,14 +33,14 @@ type CompiledOptions struct {
 	Dir string
 }
 
-// compiledDigest names what the compiled part was read with: the exporter and the forms. When it changes, every
-// module is read again.
+// compiledDigest names what the compiled part was read with: the exporter's version (not its path, which differs
+// between the paths that name one index) and the forms. When it changes, every module is read again.
 func compiledDigest(co *CompiledOptions, m Manifest, formsSource string) (string, error) {
 	j, err := json.Marshal(m.complete())
 	if err != nil {
 		return "", err
 	}
-	h := sha256.Sum256([]byte(co.Exporter.Bin + "\x00" + formsSource + "\x00" + string(j)))
+	h := sha256.Sum256([]byte(co.Exporter.Version + "\x00" + formsSource + "\x00" + string(j)))
 	return hex.EncodeToString(h[:]), nil
 }
 

@@ -80,11 +80,9 @@ func run(ctx context.Context, dir string, env []string, name string, args ...str
 	return nil
 }
 
-// BuildExporter builds the exporter with toolchain l below cacheDir, once for each version of its sources and
-// each toolchain, and returns the binary. Lake compiles the modules to objects; the binary is linked against the
-// toolchain's shared runtime (libleanshared), which needs no development libraries on the machine. cc is the C
-// compiler that links (LEAN_CC, else the toolchain's own clang, else cc when empty).
-func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, error) {
+// exporterVersion names what BuildExporter builds with toolchain l: a digest of the toolchain's path and of every
+// exporter source file, which it also gives, sorted.
+func exporterVersion(l Lean) (string, []string, error) {
 	h := sha256.New()
 	h.Write([]byte(l.Prefix))
 	var files []string
@@ -95,7 +93,7 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 		return err
 	})
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	sort.Strings(files)
 	for _, f := range files {
@@ -103,7 +101,19 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 		h.Write([]byte(f))
 		h.Write(data)
 	}
-	dir := filepath.Join(cacheDir, "exporter-"+hex.EncodeToString(h.Sum(nil))[:16])
+	return hex.EncodeToString(h.Sum(nil))[:16], files, nil
+}
+
+// BuildExporter builds the exporter with toolchain l below cacheDir, once for each version of its sources and
+// each toolchain (exporterVersion), and returns the binary. Lake compiles the modules to objects; the binary is
+// linked against the toolchain's shared runtime (libleanshared), which needs no development libraries on the
+// machine. cc is the C compiler that links (LEAN_CC, else the toolchain's own clang, else cc when empty).
+func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, error) {
+	version, files, err := exporterVersion(l)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(cacheDir, "exporter-"+version)
 	binPath := filepath.Join(dir, "declexport")
 	if _, err := os.Stat(binPath); err == nil {
 		return binPath, nil
@@ -324,6 +334,9 @@ type Constant struct {
 type Exporter struct {
 	Lean Lean
 	Bin  string
+	// Version names what Bin was built from: the exporter's sources and the toolchain (BuildExporter). The compiled
+	// part's digest covers it, and not Bin's path, which differs between the paths that name one index.
+	Version string
 	// SearchPath is LEAN_PATH: the project's library directory, its dependencies', and any extra directory
 	// (forms, proposals).
 	SearchPath []string
