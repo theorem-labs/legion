@@ -26,13 +26,40 @@ func TestReturnedPrintsEveryC13Field(t *testing.T) {
 	}
 }
 
-func TestReturnedRefusesAnEventWithoutTheC13Fields(t *testing.T) {
+// The C13 producer requires a round's reason and key, and writes each of batch, detail and log that it was not given
+// as an empty string: owner returned prints those as absent, in JSON by leaving them out.
+func TestReturnedPrintsAReturnWithoutBatchDetailOrLog(t *testing.T) {
 	f := newCommandFixture(t)
 	migration := "m:" + ownerpkg.Key(caller) + ":1"
-	eventID := f.insertEvent(migration, `{"generation":1,"landing_rounds":1,"reason":"build_red"}`)
-	code, stderr := f.as(caller).fails("returned", fmt.Sprintf("returned:%s@%d", migration, eventID))
-	if code != 4 || !strings.Contains(stderr, "detail") {
-		t.Fatalf("returned on an event without C13 fields exited %d: %s", code, stderr)
+	eventID := f.insertEvent(migration, `{"generation":1,"landing_rounds":1,"reason":"head_unavailable","batch":"","detail":"","log":"","key":"b-7/m-2/1","ready_cleared":true}`)
+	item := fmt.Sprintf("returned:%s@%d", migration, eventID)
+	out := f.as(caller).ok("--json", "returned", item)
+	var got map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("returned output %q: %v", out, err)
+	}
+	if want := map[string]string{"reason": "head_unavailable", "key": "b-7/m-2/1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("returned = %v, want %v", got, want)
+	}
+	if out := strings.TrimSpace(f.as(caller).ok("returned", item)); out != "reason head_unavailable\ndetail (absent)\nlog (absent)\nbatch (absent)\nkey b-7/m-2/1" {
+		t.Fatalf("returned printed %q", out)
+	}
+}
+
+// A return with no reason or no key is not one the producer writes: the owner could neither act on it nor name the
+// round.
+func TestReturnedRefusesAnEventWithoutAReasonOrKey(t *testing.T) {
+	f := newCommandFixture(t)
+	migration := "m:" + ownerpkg.Key(caller) + ":1"
+	for field, data := range map[string]string{
+		"key":    `{"generation":1,"landing_rounds":1,"reason":"build_red"}`,
+		"reason": `{"generation":1,"landing_rounds":1,"reason":"","key":"b-7/m-2/1"}`,
+	} {
+		eventID := f.insertEvent(migration, data)
+		code, stderr := f.as(caller).fails("returned", fmt.Sprintf("returned:%s@%d", migration, eventID))
+		if code != 4 || !strings.Contains(stderr, field) {
+			t.Fatalf("returned on an event without %s exited %d: %s", field, code, stderr)
+		}
 	}
 }
 

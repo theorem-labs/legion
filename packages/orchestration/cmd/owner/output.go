@@ -25,7 +25,7 @@ func text(value any) string {
 		}
 		return strings.Join(lines, "\n")
 	case ownerpkg.ReturnFields:
-		return fmt.Sprintf("reason %s\ndetail %s\nlog %s\nbatch %s\nkey %s", v.Reason, v.Detail, v.Log, v.Batch, v.Key)
+		return fmt.Sprintf("reason %s\ndetail %s\nlog %s\nbatch %s\nkey %s", v.Reason, absent(v.Detail), absent(v.Log), absent(v.Batch), v.Key)
 	case stepResult:
 		state := "done"
 		if v.AlreadyDone {
@@ -45,4 +45,12 @@ func text(value any) string {
 	}
 	data, _ := json.Marshal(value)
 	return string(data)
+}
+
+// absent is an optional field as text: its value, or "(absent)" when it has none.
+func absent(value string) string {
+	if value == "" {
+		return "(absent)"
+	}
+	return value
 }

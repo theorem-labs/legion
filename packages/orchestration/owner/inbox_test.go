@@ -60,9 +60,15 @@ func TestReturnFromEventReadsEveryC13Field(t *testing.T) {
 	}
 }
 
-func TestReturnFromEventRefusesMissingC13Field(t *testing.T) {
-	event := ledger.Event{ID: 9, Kind: "migration.round_failed", Data: json.RawMessage(`{"generation":1,"landing_rounds":1,"reason":"build_red"}`)}
-	if _, err := ReturnFromEvent(event); err == nil || !strings.Contains(err.Error(), "detail") {
-		t.Fatalf("ReturnFromEvent missing field error = %v", err)
+// The producer requires a round's reason and key: an event without either is refused, naming the field.
+func TestReturnFromEventRefusesAReturnWithoutReasonOrKey(t *testing.T) {
+	for field, data := range map[string]string{
+		"key":    `{"generation":1,"landing_rounds":1,"reason":"build_red"}`,
+		"reason": `{"generation":1,"landing_rounds":1,"key":"b-1/m-2/1","detail":"x","log":"y","batch":"b-1"}`,
+	} {
+		event := ledger.Event{ID: 9, Kind: "migration.round_failed", Data: json.RawMessage(data)}
+		if _, err := ReturnFromEvent(event); err == nil || !strings.Contains(err.Error(), "field "+field) {
+			t.Fatalf("ReturnFromEvent without %s error = %v", field, err)
+		}
 	}
 }

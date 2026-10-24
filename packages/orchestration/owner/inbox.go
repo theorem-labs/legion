@@ -119,16 +119,19 @@ func inboxEntry(item ledger.Item, config Config) (InboxItem, error) {
 	return entry, nil
 }
 
-// ReturnFields are the C13 fields an owner reads to repair a returned migration.
+// ReturnFields are the C13 fields an owner reads to repair a returned migration. The producer (`ledger round`)
+// requires the reason and the key, and writes each of batch, detail and log that it was not given as an empty
+// string; such a field is absent here, and left out of the JSON.
 type ReturnFields struct {
 	Reason string `json:"reason"`
-	Detail string `json:"detail"`
-	Log    string `json:"log"`
-	Batch  string `json:"batch"`
+	Detail string `json:"detail,omitempty"`
+	Log    string `json:"log,omitempty"`
+	Batch  string `json:"batch,omitempty"`
 	Key    string `json:"key"`
 }
 
-// ReturnFromEvent reads the C13 fields of a migration.round_failed event and refuses an event that lacks one.
+// ReturnFromEvent reads the C13 fields of a migration.round_failed event and refuses an event without a reason or a
+// key, which the producer never writes.
 func ReturnFromEvent(event ledger.Event) (ReturnFields, error) {
 	if event.Kind != "migration.round_failed" {
 		return ReturnFields{}, fmt.Errorf("event %d is %s, not migration.round_failed", event.ID, event.Kind)
@@ -137,9 +140,7 @@ func ReturnFromEvent(event ledger.Event) (ReturnFields, error) {
 	if err := json.Unmarshal(event.Data, &fields); err != nil {
 		return ReturnFields{}, fmt.Errorf("decode event %d: %w", event.ID, err)
 	}
-	for _, field := range []struct{ name, value string }{
-		{"reason", fields.Reason}, {"detail", fields.Detail}, {"log", fields.Log}, {"batch", fields.Batch}, {"key", fields.Key},
-	} {
+	for _, field := range []struct{ name, value string }{{"reason", fields.Reason}, {"key", fields.Key}} {
 		if strings.TrimSpace(field.value) == "" {
 			return ReturnFields{}, fmt.Errorf("event %d lacks the C13 field %s", event.ID, field.name)
 		}
