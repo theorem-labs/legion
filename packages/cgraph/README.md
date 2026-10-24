@@ -209,7 +209,8 @@ These rules follow what the machine code shows, each only where it shows it:
   helper that returns
   NULL), through `?:`, `({ ... })`, `_Generic`, pointer arithmetic, an array's decay, and the return
   of any helper of the unit. A helper not declared inline, one that returns NULL or an address (a
-  select the compiler keeps), and a `c ? container_of(...) : NULL` nothing tests also give
+  select the compiler keeps), a member's address a `_Generic` gives (`to_ns_common(ns)`, which
+  the code may keep for its several uses), and a `c ? container_of(...) : NULL` nothing tests also give
   `inner_displacement`, from the register that holds the result.
 - The evaluator folds what the compiler does: a helper whose every live return gives one value (a
   return under a constant-false test is no return), a file-scope static nothing in the unit writes

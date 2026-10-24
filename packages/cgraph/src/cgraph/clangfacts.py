@@ -3756,7 +3756,19 @@ class _FunctionWalk:
             if selected is not None and len(selected) == 1:
                 (index,) = selected
                 if 0 < index < len(children):
-                    return self.pointer(children[index], bits, members, depth + 1)
+                    chosen = self.pointer(children[index], bits, members, depth + 1)
+                    association = _strip(children[index])
+                    if (
+                        chosen.base not in _OBJECT_BASES
+                        and chosen.inner is None
+                        and association.kind == K.UNARY_OPERATOR
+                        and libclang.is_address_of(association)
+                    ):
+                        # to_ns_common(ns), a member's address a macro gives: the machine code may
+                        # keep it in a register for its several uses and add only this
+                        # (do_listns_userns' &to_ns_common(kls->user_ns)->ns_owner_root).
+                        chosen = replace(chosen, inner=bits)
+                    return chosen
         if node.kind == K.DECL_REF_EXPR and node.referenced is not None:
             referenced = node.referenced
             if referenced.kind == K.PARM_DECL and not self.written(referenced):

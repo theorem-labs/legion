@@ -228,6 +228,16 @@ def test_a_value_stored_only_into_a_local_nothing_reads_is_left_to_the_image(
     assert f"function:{function}" not in {pair["source"] for pair in pairs["only_image"] + pairs["only_c"]}
 
 
+def test_a_member_address_a_generic_gives_may_stay_in_a_register(fold_build: dict[str, Any]) -> None:
+    """fd_owner_head: &fd_to_common(u)->root.head is 256 + 16 from u, or 16 from the register that
+    holds &u->ns (do_listns_userns' addi s1, s6, 0xf0)."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_owner_head"]
+    (item,) = [item for item in accesses if item["field"] == "head"]
+    assert (item["displacement"], item.get("inner_displacement")) == (272, 16)
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert "function:fd_owner_head" not in {entry["function"] for entry in offsets["misses"]}
+
+
 def test_an_unused_value_at_a_site_inlined_beside_a_call_keeps_only_what_the_image_shows(
     fold_facts: dict[str, Any], fold_build: dict[str, Any]
 ) -> None:

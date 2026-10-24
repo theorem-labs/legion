@@ -516,6 +516,28 @@ void fd_migrate(struct fd_pvmw *w)
 	obj_free((void *)w->address);
 }
 
+/* kernel/nstree.c do_listns_userns: head = &to_ns_common(kls->user_ns)->ns_owner_root.ns_list_head,
+ * where to_ns_common is a _Generic of &(ns)->ns: the machine code may keep &user_ns->ns, which it
+ * forms for other uses, in a register and add only the offset past it. */
+struct fd_common {
+	long pad[2];
+	struct {
+		long head;
+		long tail;
+	} root;
+};
+struct fd_user {
+	long pad[32];
+	struct fd_common ns;
+};
+#define fd_to_common(x) _Generic((x), struct fd_user *: &(x)->ns)
+
+long *fd_owner_head(struct fd_user *u)
+{
+	obj_free(fd_to_common(u));
+	return &fd_to_common(u)->root.head;
+}
+
 /* A helper the image calls at one site and inlines at another, where the inlined call's value is
  * unused: only the volatile read and the call of ext_check are made there, not the call of box_size
  * the value needs. */
