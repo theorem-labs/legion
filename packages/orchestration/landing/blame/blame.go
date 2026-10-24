@@ -264,6 +264,11 @@ func IndexDeclarations(before, after []Declaration) Evidence {
 	return evidence
 }
 
+// NewEvidence returns a zero-value Evidence with initialised maps.
+func NewEvidence() Evidence {
+	return newEvidence()
+}
+
 func newEvidence() Evidence {
 	return Evidence{
 		Removed:       declarationSet{},

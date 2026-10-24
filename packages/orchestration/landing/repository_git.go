@@ -71,32 +71,77 @@ func (g RepositoryGit) ChangeSet(ctx context.Context, repository, base string, m
 // merge base to its head. Both sides are scanned from complete source files so
 // each change carries its file and fully qualified Lean name. The unified diff
 // fills Inside (body edits), FieldsAdded, FieldsRemoved and Namespaces.
+//
+// Every blob is read through a single git cat-file --batch process keyed by
+// blob ID, not one git show per file.
 func (g RepositoryGit) DeclarationEvidence(ctx context.Context, repository, base string, member Member) (blame.Evidence, error) {
 	repository = g.path(repository)
 	mergeBase, err := repositoryGit(ctx, repository, "merge-base", base, member.Head)
 	if err != nil {
 		return blame.Evidence{}, fmt.Errorf("find merge base for %q: %w", member.Migration, err)
 	}
-	// List changed Lean files with --no-renames -z for raw, unquoted paths.
-	rawPaths, err := repositoryGit(ctx, repository, "diff", "--name-only", "--no-renames", "-z", mergeBase, member.Head, "--", "*.lean")
+	// git diff --raw gives us changed files with their old and new blob IDs.
+	rawDiff, err := repositoryGit(ctx, repository, "diff", "--raw", "--no-renames", "-z", "--no-abbrev", "--full-index", mergeBase, member.Head, "--", "*.lean")
 	if err != nil {
 		return blame.Evidence{}, fmt.Errorf("list changed files for %q: %w", member.Migration, err)
 	}
-	changed := make(map[string]struct{})
-	for _, path := range strings.Split(rawPaths, "\x00") {
-		path = strings.TrimSpace(path)
-		if path != "" && strings.HasSuffix(path, ".lean") {
-			changed[path] = struct{}{}
+	type fileBlobs struct {
+		path    string
+		oldBlob string // "0000…" for additions
+		newBlob string // "0000…" for deletions
+	}
+	var files []fileBlobs
+	blobIDs := make(map[string]struct{})
+	// Raw format with -z: fields are separated by NUL. Each entry is
+	// ":oldmode newmode oldblob newblob status\0path\0".
+	parts := strings.Split(rawDiff, "\x00")
+	for i := 0; i+1 < len(parts); i += 2 {
+		meta := parts[i]
+		path := parts[i+1]
+		if path == "" || !strings.HasSuffix(path, ".lean") {
+			continue
+		}
+		// meta starts with optional ":" from previous entry's close or the
+		// first entry. Find the colon-prefixed fields.
+		idx := strings.LastIndex(meta, ":")
+		if idx < 0 {
+			continue
+		}
+		fields := strings.Fields(meta[idx+1:])
+		if len(fields) < 5 {
+			continue
+		}
+		oldBlob, newBlob := fields[2], fields[3]
+		files = append(files, fileBlobs{path: path, oldBlob: oldBlob, newBlob: newBlob})
+		const zeroes = "0000000000000000000000000000000000000000"
+		if oldBlob != zeroes {
+			blobIDs[oldBlob] = struct{}{}
+		}
+		if newBlob != zeroes {
+			blobIDs[newBlob] = struct{}{}
 		}
 	}
-	// Read declarations from both sides of each changed file.
-	before, err := g.declarationsAt(ctx, repository, mergeBase, changed)
-	if err != nil {
-		return blame.Evidence{}, fmt.Errorf("read base declarations for %q: %w", member.Migration, err)
+	if len(files) == 0 {
+		return blame.NewEvidence(), nil
 	}
-	after, err := g.declarationsAt(ctx, repository, member.Head, changed)
+	// Batch-read every unique blob through one cat-file --batch.
+	blobs, err := readBlobs(ctx, repository, blobIDs)
 	if err != nil {
-		return blame.Evidence{}, fmt.Errorf("read member declarations for %q: %w", member.Migration, err)
+		return blame.Evidence{}, fmt.Errorf("read blobs for %q: %w", member.Migration, err)
+	}
+	// Scan declarations and line owners from both sides.
+	var before, after []blame.Declaration
+	beforeOwners := make(map[string][]blame.LineOwner, len(files))
+	afterOwners := make(map[string][]blame.LineOwner, len(files))
+	for _, f := range files {
+		if src, ok := blobs[f.oldBlob]; ok {
+			before = append(before, blame.ScanDeclarations(f.path, src)...)
+			beforeOwners[f.path] = blame.ScanLineOwners(f.path, src)
+		}
+		if src, ok := blobs[f.newBlob]; ok {
+			after = append(after, blame.ScanDeclarations(f.path, src)...)
+			afterOwners[f.path] = blame.ScanLineOwners(f.path, src)
+		}
 	}
 	evidence := blame.IndexDeclarations(before, after)
 	// Enrich with Inside, Fields and Namespaces from the unified diff.
@@ -105,18 +150,6 @@ func (g RepositoryGit) DeclarationEvidence(ctx context.Context, repository, base
 		return blame.Evidence{}, fmt.Errorf("read diff for %q: %w", member.Migration, err)
 	}
 	if diffOutput != "" {
-		beforeOwners := make(map[string][]blame.LineOwner, len(changed))
-		afterOwners := make(map[string][]blame.LineOwner, len(changed))
-		for path := range changed {
-			oldSource, _ := repositoryGitSource(ctx, repository, mergeBase, path)
-			newSource, _ := repositoryGitSource(ctx, repository, member.Head, path)
-			if oldSource != "" {
-				beforeOwners[path] = blame.ScanLineOwners(path, oldSource)
-			}
-			if newSource != "" {
-				afterOwners[path] = blame.ScanLineOwners(path, newSource)
-			}
-		}
 		blame.EnrichFromDiff(&evidence, diffOutput, beforeOwners, afterOwners)
 	}
 	return evidence, nil
@@ -138,12 +171,6 @@ func (g RepositoryGit) Declarations(ctx context.Context, repository string, tree
 		return nil, err
 	}
 	return blame.DeclarationsFor(name, declarations), nil
-}
-
-// declarationsAt scans declarations from a filtered set of files. When only
-// is nil it scans every Lean file; otherwise only the named files.
-func (g RepositoryGit) declarationsAt(ctx context.Context, repository, revision string, only map[string]struct{}) ([]blame.Declaration, error) {
-	return g.scanTree(ctx, repository, revision, only)
 }
 
 type blobEntry struct {
@@ -259,6 +286,56 @@ func (g RepositoryGit) scanTree(ctx context.Context, repository, revision string
 	return all, nil
 }
 
+// readBlobs batch-reads a set of blob IDs through one git cat-file --batch
+// process and returns their contents keyed by blob ID.
+func readBlobs(ctx context.Context, repository string, ids map[string]struct{}) (map[string]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	idList := make([]string, 0, len(ids))
+	for id := range ids {
+		idList = append(idList, id)
+	}
+	command := exec.CommandContext(ctx, "git", "-C", repository, "cat-file", "--batch")
+	command.Stdin = strings.NewReader(strings.Join(idList, "\n") + "\n")
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("cat-file pipe: %w", err)
+	}
+	if err := command.Start(); err != nil {
+		return nil, fmt.Errorf("cat-file start: %w", err)
+	}
+	reader := bufio.NewReaderSize(stdout, 1<<20)
+	blobs := make(map[string]string, len(idList))
+	for _, id := range idList {
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			_ = command.Wait()
+			return nil, fmt.Errorf("read blob header for %q: %w", id, err)
+		}
+		headerFields := strings.Fields(header)
+		if len(headerFields) < 3 {
+			_ = command.Wait()
+			return nil, fmt.Errorf("unexpected blob header for %q: %q", id, header)
+		}
+		size, err := strconv.Atoi(headerFields[2])
+		if err != nil {
+			_ = command.Wait()
+			return nil, fmt.Errorf("parse blob size for %q: %w", id, err)
+		}
+		body := make([]byte, size+1)
+		if _, err := io.ReadFull(reader, body); err != nil {
+			_ = command.Wait()
+			return nil, fmt.Errorf("read blob body for %q: %w", id, err)
+		}
+		blobs[id] = string(body[:size])
+	}
+	if err := command.Wait(); err != nil {
+		return nil, fmt.Errorf("cat-file: %w", err)
+	}
+	return blobs, nil
+}
+
 func (g RepositoryGit) path(repository string) string {
 	if g.Path != "" {
 		return g.Path
@@ -273,13 +350,4 @@ func repositoryGit(ctx context.Context, repository string, args ...string) (stri
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return strings.TrimSpace(string(output)), nil
-}
-
-func repositoryGitSource(ctx context.Context, repository, revision, path string) (string, error) {
-	command := exec.CommandContext(ctx, "git", "-C", repository, "show", revision+":"+path)
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("read %q at %q: %w: %s", path, revision, err, strings.TrimSpace(string(output)))
-	}
-	return string(output), nil
 }
