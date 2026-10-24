@@ -28,7 +28,7 @@ func (d Declaration) ID() DeclarationID {
 }
 
 var (
-	declarationRE = regexp.MustCompile(`^\s*(?:@\[[^\]]*\]\s*)*((?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*)(?:def|theorem|lemma|structure|class|inductive|abbrev|instance|axiom|opaque|notation|macro|syntax|macro_rules|elab|alias)\s+([^\s(:{\[⟨]+)`)
+	declarationRE = regexp.MustCompile(`^\s*(?:@\[[^\]]*\]\s*)*((?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*)(?:def|theorem|lemma|structure|class|inductive|abbrev|instance|axiom|opaque|notation|macro|syntax|macro_rules|elab|alias)\s+(?:\(priority\s*:=\s*[^)]*\)\s*)?([^\s(:{\[⟨]+)`)
 	namespaceRE   = regexp.MustCompile(`^\s*namespace\s+(\S+)\s*$`)
 	sectionRE     = regexp.MustCompile(`^\s*(?:(?:noncomputable|public|private|meta)\s+)*section(?:\s+(\S+))?\s*$`)
 	mutualRE      = regexp.MustCompile(`^\s*mutual\s*$`)
@@ -196,7 +196,7 @@ func (s *scanner) scan(line string) scanned {
 		modifiers := strings.Fields(match[1])
 		declaration := Declaration{
 			File:      s.file,
-			Name:      s.qualify(match[2]),
+			Name:      s.qualify(strings.TrimSuffix(match[2], ".")),
 			Text:      strings.Join(strings.Fields(code), " "),
 			Private:   containsString(modifiers, "private"),
 			Protected: containsString(modifiers, "protected"),
@@ -218,7 +218,7 @@ func (s *scanner) declared(line string) string {
 	if match == nil {
 		return ""
 	}
-	return s.qualify(match[2])
+	return s.qualify(strings.TrimSuffix(match[2], "."))
 }
 
 // uncomment removes block comments, which may span lines and nest, and a

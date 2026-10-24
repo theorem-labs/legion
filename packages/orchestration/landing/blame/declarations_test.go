@@ -61,3 +61,26 @@ end Alpha
 		}
 	}
 }
+
+// A universe-polymorphic name `S.{u}` declares S, and an instance with a
+// priority still declares its name.
+func TestScanDeclarationsNamesUniversesAndPriorities(t *testing.T) {
+	source := `namespace A
+structure S.{u} (α : Sort u) where
+  x : α
+def T.{u, v} (α : Sort u) (β : Sort v) : Prop := True
+instance (priority := low) feedR_drop : Inhabited Nat := ⟨0⟩
+end A
+`
+	got := ScanDeclarations("Universe.lean", source)
+	var names []string
+	for _, declaration := range got {
+		names = append(names, declaration.Name)
+	}
+	if want := []string{"A.S", "A.T", "A.feedR_drop"}; !sameStrings(names, want) {
+		t.Fatalf("ScanDeclarations() names = %q, want %q", names, want)
+	}
+	if found := DeclarationsFor("A.S", got); len(found) != 1 || found[0].Name != "A.S" {
+		t.Fatalf("DeclarationsFor(A.S) = %+v, want the universe-polymorphic structure", found)
+	}
+}
