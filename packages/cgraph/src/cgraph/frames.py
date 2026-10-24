@@ -10,8 +10,8 @@ register i and the C passes ``&object + d`` as argument i to that callee (link's
 address too); its fields are then held at B plus their displacement.
 
 Without such a call the frame shows nothing the fields alone decide: a frame address the code forms
-where every accessed field is loaded or stored fits another struct's fields by chance 20% of the time
-with two fields and 7% with four (kernel image, ``frames.decoys``' method). Such an object is
+where every accessed field is loaded or stored fits another struct's fields by chance 21% of the time
+with two fields and 8% with four (kernel image, ``frames.decoys``' method). Such an object is
 recorded as an exclusion, as is every other access no displacement can show: a zero-size member
 (``struct pin_cookie {}`` without lockdep), a function whose machine code makes no memory access with
 a displacement, an object that is no named local, and an access whose displacement the facts could
@@ -38,13 +38,23 @@ def _exact(slot: int, fields: Fields, accesses: set[tuple[int, int]]) -> int:
     return sum((slot + displacement, width) in accesses for displacement, width in fields)
 
 
+def _held(slot: int, fields: Fields, accesses: set[tuple[int, int]]) -> int:
+    """The fields some access at the slot covers or touches (a merged wider store, a narrower load)."""
+    return sum(
+        any(offset < slot + displacement + width and slot + displacement < offset + size for offset, size in accesses)
+        for displacement, width in fields
+    )
+
+
 def evidence(name: str, function: str, analysis: dict[str, Any], image: dict[str, Any]) -> set[int]:
     """The slots the image's calls give an object: a frame address B + d in the argument register
-    where the C passes ``&object + d``."""
+    where the C passes ``&object + d``. For a choice of objects (``a|b``), the slots of each, and those
+    of a call that passes the choice itself."""
+    parts = set(name.split("|"))
     passed = [
         (callee, position, displacement)
         for callee, position, held, displacement in analysis.get("object_arguments", {}).get(function, [])
-        if held == name
+        if held == name or held in parts
     ]
     given = image.get("frame_arguments", {}).get(function, [])
     return {
@@ -57,9 +67,13 @@ def evidence(name: str, function: str, analysis: dict[str, Any], image: dict[str
 
 def fit(fields: Fields, size: int, accesses: set[tuple[int, int]], slots: set[int]) -> int | None:
     """The frame slot of an object whose accessed fields are ``(displacement, bytes)``: of the slots
-    the calls give (``evidence``), the one that holds the object's bytes and the most fields."""
+    the calls give (``evidence``), the one that holds the object's bytes and the most fields, counting
+    a wider or narrower access over a field (force_sigsegv's memset(&info, 0, 48), which the compiler
+    shrank to memset(&info + 8, 0, 40), also passes an address inside info)."""
     placed = [slot for slot in slots if _inside(slot, size)]
-    return max(placed, key=lambda slot: (_exact(slot, fields, accesses), slot)) if placed else None
+    if not placed:
+        return None
+    return max(placed, key=lambda slot: (_held(slot, fields, accesses), _exact(slot, fields, accesses), slot))
 
 
 def _reason(item: dict[str, Any], displacements: set[int]) -> str | None:
@@ -186,7 +200,7 @@ def decoys(field_accesses: dict[str, list[dict[str, Any]]], analysis: dict[str, 
         slots = {slot for slot in evidence(name, function, analysis, image) if _inside(slot, size)}
         if slots:
             placed += 1
-            slot = max(slots, key=lambda slot: (_exact(slot, fields, accesses), slot))
+            slot = fit(fields, size, accesses, slots) or max(slots)
             others = {
                 offset for _, _, offset in image.get("frame_arguments", {}).get(function, []) if offset not in slots
             }

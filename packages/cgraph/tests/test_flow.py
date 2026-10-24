@@ -917,6 +917,22 @@ def test_gnu_conditional_with_an_omitted_middle_is_no_conversion_of_its_last_ope
 
 
 def test_a_helper_first_folded_too_deep_still_folds_for_a_shallow_use(fct_facts: dict[str, Any]) -> None:
-    """fct_d1 reaches fct_off five helpers deep before fct_off_later tests it: !fct_off() still holds,
-    so the free after the return is dead."""
+    """fct_d1 reaches fct_mapping four helpers deep before fct_off_later tests fct_file: !fct_file(o)
+    still holds, so the free after the return is dead."""
     assert "obj_free" not in {call["callee"] for call in fact_events(fct_facts, "fct_off_later")["calls"]}
+
+
+def test_a_pointer_to_either_of_two_locals_names_the_choice_and_is_held_at_its_slots(fct_build: dict[str, Any]) -> None:
+    """p = k ? &a : &b; p->b = k: the store is through a register holding either frame address."""
+    (item,) = fct_build["graph"]["analysis"]["field_accesses"]["function:fct_choice"]
+    assert (item["base"], item["displacement"]) == ("local", 12)
+    assert sorted(name.split("@")[0] for name in item["object"].split("|")) == ["a", "b"]
+    offsets = fct_build["checks"]["structure_layer"]["field_offsets"]
+    assert not [miss for miss in offsets["misses"] if miss["function"] == "function:fct_choice"]
+
+
+def test_a_slot_is_scored_by_the_fields_its_accesses_cover() -> None:
+    """force_sigsegv: si_signo and si_errno merged into one sd at -72, si_code a sw at -64; memset's
+    interior address -64 is another call's slot, which holds one field exactly."""
+    fields = {(0, 4), (4, 4), (8, 4)}
+    assert frames.fit(fields, 48, {(-72, 8), (-64, 4)}, {-72, -64}) == -72

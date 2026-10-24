@@ -258,7 +258,14 @@ def _index_terms(address: _Address) -> list[dict[str, int]]:
 
 def _agree(addresses: set[_Address]) -> _Address | None:
     """The one address several definitions give: they agree on the base, the bits and the parameter
-    indices; a parameter, an element or an inner register they disagree on is dropped."""
+    indices; a parameter, an element or an inner register they disagree on is dropped. Definitions
+    that each name a local object (sched_balance_find_dst_cpu's sgs = &local_sgs or &tmp_sgs) give
+    the choice of them, ``a|b``, as large as the largest."""
+    objects = {address.object for address in addresses}
+    if len(objects) > 1 and None not in objects and {address.base for address in addresses} == {"local"}:
+        names = sorted({part for held in objects if held is not None for part in held[0].split("|")})
+        choice = ("|".join(names), max(held[1] for held in objects if held is not None))
+        addresses = {replace(address, object=choice) for address in addresses}
     agreed = {(address.bits, address.base, address.index, address.object) for address in addresses}
     if len(agreed) != 1:
         return None

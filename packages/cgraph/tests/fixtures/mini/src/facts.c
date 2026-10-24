@@ -819,3 +819,18 @@ void fct_off_later(struct fct_outer *o)
 		return;
 	obj_free(o);
 }
+
+/* sched_balance_find_dst_cpu: sgs = local_group ? &local_sgs : &tmp_sgs, then a store through sgs.
+ * The store is at either local's frame slot. */
+void fct_choice(int k)
+{
+	struct fct_inner a, b, *p;
+
+	if (k)
+		p = &a;
+	else
+		p = &b;
+	p->b = k;
+	fct_takes_inner(&a);
+	fct_takes_inner(&b);
+}

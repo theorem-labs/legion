@@ -184,10 +184,10 @@ These rules follow what the machine code shows, each only where it shows it:
   (`frame_slot_access`, a wider or narrower access over it, or, for an array member at a variable
   index, `frame_slot_indexed_access` or a formed address there). The frame alone decides no slot: on
   the kernel image (part `all`), a formed frame address where every accessed field is loaded or stored
-  fits the fields of another function's object of another struct 20% of the time with two fields, 9%
-  with three and 7% with four, so the 1,491 objects no call places are excluded as
-  `local_object_without_frame_slot`. Of the 615 objects a call places, the 309 whose function passes
-  other frame addresses too hold 926 fields at their slot and 410 at the best other frame argument.
+  fits the fields of another function's object of another struct 21% of the time with two fields, 10%
+  with three and 8% with four, so the 1,506 objects no call places are excluded as
+  `local_object_without_frame_slot`. Of the 591 objects a call places, the 295 whose function passes
+  other frame addresses too hold 847 fields at their slot and 372 at the best other frame argument.
 - Every field access no displacement can show is an exclusion of kind `field_access`, the access
   itself as its detail, and the structure check counts each reason as often as it is recorded:
   `local_object_without_frame_slot`, `zero_size_member` (an empty struct member, as `struct
