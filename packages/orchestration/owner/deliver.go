@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
 var (
-	// ErrIDOwner reports a follow-up identifier that has already been assigned to another owner.
+	// ErrIDOwner reports a work item that is in another owner's queue: an item id belongs to one owner for its whole
+	// history.
 	ErrIDOwner = errors.New("work item belongs to another owner")
 
 	noticeRetryDelays = [...]time.Duration{time.Second, 4 * time.Second, 16 * time.Second}
@@ -126,4 +130,26 @@ func OpenLedgerFile(ctx context.Context, source, dsnFile string) (*ledger.Store,
 		return nil, fmt.Errorf("open ledger from %s: %w", source, err)
 	}
 	return store, nil
+}
+
+// LedgerUnreachable reports whether err is a failure to reach the ledger, which its caller retries: a network operation
+// that failed (a refused, reset or timed-out connection, or a host name that did not resolve), a deadline, a
+// connection that closed before the server answered, a connection exception (SQLSTATE class 08), or a server that is
+// shutting down, starting up or out of connections. Any other answer from the server (an authentication failure, a
+// refusal, no repository) is no such failure, and neither is a file's error: syscall.Errno satisfies net.Error, so the
+// test is for the net package's own error types.
+func LedgerUnreachable(err error) bool {
+	var operation *net.OpError
+	var lookup *net.DNSError
+	var server *pgconn.PgError
+	if errors.As(err, &server) {
+		switch {
+		case strings.HasPrefix(server.Code, "08"): // connection_exception
+			return true
+		case server.Code == "57P01", server.Code == "57P02", server.Code == "57P03", server.Code == "53300":
+			return true // admin_shutdown, crash_shutdown, cannot_connect_now, too_many_connections
+		}
+	}
+	return errors.As(err, &operation) || errors.As(err, &lookup) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
 }

@@ -163,6 +163,18 @@ type envoySettings struct {
 	Token string
 }
 
+// CheckEnvoyConfig reads the Envoy configuration at path as ResolveListener reads ENVOY_CONFIG_FILE, for a command that
+// was told to use that file: a file it cannot read or decode is an error.
+func CheckEnvoyConfig(path string) error {
+	_, err := loadEnvoySettings(func(name string) string {
+		if name == "ENVOY_CONFIG_FILE" {
+			return path
+		}
+		return ""
+	})
+	return err
+}
+
 func loadEnvoySettings(getenv func(string) string) (envoySettings, error) {
 	path, err := envoyConfigPath(getenv)
 	if err != nil {

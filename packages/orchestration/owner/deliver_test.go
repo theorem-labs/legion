@@ -4,11 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
 var errInjected = errors.New("injected failure")
@@ -87,5 +92,49 @@ func TestDeliverReturnsTheJournalErrorWithTheNoticeItLost(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(cwd); len(entries) != 0 {
 		t.Fatalf("Deliver wrote into the working directory: %v", entries)
+	}
+}
+
+// A failure to reach the ledger is one the caller retries; an answer from the server, or a refusal, is not.
+func TestLedgerUnreachableIsAConnectionFailureOrADeadline(t *testing.T) {
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := closed.Addr().String()
+	closed.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, refused := ledger.Open(ctx, "postgres://ledger:secret@"+address+"/ledger?sslmode=disable&connect_timeout=5")
+	if refused == nil || !LedgerUnreachable(refused) {
+		t.Fatalf("a refused connection: %v, unreachable %t", refused, LedgerUnreachable(refused))
+	}
+	// A server that is shutting down, starting up or out of connections is one to try again too, and so is any
+	// connection exception (SQLSTATE class 08).
+	for _, err := range []error{
+		fmt.Errorf("read: %w", context.DeadlineExceeded),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "57P01", Message: "terminating connection due to administrator command"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "57P02", Message: "terminating connection because of crash of another server process"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "57P03", Message: "the database system is starting up"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "53300", Message: "sorry, too many clients already"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "08006", Message: "connection failure"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "08001", Message: "unable to establish connection"}),
+	} {
+		if !LedgerUnreachable(err) {
+			t.Errorf("LedgerUnreachable(%v) = false", err)
+		}
+	}
+	_, unreadable := OpenLedgerFile(ctx, "--ledger-dsn-file", filepath.Join(t.TempDir(), "no-such-dsn"))
+	for _, err := range []error{
+		// A file's errno satisfies net.Error (syscall.Errno has Timeout and Temporary), yet no ledger was tried.
+		unreadable,
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "28P01", Message: "password authentication failed"}),
+		&ledger.NotFoundError{What: "repository", ID: "r"},
+		&ledger.Refusal{Reason: ledger.ReasonExists},
+		errors.New("parse DSN"),
+	} {
+		if LedgerUnreachable(err) {
+			t.Errorf("LedgerUnreachable(%v) = true", err)
+		}
 	}
 }

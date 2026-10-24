@@ -347,11 +347,15 @@ type NoticeFields struct {
 
 // Notices builds one notice per delivery. Every notice of an item carries the key NoticeKey(item). A notice of a record
 // that queues no item names no item: its subject is its sender, and its key is NoticeKey(record@commit), one for each
-// revision of the record. A re-run of the step repeats the key, so each subscribed session takes the notice once.
+// revision of the record. A re-run of the step repeats the key, so each subscribed session takes the notice once. The
+// message names the record's commit when there is one: the gate's near verdict has none yet.
 func Notices(deliveries []Delivery, fields NoticeFields) []Notice {
-	short := fields.Commit
-	if len(short) > 12 {
-		short = short[:12]
+	at := fields.Commit
+	if len(at) > 12 {
+		at = at[:12]
+	}
+	if at != "" {
+		at = "at " + at
 	}
 	subject := fields.Edge
 	if source, target, err := ParseEdgeID(fields.Edge); err == nil {
@@ -366,7 +370,7 @@ func Notices(deliveries []Delivery, fields NoticeFields) []Notice {
 			version = ref.Version
 		}
 	}
-	message := strings.Join(strings.Fields(fmt.Sprintf("%s %s %s (epoch %d) at %s", fields.Type, subject, version, fields.Epoch, short)), " ")
+	message := strings.Join(strings.Fields(fmt.Sprintf("%s %s %s (epoch %d) %s", fields.Type, subject, version, fields.Epoch, at)), " ")
 	notices := make([]Notice, 0, len(deliveries))
 	for _, delivery := range deliveries {
 		payload := Payload{

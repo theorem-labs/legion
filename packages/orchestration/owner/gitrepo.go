@@ -356,15 +356,26 @@ func (w Worktree) head(ctx context.Context) (string, error) {
 }
 
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
-	return runGitHolding(ctx, dir, nil, args...)
+	return runGitCmd(ctx, dir, nil, nil, nil, args...)
 }
 
 // runGitHolding runs git in dir. A held lock is git's descriptor 3, so git holds the lock for as long as it runs.
 func runGitHolding(ctx context.Context, dir string, lock *os.File, args ...string) (string, error) {
+	return runGitCmd(ctx, dir, lock, nil, nil, args...)
+}
+
+// runGitCmd runs git in dir with the process environment plus env, stdin as its input, and lock as descriptor 3.
+func runGitCmd(ctx context.Context, dir string, lock *os.File, env []string, stdin []byte, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, "git", args...)
 	command.Dir = dir
 	if lock != nil {
 		command.ExtraFiles = []*os.File{lock}
+	}
+	if env != nil {
+		command.Env = append(os.Environ(), env...)
+	}
+	if stdin != nil {
+		command.Stdin = bytes.NewReader(stdin)
 	}
 	var stdout, stderr strings.Builder
 	command.Stdout = &stdout
