@@ -164,7 +164,20 @@ These rules follow what the machine code shows, each only where it shows it:
   carry up to the next fold.
 - A helper folded under a `__builtin_constant_p` choice marks all its events `conditional`, field
   accesses too: the machine code decides whether that branch was compiled, so a conditional field
-  access with no match is counted apart as `image_decided`.
+  access with no match is excluded as `image_decided` (below).
+- A field of a local object is held against the frame (`frames.py`). The object's slot B is where an
+  image call passes the frame address B + d in the argument register where the C passes
+  `&object + d` (`analysis.object_arguments` against `frame_arguments`; a struct local's cleanup
+  gets its address too). The fields are then matched at B plus their displacement
+  (`frame_slot_access`, or a wider or narrower access over it). The frame alone decides no slot: a
+  formed frame address where every accessed field is fits another struct's fields by chance too often.
+- Every field access no displacement can show is an exclusion of kind `field_access`, the access
+  itself as its detail, and the structure check counts each reason as often as it is recorded:
+  `local_object_without_frame_slot`, `zero_size_member` (an empty struct member, as `struct
+  pin_cookie` without lockdep), `no_memory_access_in_image`, `other_object`, `displacement_unknown`
+  and `image_decided`. `field_offsets.frame_decoys` measures how often a slot holds fields by chance:
+  the fields another call's frame argument would hold, and how often the frame alone would fit
+  another struct.
 
 ## Nodes and ids
 

@@ -10,10 +10,11 @@ one owner per node, and valid topics.
 from __future__ import annotations
 
 import collections
+import copy
 import re
 from typing import Any
 
-from . import jsonio
+from . import frames, jsonio
 from .config import Thresholds
 
 # Contract C1, matching Go's `^(function|struct|global|percpu|subsystem):\S+$` exactly. Python's
@@ -287,28 +288,25 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             struct_sizes[node["name"]].add(node["size"])
     candidates = []
     excluded: collections.Counter[str] = collections.Counter()
-    for function, fields in sorted(analysis["field_accesses"].items()):
+    # Each access no displacement can show, recorded in exclusions.json; each local object's slot.
+    field_accesses = copy.deepcopy(analysis["field_accesses"])
+    exclusion_items = frames.annotate(field_accesses, analysis)
+    for function, fields in sorted(field_accesses.items()):
         if function not in offsets:
             continue
         displacements = set(offsets[function])
-        if not displacements - {0}:
-            # The machine code makes no memory access with a displacement: nothing to match.
-            excluded["no_memory_access_in_image"] += len(fields)
-            continue
+        frame_accesses, frame_addresses = frames.frame_of(analysis["image"], function)
         for item in fields:
-            base = item.get("base", "pointer")
-            if base in ("local", "other"):
-                # An object on the stack or in registers: the compiler keeps it in registers.
-                excluded[f"{base}_object"] += 1
+            if item.get("excluded"):
+                excluded[item["excluded"]] += 1
                 continue
+            base = item.get("base", "pointer")
             displacement = item.get("displacement", -1)
             # A container_of displacement is negative (the member's offset subtracted): match it as is.
             if displacement >= 0 or (base == "container_of" and displacement < -1):
                 offset = displacement
             else:
                 offset = item["offset"]
-            if offset < 0 and base != "container_of":
-                continue
             size = max(1, item.get("size", 1) or 1)
             # Where the image may keep an inner address in a register instead of the folded sum: the
             # element of a variable index (``element_displacement``), a rebased helper's member, a
@@ -333,7 +331,10 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 ),
                 None,
             )
-            if base == "global" and offset in global_offsets[function]:
+            if "frame_slot" in item:
+                # A field of a local object the frame holds at the object's slot (frames.py).
+                method = frames.method(item, frame_accesses, frame_addresses)
+            elif base == "global" and offset in global_offsets[function]:
                 method = "global_address_offset"
             elif register is not None:
                 method = register
@@ -384,6 +385,7 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 # Under a __builtin_constant_p choice the compiler made per call site: the image
                 # decides whether this code was compiled.
                 excluded["image_decided"] += 1
+                exclusion_items.append(frames.exclusion(function, item, "image_decided"))
                 continue
             candidate = {
                 "function": function,
@@ -419,6 +421,7 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             "matched": sum(item["matched"] for item in candidates),
             "by_method": dict(sorted(collections.Counter(item["method"] for item in candidates).items())),
             "excluded": dict(sorted(excluded.items())),
+            "frame_decoys": frames.decoys(field_accesses, analysis),
             "misses": [
                 {key: item[key] for key in ("function", "struct", "field", "offset", "base", "method")}
                 for item in candidates
@@ -434,6 +437,8 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             "sample": {"size": len(sample), "matched": sum(item["matched"] for item in sample), "items": sample},
         },
         "excluded_embedding_bases": analysis["excluded_embedding_bases"],
+        # The excluded field accesses themselves, which the pipeline writes to exclusions.json.
+        "exclusion_items": exclusion_items,
         "unguarded_global_locks": locks,
         "largest_subsystems": [
             {"id": node["id"], "members": len(node["members"])}

@@ -2862,6 +2862,21 @@ class _FunctionWalk:
         """
         pattern = self.x.vocabulary.cleanup_class
         match = pattern.fullmatch(node.type.spelling) if pattern is not None else None
+        record, pointer, _ = _canonical_record(node.type)
+        # A local of a struct type (CLASS(fd_prepare, fdf), struct pinned_mountpoint mp __cleanup(...))
+        # is the object the destructor gets the address of and reads: its fields are the local's.
+        own = (
+            {
+                "unit": self.x.record_unit(record, None),
+                "param": None,
+                "displacement": 0,
+                "base": "local",
+                "object": self.x.object_name(node),
+                "object_size": max(node.type.get_canonical().get_size(), 0),
+            }
+            if record is not None and not pointer
+            else None
+        )
         if match is not None:
             destructor = self.x.vocabulary.cleanup_destructor.format(name=match.group(1))
             constructor = initializer
@@ -2872,6 +2887,9 @@ class _FunctionWalk:
                 if constructor is not None and constructor.kind == K.CALL_EXPR
                 else []
             )
+            if own is not None and own["unit"] is not None:
+                # A class of a named struct (not a lock guard's unnamed one): the destructor reads it.
+                arguments = [own]
         elif any(child.kind == K.UNEXPOSED_ATTR for child in node.get_children()):
             function = self.x.cleanup_function(node, self.cursor)
             if function is None:
@@ -2879,9 +2897,8 @@ class _FunctionWalk:
             destructor = function
             held = self.argument(initializer) if initializer is not None else {"unit": None, "param": None}
             if held["unit"] is None:
-                record, _, _ = _canonical_record(node.type)
                 held = {"unit": self.x.record_unit(record, None) if record is not None else None, "param": None}
-            arguments = [held]
+            arguments = [own if own is not None else held]
         else:
             return
         self.events["calls"].append(

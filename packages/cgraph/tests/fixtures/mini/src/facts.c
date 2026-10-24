@@ -546,3 +546,39 @@ void fct_lock_checked(struct fct_locked *l)
 {
 	spin_lock(fct_check(&l->lock));
 }
+
+/* __alloc_frozen_pages_noprof: ac's address goes to a call, so the object lives in a frame slot and
+ * the machine code stores and loads its fields at the slot plus their offsets. */
+long fct_frame_object(int v)
+{
+	struct fct_inner local;
+
+	local.a = v;
+	local.b = v + 2;
+	fct_takes_inner(&local);
+	return local.pad;
+}
+
+/* struct rq_flags' cookie is struct pin_cookie { } without lockdep: no byte to load or store. */
+struct fct_cookie {
+};
+struct fct_flags {
+	long flags;
+	struct fct_cookie cookie;
+};
+
+void fct_zero_size(struct fct_flags *f)
+{
+	f->cookie = (struct fct_cookie){};
+	f->flags = 1;
+}
+
+/* struct pinned_mountpoint mp __cleanup(unlock_mount): the cleanup gets the local's address. */
+void fct_release(struct fct_inner *in);
+
+long fct_cleanup_object(int v)
+{
+	struct fct_inner held __attribute__((cleanup(fct_release))) = { .a = v };
+
+	return held.b;
+}

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import collections
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import FIXTURE, add_contract_functions, build, read, text_address
 
-from cgraph import clangfacts, commands, config, contracts, image, link
+from cgraph import clangfacts, commands, config, contracts, frames, image, link
 
 
 @pytest.fixture(scope="module")
@@ -786,3 +787,56 @@ def test_a_lock_named_through_an_inline_helper_has_the_member_s_displacement(fct
         for item in fact_events(fct_facts, "fct_lock_checked")["field_accesses"]
     }
     assert found == {("lock", 8, "pointer")}
+
+
+def test_a_local_object_whose_address_escapes_is_found_in_its_frame_slot(fct_build: dict[str, Any]) -> None:
+    """fct_takes_inner(&local): the frame holds local; its fields are stored and loaded at the slot."""
+    offsets = fct_build["checks"]["structure_layer"]["field_offsets"]
+    assert not [item for item in offsets["misses"] if item["function"] == "function:fct_frame_object"]
+    assert offsets["by_method"].get("frame_slot_access", 0) >= 3
+    # c.addi sp, -0x20; c.swsp a0, 0x10(sp); c.swsp a1, 0x14(sp); c.addi4spn a0, sp, 8; c.ldsp a0, 8(sp):
+    # offsets from sp on entry. The save and restore of ra at 0x18(sp) is the frame's own.
+    image_facts = fct_build["graph"]["analysis"]["image"]
+    assert image_facts["frame_accesses"]["function:fct_frame_object"] == [[-24, 8], [-16, 4], [-12, 4]]
+    assert image_facts["frame_addresses"]["function:fct_frame_object"] == [-24]
+    # c.addi4spn a0, sp, 8 before jal fct_takes_inner: the frame address the C's &local is.
+    assert image_facts["frame_arguments"]["function:fct_frame_object"] == [["fct_takes_inner", 0, -24]]
+    (passed,) = fct_build["graph"]["analysis"]["object_arguments"]["function:fct_frame_object"]
+    assert passed[:2] == ["fct_takes_inner", 0] and passed[3] == 0
+    assert not [
+        item
+        for item in fct_build["exclusions"]["items"]
+        if item["function"] == "function:fct_frame_object" and item["kind"] == "field_access"
+    ]
+
+
+def test_every_field_access_the_check_cannot_hold_is_recorded(fct_build: dict[str, Any]) -> None:
+    """A local object in registers, a zero-size member: each is an exclusions.json item, and the
+    check's count of each reason is the number of items."""
+    offsets = fct_build["checks"]["structure_layer"]["field_offsets"]
+    items = [item for item in fct_build["exclusions"]["items"] if item["kind"] == "field_access"]
+    assert offsets["excluded"] == dict(collections.Counter(item["reason"] for item in items))
+    assert fct_build["checks"]["exclusions"]["field_access"] == offsets["excluded"]
+    found = {(item["function"], item["reason"], item["detail"]["struct"], item["detail"]["field"]) for item in items}
+    assert ("function:fct_local_object", "local_object_without_frame_slot", "fct_inner", "a") in found
+    assert ("function:fct_zero_size", "zero_size_member", "fct_flags", "cookie") in found
+
+
+def test_only_a_call_s_frame_argument_places_a_local_object() -> None:
+    """Of the slots the calls give, the one that holds the object's bytes and the most fields; the
+    fields alone place nothing; a slot above the frame's top, or too small for the object, is none."""
+    accesses = {(-48, 8), (-40, 4), (-24, 8)}
+    assert frames.fit({(0, 8)}, 8, accesses, {-24}) == -24
+    assert frames.fit({(0, 8), (8, 4)}, 16, accesses, {-48, -24}) == -48
+    assert frames.fit({(0, 8), (8, 4)}, 16, accesses, set()) is None
+    assert frames.fit({(0, 8), (8, 4)}, 64, accesses, {-48}) is None
+    assert frames.fit({(0, 8)}, 8, accesses, {8}) is None
+
+
+def test_a_cleanup_of_a_struct_local_gets_the_local_s_address(fct_facts: dict[str, Any]) -> None:
+    """fct_release(&held) runs when held's scope ends: its fields through the parameter are held's."""
+    (call,) = [
+        call for call in fact_events(fct_facts, "fct_cleanup_object")["calls"] if call["callee"] == "fct_release"
+    ]
+    (argument,) = call["arguments"]
+    assert (argument["base"], argument["displacement"], argument["object"].split("@")[0]) == ("local", 0, "held")

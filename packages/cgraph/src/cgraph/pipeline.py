@@ -170,6 +170,8 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
         "access_layer": checks.accesses(graph),
         "structure_layer": checks.structure(graph),
     }
+    # The field accesses the structure check cannot hold against the image, each recorded.
+    exclusions = jsonio.exclusion_document(part, exclusions["items"] + layers["structure_layer"].pop("exclusion_items"))
     hard = checks.hard(graph, owner_list, topics, layers, config.part_thresholds.get(part, config.thresholds))
     passes = all(item["ok"] for item in hard)
     check_document = {
