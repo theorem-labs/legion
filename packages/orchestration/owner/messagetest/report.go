@@ -41,13 +41,15 @@ type Report struct {
 	Passed     bool          `json:"passed"`
 }
 
-// Daemon names the supervisor the run started and where its configuration, socket and log are.
+// Daemon names the supervisor the run started, where its configuration, socket and log are, and the omp its panes
+// run, which the driver gives it as LEGION_OMP_PATH.
 type Daemon struct {
 	Executable string `json:"executable"`
 	Config     string `json:"config"`
 	Socket     string `json:"tmux_socket"`
 	Log        string `json:"log"`
 	Port       int    `json:"port"`
+	Omp        string `json:"omp"`
 }
 
 // StepTiming is one step of the run and its duration. Error is why it did not finish.
@@ -140,7 +142,7 @@ func (r Report) markdown() string {
 	fmt.Fprintf(&b, "# Owner message test %s\n\n", r.Run)
 	fmt.Fprintf(&b, "- Result: **%s**\n- Duration: %.1f s (%s to %s)\n- Prefix: `%s`\n- Nodes: %s\n- Edge: `%s`\n- Kill seed: %d\n",
 		verdict, r.Seconds, r.StartedAt.Format(time.RFC3339), r.FinishedAt.Format(time.RFC3339), r.Prefix, code(r.Nodes), r.Edge, r.Seed)
-	fmt.Fprintf(&b, "- Daemon: `%s start --config %s` (port %d, tmux socket `%s`, log `%s`)\n\n", r.Daemon.Executable, r.Daemon.Config, r.Daemon.Port, r.Daemon.Socket, r.Daemon.Log)
+	fmt.Fprintf(&b, "- Daemon: `%s start --config %s` (port %d, tmux socket `%s`, log `%s`), panes running `%s`\n\n", r.Daemon.Executable, r.Daemon.Config, r.Daemon.Port, r.Daemon.Socket, r.Daemon.Log, r.Daemon.Omp)
 	r.Revisions.markdown(&b)
 	b.WriteString("## Steps\n\n| Step | Seconds | Error |\n| --- | --- | --- |\n")
 	for _, step := range r.Steps {

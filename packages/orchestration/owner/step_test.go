@@ -383,7 +383,7 @@ func runnerEnv(overrides map[string]string) func(string) string {
 }
 
 func TestRunnerFromEnvNamesMissingOwner(t *testing.T) {
-	_, err := RunnerFromEnv(func(string) string { return "" }, nil, Worktree{}, "/srv/owners/state")
+	_, err := RunnerFromEnv(func(string) string { return "" }, nil, "/srv/owners/state")
 	if err == nil || err.Error() != "missing LEGION_OWNER" {
 		t.Fatalf("RunnerFromEnv error = %v, want missing LEGION_OWNER", err)
 	}
@@ -392,14 +392,14 @@ func TestRunnerFromEnvNamesMissingOwner(t *testing.T) {
 // The supervisor names the owner in LEGION_OWNER: a name ending _KEY has a credential's shape, which the daemon
 // refuses in a launch and strips from every pane, so LEGION_OWNER_KEY never reaches an owner.
 func TestRunnerFromEnvIgnoresLegionOwnerKey(t *testing.T) {
-	_, err := RunnerFromEnv(runnerEnv(map[string]string{"LEGION_OWNER": "", "LEGION_OWNER_KEY": "function:ns_match"}), nil, Worktree{}, "/srv/owners/state")
+	_, err := RunnerFromEnv(runnerEnv(map[string]string{"LEGION_OWNER": "", "LEGION_OWNER_KEY": "function:ns_match"}), nil, "/srv/owners/state")
 	if err == nil || err.Error() != "missing LEGION_OWNER" {
 		t.Fatalf("RunnerFromEnv error = %v, want missing LEGION_OWNER", err)
 	}
 }
 
 func TestRunnerFromEnvRefusesARelativeStateDir(t *testing.T) {
-	_, err := RunnerFromEnv(runnerEnv(nil), nil, Worktree{}, "state")
+	_, err := RunnerFromEnv(runnerEnv(nil), nil, "state")
 	if err == nil || !strings.Contains(err.Error(), "state_dir") || !strings.Contains(err.Error(), "absolute") {
 		t.Fatalf("RunnerFromEnv error = %v, want a refused relative state_dir", err)
 	}
@@ -409,7 +409,7 @@ func TestRunnerFromEnvRefusesARelativeStateDir(t *testing.T) {
 // built, so the command stops before it writes anything.
 func TestRunnerFromEnvRefusesAnUnresolvableListener(t *testing.T) {
 	home := t.TempDir()
-	_, err := RunnerFromEnv(runnerEnv(map[string]string{"ENVOY_URL": "", "ENVOY_TOKEN": "", "HOME": home}), nil, Worktree{}, "/srv/owners/state")
+	_, err := RunnerFromEnv(runnerEnv(map[string]string{"ENVOY_URL": "", "ENVOY_TOKEN": "", "HOME": home}), nil, "/srv/owners/state")
 	if !errors.Is(err, ErrListenerConfig) || !strings.Contains(err.Error(), "envoy.json") {
 		t.Fatalf("RunnerFromEnv error = %v, want ErrListenerConfig naming the configuration it could not read", err)
 	}
@@ -419,7 +419,7 @@ func TestRunnerFromEnvRefusesAnUnresolvableListener(t *testing.T) {
 // wherever the owner process runs.
 func TestRunnerFromEnvJournalsUnderTheDeploymentStateDir(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
-	runner, err := RunnerFromEnv(runnerEnv(nil), nil, Worktree{}, stateDir)
+	runner, err := RunnerFromEnv(runnerEnv(nil), nil, stateDir)
 	if err != nil {
 		t.Fatal(err)
 	}

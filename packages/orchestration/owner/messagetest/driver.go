@@ -34,14 +34,13 @@ type Options struct {
 	Kills  int      // how many owner panes to kill
 	Out    string   // the run's directory, absolute and new or empty
 
-	Deploy        ownerpkg.Deploy // the operator's deployment: its graph and the keys the test deployment copies
-	LedgerDSNFile string          // the ledger the run's repository is made in; the supervisor reads the same file
-	Owner         string          // the owner executable the test owners run
-	Legion        string          // the supervisor: `legion start --config FILE`
-	Environ       []string        // the supervisor's environment, before the driver puts Owner's directory on PATH
-	Getenv        func(string) string
-	Progress      io.Writer
-	Timeouts      Timeouts
+	Deploy   ownerpkg.Deploy // the operator's deployment: its graph, its ledger_dsn_file and the keys the test copies
+	Owner    string          // the owner executable the test owners run
+	Legion   string          // the supervisor: `legion start --config FILE`
+	Environ  []string        // the supervisor's environment, before the driver puts Owner's directory on PATH
+	Getenv   func(string) string
+	Progress io.Writer
+	Timeouts Timeouts
 }
 
 // Timeouts bound each wait of the run. Poll is the interval at which the driver reads the ledger, git and tmux.
@@ -78,7 +77,8 @@ type driver struct {
 	daemonLog      string
 	socket         string
 	port           int
-	tokenDir       string // the private directory of the Envoy token file the run wrote, removed at teardown
+	tokenDir       string // the private directory of the bearer files the run wrote, removed at teardown
+	omp            string // the omp the owner panes run, which the supervisor gets as LEGION_OMP_PATH
 
 	store     *ledger.Store
 	publisher *ownerpkg.HTTPPublisher
@@ -86,6 +86,7 @@ type driver struct {
 	topics    ownerpkg.Topics     // the test graph's topics.json
 	subscribe map[string][]string // the topics each owner's subscribed record must list
 	expected  Expected
+	offers    map[string]string // need version → the offer its answer queues (expectAnswered)
 	failures  []Failure
 
 	daemon     *exec.Cmd
@@ -159,8 +160,8 @@ func (o Options) check() error {
 		return fmt.Errorf("the message test takes two different nodes, not %v", o.Nodes)
 	case o.Kills < 0:
 		return fmt.Errorf("kills %d is negative", o.Kills)
-	case !filepath.IsAbs(o.Out) || !filepath.IsAbs(o.Owner) || !filepath.IsAbs(o.Legion) || !filepath.IsAbs(o.LedgerDSNFile):
-		return fmt.Errorf("the output directory, the owner and legion executables and the ledger DSN file must be absolute paths")
+	case !filepath.IsAbs(o.Out) || !filepath.IsAbs(o.Owner) || !filepath.IsAbs(o.Legion) || !filepath.IsAbs(o.Deploy.LedgerDSNFile):
+		return fmt.Errorf("the output directory, the owner and legion executables and the deployment's ledger_dsn_file must be absolute paths")
 	case strings.ContainsAny(o.Out+o.Owner, " \t\n"):
 		return fmt.Errorf("the output directory and the owner executable must not hold whitespace: the owner brief names them in one command line")
 	case o.Getenv == nil || o.Progress == nil || o.Timeouts.Poll <= 0:
@@ -288,7 +289,7 @@ func (d *driver) setup(ctx context.Context) error {
 
 	deploy := d.opts.Deploy
 	deploy.BareRepo, deploy.GraphDir, deploy.StateDir = d.bare, graphDir, d.stateDir
-	deploy.SessionsDir, deploy.ScoreWork, deploy.LedgerDSNFile = filepath.Join(out, "sessions"), filepath.Join(out, "score"), d.opts.LedgerDSNFile
+	deploy.SessionsDir, deploy.ScoreWork = filepath.Join(out, "sessions"), filepath.Join(out, "score")
 	d.deployPath = filepath.Join(out, "deploy.yaml")
 	data, err := yaml.Marshal(deploy)
 	if err != nil {
@@ -301,7 +302,7 @@ func (d *driver) setup(ctx context.Context) error {
 		return fmt.Errorf("the test deployment: %w", err)
 	}
 
-	dsn, err := os.ReadFile(d.opts.LedgerDSNFile)
+	dsn, err := os.ReadFile(d.opts.Deploy.LedgerDSNFile)
 	if err != nil {
 		return fmt.Errorf("read the ledger DSN file: %w", err)
 	}
@@ -325,18 +326,26 @@ func (d *driver) setup(ctx context.Context) error {
 	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
 		return err
 	}
-	// The supervisor reads the bearer from a file. One the run writes is private, under the operator's state_dir,
-	// and never in the run's directory, which the report names.
+	// The supervisor reads its bearers from files. The ones the run writes are private, under the operator's
+	// state_dir, and never in the run's directory, which the report names; the teardown removes them.
 	if !filepath.IsAbs(d.opts.Deploy.StateDir) {
 		return fmt.Errorf("the deployment's state_dir %q is not an absolute path", d.opts.Deploy.StateDir)
 	}
 	private := filepath.Join(d.opts.Deploy.StateDir, "message-test", d.run)
-	tokenFile, written, err := daemonTokenFile(d.opts.Getenv, token, private)
+	if err := privateDir(private); err != nil {
+		return err
+	}
+	d.tokenDir = private
+	tokenFile, err := daemonTokenFile(d.opts.Getenv, token, private)
 	if err != nil {
 		return err
 	}
-	if written {
-		d.tokenDir = private
+	operatorToken, err := operatorTokenFile(private)
+	if err != nil {
+		return err
+	}
+	if d.omp, err = d.ompPath(); err != nil {
+		return err
 	}
 	prompt := filepath.Join(daemonDir, "owner.md")
 	brief, err := renderBrief(d.opts.Owner, d.deployPath)
@@ -360,24 +369,15 @@ func (d *driver) setup(ctx context.Context) error {
 	d.daemonConfig = filepath.Join(daemonDir, "legion.yaml")
 	d.daemonLog = filepath.Join(daemonDir, "legion.log")
 	d.socket = DaemonSocket(d.run)
-	supervisor := daemonConfig(d.run, d.daemonState, d.port, url, natsURLs, tokenFile, d.opts.LedgerDSNFile, d.run, prompt, kinds)
+	supervisor := daemonConfig(d.run, d.daemonState, d.port, url, natsURLs, tokenFile, operatorToken, d.opts.Deploy.LedgerDSNFile, d.run, prompt, kinds)
 	if data, err = yaml.Marshal(supervisor); err != nil {
 		return err
 	}
 	if err := os.WriteFile(d.daemonConfig, data, 0o644); err != nil {
 		return err
 	}
-	d.report.Daemon = Daemon{Executable: d.opts.Legion, Config: d.daemonConfig, Socket: d.socket, Log: d.daemonLog, Port: d.port}
-	// The supervisor starts the template's harness from its own PATH; "" when omp is not on it.
-	omp := ""
-	for _, entry := range d.daemonEnv() {
-		if path, ok := strings.CutPrefix(entry, "PATH="); ok {
-			if found, err := LookPath("omp", path); err == nil {
-				omp = found
-			}
-		}
-	}
-	d.report.Revisions = collectRevisions(ctx, d.opts.Legion, omp, d.opts.Deploy.GraphDir)
+	d.report.Daemon = Daemon{Executable: d.opts.Legion, Config: d.daemonConfig, Socket: d.socket, Log: d.daemonLog, Port: d.port, Omp: d.omp}
+	d.report.Revisions = collectRevisions(ctx, d.opts.Legion, d.omp, d.opts.Deploy.GraphDir)
 	d.logf("run %s: nodes %v, edge %s, daemon config %s", d.run, d.nodes, d.report.Edge, d.daemonConfig)
 	return nil
 }
@@ -402,20 +402,45 @@ func freePort() (int, error) {
 	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
-// daemonEnv is the supervisor's environment: the driver's, with the owner executable's directory first on PATH and
-// no launch variable of the driver's own, so that a pane's launch variables are the supervisor's.
+// daemonEnv is the supervisor's environment: the driver's, with daemonPath as PATH, LEGION_OMP_PATH naming the omp the
+// panes run, and no launch variable of the driver's own, so that a pane's launch variables are the supervisor's.
 func (d *driver) daemonEnv() []string {
 	env := slices.DeleteFunc(slices.Clone(d.opts.Environ), func(entry string) bool {
 		name, _, _ := strings.Cut(entry, "=")
-		return name == "PATH" || slices.Contains(LaunchVariables, name)
+		return name == "PATH" || name == "LEGION_OMP_PATH" || slices.Contains(LaunchVariables, name)
 	})
+	return append(env, "PATH="+d.daemonPath(), "LEGION_OMP_PATH="+d.omp)
+}
+
+// daemonPath is the supervisor's PATH: the owner executable's directory first, then the driver's PATH.
+func (d *driver) daemonPath() string {
 	path := filepath.Dir(d.opts.Owner)
 	for _, entry := range d.opts.Environ {
 		if value, ok := strings.CutPrefix(entry, "PATH="); ok && value != "" {
 			path += string(filepath.ListSeparator) + value
 		}
 	}
-	return append(env, "PATH="+path)
+	return path
+}
+
+// ompPath is the omp the owner panes run. The daemon never looks omp up on PATH, so the driver names it to the
+// supervisor as LEGION_OMP_PATH: the operator's LEGION_OMP_PATH, else the omp on the supervisor's PATH.
+func (d *driver) ompPath() (string, error) {
+	named := strings.TrimSpace(d.opts.Getenv("LEGION_OMP_PATH"))
+	if named == "" {
+		found, err := LookPath("omp", d.daemonPath())
+		if err != nil {
+			return "", fmt.Errorf("find the omp the owner panes run: set LEGION_OMP_PATH, or put omp on PATH: %w", err)
+		}
+		return found, nil
+	}
+	if !filepath.IsAbs(named) {
+		return "", fmt.Errorf("LEGION_OMP_PATH %q is not an absolute path", named)
+	}
+	if info, err := os.Stat(named); err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("LEGION_OMP_PATH %q is not an executable file (%v)", named, err)
+	}
+	return named, nil
 }
 
 // startDaemon runs `legion start --config FILE` with its output in daemon/legion.log, and waits until it listens on
@@ -516,7 +541,7 @@ func (d *driver) wake(ctx context.Context) error {
 	for _, node := range d.nodes {
 		p := panes[node]
 		d.report.Panes = append(d.report.Panes, PaneCheck{Owner: node, Pane: p.ID, PID: p.PID, StartSeconds: seen[node].Seconds(), Env: p.Env, Dir: p.Dir})
-		want := map[string]string{"LEGION_OWNER": node, "LEGION_LEDGER_REPOSITORY": d.run, "LEGION_LEDGER_DSN_FILE": d.opts.LedgerDSNFile}
+		want := map[string]string{"LEGION_OWNER": node, "LEGION_LEDGER_REPOSITORY": d.run, "LEGION_LEDGER_DSN_FILE": d.opts.Deploy.LedgerDSNFile}
 		for _, name := range LaunchVariables {
 			if got, ok := p.Env[name]; !ok || got != want[name] {
 				d.fail(FailLaunch, node, "the pane's %s is %q (set %t), want %q", name, got, ok, want[name])
@@ -650,15 +675,24 @@ func (d *driver) arrival(ctx context.Context) error {
 func (d *driver) need(version string) string {
 	return "need:" + ownerpkg.EdgeID(d.source, d.target) + "@" + version
 }
-func (d *driver) offer(version string) string {
-	return "offer:" + ownerpkg.EdgeID(d.source, d.target) + "@" + version
-}
 
-// expectAnswered records that the need of version must be answered once, with its follow-up offer once.
+// offer is the offer item that answering the need of version queues: the run expects it (expectAnswered) before it
+// waits for the answer.
+func (d *driver) offer(version string) string { return d.offers[version] }
+
+// expectAnswered records that the need of version must be answered once, with its follow-up offer once. The offer
+// is numbered by production's rule, by the revision of the record that answers the need: the target answers the
+// run's needs one at a time, each rewriting its answer record as the next revision, so the n-th need it answers
+// queues offer:<edge>@r<n>, whatever the need's own version.
 func (d *driver) expectAnswered(version string) {
+	if d.offers == nil {
+		d.offers = map[string]string{}
+	}
+	offer := fmt.Sprintf("offer:%s@r%d", ownerpkg.EdgeID(d.source, d.target), len(d.offers)+1)
+	d.offers[version] = offer
 	d.expected.Outcomes = append(d.expected.Outcomes,
-		Outcome{Item: d.need(version), Owner: d.target, FollowUp: d.offer(version), FollowUpOwner: d.source},
-		Outcome{Item: d.offer(version), Owner: d.source, Optional: true})
+		Outcome{Item: d.need(version), Owner: d.target, FollowUp: offer, FollowUpOwner: d.source},
+		Outcome{Item: offer, Owner: d.source, Optional: true})
 }
 
 // enqueueNeed enqueues the need of version for the target and publishes its notice on the target's needs topic.
@@ -727,10 +761,8 @@ func (d *driver) answered(ctx context.Context, version string) (bool, error) {
 // deliver one message twice: the owner must record both deliveries and answer the need once.
 func (d *driver) duplicates(ctx context.Context) error {
 	item := d.need("r1")
-	for range 2 {
-		if err := d.store.Enqueue(ctx, d.run, item, d.target); err != nil {
-			return err
-		}
+	if err := enqueueTwice(ctx, d.store, d.run, item, d.target); err != nil {
+		return err
 	}
 	var copies []Publication
 	for range 2 {
@@ -748,6 +780,35 @@ func (d *driver) duplicates(ctx context.Context) error {
 		}
 		return d.recorded(ctx, copies...)
 	})
+}
+
+// queue is the part of the ledger that a repeated enqueue uses.
+type queue interface {
+	Enqueue(ctx context.Context, repo, id, owner string) error
+	Item(ctx context.Context, repo, id string) (ledger.Item, error)
+}
+
+// enqueueTwice enqueues item for owner twice, as a duplicated work item reaches the ledger. The first enqueue makes
+// the item, and the owner can answer it before the second: the ledger then refuses the repeat as an existing item,
+// which is as much a duplicate as the idempotent repeat of an open item, so it is no failure. The run's check still
+// requires one record and one completion. Any other outcome of either enqueue is an error.
+func enqueueTwice(ctx context.Context, q queue, repo, item, owner string) error {
+	if err := q.Enqueue(ctx, repo, item, owner); err != nil {
+		return err
+	}
+	err := q.Enqueue(ctx, repo, item, owner)
+	var refusal *ledger.Refusal
+	if err == nil || !errors.As(err, &refusal) || refusal.Reason != ledger.ReasonExists {
+		return err
+	}
+	current, itemErr := q.Item(ctx, repo, item)
+	if itemErr != nil {
+		return errors.Join(err, itemErr)
+	}
+	if current.Owner == owner && current.State == "done" {
+		return nil
+	}
+	return err
 }
 
 // outOfOrder enqueues r3 and then r2 with their notices: r3 must be answered, r2 completed as superseded:r3 with no
@@ -965,7 +1026,7 @@ func (d *driver) collect(ctx context.Context) (Recorded, error) {
 	return recorded, nil
 }
 
-// teardown stops the daemon and every pane on its socket, and removes the Envoy token file the run wrote.
+// teardown stops the daemon and every pane on its socket, and removes the bearer files the run wrote.
 func (d *driver) teardown(ctx context.Context) error {
 	var errs []error
 	if err := d.stopDaemon(); err != nil {

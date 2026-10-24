@@ -128,11 +128,12 @@ func TestGraphWriteKeepsTheTwoNodesUnderThePrefix(t *testing.T) {
 	}
 }
 
-// The supervisor's configuration is the minimal standing-owners file of C33: no software-workflow keys, the
-// daemon's database from LEGION_POSTGRES_DSN, two running owners, and one omp template per node kind.
+// The supervisor's configuration is the minimal standing-owners file of C33, with the operator bearer the daemon
+// requires at boot: no software-workflow keys, the daemon's database from LEGION_POSTGRES_DSN, two running owners,
+// and one omp template per node kind.
 func TestDaemonConfigIsTheMinimalStandingOwnersFile(t *testing.T) {
 	config := daemonConfig("message-test-x", "/run/daemon/state", 14000, "http://127.0.0.1:9020", []string{"nats://hub:4222"},
-		"/run/daemon/envoy-token", "/srv/ledger-dsn", "message-test-x", "/run/daemon/owner.md", []string{"function", "struct"})
+		"/run/daemon/envoy-token", "/srv/state/message-test/x/operator-token", "/srv/ledger-dsn", "message-test-x", "/run/daemon/owner.md", []string{"function", "struct"})
 	data, err := yaml.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
@@ -142,14 +143,14 @@ func TestDaemonConfigIsTheMinimalStandingOwnersFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	keys := func(m map[string]any) []string { return slices.Sorted(maps.Keys(m)) }
-	if got := keys(decoded); !slices.Equal(got, []string{"envoy_token_file", "envoy_url", "nats_urls", "port", "project", "runtime", "standing_owners", "state_dir"}) {
+	if got := keys(decoded); !slices.Equal(got, []string{"envoy_token_file", "envoy_url", "nats_urls", "operator_token_file", "port", "project", "runtime", "standing_owners", "state_dir"}) {
 		t.Fatalf("top-level keys = %v", got)
 	}
 	owners := decoded["standing_owners"].(map[string]any)
 	if got := keys(owners); !slices.Equal(got, []string{"budget_usd", "ledger_dsn_file", "max_running", "repository", "templates"}) {
 		t.Fatalf("standing_owners keys = %v", got)
 	}
-	if owners["max_running"] != 2 || owners["repository"] != "message-test-x" || decoded["runtime"] != "tmux" {
+	if owners["max_running"] != 2 || owners["repository"] != "message-test-x" || decoded["runtime"] != "tmux" || decoded["operator_token_file"] != "/srv/state/message-test/x/operator-token" {
 		t.Fatalf("config = %v", decoded)
 	}
 	templates := owners["templates"].(map[string]any)
@@ -167,6 +168,29 @@ func TestDaemonConfigIsTheMinimalStandingOwnersFile(t *testing.T) {
 func TestDaemonSocketIsTheProjectsTmuxServer(t *testing.T) {
 	if got := DaemonSocket("message-test-20261023t180000z"); got != "legion-messagetest20261023t180000z" {
 		t.Fatalf("DaemonSocket = %q", got)
+	}
+}
+
+// The driver expects the offer that the target's answer queues by production's rule: the n-th need the target answers
+// rewrites its answer record as revision n, which queues offer:<edge>@r<n>, whatever the need's own version.
+func TestDriverExpectsOffersNumberedByTheAnswerRevision(t *testing.T) {
+	d := &driver{source: "function:a@x/y.c", target: "struct:t"}
+	for _, version := range []string{"r1", "r3", "r4"} {
+		d.expectAnswered(version)
+	}
+	edge := ownerpkg.EdgeID(d.source, d.target)
+	var followUps, offers []string
+	for _, outcome := range d.expected.Outcomes {
+		if outcome.FollowUp != "" {
+			followUps = append(followUps, outcome.FollowUp)
+		}
+		if outcome.Owner == d.source {
+			offers = append(offers, outcome.Item)
+		}
+	}
+	want := []string{"offer:" + edge + "@r1", "offer:" + edge + "@r2", "offer:" + edge + "@r3"}
+	if !slices.Equal(followUps, want) || !slices.Equal(offers, want) {
+		t.Fatalf("follow-ups %v and offer outcomes %v, want %v", followUps, offers, want)
 	}
 }
 
@@ -252,30 +276,97 @@ func TestCollectRevisionsRecordsEachExecutableAndGraphInput(t *testing.T) {
 	}
 }
 
-// The supervisor reads the Envoy bearer from a file. A token that came from the environment or the Envoy
-// configuration is written to a private file outside the run's output directory, never copied into it.
-func TestDaemonTokenFileNeverLandsInTheOutputDirectory(t *testing.T) {
+// The supervisor reads the Envoy bearer and its operator bearer from files. A token that came from the environment or
+// the Envoy configuration, and the operator bearer the run makes, are written to private files outside the run's
+// output directory, never copied into it.
+func TestDaemonTokenFilesNeverLandInTheOutputDirectory(t *testing.T) {
 	private := filepath.Join(t.TempDir(), "state", "message-test", "run")
 	env := func(values map[string]string) func(string) string {
 		return func(name string) string { return values[name] }
 	}
-
-	path, written, err := daemonTokenFile(env(nil), "secret-token", private)
-	if err != nil || !written || filepath.Dir(path) != private {
-		t.Fatalf("daemonTokenFile = %q, %t, %v; want a new file in %s", path, written, err, private)
-	}
-	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("token file %s: %v, %v", path, info, err)
+	if err := privateDir(private); err != nil {
+		t.Fatal(err)
 	}
 	if dirInfo, err := os.Stat(private); err != nil || dirInfo.Mode().Perm() != 0o700 {
 		t.Fatalf("token directory %s: %v, %v", private, dirInfo, err)
 	}
 
-	if path, written, err := daemonTokenFile(env(map[string]string{"ENVOY_TOKEN_FILE": "/run/secrets/envoy"}), "secret-token", private); err != nil || written || path != "/run/secrets/envoy" {
-		t.Fatalf("with ENVOY_TOKEN_FILE: %q, %t, %v", path, written, err)
+	path, err := daemonTokenFile(env(nil), "secret-token", private)
+	if err != nil || filepath.Dir(path) != private {
+		t.Fatalf("daemonTokenFile = %q, %v; want a new file in %s", path, err, private)
 	}
-	if path, written, err := daemonTokenFile(env(nil), "", private); err != nil || written || path != "" {
-		t.Fatalf("with no token: %q, %t, %v", path, written, err)
+	operator, err := operatorTokenFile(private)
+	if err != nil || filepath.Dir(operator) != private || operator == path {
+		t.Fatalf("operatorTokenFile = %q, %v; want its own file in %s", operator, err, private)
+	}
+	for _, file := range []string{path, operator} {
+		info, err := os.Stat(file)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("token file %s: %v, %v", file, info, err)
+		}
+	}
+	if data, err := os.ReadFile(operator); err != nil || len(strings.TrimSpace(string(data))) != 64 {
+		t.Fatalf("operator bearer %q, %v; want 32 random bytes in hex", data, err)
+	}
+
+	if path, err := daemonTokenFile(env(map[string]string{"ENVOY_TOKEN_FILE": "/run/secrets/envoy"}), "secret-token", private); err != nil || path != "/run/secrets/envoy" {
+		t.Fatalf("with ENVOY_TOKEN_FILE: %q, %v", path, err)
+	}
+	if path, err := daemonTokenFile(env(nil), "", private); err != nil || path != "" {
+		t.Fatalf("with no token: %q, %v", path, err)
+	}
+}
+
+// The daemon never looks omp up on PATH, so the driver names the omp the panes run as the supervisor's
+// LEGION_OMP_PATH: the operator's LEGION_OMP_PATH, else the omp on the supervisor's PATH, and never a relative path or
+// a file that cannot run.
+func TestOmpPathIsNamedToTheSupervisor(t *testing.T) {
+	executable := func(dir, name string, mode os.FileMode) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	bin, builds := t.TempDir(), t.TempDir()
+	onPath := executable(bin, "omp", 0o755)
+	named := executable(builds, "omp-build", 0o755)
+	plain := executable(builds, "omp-text", 0o644)
+	driverWith := func(path string, env map[string]string) *driver {
+		return &driver{opts: Options{Owner: filepath.Join(t.TempDir(), "owner"), Environ: []string{"PATH=" + path, "LEGION_OMP_PATH=/stale/omp"},
+			Getenv: func(name string) string { return env[name] }}}
+	}
+
+	d := driverWith(bin, nil)
+	if got, err := d.ompPath(); err != nil || got != onPath {
+		t.Fatalf("ompPath with omp on PATH = %q, %v; want %s", got, err, onPath)
+	}
+	d = driverWith(bin, map[string]string{"LEGION_OMP_PATH": named})
+	got, err := d.ompPath()
+	if err != nil || got != named {
+		t.Fatalf("ompPath with LEGION_OMP_PATH = %q, %v; want %s", got, err, named)
+	}
+	d.omp = got
+	var given []string
+	for _, entry := range d.daemonEnv() {
+		if value, ok := strings.CutPrefix(entry, "LEGION_OMP_PATH="); ok {
+			given = append(given, value)
+		}
+	}
+	if !slices.Equal(given, []string{named}) {
+		t.Fatalf("the supervisor's LEGION_OMP_PATH = %v, want only %s", given, named)
+	}
+	for name, env := range map[string]map[string]string{
+		"a relative LEGION_OMP_PATH": {"LEGION_OMP_PATH": "omp"},
+		"a file that cannot run":     {"LEGION_OMP_PATH": plain},
+		"no omp anywhere":            nil,
+	} {
+		path := bin
+		if env == nil {
+			path = builds
+		}
+		if got, err := driverWith(path, env).ompPath(); err == nil {
+			t.Errorf("ompPath with %s = %q, want a refusal", name, got)
+		}
 	}
 }

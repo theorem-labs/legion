@@ -26,17 +26,21 @@ import (
 )
 
 // Config is the daemon's minimal standing-owners configuration (shared contract 10, C33, with the standing_owners
-// keys of C7): what the harness supervisor reads from `legion start --config FILE`.
+// keys of C7 and the operator bearer the daemon requires at boot): what the harness supervisor reads from `legion
+// start --config FILE`. OMP is the omp it runs in every pane, from LEGION_OMP_PATH, as the daemon resolves it.
 type Config struct {
-	Project        string         `yaml:"project"`
-	StateDir       string         `yaml:"state_dir"`
-	PostgresDSN    string         `yaml:"postgres_dsn"`
-	Runtime        string         `yaml:"runtime"`
-	Port           int            `yaml:"port"`
-	EnvoyURL       string         `yaml:"envoy_url"`
-	NATSURLs       []string       `yaml:"nats_urls"`
-	EnvoyTokenFile string         `yaml:"envoy_token_file"`
-	StandingOwners StandingOwners `yaml:"standing_owners"`
+	Project           string         `yaml:"project"`
+	StateDir          string         `yaml:"state_dir"`
+	PostgresDSN       string         `yaml:"postgres_dsn"`
+	Runtime           string         `yaml:"runtime"`
+	Port              int            `yaml:"port"`
+	OperatorTokenFile string         `yaml:"operator_token_file"`
+	OmpInvocation     string         `yaml:"omp_invocation"`
+	EnvoyURL          string         `yaml:"envoy_url"`
+	NATSURLs          []string       `yaml:"nats_urls"`
+	EnvoyTokenFile    string         `yaml:"envoy_token_file"`
+	StandingOwners    StandingOwners `yaml:"standing_owners"`
+	OMP               string         `yaml:"-"`
 }
 
 // StandingOwners is the standing_owners block: the ledger, the repository and limits, the named owners, the
@@ -73,8 +77,9 @@ var (
 )
 
 // LoadConfig reads and checks the configuration as the daemon would: no key outside the minimal file, the daemon's
-// database in the file or LEGION_POSTGRES_DSN, a ledger DSN file only its owner can read, and owners or templates
-// whose prompts exist and whose harness is omp. Relative paths are relative to the file.
+// database in the file or LEGION_POSTGRES_DSN, an operator bearer file that holds a token, the omp that
+// LEGION_OMP_PATH names (the daemon never looks omp up on PATH), a ledger DSN file only its owner can read, and owners
+// or templates whose prompts exist and whose harness is omp. Relative paths are relative to the file.
 func LoadConfig(path string, getenv func(string) string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -94,6 +99,7 @@ func LoadConfig(path string, getenv func(string) string) (Config, error) {
 	}
 	resolve(&config.StateDir)
 	resolve(&config.EnvoyTokenFile)
+	resolve(&config.OperatorTokenFile)
 	owners := &config.StandingOwners
 	resolve(&owners.LedgerDSNFile)
 	var all []Template
@@ -127,6 +133,18 @@ func LoadConfig(path string, getenv func(string) string) (Config, error) {
 	case len(owners.Owners) == 0 && len(owners.Templates) == 0:
 		return Config{}, errors.New("standing_owners needs owners or templates")
 	}
+	// The daemon's own boot refusals: its internal/daemon/bootreads.go and internal/omplaunch/omplaunch.go.
+	if config.OperatorTokenFile == "" {
+		return Config{}, errors.New("operator_token_file is required: the operator routes that spawn and drive claims authenticate against the bearer it names")
+	}
+	if token, err := os.ReadFile(config.OperatorTokenFile); err != nil {
+		return Config{}, fmt.Errorf("operator_token_file names %s, which could not be read: %w", config.OperatorTokenFile, err)
+	} else if strings.TrimSpace(string(token)) == "" {
+		return Config{}, fmt.Errorf("operator_token_file names %s, which is empty", config.OperatorTokenFile)
+	}
+	if config.OMP, err = ompPath(config.OmpInvocation, getenv); err != nil {
+		return Config{}, err
+	}
 	info, err := os.Stat(owners.LedgerDSNFile)
 	if err != nil {
 		return Config{}, fmt.Errorf("standing_owners.ledger_dsn_file: %w", err)
@@ -156,6 +174,27 @@ func LoadConfig(path string, getenv func(string) string) (Config, error) {
 		}
 	}
 	return config, nil
+}
+
+// ompPath is the omp every pane runs: LEGION_OMP_PATH, an absolute path to an executable, as the daemon takes it. The
+// daemon's other form, omp_invocation `mise x <tool> -- omp`, needs mise, which this stand-in does not run. As the
+// daemon does, it refuses a configuration that names neither, and never looks omp up on PATH. It runs the path as
+// named, not as its real path: the test-only stand-ins are links that act by the name they are run as.
+func ompPath(invocation string, getenv func(string) string) (string, error) {
+	configured := strings.TrimSpace(getenv("LEGION_OMP_PATH"))
+	switch {
+	case configured == "" && invocation == "":
+		return "", errors.New("omp_invocation is not set: set it to 'mise x <tool> -- omp', or set LEGION_OMP_PATH to an absolute executable path")
+	case configured == "":
+		return "", fmt.Errorf("omp_invocation %q: the test-only stand-in runs omp only from LEGION_OMP_PATH", invocation)
+	case !filepath.IsAbs(configured):
+		return "", errors.New("LEGION_OMP_PATH must be an absolute executable path")
+	}
+	info, err := os.Stat(configured)
+	if err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("LEGION_OMP_PATH is not an executable: %s", configured)
+	}
+	return configured, nil
 }
 
 // projectToken is the daemon's spelling of the project: lowercase letters and digits.
@@ -456,7 +495,7 @@ func shellQuote(words ...string) string {
 }
 
 // launch starts owner in a new tmux window: its working directory is <state_dir>/owners/<claim token>, its
-// environment holds the launch variables, and it runs the harness with the template's prompt.
+// environment holds the launch variables, and it runs the configured omp with the template's prompt.
 func (s *supervisor) launch(ctx context.Context, owner string, template Template) error {
 	token := "legion-" + s.token + "-owner-" + messagetest.EncodeOwnerName(owner)
 	workdir := filepath.Join(s.config.StateDir, "owners", token)
@@ -470,10 +509,6 @@ func (s *supervisor) launch(ctx context.Context, owner string, template Template
 	_ = os.Remove(startFile)
 	start := fmt.Sprintf("You are the owner %s of ledger repository %s. Work through your queue as your instructions say.\n", owner, s.config.StandingOwners.Repository)
 	if err := os.WriteFile(startFile, []byte(start), 0o400); err != nil {
-		return err
-	}
-	harness, err := exec.LookPath(template.Harness)
-	if err != nil {
 		return err
 	}
 	env := []string{
@@ -494,7 +529,7 @@ func (s *supervisor) launch(ctx context.Context, owner string, template Template
 	for _, pair := range env {
 		args = append(args, "-e", pair)
 	}
-	args = append(args, "-P", "-F", "#{pane_id}", shellQuote("exec", harness, "--system-prompt-file", template.PromptFile))
+	args = append(args, "-P", "-F", "#{pane_id}", shellQuote("exec", s.config.OMP, "--system-prompt-file", template.PromptFile))
 	out, err := s.tmux(ctx, args...)
 	if err != nil {
 		return err

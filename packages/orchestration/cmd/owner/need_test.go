@@ -81,7 +81,7 @@ func (f *commandFixture) needWritten(target string) bool {
 }
 
 // A listener configuration that cannot be read is exit 3, unable to check, before the command writes anything: no
-// record, no item and no journal line that would pass for a delivery failure.
+// worktree or branch, no record, no item and no journal line that would pass for a delivery failure.
 func TestNeedStopsBeforeWritingWhenTheListenerConfigurationCannotBeRead(t *testing.T) {
 	f := newCommandFixture(t)
 	delete(f.env, "ENVOY_URL")
@@ -99,6 +99,32 @@ func TestNeedStopsBeforeWritingWhenTheListenerConfigurationCannotBeRead(t *testi
 	}
 	if _, err := os.Stat(filepath.Join(f.stateDir(), "undelivered.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("a notice was journaled: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(run.dir(), "wt")); !os.IsNotExist(err) {
+		t.Fatalf("the worktree was created: %v", err)
+	}
+	if err := exec.Command("git", "--git-dir="+f.bare, "rev-parse", "--verify", "--quiet", "refs/heads/owner/"+ownerpkg.Key(caller)).Run(); err == nil {
+		t.Fatal("the owner's branch was created")
+	}
+}
+
+// A step killed in the middle of its commit leaves git's index lock behind, with no process that holds it. The step's
+// next run commits its record: a killed step does not wedge its owner.
+func TestNeedRunsAgainAfterAStepKilledInItsCommit(t *testing.T) {
+	f := newCommandFixture(t)
+	f.as(caller).ok("worktree")
+	wt := filepath.Join(f.as(caller).dir(), "wt")
+	lock := f.git(wt, "rev-parse", "--git-path", "index.lock")
+	if !filepath.IsAbs(lock) {
+		lock = filepath.Join(wt, lock)
+	}
+	f.writeFile(lock, "")
+	f.as(caller).ok("need", state, f.write("need.md", needDraft))
+	if !f.needWritten(state) {
+		t.Fatal("the need record was not committed")
+	}
+	if item := f.item("need:" + ownerpkg.EdgeID(caller, state) + "@r1"); item.State != "open" || item.Owner != state {
+		t.Fatalf("need item = %+v", item)
 	}
 }
 

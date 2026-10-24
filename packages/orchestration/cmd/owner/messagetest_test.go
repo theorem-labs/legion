@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -130,7 +131,7 @@ func TestMessageTestAnswerRecordsCompletesAndQueuesTheOfferOnce(t *testing.T) {
 	if err := yaml.Unmarshal(f.show(state, path), &record); err != nil {
 		t.Fatal(err)
 	}
-	if record != (messagetest.Answer{Item: need, Type: "need", Subject: edge, Version: "r1", Text: messagetest.AnswerText}) {
+	if record != (messagetest.Answer{Item: need, Type: "need", Subject: edge, Version: "r1", Revision: 1, Text: messagetest.AnswerText}) {
 		t.Fatalf("answer record = %+v", record)
 	}
 	if posts := f.notices(); len(posts) != 0 {
@@ -146,6 +147,40 @@ func TestMessageTestAnswerRecordsCompletesAndQueuesTheOfferOnce(t *testing.T) {
 	f.as(state).ok("message-test", "answer", start)
 	if item := f.item(start); item.State != "done" || item.Result != f.lastCommit(state, messagetest.AnswerRecord("skeleton", state, "start", state)) {
 		t.Fatalf("start = %+v, want done with its record", item)
+	}
+}
+
+// An answer to a need queues the offer that production's offer queues: offer:<edge>@r<n>, where n is the revision of
+// the record that answers the need, whatever the need's own version. A newer version of the need rewrites the record
+// as the next revision; a second run of one answer repeats its revision.
+func TestMessageTestAnswerNumbersTheOfferByItsRecordRevision(t *testing.T) {
+	f := newCommandFixture(t)
+	edge := ownerpkg.EdgeID(caller, state)
+	path := messagetest.AnswerRecord("skeleton", state, "need", edge)
+	for index, version := range []string{"r3", "r5"} {
+		need := "need:" + edge + "@" + version
+		f.enqueue(need, state)
+		f.as(state).ok("message-test", "answer", need)
+		f.as(state).ok("message-test", "answer", need)
+		offer := fmt.Sprintf("offer:%s@r%d", edge, index+1)
+		if item := f.item(offer); item.State != "open" || item.Owner != caller {
+			t.Fatalf("the answer of %s: %s = %+v, want open for %s", need, offer, item, caller)
+		}
+		var record map[string]any
+		if err := yaml.Unmarshal(f.show(state, path), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record["revision"] != index+1 || record["version"] != version {
+			t.Fatalf("the answer record of %s = %v, want revision %d", need, record, index+1)
+		}
+	}
+	for _, version := range []string{"r3", "r5"} {
+		if _, err := f.store.Item(f.ctx, "r", "offer:"+edge+"@"+version); !isNotFound(err) {
+			t.Fatalf("an offer is numbered by the need version %s: %v", version, err)
+		}
+	}
+	if n := f.commitCount(state, path); n != 2 {
+		t.Fatalf("answer commits = %d, want one for each version", n)
 	}
 }
 

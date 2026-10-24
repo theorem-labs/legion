@@ -113,9 +113,11 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 	defer cancel()
 	command := exec.CommandContext(ctx, filepath.Join(bin, "owner"), "--deploy", deploy, "message-test",
 		"--prefix", "notifications.lxspec-message-test.", "--kills", "3", "--out", out)
+	// The driver reads its ledger from the deployment's ledger_dsn_file alone: a launch variable in the operator's
+	// shell names no ledger of the run.
 	command.Env = append(os.Environ(), "PATH="+bin+string(filepath.ListSeparator)+os.Getenv("PATH"), "HOME="+root,
 		"ENVOY_URL="+listener.URL, "ENVOY_TOKEN=message-test-token", "LEGION_POSTGRES_DSN=postgres://legion@127.0.0.1/legion",
-		"OWNER_HARNESS_STEP_DELAY=300ms")
+		"OWNER_HARNESS_STEP_DELAY=300ms", "LEGION_LEDGER_DSN_FILE="+filepath.Join(root, "not-the-deployment-ledger"))
 	output, err := command.CombinedOutput()
 	reportText, _ := os.ReadFile(filepath.Join(out, "report.md"))
 	if err != nil {
@@ -181,15 +183,29 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The supervisor reads the Envoy bearer and its operator bearer from private files outside the run's directory,
+	// which the teardown removed. It runs the omp that the driver names, and the report names that omp.
 	var supervisor struct {
-		EnvoyTokenFile string `yaml:"envoy_token_file"`
+		EnvoyTokenFile    string `yaml:"envoy_token_file"`
+		OperatorTokenFile string `yaml:"operator_token_file"`
 	}
 	data, err = os.ReadFile(filepath.Join(out, "daemon", "legion.yaml"))
-	if err != nil || yaml.Unmarshal(data, &supervisor) != nil || supervisor.EnvoyTokenFile == "" || strings.HasPrefix(supervisor.EnvoyTokenFile, out+string(filepath.Separator)) {
-		t.Fatalf("legion.yaml names the token file %q (%v); want one outside %s", supervisor.EnvoyTokenFile, err, out)
+	if err != nil || yaml.Unmarshal(data, &supervisor) != nil {
+		t.Fatalf("legion.yaml: %v\n%s", err, data)
 	}
-	if _, err := os.Stat(supervisor.EnvoyTokenFile); !os.IsNotExist(err) {
-		t.Fatalf("the token file %s is left after the run: %v", supervisor.EnvoyTokenFile, err)
+	for key, file := range map[string]string{"envoy_token_file": supervisor.EnvoyTokenFile, "operator_token_file": supervisor.OperatorTokenFile} {
+		if file == "" || strings.HasPrefix(file, out+string(filepath.Separator)) {
+			t.Fatalf("legion.yaml %s = %q; want a file outside %s", key, file, out)
+		}
+		if _, err := os.Stat(file); !os.IsNotExist(err) {
+			t.Fatalf("the %s %s is left after the run: %v", key, file, err)
+		}
+	}
+	var raw struct {
+		Daemon map[string]any `json:"daemon"`
+	}
+	if data, err := os.ReadFile(filepath.Join(out, "report.json")); err != nil || json.Unmarshal(data, &raw) != nil || raw.Daemon["omp"] != filepath.Join(bin, "omp") {
+		t.Fatalf("the report's daemon = %v (%v); want omp %s", raw.Daemon, err, filepath.Join(bin, "omp"))
 	}
 
 	// The report names what ran, and the stand-ins say they are stand-ins.

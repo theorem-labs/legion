@@ -28,8 +28,8 @@ type party struct {
 	runner  ownerpkg.Runner
 }
 
-// party reads everything a step needs before the step writes anything: a listener configuration that cannot be
-// read stops the command here, unable to check (exit 3).
+// party reads everything a step needs before the step writes anything: a launch variable or a listener configuration
+// that cannot be read stops the command here, before it creates the worktree or its branch (exit 2 or 3).
 func (s *session) party() (party, error) {
 	if err := s.load(); err != nil {
 		return party{}, err
@@ -50,14 +50,15 @@ func (s *session) party() (party, error) {
 	if err != nil {
 		return party{}, err
 	}
+	runner, err := ownerpkg.RunnerFromEnv(s.getenv, store, s.deploy.StateDir)
+	if err != nil {
+		return party{}, err
+	}
 	tree, err := s.worktree()
 	if err != nil {
 		return party{}, err
 	}
-	runner, err := ownerpkg.RunnerFromEnv(s.getenv, store, tree, s.deploy.StateDir)
-	if err != nil {
-		return party{}, err
-	}
+	runner.Tree = tree
 	return party{identity: id, epoch: m.epochFor(id.ID), routing: routing, tree: tree, runner: runner}, nil
 }
 

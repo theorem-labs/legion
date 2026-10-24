@@ -2,6 +2,8 @@ package messagetest
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -105,27 +107,36 @@ func versionOutput(ctx context.Context, command, arg string) string {
 	return text
 }
 
+// privateDir makes dir, which only its owner can open, for the bearer files the run writes.
+func privateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
+}
+
 // daemonTokenFile is the file the supervisor reads the Envoy bearer from: ENVOY_TOKEN_FILE when the operator named
-// one, else a file the run writes in the private directory dir (mode 0700, the file 0600), or none when there is no
-// token. written reports whether the run wrote it; the teardown removes dir then.
-func daemonTokenFile(getenv func(string) string, token, dir string) (path string, written bool, err error) {
+// one, else a file (mode 0600) the run writes in its private directory dir, or none when there is no token.
+func daemonTokenFile(getenv func(string) string, token, dir string) (string, error) {
 	if named := strings.TrimSpace(getenv("ENVOY_TOKEN_FILE")); named != "" {
-		return named, false, nil
+		return named, nil
 	}
 	if token == "" {
-		return "", false, nil
+		return "", nil
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", false, err
+	path := filepath.Join(dir, "envoy-token")
+	return path, os.WriteFile(path, []byte(token+"\n"), 0o600)
+}
+
+// operatorTokenFile writes a new bearer for the supervisor's operator routes (mode 0600) in the run's private
+// directory dir. The daemon refuses to start without operator_token_file; the run never calls those routes.
+func operatorTokenFile(dir string) (string, error) {
+	var secret [32]byte
+	if _, err := rand.Read(secret[:]); err != nil {
+		return "", err
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return "", false, err
-	}
-	path = filepath.Join(dir, "envoy-token")
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-		return "", false, err
-	}
-	return path, true, nil
+	path := filepath.Join(dir, "operator-token")
+	return path, os.WriteFile(path, []byte(hex.EncodeToString(secret[:])+"\n"), 0o600)
 }
 
 // LookPath finds an executable name on the given PATH, which may differ from the process's own.

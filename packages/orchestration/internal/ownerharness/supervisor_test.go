@@ -50,13 +50,18 @@ func newSupervisorFixture(t *testing.T) *supervisorFixture {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// The omp stand-in records the prompt file it was given and stays alive, as an idle session does.
-	if err := os.WriteFile(filepath.Join(bin, "omp"), []byte("#!/bin/sh\necho \"$@\" > argv\nexec sleep 600\n"), 0o755); err != nil {
+	// The omp stand-in records the prompt file it was given and stays alive, as an idle session does. It is not on
+	// PATH: the supervisor runs the omp that LEGION_OMP_PATH names, as the daemon does.
+	omp := filepath.Join(bin, "omp")
+	if err := os.WriteFile(omp, []byte("#!/bin/sh\necho \"$@\" > argv\nexec sleep 600\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", bin+string(filepath.ListSeparator)+os.Getenv("PATH"))
 	dsnFile := filepath.Join(dir, "ledger-dsn")
 	if err := os.WriteFile(dsnFile, []byte(dsn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	operatorToken := filepath.Join(dir, "operator-token")
+	if err := os.WriteFile(operatorToken, []byte("operator\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	prompt := filepath.Join(dir, "owner.md")
@@ -65,6 +70,7 @@ func newSupervisorFixture(t *testing.T) *supervisorFixture {
 	}
 	project := "harness-" + strings.ToLower(time.Now().Format("150405.000000"))
 	config := "project: " + project + "\nstate_dir: " + filepath.Join(dir, "state") + "\nruntime: tmux\npostgres_dsn: postgres://unused\n" +
+		"operator_token_file: " + operatorToken + "\n" +
 		"port: " + "0" + "\nenvoy_url: http://127.0.0.1:9\nstanding_owners:\n  ledger_dsn_file: " + dsnFile + "\n  repository: r\n" +
 		"  max_running: 2\n  budget_usd: 100\n  reconcile_seconds: 1\n  never_start: [escalations]\n" +
 		"  owners:\n    - {name: librarian, prompt_file: " + prompt + ", harness: omp, max_cost_usd: 1}\n" +
@@ -73,7 +79,7 @@ func newSupervisorFixture(t *testing.T) *supervisorFixture {
 	if err := os.WriteFile(path, []byte(config), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := LoadConfig(path, func(string) string { return "" })
+	loaded, err := LoadConfig(path, func(name string) string { return map[string]string{"LEGION_OMP_PATH": omp}[name] })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,42 +253,70 @@ func TestLoadConfigRefusesWhatTheMinimalFileDoesNotAllow(t *testing.T) {
 	if err := os.WriteFile(dsnFile, []byte("postgres://x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	operatorToken := filepath.Join(dir, "operator-token")
+	if err := os.WriteFile(operatorToken, []byte("operator\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	emptyToken := filepath.Join(dir, "empty-token")
+	if err := os.WriteFile(emptyToken, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	prompt := filepath.Join(dir, "owner.md")
 	if err := os.WriteFile(prompt, []byte("prompt"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	base := "project: p\nstate_dir: " + dir + "/state\nstanding_owners:\n  ledger_dsn_file: " + dsnFile + "\n  repository: r\n  max_running: 2\n  budget_usd: 10\n" +
+	omp := filepath.Join(dir, "omp")
+	if err := os.WriteFile(omp, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := "project: p\nstate_dir: " + dir + "/state\noperator_token_file: " + operatorToken + "\nstanding_owners:\n  ledger_dsn_file: " + dsnFile +
+		"\n  repository: r\n  max_running: 2\n  budget_usd: 10\n" +
 		"  templates:\n    function: {prompt_file: " + prompt + ", harness: omp, max_cost_usd: 1}\n"
 	path := filepath.Join(dir, "legion.yaml")
-	load := func(text string, env map[string]string) error {
+	load := func(text string, env map[string]string) (Config, error) {
 		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, err := LoadConfig(path, func(name string) string { return env[name] })
-		return err
+		return LoadConfig(path, func(name string) string { return env[name] })
 	}
-	if err := load(base, map[string]string{"LEGION_POSTGRES_DSN": "postgres://legion"}); err != nil {
-		t.Fatalf("the minimal file with LEGION_POSTGRES_DSN: %v", err)
+	good := map[string]string{"LEGION_POSTGRES_DSN": "postgres://legion", "LEGION_OMP_PATH": omp}
+	config, err := load(base, good)
+	if err != nil {
+		t.Fatalf("the minimal file with LEGION_POSTGRES_DSN and LEGION_OMP_PATH: %v", err)
+	}
+	if config.OMP != omp || config.OperatorTokenFile != operatorToken {
+		t.Fatalf("config runs omp %q with operator token %q", config.OMP, config.OperatorTokenFile)
 	}
 	for name, text := range map[string]string{
-		"no daemon database":        base,
-		"an unknown key":            base + "dispatch_url: http://dispatch\n",
-		"an unknown kind":           strings.Replace(base, "function:", "file:", 1),
-		"a harness that is not omp": strings.Replace(base, "harness: omp", "harness: claude", 1),
-		"no owners or templates":    strings.Split(base, "  templates:")[0],
+		"no daemon database":           base,
+		"no omp":                       base,
+		"a relative LEGION_OMP_PATH":   base,
+		"an omp_invocation only":       base + "omp_invocation: mise x omp -- omp\n",
+		"no operator token file":       strings.Replace(base, "operator_token_file: "+operatorToken+"\n", "", 1),
+		"an empty operator token file": strings.Replace(base, operatorToken, emptyToken, 1),
+		"a missing operator token":     strings.Replace(base, operatorToken, filepath.Join(dir, "no-token"), 1),
+		"an unknown key":               base + "dispatch_url: http://dispatch\n",
+		"an unknown kind":              strings.Replace(base, "function:", "file:", 1),
+		"a harness that is not omp":    strings.Replace(base, "harness: omp", "harness: claude", 1),
+		"no owners or templates":       strings.Split(base, "  templates:")[0],
 	} {
-		env := map[string]string{"LEGION_POSTGRES_DSN": "postgres://legion"}
-		if name == "no daemon database" {
-			env = nil
+		env := map[string]string{"LEGION_POSTGRES_DSN": "postgres://legion", "LEGION_OMP_PATH": omp}
+		switch name {
+		case "no daemon database":
+			delete(env, "LEGION_POSTGRES_DSN")
+		case "no omp", "an omp_invocation only":
+			delete(env, "LEGION_OMP_PATH")
+		case "a relative LEGION_OMP_PATH":
+			env["LEGION_OMP_PATH"] = "omp"
 		}
-		if err := load(text, env); err == nil {
+		if _, err := load(text, env); err == nil {
 			t.Errorf("LoadConfig accepted %s", name)
 		}
 	}
 	if err := os.Chmod(dsnFile, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := load(base, map[string]string{"LEGION_POSTGRES_DSN": "postgres://legion"}); err == nil {
+	if _, err := load(base, good); err == nil {
 		t.Error("LoadConfig accepted a ledger DSN file others can read")
 	}
 }

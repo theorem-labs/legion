@@ -325,10 +325,11 @@ func OpenLedger(ctx context.Context, env func(string) string) (*ledger.Store, er
 }
 
 // RunnerFromEnv is the one way to build an owner process's step runner: the owner and the ledger repository from
-// its launch variables LEGION_OWNER and LEGION_LEDGER_REPOSITORY (C8), the ledger l (OpenLedger's), the owner's
-// worktree, the journal of undelivered notices in the deployment's state_dir, and the publisher of the listener
-// that ResolveListener names. A listener configuration that cannot be resolved is ErrListenerConfig.
-func RunnerFromEnv(env func(string) string, l Ledger, tree Worktree, stateDir string) (Runner, error) {
+// its launch variables LEGION_OWNER and LEGION_LEDGER_REPOSITORY (C8), the ledger l (OpenLedger's), the journal of
+// undelivered notices in the deployment's state_dir, and the publisher of the listener that ResolveListener names. A
+// listener configuration that cannot be resolved is ErrListenerConfig. It writes nothing, so a command builds its
+// runner before it creates the owner's worktree, and then sets the runner's Tree to that worktree.
+func RunnerFromEnv(env func(string) string, l Ledger, stateDir string) (Runner, error) {
 	owner, err := requiredEnv(env, "LEGION_OWNER")
 	if err != nil {
 		return Runner{}, err
@@ -346,7 +347,6 @@ func RunnerFromEnv(env func(string) string, l Ledger, tree Worktree, stateDir st
 	}
 	return Runner{
 		Ledger:  l,
-		Tree:    tree,
 		Envoy:   NewHTTPPublisher(url, token),
 		Owner:   owner,
 		Repo:    repo,

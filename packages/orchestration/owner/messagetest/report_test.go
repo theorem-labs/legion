@@ -13,7 +13,7 @@ func sampleReport() Report {
 	start := time.Date(2026, 10, 23, 18, 0, 0, 0, time.UTC)
 	return Report{
 		Run: "message-test-20261023t180000z", Prefix: "notifications.lxspec-message-test.", Nodes: []string{fn, st},
-		StartedAt: start, FinishedAt: start.Add(90 * time.Second),
+		StartedAt: start, FinishedAt: start.Add(90 * time.Second), Daemon: Daemon{Executable: "/opt/bin/legion", Omp: "/opt/omp/bin/omp"},
 		Steps:      []StepTiming{{Name: "setup", StartedAt: start, Seconds: 1.5}, {Name: "wake", StartedAt: start.Add(2 * time.Second), Seconds: 3}},
 		Panes:      []PaneCheck{{Owner: st, Pane: "%3", StartSeconds: 0.8, Env: map[string]string{"LEGION_OWNER": st}}},
 		Published:  []Publication{{Step: "arrival", Kind: "all", Topic: all, ID: "evt-all", Receivers: []string{fn, st}}},
@@ -59,7 +59,7 @@ func TestReportWritesJSONAndMarkdown(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Passed || len(decoded.Failures) != 1 || decoded.Steps[1].Name != "wake" || decoded.Seconds != 90 {
+	if decoded.Passed || len(decoded.Failures) != 1 || decoded.Steps[1].Name != "wake" || decoded.Seconds != 90 || decoded.Daemon.Omp != "/opt/omp/bin/omp" {
 		t.Fatalf("report.json = %+v", decoded)
 	}
 	markdown, err := os.ReadFile(filepath.Join(dir, "report.md"))
@@ -67,7 +67,8 @@ func TestReportWritesJSONAndMarkdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"FAILED", "| setup | 1.5 |", "%3", "evt-all", "0.25", MomentAfterClaim, needR1, "completed 2 times", "message-test-20261023t180000z",
-		"## Revisions", "0123456789abcdef0123456789abcdef01234567", "gopkg.in/yaml.v3 v3.0.1", "legion v9 (fedcba9876543210)", "omp 1.57.0", "tmux 3.4", "git version 2.43.0", "sha256:cc"} {
+		"## Revisions", "0123456789abcdef0123456789abcdef01234567", "gopkg.in/yaml.v3 v3.0.1", "legion v9 (fedcba9876543210)", "omp 1.57.0", "tmux 3.4", "git version 2.43.0", "sha256:cc",
+		"panes running `/opt/omp/bin/omp`"} {
 		if !strings.Contains(string(markdown), want) {
 			t.Errorf("report.md does not contain %q:\n%s", want, markdown)
 		}

@@ -335,14 +335,17 @@ type NoticeFields struct {
 	Epoch    int
 	From, To string
 	Edge     string
-	Item     string
+	Item     string // the work item the notice is about; "" for a record that queues no item
+	Version  string // the record's version, which the message names when the notice names no item
 	Record   string
 	Commit   string
 	Versions map[string]any
 	Models   map[string]any
 }
 
-// Notices builds one notice per delivery. Every notice of an item carries the key c-<hex16(item)>.
+// Notices builds one notice per delivery. Every notice of an item carries the key c-<hex16(item)>. A notice of a record
+// that queues no item names no item: its subject is its sender, and its key is c-<hex16(record@commit)>, one for each
+// revision of the record, which a re-run of the step repeats.
 func Notices(deliveries []Delivery, fields NoticeFields) []Notice {
 	short := fields.Commit
 	if len(short) > 12 {
@@ -351,24 +354,27 @@ func Notices(deliveries []Delivery, fields NoticeFields) []Notice {
 	subject := fields.Edge
 	if source, target, err := ParseEdgeID(fields.Edge); err == nil {
 		subject = source + " -> " + target
+	} else if fields.Edge == "" {
+		subject = fields.From
 	}
-	version := ""
-	if ref, err := ParseItemID(fields.Item); err == nil {
-		version = ref.Version
+	version, key := fields.Version, fields.Record+"@"+fields.Commit
+	if fields.Item != "" {
+		key = fields.Item
+		if ref, err := ParseItemID(fields.Item); err == nil {
+			version = ref.Version
+		}
 	}
 	message := strings.Join(strings.Fields(fmt.Sprintf("%s %s %s (epoch %d) at %s", fields.Type, subject, version, fields.Epoch, short)), " ")
 	notices := make([]Notice, 0, len(deliveries))
 	for _, delivery := range deliveries {
-		notices = append(notices, Notice{
-			Topic:   delivery.Topic,
-			Message: message,
-			Payload: Payload{
-				"type": fields.Type, "epoch": fields.Epoch, "from": fields.From, "to": fields.To, "edge": fields.Edge,
-				"item": fields.Item, "record": fields.Record, "commit": fields.Commit, "versions": fields.Versions,
-				"models": fields.Models,
-			},
-			Key: "c-" + Hex16(fields.Item),
-		})
+		payload := Payload{
+			"type": fields.Type, "epoch": fields.Epoch, "from": fields.From, "to": fields.To, "edge": fields.Edge,
+			"record": fields.Record, "commit": fields.Commit, "versions": fields.Versions, "models": fields.Models,
+		}
+		if fields.Item != "" {
+			payload["item"] = fields.Item
+		}
+		notices = append(notices, Notice{Topic: delivery.Topic, Message: message, Payload: payload, Key: "c-" + Hex16(key)})
 	}
 	return notices
 }

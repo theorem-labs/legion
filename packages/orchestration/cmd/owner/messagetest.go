@@ -179,9 +179,11 @@ func (s *session) messageTestSaw(delivery, topic string) (any, error) {
 }
 
 // messageTestAnswer answers a start, need or offer item with an offer record of fixed text, as one step: the record
-// with the item's Owner-Item trailer, the follow-up offer of a need, and the completion. An item older than the
-// version the owner already answered, which the answer record holds, completes as superseded:<newer version> with
-// no record.
+// with the item's Owner-Item trailer, the follow-up offer of a need, and the completion. The record has a revision, as
+// a spec does: 1, and one more each time a newer version rewrites it. A need's follow-up is numbered as production's
+// offer numbers it, offer:<edge>@r<n> with n the revision of the record that answers the need. An item older than the
+// version the owner already answered, which the answer record holds, completes as superseded:<newer version> with no
+// record.
 func (s *session) messageTestAnswer(item string, ref ownerpkg.ItemRef) (any, error) {
 	p, err := s.party()
 	if err != nil {
@@ -206,6 +208,7 @@ func (s *session) messageTestAnswer(item string, ref ownerpkg.ItemRef) (any, err
 	if err != nil {
 		return nil, err
 	}
+	answer := messagetest.Answer{Item: item, Type: ref.Type, Subject: ref.Subject, Version: ref.Version, Revision: 1, Text: messagetest.AnswerText}
 	if found {
 		var answered messagetest.Answer
 		if err := yaml.Unmarshal(previous, &answered); err != nil {
@@ -214,10 +217,17 @@ func (s *session) messageTestAnswer(item string, ref ownerpkg.ItemRef) (any, err
 		if versionAfter(answered.Version, ref.Version) {
 			return s.completeSuperseded(item, answered.Version)
 		}
+		answer.Revision = answered.Revision
 	}
-	data, err := yaml.Marshal(messagetest.Answer{Item: item, Type: ref.Type, Subject: ref.Subject, Version: ref.Version, Text: messagetest.AnswerText})
+	data, err := yaml.Marshal(answer)
 	if err != nil {
 		return nil, err
+	}
+	if found && !bytes.Equal(data, previous) {
+		answer.Revision++
+		if data, err = yaml.Marshal(answer); err != nil {
+			return nil, err
+		}
 	}
 	var followUps []ownerpkg.FollowUp
 	if ref.Type == "need" {
@@ -225,7 +235,7 @@ func (s *session) messageTestAnswer(item string, ref ownerpkg.ItemRef) (any, err
 		if err != nil {
 			return nil, err
 		}
-		followUps = append(followUps, ownerpkg.FollowUp{Item: "offer:" + ref.Subject + "@" + ref.Version, Owner: source})
+		followUps = append(followUps, ownerpkg.FollowUp{Item: fmt.Sprintf("offer:%s@r%d", ref.Subject, answer.Revision), Owner: source})
 	}
 	if err := s.checkNotHeldByOther(store, item); err != nil {
 		return nil, err
@@ -259,6 +269,8 @@ type messageTestResult struct {
 }
 
 // messageTestRun drives the message test against the operator's deployment and the supervisor named legion on PATH.
+// It is the operator's program, not an owner's: it reads no launch variable, and its ledger is the deployment's
+// ledger_dsn_file alone, which it gives the supervisor, so the test owners get it as LEGION_LEDGER_DSN_FILE.
 func (s *session) messageTestRun(flags driverFlags) (any, error) {
 	deployPath := s.deployPath
 	if deployPath == "" {
@@ -271,10 +283,6 @@ func (s *session) messageTestRun(flags driverFlags) (any, error) {
 	deploy, err := ownerpkg.LoadDeploy(deployPath)
 	if err != nil {
 		return nil, err
-	}
-	dsnFile := strings.TrimSpace(s.getenv("LEGION_LEDGER_DSN_FILE"))
-	if dsnFile == "" {
-		dsnFile = deploy.LedgerDSNFile
 	}
 	out := flags.out
 	if !filepath.IsAbs(out) {
@@ -294,7 +302,7 @@ func (s *session) messageTestRun(flags driverFlags) (any, error) {
 	}
 	report, err := messagetest.Run(s.ctx, messagetest.Options{
 		Prefix: flags.prefix, Nodes: flags.nodes, Kills: flags.kills, Out: out,
-		Deploy: deploy, LedgerDSNFile: dsnFile, Owner: owner, Legion: legion,
+		Deploy: deploy, Owner: owner, Legion: legion,
 		Environ: os.Environ(), Getenv: s.getenv, Progress: s.stderr, Timeouts: messagetest.DefaultTimeouts(),
 	})
 	if err != nil {

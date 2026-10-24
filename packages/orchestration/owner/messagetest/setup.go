@@ -239,17 +239,19 @@ func renderBrief(owner, deploy string) ([]byte, error) {
 }
 
 // DaemonConfig is the supervisor's minimal standing-owners configuration (shared contract 10, C33): no software
-// workflow keys, the daemon's own Postgres from LEGION_POSTGRES_DSN in its environment, and one template for each
-// kind of the test's nodes.
+// workflow keys, the daemon's own Postgres from LEGION_POSTGRES_DSN in its environment, the operator bearer that the
+// daemon requires at boot, and one template for each kind of the test's nodes. The omp the panes run is no key: the
+// driver gives it as LEGION_OMP_PATH in the supervisor's environment.
 type DaemonConfig struct {
-	Project        string         `yaml:"project"`
-	StateDir       string         `yaml:"state_dir"`
-	Runtime        string         `yaml:"runtime"`
-	Port           int            `yaml:"port"`
-	EnvoyURL       string         `yaml:"envoy_url,omitempty"`
-	NATSURLs       []string       `yaml:"nats_urls,omitempty"`
-	EnvoyTokenFile string         `yaml:"envoy_token_file,omitempty"`
-	StandingOwners StandingOwners `yaml:"standing_owners"`
+	Project           string         `yaml:"project"`
+	StateDir          string         `yaml:"state_dir"`
+	Runtime           string         `yaml:"runtime"`
+	Port              int            `yaml:"port"`
+	OperatorTokenFile string         `yaml:"operator_token_file"`
+	EnvoyURL          string         `yaml:"envoy_url,omitempty"`
+	NATSURLs          []string       `yaml:"nats_urls,omitempty"`
+	EnvoyTokenFile    string         `yaml:"envoy_token_file,omitempty"`
+	StandingOwners    StandingOwners `yaml:"standing_owners"`
 }
 
 // StandingOwners is the daemon's standing_owners block: the ledger, the repository and limits, and the templates
@@ -275,13 +277,14 @@ const (
 	daemonBudgetUSD = 1000
 )
 
-func daemonConfig(project, stateDir string, port int, envoyURL string, natsURLs []string, tokenFile, ledgerDSNFile, repo, prompt string, kinds []string) DaemonConfig {
+func daemonConfig(project, stateDir string, port int, envoyURL string, natsURLs []string, tokenFile, operatorTokenFile, ledgerDSNFile, repo, prompt string, kinds []string) DaemonConfig {
 	templates := map[string]OwnerTemplate{}
 	for _, kind := range kinds {
 		templates[kind] = OwnerTemplate{PromptFile: prompt, Harness: "omp", MaxCostUSD: ownerMaxCostUSD}
 	}
 	return DaemonConfig{
-		Project: project, StateDir: stateDir, Runtime: "tmux", Port: port, EnvoyURL: envoyURL, NATSURLs: natsURLs, EnvoyTokenFile: tokenFile,
+		Project: project, StateDir: stateDir, Runtime: "tmux", Port: port, OperatorTokenFile: operatorTokenFile,
+		EnvoyURL: envoyURL, NATSURLs: natsURLs, EnvoyTokenFile: tokenFile,
 		StandingOwners: StandingOwners{LedgerDSNFile: ledgerDSNFile, Repository: repo, MaxRunning: 2, BudgetUSD: daemonBudgetUSD, Templates: templates},
 	}
 }

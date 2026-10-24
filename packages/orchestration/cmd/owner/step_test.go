@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -152,6 +153,73 @@ func TestOfferAnsweringSeveralItemsCommitsATrailerForEach(t *testing.T) {
 	}
 	if count := f.git(f.root, "--git-dir="+f.bare, "rev-list", "--count", "owner/"+ownerpkg.Key(state), "--", specPath); count != "1" {
 		t.Fatalf("spec commits = %s, want 1", count)
+	}
+}
+
+// When every --answers item is done, the command repeats the revision that answered them, with that revision's
+// number and commit. A changed draft is a new revision, which answers nothing that is done, so the command refuses
+// it and writes nothing.
+func TestOfferWithEveryAnswerDoneRepeatsItsRevisionOrRefusesAChangedDraft(t *testing.T) {
+	f := newCommandFixture(t)
+	need := "need:" + ownerpkg.EdgeID(caller, state) + "@r1"
+	f.as(caller).ok("need", state, f.write("need.md", needDraft))
+	offerFile := f.write("offer.md", offerDraft)
+	f.as(state).ok("offer", offerFile, "--answers", need)
+	specPath := ownerpkg.SpecRecord("skeleton", state)
+	specCommit := f.lastCommit(state, specPath)
+
+	var again stepResult
+	if err := json.Unmarshal([]byte(f.as(state).ok("--json", "offer", offerFile, "--answers", need)), &again); err != nil {
+		t.Fatal(err)
+	}
+	if !again.AlreadyDone || again.Revision != 1 || again.Commit != specCommit {
+		t.Fatalf("the repeated offer = %+v, want already done at r1 with %s", again, specCommit)
+	}
+
+	changed := f.write("offer-2.md", strings.Replace(offerDraft, "the last value that a writer stored", "the value that the last writer stored", 1))
+	if code, stderr := f.as(state).fails("offer", changed, "--answers", need); code != 1 || !strings.Contains(stderr, need) {
+		t.Fatalf("a changed draft answering only done items exited %d: %s", code, stderr)
+	}
+	if got := f.lastCommit(state, specPath); got != specCommit {
+		t.Fatalf("the refused draft moved the spec to %s", got)
+	}
+	if posts := f.notices(); len(posts) != 2 {
+		t.Fatalf("listener got %d posts, want the need's and the first offer's only: %+v", len(posts), posts)
+	}
+}
+
+// A spec revision that offers no edge notifies the users of the owner's spec. It queues no item for them, so the
+// notice names none; it carries its own key for each revision, which a re-run repeats, and its message names the
+// revision.
+func TestSpecRevisionWithNoEdgeNamesNoItem(t *testing.T) {
+	f := newCommandFixture(t)
+	f.as(state).ok("offer", f.write("spec-1.md", offerDraft))
+	revised := f.write("spec-2.md", strings.Replace(offerDraft, "the last value that a writer stored", "the value that the last writer stored", 1))
+	f.as(state).ok("offer", revised)
+	f.as(state).ok("offer", revised) // a second run repeats the notice under the same key
+
+	posts := f.notices()
+	if len(posts) != 3 {
+		t.Fatalf("listener got %d posts, want r1, r2 and r2 again: %+v", len(posts), posts)
+	}
+	specPath := ownerpkg.SpecRecord("skeleton", state)
+	for index, post := range posts {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(post.Payload), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if item, ok := payload["item"]; ok {
+			t.Errorf("post %d names the item %v", index, item)
+		}
+		if post.Topic != "notifications.lxspec.node.struct:state.users" || payload["record"] != specPath || payload["type"] != "offer" {
+			t.Errorf("post %d = %+v", index, post)
+		}
+		if want := map[int]string{0: " r1 ", 1: " r2 ", 2: " r2 "}[index]; !strings.Contains(post.Message, state+want) {
+			t.Errorf("post %d message %q does not name %s%s", index, post.Message, state, want)
+		}
+	}
+	if posts[0].IdempotencyKey == posts[1].IdempotencyKey || posts[1].IdempotencyKey != posts[2].IdempotencyKey || !strings.HasPrefix(posts[0].IdempotencyKey, "c-") {
+		t.Fatalf("keys = %q, %q, %q; want one key for each revision, repeated by the re-run", posts[0].IdempotencyKey, posts[1].IdempotencyKey, posts[2].IdempotencyKey)
 	}
 }
 

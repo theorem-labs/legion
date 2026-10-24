@@ -52,13 +52,16 @@ type Saw struct {
 	ReceivedAt time.Time `yaml:"received_at"`
 }
 
-// Answer is an owner's answer to one item: an offer record with fixed text.
+// Answer is an owner's answer to one item: an offer record with fixed text. Revision numbers the record as a spec's
+// revision numbers a spec: 1, and one more each time a newer version of the item rewrites it. The offer that the
+// answer to a need queues is offer:<edge>@r<Revision>.
 type Answer struct {
-	Item    string `yaml:"item"`
-	Type    string `yaml:"type"`
-	Subject string `yaml:"subject"`
-	Version string `yaml:"version"`
-	Text    string `yaml:"text"`
+	Item     string `yaml:"item"`
+	Type     string `yaml:"type"`
+	Subject  string `yaml:"subject"`
+	Version  string `yaml:"version"`
+	Revision int    `yaml:"revision"`
+	Text     string `yaml:"text"`
 }
 
 // ExtraTopicsPath is the driver's list, for each test owner, of the topics it subscribes to beyond `owner topics`: the

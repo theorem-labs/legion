@@ -166,6 +166,12 @@ func (s *session) offer(file string, answers []string) (any, error) {
 	result := stepResult{Answered: answeredItems, Record: recordPath, Revision: front.Revision}
 	subject := fmt.Sprintf("owner: spec r%d", front.Revision)
 	if len(items) > 0 && len(open) == 0 {
+		// Every answered item is done. A run that repeats the revision that answered them repeats its result. A
+		// changed draft would be a new revision that answers none of them, so it is refused, never dropped.
+		if !found || !bytes.Equal(data, previous) {
+			return nil, refusef("%s: every --answers item is done, and this draft differs from the current spec r%d; "+
+				"to write it as a new revision, run owner offer %s without the done items", strings.Join(answeredItems, ", "), prevFront.Revision, file)
+		}
 		result.AlreadyDone = true
 		result.Commit, err = s.lastCommit(branch(p.ID), recordPath)
 		return result, err
@@ -227,10 +233,9 @@ func (s *session) offer(file string, answers []string) (any, error) {
 	}
 	if len(queued) == 0 {
 		// The revision offers no edge: its notice goes to the users of the owner's spec, on the first step, or on a
-		// step that answers nothing.
-		item := fmt.Sprintf("spec:%s@r%d", p.ID, front.Revision)
+		// step that answers nothing. It queues no item for them, so it names none.
 		notices := ownerpkg.Notices(p.routing.Topics(ownerpkg.Route{Step: ownerpkg.RouteOffer, Target: p.ID, TargetKind: p.Kind, Linked: linked}), ownerpkg.NoticeFields{
-			Type: "offer", Epoch: p.epoch, From: p.ID, Item: item, Record: recordPath, Commit: commit,
+			Type: "offer", Epoch: p.epoch, From: p.ID, Version: fmt.Sprintf("r%d", front.Revision), Record: recordPath, Commit: commit,
 			Versions: map[string]any{"offer": specHash}, Models: models,
 		})
 		if len(steps) == 0 {
