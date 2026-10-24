@@ -35,8 +35,9 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   declared size of an object symbol that `System.map` names. Thread-pointer accesses are per-CPU
   state. Globals the machine code addresses but the C does not name become nodes with image-only
   access edges.
-- **The contract graph** (optional): the proof's own graph. It maps functions to contracts, confirms
-  callback tables a C initializer also names, and gives the interfaces the measures map onto groups.
+- **The contract graph** (optional): the proof's own graph. Its function nodes are joined to the graph's
+  functions by image address (below); it confirms callback tables a C initializer also names, and
+  gives the interfaces the measures map onto groups.
 
 A helper defined in a header or a file is folded into a caller where the caller's machine code does
 not call it, so the C layer sees what the compiler inlined. A helper the image calls stays a call and
@@ -62,12 +63,17 @@ size.
 
 `owners.json` lists one owner per function of the part, per data structure that a part function
 accesses or a structure link joins, per per-CPU state, and per subsystem. The owner's key is the node
-id. `contract` is the contract graph's function node, `null` when there is none, or a list of node ids
-when the contract graph names the function more than once. It names a function by the C file it is
-compiled into, so a header helper (or a function of a C file another includes) appears once per
-including file of the part, and a weak default appears beside the definition that replaced it. Each
-contract node belongs to exactly one owner; one whose C function is no part function is excluded as
-`contract_function`/`definition_not_a_part_function`. `topics.json` gives each owner's subscriptions
+id. `contract` is the contract graph's function node whose `addr` is an image address of the function
+(one of its `image_addresses`), `null` when there is none, or a list of node ids when several nodes
+give addresses of its image copies (a header helper compiled into several units). The address is the
+machine code the contract is about, so the join holds where the node's id names another C file than
+the function's own: a file name with a hyphen, a function of another C file or of a header, an alias
+symbol. Each contract node belongs to exactly one owner. Every other function node is in
+`exclusions.json` as `contract_function` with a reason: `outside_function_prefix` (another
+program's node), `no_image_symbol` (no address: a macro, an always-inline helper or an assembly
+label), `no_part_function_at_address` (assembly, or a function of a unit outside the part; the detail
+names the image symbol there) or `address_of_several_part_functions`. Two nodes that give one
+address fail the hard check `contract_mapping_unique`. `topics.json` gives each owner's subscriptions
 under `topics.prefix`: `node.<id>.needs` and `all` for everyone; `node.<callee>.callers`,
 `node.<caller>.callees` and `node.<data>.users` for a function; `node.<linked>.linked` for a data
 structure or a subsystem; `node.<neighbour>.neighbors` for every neighbour in the three layers. In a

@@ -4,11 +4,14 @@ callback tables and interfaces its tools resolved."""
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .errors import InputError
+
+_ADDRESS = re.compile(r"0x[0-9a-f]+")
 
 
 def _symbol(name: str) -> str:
@@ -19,7 +22,8 @@ def _symbol(name: str) -> str:
 @dataclass
 class ContractGraph:
     meta: dict[str, Any] = field(default_factory=dict)
-    # (C file, symbol) -> the function node
+    # (C file, symbol) -> the function node with an address, the C file read from the node's id. Used
+    # only to pin a definition's image copy among several of one name; ownership is joined by address.
     functions: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
     edges: list[dict[str, Any]] = field(default_factory=list)
@@ -44,12 +48,15 @@ class ContractGraph:
             graph.nodes[node["id"]] = node
             if node.get("kind") != "fn":
                 continue
-            source = c_file(node["id"], prefix)
-            if source is None:
-                continue
             symbols = node.get("syms", [])
             if not isinstance(symbols, list) or not all(isinstance(symbol, str) for symbol in symbols):
-                raise InputError(f"contract graph {path} node {index} has malformed syms")
+                raise InputError(f"contract graph {path} node {node['id']} has malformed syms")
+            address = node.get("addr", "")
+            if not isinstance(address, str) or (address and not _ADDRESS.fullmatch(address)):
+                raise InputError(f"contract graph {path} node {node['id']} has a malformed addr {address!r}")
+            source = c_file(node["id"], prefix)
+            if source is None or not address:
+                continue
             for symbol in symbols:
                 graph.functions.setdefault((source, _symbol(symbol)), node)
         if not all(isinstance(edge, dict) for edge in edges):
@@ -60,6 +67,10 @@ class ContractGraph:
     def function(self, source: str, name: str) -> dict[str, Any] | None:
         return self.functions.get((source, name))
 
+    def function_nodes(self) -> list[dict[str, Any]]:
+        """Every function node, in id order."""
+        return [self.nodes[identity] for identity in sorted(self.nodes) if self.nodes[identity].get("kind") == "fn"]
+
     def table_edges(self) -> list[dict[str, Any]]:
         return [edge for edge in self.edges if edge.get("kind") == "table"]
 
@@ -67,6 +78,12 @@ class ContractGraph:
         return [
             edge for edge in self.edges if edge.get("kind") == "binds" and str(edge.get("dst", "")).startswith("if:")
         ]
+
+
+def address(node: dict[str, Any]) -> int | None:
+    """The image address a function node gives, or None: the machine code the contract is about."""
+    value = node.get("addr")
+    return int(value, 16) if value else None
 
 
 def c_file(node_id: str, prefix: str) -> str | None:

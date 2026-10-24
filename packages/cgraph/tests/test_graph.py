@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 from conftest import FIXTURE, build, edges, node, read
 
 from cgraph import clangfacts, commands, config, contracts, image, jsonio, link, structure
+from cgraph.errors import InputError
 
 
 def targets(graph: dict[str, Any], kind: str, source: str, **fields: Any) -> set[str]:
@@ -326,14 +328,10 @@ def test_every_contract_callback_drop_has_a_c3_classification() -> None:
         )
         for source in files
     }
-    source_node = {"id": "Prog/src/store/RunGet", "kind": "fn", "syms": ["run_get"]}
-    target_node = {"id": "Prog/src/store/BoxGet", "kind": "fn", "syms": ["box_get"]}
+    source_node = {"id": "Prog/src/store/RunGet", "kind": "fn", "syms": ["run_get"], "addr": "0x1127e"}
+    target_node = {"id": "Prog/src/store/BoxGet", "kind": "fn", "syms": ["box_get"], "addr": "0x111a0"}
     contract_graph = contracts.ContractGraph(
         nodes={source_node["id"]: source_node, target_node["id"]: target_node},
-        functions={
-            ("src/store.c", "run_get"): source_node,
-            ("src/store.c", "box_get"): target_node,
-        },
         edges=[
             {"kind": "table", "src": source_node["id"], "dst": "Prog/src/store/NoC", "evidence": ["table:ops"]},
             {"kind": "table", "src": source_node["id"], "dst": target_node["id"], "evidence": ["call:ops"]},
@@ -350,6 +348,9 @@ def test_every_contract_callback_drop_has_a_c3_classification() -> None:
         source = linker.visible("src/store.c", "run_get")
         assert source is not None
         exclusions: list[dict[str, Any]] = []
+        join = link._join_contracts(
+            contract_graph, "Prog/", link._functions_at(linker), {source.id}, linked_image.text_at
+        )
         link._callback_edges(
             link.GraphBuilder(),
             linker,
@@ -357,7 +358,7 @@ def test_every_contract_callback_drop_has_a_c3_classification() -> None:
             [table for unit in facts.values() for table in unit["tables"]],
             {source.id: source},
             exclusions,
-            link._contract_owners(linker),
+            {contract_id: linker.primary[identity] for contract_id, identity in join.resolved.items()},
         )
     finally:
         linked_image.close()
@@ -461,13 +462,20 @@ def test_structure_drops_are_written_as_c3_items() -> None:
     assert {item["reason"] for item in membership_drops} == {"arguments_unresolved", "end_not_a_node"}
 
 
-def _add_contract_functions(copy: Path, *functions: tuple[str, str, bool]) -> None:
+def _address(copy: Path, name: str, copy_index: int = 0) -> str:
+    """The image address System.map gives a text symbol, as the contract graph writes it."""
+    found = [
+        line.split()[0]
+        for line in (copy / "image" / "System.map").read_text().splitlines()
+        if line.split()[2] == name and line.split()[1] in "Tt"
+    ]
+    return f"0x{int(found[copy_index], 16):x}"
+
+
+def _add_contract_functions(copy: Path, *functions: dict[str, Any]) -> None:
     path = copy / "contracts.json"
     graph = json.loads(path.read_text())
-    graph["nodes"] += [
-        {"id": identity, "kind": "fn", "syms": [symbol], "addr": "", "in_image": in_image}
-        for identity, symbol, in_image in functions
-    ]
+    graph["nodes"] += [{"kind": "fn", "in_image": bool(item["addr"]), **item} for item in functions]
     path.write_text(json.dumps(graph))
 
 
@@ -479,60 +487,137 @@ def _claimed(owners: list[dict[str, Any]]) -> list[str]:
     return claimed
 
 
-def test_a_header_function_carries_the_contract_of_every_including_file(copy: Path, tmp_path: Path) -> None:
-    """The contract graph names a function by the C file it is compiled into: a header helper is
-    one node, and it carries each including file's contract, a list when there are several."""
-    bags = copy / "src" / "bags.c"
-    bags.write_text(bags.read_text() + "\nlong bag_box_size(struct box *b)\n{\n\treturn box_size(b);\n}\n")
-    _add_contract_functions(
-        copy, ("Prog/src/store/BoxSize", "box_size", True), ("Prog/src/bags/BoxSize", "box_size", False)
-    )
+def _contract_items(out: Path) -> dict[str, dict[str, Any]]:
+    return {
+        item["target"]: item for item in read(out, "exclusions.json")["items"] if item["kind"] == "contract_function"
+    }
+
+
+# (contract id, its symbol, the image symbol and copy whose address it gives, the node it must reach).
+# The id's path never names the C file the function is in, so only the image address joins them.
+ADDRESS_JOINS = [
+    # A file name with a hyphen, which the contract graph's directory spells with an underscore.
+    ("Prog/src/sto_re/BoxTreeAdd", "box_tree_add", ("box_tree_add", 0), "function:box_tree_add"),
+    # A function the directory places in another C file than the one that defines it.
+    ("Prog/src/store/BagLink", "bag_link", ("bag_link", 0), "function:bag_link"),
+    # A helper a header defines, compiled into the unit that includes it.
+    ("Prog/src/store/BoxSize", "box_size", ("box_size", 0), "function:box_size@include/mini.h"),
+    # An alias: the contract graph's symbol is another name for the same code.
+    ("Prog/src/bags/VisitAlias", "visit_alias", ("visit", 0), "function:visit@src/bags.c"),
+    # One of two statics of one name: the address picks bags.c's copy.
+    ("Prog/src/bags/HelperDup", "helper_dup", ("helper_dup", 1), "function:helper_dup@src/bags.c"),
+]
+
+
+@pytest.mark.parametrize(
+    ("identity", "symbol", "image_symbol", "expected"), ADDRESS_JOINS, ids=[item[0] for item in ADDRESS_JOINS]
+)
+def test_a_contract_function_reaches_the_part_function_at_its_image_address(
+    copy: Path, tmp_path: Path, identity: str, symbol: str, image_symbol: tuple[str, int], expected: str
+) -> None:
+    _add_contract_functions(copy, {"id": identity, "syms": [symbol], "addr": _address(copy, *image_symbol)})
     out = tmp_path / "out"
     result = build(copy, "both", out)
     assert result.passes, result.hard_checks
-    graph = read(out, "graph.json")
-    helper = node(graph, "function:box_size@include/mini.h")
-    assert helper["contract"] == ["Prog/src/bags/BoxSize", "Prog/src/store/BoxSize"]
-    assert {"source": "contract_graph", "id": "Prog/src/bags/BoxSize"} in helper["provenance"]
-    assert {"source": "contract_graph", "id": "Prog/src/store/BoxSize"} in helper["provenance"]
-    assert node(graph, "function:box_new")["contract"] == "Prog/src/store/BoxNew"
-    owners = read(out, "owners.json")["owners"]
-    by_id = {owner["id"]: owner for owner in owners}
-    assert by_id["function:box_size@include/mini.h"]["contract"] == ["Prog/src/bags/BoxSize", "Prog/src/store/BoxSize"]
-    assert by_id["function:box_new"]["contract"] == "Prog/src/store/BoxNew"
-    # Each contract directory has exactly one owner.
-    claimed = _claimed(owners)
-    assert len(claimed) == len(set(claimed))
-    assert not any(
-        item["kind"] == "contract_function" and item["target"] in {"Prog/src/store/BoxSize", "Prog/src/bags/BoxSize"}
-        for item in read(out, "exclusions.json")["items"]
-    )
+    function = node(read(out, "graph.json"), expected)
+    assert function["contract"] == identity
+    assert {"source": "contract_graph", "id": identity} in function["provenance"]
+    owners = {owner["id"]: owner for owner in read(out, "owners.json")["owners"]}
+    assert owners[expected]["contract"] == identity
+    assert identity not in _contract_items(out)
 
 
-def test_a_weak_default_s_contract_belongs_to_the_node_that_replaced_it(copy: Path, tmp_path: Path) -> None:
+def test_every_contract_function_that_reaches_no_part_function_is_an_exclusion(copy: Path, tmp_path: Path) -> None:
+    anchor = _address(copy, "anchor_pair")
     _add_contract_functions(
-        copy, ("Prog/src/bags/ArchHook", "arch_hook", True), ("Prog/src/store/ArchHook", "arch_hook", True)
+        copy,
+        # A macro, an always-inline helper or an assembly label: the contract graph gives no symbol.
+        {"id": "Prog/src/store/ListInsert", "syms": [], "addr": ""},
+        # Assembly (src/anchor.S): the image has the code, no C function of the part is there.
+        {"id": "Prog/src/anchor/AnchorPair", "syms": ["anchor_pair"], "addr": anchor},
+        # A function of another program in the same contract graph.
+        {"id": "Firmware/lib/boot/Start", "syms": ["fw_start"], "addr": "0x80000000"},
     )
     out = tmp_path / "out"
     assert build(copy, "both", out).passes
-    hook = node(read(out, "graph.json"), "function:arch_hook")
-    assert hook["contract"] == ["Prog/src/bags/ArchHook", "Prog/src/store/ArchHook"]
-
-
-def test_a_contract_whose_c_function_is_no_part_function_is_an_exclusion(copy: Path, tmp_path: Path) -> None:
-    """list_insert, a header helper the image inlines everywhere, is no node: its contract has no owner."""
-    _add_contract_functions(copy, ("Prog/src/store/ListInsert", "list_insert", False))
-    out = tmp_path / "out"
-    assert build(copy, "both", out).passes
-    items = [item for item in read(out, "exclusions.json")["items"] if item["target"] == "Prog/src/store/ListInsert"]
-    assert items == [
-        {
-            "kind": "contract_function",
-            "reason": "definition_not_a_part_function",
-            "function": "function:list_insert@include/mini.h",
-            "target": "Prog/src/store/ListInsert",
-            "detail": {"source": "src/store.c", "symbol": "list_insert"},
-            "provenance": [{"source": "contract_graph", "id": "Prog/src/store/ListInsert"}],
-        }
+    items = _contract_items(out)
+    assert {target: (item["reason"], item["function"]) for target, item in items.items()} == {
+        "Prog/src/store/ListInsert": ("no_image_symbol", None),
+        "Prog/src/anchor/AnchorPair": ("no_part_function_at_address", None),
+        "Firmware/lib/boot/Start": ("outside_function_prefix", None),
+    }
+    assert items["Prog/src/anchor/AnchorPair"]["detail"] == {
+        "address": anchor,
+        "symbol": "anchor_pair",
+        "image_symbol": "anchor_pair",
+        "c_functions": [],
+    }
+    assert items["Prog/src/store/ListInsert"]["provenance"] == [
+        {"source": "contract_graph", "id": "Prog/src/store/ListInsert"}
     ]
-    assert "Prog/src/store/ListInsert" not in _claimed(read(out, "owners.json")["owners"])
+    claimed = _claimed(read(out, "owners.json")["owners"])
+    assert not set(items) & set(claimed)
+
+
+def test_a_contract_function_of_another_part_is_recorded_not_dropped(copy: Path, tmp_path: Path) -> None:
+    """Part store parses only src/store.c: bags.c's BagAdd reaches no function of the part."""
+    out = tmp_path / "out"
+    assert build(copy, "store", out).passes
+    item = _contract_items(out)["Prog/src/bags/BagAdd"]
+    assert (item["reason"], item["detail"]["image_symbol"]) == ("no_part_function_at_address", "bag_add")
+
+
+def test_two_contract_functions_at_one_address_fail_the_unique_mapping_check(copy: Path, tmp_path: Path) -> None:
+    _add_contract_functions(
+        copy, {"id": "Prog/src/store/BoxNewAgain", "syms": ["box_new"], "addr": _address(copy, "box_new")}
+    )
+    out = tmp_path / "out"
+    result = build(copy, "both", out)
+    failed = [item for item in result.hard_checks if not item["ok"]]
+    assert [item["name"] for item in failed] == ["contract_mapping_unique"]
+    assert failed[0]["items"] == [
+        {"address": _address(copy, "box_new"), "ids": ["Prog/src/store/BoxNew", "Prog/src/store/BoxNewAgain"]}
+    ]
+
+
+def test_the_address_join_gives_lists_and_refuses_an_address_of_several_part_functions() -> None:
+    graph = contracts.ContractGraph(
+        nodes={
+            "Prog/a/F": {"id": "Prog/a/F", "kind": "fn", "syms": ["f"], "addr": "0x10"},
+            "Prog/b/F": {"id": "Prog/b/F", "kind": "fn", "syms": ["f"], "addr": "0x20"},
+            "Prog/c/G": {"id": "Prog/c/G", "kind": "fn", "syms": ["g"], "addr": "0x30"},
+            "Prog/d/H": {"id": "Prog/d/H", "kind": "fn", "syms": ["h"], "addr": "0x40"},
+            "if:X": {"id": "if:X", "kind": "iface"},
+        }
+    )
+    functions_at = {
+        0x10: ["function:f@inc.h"],
+        0x20: ["function:f@inc.h"],
+        0x30: ["function:g@a.h", "function:g@b.h"],
+        0x40: ["function:h@other.h"],
+    }
+    part = {"function:f@inc.h", "function:g@a.h", "function:g@b.h"}
+    join = link._join_contracts(graph, "Prog/", functions_at, part, {0x40: "h"})
+    assert join.owners == {"Prog/a/F": "function:f@inc.h", "Prog/b/F": "function:f@inc.h"}
+    # A callback may name a C function that is no part function; only an owner must be one.
+    assert join.resolved == {**join.owners, "Prog/d/H": "function:h@other.h"}
+    assert [(item["target"], item["reason"], item["detail"]) for item in join.drops] == [
+        (
+            "Prog/c/G",
+            "address_of_several_part_functions",
+            {"address": "0x30", "symbol": "g", "candidates": ["function:g@a.h", "function:g@b.h"]},
+        ),
+        (
+            "Prog/d/H",
+            "no_part_function_at_address",
+            {"address": "0x40", "symbol": "h", "image_symbol": "h", "c_functions": ["function:h@other.h"]},
+        ),
+    ]
+    assert join.duplicates == []
+
+
+def test_a_malformed_contract_address_is_an_input_error(tmp_path: Path) -> None:
+    path = tmp_path / "contracts.json"
+    path.write_text(json.dumps({"nodes": [{"id": "Prog/a/F", "kind": "fn", "syms": ["f"], "addr": "f00"}]}))
+    with pytest.raises(InputError, match=r"Prog/a/F.*addr"):
+        contracts.ContractGraph.load(path, "Prog/")

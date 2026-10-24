@@ -100,11 +100,7 @@ def _offsets(d: Documents) -> None:
 
 def _contract_mapping(d: Documents) -> None:
     d["graph"]["analysis"]["contract_mapping_duplicates"] = [
-        {
-            "source": "src/store.c",
-            "symbol": "box_new",
-            "ids": ["Prog/src/store/BoxNew", "Prog/src/store/BoxNewDuplicate"],
-        }
+        {"address": "0x111b4", "ids": ["Prog/src/store/BoxNew", "Prog/src/store/BoxNewDuplicate"]}
     ]
 
 

@@ -27,7 +27,8 @@ import capstone
 
 from . import jsonio, structure
 from .config import Config
-from .contracts import ContractGraph, c_file
+from .contracts import ContractGraph
+from .contracts import address as contract_address
 from .errors import CacheError
 from .image import FunctionFacts, Image, Symbol
 
@@ -998,17 +999,19 @@ def _assemble(
     """The contract layer over a core: the same graph a link of both layers at once gives."""
     nodes: dict[str, dict[str, Any]] = {node["id"]: node for node in core["nodes"]}
     analysis = dict(core["analysis"])
-    owners = _contract_owners(linker)
+    part_functions = set(analysis["part_functions"])
+    join = _join_contracts(
+        contracts, linker.config.contract_function_prefix, _functions_at(linker), part_functions, linker.image.text_at
+    )
     claimed: dict[str, list[str]] = collections.defaultdict(list)
-    for contract_id, definition in owners.items():
-        claimed[definition.id].append(contract_id)
+    for contract_id, identity in join.owners.items():
+        claimed[identity].append(contract_id)
     for identity in analysis["part_functions"]:
         ids = sorted(claimed.get(identity, []))
         if ids:
             node = nodes[identity]
-            # One contract is its id; a function the contract graph names more than once (a header
-            # helper in each including file, a weak default and the definition that replaced it)
-            # carries the list, so each contract has exactly one owner.
+            # One contract is its id; a function whose image copies several contract nodes name (a
+            # header helper compiled into several units) carries the list. Each contract has one owner.
             node["contract"] = ids[0] if len(ids) == 1 else ids
             node["provenance"] = _unique_sorted(
                 [*node["provenance"], *({"source": "contract_graph", "id": item} for item in ids)]
@@ -1018,7 +1021,13 @@ def _assemble(
     builder.nodes = nodes
     exclusions = list(core["exclusions"])
     callbacks = _callback_edges(
-        builder, linker, contracts, analysis["callback_tables"], analysis["part_functions"], exclusions, owners
+        builder,
+        linker,
+        contracts,
+        analysis["callback_tables"],
+        analysis["part_functions"],
+        exclusions,
+        {contract_id: linker.primary[identity] for contract_id, identity in join.resolved.items()},
     )
     for identity, node in nodes.items():
         if identity not in core_ids:
@@ -1035,14 +1044,14 @@ def _assemble(
         edges.append(edge)
         previous = position
     edges += core["edges"][previous:]
-    expected_functions, contract_drops = _expected_functions(linker, owners, set(analysis["part_functions"]))
-    exclusions.extend(contract_drops)
+    expected_functions = _expected_functions(linker)
+    exclusions.extend(join.drops)
     exclusion_document = jsonio.exclusion_document(part, exclusions)
     analysis.update(
         {
             "expected_functions": expected_functions,
             "resolved_callbacks": callbacks,
-            "contract_mapping_duplicates": _contract_mapping_duplicates(linker),
+            "contract_mapping_duplicates": join.duplicates,
             "excluded": exclusion_document["counts"],
         }
     )
@@ -1194,28 +1203,87 @@ def _owned(function: dict[str, Any]) -> bool:
     return bool(function["main_file"] or function["file"].endswith(".c"))
 
 
-def _contract_owners(linker: Linker) -> dict[str, Definition]:
-    """The definition whose node each contract function node of the contract graph is.
-
-    The contract graph names a function by the C file it is compiled into, so a header helper or a
-    function of an included C file appears once per including file. Its definition is the one that
-    file's unit sees, else the definition in that file; its node is that definition's (the strong one
-    of a weak pair). So each contract has exactly one owner."""
-    owners: dict[str, Definition] = {}
-    for (source, symbol), node in sorted(linker.contracts.functions.items()):
-        definition = linker.visible(source, symbol) if source in linker.tus else None
-        if definition is None:
-            definition = next((item for item in linker.by_name.get(symbol, []) if item.file == source), None)
-        if definition is not None:
-            owners.setdefault(node["id"], linker.node_of(definition))
-    return owners
+def _functions_at(linker: Linker) -> dict[int, list[str]]:
+    """Each image address a C definition's copy starts at, with the node ids of the definitions there."""
+    at: dict[int, set[str]] = collections.defaultdict(set)
+    for definition in linker.definitions.values():
+        for symbol in linker.symbols(definition):
+            at[symbol.address].add(linker.node_of(definition).id)
+    return {address: sorted(ids) for address, ids in at.items()}
 
 
-def _expected_functions(
-    linker: Linker, owners: dict[str, Definition], part_functions: set[str]
-) -> tuple[list[str], list[dict[str, Any]]]:
-    """Functions of the part's files that the image holds, and contract functions of the part's
-    files that reach no part function: none defined in C, or one whose definition is no part function."""
+@dataclass(frozen=True)
+class ContractJoin:
+    """The contract graph's function nodes joined to the graph's functions by image address."""
+
+    owners: dict[str, str]  # contract id -> the part function that owns it
+    resolved: dict[str, str]  # contract id -> the C function at its address (a callback may name a non-part one)
+    drops: list[dict[str, Any]]  # C3 items: every function node no part function owns
+    duplicates: list[dict[str, Any]]  # addresses that several function nodes give
+
+
+def _join_contracts(
+    contracts: ContractGraph,
+    prefix: str,
+    functions_at: dict[int, list[str]],
+    part: set[str],
+    text_at: dict[int, str],
+) -> ContractJoin:
+    """Each function node of the contract graph to the part function whose image copy starts at the
+    node's address. The address is the machine code the contract is about, so the join holds where the
+    node's id names another file than the C function's own: a file name with a hyphen, a function of
+    another C file or of a header, an alias symbol. Every other function node is a C3 item."""
+    owners: dict[str, str] = {}
+    resolved: dict[str, str] = {}
+    drops: list[dict[str, Any]] = []
+    given: dict[int, list[str]] = collections.defaultdict(list)
+    for node in contracts.function_nodes():
+        identity = node["id"]
+        address = contract_address(node)
+        symbols = node.get("syms", [])
+        detail: dict[str, Any] = {"address": node.get("addr") or None, "symbol": symbols[0] if symbols else None}
+        if prefix and not identity.startswith(prefix):
+            reason = "outside_function_prefix"
+        elif address is None:
+            # A macro, an always-inline helper or an assembly label: nothing in the image to own.
+            reason = "no_image_symbol"
+        else:
+            given[address].append(identity)
+            candidates = functions_at.get(address, [])
+            in_part = [candidate for candidate in candidates if candidate in part]
+            chosen = in_part or candidates
+            if len(chosen) == 1:
+                resolved[identity] = chosen[0]
+            if len(in_part) == 1:
+                owners[identity] = in_part[0]
+                continue
+            if in_part:
+                reason = "address_of_several_part_functions"
+                detail["candidates"] = in_part
+            else:
+                # Assembly, or a C function of a unit outside the part.
+                reason = "no_part_function_at_address"
+                detail["image_symbol"] = text_at.get(address)
+                detail["c_functions"] = candidates
+        drops.append(
+            {
+                "kind": "contract_function",
+                "reason": reason,
+                "function": None,
+                "target": identity,
+                "detail": detail,
+                "provenance": [{"source": "contract_graph", "id": identity}],
+            }
+        )
+    duplicates = [
+        {"address": _hex(address), "ids": sorted(ids)} for address, ids in sorted(given.items()) if len(ids) > 1
+    ]
+    return ContractJoin(owners, resolved, drops, duplicates)
+
+
+def _expected_functions(linker: Linker) -> list[str]:
+    """Functions of the part's files that the image holds: an image symbol (a global one, or a local
+    one that follows the unit's ELF FILE symbol) whose name a part unit defines."""
     expected: set[str] = set()
     for source in sorted(linker.part_files):
         base = os.path.basename(source)
@@ -1231,53 +1299,4 @@ def _expected_functions(
                 definition = linker.visible(source, name)
                 assert definition is not None
                 expected.add(definition.id)
-    drops = []
-    for (source, name), node in sorted(linker.contracts.functions.items()):
-        if source not in linker.part_files:
-            continue
-        owner = owners.get(node["id"])
-        reason = None
-        if (node.get("in_image") or node.get("addr")) and name in linker.image.functions:
-            definitions = [
-                item
-                for item in linker.by_name.get(name, [])
-                if item.file == source or (item.tu == source and item.file.endswith(".c"))
-            ]
-            if definitions:
-                # A function of the part's files: the hard check requires its node.
-                expected.add(definitions[0].id)
-                continue
-            if owner is None:
-                reason = "no_c_file"
-        if reason is None and owner is not None and owner.id not in part_functions:
-            reason = "definition_not_a_part_function"
-        if reason is not None:
-            drops.append(
-                {
-                    "kind": "contract_function",
-                    "reason": reason,
-                    "function": owner.id if owner is not None else None,
-                    "target": node["id"],
-                    "detail": {"source": source, "symbol": name},
-                    "provenance": [{"source": "contract_graph", "id": node["id"]}],
-                }
-            )
-    return sorted(expected), sorted(drops, key=jsonio.canonical)
-
-
-def _contract_mapping_duplicates(linker: Linker) -> list[dict[str, Any]]:
-    """Every contract mapping that gives one C function more than one contract node."""
-    mappings: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
-    for node in linker.contracts.nodes.values():
-        if node.get("kind") != "fn":
-            continue
-        source = c_file(node["id"], linker.config.contract_function_prefix)
-        if source is None:
-            continue
-        for symbol in node.get("syms", []):
-            mappings[(source, symbol.split(".", 1)[0])].add(node["id"])
-    return [
-        {"source": source, "symbol": symbol, "ids": sorted(ids)}
-        for (source, symbol), ids in sorted(mappings.items())
-        if len(ids) > 1
-    ]
+    return sorted(expected)

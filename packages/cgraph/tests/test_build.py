@@ -449,8 +449,19 @@ def test_concurrent_cli_builds_share_a_valid_cache(copy: Path, tmp_path: Path) -
 
 def test_an_assembly_function_of_a_part_file_is_excluded_not_a_node(copy: Path, tmp_path: Path) -> None:
     contracts = json.loads((copy / "contracts.json").read_text())
+    address = next(
+        line.split()[0]
+        for line in (copy / "image" / "System.map").read_text().splitlines()
+        if line.endswith(" anchor_pair")
+    )
     contracts["nodes"].append(
-        {"id": "Prog/src/store/AnchorPair", "kind": "fn", "syms": ["anchor_pair"], "addr": "", "in_image": True}
+        {
+            "id": "Prog/src/store/AnchorPair",
+            "kind": "fn",
+            "syms": ["anchor_pair"],
+            "addr": f"0x{int(address, 16):x}",
+            "in_image": True,
+        }
     )
     (copy / "contracts.json").write_text(json.dumps(contracts))
     out = tmp_path / "out"
@@ -462,7 +473,8 @@ def test_an_assembly_function_of_a_part_file_is_excluded_not_a_node(copy: Path, 
     )
     assert {key: item[key] for key in ("kind", "reason", "function", "target")} == {
         "kind": "contract_function",
-        "reason": "no_c_file",
+        "reason": "no_part_function_at_address",
         "function": None,
         "target": "Prog/src/store/AnchorPair",
     }
+    assert item["detail"]["image_symbol"] == "anchor_pair"

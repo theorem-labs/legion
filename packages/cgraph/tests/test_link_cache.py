@@ -99,23 +99,20 @@ def _change_system_map(copy: Path) -> None:
     path.write_text(path.read_text() + "0000000000000000 a cgraph_unused_absolute\n")
 
 
-def _pin_box_new(copy: Path) -> None:
-    address = next(
-        line.split()[0]
-        for line in (copy / "image" / "System.map").read_text().splitlines()
-        if line.endswith(" box_new")
-    )
+def _unpin_box_new(copy: Path) -> None:
+    """The fixture's contract graph pins box_new's image copy by its address; the change removes it."""
 
     def change(contracts: dict[str, Any]) -> None:
         for node in contracts["nodes"]:
             if node["id"] == "Prog/src/store/BoxNew":
-                node["addr"] = f"0x{int(address, 16):x}"
+                assert node["addr"]
+                node["addr"] = ""
 
     _edit_contracts(copy, change)
 
 
 @pytest.mark.parametrize(
-    "change", [_change_c, _change_config, _change_system_map, _pin_box_new], ids=["c", "config", "map", "pin"]
+    "change", [_change_c, _change_config, _change_system_map, _unpin_box_new], ids=["c", "config", "map", "pin"]
 )
 def test_a_change_to_an_input_the_core_reads_computes_it_again(
     copy: Path, tmp_path: Path, cores: list[str], change: Callable[[Path], None]
