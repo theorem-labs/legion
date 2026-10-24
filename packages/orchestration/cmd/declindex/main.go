@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -226,14 +225,6 @@ func fail(w io.Writer, err error) int {
 	}
 }
 
-func treeHead(tree string) string {
-	out, err := exec.Command("git", "-C", tree, "rev-parse", "HEAD").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 func (e *env) printJSON(v any) int {
 	enc := json.NewEncoder(e.stdout)
 	enc.SetIndent("", " ")
@@ -252,7 +243,7 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	}
 	defer e.close()
 	tree := e.cfg.TreeSpec()
-	opt := declindex.RefreshOptions{Commit: treeHead(e.cfg.Tree), Jobs: e.cfg.Jobs, Log: e.stderr}
+	opt := declindex.RefreshOptions{Jobs: e.cfg.Jobs, Log: e.stderr}
 	var sync func(context.Context) error
 	if commit := e.getenv("LAND_COMMIT"); commit != "" {
 		if !isCommitID(commit) {
@@ -260,6 +251,11 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 		}
 		opt.Commit, opt.CheckLandedCoverage = commit, true
 		sync = declindex.Sync(e.cfg, commit, e.stderr)
+	} else if head, err := declindex.TreeHead(ctx, e.cfg.Tree); err != nil {
+		// A build outside Git is indexed without a commit, which no ledger or gate check accepts.
+		fmt.Fprintf(e.stderr, "note: the index records no commit: %v\n", err)
+	} else {
+		opt.Commit = head
 	}
 	if e.cfg.Lean.Export {
 		opt.Compiled = func(ctx context.Context) (*declindex.CompiledOptions, error) { return compiledOptions(ctx, e) }
@@ -321,7 +317,9 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	if st.Modules, err = e.store.ModuleCount(ctx); err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	st.TreeHead = treeHead(e.cfg.Tree)
+	if st.TreeHead, err = declindex.TreeHead(ctx, e.cfg.Tree); err != nil {
+		fmt.Fprintf(e.stderr, "note: %v\n", err)
+	}
 	if e.g.json {
 		return e.printJSON(st)
 	}
@@ -330,13 +328,20 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	return 0
 }
 
-// staleNote warns when the build the index read is not the tree's current commit.
-func (e *env) staleNote(ctx context.Context) string {
-	c, _ := e.store.Meta(ctx, "commit")
-	if h := treeHead(e.cfg.Tree); h != "" && c != h {
+// staleNote reads the index's commit, and warns when the build the index read is not the tree's current commit, or
+// when the tree's commit cannot be read.
+func (e *env) staleNote(ctx context.Context) (string, error) {
+	c, err := e.store.Meta(ctx, "commit")
+	if err != nil {
+		return "", err
+	}
+	switch h, err := declindex.TreeHead(ctx, e.cfg.Tree); {
+	case err != nil:
+		fmt.Fprintf(e.stderr, "note: cannot compare the index's commit with the tree's: %v\n", err)
+	case c != h:
 		fmt.Fprintf(e.stderr, "note: the index is at %s, the tree at %s; run declindex refresh after the build\n", short(c), short(h))
 	}
-	return c
+	return c, nil
 }
 
 func short(c string) string { return c[:min(9, len(c))] }
@@ -362,7 +367,9 @@ func cmdWhere(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	e.staleNote(ctx)
+	if _, err := e.staleNote(ctx); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
 	var all []declindex.Found
 	rc := 0
 	for _, q := range qs {
@@ -397,7 +404,9 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	e.staleNote(ctx)
+	if _, err := e.staleNote(ctx); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
 	rc := 0
 	type hashed struct {
 		Declaration string `json:"declaration"`
@@ -470,7 +479,10 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	commit := e.staleNote(ctx)
+	commit, err := e.staleNote(ctx)
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
 	rc := 0
 	var answers []declindex.Answer
 	for _, q := range qs {

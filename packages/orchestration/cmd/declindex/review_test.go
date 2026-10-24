@@ -44,6 +44,11 @@ func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 	if err := os.WriteFile(config, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The ledger compares the index's commit with the tree's, so the tree is a Git work tree.
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "one")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}

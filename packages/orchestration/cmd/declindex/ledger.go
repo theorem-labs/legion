@@ -149,9 +149,16 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	indexCommit := e.staleNote(ctx)
-	if indexCommit != treeHead(e.cfg.Tree) {
-		return fail(e.stderr, &unableError{fmt.Errorf("the index is at %q, not the tree's commit: refresh it after the landing first", indexCommit)})
+	indexCommit, err := e.store.Meta(ctx, "commit")
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	head, err := declindex.TreeHead(ctx, e.cfg.Tree)
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	if indexCommit != head {
+		return fail(e.stderr, &unableError{fmt.Errorf("the index is at %q, not the tree's commit %s: refresh it after the landing first", indexCommit, head)})
 	}
 	if landed != "" {
 		covers, err := ledgerCommitCovers(ctx, e.cfg.Tree, landed, indexCommit)

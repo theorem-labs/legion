@@ -157,6 +157,31 @@ func TestGateRejectsInTreeStateAndEscapedRegistry(t *testing.T) {
 	})
 }
 
+// A tree that is not a Git work tree has no commit to compare the index's commit with: the gate is unable to
+// decide, rather than comparing two empty commits.
+func TestGateIsUnableOnATreeThatIsNotAGitWorkTree(t *testing.T) {
+	old := gateSandboxAvailable
+	gateSandboxAvailable = func() error { return nil }
+	t.Cleanup(func() { gateSandboxAvailable = old })
+	config := fixture(t)
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
+	body, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, config, string(body)+"registry: registry\n")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	proposal := filepath.Join(filepath.Dir(config), "proposal.json")
+	writeTestFile(t, proposal, `{"id":"p","concept":{"name":"Fresh","home":"New.lean","meaning":"A fresh fact."},"source":"def Fresh : Prop := True\n"}`)
+	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+	if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "commit of the tree") {
+		t.Fatalf("gate on a tree that is not a Git work tree: want exit 3, no stdout and the tree's commit named, got %+v", r)
+	}
+}
+
 func TestGateRejectsRegistryMutationAfterInitialStatus(t *testing.T) {
 	oldSandbox, oldStatus := gateSandboxAvailable, gateAfterRegistryStatus
 	gateSandboxAvailable = func() error { return nil }

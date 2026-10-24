@@ -88,6 +88,11 @@ func TestLedgerClassifiesConnectionFailureAsTemporary(t *testing.T) {
 	if err := os.WriteFile(config, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The ledger compares the index's commit with the tree's, so the tree is a Git work tree.
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "one")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}
@@ -107,5 +112,30 @@ func TestLedgerRequiresADatabaseSource(t *testing.T) {
 	config := fixture(t)
 	if r := invoke(t, "--config", config, "ledger"); r.code != 2 {
 		t.Fatalf("ledger without a DSN or contracts file: %+v", r)
+	}
+}
+
+// A tree that is not a Git work tree has no commit to compare the index's commit with: the ledger check is
+// unable to run, rather than comparing two empty commits.
+func TestLedgerIsUnableOnATreeThatIsNotAGitWorkTree(t *testing.T) {
+	config := fixture(t)
+	body, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, append(body, []byte("repo: r\ncontracts:\n  paths: [\"Sub/**\"]\n  kinds: [def]\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	contracts := filepath.Join(filepath.Dir(config), "contracts.json")
+	if err := os.WriteFile(contracts, []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	emit := filepath.Join(filepath.Dir(config), "operations.jsonl")
+	r := invoke(t, "--config", config, "ledger", "--contracts-file", contracts, "--emit", emit)
+	if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "commit of the tree") {
+		t.Fatalf("ledger on a tree that is not a Git work tree: want exit 3, no stdout and the tree's commit named, got %+v", r)
 	}
 }

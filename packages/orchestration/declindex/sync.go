@@ -120,6 +120,20 @@ func trackedChanges(ctx context.Context, tree string) (bool, error) {
 	return strings.TrimSpace(string(out)) != "", nil
 }
 
+// TreeHead is the commit that the Git work tree at tree has checked out. A tree that is not a Git work tree, or
+// whose branch has no commit yet, is an error: it has no commit to compare an index's commit with.
+func TreeHead(ctx context.Context, tree string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", tree, "rev-parse", "HEAD").Output()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && len(exit.Stderr) != 0 {
+			err = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exit.Stderr)))
+		}
+		return "", fmt.Errorf("read the commit of the tree %s: %w", tree, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 func commitIsAncestor(ctx context.Context, tree, ancestor, descendant string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", tree, "merge-base", "--is-ancestor", ancestor, descendant)
 	err := cmd.Run()

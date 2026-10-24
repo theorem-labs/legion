@@ -46,7 +46,9 @@ func cmdStates(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	e.staleNote(ctx)
+	if _, err := e.staleNote(ctx); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
 	out := map[string][]declindex.Stating{}
 	rc := 0
 	for _, c := range concepts {
@@ -88,7 +90,9 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	e.staleNote(ctx)
+	if _, err := e.staleNote(ctx); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
 	out := map[string][]string{}
 	rc := 0
 	for _, q := range qs {
@@ -304,7 +308,11 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	if head := treeHead(e.cfg.Tree); head != commit {
+	head, err := declindex.TreeHead(ctx, e.cfg.Tree)
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	if head != commit {
 		return fail(e.stderr, &unableError{fmt.Errorf("the tree HEAD %s differs from the index commit %s", head, commit)})
 	}
 	rel, err := filepath.Rel(e.cfg.Tree, registry)
@@ -345,7 +353,6 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fail(e.stderr, &usageError{fmt.Sprintf("%s: %v", args[0], err)})
 	}
-	e.staleNote(ctx)
 	co, err := e.cfg.Compiled(ctx, declindex.FormsModule{}, e.stderr)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
