@@ -288,6 +288,18 @@ These rules follow what the machine code shows, each only where it shows it:
   `cancelled_by`, the helper, and a helper's returned member address (`returned`, `dl_rq_of_se`'s
   `&rq->dl`) is dropped at a call marked `result_cancelled`, whose value the caller takes back the
   same way (`rq_of_dl_rq(dl_rq_of_se(dl_se))`).
+- A condition the walk decides takes each local as the stores that reach it on live paths hold it: the
+  store every path to the use passes (copy_creds' `ret = create_user_ns(new); if (ret < 0) goto
+  error_put;` with the stub's -EINVAL), or the initial value and the stores outside a branch a constant
+  condition rules out (dma_direct_alloc's `remap`, WARN_ONCE's `__ret_once`); a local whose address is
+  taken counts only where that happens after the use, outside any loop (mlock_pte_range's `ptl`). The
+  value of `({ …; v; })` is its last statement's. A decided `if` whose taken branch exits ends its
+  block, and a `for` whose condition is false for the values its init gives (`for (i = 8; i <
+  KMALLOC_MIN_SIZE; …)` with KMALLOC_MIN_SIZE 8) has no compiled body or step.
+- A call through a member of a struct passed by value (rht_head_hashfn's `params.obj_hashfn(…)`) is a
+  `parameter_calls` item with that `member`; at the fold whose arguments make the member a function of
+  the unit (simple_xattr_params' simple_xattr_obj_hashfn) that function is one the code passes, called
+  with the call's arguments, and folded where the image shows it (its inlined jhash).
 - A helper folded under a `__builtin_constant_p` choice marks all its events `conditional`, field
   accesses too: the machine code decides whether that branch was compiled, so a conditional field
   access with no match is excluded as `image_decided` (below).

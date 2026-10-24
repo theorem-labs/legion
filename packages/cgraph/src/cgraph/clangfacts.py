@@ -2310,6 +2310,13 @@ class _Evaluator:
         if kind == K.COMPOUND_LITERAL_EXPR and typed is None and _is_record(cursor.type):
             # pte_clear's __pte(0), ((pte_t) { (0) }): a struct its initializer gives.
             return self.literal_struct(cursor)
+        if kind == K.StmtExpr and inner and inner[0].kind == K.COMPOUND_STMT:
+            # __ONCE_LITE_IF's ({ …; unlikely(__ret_once); }): the value of its last statement.
+            statements = _children(inner[0])
+            last = statements[-1] if statements else None
+            if last is None or not last.kind.is_expression():
+                return None
+            return self.expression(last, resolve, depth + 1, truth)
         if typed is None:
             return None
         if kind == K.UNARY_OPERATOR and inner and libclang.is_address_of(cursor):
@@ -2367,7 +2374,8 @@ class _Evaluator:
     def object_address(self, operand: ci.Cursor, typed: dict[str, Any]) -> dict[str, Any] | None:
         """``&g`` of a global, or a function, that no declaration the unit sees makes weak: an address
         that is not 0 (pagetable_pte_ctor's ``mm != &init_mm`` holds for NULL), named so that two are
-        compared alike. A function of the unit gives the parameters it never reads (``ignored``)."""
+        compared alike. A function of the unit gives its name (``function``) and the parameters it never
+        reads (``ignored``)."""
         node = _strip(operand)
         named = node.referenced if node.kind == K.DECL_REF_EXPR else None
         if named is None or not (_is_global_var(named) or named.kind == K.FUNCTION_DECL):
@@ -2376,7 +2384,8 @@ class _Evaluator:
         if any(self.weak(declaration) for declaration in declarations if declaration is not None):
             return None
         if named.kind == K.FUNCTION_DECL and named.spelling in self.definitions:
-            return {"g": named.get_usr(), "ignored": sorted(self.ignored(named)), **typed}
+            ignored = sorted(self.ignored(named))
+            return {"g": named.get_usr(), "function": named.spelling, "ignored": ignored, **typed}
         return {"g": named.get_usr(), **typed}
 
     def struct_reference(self, cursor: ci.Cursor, resolve: _Resolve, depth: int) -> dict[str, Any] | None:
@@ -3181,6 +3190,124 @@ class _FunctionWalk:
         """The condition as an expression on the parameters, when it names one."""
         expression = self.x.evaluator.expression(condition, self.held, truth=truth)
         return expression if expressions.mentions_parameter(expression) else None
+
+    def flowed(self, variable: ci.Cursor, reference: ci.Cursor, depth: int) -> dict[str, Any] | None:
+        """The values a local may hold at ``reference`` on live paths: the store every path to it
+        passes and the stores that can still come after that one (copy_creds' ``ret =
+        create_user_ns(new); if (ret < 0)``), or, without such a store, its initial value and each store
+        outside a branch a constant condition rules out (dma_direct_alloc's ``remap = true`` under
+        PageHighMem). A local whose address is taken only after the reference, outside any loop, keeps
+        these values there (mlock_pte_range's ``ptl``); any other one is stated as ``held`` states it."""
+        key = variable.hash
+        writes = self.x.evaluator.stores_in(self.cursor)
+        if variable.kind == K.VAR_DECL and not _is_local(variable):
+            # A static local keeps its value between calls.
+            return None
+        if (
+            variable.kind != K.VAR_DECL
+            or key in self.holding
+            or depth > _EXPRESSION_DEPTH
+            or key in writes.combined
+            or (key in writes.opaque and not self.escapes_after(variable, reference))
+        ):
+            return self.held(variable, reference, depth)
+        self.local_uses()
+        definitions = self.definitions.get(key, [])
+        dominating = self.dominating(variable, reference)
+        if dominating is not None:
+            value, keep = dominating
+            others = [other for other, place in definitions if other.hash != value.hash and keep(other, place)]
+            sources = [value, *(other for other in others if not self.dead_store(other))]
+        else:
+            live = [other for other, _ in definitions if not self.dead_store(other)]
+            if len(live) == len(definitions) and key not in writes.opaque:
+                return self.held(variable, reference, depth)
+            initializer = libclang.var_initializer(variable)
+            if initializer is None:
+                return None
+            sources = [initializer, *live]
+        self.holding.add(key)
+        try:
+            stated = [self.x.evaluator.expression(source, self.flowed, depth + 1) for source in sources]
+        finally:
+            self.holding.discard(key)
+        if any(value is None for value in stated):
+            return None
+        choice = stated[0]
+        for value in stated[1:]:
+            choice = {"op": "?:", "a": [None, choice, value]}
+        return choice
+
+    def dead_store(self, store: ci.Cursor) -> bool:
+        """The store is in a branch of an ``if`` whose condition a constant rules it out of."""
+        node = store
+        while node.hash != self.cursor.hash:
+            parent = self.parents.get(node.hash)
+            if parent is None:
+                return False
+            branches = _children(parent)
+            if parent.kind == K.IF_STMT and len(branches) >= 2 and node.hash != branches[0].hash:
+                value = self.x.evaluator.evaluate(branches[0], truth=True)
+                if value is not None and (node.hash == branches[1].hash) != bool(value):
+                    return True
+            node = parent
+        return False
+
+    def decided(self, condition: ci.Cursor) -> int | None:
+        """The truth of a condition: as the evaluator folds it, or as the stores that reach its locals
+        on live paths give it (``flowed``)."""
+        value = self.x.evaluator.evaluate(condition, truth=True)
+        if value is not None or self.x.evaluator.image_decides(condition):
+            return value
+        return expressions.truth(self.x.evaluator.expression(condition, self.flowed, truth=True))
+
+    def decided_exit(self, statement: ci.Cursor) -> bool:
+        """An ``if`` whose condition ``decided`` gives and whose branch it selects exits."""
+        parts = _children(statement)
+        if statement.kind != K.IF_STMT or len(parts) < 2:
+            return False
+        value = self.decided(parts[0])
+        if value is None:
+            return False
+        branch = parts[1] if value else (parts[2] if len(parts) > 2 else None)
+        return branch is not None and self.x.evaluator.exits(branch)
+
+    def never_entered(self, loop: ci.Cursor) -> bool:
+        """A ``for`` whose condition, which stores nothing, is false for the values its init gives the
+        variables it sets: the body never runs (``for (i = 8; i < 8; i += 8)``)."""
+        parts = _children(loop)
+        roles = self.header_roles(parts[:-1])
+        if roles is None or "init" not in roles or "condition" not in roles or loop.hash in self.label_holders:
+            return False
+        initial, condition = parts[roles.index("init")], parts[roles.index("condition")]
+        if any(_store_target(node) is not None for node in condition.walk_preorder()):
+            return False
+        firsts: dict[int, ci.Cursor] = {}
+        node = _bare(initial)
+        if node.kind == K.DECL_STMT:
+            for variable in _children(node):
+                value = libclang.var_initializer(variable) if variable.kind == K.VAR_DECL else None
+                if value is not None:
+                    firsts[variable.hash] = value
+        pending = [node]
+        while pending:
+            part = _bare(pending.pop())
+            operands = _children(part)
+            if part.kind == K.BINARY_OPERATOR and libclang.binary_kind(part) == _COMMA:
+                pending += operands
+            elif _is_plain_assignment(part) and len(operands) == 2:
+                target = _strip_parens(operands[0])
+                if target.kind == K.DECL_REF_EXPR and target.referenced is not None:
+                    firsts[target.referenced.hash] = operands[1]
+        if not firsts:
+            return False
+
+        def entry(variable: ci.Cursor, reference: ci.Cursor, depth: int) -> dict[str, Any] | None:
+            if variable.hash in firsts:
+                return self.x.evaluator.expression(firsts[variable.hash], self.flowed, depth + 1)
+            return self.flowed(variable, reference, depth)
+
+        return expressions.truth(self.x.evaluator.expression(condition, entry, truth=True)) == 0
 
     def object_operand(self, operand: ci.Cursor) -> bool:
         """The operand is the address of an object the program defines (``&init_mm``), never 0."""
@@ -4466,6 +4593,17 @@ class _FunctionWalk:
                 }
             )
             return
+        member = self.pointer_target(node)
+        if member is not None:
+            # rht_head_hashfn's params.obj_hashfn(ptr, …): the function a fold binds the member to is
+            # called with these arguments (link.Linker.member_calls).
+            self.events["parameter_calls"].append(
+                {
+                    "member": member,
+                    "arguments": [self.argument(argument) for argument in arguments],
+                    "provenance": [self.x.location(node)],
+                }
+            )
         callee_expression = head
         for child in callee_expression.walk_preorder():
             referenced = child.referenced
@@ -4945,7 +5083,7 @@ class _FunctionWalk:
                     self.walk(child, node, child_index, reason, generic)
                 self.conditional -= 1
                 return
-            value = self.x.evaluator.evaluate(condition, truth=True)
+            value = self.decided(condition)
             if value is not None:
                 live = 1 if value else 2
                 self.walk(condition, node, 0, reason, generic)
@@ -5057,6 +5195,14 @@ class _FunctionWalk:
                 self.discard(children[0], node, 0, generic)
                 self.walk(children[1], node, 1, reason, generic)
                 return
+        if kind == K.FOR_STMT and reason is None and self.never_entered(node):
+            # setup_kmalloc_cache_index_table's for (i = 8; i < KMALLOC_MIN_SIZE; i += 8), KMALLOC_MIN_SIZE
+            # being 8: the init and the first test are code, the body and the step are not.
+            roles = self.header_roles(children[:-1]) or []
+            for child_index, child in enumerate(children):
+                role = roles[child_index] if child_index < len(roles) else "body"
+                self.walk(child, node, child_index, None if role in ("init", "condition") else "dead_branch", generic)
+            return
         if kind == K.SWITCH_STMT and len(children) == 2 and reason is None:
             # A value clang folds (switch (sizeof(x)), switch (_NSIG_WORDS)). The evaluator's helper
             # results are truth values, which choose an if but not a case.
@@ -5132,7 +5278,7 @@ class _FunctionWalk:
                     self.walk_guarded(case_guard, child, node, child_index, None, generic)
                 else:
                     self.walk(child, node, child_index, None, generic)
-                if not dead and self.x.evaluator.exits(child):
+                if not dead and (self.x.evaluator.exits(child) or self.decided_exit(child)):
                     dead = True
                 elif not dead and _exits_under_builtin(child, self.x.evaluator):
                     self.conditional += 1

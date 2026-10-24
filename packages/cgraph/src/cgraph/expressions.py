@@ -83,6 +83,12 @@ def _address(expression: Expression | None) -> Expression | None:
     return None
 
 
+def function_named(expression: Expression | None) -> str | None:
+    """The function of the unit an address names (a constant struct's member that holds it), or None."""
+    found = _address(expression)
+    return found.get("function") if found is not None else None
+
+
 def _truths(expression: Expression | None) -> set[int] | None:
     """The truth values the expression may take (an object's address is true), or None."""
     if nonzero(expression):

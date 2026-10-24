@@ -213,6 +213,9 @@ class Effective:
     # Per function the code passes to a folded helper, the arguments that helper calls it with
     # (kref_put's release(kref)), in this code's terms.
     pointer_calls: dict[str, list[list[dict[str, Any]]]] = field(default_factory=dict)
+    # The calls through a member of a struct a parameter passes by value whose function no fold has
+    # bound yet (rht_head_hashfn's params.obj_hashfn), in this code's terms.
+    member_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _with_via(item: dict[str, Any], helper: str) -> dict[str, Any]:
@@ -485,6 +488,8 @@ class Linker:
         result = Effective()
         for kind in _EVENT_LISTS:
             setattr(result, kind, _resolved(events[kind], table))
+        through = _resolved(events.get("parameter_calls", []), table)
+        result.member_calls = [item for item in through if "member" in item]
         callees = self.image_callees(caller)
         calls = _resolved(events["calls"], table)
 
@@ -536,6 +541,7 @@ class Linker:
                 result.folds += bound.folds
                 result.unbound += [_under(item, guards) for item in bound.unbound]
                 self.pointer_calls(tu, callee, call, result)
+                self.member_calls(child, call, result)
             else:
                 result.calls.append({**call, "tu": tu})
                 if call.get("visible") and callee in callees and callee not in stack and callee != name:
@@ -641,6 +647,34 @@ class Linker:
         self.effective_cache[key] = result
         return result
 
+    def member_calls(self, child: Effective, call: dict[str, Any], result: Effective) -> None:
+        """The calls a folded helper makes through a member of a struct its parameter passes by value,
+        with the call's arguments put in: where the member is now a function of the unit (simple_xattr
+        _params' obj_hashfn is simple_xattr_obj_hashfn), that function is one the code passes, called
+        with those arguments (``pointer_calls``), and folded where the image shows it; where it still
+        names a parameter, the call goes up to the next fold."""
+        values = _argument_values(call["arguments"])
+        named = {item["target"] for item in result.function_pointers}
+        for item in child.member_calls:
+            restated = {"callee": "", "arguments": item["arguments"], "provenance": item["provenance"]}
+            if item.get("guards"):
+                restated["guards"] = item["guards"]
+            live = _bind(Effective(calls=[restated]), call["arguments"]).calls
+            if not live:
+                continue
+            member = expressions.substitute(item["member"], values)
+            target = expressions.function_named(member)
+            guards = [*live[0].get("guards", []), *call.get("guards", [])]
+            if target is not None:
+                result.pointer_calls.setdefault(target, []).append(live[0]["arguments"])
+                if target not in named:
+                    named.add(target)
+                    pointer = {"target": target, "provenance": item["provenance"]}
+                    result.function_pointers.append({**pointer, "guards": guards} if guards else pointer)
+            elif expressions.mentions_parameter(member):
+                moved = {**item, "member": member, "arguments": live[0]["arguments"]}
+                result.member_calls.append({**moved, "guards": guards} if guards else moved)
+
     def pointer_calls(self, tu: str, helper: str, call: dict[str, Any], result: Effective) -> None:
         """The calls a folded helper makes through a parameter its caller passes a function in: that
         function's arguments in the caller's terms, kept per function in ``result.pointer_calls``."""
@@ -649,6 +683,8 @@ class Linker:
             record = record.get("value_unused", record)
         through = _resolved(record["events"].get("parameter_calls", []), record.get("guards", []))
         for item in through:
+            if "param" not in item:
+                continue
             passed = call["arguments"][item["param"]] if item["param"] < len(call["arguments"]) else {}
             target = passed.get("function")
             if target is None:

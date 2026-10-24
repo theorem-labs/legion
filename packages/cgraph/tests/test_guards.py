@@ -946,3 +946,128 @@ def test_a_compound_literal_argument_is_a_constant_struct(tmp_path: Path) -> Non
     assert {call["callee"] for call in fold(facts, "pte_clear", "set_pte_at").calls} == {"pte_present", "kept"}
     assert "warn" in {call["callee"] for call in fold(facts, "pte_mark", "set_pte_at").calls}
     assert "warn" in {call["callee"] for call in fold(facts, "pte_set", "set_pte_at").calls}
+
+
+FLOW = """
+    static inline int stub_ns(void *p) { return -22; }
+    int set_counts(void *p);
+    void bump(int *v);
+    int copy(void *p, unsigned long flags)
+    {
+        int ret;
+        if (flags & 1) {
+            ret = stub_ns(p);
+            if (ret < 0)
+                goto error;
+            ret = set_counts(p);
+            if (ret < 0)
+                goto error;
+        }
+        late();
+        return 0;
+    error:
+        err();
+        return ret;
+    }
+    int copy_bumped(void *p)
+    {
+        int ret = stub_ns(p);
+        bump(&ret);
+        if (ret < 0)
+            return ret;
+        note();
+        return 0;
+    }
+    static inline int *trans_lock(void *p) { return 0; }
+    int *map_lock(void *p, int **ptl);
+    void range(void *p) { int *ptl; ptl = trans_lock(p); if (ptl) { warn(); return; } map_lock(p, &ptl); kept(); }
+    static inline int highmem(void *p) { return 0; }
+    void remap_fn(void *p) { int remap = 0; if (highmem(p)) remap = 1; if (remap) warn(); kept(); }
+    void remap_live(void *p, int k) { int remap = 0; if (k) remap = 1; if (remap) warn(); kept(); }
+"""
+
+
+def test_a_local_holds_what_the_stores_that_reach_a_use_on_live_paths_give(tmp_path: Path) -> None:
+    """copy_creds: `ret = create_user_ns(new); if (ret < 0) goto error_put;` with the stub returning
+    -EINVAL, so set_cred_ucounts is not compiled; mlock_pte_range: `ptl = pmd_trans_huge_lock(pmd,
+    vma); if (ptl)` with the stub returning NULL, `&ptl` taken after; dma_direct_alloc: `remap = true`
+    only under PageHighMem, which is 0 (llvm-objdump: no call of set_counts, warn)."""
+    facts = facts_of(tmp_path, FLOW)
+
+    def callees(function: str) -> set[str]:
+        return {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+
+    assert callees("copy") == {"stub_ns", "late", "err"}
+    assert "note" in callees("copy_bumped")
+    assert "warn" not in callees("range")
+    assert "warn" not in callees("remap_fn")
+    assert "warn" in callees("remap_live")
+
+
+WARN_ONCE = """
+    void __warn_printk(const char *fmt, ...);
+    #define unlikely(x) __builtin_expect(!!(x), 0)
+    #define __ONCE_LITE_IF(condition) ({ static _Bool __already_done; _Bool __ret_cond = !!(condition); \\
+        _Bool __ret_once = 0; if (unlikely(__ret_cond && !__already_done)) { __already_done = 1; \\
+        __ret_once = 1; } unlikely(__ret_once); })
+    #define DO_ONCE_LITE_IF(condition, func, ...) ({ _Bool __ret_do_once = !!(condition); \\
+        if (__ONCE_LITE_IF(__ret_do_once)) func(__VA_ARGS__); unlikely(__ret_do_once); })
+    #define WARN(condition, format...) ({ int __ret_warn_on = !!(condition); \\
+        if (unlikely(__ret_warn_on)) __warn_printk(format); unlikely(__ret_warn_on); })
+    #define WARN_ONCE(condition, format...) DO_ONCE_LITE_IF(condition, WARN, 1, format)
+    void lock_idx(unsigned long mask) { WARN_ONCE(0 && (mask & (mask - 1)), "mixed"); kept(); }
+    void lock_live(unsigned long mask) { WARN_ONCE(mask & (mask - 1), "mixed"); kept(); }
+    void size_table(long *table, int min)
+    {
+        int i;
+        for (i = 8; i < 8; i += 8)
+            table[i] = note_index(i);
+        for (i = 8; i < min; i += 8)
+            table[i] = late_index(i);
+        kept();
+    }
+    int note_index(int i); int late_index(int i);
+"""
+
+
+def test_a_warn_once_whose_condition_is_constant_false_and_a_loop_never_entered_are_not_code(tmp_path: Path) -> None:
+    """srcu_readers_lock_idx: `WARN_ONCE(IS_ENABLED(CONFIG_PROVE_RCU) && (mask & (mask - 1)), …)`:
+    __ONCE_LITE_IF's `__ret_once` is set only under its false test, so its value, 0, decides the if
+    (llvm-objdump: no __warn_printk). setup_kmalloc_cache_index_table: `for (i = 8; i < KMALLOC_MIN_SIZE;
+    i += 8)` with KMALLOC_MIN_SIZE 8 (llvm-objdump: ret)."""
+    facts = facts_of(tmp_path, "int note_index(int i); int late_index(int i);" + WARN_ONCE)
+
+    def callees(function: str) -> set[str]:
+        return {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+
+    assert callees("lock_idx") == {"kept"}
+    assert "__warn_printk" in callees("lock_live")
+    assert callees("size_table") == {"late_index", "kept"}
+
+
+MEMBER_CALL = """
+    struct hp { unsigned short len; long (*hash)(const void *, unsigned int); };
+    long inner(const void *k);
+    static long name_hash(const void *k, unsigned int len) { return inner(k); }
+    static const struct hp named = { .hash = name_hash };
+    static inline long lookup(const void *k, const struct hp params) { return params.hash ? params.hash(k, params.len) : 0; }
+    static inline long mid(const void *k, const struct hp params) { return lookup(k, params); }
+    long find(const void *k) { return mid(k, named); }
+"""
+
+
+def test_a_function_a_const_struct_member_names_is_folded_where_a_helper_calls_through_it(tmp_path: Path) -> None:
+    """simple_xattr_add: rht_head_hashfn calls `params.obj_hashfn(ptr, …)`, simple_xattr_params names
+    simple_xattr_obj_hashfn, which the compiler inlined: the image of simple_xattr_add calls its jhash."""
+    from test_link_rules import StubImage, build, c_calls, call_pairs, image_calls
+
+    from cgraph.image import FunctionFacts
+
+    facts = facts_of(tmp_path, MEMBER_CALL)
+    image = StubImage(
+        {"find": [(0x100, False, "")], "inner": [(0x200, False, "")]},
+        {0x100: FunctionFacts(calls=image_calls("inner"))},
+    )
+    graph = build({"src/g.c": facts}, image)
+    assert "function:inner" in c_calls(graph, "function:find")
+    assert call_pairs(graph)["only_image"] == []
