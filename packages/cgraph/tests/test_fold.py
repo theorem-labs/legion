@@ -135,3 +135,15 @@ def test_a_member_address_a_container_of_takes_back_is_not_formed(
 )
 def test_a_member_address_read_through_stays(fold_build: dict[str, Any], function: str, fields: set[str]) -> None:
     assert folded_fields(fold_build, function) == fields
+
+
+@pytest.mark.parametrize(("function", "record"), [("fd_index_kept", ("f", 16, 40)), ("fd_index_folded", ("h", 8, 32))])
+def test_an_index_s_constant_may_stay_in_the_index_register(
+    fold_build: dict[str, Any], function: str, record: tuple[str, int, int]
+) -> None:
+    """t->act[k - 1].f: sd 0x28 where the register keeps k - 1 for a shift; t->act[k - 1].h: sd 0x8
+    where the constant folds into the store (llvm-objdump). The record offers both, and each matches."""
+    (item,) = fold_build["graph"]["analysis"]["field_accesses"][f"function:{function}"]
+    assert (item["field"], item["displacement"], item["index_displacement"]) == record
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert f"function:{function}" not in {entry["function"] for entry in offsets["misses"]}

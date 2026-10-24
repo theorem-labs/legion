@@ -254,3 +254,28 @@ long fd_not_taken_back(struct fd_two *t)
 {
 	return fd_two_read(&t->b);
 }
+
+/* kernel/signal.c kernel_sigaction: current->sighand->action[sig - 1].sa.sa_handler = action, then
+ * sigaddset(&mask, sig) shifts by sig - 1: the register keeps sig - 1, so the store adds the array's
+ * offset, 32 + 8 for f, not 32 - 24 + 8. Alone, the store to h folds the constant: 8. */
+struct fd_elem {
+	long h;
+	long f;
+	long m;
+};
+struct fd_table {
+	long lock;
+	long pad[3];
+	struct fd_elem act[8];
+};
+
+void fd_index_kept(struct fd_table *t, int k, long v, unsigned long *mask)
+{
+	t->act[k - 1].f = v;
+	*mask = 1UL << (k - 1);
+}
+
+void fd_index_folded(struct fd_table *t, int k, long v)
+{
+	t->act[k - 1].h = v;
+}

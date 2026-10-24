@@ -837,7 +837,7 @@ def _fix_index(item: dict[str, Any], arguments: list[dict[str, Any]]) -> dict[st
         if value is not None:
             shift += value * term["scale"]
         elif isinstance(expression, dict) and "p" in expression and set(expression) <= {"p", "w", "s"}:
-            kept.append({"param": expression["p"], "scale": term["scale"]})
+            kept.append({**term, "param": expression["p"]})
     fixed = {key: value for key, value in item.items() if key != "index"}
     if kept:
         fixed["index"] = kept
@@ -1847,7 +1847,10 @@ def _initializer_value(
 def _field_access(item: dict[str, Any]) -> dict[str, Any]:
     """A field access as the structure check reads it. ``address`` marks a member whose value is only
     its address (``&p->m``, an array member decaying to a pointer); ``element_displacement`` is the
-    displacement past a variable index; ``param`` is the parameter the base pointer is."""
+    displacement past a variable index; ``param`` is the parameter the base pointer is;
+    ``index_displacement`` is the displacement without the constants of the parameter indices, which
+    the machine code may keep in the index register (kernel_sigaction's ``action[sig - 1]``: the
+    register holds sig - 1 and the store adds 32, not 8)."""
     access = {key: item.get(key, -1) for key in _FIELD_KEYS}
     if item.get("address"):
         access["address"] = True
@@ -1857,6 +1860,9 @@ def _field_access(item: dict[str, Any]) -> dict[str, Any]:
     for key in ("element_displacement", "inner_displacement", "param", "element_size", "object", "object_size"):
         if item.get(key) is not None:
             access[key] = item[key]
+    kept = sum(term.get("constant", 0) * term["scale"] for term in item.get("index", []))
+    if kept and item.get("base") != "unknown" and item.get("displacement", -1) != -1:
+        access["index_displacement"] = item["displacement"] - kept
     return access
 
 

@@ -173,10 +173,13 @@ These rules follow what the machine code shows, each only where it shows it:
   addresses), and the access's own displacement stays as `inner_displacement`, for code that keeps
   the member's address in a register. An address that steps by a helper's parameter
   (`sb->s_writers.rw_sem + level - 1`) gives an `index` term: a caller's constant argument adds its
-  steps at the fold, the caller's own parameter carries the term on. A pointer loaded through the
-  parameter (`f(path->dentry)`) is another object and is not rebased. A parameter is followed to its
-  callers' globals (above) on the same rule. `analysis.object_arguments` lists each local object whose
-  address a function passes to a call.
+  steps at the fold, the caller's own parameter carries the term on. A term keeps the constant its
+  index adds to the parameter (`sig - 1`), and the structure check also tries the displacement
+  without those constants' steps, `index_displacement`, as the machine code may keep the constant in
+  the index register (`kernel_sigaction`'s `action[sig - 1]`, whose `sig - 1` a shift reuses). A
+  pointer loaded through the parameter (`f(path->dentry)`) is another object and is not rebased. A
+  parameter is followed to its callers' globals (above) on the same rule. `analysis.object_arguments`
+  lists each local object whose address a function passes to a call.
 - A local's or parameter's address is derived from the values that reach each use: the assignments
   before it (or after it, around a loop or a backward goto), less those an assignment on every path
   overwrites (also a `for` header's: the condition's `(p = next_task(p)) != &init_task` in the body,

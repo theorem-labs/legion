@@ -316,13 +316,16 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             size = max(1, item.get("size", 1) or 1)
             # Where the image may keep an inner address in a register instead of the folded sum: the
             # element of a variable index (``element_displacement``), a rebased helper's member, a
-            # global's member (the field's own offset), or the container itself where container_of
-            # cancels against a pointer the code already holds (the field's own offset).
+            # global's member (the field's own offset), the container itself where container_of
+            # cancels against a pointer the code already holds (the field's own offset), or an index
+            # register that holds a parameter index with its constant (``index_displacement``).
             alternates = [offset]
             if item.get("element_displacement") is not None:
                 alternates.append(item["element_displacement"])
             if item.get("inner_displacement") is not None:
                 alternates.append(item["inner_displacement"])
+            if item.get("index_displacement") is not None:
+                alternates.append(item["index_displacement"])
             if base in ("global", "container_of") and item.get("offset", -1) >= 0:
                 alternates.append(item["offset"])
             register = next(

@@ -229,16 +229,18 @@ class _Address:
     function's parameter it is when it is one, past a variable index the bits from the start of that
     indexed element, the bits from a register the machine code may hold instead (the value a helper
     the image may call returns, or the address a loop keeps reassigning), and the variable indices
-    that are parameters: each parameter's position and the bits one step adds, which ``bits`` counts
-    as 0 and a caller that passes a constant fixes (__sb_end_write(sb, SB_FREEZE_WRITE)). A local
-    object's address also names that object and its bytes, so its fields can be found in the frame."""
+    that are parameters: each parameter's position, the bits one step adds, and the constant the index
+    adds to the parameter (``sig - 1``: -1), whose steps ``bits`` counts while the parameter's count
+    as 0; a caller that passes a constant fixes the term (__sb_end_write(sb, SB_FREEZE_WRITE)). A
+    local object's address also names that object and its bytes, so its fields can be found in the
+    frame."""
 
     bits: int
     base: str
     param: int | None = None
     element: int | None = None
     inner: int | None = None
-    index: tuple[tuple[int, int], ...] = ()
+    index: tuple[tuple[int, int, int], ...] = ()
     object: tuple[str, int] | None = None
 
     def shifted(self, bits: int) -> _Address:
@@ -247,16 +249,23 @@ class _Address:
         return replace(self, bits=self.bits + bits, element=element, inner=inner)
 
 
-def _indexed(address: _Address, param: int | None, scale: int) -> _Address:
-    """An address past a variable index, with the index's term when the index is a parameter."""
-    if param is None or address.base == "unknown":
+def _indexed(address: _Address, indexed: tuple[int, int] | None, scale: int) -> _Address:
+    """An address past a variable index, with the index's term when the index is a parameter plus a
+    constant (``index_of``)."""
+    if indexed is None or address.base == "unknown":
         return address
-    return replace(address, index=(*address.index, (param, scale)))
+    return replace(address, index=(*address.index, (indexed[0], scale, indexed[1])))
 
 
 def _index_terms(address: _Address) -> list[dict[str, int]]:
-    """An address's parameter indices as the facts give them: the parameter and the bytes a step adds."""
-    return [{"param": param, "scale": scale // 8} for param, scale in address.index]
+    """An address's parameter indices as the facts give them: the parameter, the bytes a step adds,
+    and the constant the index adds to the parameter where it is not 0 (the displacement counts its
+    steps; the machine code may keep it in the index register instead: kernel_sigaction's
+    ``action[sig - 1]``)."""
+    return [
+        {"param": param, "scale": scale // 8, **({"constant": constant} if constant else {})}
+        for param, scale, constant in address.index
+    ]
 
 
 def _agree(addresses: set[_Address]) -> _Address | None:
@@ -3195,7 +3204,7 @@ class _FunctionWalk:
             if value is not None:
                 return found
             # The nearest variable index decides what a register that holds the element adds.
-            return _indexed(replace(found, element=bits), indexed[0] if indexed is not None else None, size * 8)
+            return _indexed(replace(found, element=bits), indexed, size * 8)
         if node.kind == K.UNARY_OPERATOR and children and libclang.unary_kind(node) == _DEREF:
             return self.pointer(children[0], bits, members, depth + 1)
         if node.kind == K.DECL_REF_EXPR and node.referenced is not None:
@@ -3242,7 +3251,7 @@ class _FunctionWalk:
             stepped = self.pointer(pointer, bits + steps * step, members, depth + 1)
             if stepped.base == "unknown":
                 return stepped
-            return _indexed(replace(stepped, element=bits), indexed[0] if indexed is not None else None, sign * step)
+            return _indexed(replace(stepped, element=bits), indexed, sign * step)
         if node.kind == K.CONDITIONAL_OPERATOR and len(children) == 3:
             # to_software_node(fwnode): is_software_node(fwnode) ? container_of(fwnode, ...) : NULL.
             # A null arm is never dereferenced; arms that point the same way give that address.
@@ -3278,7 +3287,7 @@ class _FunctionWalk:
             if returned is not None:
                 # The helper's parameter indices, as the call's arguments give them.
                 shift, terms = 0, []
-                for position, scale in returned.index:
+                for position, scale, constant in returned.index:
                     value = self.x.evaluator.evaluate(arguments[position]) if position < len(arguments) else None
                     indexed = (
                         self.index_of(arguments[position]) if position < len(arguments) and value is None else None
@@ -3287,7 +3296,7 @@ class _FunctionWalk:
                         shift += value * scale
                     elif indexed is not None:
                         shift += indexed[1] * scale
-                        terms.append((indexed[0], scale))
+                        terms.append((indexed[0], scale, constant + indexed[1]))
                 returned = replace(returned, bits=returned.bits + shift, index=tuple(terms))
             if returned is not None and returned.param is None:
                 found = returned.shifted(bits)
