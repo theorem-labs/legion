@@ -96,88 +96,120 @@ type Outcome struct {
 	Undelivered []string
 }
 
-// Run completes a step in the protocol order, holding the worktree's commit lock throughout: it reads the answers,
-// builds the record from HEAD, claims the open answers, commits the record, queues the follow-ups, sends the notices
-// and completes the answers. Two steps of one owner therefore run one after the other, and each builds from the
-// record the other committed. Repeating a step after any failure reuses the record, the idempotent follow-ups, the
-// notice keys and the already-completed answers.
+// Run completes a step in the protocol order: the record, its follow-ups, its notices, then the completion of its
+// answers. The worktree's commit lock covers what reads or changes the owner's state: reading the answers, building
+// the record from HEAD (where its revision is picked), claiming the open answers, the commit and the follow-ups; and,
+// taken again, the completion. Two steps of one owner therefore pick their revisions one after the other, and each
+// builds from the record the other committed. The notices are fixed once the commit is known, so they are sent,
+// retried and journaled between the two with the lock released: another command of the owner does not wait on a
+// listener that refuses them. They are sent before the completion, so a step killed in between leaves its answers
+// open, and its re-run sends them again. Repeating a step after any failure reuses the record, the idempotent
+// follow-ups, the notice keys and the already-completed answers.
 func (r Runner) Run(ctx context.Context, s Step) (Outcome, error) {
-	var outcome Outcome
+	var (
+		outcome  Outcome
+		notices  []Notice
+		answered []claimed
+	)
 	err := r.Tree.locked(ctx, func(git func(args ...string) (string, error)) error {
 		var err error
-		outcome, err = r.run(ctx, s, git)
+		outcome, notices, answered, err = r.record(ctx, s, git)
 		return err
 	})
-	return outcome, err
-}
-
-func (r Runner) run(ctx context.Context, s Step, git func(args ...string) (string, error)) (Outcome, error) {
-	open, err := r.openAnswers(ctx, s.Answers)
-	if err != nil {
-		return Outcome{}, err
-	}
-	previous, found, err := r.Tree.BlobAtHead(s.Path)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("read record %s: %w", s.Path, err)
-	}
-	record, err := s.Build(previous, found)
-	if err != nil {
-		return Outcome{}, err
-	}
-	if len(s.Answers) > 0 && len(open) == 0 && found && bytes.Equal(previous, record.Data) {
-		commit, err := r.Tree.LastCommitTouching(s.Path)
-		return Outcome{AlreadyDone: true, Commit: commit}, err
-	}
-
-	answered := make([]string, 0, len(open))
-	generations := make(map[string]int64, len(open))
-	for _, item := range open {
-		generation, err := claimOrAdopt(ctx, r.Ledger, r.Repo, r.Owner, item.ID, item)
-		if err != nil {
-			return Outcome{}, err
-		}
-		answered, generations[item.ID] = append(answered, item.ID), generation
-	}
-	files := append([]File{{Path: s.Path, Data: record.Data}}, record.Also...)
-	if err := r.Tree.commitFiles(git, files, record.Subject, map[string][]string{"Owner-Item": answered}); err != nil {
-		return Outcome{}, fmt.Errorf("commit record %s: %w", s.Path, err)
-	}
-	commit, err := r.Tree.LastCommitTouching(s.Path)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("find the commit of record %s: %w", s.Path, err)
-	}
-	if commit == "" {
-		return Outcome{}, fmt.Errorf("record %q has no commit", s.Path)
-	}
-	if err := r.checkAttributed(s.Path, answered, commit); err != nil {
-		return Outcome{Commit: commit}, err
-	}
-
-	for _, followUp := range record.FollowUps {
-		if err := r.enqueue(ctx, followUp); err != nil {
-			return Outcome{Commit: commit}, err
-		}
-	}
-
-	outcome := Outcome{Commit: commit}
-	var notices []Notice
-	if record.Notices != nil {
-		notices = record.Notices(commit)
+	if err != nil || outcome.AlreadyDone {
+		return outcome, err
 	}
 	undelivered, err := Deliver(ctx, r.Envoy, r.Journal, notices)
 	for _, notice := range undelivered {
 		outcome.Undelivered = append(outcome.Undelivered, notice.Topic)
 	}
-	if err != nil {
+	if err != nil || len(answered) == 0 {
 		return outcome, err
 	}
+	err = r.Tree.locked(ctx, func(func(args ...string) (string, error)) error {
+		return r.complete(ctx, answered, outcome.Commit)
+	})
+	return outcome, err
+}
 
-	for _, id := range answered {
-		if err := r.Ledger.Complete(ctx, r.Repo, id, r.Owner, generations[id], commit); err != nil {
-			return outcome, fmt.Errorf("complete answer item %q: %w", id, err)
+// claimed is an answer that a step claimed, or whose lease of its owner it adopted, at generation.
+type claimed struct {
+	id         string
+	generation int64
+}
+
+// record is the part of a step under the commit lock before its notices: it reads the answers, builds the record
+// from HEAD, claims the open answers, commits, and queues the follow-ups. It returns the notices to send and the
+// answers to complete.
+func (r Runner) record(ctx context.Context, s Step, git func(args ...string) (string, error)) (Outcome, []Notice, []claimed, error) {
+	open, err := r.openAnswers(ctx, s.Answers)
+	if err != nil {
+		return Outcome{}, nil, nil, err
+	}
+	previous, found, err := r.Tree.BlobAtHead(s.Path)
+	if err != nil {
+		return Outcome{}, nil, nil, fmt.Errorf("read record %s: %w", s.Path, err)
+	}
+	record, err := s.Build(previous, found)
+	if err != nil {
+		return Outcome{}, nil, nil, err
+	}
+	if len(s.Answers) > 0 && len(open) == 0 && found && bytes.Equal(previous, record.Data) {
+		commit, err := r.Tree.LastCommitTouching(s.Path)
+		return Outcome{AlreadyDone: true, Commit: commit}, nil, nil, err
+	}
+
+	answered := make([]claimed, 0, len(open))
+	ids := make([]string, 0, len(open))
+	for _, item := range open {
+		generation, err := claimOrAdopt(ctx, r.Ledger, r.Repo, r.Owner, item.ID, item)
+		if err != nil {
+			return Outcome{}, nil, nil, err
+		}
+		answered, ids = append(answered, claimed{id: item.ID, generation: generation}), append(ids, item.ID)
+	}
+	files := append([]File{{Path: s.Path, Data: record.Data}}, record.Also...)
+	if err := r.Tree.commitFiles(git, files, record.Subject, map[string][]string{"Owner-Item": ids}); err != nil {
+		return Outcome{}, nil, nil, fmt.Errorf("commit record %s: %w", s.Path, err)
+	}
+	commit, err := r.Tree.LastCommitTouching(s.Path)
+	if err != nil {
+		return Outcome{}, nil, nil, fmt.Errorf("find the commit of record %s: %w", s.Path, err)
+	}
+	if commit == "" {
+		return Outcome{}, nil, nil, fmt.Errorf("record %q has no commit", s.Path)
+	}
+	if err := r.checkAttributed(s.Path, ids, commit); err != nil {
+		return Outcome{Commit: commit}, nil, nil, err
+	}
+	for _, followUp := range record.FollowUps {
+		if err := r.enqueue(ctx, followUp); err != nil {
+			return Outcome{Commit: commit}, nil, nil, err
 		}
 	}
-	return outcome, nil
+	var notices []Notice
+	if record.Notices != nil {
+		notices = record.Notices(commit)
+	}
+	return Outcome{Commit: commit}, notices, answered, nil
+}
+
+// complete completes each answer with the record's commit, under the commit lock. An answer that is done already was
+// completed by another command of the owner, which adopted the same lease while this one sent its notices.
+func (r Runner) complete(ctx context.Context, answered []claimed, commit string) error {
+	for _, answer := range answered {
+		item, err := r.Ledger.Item(ctx, r.Repo, answer.id)
+		if err != nil {
+			return fmt.Errorf("re-read answer item %q: %w", answer.id, err)
+		}
+		if item.State == "done" {
+			continue
+		}
+		if err := r.Ledger.Complete(ctx, r.Repo, answer.id, r.Owner, answer.generation, commit); err != nil {
+			return fmt.Errorf("complete answer item %q: %w", answer.id, err)
+		}
+	}
+	return nil
 }
 
 // openAnswers reads each answer and returns the open ones, in order. An open answer that another holder's live

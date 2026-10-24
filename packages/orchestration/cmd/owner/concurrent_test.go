@@ -255,3 +255,54 @@ func TestConcurrentOffersOfOneOwnerAreTwoRevisions(t *testing.T) {
 		t.Fatalf("the spec after both offers = %+v, want r2 answering %s", front, secondNeed)
 	}
 }
+
+// A refused notice is retried and journaled after the step has let go of the owner's commit lock: a second command of
+// the same owner commits and returns while the listener still refuses the first command's notice.
+func TestASecondCommandDoesNotWaitOnTheFirstCommandsRefusedNotice(t *testing.T) {
+	f := newCommandFixture(t)
+	f.as(caller).ok("worktree")
+	firstDraft, secondDraft := f.write("need-state.md", needDraft), f.write("need-cluster.md", needDraft)
+	f.mu.Lock()
+	f.refuseTopic = "notifications.example.node.struct:state.needs"
+	f.mu.Unlock()
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+
+	first := make(chan int, 1)
+	go func() {
+		_, _, code := f.as(caller).runContext(ctx, "need", state, firstDraft)
+		first <- code
+	}()
+	waitUntil(t, 60*time.Second, "the listener to refuse the first need's notice", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return len(f.refused) > 0
+	})
+	type exit struct {
+		code   int
+		stderr string
+	}
+	second := make(chan exit, 1)
+	go func() {
+		_, stderr, code := f.as(caller).call("need", "subsystem:cluster", secondDraft)
+		second <- exit{code, stderr}
+	}()
+	select {
+	case got := <-second:
+		if got.code != 0 {
+			t.Fatalf("the second need exited %d: %s", got.code, got.stderr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second need waited for the first need's refused notice")
+	}
+	select {
+	case code := <-first:
+		t.Fatalf("the first need exited %d before its notice's retries ended", code)
+	default:
+	}
+	if item := f.item("need:" + ownerpkg.EdgeID(caller, "subsystem:cluster") + "@r1"); item.State != "open" {
+		t.Fatalf("the second need's item = %+v", item)
+	}
+	cancel()
+	<-first
+}

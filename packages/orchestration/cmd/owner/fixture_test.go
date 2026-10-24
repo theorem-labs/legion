@@ -31,18 +31,20 @@ const (
 )
 
 type commandFixture struct {
-	t        *testing.T
-	ctx      context.Context
-	dsn      string
-	store    *ledger.Store
-	root     string
-	bare     string
-	deploy   string
-	listener *httptest.Server
-	mu       sync.Mutex
-	posts    []noticePost
-	refuse   bool // the listener answers every publish with 503
-	env      map[string]string
+	t           *testing.T
+	ctx         context.Context
+	dsn         string
+	store       *ledger.Store
+	root        string
+	bare        string
+	deploy      string
+	listener    *httptest.Server
+	mu          sync.Mutex
+	posts       []noticePost
+	refuse      bool   // the listener answers every publish with 503
+	refuseTopic string // the listener answers every publish on this topic with 503
+	refused     []noticePost
+	env         map[string]string
 }
 
 type noticePost struct {
@@ -86,7 +88,8 @@ func newCommandFixture(t *testing.T) *commandFixture {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.refuse {
+		if f.refuse || post.Topic == f.refuseTopic {
+			f.refused = append(f.refused, post)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"error":"listener unavailable"}`))

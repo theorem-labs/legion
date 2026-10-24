@@ -37,11 +37,14 @@ Steps:
 
 - Each command that writes records runs one step (`Runner.Run`): one record and the files its commit writes beside
   it (an accept's edge record, a reply's escalation), the items the record answers, its follow-up items and its
-  notices. The step holds the worktree's commit lock, `flock(2)` on `owner.flock` in the worktree's git directory,
-  for all of it: it reads the answered items, builds the record from the one `HEAD` holds (the revision is picked
-  there), claims the open answers, commits, queues the follow-ups, sends the notices, which it builds once the commit
-  is known, and completes the answers. Two commands of one owner therefore run one after the other, and the second
-  builds from the record the first committed: two needs with different drafts are two revisions with two items.
+  notices. The worktree's commit lock, `flock(2)` on `owner.flock` in the worktree's git directory, covers what reads
+  or changes the owner's state: the step reads the answered items, builds the record from the one `HEAD` holds (the
+  revision is picked there), claims the open answers, commits and queues the follow-ups; and, taking the lock again,
+  it completes the answers. Two commands of one owner therefore pick their revisions one after the other, and the
+  second builds from the record the first committed: two needs with different drafts are two revisions with two
+  items. The notices, built once the commit is known, are sent between the two with the lock released, so another
+  command of the owner does not wait on a listener that refuses them; they are sent before the completion, so a
+  step killed in between leaves its answers open and its re-run sends them again.
 - A record commit carries one `Owner-Item: <item>` trailer for each open item it answers: a spec revision that
   answers two needs and the open `start:` item carries three. An item never completes with a commit that lacks its
   trailer (`ErrUnattributed`, exit 4). A step whose answers are all done repeats the step that answered them when
