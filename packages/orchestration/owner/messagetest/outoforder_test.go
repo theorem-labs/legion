@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,8 +49,9 @@ func (p *publishes) published() []map[string]string {
 
 // Acceptance run 7 stalled here: the target answered r3, completed r2 as superseded, and both notices reached its
 // session, but the owner model ended its turn having recorded one of them, and the driver waited for the other record
-// until its 15-minute timeout. The step ends on the ledger and the session's transcript alone; the owner here records
-// neither notice.
+// until its 15-minute timeout. The step ends on the ledger and the sessions' transcripts alone: the target's, which
+// records both notices, and the source's, which records the target's own notice of the offer r3's answer queued. The
+// owner here records neither notice.
 func TestOutOfOrderEndsOnTheLedgerAndTheTranscriptWhateverTheOwnerRecords(t *testing.T) {
 	ctx := t.Context()
 	store, err := ledger.Open(ctx, testpg.Database(t, "message_test_out_of_order"))
@@ -67,20 +69,23 @@ func TestOutOfOrderEndsOnTheLedgerAndTheTranscriptWhateverTheOwnerRecords(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
+	dir, sourceDir := t.TempDir(), t.TempDir()
 	transcript := filepath.Join(dir, "2026-10-24T05-14-44-553Z_s.jsonl")
 	writeTranscript(t, transcript, titleLine, headerLine, "")
+	sourceTranscript := filepath.Join(sourceDir, "2026-10-24T05-14-44-553Z_f.jsonl")
+	writeTranscript(t, sourceTranscript, titleLine, strings.Replace(headerLine, "01a16c41-7fe7-70b4-9919-208d7325025a", "source", 1), "")
 	d := &driver{
 		opts: Options{Progress: io.Discard, Timeouts: Timeouts{Item: 30 * time.Second, Poll: 10 * time.Millisecond}},
-		run:  "r", nodes: []string{fn, st}, source: fn, target: st, store: store, routing: routing, report: &Report{},
+		run:  "r", nodes: []string{fn, st}, source: fn, target: st, targetKind: "struct", store: store, routing: routing, report: &Report{},
 		publisher: ownerpkg.NewHTTPPublisher(server.URL, ""), bare: filepath.Join(dir, "no-repo.git"),
-		subscribe: map[string][]string{st: {routing.NeedsTopic(st)}}, transcriptDirs: map[string][]string{st: {dir}},
+		subscribe: map[string][]string{st: {routing.NeedsTopic(st)}}, transcriptDirs: map[string][]string{st: {dir}, fn: {sourceDir}},
 	}
-	d.expectAnswered("r1") // the duplicates step's need: the out-of-order step's answer queues the second offer
+	d.expectAnswered("duplicates", "r1") // the duplicates step's need: the out-of-order step's answer queues the second offer
 
 	owner := make(chan error, 1)
 	go func() {
-		owner <- answerOutOfOrder(ctx, store, listener, transcript, d.need("r3"), d.need("r2"), "offer:"+edge+"@r2")
+		owner <- answerOutOfOrder(ctx, store, listener, transcript, sourceTranscript, d.need("r3"), d.need("r2"), "offer:"+edge+"@r2",
+			"notifications.example-message-test.r.node.struct:mountpoint.users")
 	}()
 	if err := d.outOfOrder(ctx); err != nil {
 		t.Fatalf("the out-of-order step: %v", err)
@@ -91,9 +96,9 @@ func TestOutOfOrderEndsOnTheLedgerAndTheTranscriptWhateverTheOwnerRecords(t *tes
 }
 
 // answerOutOfOrder is the target owner of the out-of-order step: once both needs and their notices are out, both
-// notices reach its session's transcript, and it answers r3 with its follow-up offer and completes r2 as superseded.
-// It records no delivery of its own.
-func answerOutOfOrder(ctx context.Context, store *ledger.Store, listener *publishes, transcript, r3, r2, offer string) error {
+// notices reach its session's transcript, and it answers r3 with its follow-up offer, whose own notice reaches the
+// source's session on the offer topic, and completes r2 as superseded. It records no delivery of its own.
+func answerOutOfOrder(ctx context.Context, store *ledger.Store, listener *publishes, transcript, sourceTranscript, r3, r2, offer, offerTopic string) error {
 	for len(listener.published()) < 2 {
 		select {
 		case <-ctx.Done():
@@ -119,6 +124,17 @@ func answerOutOfOrder(ctx context.Context, store *ledger.Store, listener *publis
 		return err
 	}
 	if err := store.Enqueue(ctx, "r", offer, fn); err != nil {
+		return err
+	}
+	notice := "envoy:\n  from: agent\n  id: evt-offer\n  message:\n    from: \"" + st + "\"\n    item: \"" + offer + "\"\n    type: offer"
+	line, _ := json.Marshal(map[string]any{"type": "custom_message", "customType": "envoy-message", "content": notice,
+		"details": map[string]string{"subject": offerTopic, "topic": offerTopic, "event_id": "evt-offer"}, "timestamp": time.Now().UTC()})
+	source, err := os.OpenFile(sourceTranscript, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	if _, err := source.Write(append(line, '\n')); err != nil {
 		return err
 	}
 	if err := store.Complete(ctx, "r", r3, st, lease.Generation, "answered"); err != nil {

@@ -78,13 +78,14 @@ type driver struct {
 	root           string // the copy's records root
 	nodes          []string
 	source, target string
+	targetKind     string // the target's graph kind, by which the routing table routes its offer notices
 	bare           string
 	stateDir       string // the test deployment's state_dir
 	deployPath     string
 	daemonState    string
 	daemonConfig   string
 	daemonLog      string
-	socket         string
+	tmux           tmuxServer // the daemon's private tmux server, under the run's own TMUX_TMPDIR
 	port           int
 	tokenDir       string // the private directory of the bearer files the run wrote, removed at teardown
 	omp            string // the omp the owner panes run, which the supervisor gets as LEGION_OMP_PATH
@@ -135,7 +136,7 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		opts.Kills = DefaultKills
 	}
 	d := &driver{
-		opts: opts, run: run, root: "skeleton",
+		opts: opts, run: run, root: "skeleton", tmux: runTmux(opts.Out, daemonProject(run)),
 		report: &Report{Out: opts.Out, StartedAt: now, KillSchedule: KillSchedule(opts.Kills)},
 	}
 	d.report.Run = d.run
@@ -296,6 +297,11 @@ func (d *driver) wait(ctx context.Context, timeout time.Duration, what string, d
 }
 
 func (d *driver) setup(ctx context.Context) error {
+	// The run's tmux socket lives under its directory: a directory too long for it stops the run before anything
+	// starts.
+	if err := d.tmux.fits(); err != nil {
+		return err
+	}
 	out := d.opts.Out
 	graph, err := readGraph(d.opts.Deploy.GraphDir)
 	if err != nil {
@@ -309,6 +315,8 @@ func (d *driver) setup(ctx context.Context) error {
 	}
 	d.report.Nodes = d.nodes
 	d.source, d.target = graph.edge(d.nodes)
+	target, _ := graph.owners.ByID(d.target)
+	d.targetKind = target.Kind
 	d.report.Edge = ownerpkg.EdgeID(d.source, d.target)
 	base := d.opts.Prefix
 	if base == "" {
@@ -440,15 +448,21 @@ func (d *driver) setup(ctx context.Context) error {
 	d.daemonState = filepath.Join(daemonDir, "state")
 	d.daemonConfig = filepath.Join(daemonDir, "legion.yaml")
 	d.daemonLog = filepath.Join(daemonDir, "legion.log")
-	d.socket = DaemonSocket(d.run)
-	supervisor := daemonConfig(d.run, d.daemonState, d.port, url, natsURLs, tokenFile, operatorToken, d.opts.Deploy.LedgerDSNFile, d.run, prompt, kinds)
+	// The daemon's tmux server and its socket live in the run's own tmux directory, which the teardown removes: tmux
+	// uses /tmp when the directory TMUX_TMPDIR names is missing (tmux.c expand_paths), and never removes a socket file.
+	if err := os.Mkdir(d.tmux.tmpDir, 0o700); err != nil {
+		return err
+	}
+	project := daemonProject(d.run)
+	supervisor := daemonConfig(project, d.daemonState, d.port, url, natsURLs, tokenFile, operatorToken, d.opts.Deploy.LedgerDSNFile, d.run, prompt, kinds)
 	if data, err = yaml.Marshal(supervisor); err != nil {
 		return err
 	}
 	if err := os.WriteFile(d.daemonConfig, data, 0o644); err != nil {
 		return err
 	}
-	d.report.Daemon = Daemon{Executable: d.opts.Legion, Config: d.daemonConfig, Socket: d.socket, Log: d.daemonLog, Port: d.port, Omp: d.omp}
+	d.report.Daemon = Daemon{Executable: d.opts.Legion, Config: d.daemonConfig, Project: project, Socket: d.tmux.socket, TmuxTmpDir: d.tmux.tmpDir,
+		SocketPath: d.tmux.socketPath(), Log: d.daemonLog, Port: d.port, Omp: d.omp}
 	d.report.Revisions = collectRevisions(ctx, d.opts.Legion, d.omp, d.opts.Deploy.GraphDir)
 	d.logf("run %s: nodes %v, edge %s, daemon config %s", d.run, d.nodes, d.report.Edge, d.daemonConfig)
 	return nil
@@ -475,13 +489,15 @@ func freePort() (int, error) {
 }
 
 // daemonEnv is the supervisor's environment: the driver's, with daemonPath as PATH, LEGION_OMP_PATH naming the omp the
-// panes run, and no launch variable of the driver's own, so that a pane's launch variables are the supervisor's.
+// panes run, TMUX_TMPDIR naming the run's own tmux directory (the daemon keeps that variable for every tmux command it
+// runs, and names its socket legion-<project> in it), and no launch variable of the driver's own, so that a pane's
+// launch variables are the supervisor's.
 func (d *driver) daemonEnv() []string {
 	env := slices.DeleteFunc(slices.Clone(d.opts.Environ), func(entry string) bool {
 		name, _, _ := strings.Cut(entry, "=")
-		return name == "PATH" || name == "LEGION_OMP_PATH" || slices.Contains(LaunchVariables, name)
+		return name == "PATH" || name == "LEGION_OMP_PATH" || name == "TMUX_TMPDIR" || slices.Contains(LaunchVariables, name)
 	})
-	return append(env, "PATH="+d.daemonPath(), "LEGION_OMP_PATH="+d.omp)
+	return append(env, "PATH="+d.daemonPath(), "LEGION_OMP_PATH="+d.omp, "TMUX_TMPDIR="+d.tmux.tmpDir)
 }
 
 // daemonPath is the supervisor's PATH: the owner executable's directory first, then the driver's PATH.
@@ -590,9 +606,9 @@ func (d *driver) wake(ctx context.Context) error {
 		}
 		d.expected.Outcomes = append(d.expected.Outcomes, Outcome{Item: item, Owner: node})
 	}
-	panes, seen, err := d.awaitPanes(ctx, func(ctx context.Context, _ string) (map[string]pane, error) { return d.panes(ctx) }, start)
+	panes, seen, err := d.awaitPanes(ctx, d.panes, start)
 	if err != nil {
-		return fmt.Errorf("%w; the panes on tmux socket %s: %s", err, d.socket, paneCommands(ctx, d.socket))
+		return fmt.Errorf("%w; the panes on tmux socket %s: %s", err, d.tmux.socket, d.tmux.paneCommands(ctx))
 	}
 	ownersDir := d.ownersDir()
 	for _, node := range d.nodes {
@@ -618,7 +634,7 @@ func (d *driver) wake(ctx context.Context) error {
 // report shows it beside.
 func (d *driver) awaitSubscriptions(ctx context.Context) error {
 	client := &http.Client{Timeout: 10 * time.Second}
-	dir := "legion-" + projectToken(d.run) + "-owner-" // the claim token in each owner's working directory (C9)
+	dir := "legion-" + projectToken(daemonProject(d.run)) + "-owner-" // the claim token in each owner's working directory (C9)
 	var read time.Time
 	pending := "; the listener was not read yet"
 	err := d.wait(ctx, d.opts.Timeouts.Subscribed, "each owner session to subscribe to its topics", func() (bool, error) {
@@ -661,7 +677,7 @@ func (d *driver) awaitSubscriptions(ctx context.Context) error {
 // panes lists the owner panes and notes what their processes show: every owner process of the run, which the
 // teardown stops, and the session transcripts they hold open, whose directory holds every transcript of that owner.
 func (d *driver) panes(ctx context.Context) (map[string]pane, error) {
-	panes, err := ownerPanes(ctx, d.socket)
+	panes, err := d.tmux.ownerPanes(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -709,12 +725,12 @@ func (d *driver) ownersDir() string {
 // owner directory before it starts the owner, so a pane seen earlier is still starting. seen is when each pane first
 // appeared. When every pane appeared but one never reached the owners directory, the panes as last seen are
 // returned with no error, for the launch check to judge.
-func (d *driver) awaitPanes(ctx context.Context, list func(context.Context, string) (map[string]pane, error), start time.Time) (map[string]pane, map[string]time.Duration, error) {
+func (d *driver) awaitPanes(ctx context.Context, list func(context.Context) (map[string]pane, error), start time.Time) (map[string]pane, map[string]time.Duration, error) {
 	seen := map[string]time.Duration{}
 	var panes map[string]pane
 	err := d.wait(ctx, d.opts.Timeouts.PaneStart, "both owner panes", func() (bool, error) {
 		var err error
-		if panes, err = list(ctx, d.socket); err != nil {
+		if panes, err = list(ctx); err != nil {
 			return false, err
 		}
 		owners, started := d.ownersDir(), true
@@ -887,11 +903,13 @@ func (d *driver) need(version string) string {
 // waits for the answer.
 func (d *driver) offer(version string) string { return d.offers[version] }
 
-// expectAnswered records that the need of version must be answered once, with its follow-up offer once. The offer
-// is numbered by production's rule, by the revision of the record that answers the need: the target answers the
-// run's needs one at a time, each rewriting its answer record as the next revision, so the n-th need it answers
-// queues offer:<edge>@r<n>, whatever the need's own version.
-func (d *driver) expectAnswered(version string) {
+// expectAnswered records that the need of version, which step enqueued, must be answered once, with its follow-up
+// offer once, and that the target's answer publishes the offer's notice itself, which must reach the source's session:
+// on the topic of the routing table's offer row for the target (a data structure's users topic, a function's callers
+// topic), from the target, naming the offer. The offer is numbered by production's rule, by the revision of the
+// record that answers the need: the target answers the run's needs one at a time, each rewriting its answer record as
+// the next revision, so the n-th need it answers queues offer:<edge>@r<n>, whatever the need's own version.
+func (d *driver) expectAnswered(step, version string) {
 	if d.offers == nil {
 		d.offers = map[string]string{}
 	}
@@ -900,6 +918,10 @@ func (d *driver) expectAnswered(version string) {
 	d.expected.Outcomes = append(d.expected.Outcomes,
 		Outcome{Item: d.need(version), Owner: d.target, FollowUp: offer, FollowUpOwner: d.source},
 		Outcome{Item: offer, Owner: d.source, Optional: true})
+	for _, delivery := range d.routing.Topics(ownerpkg.Route{Step: ownerpkg.RouteOffer, Source: d.source, Target: d.target, TargetKind: d.targetKind}) {
+		d.expected.OwnerNotices = append(d.expected.OwnerNotices,
+			ExpectedOwnerNotice{Step: step, Receiver: delivery.Receiver, From: d.target, Type: "offer", Item: offer, Topic: delivery.Topic})
+	}
 }
 
 // enqueueNeed enqueues the need of version for the target and publishes its notice on the target's needs topic.
@@ -941,17 +963,43 @@ func (d *driver) itemExists(ctx context.Context, item string) (bool, error) {
 	return err == nil, err
 }
 
-// answered reports whether the need of version is done and its follow-up offer exists.
+// answered reports whether the need of version is done, its follow-up offer exists, and the target's own notice of
+// that offer reached the source's session.
 func (d *driver) answered(ctx context.Context, version string) (bool, error) {
 	done, err := d.itemDone(ctx, d.need(version))
 	if err != nil || !done {
 		return false, err
 	}
-	return d.itemExists(ctx, d.offer(version))
+	if exists, err := d.itemExists(ctx, d.offer(version)); err != nil || !exists {
+		return false, err
+	}
+	return d.noticed(d.offer(version))
+}
+
+// noticed reports whether each owner notice of item reached its receiver's session on its topic.
+func (d *driver) noticed(item string) (bool, error) {
+	arrivals, err := d.arrivals()
+	if err != nil {
+		return false, err
+	}
+	for _, notice := range d.expected.OwnerNotices {
+		if notice.Item != item {
+			continue
+		}
+		var received []Arrival
+		for _, list := range arrivals[notice.Receiver] {
+			received = append(received, list...)
+		}
+		if onTopic, _ := ownerNoticeArrivals(notice, received); len(onTopic) == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // duplicates enqueues the need r1 twice, and publishes its notice twice under two idempotency keys, as Envoy may
-// deliver one message twice: both deliveries must reach the owner's session and the need be answered once.
+// deliver one message twice: both deliveries must reach the owner's session and the need be answered once, and the
+// target's own notice of the offer its answer queues must reach the source's session.
 func (d *driver) duplicates(ctx context.Context) error {
 	item := d.need("r1")
 	if err := enqueueTwice(ctx, d.store, d.run, item, d.target); err != nil {
@@ -965,8 +1013,8 @@ func (d *driver) duplicates(ctx context.Context) error {
 		}
 		copies = append(copies, publication)
 	}
-	d.expectAnswered("r1")
-	return d.wait(ctx, d.opts.Timeouts.Item, item+" to be answered and both of its notices to reach the session", func() (bool, error) {
+	d.expectAnswered("duplicates", "r1")
+	return d.wait(ctx, d.opts.Timeouts.Item, item+" to be answered, both of its notices to reach the target's session and the offer's notice the source's", func() (bool, error) {
 		done, err := d.answered(ctx, "r1")
 		if err != nil || !done {
 			return false, err
@@ -1005,9 +1053,9 @@ func enqueueTwice(ctx context.Context, q queue, repo, item, owner string) error 
 }
 
 // outOfOrder enqueues r3 and then r2 with their notices: r3 must be answered, r2 completed as superseded:r3 with no
-// record, and both notices must reach the running owner's session. Each condition is the ledger's or the session
-// transcript's, never the owner model's record of a notice: the model may handle a burst of deliveries and end its turn
-// without recording one.
+// record, both notices must reach the running owner's session, and the target's own notice of the offer r3's answer
+// queues must reach the source's. Each condition is the ledger's or a session transcript's, never the owner model's
+// record of a notice: the model may handle a burst of deliveries and end its turn without recording one.
 func (d *driver) outOfOrder(ctx context.Context) error {
 	var notices []Publication
 	for _, version := range []string{"r3", "r2"} {
@@ -1017,7 +1065,7 @@ func (d *driver) outOfOrder(ctx context.Context) error {
 		}
 		notices = append(notices, publication)
 	}
-	d.expectAnswered("r3")
+	d.expectAnswered("out of order", "r3")
 	d.expected.Outcomes = append(d.expected.Outcomes, Outcome{Item: d.need("r2"), Owner: d.target, Superseded: "r3"})
 	return d.wait(ctx, d.opts.Timeouts.Item, "r3 to be answered, r2 to be done and both notices to reach the session", func() (bool, error) {
 		done, err := d.answered(ctx, "r3")
@@ -1075,7 +1123,7 @@ func (d *driver) kill(index int) func(context.Context) error {
 		if _, err := d.enqueueNeed(ctx, "kill", version, false); err != nil {
 			return err
 		}
-		d.expectAnswered(version)
+		d.expectAnswered("kill", version)
 		var target pane
 		err := d.wait(ctx, d.opts.Timeouts.Item, "the "+moment+" moment of "+item, func() (bool, error) {
 			panes, err := d.panes(ctx)
@@ -1182,7 +1230,7 @@ func (d *driver) killPaneTree(ctx context.Context, p pane) error {
 		}
 		queue = append(queue, children(queue[0])...)
 	}
-	if err := killPane(ctx, d.socket, p.ID); err != nil {
+	if err := d.tmux.killPane(ctx, p.ID); err != nil {
 		if _, alive, _ := ProcessIncarnation(p.Root); alive {
 			return err
 		}
@@ -1272,7 +1320,7 @@ func (d *driver) restart(ctx context.Context) error {
 	if _, err := d.enqueueNeed(ctx, "restart", version, false); err != nil {
 		return err
 	}
-	d.expectAnswered(version)
+	d.expectAnswered("restart", version)
 	seen := func() error {
 		panes, err := d.panes(ctx)
 		if err != nil {
@@ -1327,7 +1375,8 @@ func (d *driver) restart(ctx context.Context) error {
 
 // collect reads the run's ledger events, the owners' branches and every delivery the owners' session transcripts
 // record, and reports each expected delivery: whether and where the session recorded it, and whether the owner model
-// also recorded it with `owner message-test saw`, a second signal that decides nothing.
+// also recorded it with `owner message-test saw`, a second signal that decides nothing; and each owner notice:
+// whether, where and how often its receiver's session recorded it on its topic.
 func (d *driver) collect(ctx context.Context) (Recorded, error) {
 	var recorded Recorded
 	if d.store == nil {
@@ -1385,13 +1434,22 @@ func (d *driver) collect(ctx context.Context) (Recorded, error) {
 		}
 		d.report.Deliveries = append(d.report.Deliveries, delivery)
 	}
+	for _, notice := range d.expected.OwnerNotices {
+		onTopic, _ := ownerNoticeArrivals(notice, recorded.Arrivals)
+		report := OwnerNotice{ExpectedOwnerNotice: notice, Arrivals: len(onTopic)}
+		if len(onTopic) > 0 {
+			first := slices.MinFunc(onTopic, func(a, b Arrival) int { return a.At.Compare(b.At) })
+			report.Arrived, report.EventID, report.DedupeKey, report.Transcript, report.Line, report.At = true, first.ID, first.DedupeKey, first.Transcript, first.Line, first.At
+		}
+		d.report.OwnerNotices = append(d.report.OwnerNotices, report)
+	}
 	return recorded, nil
 }
 
 // teardown stops what the run started and removes the token files: the daemon by its own PID, every pane by the
 // run's own tmux socket, then every owner process the run saw that still runs, by its own PID; then the bearer files
-// the run wrote and the daemon's boot tokens. It runs on a context of its own, bounded by cleanupTimeout, so it also
-// stops a run whose context ended (an interrupt).
+// the run wrote, the daemon's boot tokens and the run's tmux directory, which holds the socket. It runs on a context
+// of its own, bounded by cleanupTimeout, so it also stops a run whose context ended (an interrupt).
 func (d *driver) teardown(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
@@ -1399,13 +1457,19 @@ func (d *driver) teardown(ctx context.Context) error {
 	if err := d.stopDaemon(); err != nil {
 		errs = append(errs, err)
 	}
-	if d.socket != "" {
+	// The run's tmux server, once setup made its directory. tmux never removes a socket file, so the directory goes
+	// once the server is stopped; while the server may still run, its socket stays, so that it can be reached.
+	if _, err := os.Stat(d.tmux.tmpDir); err == nil {
 		// The panes' processes as they are now, so that the owners stopped below include the newest.
 		if _, err := d.panes(ctx); err != nil {
 			errs = append(errs, err)
 		}
-		if err := killServer(ctx, d.socket); err != nil {
+		if err := d.tmux.killServer(ctx); err != nil {
 			errs = append(errs, err)
+		} else if err := os.RemoveAll(d.tmux.tmpDir); err != nil {
+			errs = append(errs, err)
+		} else {
+			d.report.Teardown.TmuxDir = d.tmux.tmpDir
 		}
 	}
 	if err := d.stopOwners(ctx); err != nil {

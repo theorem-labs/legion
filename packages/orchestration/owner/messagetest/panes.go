@@ -3,12 +3,14 @@ package messagetest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // LaunchVariables are the owner launch environment of shared contract C8, as the agreed supervisor contract names
@@ -27,18 +29,81 @@ type pane struct {
 	Dir   string
 }
 
-// ownerPanes lists the panes on the tmux socket whose process tree holds LEGION_OWNER, by owner. A socket with no
-// server has none, and so does a server with no session yet, which tmux answers with "no current target": the
-// supervisor's private server is up before its first owner's session exists.
-func ownerPanes(ctx context.Context, socket string) (map[string]pane, error) {
-	out, err := exec.CommandContext(ctx, "tmux", "-L", socket, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").CombinedOutput()
+// tmuxServer is the daemon's private tmux server as tmux finds it: the socket name the daemon gives it (-L), in the
+// directory TMUX_TMPDIR names. The driver gives the daemon the run's own TMUX_TMPDIR (the daemon keeps that variable
+// for each tmux command it runs), and runs each tmux command of its own under the same one, so both reach one server.
+// An empty tmpDir is tmux's default directory.
+type tmuxServer struct{ socket, tmpDir string }
+
+// ErrTmuxSocketTooLong is an output directory too long to hold a run's tmux socket.
+var ErrTmuxSocketTooLong = errors.New("the run's tmux socket would not fit a Unix socket address")
+
+// maxSocketPath is the longest path a Unix socket address holds: sun_path is 108 bytes with its NUL, and tmux refuses
+// a longer path with ENAMETOOLONG (tmux 3.7b client.c:114-117, server.c:116-119).
+const maxSocketPath = 107
+
+// runTmux is the private tmux server of a run in out: the socket of the daemon of project, in <out>/tmux, which the
+// driver gives the daemon and its own tmux commands as TMUX_TMPDIR.
+func runTmux(out, project string) tmuxServer {
+	return tmuxServer{socket: DaemonSocket(project), tmpDir: filepath.Join(out, "tmux")}
+}
+
+// fits refuses a socket path that would not fit a Unix socket address, with ErrTmuxSocketTooLong.
+func (s tmuxServer) fits() error {
+	if path := s.socketPath(); len(path) > maxSocketPath {
+		return fmt.Errorf("%w: %s is %d bytes, and a Unix socket path holds at most %d; choose a shorter output directory",
+			ErrTmuxSocketTooLong, path, len(path), maxSocketPath)
+	}
+	return nil
+}
+
+// CheckOut refuses an output directory too long to hold the tmux socket of a run in it, with ErrTmuxSocketTooLong.
+// Every run's socket path has one length, whatever the random digits of its name, so the operator's command checks
+// its output directory before it starts a run; the run's setup checks its own again.
+func CheckOut(out string) error {
+	run, err := runName(time.Now())
+	if err != nil {
+		return err
+	}
+	return runTmux(out, daemonProject(run)).fits()
+}
+
+// socketPath is where tmux puts the server's socket: realpath(TMUX_TMPDIR)/tmux-<uid>/<socket> (tmux 3.7b tmux.c,
+// make_label). The links of the part of tmpDir that exists are resolved, and the rest, which the driver makes, is
+// taken as it is.
+func (s tmuxServer) socketPath() string {
+	base := filepath.Join("tmux-"+strconv.Itoa(os.Getuid()), s.socket)
+	for dir, rest := s.tmpDir, ""; ; dir, rest = filepath.Dir(dir), filepath.Join(filepath.Base(dir), rest) {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(resolved, rest, base)
+		}
+		if filepath.Dir(dir) == dir {
+			return filepath.Join(s.tmpDir, base)
+		}
+	}
+}
+
+// command is `tmux -L <socket> args...` under the server's TMUX_TMPDIR.
+func (s tmuxServer) command(ctx context.Context, args ...string) *exec.Cmd {
+	command := exec.CommandContext(ctx, "tmux", append([]string{"-L", s.socket}, args...)...)
+	if s.tmpDir != "" {
+		command.Env = append(os.Environ(), "TMUX_TMPDIR="+s.tmpDir)
+	}
+	return command
+}
+
+// ownerPanes lists the panes of the server whose process tree holds LEGION_OWNER, by owner. A socket with no server
+// has none, and so does a server with no session yet, which tmux answers with "no current target": the supervisor's
+// private server is up before its first owner's session exists.
+func (s tmuxServer) ownerPanes(ctx context.Context) (map[string]pane, error) {
+	out, err := s.command(ctx, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").CombinedOutput()
 	if err != nil {
 		text := string(out)
 		if strings.Contains(text, "no server running") || strings.Contains(text, "error connecting") || strings.Contains(text, "No such file") ||
 			strings.Contains(text, "no current target") {
 			return map[string]pane{}, nil
 		}
-		return nil, fmt.Errorf("tmux -L %s list-panes: %w: %s", socket, err, bytes.TrimSpace(out))
+		return nil, fmt.Errorf("tmux -L %s list-panes: %w: %s", s.socket, err, bytes.TrimSpace(out))
 	}
 	panes := map[string]pane{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -114,25 +179,25 @@ func children(pid int) []int {
 	return out
 }
 
-func killPane(ctx context.Context, socket, id string) error {
-	if out, err := exec.CommandContext(ctx, "tmux", "-L", socket, "kill-pane", "-t", id).CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux -L %s kill-pane -t %s: %w: %s", socket, id, err, bytes.TrimSpace(out))
+func (s tmuxServer) killPane(ctx context.Context, id string) error {
+	if out, err := s.command(ctx, "kill-pane", "-t", id).CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux -L %s kill-pane -t %s: %w: %s", s.socket, id, err, bytes.TrimSpace(out))
 	}
 	return nil
 }
 
-// killServer stops every pane on the socket; a socket with no server is already stopped.
-func killServer(ctx context.Context, socket string) error {
-	out, err := exec.CommandContext(ctx, "tmux", "-L", socket, "kill-server").CombinedOutput()
+// killServer stops every pane of the server; a socket with no server is already stopped.
+func (s tmuxServer) killServer(ctx context.Context) error {
+	out, err := s.command(ctx, "kill-server").CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "no server running") && !strings.Contains(string(out), "error connecting") {
-		return fmt.Errorf("tmux -L %s kill-server: %w: %s", socket, err, bytes.TrimSpace(out))
+		return fmt.Errorf("tmux -L %s kill-server: %w: %s", s.socket, err, bytes.TrimSpace(out))
 	}
 	return nil
 }
 
-// paneCommands lists every pane of the socket with its start command, for a report of panes without an owner.
-func paneCommands(ctx context.Context, socket string) string {
-	out, err := exec.CommandContext(ctx, "tmux", "-L", socket, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pane_start_command}").CombinedOutput()
+// paneCommands lists every pane of the server with its start command, for a report of panes without an owner.
+func (s tmuxServer) paneCommands(ctx context.Context) string {
+	out, err := s.command(ctx, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pane_start_command}").CombinedOutput()
 	if err != nil {
 		return strings.TrimSpace(string(out))
 	}

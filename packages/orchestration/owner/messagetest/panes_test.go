@@ -24,10 +24,55 @@ func TestOwnerPanesOfAServerWithNoSessionIsNone(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = exec.Command("tmux", "-L", socket, "kill-server").Run() })
 
-	panes, err := ownerPanes(context.Background(), socket)
+	panes, err := tmuxServer{socket: socket}.ownerPanes(context.Background())
 	if err != nil || len(panes) != 0 {
 		t.Fatalf("ownerPanes on a server with no session = %v, %v, want no pane and no error", panes, err)
 	}
+}
+
+// The run's tmux server is under the run's own TMUX_TMPDIR, which the driver gives every tmux command of its own, as it
+// gives it the daemon: the driver finds the panes of a server started there, the same socket name in tmux's default
+// directory is no server of the run's, and killing the run's server stops it.
+func TestTheDriversTmuxCommandsUseTheRunsTmuxDirectory(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is not installed; the pane listing reads a real tmux server")
+	}
+	ctx := context.Background()
+	dir := shortTempDir(t)
+	run := tmuxServer{socket: fmt.Sprintf("mt-dir-%d", os.Getpid()), tmpDir: dir}
+	start := exec.Command("tmux", "-L", run.socket, "-f", "/dev/null", "new-session", "-d", "-e", "LEGION_OWNER="+st, "sleep 300")
+	start.Env = append(os.Environ(), "TMUX_TMPDIR="+dir)
+	if out, err := start.CombinedOutput(); err != nil {
+		t.Fatalf("start a server under %s: %v: %s", dir, err, out)
+	}
+	t.Cleanup(func() { _ = run.killServer(ctx) })
+	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("tmux-%d", os.Getuid()), run.socket)); err != nil {
+		t.Fatalf("the server's socket is not under %s: %v", dir, err)
+	}
+	if panes, err := run.ownerPanes(ctx); err != nil || len(panes) != 1 || panes[st].ID == "" {
+		t.Fatalf("the run's server lists %v, %v; want the owner pane of %s", panes, err, st)
+	}
+	if panes, err := (tmuxServer{socket: run.socket}).ownerPanes(ctx); err != nil || len(panes) != 0 {
+		t.Fatalf("tmux's default directory lists %v, %v for %s; want no server of that name there", panes, err, run.socket)
+	}
+	if err := run.killServer(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if panes, err := run.ownerPanes(ctx); err != nil || len(panes) != 0 {
+		t.Fatalf("after killServer the run's server lists %v, %v", panes, err)
+	}
+}
+
+// shortTempDir is a temporary directory with a short path: a tmux socket under it must fit a Unix socket's 107-byte
+// path, which a directory named for the test, as t.TempDir's is, can exceed.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "mt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 // ownerDirFixture is a supervisor state directory with its owners directory, the working directory the supervisor
@@ -52,7 +97,7 @@ func ownerDirFixture(t *testing.T, node string, paneStart time.Duration) (*drive
 func TestAwaitPanesWaitsForEachPaneToReachItsOwnerDirectory(t *testing.T) {
 	d, want := ownerDirFixture(t, st, 10*time.Second)
 	listings := 0
-	list := func(context.Context, string) (map[string]pane, error) {
+	list := func(context.Context) (map[string]pane, error) {
 		listings++
 		dir := "/srv/where-the-server-started"
 		if listings >= 3 {
@@ -70,7 +115,7 @@ func TestAwaitPanesWaitsForEachPaneToReachItsOwnerDirectory(t *testing.T) {
 // pane that never started: the wait returns the pane as last seen, so the launch check names its directory.
 func TestAwaitPanesReturnsAPaneThatNeverReachesItsOwnerDirectory(t *testing.T) {
 	d, _ := ownerDirFixture(t, st, 50*time.Millisecond)
-	list := func(context.Context, string) (map[string]pane, error) {
+	list := func(context.Context) (map[string]pane, error) {
 		return map[string]pane{st: {ID: "%1", Owner: st, Dir: "/srv/elsewhere"}}, nil
 	}
 	panes, seen, err := d.awaitPanes(context.Background(), list, time.Now())

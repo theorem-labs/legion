@@ -66,10 +66,26 @@ type Outcome struct {
 	Optional      bool   `json:"optional,omitempty"`
 }
 
-// Expected is every delivery and item outcome a run must show.
+// ExpectedOwnerNotice is a notice that an owner session publishes itself and that must reach the other owner's
+// session: the target's `message-test answer` of a need publishes, through the routing table's offer row, the notice
+// of the offer it queues for the need's source, as `owner offer` does. The receiver's transcript shows it by the
+// payload's type, its publisher (from) and the item it names, and by pi-envoy's record of the topic it arrived on.
+// Step is the run's step whose need the answer answered. The receiver, the source, is never killed, so every one is
+// required.
+type ExpectedOwnerNotice struct {
+	Step     string `json:"step"`
+	Receiver string `json:"receiver"`
+	From     string `json:"from"`
+	Type     string `json:"type"`
+	Item     string `json:"item"`
+	Topic    string `json:"topic"`
+}
+
+// Expected is every delivery, owner notice and item outcome a run must show.
 type Expected struct {
-	Deliveries []ExpectedDelivery `json:"deliveries"`
-	Outcomes   []Outcome          `json:"outcomes"`
+	Deliveries   []ExpectedDelivery    `json:"deliveries"`
+	OwnerNotices []ExpectedOwnerNotice `json:"owner_notices"`
+	Outcomes     []Outcome             `json:"outcomes"`
 }
 
 // Failure is one assertion the recorded state broke.
@@ -80,16 +96,18 @@ type Failure struct {
 }
 
 // Check compares the recorded state of a run with what it must show. It names every missed, duplicate and
-// unexpected delivery, by the owner sessions' transcripts; every item completed twice or never, recorded twice or not
-// at all, or completed with another result; every out-of-order item answered as if it were current; every follow-up
-// enqueued twice, never or for another owner; and every record, completion or item of an item the run did not
-// expect. The owners' own records of their deliveries decide nothing.
+// unexpected delivery of the driver's notices, and every owner notice missed or delivered on another topic, by the
+// owner sessions' transcripts; every item completed twice or never, recorded twice or not at all, or completed with
+// another result; every out-of-order item answered as if it were current; every follow-up enqueued twice, never or
+// for another owner; and every record, completion or item of an item the run did not expect. The owners' own records
+// of their deliveries decide nothing.
 func Check(expected Expected, recorded Recorded) []Failure {
 	var failures []Failure
 	fail := func(kind, subject, format string, args ...any) {
 		failures = append(failures, Failure{Kind: kind, Subject: subject, Detail: fmt.Sprintf(format, args...)})
 	}
 	checkDeliveries(expected.Deliveries, recorded.Arrivals, fail)
+	checkOwnerNotices(expected.OwnerNotices, recorded.Arrivals, fail)
 
 	completions, enqueues := map[string][]string{}, map[string][]string{}
 	var completedOrder, enqueuedOrder []string
@@ -186,11 +204,7 @@ func checkDeliveries(deliveries []ExpectedDelivery, arrivals []Arrival, fail fun
 	for _, k := range order {
 		topic, ok := expected[k]
 		for _, a := range arrived[k] {
-			// The delivered topic is pi-envoy's record: the envelope's topic and the subject the session took it on.
-			delivered := a.Subject
-			if a.Topic != topic {
-				delivered = a.Topic
-			}
+			delivered := deliveredOn(a, topic)
 			if !ok || a.Topic != topic || a.Subject != topic {
 				fail(FailUnexpected, fmt.Sprintf("%s on %s for %s", k.id, delivered, k.owner),
 					"the session recorded it at %s:%d (run %s, step %s, envelope topic %s, subject %s); the driver published no such notice for this owner on this topic",
@@ -201,6 +215,51 @@ func checkDeliveries(deliveries []ExpectedDelivery, arrivals []Arrival, fail fun
 			fail(FailDuplicate, fmt.Sprintf("%s on %s for %s", k.id, topic, k.owner), "the session recorded it %d times", n)
 		}
 	}
+}
+
+// deliveredOn is the topic pi-envoy recorded a delivery on, given the topic it had to arrive on: the envelope's
+// topic when it is another, else the subject the session took it on.
+func deliveredOn(a Arrival, topic string) string {
+	if a.Topic != topic {
+		return a.Topic
+	}
+	return a.Subject
+}
+
+// checkOwnerNotices fails each owner notice that its receiver's session never recorded on its topic: a delivery of it
+// on another topic is unexpected, and no delivery at all is missed.
+func checkOwnerNotices(notices []ExpectedOwnerNotice, arrivals []Arrival, fail func(kind, subject, format string, args ...any)) {
+	for _, notice := range notices {
+		onTopic, elsewhere := ownerNoticeArrivals(notice, arrivals)
+		switch {
+		case len(onTopic) > 0:
+		case len(elsewhere) > 0:
+			a := elsewhere[0]
+			fail(FailUnexpected, fmt.Sprintf("%s on %s for %s", notice.Item, deliveredOn(a, notice.Topic), notice.Receiver),
+				"%s's own %s notice reached the session at %s:%d with envelope topic %s and subject %s; the routing table gives it %s",
+				notice.From, notice.Type, a.Transcript, a.Line, a.Topic, a.Subject, notice.Topic)
+		default:
+			fail(FailMissed, fmt.Sprintf("%s from %s on %s for %s", notice.Item, notice.From, notice.Topic, notice.Receiver),
+				"the %s step's answer queued the item and publishes its %s notice itself, and the receiving session was running and subscribed; its transcript records no delivery of it",
+				notice.Step, notice.Type)
+		}
+	}
+}
+
+// ownerNoticeArrivals are the deliveries of an owner's notice in its receiver's session: those whose payload has the
+// notice's type, publisher and item, on the notice's topic (pi-envoy's record of the envelope's topic and of the
+// subject the session took it on), and elsewhere.
+func ownerNoticeArrivals(notice ExpectedOwnerNotice, arrivals []Arrival) (onTopic, elsewhere []Arrival) {
+	for _, a := range arrivals {
+		switch {
+		case a.Owner != notice.Receiver || a.Type != notice.Type || a.From != notice.From || a.Item != notice.Item:
+		case a.Topic == notice.Topic && a.Subject == notice.Topic:
+			onTopic = append(onTopic, a)
+		default:
+			elsewhere = append(elsewhere, a)
+		}
+	}
+	return onTopic, elsewhere
 }
 
 func checkOutcome(outcome Outcome, results []string, records []Commit, enqueues map[string][]string, fail func(kind, subject, format string, args ...any)) {

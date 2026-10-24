@@ -3,12 +3,14 @@ package messagetest
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -140,7 +142,7 @@ func setupStopOptions(t *testing.T, prefix string) Options {
 	dir := writeGraphDir(t, map[string]string{fn: "function", st: "struct"},
 		map[string][]string{fn: everyKind("function:c%40x%2Fy%2Ec", st), st: {"all", "node.struct:t.needs", "node.struct:u.linked"}}, [][2]string{{fn, st}})
 	return Options{
-		Prefix: prefix, Nodes: []string{fn, st}, Kills: 3, Out: filepath.Join(t.TempDir(), "run"),
+		Prefix: prefix, Nodes: []string{fn, st}, Kills: 3, Out: filepath.Join(shortTempDir(t), "run"),
 		Deploy: ownerpkg.Deploy{GraphDir: dir, LedgerDSNFile: filepath.Join(t.TempDir(), "ledger-dsn")},
 		Owner:  "/opt/bin/owner", Legion: "/opt/bin/legion",
 		Getenv: func(string) string { return "" }, Progress: io.Discard, Timeouts: Timeouts{Poll: time.Millisecond},
@@ -326,10 +328,86 @@ func TestRunNameIsItsStampAndARandomSuffix(t *testing.T) {
 		if !regexp.MustCompile(`^message-test-20261024t050420z-[0-9a-f]{8}$`).MatchString(name) {
 			t.Fatalf("run name %q is not message-test-<stamp>-<8 hex digits>", name)
 		}
-		if names[DaemonSocket(name)] {
-			t.Fatalf("two runs of one second share the tmux socket %s", DaemonSocket(name))
+		if names[DaemonSocket(daemonProject(name))] {
+			t.Fatalf("two runs of one second share the tmux socket %s", DaemonSocket(daemonProject(name)))
 		}
-		names[DaemonSocket(name)] = true
+		names[DaemonSocket(daemonProject(name))] = true
+	}
+}
+
+// The daemon's project names its tmux socket, legion-<project>, which lives under the run's directory and must fit a
+// Unix socket's path: so it is short, mt and the run's 8 random hex digits, which two runs of one second do not share.
+// The ledger repository, the topics and the bearer directory keep the run's full name.
+func TestDaemonProjectIsShortAndKeepsTheRunsRandomSuffix(t *testing.T) {
+	if got := daemonProject("message-test-20261024t050420z-0a1b2c3d"); got != "mt0a1b2c3d" {
+		t.Fatalf("daemonProject = %q, want mt0a1b2c3d", got)
+	}
+	if got := DaemonSocket(daemonProject("message-test-20261024t050420z-0a1b2c3d")); got != "legion-mt0a1b2c3d" {
+		t.Fatalf("the daemon's socket = %q", got)
+	}
+}
+
+// The run's tmux server lives under the run's own directory: the driver gives the daemon, and each tmux command of
+// its own, TMUX_TMPDIR=<out>/tmux, where tmux puts the socket at tmux-<uid>/legion-<project>. A Unix socket's path
+// must fit sun_path, 108 bytes with its NUL: tmux 3.7b refuses a longer one with "File name too long" (client.c:114-117,
+// server.c:116-119) and serves a 107-byte one. So CheckOut, which the operator's command runs before anything starts,
+// refuses an output directory whose socket path would be 108 bytes or more, and a run in one fails its setup before it
+// starts a daemon; a 107-byte one passes both.
+func TestRunRefusesAnOutWhoseTmuxSocketCannotFit(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// <out>/tmux/tmux-<uid>/legion-mt<8 hex digits>
+	rest := len("/tmux/tmux-") + len(strconv.Itoa(os.Getuid())) + len("/legion-mt") + 8
+	out := func(socket int) string {
+		pad := socket - rest - len(base) - 1
+		if pad < 1 {
+			t.Skipf("the temporary directory %s is too long to build a %d-byte socket path under", base, socket)
+		}
+		return filepath.Join(base, strings.Repeat("o", pad))
+	}
+	run := func(out string) Report {
+		report, err := Run(t.Context(), Options{
+			Nodes: []string{"function:c@x/y.c", "struct:t"}, Out: out,
+			Deploy: ownerpkg.Deploy{GraphDir: t.TempDir(), LedgerDSNFile: filepath.Join(t.TempDir(), "ledger-dsn")},
+			Owner:  "/opt/bin/owner", Legion: "/opt/bin/legion",
+			Getenv: func(string) string { return "" }, Progress: io.Discard, Timeouts: Timeouts{Poll: time.Millisecond},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return report
+	}
+	fits, long := out(107), out(108)
+	if err := CheckOut(fits); err != nil {
+		t.Fatalf("CheckOut of a 107-byte socket path: %v", err)
+	}
+	if failure := setupFailure(run(fits)); strings.Contains(failure, "tmux socket") {
+		t.Fatalf("a run whose tmux socket path is 107 bytes failed setup on it: %s", failure)
+	}
+	if err := CheckOut(long); !errors.Is(err, ErrTmuxSocketTooLong) || !strings.Contains(err.Error(), "108 bytes") {
+		t.Fatalf("CheckOut of a 108-byte socket path = %v, want ErrTmuxSocketTooLong naming its length", err)
+	}
+	report := run(long)
+	if failure := setupFailure(report); !strings.Contains(failure, "tmux socket") || !strings.Contains(failure, "108 bytes") || report.Daemon.Executable != "" {
+		t.Fatalf("a run whose tmux socket path would be 108 bytes: setup %q, daemon %+v; want setup to stop on the socket before any daemon", failure, report.Daemon)
+	}
+}
+
+// The daemon keeps TMUX_TMPDIR for every tmux command it runs (its pane environment's allow-list), so the driver gives
+// it the run's own tmux directory, in place of any the operator's environment names.
+func TestDaemonEnvGivesTheSupervisorTheRunsTmuxDirectory(t *testing.T) {
+	d := &driver{opts: Options{Owner: "/opt/bin/owner", Environ: []string{"PATH=/usr/bin", "TMUX_TMPDIR=/tmp/operator", "HOME=/home/operator"}},
+		tmux: tmuxServer{socket: "legion-mt0a1b2c3d", tmpDir: "/runs/one/tmux"}}
+	var got []string
+	for _, entry := range d.daemonEnv() {
+		if value, ok := strings.CutPrefix(entry, "TMUX_TMPDIR="); ok {
+			got = append(got, value)
+		}
+	}
+	if !slices.Equal(got, []string{"/runs/one/tmux"}) {
+		t.Fatalf("the supervisor's TMUX_TMPDIR = %v, want only the run's /runs/one/tmux", got)
 	}
 }
 
@@ -338,7 +416,7 @@ func TestRunNameIsItsStampAndARandomSuffix(t *testing.T) {
 func TestDriverExpectsOffersNumberedByTheAnswerRevision(t *testing.T) {
 	d := &driver{source: "function:a@x/y.c", target: "struct:t"}
 	for _, version := range []string{"r1", "r3", "r4"} {
-		d.expectAnswered(version)
+		d.expectAnswered("kill", version)
 	}
 	edge := ownerpkg.EdgeID(d.source, d.target)
 	var followUps, offers []string
@@ -356,6 +434,34 @@ func TestDriverExpectsOffersNumberedByTheAnswerRevision(t *testing.T) {
 	}
 }
 
+// Each need the target answers queues an offer for the source, and the target's answer publishes that offer's notice
+// itself, through the routing table's offer row: the driver expects it in the source's session, from the target, on
+// the topic the row gives the target's kind (a data structure's users topic, a function's callers topic), and names
+// the step whose need the answer answered.
+func TestDriverExpectsTheTargetsOwnNoticeOfEachOffer(t *testing.T) {
+	prefix := "notifications.example-message-test.mt."
+	routing, err := ownerpkg.NewRouting(prefix, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ target, kind, topic string }{
+		{"struct:t", "struct", prefix + "node.struct:t.users"},
+		{"function:t@x/t.c", "function", prefix + "node.function:t%40x%2Ft%2Ec.callers"},
+	} {
+		d := &driver{source: "function:a@x/y.c", target: tc.target, targetKind: tc.kind, routing: routing}
+		d.expectAnswered("duplicates", "r1")
+		d.expectAnswered("out of order", "r3")
+		edge := ownerpkg.EdgeID(d.source, d.target)
+		want := []ExpectedOwnerNotice{
+			{Step: "duplicates", Receiver: d.source, From: d.target, Type: "offer", Item: "offer:" + edge + "@r1", Topic: tc.topic},
+			{Step: "out of order", Receiver: d.source, From: d.target, Type: "offer", Item: "offer:" + edge + "@r2", Topic: tc.topic},
+		}
+		if !slices.Equal(d.expected.OwnerNotices, want) {
+			t.Errorf("a %s target: the expected owner notices = %+v\nwant %+v", tc.kind, d.expected.OwnerNotices, want)
+		}
+	}
+}
+
 func TestBriefNamesTheTestDeploymentsOwnerCommand(t *testing.T) {
 	brief, err := renderBrief("/opt/bin/owner", "/runs/one/deploy.yaml")
 	if err != nil {
@@ -368,6 +474,9 @@ func TestBriefNamesTheTestDeploymentsOwnerCommand(t *testing.T) {
 		// every other owner's notices too: the brief names the exact list and forbids a wildcard.
 		"exactly as printed", "never a wildcard",
 		"message-test subscribed", "--json inbox", "claim <item>", "message-test answer <item>", "message-test saw <id> <topic>", "End the turn",
+		// An owner's own notice has no topic field: the brief tells the owners to record only the driver's notices,
+		// and that any other is the other test owner's notice of an item the inbox lists.
+		"`type` is `message-test`", "the other test owner's own notice", "record nothing for it",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("owner.md does not say %q", want)
