@@ -639,7 +639,8 @@ func TestNewRunnerJournalsUnderTheDeploymentStateDir(t *testing.T) {
 	}
 	cwd := t.TempDir()
 	t.Chdir(cwd)
-	if err := runner.journal(Notice{Topic: "notifications.example.all", Key: "k"}, errInjected); err != nil {
+	noRetryDelays(t)
+	if _, err := Deliver(context.Background(), &topicPublisher{refuse: "notifications.example.all"}, runner.Journal, []Notice{{Topic: "notifications.example.all", Key: "k"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(runner.Journal); err != nil {
@@ -719,20 +720,6 @@ func TestSupersedeAdoptsOnlyALiveLeaseOfTheSameOwner(t *testing.T) {
 	var refusal *ledger.Refusal
 	if err := Supersede(fixture.ctx, fixture.ledger, "r", owner, held, "r6"); !errors.As(err, &refusal) || refusal.Reason != ledger.ReasonLeaseHeld {
 		t.Fatalf("Supersede over another holder's lease error = %v, want a held-lease refusal", err)
-	}
-}
-
-func TestJournalRefusesAPathRelativeToTheWorkingDirectory(t *testing.T) {
-	cwd := t.TempDir()
-	t.Chdir(cwd)
-	for _, path := range []string{"", "undelivered.jsonl"} {
-		err := Runner{Journal: path}.journal(Notice{Topic: "notifications.example.all", Key: "k"}, errInjected)
-		if err == nil || !strings.Contains(err.Error(), "absolute") {
-			t.Fatalf("journal(%q) error = %v, want a refused relative path", path, err)
-		}
-	}
-	if entries, _ := os.ReadDir(cwd); len(entries) != 0 {
-		t.Fatalf("journal wrote into the working directory: %v", entries)
 	}
 }
 

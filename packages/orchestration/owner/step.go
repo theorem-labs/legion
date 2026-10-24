@@ -160,15 +160,16 @@ func (r Runner) run(ctx context.Context, s Step, git func(args ...string) (strin
 	}
 
 	outcome := Outcome{Commit: commit}
+	var notices []Notice
 	if record.Notices != nil {
-		for _, notice := range record.Notices(commit) {
-			if err := r.publish(ctx, notice); err != nil {
-				if journalErr := r.journal(notice, err); journalErr != nil {
-					return outcome, journalErr
-				}
-				outcome.Undelivered = append(outcome.Undelivered, notice.Topic)
-			}
-		}
+		notices = record.Notices(commit)
+	}
+	undelivered, err := Deliver(ctx, r.Envoy, r.Journal, notices)
+	for _, notice := range undelivered {
+		outcome.Undelivered = append(outcome.Undelivered, notice.Topic)
+	}
+	if err != nil {
+		return outcome, err
 	}
 
 	for _, id := range answered {
@@ -297,14 +298,33 @@ func (r Runner) enqueue(ctx context.Context, followUp FollowUp) error {
 	return nil
 }
 
-func (r Runner) publish(ctx context.Context, notice Notice) error {
+// Deliver sends each notice through envoy, retrying a refused one at 1 s, 4 s and 16 s, and appends each one that
+// envoy still refuses to the journal of undelivered notices at journal: an absolute path, a deployment's
+// <state_dir>/undelivered.jsonl. It returns the notices envoy refused, in order. Its error is a journal it could not
+// write, and the notices it returns then end with the one that journal lost.
+func Deliver(ctx context.Context, envoy Publisher, journal string, notices []Notice) ([]Notice, error) {
+	var undelivered []Notice
+	for _, notice := range notices {
+		publishErr := publish(ctx, envoy, notice)
+		if publishErr == nil {
+			continue
+		}
+		undelivered = append(undelivered, notice)
+		if err := appendJournal(journal, notice, publishErr); err != nil {
+			return undelivered, err
+		}
+	}
+	return undelivered, nil
+}
+
+func publish(ctx context.Context, envoy Publisher, notice Notice) error {
 	if strings.TrimSpace(notice.Key) == "" {
 		return fmt.Errorf("publish notice on %q: empty idempotency key", notice.Topic)
 	}
 
 	var err error
 	for attempt := 0; attempt <= len(noticeRetryDelays); attempt++ {
-		err = r.Envoy.Publish(ctx, notice.Topic, notice.Message, notice.Payload, notice.Key)
+		err = envoy.Publish(ctx, notice.Topic, notice.Message, notice.Payload, notice.Key)
 		if err == nil {
 			return nil
 		}
@@ -329,8 +349,7 @@ func wait(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func (r Runner) journal(notice Notice, publishErr error) error {
-	path := r.Journal
+func appendJournal(path string, notice Notice, publishErr error) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("the notice journal %q is not an absolute path: it is the deployment's <state_dir>/undelivered.jsonl", path)
 	}
