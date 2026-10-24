@@ -16,11 +16,11 @@ func TestLoadDeployReadsEveryConfiguredField(t *testing.T) {
 	}
 	want := Deploy{
 		BareRepo: "/srv/owners/repo.git", LandingRepo: "/srv/owners/landing", LedgerDSNFile: "/srv/owners/ledger-dsn",
-		VMHost: "linux28-poc-build", SSHConfig: "/srv/owners/ssh_config", VMRoot: "/theorem/owners",
-		GraphDir: "/theorem/linux-graph/out", StateDir: "/srv/owners/state", SessionsDir: "/srv/owners/sessions",
+		VMHost: "build.example.test", SSHConfig: "/srv/owners/ssh_config", VMRoot: "/srv/vm/owners",
+		GraphDir: "/srv/graph/out", StateDir: "/srv/owners/state", SessionsDir: "/srv/owners/sessions",
 		ScoreWork: "/srv/owners/score", LedgerRemotePort: 15432, LedgerLocalPort: 5432,
 		Hooks: map[string]Hook{"score": {
-			Dir: "/theorem/score", Command: "/usr/local/bin/score-input", Parts: []string{"slice"},
+			Dir: "/srv/score", Command: "/usr/local/bin/score-input", Parts: []string{"slice"},
 		}},
 		Upstream: UpstreamConfig{
 			URL: "https://example.test/upstream.git", Branch: "main", CacheHost: "cache.example.test",
@@ -54,10 +54,10 @@ func TestLoadDeployRejectsInvalidRequiredValues(t *testing.T) {
 		{"missing bare repository", "bare_repo: /srv/owners/repo.git", "bare_repo: ", "bare_repo"},
 		{"missing landing repository", "landing_repo: /srv/owners/landing", "landing_repo: ", "landing_repo"},
 		{"missing ledger DSN file", "ledger_dsn_file: /srv/owners/ledger-dsn", "ledger_dsn_file: ", "ledger_dsn_file"},
-		{"missing VM host", "vm_host: linux28-poc-build", "vm_host: ", "vm_host"},
+		{"missing VM host", "vm_host: build.example.test", "vm_host: ", "vm_host"},
 		{"missing SSH config", "ssh_config: /srv/owners/ssh_config", "ssh_config: ", "ssh_config"},
-		{"missing VM root", "vm_root: /theorem/owners", "vm_root: ", "vm_root"},
-		{"missing graph directory", "graph_dir: /theorem/linux-graph/out", "graph_dir: ", "graph_dir"},
+		{"missing VM root", "vm_root: /srv/vm/owners", "vm_root: ", "vm_root"},
+		{"missing graph directory", "graph_dir: /srv/graph/out", "graph_dir: ", "graph_dir"},
 		{"missing state directory", "state_dir: /srv/owners/state", "state_dir: ", "state_dir"},
 		{"missing sessions directory", "sessions_dir: /srv/owners/sessions", "sessions_dir: ", "sessions_dir"},
 		{"missing score work directory", "score_work: /srv/owners/score", "score_work: ", "score_work"},
@@ -68,7 +68,7 @@ func TestLoadDeployRejectsInvalidRequiredValues(t *testing.T) {
 		{"missing upstream poll time", "poll_seconds: \"300\"", "poll_seconds: ", "upstream.poll_seconds"},
 		{"invalid remote port", "ledger_remote_port: 15432", "ledger_remote_port: 65536", "ledger_remote_port"},
 		{"invalid local port", "ledger_local_port: 5432", "ledger_local_port: 0", "ledger_local_port"},
-		{"invalid score hook directory", "dir: /theorem/score", "dir: ", "hooks.score.dir"},
+		{"invalid score hook directory", "dir: /srv/score", "dir: ", "hooks.score.dir"},
 		{"invalid score hook", "command: /usr/local/bin/score-input", "command: ", "hooks.score.command"},
 		{"unknown upstream field", "poll_seconds: \"300\"", "poll_seconds: \"300\"\n  unexpected: true", "unexpected"},
 	} {
@@ -110,7 +110,7 @@ func TestDecodeStrictYAMLReadsOwnerConfiguration(t *testing.T) {
 	if err := decodeStrictYAML(data, &config); err != nil {
 		t.Fatal(err)
 	}
-	if config.Repo != "machcsl-riscv-experimental" || config.TopicPrefix != "notifications.lxspec." ||
+	if config.Repo != "example-repo" || config.TopicPrefix != "notifications.example." ||
 		config.Paths.NodeModuleTemplate != "Linux/Skeleton/{key}/Node.lean" ||
 		!reflect.DeepEqual(config.Build.GateTargets, []string{"Linux", "Firmware", "Combined"}) {
 		t.Fatalf("owner configuration = %+v", config)
@@ -136,7 +136,7 @@ func TestLoadConfigReadsOwnerConfigurationAtMain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Repo != "machcsl-riscv-experimental" || config.ActiveFile != "skeleton/active/ns-match.yaml" ||
+	if config.Repo != "example-repo" || config.ActiveFile != "skeleton/active/ns-match.yaml" ||
 		config.Paths.EdgeRecordTemplate != "skeleton/nodes/{key_source}/edges/E{hex16_target}.yaml" {
 		t.Fatalf("LoadConfig = %+v", config)
 	}
@@ -158,19 +158,23 @@ func TestLoadConfigNamesMissingKey(t *testing.T) {
 	}
 }
 
-// Owners publish under notifications.lxspec.; a test run, such as the message test, keeps its traffic apart under
-// notifications.lxspec-<name>. so that no production owner receives it.
-func TestValidTopicPrefixIsTheProtocolsOrAMarkedTestPrefix(t *testing.T) {
+// Owners publish under the prefix their configuration names, any prefix under notifications. that ends in a dot; a
+// test run, such as the message test, keeps its traffic apart under a prefix of its own so that no production owner
+// receives it.
+func TestValidTopicPrefixIsAnyPrefixUnderNotifications(t *testing.T) {
 	for prefix, want := range map[string]bool{
-		"notifications.lxspec.":              true,
-		"notifications.lxspec.extra.":        true,
-		"notifications.lxspec-message-test.": true,
-		"notifications.lxspec":               false,
-		"notifications.lxspecx.":             false,
-		"notifications.lxspec-.":             false,
-		"notifications.lxspec-Test.":         false,
-		"notifications.lxspec-message-test":  false,
-		"notifications.other.":               false,
+		"notifications.example.":              true,
+		"notifications.example.extra.":        true,
+		"notifications.example-message-test.": true,
+		"notifications.other.":                true,
+		"notifications.example":               false,
+		"notifications.example-message-test":  false,
+		"notifications.":                      false,
+		"notifications..":                     false,
+		"notifications.example..":             false,
+		"notifications.exa mple.":             false,
+		"example.":                            false,
+		"":                                    false,
 	} {
 		if got := ValidTopicPrefix(prefix); got != want {
 			t.Errorf("ValidTopicPrefix(%q) = %v, want %v", prefix, got, want)
@@ -178,19 +182,19 @@ func TestValidTopicPrefixIsTheProtocolsOrAMarkedTestPrefix(t *testing.T) {
 	}
 }
 
-func TestLoadTopicsAcceptsAMarkedTestPrefix(t *testing.T) {
+func TestLoadTopicsAcceptsATestRunsPrefixUnderNotifications(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "topics.json")
-	document := `{"format":"cgraph/topics/v1","part":"slice","prefix":"notifications.lxspec-message-test.","owners":{}}`
+	document := `{"format":"cgraph/topics/v1","part":"slice","prefix":"notifications.example-message-test.","owners":{}}`
 	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadTopics(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(strings.Replace(document, "lxspec-message-test", "other", 1)), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(strings.Replace(document, "notifications.example-message-test.", "example.", 1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadTopics(path); err == nil {
-		t.Fatal("LoadTopics accepted a prefix outside notifications.lxspec")
+		t.Fatal("LoadTopics accepted a prefix outside notifications.")
 	}
 }

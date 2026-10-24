@@ -1,4 +1,4 @@
-// Package messagetest is the owner message test (INFRA-146 Task 1.8): before any production owner starts, it shows
+// Package messagetest is the owner message test (plan Task 1.8): before any production owner starts, it shows
 // that a notice on each topic kind reaches real owner sessions that the supervisor starts from their ledger queues,
 // and that duplicate notices and items, items out of order, killed owner sessions and a supervisor restart still
 // leave each step done once. The driver reads every assertion from durable state: the ledger's events and the
@@ -29,7 +29,7 @@ import (
 
 // Options configure one run.
 type Options struct {
-	Prefix string   // the topic prefix: notifications.lxspec., or a test run's notifications.lxspec-<name>.
+	Prefix string   // the topic prefix, under notifications. and ending in a dot; empty means the graph's own
 	Nodes  []string // the two owners; none means pickNodes chooses them from the graph
 	Kills  int      // how many owner panes to kill
 	Out    string   // the run's directory, absolute and new or empty
@@ -154,8 +154,8 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 
 func (o Options) check() error {
 	switch {
-	case !ownerpkg.ValidTopicPrefix(o.Prefix):
-		return fmt.Errorf("prefix %q is not notifications.lxspec. or notifications.lxspec-<name>.", o.Prefix)
+	case o.Prefix != "" && !ownerpkg.ValidTopicPrefix(o.Prefix):
+		return fmt.Errorf("prefix %q is not a prefix under notifications. that ends in a dot", o.Prefix)
 	case len(o.Nodes) != 0 && (len(o.Nodes) != 2 || o.Nodes[0] == o.Nodes[1]):
 		return fmt.Errorf("the message test takes two different nodes, not %v", o.Nodes)
 	case o.Kills < 0:
@@ -249,6 +249,11 @@ func (d *driver) setup(ctx context.Context) error {
 	d.report.Nodes = d.nodes
 	d.source, d.target = graph.edge(d.nodes)
 	d.report.Edge = ownerpkg.EdgeID(d.source, d.target)
+	if d.opts.Prefix == "" {
+		// No prefix given: the run keeps the one the deployment's graph names, which its owners use.
+		d.opts.Prefix = graph.topics.Prefix
+	}
+	d.report.Prefix = d.opts.Prefix
 
 	graphDir := filepath.Join(out, "graph")
 	topics, owners, err := graph.write(graphDir, d.opts.Prefix, d.nodes, d.source)

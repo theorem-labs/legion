@@ -32,7 +32,7 @@ const (
 func writeMessageTestGraph(t *testing.T, dir string) {
 	t.Helper()
 	node := func(id, suffix string) string {
-		return "notifications.lxspec.node." + ownerpkg.TopicToken(id) + "." + suffix
+		return "notifications.example.node." + ownerpkg.TopicToken(id) + "." + suffix
 	}
 	owners := []map[string]any{}
 	for id, kind := range map[string]string{mtFunction: "function", mtStruct: "struct", mtCaller: "function", mtCallee: "function", mtLinked: "struct"} {
@@ -41,11 +41,11 @@ func writeMessageTestGraph(t *testing.T, dir string) {
 	}
 	documents := map[string]any{
 		"owners.json": map[string]any{"format": "cgraph/owners/v1", "part": "slice", "owners": owners},
-		"topics.json": map[string]any{"format": "cgraph/topics/v1", "part": "slice", "prefix": "notifications.lxspec.", "token_rule": "percent-encoding",
+		"topics.json": map[string]any{"format": "cgraph/topics/v1", "part": "slice", "prefix": "notifications.example.", "token_rule": "percent-encoding",
 			"owners": map[string][]string{
-				mtFunction: {"notifications.lxspec.all", node(mtFunction, "needs"), node(mtCallee, "callers"), node(mtCallee, "neighbors"),
+				mtFunction: {"notifications.example.all", node(mtFunction, "needs"), node(mtCallee, "callers"), node(mtCallee, "neighbors"),
 					node(mtCaller, "callees"), node(mtCaller, "neighbors"), node(mtStruct, "users"), node(mtStruct, "neighbors")},
-				mtStruct: {"notifications.lxspec.all", node(mtStruct, "needs"), node(mtFunction, "neighbors"), node(mtLinked, "linked"), node(mtLinked, "neighbors")},
+				mtStruct: {"notifications.example.all", node(mtStruct, "needs"), node(mtFunction, "neighbors"), node(mtLinked, "linked"), node(mtLinked, "neighbors")},
 			}},
 		"graph.json": map[string]any{"format": "cgraph/graph/v1", "part": "slice", "nodes": []map[string]any{
 			{"id": mtFunction, "kind": "function", "part": true}, {"id": mtCaller, "kind": "function", "part": true},
@@ -90,7 +90,7 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 	}
 	deploy := filepath.Join(root, "deploy.yaml")
 	stateDir := filepath.Join(root, "state")
-	if err := os.WriteFile(deploy, []byte(strings.NewReplacer("/srv/owners/ledger-dsn", dsnFile, "/theorem/linux-graph/out", graphDir, "/srv/owners/state", stateDir).Replace(string(testdata))), 0o600); err != nil {
+	if err := os.WriteFile(deploy, []byte(strings.NewReplacer("/srv/owners/ledger-dsn", dsnFile, "/srv/graph/out", graphDir, "/srv/owners/state", stateDir).Replace(string(testdata))), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	listener := httptest.NewServer(ownerharness.NewListener())
@@ -112,7 +112,7 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 	command := exec.CommandContext(ctx, filepath.Join(bin, "owner"), "--deploy", deploy, "message-test",
-		"--prefix", "notifications.lxspec-message-test.", "--kills", "3", "--out", out)
+		"--prefix", "notifications.example-message-test.", "--kills", "3", "--out", out)
 	// The driver reads its ledger from the deployment's ledger_dsn_file alone: a launch variable in the operator's
 	// shell names no ledger of the run.
 	command.Env = append(os.Environ(), "PATH="+bin+string(filepath.ListSeparator)+os.Getenv("PATH"), "HOME="+root,

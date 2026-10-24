@@ -106,7 +106,7 @@ func newCommandFixture(t *testing.T) *commandFixture {
 	for _, name := range []string{"graph.json", "owners.json", "topics.json", "facts.json"} {
 		f.copyFile(filepath.Join(testdata, name), filepath.Join(graphDir, name))
 	}
-	ownerYAML := strings.NewReplacer("repo: machcsl-riscv-experimental", "repo: r", "active: skeleton/active/ns-match.yaml", "active: skeleton/active/fixture.yaml").
+	ownerYAML := strings.NewReplacer("repo: example-repo", "repo: r", "active: skeleton/active/ns-match.yaml", "active: skeleton/active/fixture.yaml").
 		Replace(string(f.read(filepath.Join(testdata, "owner.yaml"))))
 	f.bare = f.createBareRepo(map[string]string{
 		"skeleton/owner.yaml":           ownerYAML,
@@ -119,7 +119,7 @@ func newCommandFixture(t *testing.T) *commandFixture {
 	dsnFile := filepath.Join(f.root, "ledger-dsn")
 	f.writeFile(dsnFile, dsn)
 	f.deploy = filepath.Join(f.root, "deploy.yaml")
-	f.writeFile(f.deploy, strings.NewReplacer("/srv/owners/repo.git", f.bare, "/srv/owners/ledger-dsn", dsnFile, "/theorem/linux-graph/out", graphDir,
+	f.writeFile(f.deploy, strings.NewReplacer("/srv/owners/repo.git", f.bare, "/srv/owners/ledger-dsn", dsnFile, "/srv/graph/out", graphDir,
 		"/srv/owners/state", f.stateDir()).Replace(string(f.read(filepath.Join(testdata, "deploy.yaml")))))
 	f.env = map[string]string{
 		"LEGION_LEDGER_REPOSITORY": "r",

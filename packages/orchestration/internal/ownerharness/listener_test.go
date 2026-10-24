@@ -86,7 +86,7 @@ func TestListenerDeliversOnlyToSessionsSubscribedWhenItPublishes(t *testing.T) {
 func TestListenerRefusesATopicOutsideNotifications(t *testing.T) {
 	server := httptest.NewServer(NewListener())
 	defer server.Close()
-	body, _ := json.Marshal(map[string]any{"topic": "lxspec.all", "message": "a notice"})
+	body, _ := json.Marshal(map[string]any{"topic": "example.all", "message": "a notice"})
 	response, err := http.Post(server.URL+"/v1/messages/publish", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)

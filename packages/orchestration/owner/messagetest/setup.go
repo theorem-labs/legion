@@ -26,7 +26,7 @@ var copyFiles embed.FS
 // librarian's topics, which no node owner holds.
 const testFact = "stack-alignment"
 
-// TopicKinds are the node topic kinds of INFRA-109 section 3.5 and the topic every owner holds.
+// TopicKinds are the owner protocol's node topic kinds and the topic every owner holds.
 var TopicKinds = []string{"needs", "callers", "callees", "users", "neighbors", "linked", "all"}
 
 // graphInputs are the deployment's graph files the test copies its two nodes from.

@@ -39,7 +39,7 @@ func LoadTopics(path string) (Topics, error) {
 		return Topics{}, err
 	}
 	if !ValidTopicPrefix(topics.Prefix) {
-		return Topics{}, fmt.Errorf("%s prefix %q is not notifications.lxspec. or a test run's notifications.lxspec-<name>.", path, topics.Prefix)
+		return Topics{}, fmt.Errorf("%s prefix %q is not a prefix under notifications. that ends in a dot", path, topics.Prefix)
 	}
 	return topics, nil
 }

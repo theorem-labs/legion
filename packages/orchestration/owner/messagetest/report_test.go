@@ -12,7 +12,7 @@ import (
 func sampleReport() Report {
 	start := time.Date(2026, 10, 23, 18, 0, 0, 0, time.UTC)
 	return Report{
-		Run: "message-test-20261023t180000z", Prefix: "notifications.lxspec-message-test.", Nodes: []string{fn, st},
+		Run: "message-test-20261023t180000z", Prefix: "notifications.example-message-test.", Nodes: []string{fn, st},
 		StartedAt: start, FinishedAt: start.Add(90 * time.Second), Daemon: Daemon{Executable: "/opt/bin/legion", Omp: "/opt/omp/bin/omp"},
 		Steps:      []StepTiming{{Name: "setup", StartedAt: start, Seconds: 1.5}, {Name: "wake", StartedAt: start.Add(2 * time.Second), Seconds: 3}},
 		Panes:      []PaneCheck{{Owner: st, Pane: "%3", StartSeconds: 0.8, Env: map[string]string{"LEGION_OWNER": st}}},

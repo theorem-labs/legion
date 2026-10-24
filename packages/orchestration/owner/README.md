@@ -80,12 +80,13 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
 1. **Setup.** A ledger repository `message-test-<UTC stamp>` in the ledger of the operator deployment's
    `ledger_dsn_file` (the driver is the operator's program: it reads no launch variable, and the supervisor gives the
    same file to the test owners as `LEGION_LEDGER_DSN_FILE`), a bare repository with the test's `skeleton/` files, a
-   graph directory with the two nodes' `owners.json`, their `topics.json` moved under `--prefix`, the deployment's
-   `graph.json`, and a `facts.json` in which the source node states `stack-alignment`; a test deployment
-   `DIR/deploy.yaml`; and the daemon's minimal standing-owners file `DIR/daemon/legion.yaml` (C33: `project`,
-   `state_dir`, `runtime: tmux`, its own `port`, `operator_token_file`, the Envoy keys, and `standing_owners` with
-   `max_running: 2` and an `omp` template per node kind, prompt `DIR/daemon/owner.md`). The daemon's own database
-   comes from `LEGION_POSTGRES_DSN`. It runs `legion start --config DIR/daemon/legion.yaml` from `PATH`, with the
+   graph directory with the two nodes' `owners.json`, their `topics.json` moved under `--prefix` (without it, the
+   deployment graph's own prefix), the deployment's `graph.json`, and a `facts.json` in which the source node states
+   `stack-alignment`; a test deployment `DIR/deploy.yaml`; and the daemon's minimal standing-owners file
+   `DIR/daemon/legion.yaml` (C33: `project`, `state_dir`, `runtime: tmux`, its own `port`, `operator_token_file`, the
+   Envoy keys, and `standing_owners` with `max_running: 2` and an `omp` template per node kind, prompt
+   `DIR/daemon/owner.md`). The daemon's own database comes from `LEGION_POSTGRES_DSN`. It runs
+   `legion start --config DIR/daemon/legion.yaml` from `PATH`, with the
    `owner` executable's directory first. The daemon never looks omp up on `PATH`, so the driver gives it
    `LEGION_OMP_PATH`: the operator's `LEGION_OMP_PATH`, else the `omp` on the supervisor's `PATH`; the report names it.
    The daemon refuses to start without an operator bearer, so the run writes a new random one for its operator routes,
@@ -119,8 +120,9 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    item answered as current, a follow-up enqueued twice, never or for another owner, and a record or completion of an
    item the run did not expect.
 
-`messagetest/owner.md` is the test owners' prompt. Production owners publish under `notifications.lxspec.`; a test
-run uses `notifications.lxspec-<name>.`, which `topic_prefix` and `topics.json` accept so that its traffic reaches no
+`messagetest/owner.md` is the test owners' prompt. Owners publish under the copy's `topic_prefix`, which the
+deployment graph's `topics.json` repeats; both accept any prefix under `notifications.` that ends in a dot. A test run
+passes a `--prefix` of its own, such as `notifications.example-message-test.`, so that its traffic reaches no
 production owner.
 
 `internal/ownerharness` is test support that only `_test.go` files import (its guard test checks it), and no command
@@ -130,5 +132,5 @@ agreed contracts C8, C9 and C33, which refuses to start, as the daemon does, wit
 scripted owner that follows `owner.md`; `OWNER_HARNESS_STEP_DELAY` paces it), with an HTTP stand-in for the
 listener. Each stand-in answers a version request as a test-only stand-in, so the report of a run against it says
 so. A run against the harness checks the driver and the owner command; it is neither production nor acceptance
-evidence for C8, C9 or C33. Against the real daemon the same run fails at `start the daemon` until INFRA-137 R1 lands
-those contracts.
+evidence for C8, C9 or C33. Against the real daemon the same run fails at `start the daemon` until the daemon
+implements those contracts.

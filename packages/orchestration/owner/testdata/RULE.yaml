@@ -1,4 +1,4 @@
-# The order of each owner's queue (INFRA-109 section 3.3 item 3). People wrote version 1:
+# The order of each owner's queue, as the owner protocol defines it. People wrote version 1:
 # first the needs that stop the most instructions, and the leaves of the call graph before their callers.
 version: 1
 order:

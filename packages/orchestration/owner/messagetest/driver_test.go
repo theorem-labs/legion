@@ -3,20 +3,22 @@ package messagetest
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 	"gopkg.in/yaml.v3"
 )
 
-const source = "notifications.lxspec."
+const source = "notifications.example."
 
-// writeGraphDir writes a deployment graph: owners, their topics under notifications.lxspec., and access edges.
+// writeGraphDir writes a deployment graph: owners, their topics under notifications.example., and access edges.
 func writeGraphDir(t *testing.T, owners map[string]string, topics map[string][]string, access [][2]string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -99,7 +101,7 @@ func TestGraphWriteKeepsTheTwoNodesUnderThePrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(t.TempDir(), "graph")
-	prefix := "notifications.lxspec-message-test."
+	prefix := "notifications.example-message-test."
 	if _, _, err := graph.write(out, prefix, []string{fn, st}, fn); err != nil {
 		t.Fatal(err)
 	}
@@ -125,6 +127,40 @@ func TestGraphWriteKeepsTheTwoNodesUnderThePrefix(t *testing.T) {
 	}
 	if _, _, err := graph.write(out, prefix, []string{fn, "struct:missing"}, fn); err == nil {
 		t.Fatal("write accepted a node the graph does not have")
+	}
+}
+
+// With no prefix given, a run keeps the deployment graph's own prefix, the one the deployment's configuration names:
+// the test graph, the test copy's topic_prefix and the report all carry it, and the code holds no default of its own.
+func TestRunWithNoPrefixKeepsTheDeploymentGraphsPrefix(t *testing.T) {
+	fn, st := "function:c@x/y.c", "struct:t"
+	dir := writeGraphDir(t, map[string]string{fn: "function", st: "struct"},
+		map[string][]string{fn: everyKind("function:c%40x%2Fy%2Ec", st), st: {"all", "node.struct:t.needs"}}, [][2]string{{fn, st}})
+	out := filepath.Join(t.TempDir(), "run")
+	// The deployment names only its graph and a ledger DSN file, so the run stops at setup once it has written the
+	// test graph and the test copy.
+	report, err := Run(t.Context(), Options{
+		Nodes: []string{fn, st}, Out: out,
+		Deploy: ownerpkg.Deploy{GraphDir: dir, LedgerDSNFile: filepath.Join(t.TempDir(), "ledger-dsn")},
+		Owner:  "/opt/bin/owner", Legion: "/opt/bin/legion",
+		Getenv: func(string) string { return "" }, Progress: io.Discard, Timeouts: Timeouts{Poll: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Prefix != source {
+		t.Fatalf("report prefix = %q, want the graph's %q", report.Prefix, source)
+	}
+	topics, err := ownerpkg.LoadTopics(filepath.Join(out, "graph", "topics.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topics.Prefix != source || !slices.Equal(topics.Owners[st], []string{source + "all", source + "node.struct:t.needs"}) {
+		t.Fatalf("topics.json = %+v, want the graph's prefix %q", topics, source)
+	}
+	config, err := ownerpkg.LoadConfig(&ownerpkg.Repo{Path: filepath.Join(out, "repo.git")})
+	if err != nil || config.TopicPrefix != source {
+		t.Fatalf("the test copy's configuration = %+v, %v; want topic_prefix %q", config, err, source)
 	}
 }
 
@@ -213,7 +249,7 @@ func TestBriefNamesTheTestDeploymentsOwnerCommand(t *testing.T) {
 func TestCreateCopyIsAnOwnerConfigurationAtMain(t *testing.T) {
 	root := t.TempDir()
 	bare := filepath.Join(root, "repo.git")
-	prefix := "notifications.lxspec-message-test."
+	prefix := "notifications.example-message-test."
 	if err := createCopy(bare, filepath.Join(root, "seed"), copyConfig("message-test-x", prefix, filepath.Join(root, "graph")), []string{"function:c@x/y.c", "struct:t"}); err != nil {
 		t.Fatal(err)
 	}

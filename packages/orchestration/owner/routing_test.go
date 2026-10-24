@@ -167,16 +167,16 @@ func assertRouteReachesReceivers(t *testing.T, fixture routingFixture, routing R
 
 // A routing table always has its topic prefix: no notice is addressed under a default the deployment did not name.
 func TestNewRoutingRefusesAPrefixOutsideTheNamespace(t *testing.T) {
-	for _, prefix := range []string{"", "notifications.", "notifications.other.", "lxspec."} {
+	for _, prefix := range []string{"", "notifications.", "notifications.example", "example."} {
 		if _, err := NewRouting(prefix, nil); err == nil || !strings.Contains(err.Error(), "prefix") {
 			t.Errorf("NewRouting(%q) error = %v, want a refused prefix", prefix, err)
 		}
 	}
-	routing, err := NewRouting("notifications.lxspec-message-test.", nil)
+	routing, err := NewRouting("notifications.example-message-test.", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := routing.NeedsTopic("struct:state"); got != "notifications.lxspec-message-test.node.struct:state.needs" {
+	if got := routing.NeedsTopic("struct:state"); got != "notifications.example-message-test.node.struct:state.needs" {
 		t.Fatalf("NeedsTopic = %q", got)
 	}
 }

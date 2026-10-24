@@ -148,7 +148,7 @@ func newStepFixture(t *testing.T) *stepFixture {
 				{Item: "review:function:ns_match@r1", Owner: owner},
 			},
 			Notices: []Notice{{
-				Topic:   "notifications.lxspec.node.struct:ns_common.needs",
+				Topic:   "notifications.example.node.struct:ns_common.needs",
 				Message: "need changed",
 				Payload: Payload{"item": answer},
 				Key:     "c-need-ns-match-r1",
@@ -428,7 +428,7 @@ func TestRunnerFromEnvJournalsUnderTheDeploymentStateDir(t *testing.T) {
 	}
 	cwd := t.TempDir()
 	t.Chdir(cwd)
-	if err := runner.journal(Notice{Topic: "notifications.lxspec.all", Key: "k"}, errInjected); err != nil {
+	if err := runner.journal(Notice{Topic: "notifications.example.all", Key: "k"}, errInjected); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(runner.Journal); err != nil {
@@ -508,7 +508,7 @@ func TestJournalRefusesAPathRelativeToTheWorkingDirectory(t *testing.T) {
 	cwd := t.TempDir()
 	t.Chdir(cwd)
 	for _, path := range []string{"", "undelivered.jsonl"} {
-		err := Runner{Journal: path}.journal(Notice{Topic: "notifications.lxspec.all", Key: "k"}, errInjected)
+		err := Runner{Journal: path}.journal(Notice{Topic: "notifications.example.all", Key: "k"}, errInjected)
 		if err == nil || !strings.Contains(err.Error(), "absolute") {
 			t.Fatalf("journal(%q) error = %v, want a refused relative path", path, err)
 		}

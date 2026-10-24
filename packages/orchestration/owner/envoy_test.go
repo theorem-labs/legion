@@ -28,7 +28,7 @@ func TestHTTPPublisherSendsListenerEnvelope(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body.Topic != "notifications.lxspec.node.function:ns_match.needs" || body.Message != "need changed" || body.IdempotencyKey != "need:abc" {
+		if body.Topic != "notifications.example.node.function:ns_match.needs" || body.Message != "need changed" || body.IdempotencyKey != "need:abc" {
 			t.Fatalf("publish body = %#v", body)
 		}
 		var payload map[string]string
@@ -38,7 +38,7 @@ func TestHTTPPublisherSendsListenerEnvelope(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := NewHTTPPublisher(server.URL, "envoy-bearer").Publish(context.Background(), "notifications.lxspec.node.function:ns_match.needs", "need changed", map[string]string{"item": "need:abc"}, "need:abc"); err != nil {
+	if err := NewHTTPPublisher(server.URL, "envoy-bearer").Publish(context.Background(), "notifications.example.node.function:ns_match.needs", "need changed", map[string]string{"item": "need:abc"}, "need:abc"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -53,13 +53,13 @@ func TestHTTPPublisherOmitsEmptyAuthorizationAndRefusesNonNotificationTopics(t *
 	}))
 	defer server.Close()
 	publisher := NewHTTPPublisher(server.URL, "")
-	if err := publisher.Publish(context.Background(), "notifications.lxspec.all", "changed", nil, "key"); err != nil {
+	if err := publisher.Publish(context.Background(), "notifications.example.all", "changed", nil, "key"); err != nil {
 		t.Fatal(err)
 	}
-	if err := publisher.Publish(context.Background(), "lxspec.all", "changed", nil, "key"); err == nil {
+	if err := publisher.Publish(context.Background(), "example.all", "changed", nil, "key"); err == nil {
 		t.Fatal("Publish accepted a topic outside notifications.")
 	}
-	if err := publisher.Publish(context.Background(), "notifications.lxspec.all", "changed", nil, ""); err == nil || !strings.Contains(err.Error(), "idempotency key") {
+	if err := publisher.Publish(context.Background(), "notifications.example.all", "changed", nil, ""); err == nil || !strings.Contains(err.Error(), "idempotency key") {
 		t.Fatalf("Publish without an idempotency key error = %v", err)
 	}
 	if requests != 1 {
@@ -75,7 +75,7 @@ func TestHTTPPublisherReturnsTheListenerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	err := NewHTTPPublisher(server.URL, "").Publish(context.Background(), "notifications.lxspec.all", "changed", nil, "key")
+	err := NewHTTPPublisher(server.URL, "").Publish(context.Background(), "notifications.example.all", "changed", nil, "key")
 	if err == nil || !strings.Contains(err.Error(), "unknown topic") {
 		t.Fatalf("Publish error = %v, want listener error", err)
 	}
@@ -84,19 +84,19 @@ func TestHTTPPublisherReturnsTheListenerError(t *testing.T) {
 // The listener answers a publish with the envelope it sent; its event_id is the id a subscribed session's delivery
 // carries, so the message test can match each record of a delivery to its publication.
 func TestHTTPPublisherPublishEventReturnsTheListenersEventID(t *testing.T) {
-	reply := `{"event_id":"evt-9","topic":"notifications.lxspec.all","dedupe_key":"publish.key"}`
+	reply := `{"event_id":"evt-9","topic":"notifications.example.all","dedupe_key":"publish.key"}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(reply))
 	}))
 	defer server.Close()
 	publisher := NewHTTPPublisher(server.URL, "")
-	id, err := publisher.PublishEvent(context.Background(), "notifications.lxspec.all", "changed", nil, "key")
+	id, err := publisher.PublishEvent(context.Background(), "notifications.example.all", "changed", nil, "key")
 	if err != nil || id != "evt-9" {
 		t.Fatalf("PublishEvent = %q, %v, want evt-9", id, err)
 	}
-	reply = `{"topic":"notifications.lxspec.all"}`
-	if _, err := publisher.PublishEvent(context.Background(), "notifications.lxspec.all", "changed", nil, "key"); err == nil || !strings.Contains(err.Error(), "event_id") {
+	reply = `{"topic":"notifications.example.all"}`
+	if _, err := publisher.PublishEvent(context.Background(), "notifications.example.all", "changed", nil, "key"); err == nil || !strings.Contains(err.Error(), "event_id") {
 		t.Fatalf("PublishEvent with no event_id error = %v", err)
 	}
 }

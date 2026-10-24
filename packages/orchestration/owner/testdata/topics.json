@@ -1,52 +1,52 @@
 {
   "format": "cgraph/topics/v1",
   "part": "slice",
-  "prefix": "notifications.lxspec.",
+  "prefix": "notifications.example.",
   "token_rule": "node id with every character outside [A-Za-z0-9_:-] percent-encoded",
   "owners": {
     "function:callee": [
-      "notifications.lxspec.all",
-      "notifications.lxspec.node.function:callee.needs",
-      "notifications.lxspec.node.function:caller.callees",
-      "notifications.lxspec.node.function:caller.neighbors",
-      "notifications.lxspec.node.function:second%40kernel%2Fsecond%2Ec.callees",
-      "notifications.lxspec.node.function:second%40kernel%2Fsecond%2Ec.neighbors"
+      "notifications.example.all",
+      "notifications.example.node.function:callee.needs",
+      "notifications.example.node.function:caller.callees",
+      "notifications.example.node.function:caller.neighbors",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.callees",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.neighbors"
     ],
     "function:caller": [
-      "notifications.lxspec.all",
-      "notifications.lxspec.node.function:callee.callers",
-      "notifications.lxspec.node.function:callee.neighbors",
-      "notifications.lxspec.node.function:caller.needs",
-      "notifications.lxspec.node.struct:state.neighbors",
-      "notifications.lxspec.node.struct:state.users",
-      "notifications.lxspec.node.subsystem:cluster.neighbors",
-      "notifications.lxspec.node.subsystem:cluster.users"
+      "notifications.example.all",
+      "notifications.example.node.function:callee.callers",
+      "notifications.example.node.function:callee.neighbors",
+      "notifications.example.node.function:caller.needs",
+      "notifications.example.node.struct:state.neighbors",
+      "notifications.example.node.struct:state.users",
+      "notifications.example.node.subsystem:cluster.neighbors",
+      "notifications.example.node.subsystem:cluster.users"
     ],
     "function:second@kernel/second.c": [
-      "notifications.lxspec.all",
-      "notifications.lxspec.node.function:callee.callers",
-      "notifications.lxspec.node.function:callee.neighbors",
-      "notifications.lxspec.node.function:second%40kernel%2Fsecond%2Ec.needs",
-      "notifications.lxspec.node.struct:state.neighbors",
-      "notifications.lxspec.node.struct:state.users",
-      "notifications.lxspec.node.subsystem:cluster.neighbors",
-      "notifications.lxspec.node.subsystem:cluster.users"
+      "notifications.example.all",
+      "notifications.example.node.function:callee.callers",
+      "notifications.example.node.function:callee.neighbors",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.needs",
+      "notifications.example.node.struct:state.neighbors",
+      "notifications.example.node.struct:state.users",
+      "notifications.example.node.subsystem:cluster.neighbors",
+      "notifications.example.node.subsystem:cluster.users"
     ],
     "struct:state": [
-      "notifications.lxspec.all",
-      "notifications.lxspec.node.function:caller.neighbors",
-      "notifications.lxspec.node.function:second%40kernel%2Fsecond%2Ec.neighbors",
-      "notifications.lxspec.node.struct:state.needs",
-      "notifications.lxspec.node.subsystem:cluster.linked",
-      "notifications.lxspec.node.subsystem:cluster.neighbors"
+      "notifications.example.all",
+      "notifications.example.node.function:caller.neighbors",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.neighbors",
+      "notifications.example.node.struct:state.needs",
+      "notifications.example.node.subsystem:cluster.linked",
+      "notifications.example.node.subsystem:cluster.neighbors"
     ],
     "subsystem:cluster": [
-      "notifications.lxspec.all",
-      "notifications.lxspec.node.function:caller.neighbors",
-      "notifications.lxspec.node.function:second%40kernel%2Fsecond%2Ec.neighbors",
-      "notifications.lxspec.node.struct:state.linked",
-      "notifications.lxspec.node.struct:state.neighbors",
-      "notifications.lxspec.node.subsystem:cluster.needs"
+      "notifications.example.all",
+      "notifications.example.node.function:caller.neighbors",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.neighbors",
+      "notifications.example.node.struct:state.linked",
+      "notifications.example.node.struct:state.neighbors",
+      "notifications.example.node.subsystem:cluster.needs"
     ]
   }
 }

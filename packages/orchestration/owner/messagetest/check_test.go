@@ -12,7 +12,7 @@ import (
 const (
 	fn  = "function:get_mountpoint@fs/namespace.c"
 	st  = "struct:mountpoint"
-	all = "notifications.lxspec-message-test.all"
+	all = "notifications.example-message-test.all"
 )
 
 var (
@@ -23,7 +23,7 @@ var (
 	offrR1 = "offer:" + edge + "@r1"
 	offrR2 = "offer:" + edge + "@r2"
 	offrR3 = "offer:" + edge + "@r3"
-	needs  = "notifications.lxspec-message-test.node.struct:mountpoint.needs"
+	needs  = "notifications.example-message-test.node.struct:mountpoint.needs"
 )
 
 // recording builds the ledger rows and git logs a run leaves, one call per row or commit.

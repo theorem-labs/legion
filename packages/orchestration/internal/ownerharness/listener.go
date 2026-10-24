@@ -1,5 +1,5 @@
 // Package ownerharness is test support for the owner message test, and only tests import it (guard_test.go checks
-// this). It holds stand-ins: a supervisor that starts standing owners in tmux the way the agreed INFRA-137 contracts
+// this). It holds stand-ins: a supervisor that starts standing owners in tmux the way the agreed supervisor contracts
 // C8, C9 and C33 describe, an HTTP stand-in for the Envoy listener's publish route and its delivery to subscribed
 // sessions (C21), and a scripted owner session that follows owner.md. The test binary runs them when linked as
 // legion or omp. None of them is the Legion daemon, Envoy or omp: a run against them checks the message-test driver

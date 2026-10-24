@@ -104,7 +104,7 @@ func (c Config) validate() error {
 		}
 	}
 	if !ValidTopicPrefix(c.TopicPrefix) {
-		return fmt.Errorf("topic_prefix %q must be notifications.lxspec. or a test run's notifications.lxspec-<name>., and end with a dot", c.TopicPrefix)
+		return fmt.Errorf("topic_prefix %q is not a prefix under notifications. that ends in a dot", c.TopicPrefix)
 	}
 	if len(c.Build.GateTargets) == 0 {
 		return errors.New("missing build.gate_targets")
@@ -112,12 +112,12 @@ func (c Config) validate() error {
 	return nil
 }
 
-// topicPrefix is the protocol's prefix, notifications.lxspec., or a test run's notifications.lxspec-<name>.,
-// optionally followed by more tokens; it ends in a dot.
-var topicPrefix = regexp.MustCompile(`^notifications\.lxspec(-[a-z0-9]+)*\.([^.\s]+\.)*$`)
+// topicPrefix is notifications. followed by one or more tokens, each ending in a dot.
+var topicPrefix = regexp.MustCompile(`^notifications\.([^.\s]+\.)+$`)
 
-// ValidTopicPrefix reports whether prefix can start owner topics: notifications.lxspec., or a test run's
-// notifications.lxspec-<name>. (lowercase letters, digits and hyphens), which keeps its traffic away from owners.
+// ValidTopicPrefix reports whether prefix can start owner topics: any prefix under notifications. that ends in a dot,
+// such as notifications.example. The configuration names it; a test run, such as the message test, keeps its traffic
+// away from owners under a prefix of its own.
 func ValidTopicPrefix(prefix string) bool { return topicPrefix.MatchString(prefix) }
 
 // LoadDeploy reads an operator deployment file and refuses unknown or missing required keys.

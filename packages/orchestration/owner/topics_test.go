@@ -10,21 +10,21 @@ func TestSubscriptionsAddFactUsersNeedsConceptsAndAll(t *testing.T) {
 	fixture := loadRoutingFixture(t)
 
 	caller := fixture.subscriptions(t, "function:caller")
-	for _, want := range append(append([]string(nil), fixture.topics.Owners["function:caller"]...), "notifications.lxspec.fact.stack-alignment.users") {
+	for _, want := range append(append([]string(nil), fixture.topics.Owners["function:caller"]...), "notifications.example.fact.stack-alignment.users") {
 		if !contains(caller, want) {
 			t.Errorf("caller subscriptions = %v, missing %q", caller, want)
 		}
 	}
-	if contains(fixture.subscriptions(t, "function:second@kernel/second.c"), "notifications.lxspec.fact.stack-alignment.users") {
+	if contains(fixture.subscriptions(t, "function:second@kernel/second.c"), "notifications.example.fact.stack-alignment.users") {
 		t.Error("a function that states no fact subscribed to the fact's users topic")
 	}
 
 	// Role owners are in no topics.json, so the command adds all for them: protocol adopt and revert, landings and
 	// the score reach every owner on it.
-	if got := fixture.subscriptions(t, "fact-stack-alignment"); !reflect.DeepEqual(got, []string{"notifications.lxspec.fact.stack-alignment.needs", "notifications.lxspec.all"}) {
+	if got := fixture.subscriptions(t, "fact-stack-alignment"); !reflect.DeepEqual(got, []string{"notifications.example.fact.stack-alignment.needs", "notifications.example.all"}) {
 		t.Fatalf("fact owner subscriptions = %v", got)
 	}
-	if got := fixture.subscriptions(t, "librarian"); !reflect.DeepEqual(got, []string{"notifications.lxspec.concepts", "notifications.lxspec.all"}) {
+	if got := fixture.subscriptions(t, "librarian"); !reflect.DeepEqual(got, []string{"notifications.example.concepts", "notifications.example.all"}) {
 		t.Fatalf("librarian subscriptions = %v", got)
 	}
 	if got := fixture.subscriptions(t, "function:caller"); len(got) != len(slices.Compact(slices.Sorted(slices.Values(got)))) {

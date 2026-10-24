@@ -92,10 +92,10 @@ func TestNeedOfferAcceptRoundTripUsesPostgresAndListener(t *testing.T) {
 		t.Fatalf("repeated need keys = %q and %q", posts[0].IdempotencyKey, posts[1].IdempotencyKey)
 	}
 	wantTopics := []string{
-		"notifications.lxspec.node.struct:state.needs",
-		"notifications.lxspec.node.struct:state.needs",
-		"notifications.lxspec.node.struct:state.users",
-		"notifications.lxspec.node.struct:state.needs",
+		"notifications.example.node.struct:state.needs",
+		"notifications.example.node.struct:state.needs",
+		"notifications.example.node.struct:state.users",
+		"notifications.example.node.struct:state.needs",
 	}
 	for index, post := range posts {
 		if post.Topic != wantTopics[index] {
@@ -211,7 +211,7 @@ func TestSpecRevisionWithNoEdgeNamesNoItem(t *testing.T) {
 		if item, ok := payload["item"]; ok {
 			t.Errorf("post %d names the item %v", index, item)
 		}
-		if post.Topic != "notifications.lxspec.node.struct:state.users" || payload["record"] != specPath || payload["type"] != "offer" {
+		if post.Topic != "notifications.example.node.struct:state.users" || payload["record"] != specPath || payload["type"] != "offer" {
 			t.Errorf("post %d = %+v", index, post)
 		}
 		if want := map[int]string{0: " r1 ", 1: " r2 ", 2: " r2 "}[index]; !strings.Contains(post.Message, state+want) {

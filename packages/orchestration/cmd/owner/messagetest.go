@@ -62,7 +62,7 @@ type driverFlags struct {
 }
 
 func parseDriverFlags(args []string) (driverFlags, error) {
-	flags := driverFlags{prefix: "notifications.lxspec.", kills: 5}
+	flags := driverFlags{kills: 5}
 	for len(args) > 0 {
 		if len(args) < 2 {
 			return driverFlags{}, usagef("%s needs a value; %s", args[0], messageTestUsage)
@@ -72,7 +72,7 @@ func parseDriverFlags(args []string) (driverFlags, error) {
 		switch name {
 		case "--prefix":
 			if !ownerpkg.ValidTopicPrefix(value) {
-				return driverFlags{}, usagef("--prefix %q is not notifications.lxspec. or notifications.lxspec-<name>.", value)
+				return driverFlags{}, usagef("--prefix %q is not a prefix under notifications. that ends in a dot", value)
 			}
 			flags.prefix = value
 		case "--nodes":

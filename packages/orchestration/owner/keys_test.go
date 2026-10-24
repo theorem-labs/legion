@@ -50,8 +50,10 @@ func TestTopicTokenPercentEncodesNonGraphBytes(t *testing.T) {
 	}
 }
 
+// The fixture is a topics.json in the graph tool's cgraph/topics/v1 shape, its tokens spelled by its token_rule, with
+// ids that hold `@`, `/` and `.` as source-file ids do.
 func TestTopicTokenMatchesGraphTool(t *testing.T) {
-	data, err := os.ReadFile("testdata/topics-slice.json")
+	data, err := os.ReadFile("testdata/topics-tokens.json")
 	if err != nil {
 		t.Fatal(err)
 	}

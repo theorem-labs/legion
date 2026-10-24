@@ -41,7 +41,7 @@ func TestNeedJournalsANoticeTheListenerRefuses(t *testing.T) {
 	f := newCommandFixture(t)
 	f.refuseNotices()
 	need := "need:" + ownerpkg.EdgeID(caller, state) + "@r1"
-	topic := "notifications.lxspec.node.struct:state.needs"
+	topic := "notifications.example.node.struct:state.needs"
 
 	run := f.as(caller)
 	stdout, stderr, code := run.runIn(run.dir(), "--json", "need", state, f.write("need.md", needDraft))

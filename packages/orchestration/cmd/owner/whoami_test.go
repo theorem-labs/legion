@@ -24,9 +24,9 @@ func TestWhoamiAndTopicsDescribeEveryOwnerKind(t *testing.T) {
 	}
 
 	for owner, wantTopic := range map[string]string{
-		caller:      "notifications.lxspec.fact.stack-alignment.users",
-		fact:        "notifications.lxspec.fact.stack-alignment.needs",
-		"librarian": "notifications.lxspec.concepts",
+		caller:      "notifications.example.fact.stack-alignment.users",
+		fact:        "notifications.example.fact.stack-alignment.needs",
+		"librarian": "notifications.example.concepts",
 	} {
 		var topics struct {
 			Owner  string   `json:"owner"`

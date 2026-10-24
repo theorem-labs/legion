@@ -11,9 +11,9 @@ import (
 	"strings"
 )
 
-// LaunchVariables are the owner launch environment of shared contract C8, as INFRA-137 names it: the node id, the
-// ledger repository and the ledger DSN file. (A name ending _KEY has a credential's shape, which the daemon strips
-// from every pane, so the node id travels as LEGION_OWNER.)
+// LaunchVariables are the owner launch environment of shared contract C8, as the agreed supervisor contract names
+// it: the node id, the ledger repository and the ledger DSN file. (A name ending _KEY has a credential's shape, which
+// the daemon strips from every pane, so the node id travels as LEGION_OWNER.)
 var LaunchVariables = []string{"LEGION_OWNER", "LEGION_LEDGER_REPOSITORY", "LEGION_LEDGER_DSN_FILE"}
 
 // pane is one tmux pane of the daemon's socket that runs an owner: the process that holds the launch variables,

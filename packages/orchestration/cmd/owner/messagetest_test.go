@@ -14,7 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const prefix = "notifications.lxspec."
+const prefix = "notifications.example."
 
 func (f *commandFixture) messageTopics(owner string) []string {
 	f.t.Helper()

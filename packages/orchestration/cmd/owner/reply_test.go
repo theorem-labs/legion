@@ -67,7 +67,7 @@ func TestMissingPremiseReplyGoesToThePremiseOwner(t *testing.T) {
 	}
 	posts := f.notices()
 	last := posts[len(posts)-1]
-	if last.Topic != "notifications.lxspec.node.struct:state.users" || decodePayload(t, last).Item != replyID {
+	if last.Topic != "notifications.example.node.struct:state.users" || decodePayload(t, last).Item != replyID {
 		t.Fatalf("reply notice = %+v", last)
 	}
 }
@@ -126,7 +126,7 @@ func TestOfferAnswersAReplyAndQueuesTheRevisedOfferForTheSource(t *testing.T) {
 		t.Fatalf("the target's queue after it answered the reply = %+v, %v", open, err)
 	}
 	last := f.notices()[len(f.notices())-1]
-	if payload := decodePayload(t, last); last.Topic != "notifications.lxspec.node.struct:state.users" || payload.Item != offer2 || payload.Commit != specCommit {
+	if payload := decodePayload(t, last); last.Topic != "notifications.example.node.struct:state.users" || payload.Item != offer2 || payload.Commit != specCommit {
 		t.Fatalf("revised offer notice = %+v %+v", last, payload)
 	}
 

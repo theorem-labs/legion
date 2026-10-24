@@ -263,11 +263,11 @@ type Routing struct {
 	factOwners FactOwners
 }
 
-// NewRouting is the routing table under prefix, which is notifications.lxspec. or a test run's
-// notifications.lxspec-<name>.; factOwners maps a fact owner's role name to its fact.
+// NewRouting is the routing table under prefix, a prefix under notifications. that ends in a dot (ValidTopicPrefix);
+// factOwners maps a fact owner's role name to its fact.
 func NewRouting(prefix string, factOwners FactOwners) (Routing, error) {
 	if !ValidTopicPrefix(prefix) {
-		return Routing{}, fmt.Errorf("topic prefix %q is not notifications.lxspec. or a test run's notifications.lxspec-<name>.", prefix)
+		return Routing{}, fmt.Errorf("topic prefix %q is not a prefix under notifications. that ends in a dot", prefix)
 	}
 	return Routing{prefix: prefix, factOwners: factOwners}, nil
 }
