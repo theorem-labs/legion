@@ -856,3 +856,40 @@ def test_a_global_s_address_a_constant_argument_compares_with_is_not_formed(tmp_
     # &init_mm != &init_mm is false: the right operand is not computed.
     assert "lock_init" not in {call["callee"] for call in fold(facts, "alloc_init", "ctor").calls}
     assert "lock_init" in {call["callee"] for call in fold(facts, "alloc_late", "ctor").calls}
+
+
+FUNCTION_MEMBER = """
+    struct hp { unsigned short len; long (*hash)(const void *, unsigned int); int (*cmp)(const void *, const void *); };
+    struct ht { long pad[2]; struct hp p; };
+    long other_hash(const void *k, unsigned int len);
+    int compare(const void *a, const void *b);
+    static long name_hash(const void *k, unsigned int len) { return *(const long *)k; }
+    static int name_cmp(const void *a, const void *b) { return a == b; }
+    static const struct hp named_params = { .hash = name_hash, .cmp = name_cmp };
+    static inline long lookup(struct ht *t, const void *k, const struct hp params)
+    {
+        long h = __builtin_expect(!!(params.hash), 1) ? params.hash(k, params.len ?: t->p.len) : other_hash(k, t->p.len);
+        return params.cmp ? h + params.cmp(k, t) : h + compare(k, t);
+    }
+    long find(struct ht *t, const void *k) { return lookup(t, k, named_params); }
+    long find_given(struct ht *t, const void *k, struct hp given) { return lookup(t, k, given); }
+"""
+
+
+def test_a_const_struct_s_function_member_decides_its_tests_and_leaves_an_argument_it_ignores_to_the_image(
+    tmp_path: Path,
+) -> None:
+    """simple_xattr_add: simple_xattr_params' obj_hashfn and obj_cmpfn are functions, so rht_head_hashfn's
+    `likely(params.obj_hashfn)` and `params.obj_cmpfn ?` hold, and simple_xattr_obj_hashfn never reads
+    the key_len it is passed (llvm-objdump of find: ld a2, 0x0(a1); xor; seqz; add; ret)."""
+    facts = facts_of(tmp_path, FUNCTION_MEMBER)
+
+    def lengths(found: link.Effective) -> list[Any]:
+        return sorted(str(item.get("conditional")) for item in found.field_accesses if item.get("base") == "pointer")
+
+    found = fold(facts, "find", "lookup")
+    assert {call["callee"] for call in found.calls} == set()
+    assert lengths(found) == ["True"]
+    given = fold(facts, "find_given", "lookup")
+    assert {call["callee"] for call in given.calls} == {"other_hash", "compare"}
+    assert lengths(given) == ["None", "None"]

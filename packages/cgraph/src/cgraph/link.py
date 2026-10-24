@@ -41,8 +41,10 @@ _ADDRESS_KEYS = frozenset({"displacement", "base", "object", "object_size", "ele
 _CORE_FORMAT = "cgraph/link-core/v1"
 # The events a fold under a __builtin_constant_p choice marks ``conditional``, besides calls.
 _MARKED = ("accesses", "field_accesses")
-# A guard's outcome at a fold where its arguments decide against the event (``_decision``).
+# A guard's outcome at a fold where its arguments decide against the event (``_decision``), and where
+# they decide against it but the guard leaves the event to the image.
 _AGAINST: Any = object()
+_IMAGE: Any = object()
 # Image items naming every C name at an address the code forms, where the image cannot tell which
 # the C meant: the start of a merged-globals block, a zero-size marker at a function's start.
 _ADDRESS_NAMES = ("merged_globals_block_base", "code_marker_at_function_start")
@@ -904,30 +906,30 @@ def _decided(
         outcome = decisions[key][1]
         if outcome is _AGAINST:
             return None
-        if outcome is not None:
+        if outcome is not None and outcome is not _IMAGE:
             left.append(outcome)
     return left
 
 
 def _decision(guard: dict[str, Any], values: list[dict[str, Any] | None]) -> Any:
     """One guard with the arguments' values put in: ``_AGAINST`` where every value it may take is
-    against the event (for a ``u`` guard: where its truth is decided), None where every one is for it
-    or it no longer names a parameter, else the guard on the caller's parameters."""
+    against the event (for a ``u`` guard: where its truth is decided; ``_IMAGE`` for an ``image`` guard),
+    None where every one is for it or it no longer names a parameter, else the guard on the caller's
+    parameters."""
     expression = expressions.substitute(guard["e"], values)
     truth = expressions.truth(expression)
-    if "u" in guard:
-        if truth is not None:
-            return _AGAINST
-        return {"e": expression, "u": True} if expressions.mentions_parameter(expression) else None
     if truth is not None:
-        return None if bool(truth) == guard["v"] else _AGAINST
-    return {"e": expression, "v": guard["v"]} if expressions.mentions_parameter(expression) else None
+        if "u" not in guard and bool(truth) == guard["v"]:
+            return None
+        return _IMAGE if guard.get("image") else _AGAINST
+    return {**guard, "e": expression} if expressions.mentions_parameter(expression) else None
 
 
 def _guarded(bound: Effective, child: Effective, arguments: list[dict[str, Any]]) -> Effective:
     """The bound events with the arguments applied to their guards: an event a guard decides against
     is dead for these arguments (a call or an access to state becomes unevaluated, with reason
-    ``constant_argument``; any other event is dropped). Each call's argument values are restated in
+    ``constant_argument``; any other event is dropped), and a call or an access an ``image`` guard
+    decides against is ``conditional``: the image decides. Each call's argument values are restated in
     the caller's terms, for the folds below it."""
     values = _argument_values(arguments)
     for original, call in zip(child.calls, bound.calls, strict=True):
@@ -948,6 +950,8 @@ def _guarded(bound: Effective, child: Effective, arguments: list[dict[str, Any]]
                 continue
             left = _decided(item["guards"], arguments, decisions)
             if left is not None:
+                imaged = kind in ("calls", *_MARKED) and any(decisions[id(g)][1] is _IMAGE for g in item["guards"])
+                item = {**item, "conditional": True} if imaged else item
                 kept.append({**item, "guards": left} if left else {k: v for k, v in item.items() if k != "guards"})
             elif kind == "unevaluated":
                 kept.append({k: v for k, v in item.items() if k != "guards"})

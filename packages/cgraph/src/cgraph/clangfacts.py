@@ -468,6 +468,7 @@ class _Extractor:
             {cursor.spelling: cursor for cursor in tu.cursor.get_children()
              if cursor.kind == K.FUNCTION_DECL and cursor.is_definition() and cursor.spelling},
             self.is_weak,
+            self.ignored_parameters,
         )  # fmt: skip
         self.ignored_cache: dict[str, tuple[frozenset[int], int | None]] = {}
         self.returned: dict[str, _Address | None] = {}
@@ -1988,10 +1989,17 @@ class _Evaluator:
         17: lambda a, b: a & b, 18: lambda a, b: a ^ b, 19: lambda a, b: a | b,
     }  # fmt: skip
 
-    def __init__(self, definitions: dict[str, ci.Cursor], weak: Callable[[ci.Cursor], bool] = lambda _: False) -> None:
+    def __init__(
+        self,
+        definitions: dict[str, ci.Cursor],
+        weak: Callable[[ci.Cursor], bool] = lambda _: False,
+        ignored: Callable[[ci.Cursor], frozenset[int]] = lambda _: frozenset(),
+    ) -> None:
         self.definitions = definitions
         # A weak definition's answer is not the program's: another unit may replace it.
         self.weak = weak
+        # The parameters a function of the unit never reads (_Extractor.ignored_parameters).
+        self.ignored = ignored
         self.helpers: dict[str, tuple[int | None, int | None]] = {}
         self.locals: dict[int, int | None] = {}
         self.values: dict[tuple[int, bool], int | None] = {}
@@ -2334,16 +2342,19 @@ class _Evaluator:
         return {"op": ".", "a": [struct], "o": offset, **(typed or {})}
 
     def object_address(self, operand: ci.Cursor, typed: dict[str, Any]) -> dict[str, Any] | None:
-        """``&g`` of a global no declaration the unit sees makes weak: an address that is not 0
-        (pagetable_pte_ctor's ``mm != &init_mm`` holds for NULL), named so that two are compared alike."""
-        node = _strip_parens(operand)
-        variable = node.referenced if node.kind == K.DECL_REF_EXPR else None
-        if variable is None or not _is_global_var(variable):
+        """``&g`` of a global, or a function, that no declaration the unit sees makes weak: an address
+        that is not 0 (pagetable_pte_ctor's ``mm != &init_mm`` holds for NULL), named so that two are
+        compared alike. A function of the unit gives the parameters it never reads (``ignored``)."""
+        node = _strip(operand)
+        named = node.referenced if node.kind == K.DECL_REF_EXPR else None
+        if named is None or not (_is_global_var(named) or named.kind == K.FUNCTION_DECL):
             return None
-        declarations = (variable, variable.canonical, variable.get_definition())
+        declarations = (named, named.canonical, named.get_definition())
         if any(self.weak(declaration) for declaration in declarations if declaration is not None):
             return None
-        return {"g": variable.get_usr(), **typed}
+        if named.kind == K.FUNCTION_DECL and named.spelling in self.definitions:
+            return {"g": named.get_usr(), "ignored": sorted(self.ignored(named)), **typed}
+        return {"g": named.get_usr(), **typed}
 
     def struct_reference(self, cursor: ci.Cursor, resolve: _Resolve, depth: int) -> dict[str, Any] | None:
         """A struct a reference names: a parameter passed by value, as itself, or a const global, as its
@@ -2365,6 +2376,7 @@ class _Evaluator:
         global may change, or its initializer gives a union, an array or a bit-field."""
         key = variable.hash
         if key not in self.structs:
+            self.structs[key] = None  # a member's function that names the global again: unknown there
             definition = variable.get_definition() or variable
             typ = definition.type
             initializer = libclang.var_initializer(definition)
@@ -2383,7 +2395,8 @@ class _Evaluator:
         self, node: ci.Cursor, record: ci.Type, bits: int, members: dict[int, dict[str, Any] | None]
     ) -> bool:
         """The scalar members a struct's initializer list gives, by their bits from the global's start
-        (a later designator of a member replaces an earlier one); False for another shape."""
+        (a later designator of a member replaces an earlier one): a constant, or the address of an
+        object or a function (``object_address``); False for another shape."""
         declaration = record.get_declaration()
         if node.kind != K.INIT_LIST_EXPR or declaration is None or declaration.kind != K.STRUCT_DECL:
             return False
@@ -2411,8 +2424,12 @@ class _Evaluator:
             typed = _integer_type(typ)
             if typed is None:
                 return False
+            address = _strip(value)
+            if typ.kind == TK.POINTER and address.kind == K.UNARY_OPERATOR and libclang.is_address_of(address):
+                address = _children(address)[0] if _children(address) else address
+            pointed = self.object_address(address, typed) if typ.kind == TK.POINTER else None
             number = 0 if _is_null(value) else self.evaluate(value)
-            members[bits + offset] = {"c": number, **typed} if number is not None else None
+            members[bits + offset] = pointed or ({"c": number, **typed} if number is not None else None)
         return True
 
     def exits(self, statement: ci.Cursor, loop: bool = False) -> bool:
@@ -2647,8 +2664,9 @@ class _Evaluator:
 
 def _any_way(ways: list[list[dict[str, Any]]]) -> dict[str, Any] | None:
     """The condition that holds where every guard of at least one of ``ways`` holds; None where a way
-    has a guard that is no condition (``u``: compiled where its expression is not decided)."""
-    if any("v" not in guard for way in ways for guard in way):
+    has a guard that is no condition (``u``: compiled where its expression is not decided; ``image``:
+    left to the image where it is decided against)."""
+    if any("v" not in guard or "image" in guard for way in ways for guard in way):
         return None
     typed = {"w": 32, "s": True}
     terms = []
@@ -3134,6 +3152,19 @@ class _FunctionWalk:
         """The operand is the address of an object the program defines (``&init_mm``), never 0."""
         return expressions.nonzero(self.x.evaluator.expression(operand, self.held))
 
+    def pointer_target(self, call: ci.Cursor) -> dict[str, Any] | None:
+        """The function a call through a pointer reaches, as an expression on the parameters that a fold
+        may make a function's address (rht_head_hashfn's ``params.obj_hashfn``): a member of a struct the
+        function is passed by value. None for a direct call or another pointer."""
+        referenced = call.referenced
+        head = next(iter(call.get_children()), None)
+        if head is None or (referenced is not None and referenced.kind == K.FUNCTION_DECL):
+            return None
+        target = self.x.evaluator.expression(head, self.held)
+        if target is None or target.get("op") != "." or not expressions.mentions_parameter(target):
+            return None
+        return target
+
     def label_guard(self, label: ci.Cursor, fallthrough: list[dict[str, Any]] | None) -> dict[str, Any] | None:
         """The guard on a label's code: reached by the gotos met before it and, unless ``fallthrough`` is
         None, by control falling into it under those guards; so compiled where any of them is. None
@@ -3186,34 +3217,37 @@ class _FunctionWalk:
             self.labelled[key] = found
         return self.labelled[key]
 
-    def guard_id(self, expression: dict[str, Any], value: bool | None) -> int:
+    def guard_id(self, expression: dict[str, Any], value: bool | None, image: bool = False) -> int:
         """The guard's index in the function's table, added once. A guard with no ``value`` holds where
         its expression is not decided (``u``): what only computes an operand of a comparison the caller's
-        constants fold."""
+        constants fold. Where an ``image`` guard is decided against, the image decides."""
         guard = {"e": expression, "v": value} if value is not None else {"e": expression, "u": True}
+        if image:
+            guard["image"] = True
         key = jsonio.canonical(guard)
         if key not in self.guard_ids:
             self.guard_ids[key] = len(self.guard_table)
             self.guard_table.append(guard)
         return self.guard_ids[key]
 
-    def push_guard(self, expression: dict[str, Any], value: bool | None) -> None:
-        self.guard_stack.append(self.guard_id(expression, value))
+    def push_guard(self, expression: dict[str, Any], value: bool | None, image: bool = False) -> None:
+        self.guard_stack.append(self.guard_id(expression, value, image))
 
     def walk_guarded(
         self,
-        guard: tuple[dict[str, Any] | None, bool | None] | None,
+        guard: tuple[dict[str, Any] | None, bool | None] | tuple[dict[str, Any] | None, bool | None, bool] | None,
         node: ci.Cursor,
         parent: ci.Cursor | None,
         index: int,
         reason: str | None,
         generic: bool,
     ) -> None:
-        """Walk a branch under a guard, unless a label inside lets a goto enter it without one."""
+        """Walk a branch under a guard (its expression, its value, and whether the image decides where
+        it is against), unless a label inside lets a goto enter it without one."""
         pushed = guard is not None and guard[0] is not None and not self.has_label(node)
         if pushed:
             assert guard is not None and guard[0] is not None
-            self.push_guard(guard[0], guard[1])
+            self.push_guard(guard[0], guard[1], any(guard[2:]))
         try:
             self.walk(node, parent, index, reason, generic)
         finally:
@@ -5074,6 +5108,17 @@ class _FunctionWalk:
                     exit_guards += 1
             del self.guard_stack[len(self.guard_stack) - exit_guards :]
             self.conditional -= builtin_exits
+            return
+        if kind == K.CALL_EXPR and children and reason is None and (target := self.pointer_target(node)) is not None:
+            # rht_head_hashfn's params.obj_hashfn(ptr, key_len, seed): where the fold gives the function
+            # (simple_xattr_params' simple_xattr_obj_hashfn) and it never reads a parameter, the image
+            # decides whether the argument, which has no effect, is computed.
+            offset = len(children) - len(list(node.get_arguments() or []))
+            for child_index, child in enumerate(children):
+                slot = child_index - offset
+                ignores = {"op": "ignores", "a": [target], "k": slot, "w": 32, "s": True}
+                unread = slot >= 0 and self.x.effect_free(child, self.dead_variables)
+                self.walk_guarded((ignores, False, True) if unread else None, child, node, child_index, None, generic)
             return
         if kind == K.CALL_EXPR and children and reason in (None, "discarded"):
             ignored = self.x.ignored_parameters(node.referenced)

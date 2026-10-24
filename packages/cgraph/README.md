@@ -254,12 +254,18 @@ These rules follow what the machine code shows, each only where it shows it:
   `vmg && …` before a read of `remove`). The address of a global no declaration the unit sees makes
   weak is not 0 (`{"g": usr}`), and where it is an operand of `==` or `!=` with the parameters it is
   formed only where the arguments leave that comparison open (a guard with `u`): alloc_pte_late's
-  `pagetable_pte_ctor(NULL, …)` folds `mm != &init_mm` and never forms &init_mm. A call argument gives
-  the value it passes (`expr`: a constant, a choice, a named value, a struct, an object's address, or
-  an expression on the caller's own parameters, at each type's width). At a
-  fold, link puts the arguments in; a call or an access a guard decides against becomes `unevaluated`
-  with reason `constant_argument` (an exclusion), other events are dropped, and the guards still open
-  carry up to the next fold.
+  `pagetable_pte_ctor(NULL, …)` folds `mm != &init_mm` and never forms &init_mm. A const struct's
+  member that is a function's address is such an address too, with the parameters the unit's function
+  never reads: simple_xattr_params' `obj_hashfn` and `obj_cmpfn` decide rht_head_hashfn's
+  `likely(params.obj_hashfn)` and `params.obj_cmpfn ?`. An argument without effect of a call through
+  a member of a struct the function is passed by value is under a guard with `image` on whether the
+  function the fold gives ignores it; where it does (simple_xattr_obj_hashfn's `len`), the image
+  decides whether the argument is computed. A call argument gives the value it passes (`expr`: a
+  constant, a choice, a named value, a struct, an object's address, or an expression on the caller's
+  own parameters, at each type's width). At a fold, link puts the arguments in; a call or an access a
+  guard decides against becomes `unevaluated` with reason `constant_argument` (an exclusion), or
+  `conditional` for a guard with `image`; other events are dropped, and the guards still open carry
+  up to the next fold.
 - A call whose value nothing uses (a discarded value that has an effect, such as an argument the
   callee ignores) is marked `value_unused`; the facts give the callee a second event set,
   `value_unused`, from its walk with each return's value discarded, and link folds that set there:

@@ -2,14 +2,15 @@
 
 An expression is JSON: ``{"c": n}`` a constant, ``{"p": i}`` the function's parameter ``i``, ``{"v":
 name}`` the one value a variable holds that the facts cannot state, ``{"g": name}`` the address of an
-object the program defines (not weak, so not 0), ``None`` a value the facts cannot name, or ``{"op":
-name, "a": [operands]}``: a C operator by its spelling (``"neg"`` and ``"~"`` and ``"!"`` unary,
-``"cast"`` a conversion), ``"in"`` (the operand is one of ``"set"``), ``"."`` (the member ``"o"`` bits
-into the struct its operand is), or ``"?:"``, whose None condition makes it a choice between its two
-values. Each carries its C type: its width ``w`` in bits, its signedness ``s``, and ``b`` for _Bool. A
-struct has no type keys: a parameter passed by value, a member that is itself a struct, or
-``{"struct": [[bits, expression], ...]}``, a constant struct's scalar members (a member it does not
-list is 0).
+object or a function the program defines (not weak, so not 0; a function of the unit gives the
+parameters it never reads, ``"ignored"``), ``None`` a value the facts cannot name, or ``{"op": name,
+"a": [operands]}``: a C operator by its spelling (``"neg"`` and ``"~"`` and ``"!"`` unary, ``"cast"`` a
+conversion), ``"in"`` (the operand is one of ``"set"``), ``"."`` (the member ``"o"`` bits into the
+struct its operand is), ``"ignores"`` (1 where the function its operand points to never reads its
+parameter ``"k"``), or ``"?:"``, whose None condition makes it a choice between its two values. Each
+carries its C type: its width ``w`` in bits, its signedness ``s``, and ``b`` for _Bool. A struct has no
+type keys: a parameter passed by value, a member that is itself a struct, or ``{"struct": [[bits,
+expression], ...]}``, a constant struct's scalar members (a member it does not list is 0).
 """
 
 from __future__ import annotations
@@ -56,16 +57,30 @@ def _bounded(found: set[int]) -> frozenset[int] | None:
 
 
 def nonzero(expression: Expression | None) -> bool:
-    """An object's address, also converted to a type that keeps all its bits: never 0."""
+    """An object's or a function's address, also as a constant struct's member and converted to a type
+    that keeps all its bits: never 0."""
     if expression is None:
         return False
     if "g" in expression:
         return True
+    if expression.get("op") == "." and "w" in expression:
+        return nonzero(member(expression["a"][0], expression["o"]))
     if expression.get("op") != "cast":
         return False
     operand = expression["a"][0]
     keeps = expression.get("b") or expression.get("w", 0) >= (operand or {}).get("w", 0)
     return bool(keeps) and nonzero(operand)
+
+
+def _address(expression: Expression | None) -> Expression | None:
+    """The object or function an address names (``{"g": …}``), through casts and constant members."""
+    if expression is None or "g" in expression:
+        return expression
+    if expression.get("op") == "cast":
+        return _address(expression["a"][0])
+    if expression.get("op") == ".":
+        return _address(member(expression["a"][0], expression["o"]))
+    return None
 
 
 def _truths(expression: Expression | None) -> set[int] | None:
@@ -102,6 +117,11 @@ def values(expression: Expression | None) -> frozenset[int] | None:
     if operator == ".":
         held = values(member(operands[0], expression["o"])) if "w" in expression else None
         return None if held is None else _bounded({normalized(value, expression) for value in held})
+    if operator == "ignores":
+        # simple_xattr_obj_hashfn never reads the key_len rht_head_hashfn passes it.
+        target = _address(operands[0])
+        ignored = target.get("ignored") if target is not None else None
+        return None if ignored is None else frozenset({int(expression["k"] in ignored)})
     if operator in ("&&", "||"):
         decisive = int(operator == "||")
         truths = [_truths(operand) for operand in operands[:2]]
