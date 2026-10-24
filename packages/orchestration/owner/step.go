@@ -29,11 +29,6 @@ var (
 	noticeRetryDelays = [...]time.Duration{time.Second, 4 * time.Second, 16 * time.Second}
 )
 
-// MissingEnvError names a launch variable an owner process needs and does not have.
-type MissingEnvError struct{ Name string }
-
-func (e *MissingEnvError) Error() string { return "missing " + e.Name }
-
 // Ledger is the subset of the work-item ledger a step needs.
 type Ledger interface {
 	Item(ctx context.Context, repo, id string) (ledger.Item, error)
@@ -74,8 +69,8 @@ type Runner struct {
 	Ledger  Ledger
 	Tree    Worktree
 	Envoy   Publisher
-	Owner   string // $LEGION_OWNER
-	Repo    string // $LEGION_LEDGER_REPOSITORY
+	Owner   string // the owner the command acts for (--owner)
+	Repo    string // the ledger repository: skeleton/owner.yaml's repo
 	Journal string // absolute: the deployment's <state_dir>/undelivered.jsonl
 }
 
@@ -164,9 +159,9 @@ func (r Runner) checkAttributed(s Step, commit string) error {
 	return nil
 }
 
-// claimOrAdopt takes the lease a step needs on item: a live lease of owner is its own earlier process, whose release
-// the supervisor has not sent yet, so its generation is adopted; any other item is claimed, which refuses another
-// holder's live lease.
+// claimOrAdopt takes the lease a step needs on item: a live lease of owner is its own earlier command's, which a killed
+// command left held, so its generation is adopted; any other item is claimed, which refuses another holder's live
+// lease.
 func claimOrAdopt(ctx context.Context, l Ledger, repo, owner, id string, item ledger.Item) (int64, error) {
 	if item.Holder == owner && LeaseLive(item) {
 		return item.Generation, nil
@@ -304,45 +299,36 @@ func (r Runner) journal(notice Notice, publishErr error) error {
 	return nil
 }
 
-// OpenLedger opens the ledger of an owner process from LEGION_LEDGER_DSN_FILE, the launch variable of C8: the one
-// source of the ledger for every owner command.
-func OpenLedger(ctx context.Context, env func(string) string) (*ledger.Store, error) {
-	dsnFile, err := requiredEnv(env, "LEGION_LEDGER_DSN_FILE")
-	if err != nil {
-		return nil, err
-	}
+// OpenLedgerFile opens the ledger whose DSN the file dsnFile holds. source names where dsnFile came from (a flag, or
+// the deployment's ledger_dsn_file), so an error says which setting to fix.
+func OpenLedgerFile(ctx context.Context, source, dsnFile string) (*ledger.Store, error) {
 	dsn, err := os.ReadFile(dsnFile)
 	if err != nil {
-		return nil, fmt.Errorf("read LEGION_LEDGER_DSN_FILE %q: %w", dsnFile, err)
+		return nil, fmt.Errorf("read %s %q: %w", source, dsnFile, err)
 	}
 	if strings.TrimSpace(string(dsn)) == "" {
-		return nil, fmt.Errorf("LEGION_LEDGER_DSN_FILE %q is empty", dsnFile)
+		return nil, fmt.Errorf("%s %q is empty", source, dsnFile)
 	}
 	store, err := ledger.Open(ctx, strings.TrimSpace(string(dsn)))
 	if err != nil {
-		return nil, fmt.Errorf("open ledger from LEGION_LEDGER_DSN_FILE: %w", err)
+		return nil, fmt.Errorf("open ledger from %s: %w", source, err)
 	}
 	return store, nil
 }
 
-// RunnerFromEnv is the one way to build an owner process's step runner: the owner and the ledger repository from
-// its launch variables LEGION_OWNER and LEGION_LEDGER_REPOSITORY (C8), the ledger l (OpenLedger's), the journal of
-// undelivered notices in the deployment's state_dir, and the publisher of the listener that ResolveListener names. A
-// listener configuration that cannot be resolved is ErrListenerConfig. It writes nothing, so a command builds its
-// runner before it creates the owner's worktree, and then sets the runner's Tree to that worktree.
-func RunnerFromEnv(env func(string) string, l Ledger, stateDir string) (Runner, error) {
-	owner, err := requiredEnv(env, "LEGION_OWNER")
-	if err != nil {
-		return Runner{}, err
-	}
-	repo, err := requiredEnv(env, "LEGION_LEDGER_REPOSITORY")
-	if err != nil {
-		return Runner{}, err
+// NewRunner is the one way to build an owner's step runner: for owner, in ledger repository repo, with the ledger l,
+// the journal of undelivered notices in the deployment's state_dir, and the publisher of the listener that
+// ResolveListener names from getenv. A listener configuration that cannot be resolved is ErrListenerConfig. It writes
+// nothing, so a command builds its runner before it creates the owner's worktree, and then sets the runner's Tree to
+// that worktree.
+func NewRunner(owner, repo string, l Ledger, stateDir string, getenv func(string) string) (Runner, error) {
+	if strings.TrimSpace(owner) == "" || strings.TrimSpace(repo) == "" {
+		return Runner{}, fmt.Errorf("a step runner needs an owner and a ledger repository, not %q and %q", owner, repo)
 	}
 	if !filepath.IsAbs(stateDir) {
 		return Runner{}, fmt.Errorf("the deployment's state_dir %q is not an absolute path", stateDir)
 	}
-	url, token, err := ResolveListener(env)
+	url, token, err := ResolveListener(getenv)
 	if err != nil {
 		return Runner{}, fmt.Errorf("%w: %v", ErrListenerConfig, err)
 	}
@@ -353,15 +339,4 @@ func RunnerFromEnv(env func(string) string, l Ledger, stateDir string) (Runner, 
 		Repo:    repo,
 		Journal: filepath.Join(stateDir, "undelivered.jsonl"),
 	}, nil
-}
-
-func requiredEnv(env func(string) string, name string) (string, error) {
-	value := ""
-	if env != nil {
-		value = strings.TrimSpace(env(name))
-	}
-	if value == "" {
-		return "", &MissingEnvError{Name: name}
-	}
-	return value, nil
 }

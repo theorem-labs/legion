@@ -20,11 +20,12 @@ type session struct {
 	ctx        context.Context
 	getenv     func(string) string
 	cwd        string
-	deployPath string
+	deployPath string // --deploy
+	owner      string // --owner: the owner (or the person) the command acts for
+	dsnFile    string // --ledger-dsn-file, which replaces the deployment's ledger_dsn_file
 
 	loaded bool
-	owner  string
-	repo   string
+	repo   string // the ledger repository: skeleton/owner.yaml's repo
 	deploy ownerpkg.Deploy
 	bare   ownerpkg.Repo
 	config ownerpkg.Config
@@ -37,17 +38,10 @@ func (s *session) close() {
 	}
 }
 
+// load reads the deployment and the copy's skeleton/owner.yaml at main, whose repo is the ledger repository.
 func (s *session) load() error {
 	if s.loaded {
 		return nil
-	}
-	s.owner = strings.TrimSpace(s.getenv("LEGION_OWNER"))
-	if s.owner == "" {
-		return usagef("LEGION_OWNER is unset: it names the owner (or the person) this command acts for")
-	}
-	s.repo = strings.TrimSpace(s.getenv("LEGION_LEDGER_REPOSITORY"))
-	if s.repo == "" {
-		return usagef("LEGION_LEDGER_REPOSITORY is unset")
 	}
 	deploy, err := s.loadDeploy()
 	if err != nil {
@@ -58,10 +52,7 @@ func (s *session) load() error {
 	if err != nil {
 		return err
 	}
-	if config.Repo != s.repo {
-		return fmt.Errorf("skeleton/owner.yaml names ledger repository %q, but LEGION_LEDGER_REPOSITORY is %q", config.Repo, s.repo)
-	}
-	s.config, s.loaded = config, true
+	s.config, s.repo, s.loaded = config, config.Repo, true
 	return nil
 }
 
@@ -78,12 +69,19 @@ func (s *session) loadDeploy() (ownerpkg.Deploy, error) {
 	return ownerpkg.LoadDeploy(path)
 }
 
-// ledger opens the ledger the way every owner process does: from LEGION_LEDGER_DSN_FILE (C8).
+// ledger opens the ledger whose DSN is in --ledger-dsn-file, else in the deployment's ledger_dsn_file.
 func (s *session) ledger() (*ledger.Store, error) {
 	if s.store != nil {
 		return s.store, nil
 	}
-	store, err := ownerpkg.OpenLedger(s.ctx, s.getenv)
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	source, file := "--ledger-dsn-file", s.dsnFile
+	if file == "" {
+		source, file = "the deployment's ledger_dsn_file", s.deploy.LedgerDSNFile
+	}
+	store, err := ownerpkg.OpenLedgerFile(s.ctx, source, file)
 	if err != nil {
 		return nil, err
 	}

@@ -19,11 +19,17 @@ import (
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 )
 
-const usage = "usage: owner [--json] [--deploy PATH] <command> ...\n" +
+const usage = "usage: owner [--json] [--deploy PATH] [--ledger-dsn-file PATH] --owner <id> <command> ...\n" +
+	"  --owner names the owner (or the person) the command acts for; every command but returned needs it.\n" +
+	"  The ledger repository is skeleton/owner.yaml's repo; the ledger DSN is in --ledger-dsn-file, else the\n" +
+	"  deployment's ledger_dsn_file (--deploy, else ~/.config/owner/deploy.yaml).\n" +
 	"commands: whoami | topics | worktree | inbox | claim <item> |\n" +
 	"  need <target> <file> [--outside-part | --answers <reply item>...] | offer <file> [--answers <need or reply item>...] |\n" +
 	"  accept <item> | reply <item> <reason> <file> [--premise-owner <id>] |\n" +
 	"  done <need or offer item> --superseded r<n> | returned <item>"
+
+// ownerless are the commands that act for no owner, so they run without --owner.
+var ownerless = map[string]bool{"returned": true}
 
 const (
 	exitRefused  = 1
@@ -63,8 +69,10 @@ func main() {
 
 func run(ctx context.Context, args []string, getenv func(string) string, cwd string, stdout, stderr io.Writer) int {
 	jsonOutput := false
-	deployPath := ""
+	s := &session{ctx: ctx, getenv: getenv, cwd: cwd}
+	defer s.close()
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		var value *string
 		switch args[0] {
 		case "--help", "-h":
 			fmt.Fprintln(stdout, usage)
@@ -72,14 +80,20 @@ func run(ctx context.Context, args []string, getenv func(string) string, cwd str
 		case "--json":
 			jsonOutput = true
 			args = args[1:]
+			continue
 		case "--deploy":
-			if len(args) < 2 {
-				return writeError(stderr, jsonOutput, usagef("--deploy needs a path"))
-			}
-			deployPath, args = args[1], args[2:]
+			value = &s.deployPath
+		case "--owner":
+			value = &s.owner
+		case "--ledger-dsn-file":
+			value = &s.dsnFile
 		default:
 			return writeError(stderr, jsonOutput, usagef("unknown option %s", args[0]))
 		}
+		if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+			return writeError(stderr, jsonOutput, usagef("%s needs a value", args[0]))
+		}
+		*value, args = strings.TrimSpace(args[1]), args[2:]
 	}
 	if len(args) == 0 {
 		return writeError(stderr, jsonOutput, usagef("missing command"))
@@ -88,8 +102,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, cwd str
 	if err != nil {
 		return writeError(stderr, jsonOutput, err)
 	}
-	s := &session{ctx: ctx, getenv: getenv, cwd: cwd, deployPath: deployPath}
-	defer s.close()
+	if s.owner == "" && !ownerless[args[0]] {
+		return writeError(stderr, jsonOutput, usagef("%s needs --owner <id>: the owner (or the person) it acts for", args[0]))
+	}
 	value, err := command(s)
 	if err != nil {
 		return writeError(stderr, jsonOutput, err)
@@ -188,13 +203,12 @@ func parseCommand(args []string) (func(*session) (any, error), error) {
 func writeError(stderr io.Writer, jsonOutput bool, err error) int {
 	code := exitProtocol
 	var usageErr *usageError
-	var missing *ownerpkg.MissingEnvError
 	var refused *refusedError
 	var unableErr *unableError
 	var refusal *ledger.Refusal
 	var notFound *ledger.NotFoundError
 	switch {
-	case errors.As(err, &usageErr), errors.As(err, &missing):
+	case errors.As(err, &usageErr):
 		code = exitUsage
 	case errors.As(err, &refused), errors.As(err, &refusal), errors.As(err, &notFound), errors.Is(err, ownerpkg.ErrIDOwner):
 		code = exitRefused

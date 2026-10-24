@@ -122,11 +122,9 @@ func newCommandFixture(t *testing.T) *commandFixture {
 	f.writeFile(f.deploy, strings.NewReplacer("/srv/owners/repo.git", f.bare, "/srv/owners/ledger-dsn", dsnFile, "/srv/graph/out", graphDir,
 		"/srv/owners/state", f.stateDir()).Replace(string(f.read(filepath.Join(testdata, "deploy.yaml")))))
 	f.env = map[string]string{
-		"LEGION_LEDGER_REPOSITORY": "r",
-		"LEGION_LEDGER_DSN_FILE":   dsnFile,
-		"ENVOY_URL":                f.listener.URL,
-		"ENVOY_TOKEN":              "test-token",
-		"HOME":                     f.root,
+		"ENVOY_URL":   f.listener.URL,
+		"ENVOY_TOKEN": "test-token",
+		"HOME":        f.root,
 	}
 	return f
 }
@@ -151,18 +149,16 @@ func (o ownerRun) runIn(dir string, args ...string) (string, string, int) {
 	return o.runContext(o.f.ctx, dir, args...)
 }
 
-// runContext runs the command under ctx: cancelling it stops the command as a killed pane stops its process.
+// runContext runs the command under ctx as --owner o.owner: cancelling it stops the command as a killed session
+// stops its process.
 func (o ownerRun) runContext(ctx context.Context, dir string, args ...string) (string, string, int) {
 	var stdout, stderr bytes.Buffer
-	env := func(key string) string {
-		if key == "LEGION_OWNER" {
-			return o.owner
-		}
-		return o.f.env[key]
-	}
-	code := run(ctx, append([]string{"--deploy", o.f.deploy}, args...), env, dir, &stdout, &stderr)
+	code := run(ctx, append([]string{"--deploy", o.f.deploy, "--owner", o.owner}, args...), o.f.getenv, dir, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
+
+// getenv is the command's environment: the listener and HOME, and no owner variable.
+func (f *commandFixture) getenv(key string) string { return f.env[key] }
 
 func (o ownerRun) dir() string {
 	dir := filepath.Join(o.f.root, "owners", ownerpkg.Key(o.owner))

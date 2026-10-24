@@ -7,12 +7,21 @@ the inbox that the `owner` command (`cmd/owner`) uses.
 
 ## The command
 
-`owner [--json] [--deploy PATH] <command>`. The deployment file defaults to `~/.config/owner/deploy.yaml`. The
-command acts for `LEGION_OWNER` in ledger repository `LEGION_LEDGER_REPOSITORY`, with the ledger DSN from the file
-`LEGION_LEDGER_DSN_FILE` (the three launch variables of C8; a command that needs one it lacks exits 2), and the
-Envoy listener of `ResolveListener`. `RunnerFromEnv` is the one way the command builds its step runner, and the
-command builds it before it creates the owner's worktree or writes anything: a listener configuration that cannot be
-read is exit 3, with no worktree, branch, record, item or journal line left behind.
+`owner [--json] [--deploy PATH] [--ledger-dsn-file PATH] --owner <id> <command>`. An owner runs as an ordinary
+Legion architect session, whose environment names no owner, so the command reads its identity from its arguments
+and files, never from a launch variable:
+
+- `--owner <id>` names the owner (or the person) the command acts for. A region architect acts for several nodes,
+  so it passes the node on each command. Every command but `returned` needs it, and exits 2 without it.
+- The ledger repository is `repo` in the copy's `skeleton/owner.yaml` at `main`.
+- The ledger DSN is in the file that `--ledger-dsn-file` names, else in the deployment file's `ledger_dsn_file`.
+- The deployment file is `--deploy`, else `~/.config/owner/deploy.yaml`.
+- The Envoy listener is the one `ResolveListener` names (`ENVOY_URL`, `ENVOY_TOKEN_FILE`, `ENVOY_TOKEN`, then the
+  Envoy configuration).
+
+`NewRunner` is the one way the command builds its step runner, and the command builds it before it creates the
+owner's worktree or writes anything: a listener configuration that cannot be read is exit 3, with no worktree,
+branch, record, item or journal line left behind.
 
 Inputs:
 
@@ -64,6 +73,6 @@ Steps:
 | `done <need or offer item> --superseded r<n>` | Completes the item as `superseded:r<n>` with no record, when r<n> is later than the item's and exists: the source's need record, or the target's spec, is at r<n> or newer |
 | `returned <item>` | Prints the C13 `reason`, `detail`, `log`, `batch` and `key` of the return event. The producer requires `reason` and `key` (exit 4 without either) and writes an empty `batch`, `detail` or `log` when it was not given one: such a field prints as `(absent)`, and the JSON leaves it out |
 
-Exit codes: 0 done, 1 refused, 2 usage (a missing launch variable included), 3 unable to check (an unreadable graph,
+Exit codes: 0 done, 1 refused, 2 usage (a missing `--owner` included), 3 unable to check (an unreadable graph,
 rule, manifest, score, reviews or listener configuration input), 4 protocol error. Item versions are canonical: a
 decimal has no leading zero, so `@r01` is no item id.

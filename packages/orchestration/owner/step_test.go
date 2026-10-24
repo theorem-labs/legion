@@ -370,56 +370,52 @@ func TestStepAnsweringNoItemJournalsNoticeAfterFourPublisherFailures(t *testing.
 	assertNoAnswerStepRecorded(t, fixture, outcome)
 }
 
-// runnerEnv is an owner process's environment: the launch variables of C8 and a reachable listener.
+// runnerEnv is an owner session's environment: a reachable listener, and no owner variable.
 func runnerEnv(overrides map[string]string) func(string) string {
-	env := map[string]string{
-		"LEGION_OWNER": "function:ns_match", "LEGION_LEDGER_REPOSITORY": "r", "LEGION_LEDGER_DSN_FILE": "/nonexistent",
-		"ENVOY_URL": "http://127.0.0.1:1", "ENVOY_TOKEN": "token",
-	}
+	env := map[string]string{"ENVOY_URL": "http://127.0.0.1:1", "ENVOY_TOKEN": "token"}
 	for name, value := range overrides {
 		env[name] = value
 	}
 	return func(name string) string { return env[name] }
 }
 
-func TestRunnerFromEnvNamesMissingOwner(t *testing.T) {
-	_, err := RunnerFromEnv(func(string) string { return "" }, nil, "/srv/owners/state")
-	if err == nil || err.Error() != "missing LEGION_OWNER" {
-		t.Fatalf("RunnerFromEnv error = %v, want missing LEGION_OWNER", err)
+// The runner acts for the owner and the ledger repository it is given; the environment names neither.
+func TestNewRunnerActsForTheOwnerAndRepositoryItIsGiven(t *testing.T) {
+	runner, err := NewRunner("function:ns_match", "r", nil, "/srv/owners/state", runnerEnv(map[string]string{"LEGION_OWNER": "function:other", "LEGION_LEDGER_REPOSITORY": "other"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.Owner != "function:ns_match" || runner.Repo != "r" {
+		t.Fatalf("runner acts for %q in %q", runner.Owner, runner.Repo)
+	}
+	for _, missing := range [][2]string{{"", "r"}, {"function:ns_match", ""}} {
+		if _, err := NewRunner(missing[0], missing[1], nil, "/srv/owners/state", runnerEnv(nil)); err == nil {
+			t.Errorf("NewRunner(%q, %q) built a runner", missing[0], missing[1])
+		}
 	}
 }
 
-// The supervisor names the owner in LEGION_OWNER: a name ending _KEY has a credential's shape, which the daemon
-// refuses in a launch and strips from every pane, so LEGION_OWNER_KEY never reaches an owner.
-func TestRunnerFromEnvIgnoresLegionOwnerKey(t *testing.T) {
-	_, err := RunnerFromEnv(runnerEnv(map[string]string{"LEGION_OWNER": "", "LEGION_OWNER_KEY": "function:ns_match"}), nil, "/srv/owners/state")
-	if err == nil || err.Error() != "missing LEGION_OWNER" {
-		t.Fatalf("RunnerFromEnv error = %v, want missing LEGION_OWNER", err)
-	}
-}
-
-func TestRunnerFromEnvRefusesARelativeStateDir(t *testing.T) {
-	_, err := RunnerFromEnv(runnerEnv(nil), nil, "state")
+func TestNewRunnerRefusesARelativeStateDir(t *testing.T) {
+	_, err := NewRunner("function:ns_match", "r", nil, "state", runnerEnv(nil))
 	if err == nil || !strings.Contains(err.Error(), "state_dir") || !strings.Contains(err.Error(), "absolute") {
-		t.Fatalf("RunnerFromEnv error = %v, want a refused relative state_dir", err)
+		t.Fatalf("NewRunner error = %v, want a refused relative state_dir", err)
 	}
 }
 
 // A listener configuration that cannot be read is no delivery failure to retry and journal: the runner is never
 // built, so the command stops before it writes anything.
-func TestRunnerFromEnvRefusesAnUnresolvableListener(t *testing.T) {
+func TestNewRunnerRefusesAnUnresolvableListener(t *testing.T) {
 	home := t.TempDir()
-	_, err := RunnerFromEnv(runnerEnv(map[string]string{"ENVOY_URL": "", "ENVOY_TOKEN": "", "HOME": home}), nil, "/srv/owners/state")
+	_, err := NewRunner("function:ns_match", "r", nil, "/srv/owners/state", runnerEnv(map[string]string{"ENVOY_URL": "", "ENVOY_TOKEN": "", "HOME": home}))
 	if !errors.Is(err, ErrListenerConfig) || !strings.Contains(err.Error(), "envoy.json") {
-		t.Fatalf("RunnerFromEnv error = %v, want ErrListenerConfig naming the configuration it could not read", err)
+		t.Fatalf("NewRunner error = %v, want ErrListenerConfig naming the configuration it could not read", err)
 	}
 }
 
-// The journal of a runner built from an owner's environment is the deployment's state_dir/undelivered.jsonl,
-// wherever the owner process runs.
-func TestRunnerFromEnvJournalsUnderTheDeploymentStateDir(t *testing.T) {
+// The journal of a runner is the deployment's state_dir/undelivered.jsonl, wherever the owner's command runs.
+func TestNewRunnerJournalsUnderTheDeploymentStateDir(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
-	runner, err := RunnerFromEnv(runnerEnv(nil), nil, stateDir)
+	runner, err := NewRunner("function:ns_match", "r", nil, stateDir, runnerEnv(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,16 +435,23 @@ func TestRunnerFromEnvJournalsUnderTheDeploymentStateDir(t *testing.T) {
 	}
 }
 
-// An owner process reads its ledger only from LEGION_LEDGER_DSN_FILE, the launch variable of C8.
-func TestOpenLedgerReadsOnlyTheLaunchVariable(t *testing.T) {
-	if _, err := OpenLedger(context.Background(), runnerEnv(map[string]string{"LEGION_LEDGER_DSN_FILE": ""})); err == nil || err.Error() != "missing LEGION_LEDGER_DSN_FILE" {
-		t.Fatalf("OpenLedger error = %v, want missing LEGION_LEDGER_DSN_FILE", err)
+// OpenLedgerFile opens the ledger whose DSN a file holds, and names where that file came from when it cannot.
+func TestOpenLedgerFileNamesTheFilesSource(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	dsnFile := filepath.Join(t.TempDir(), "ledger-dsn")
+	for _, path := range []string{empty, filepath.Join(dir, "missing")} {
+		if _, err := OpenLedgerFile(context.Background(), "ledger_dsn_file", path); err == nil || !strings.Contains(err.Error(), "ledger_dsn_file") || !strings.Contains(err.Error(), path) {
+			t.Errorf("OpenLedgerFile(%q) error = %v, want one naming ledger_dsn_file and the path", path, err)
+		}
+	}
+	dsnFile := filepath.Join(dir, "ledger-dsn")
 	if err := os.WriteFile(dsnFile, []byte(testpg.Database(t, "owner_open_ledger")+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := OpenLedger(context.Background(), runnerEnv(map[string]string{"LEGION_LEDGER_DSN_FILE": dsnFile}))
+	store, err := OpenLedgerFile(context.Background(), "ledger_dsn_file", dsnFile)
 	if err != nil {
 		t.Fatal(err)
 	}

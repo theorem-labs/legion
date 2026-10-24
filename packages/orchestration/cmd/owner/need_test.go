@@ -178,20 +178,6 @@ func TestNeedRunsAgainAfterAStepKilledInItsCommit(t *testing.T) {
 	}
 }
 
-// The command reads its ledger from LEGION_LEDGER_DSN_FILE only, the launch variable of C8, as the step runner
-// does: the deployment's ledger_dsn_file is not a second source.
-func TestNeedReadsTheLedgerOnlyFromTheLaunchVariable(t *testing.T) {
-	f := newCommandFixture(t)
-	delete(f.env, "LEGION_LEDGER_DSN_FILE")
-	code, stderr := f.as(caller).fails("need", state, f.write("need.md", needDraft))
-	if code != 2 || !strings.Contains(stderr, "LEGION_LEDGER_DSN_FILE") {
-		t.Fatalf("need without LEGION_LEDGER_DSN_FILE exited %d: %s", code, stderr)
-	}
-	if f.needWritten(state) {
-		t.Fatal("the need record was committed")
-	}
-}
-
 // A reviews path that git cannot list is an input the command cannot read, never "no reviewers".
 func TestNeedRefusesAReviewsPathItCannotRead(t *testing.T) {
 	f := newCommandFixture(t)

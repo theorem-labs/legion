@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -52,19 +53,69 @@ func TestWorktreeIsTheWorkingDirectorysWtWhenRunInDot(t *testing.T) {
 	}
 }
 
-// The supervisor names the owner in LEGION_OWNER; LEGION_OWNER_KEY has a credential's shape, which the daemon
-// strips from every pane, so the command never reads it.
-func TestCommandsActForLegionOwnerNotLegionOwnerKey(t *testing.T) {
+// An owner runs as an ordinary architect session, whose environment names no owner: the command acts for the owner
+// that --owner names, and a launch variable such as LEGION_OWNER names nobody. A command that needs an owner and has
+// no --owner is a usage error that names the flag, before it reads anything.
+func TestCommandsActForTheOwnerFlagNotALaunchVariable(t *testing.T) {
 	f := newCommandFixture(t)
-	env := func(key string) string {
-		if key == "LEGION_OWNER_KEY" {
-			return caller
+	f.env["LEGION_OWNER"] = caller
+	for _, command := range [][]string{{"whoami"}, {"inbox"}, {"worktree"}, {"need", state, f.write("need.md", needDraft)}} {
+		var stdout, stderr strings.Builder
+		code := run(f.ctx, append([]string{"--deploy", f.deploy}, command...), f.getenv, f.root, &stdout, &stderr)
+		if code != exitUsage || !strings.Contains(stderr.String(), "--owner") {
+			t.Errorf("%v with LEGION_OWNER and no --owner exited %d: %s", command, code, stderr.String())
 		}
-		return f.env[key]
 	}
+	if f.needWritten(state) {
+		t.Fatal("a need with no --owner was committed")
+	}
+	// returned reads a migration's return event, which acts for no owner: it needs no --owner.
+	migration := "m:" + ownerpkg.Key(caller) + ":1"
+	event := f.insertEvent(migration, `{"generation":1,"landing_rounds":1,"reason":"head_unavailable","batch":"","detail":"","log":"","key":"b-7/m-2/1","ready_cleared":true}`)
 	var stdout, stderr strings.Builder
-	code := run(f.ctx, []string{"--deploy", f.deploy, "whoami"}, env, f.as(caller).dir(), &stdout, &stderr)
-	if code != exitUsage || !strings.Contains(stderr.String(), "LEGION_OWNER is unset") {
-		t.Fatalf("whoami with only LEGION_OWNER_KEY exited %d: %s", code, stderr.String())
+	if code := run(f.ctx, []string{"--deploy", f.deploy, "returned", "returned:" + migration + "@" + strconv.FormatInt(event, 10)}, f.getenv, f.root, &stdout, &stderr); code != 0 {
+		t.Fatalf("returned with no --owner exited %d: %s", code, stderr.String())
+	}
+}
+
+// The ledger repository is the copy's skeleton/owner.yaml repo and the ledger is the deployment's ledger_dsn_file: a
+// launch variable that names another repository or DSN file changes nothing.
+func TestCommandsReadTheLedgerFromTheCopyAndTheDeployment(t *testing.T) {
+	f := newCommandFixture(t)
+	f.env["LEGION_LEDGER_REPOSITORY"] = "another-repository"
+	f.env["LEGION_LEDGER_DSN_FILE"] = filepath.Join(f.root, "missing-dsn")
+	need := "need:" + ownerpkg.EdgeID(caller, state) + "@r1"
+	f.as(caller).ok("need", state, f.write("need.md", needDraft))
+	if item := f.item(need); item.State != "open" || item.Owner != state {
+		t.Fatalf("need item in repository r = %+v", item)
+	}
+	var inbox []ownerpkg.InboxItem
+	if err := json.Unmarshal([]byte(f.as(state).ok("--json", "inbox")), &inbox); err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 || inbox[0].ID != need {
+		t.Fatalf("the target's inbox = %+v, want %s", inbox, need)
+	}
+}
+
+// --ledger-dsn-file names the ledger instead of the deployment's ledger_dsn_file; without it, a ledger_dsn_file the
+// command cannot read stops the command, naming that file.
+func TestLedgerDSNFileFlagOverridesTheDeployment(t *testing.T) {
+	f := newCommandFixture(t)
+	missing := filepath.Join(f.root, "missing-dsn")
+	deploy := filepath.Join(f.root, "deploy-missing-dsn.yaml")
+	f.writeFile(deploy, strings.Replace(string(f.read(f.deploy)), filepath.Join(f.root, "ledger-dsn"), missing, 1))
+	need := "need:" + ownerpkg.EdgeID(caller, state) + "@r1"
+
+	code, stderr := f.as(caller).fails("--deploy", deploy, "need", state, f.write("need.md", needDraft))
+	if code == 0 || !strings.Contains(stderr, missing) || !strings.Contains(stderr, "ledger_dsn_file") {
+		t.Fatalf("need with an unreadable ledger_dsn_file exited %d: %s", code, stderr)
+	}
+	if f.needWritten(state) {
+		t.Fatal("the need was committed with no ledger")
+	}
+	f.as(caller).ok("--deploy", deploy, "--ledger-dsn-file", filepath.Join(f.root, "ledger-dsn"), "need", state, f.write("need.md", needDraft))
+	if item := f.item(need); item.State != "open" || item.Owner != state {
+		t.Fatalf("need item through --ledger-dsn-file = %+v", item)
 	}
 }
