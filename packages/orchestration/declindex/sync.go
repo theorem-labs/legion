@@ -146,6 +146,33 @@ func TreeHead(ctx context.Context, tree string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// CommitAtHead gives the index's commit once it has checked that it is the commit that the Git work tree at tree
+// has checked out, and, when landed is not empty, that landed is that commit or one of its ancestors. It is the
+// precondition of the commands that read the tree with the index: the gate and the post-landing check.
+func (s *Store) CommitAtHead(ctx context.Context, tree, landed string) (string, error) {
+	commit, err := s.Meta(ctx, "commit")
+	if err != nil {
+		return "", err
+	}
+	head, err := TreeHead(ctx, tree)
+	if err != nil {
+		return "", err
+	}
+	if commit != head {
+		return "", fmt.Errorf("the tree HEAD %s differs from the index commit %q: refresh the index", head, commit)
+	}
+	if landed != "" {
+		covers, err := CommitIsAncestor(ctx, tree, landed, commit)
+		if err != nil {
+			return "", err
+		}
+		if !covers {
+			return "", fmt.Errorf("LAND_COMMIT %s is neither the index's commit nor its ancestor", landed)
+		}
+	}
+	return commit, nil
+}
+
 // CommitIsAncestor reports whether ancestor is descendant or one of its ancestors, in the Git repository of tree.
 func CommitIsAncestor(ctx context.Context, tree, ancestor, descendant string) (bool, error) {
 	err := runGit(ctx, tree, nil, "merge-base", "--is-ancestor", ancestor, descendant)

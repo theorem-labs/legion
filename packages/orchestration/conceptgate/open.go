@@ -142,16 +142,9 @@ func OpenGate(ctx context.Context, cfg declindex.Config, opts Options) (_ *Gate,
 	if err != nil {
 		return nil, err
 	}
-	commit, err := index.Meta(ctx, "commit")
+	commit, err := index.CommitAtHead(ctx, p.tree, "")
 	if err != nil {
 		return nil, err
-	}
-	head, err := declindex.TreeHead(ctx, p.tree)
-	if err != nil {
-		return nil, err
-	}
-	if head != commit {
-		return nil, fmt.Errorf("the tree HEAD %s differs from the index commit %s", head, commit)
 	}
 	if work, err = os.MkdirTemp("", "declindex-gate-"); err != nil {
 		return nil, err
@@ -199,8 +192,8 @@ func (r *LandingReport) Defective() bool {
 }
 
 // RecheckLanding rechecks the registry concepts that the landing of landed (of commit when empty) added, as
-// committed at commit, the commit of index, which the caller has checked is the tree's HEAD. It is nil when cfg
-// names no registry. A cause that stops the recheck is the report's Unable.
+// committed at commit: the commit of index that Store.CommitAtHead gave, which the caller runs first, so that it is
+// the tree's HEAD. It is nil when cfg names no registry. A cause that stops the recheck is the report's Unable.
 func RecheckLanding(ctx context.Context, cfg declindex.Config, index *declindex.Store, commit, landed string, opts Options) *LandingReport {
 	if cfg.Registry == "" {
 		return nil
