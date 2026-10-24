@@ -5209,6 +5209,17 @@ class _FunctionWalk:
             self.call(node, parent, reason, generic)
         elif kind in (K.DECL_REF_EXPR, K.MEMBER_REF_EXPR):
             self.reference(node, parent, index, reason, generic)
+        if kind == K.CALL_EXPR and node.spelling == "__builtin_prefetch" and reason is None:
+            # A prefetch is a hint the target may emit no instruction for (rv64 without Zicbop): the
+            # address it is given is computed only where the image has it (task_sched_runtime's
+            # prefetch_curr_exec_start).
+            self.conditional += 1
+            try:
+                for child_index, child in enumerate(children):
+                    self.walk(child, node, child_index, reason, generic)
+            finally:
+                self.conditional -= 1
+            return
         if kind == K.CALL_EXPR and node.spelling in _IMAGE_DECIDES:
             # __builtin_constant_p(x) and __builtin_object_size(p, type) never evaluate their operands.
             for child_index, child in enumerate(children):

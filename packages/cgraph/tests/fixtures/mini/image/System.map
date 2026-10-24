@@ -230,8 +230,9 @@
 0000000000011c82 T fd_print_each
 0000000000011c86 T fd_make_vfsuid
 0000000000011c9a T fd_report_mult
-0000000000011c9e t box_size
-0000000000011ca2 T patch_fill
+0000000000011c9e T fd_prefetch
+0000000000011ca0 t box_size
+0000000000011ca4 T patch_fill
 0000000000012d00 D flow_ops
 0000000000012d10 D flow_clock
 0000000000012d18 D flow_header_ops

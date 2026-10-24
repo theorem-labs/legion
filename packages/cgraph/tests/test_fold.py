@@ -289,3 +289,11 @@ def test_a_loop_whose_effects_the_image_decides_is_left_to_the_image(fold_build:
     assert {(item["field"], bool(item.get("conditional"))) for item in accesses} == {("lo", True), ("hi", True)}
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert "function:fd_report_mult" not in {entry["function"] for entry in offsets["misses"]}
+
+
+def test_a_prefetched_address_is_left_to_the_image(fold_build: dict[str, Any]) -> None:
+    """fd_prefetch: ret (llvm-objdump). What the prefetches are given is the image's to decide."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_prefetch"]
+    assert {(item["field"], bool(item.get("conditional"))) for item in accesses} == {("curr", True), ("sl", True)}
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert "function:fd_prefetch" not in {entry["function"] for entry in offsets["misses"]}

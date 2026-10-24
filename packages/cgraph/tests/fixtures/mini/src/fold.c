@@ -714,3 +714,14 @@ void fd_report_mult(struct fd_node_range *r, struct box *b)
 			continue;
 	obj_free(b);
 }
+
+/* kernel/sched/core.c task_sched_runtime's prefetch_curr_exec_start(p): curr = task_rq(p)->cfs.curr;
+ * prefetch(curr); prefetch(&curr->exec_start);, which rv64 without Zicbop emits nothing for
+ * (llvm-objdump: ret). */
+void fd_prefetch(struct fd_queue *q)
+{
+	struct fd_cur *curr = q->curr;
+
+	__builtin_prefetch(curr);
+	__builtin_prefetch(&curr->sl);
+}
