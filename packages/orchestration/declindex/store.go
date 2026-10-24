@@ -244,7 +244,7 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 	}
 	dsn := "file:" + path + "?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(" + busyTimeoutMS + ")"
 	var release func()
-	if unix.Access(filepath.Dir(path), unix.W_OK) != nil {
+	if !directoryWritable(filepath.Dir(path)) {
 		locks := []string{path + writeLockSuffix}
 		if scope == IndexAndTree {
 			locks = []string{path + refreshLockSuffix, path + writeLockSuffix}
@@ -311,6 +311,10 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 	s.reload()
 	return s, nil
 }
+
+// directoryWritable reports whether this process can create files in dir, as SQLite must to read a WAL database. A
+// test replaces it to stand for a read-only directory whatever its user: a directory's mode does not stop root.
+var directoryWritable = func(dir string) bool { return unix.Access(dir, unix.W_OK) == nil }
 
 // lockShared takes the flock of each of paths shared, in order, and gives the release of them all. A lock file that
 // is missing is one that no refresh of this declindex made.

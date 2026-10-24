@@ -387,6 +387,24 @@ func TestARefreshWaitingForTheRefreshLockEndsWithItsContext(t *testing.T) {
 	}
 }
 
+// readOnlyDirectory makes dir read-only until the restore it gives, which the test's cleanup also runs: its mode,
+// which stops a writer that is not root, and OpenReadOnly's view of it (directoryWritable), which the mode does not
+// change for root.
+func readOnlyDirectory(t *testing.T, dir string) (restore func()) {
+	t.Helper()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	writable := directoryWritable
+	directoryWritable = func(string) bool { return false }
+	restore = func() {
+		directoryWritable = writable
+		_ = os.Chmod(dir, 0o755)
+	}
+	t.Cleanup(restore)
+	return restore
+}
+
 // The index directory of a post-landing check is read-only. The index there opens read-only, and a refresh waits
 // until the reader is done, so the reader never sees a refresh half written.
 func TestOpenReadOnlyReadsAnIndexInAReadOnlyDirectory(t *testing.T) {
@@ -403,10 +421,7 @@ func TestOpenReadOnlyReadsAnIndexInAReadOnlyDirectory(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	restore := readOnlyDirectory(t, dir)
 	reader, err := OpenReadOnly(context.Background(), path, IndexOnly)
 	if err != nil {
 		t.Fatalf("open read-only in a read-only directory: %v", err)
@@ -417,9 +432,7 @@ func TestOpenReadOnlyReadsAnIndexInAReadOnlyDirectory(t *testing.T) {
 	if n, err := reader.ModuleCount(context.Background()); err != nil || n != 2 {
 		t.Fatalf("modules %d, %v", n, err)
 	}
-	if err := os.Chmod(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	restore()
 	other, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -484,10 +497,7 @@ func TestAReadOnlyReaderWaitsForTheLocksOfWhatItReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	refreshLock, writeLock := openLockHolder(t, path+".lock"), openLockHolder(t, path+".write.lock")
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	readOnlyDirectory(t, dir)
 	read := func(scope ReadScope, wait time.Duration) error {
 		ctx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
@@ -546,10 +556,7 @@ func TestAnIndexOnlyReaderReadsWhileARefreshSyncs(t *testing.T) {
 	synced := false
 	writer.afterRefreshLock = func(context.Context) error {
 		synced = true
-		if err := os.Chmod(dir, 0o555); err != nil {
-			return err
-		}
-		defer func() { _ = os.Chmod(dir, 0o755) }()
+		defer readOnlyDirectory(t, dir)()
 		wait, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		if reader, err := OpenReadOnly(wait, path, IndexOnly); err != nil {
