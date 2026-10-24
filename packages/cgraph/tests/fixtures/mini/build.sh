@@ -11,7 +11,7 @@ FLAGS=(--target=riscv64-unknown-elf -march=rv64imac -mabi=lp64 -mcmodel=medany -
 	-nostdinc -fno-builtin -fms-extensions -Iinclude -std=gnu2x)
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-for source in src/store.c src/bags.c src/flow.c src/facts.c src/dead.c src/anchor.S; do
+for source in src/store.c src/bags.c src/flow.c src/facts.c src/dead.c src/anchor.S src/fold.c; do
 	"$CLANG" "${FLAGS[@]}" -c "$source" -o "$work/$(basename "$source").o"
 done
 # The stubs give the external helpers a body so the image links; the tests never read them.
@@ -38,7 +38,8 @@ void fct_show(unsigned long m) { (void)m; }
 void _start(void) { for (;;) ; }
 EOF
 "$CLANG" "${FLAGS[@]}" -c "$work/stubs.c" -o "$work/stubs.o"
+# src/fold.c comes after the stubs: code added there moves no address before it.
 "$LLD" -o image/mini.elf --build-id=none -Tpercpu.ld "$work/store.c.o" "$work/bags.c.o" "$work/flow.c.o" \
-	"$work/facts.c.o" "$work/dead.c.o" "$work/anchor.S.o" "$work/stubs.o"
+	"$work/facts.c.o" "$work/dead.c.o" "$work/anchor.S.o" "$work/stubs.o" "$work/fold.c.o"
 # Like the kernel's System.map, the map leaves out assembler-local labels (.L...).
 "$NM" -n image/mini.elf | awk 'NF == 3 && $3 !~ /^\.L/' >image/System.map

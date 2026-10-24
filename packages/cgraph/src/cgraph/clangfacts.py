@@ -1011,10 +1011,12 @@ class _Extractor:
 
     def loop_without_effect(self, loop: ci.Cursor, function: ci.Cursor, dead: frozenset[int]) -> bool:
         """A loop that has no effect: it may be assumed to end (not a constant controlling
-        expression), and it stores only to locals nothing outside it reads. flush_all_rcu_sheaves'
-        ``list_for_each_entry(s, &slab_caches, list) { if (!cache_has_sheaves(s)) continue; ... }``
-        with CONFIG_SLUB_TINY stores only its cursor; the compiler removes the whole loop."""
-        if loop.kind not in _LOOPS or self.loop_may_not_end(loop):
+        expression), control leaves it only by its end (no return or goto in a part it reaches, as
+        __aggregate_find's ``list_for_each_entry(...) if (...) return m;``), and it stores only to
+        locals nothing outside it reads. flush_all_rcu_sheaves' ``list_for_each_entry(s,
+        &slab_caches, list) { if (!cache_has_sheaves(s)) continue; ... }`` with CONFIG_SLUB_TINY
+        stores only its cursor; the compiler removes the whole loop."""
+        if loop.kind not in _LOOPS or self.loop_may_not_end(loop) or _jumps_out(loop, 0, self.live_children):
             return False
         stored: set[int] = set()
         for node in _effect_nodes(loop, self.live_children):

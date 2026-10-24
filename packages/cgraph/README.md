@@ -40,7 +40,8 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   `if` whose branches have no effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)`
   without `CONFIG_PM`, an `if (c) return v;` whose return and the rest of its block give the same
   without an effect (`rcutree_online_cpu`'s `return 0` before `tick_dep_clear(); return 0;`), a loop
-  that may be assumed to end and stores only to locals nothing after it reads
+  that may be assumed to end, that control leaves only by its end (not `__aggregate_find`'s list walk,
+  which returns its cursor), and that stores only to locals nothing after it reads
   (`flush_all_rcu_sheaves`' list walk with `CONFIG_SLUB_TINY`), stores to a local or a parameter
   that compiled code never reads, such as `local_lock`'s `__tl` or a struct whose address only dead
   code takes, a store every read sees stored again first (`ipi_mux_send_mask`'s `icpu`, stored again
