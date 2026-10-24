@@ -119,9 +119,35 @@ func TestRecheckRejectsAnInvalidStoredProposer(t *testing.T) {
 	}
 }
 
+// An added concept whose stored source does not compile against the landed tree is a defect of that concept, not
+// an inability: the recheck goes on with the other additions.
+func TestRecheckReportsAStoredSourceThatDoesNotCompileAsADefect(t *testing.T) {
+	g, lib := gateForTest(t)
+	const key = "0123456789abcdef0123456789abcdef"
+	broken := Concept{Name: "Fx.Broken", Home: "Broken.lean", Meaning: "A fact whose source names a missing constant.",
+		Proposal: "broken", Proposer: "role", CompiledHash: key,
+		Source: "import Fixture\n\ndef Fx.Broken (x : Nat) : Prop := Fx.RenamedSince x\n"}
+	body, err := Render(broken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(g.Registry, "concepts", key+".yaml")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg, _, err := Load(g.Registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := Recheck(context.Background(), g, reg, []string{path})
+	if err != nil || len(report.Defects) != 1 || !strings.Contains(report.Defects[0].Message, "does not compile") || len(lib.got) != 0 {
+		t.Fatalf("uncompilable stored source: %+v, %v, librarian %+v", report, err, lib.got)
+	}
+}
+
 func exportedHash(t *testing.T, g *Gate, reg Registry, p Proposal) string {
 	t.Helper()
-	constants, err := g.export(context.Background(), reg, p)
+	constants, _, err := g.export(context.Background(), reg, p)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -95,8 +95,8 @@ func TestRefreshStoresSourcesAndTheReplacedCommit(t *testing.T) {
 	if got, err := s.Meta(ctx, "sources"); err != nil || got != "git" {
 		t.Errorf("sources meta = %q, %v; want git", got, err)
 	}
-	if got, err := s.Meta(ctx, "prev_commit"); err != nil || got != "base" {
-		t.Errorf("prev_commit = %q, %v; want base", got, err)
+	if got, recorded, err := s.Landing(ctx, "candidate"); err != nil || !recorded || got != "base" {
+		t.Errorf("the landing of candidate replaced %q (recorded %v, %v); want base", got, recorded, err)
 	}
 }
 

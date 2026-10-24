@@ -41,7 +41,8 @@ func TestRefreshNeverCompilesStoredAddedSource(t *testing.T) {
 	compiled := *g.Compiled
 	compiled.Forms = forms
 	compiled.Dir = t.TempDir()
-	if _, err := g.Index.Refresh(context.Background(), g.Tree, declindex.RefreshOptions{Commit: gitHead(t, g.Tree.Source), Compiled: &compiled}); err != nil {
+	step := func(context.Context) (*declindex.CompiledOptions, error) { return &compiled, nil }
+	if _, err := g.Index.Refresh(context.Background(), g.Tree, declindex.RefreshOptions{Commit: gitHead(t, g.Tree.Source), Compiled: step}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(witness); err == nil {

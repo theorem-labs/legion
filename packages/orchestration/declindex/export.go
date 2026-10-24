@@ -205,8 +205,13 @@ func (l Lean) confined(ctx context.Context, argv []string, scratch string, input
 	return confine.Command(ctx, confine.Spec{Argv: argv, Env: l.env(searchPath, scratch), Scratch: scratch, Inputs: inputs, Read: reads})
 }
 
+// ErrSourceFailed says that Lean ran on an untrusted source and reported errors in it: the source's failure, not
+// the sandbox's or the toolchain's.
+var ErrSourceFailed = errors.New("the source does not compile")
+
 // CompileConfined compiles source as the module rel in the sandbox, for source that untrusted text wrote. scratch
-// must be fresh (NewScratch): the source is copied into it, and Lean writes its outputs there and nowhere else.
+// must be fresh (NewScratch): the source is copied into it, and Lean writes its outputs there and nowhere else. An
+// error that Lean reports in the source wraps ErrSourceFailed; any other failure (the sandbox, a signal) does not.
 func CompileConfined(ctx context.Context, l Lean, searchPath []string, scratch, rel string, source []byte) error {
 	base := filepath.Join(scratch, filepath.FromSlash(rel))
 	argv := []string{l.bin("lean"), "-R", scratch, "-o", base + ".olean", "-i", base + ".ilean", base + ".lean"}
@@ -217,10 +222,17 @@ func CompileConfined(ctx context.Context, l Lean, searchPath []string, scratch, 
 	}
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
+	err = cmd.Run()
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &ee) && ee.ExitCode() == 1 && ctx.Err() == nil:
+		// Lean exits 1 when the file has errors; the launcher's own failures exit 126.
+		return fmt.Errorf("%w: lean %s: %v\n%s", ErrSourceFailed, base+".lean", err, out.String())
+	default:
 		return fmt.Errorf("lean %s: %w\n%s", base+".lean", err, out.String())
 	}
-	return nil
 }
 
 // CheckSandbox reports whether toolchain l runs in the sandbox here: the sandbox is available, and a confined

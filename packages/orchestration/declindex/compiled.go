@@ -139,8 +139,8 @@ func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) 
 
 // refreshCompiled re-reads the compiled modules whose .olean changed (all of them when the exporter or the
 // forms changed), then the statements that a changed definition reaches, since a definition's facts pass to
-// every statement that applies it.
-func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOptions, files []moduleFile, log io.Writer) (int, int, error) {
+// every statement that applies it. It records commit as the commit whose compiled part the index holds.
+func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOptions, files []moduleFile, commit string, log io.Writer) (int, int, error) {
 	t0 := time.Now()
 	x, m, src, err := co.prepare(ctx, tree.Roots)
 	if err != nil {
@@ -191,7 +191,11 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		}
 	}
 	if len(todo) == 0 {
-		return 0, 0, nil
+		if full {
+			// Nothing was read with the new exporter or forms: the compiled part is not complete for commit.
+			return 0, 0, nil
+		}
+		return 0, 0, s.setMeta(ctx, s.db, "compiled_commit", commit)
 	}
 	sort.Strings(todo)
 	before, err := s.defHashes(ctx, todo)
@@ -258,6 +262,9 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		}
 	}
 	if err := s.setMeta(ctx, tx, "compiled", digest); err != nil {
+		return 0, 0, err
+	}
+	if err := s.setMeta(ctx, tx, "compiled_commit", commit); err != nil {
 		return 0, 0, err
 	}
 	return len(todo), len(again), tx.Commit()

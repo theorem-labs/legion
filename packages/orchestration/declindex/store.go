@@ -11,15 +11,18 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
+	"time"
 
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite" // the database/sql driver "sqlite"
 )
 
-// SchemaVersion changes when the tables change; an index of another version is rebuilt from nothing.
+// SchemaVersion changes when a table changes; an index of another version is rebuilt from nothing. A new table
+// that older binaries do not read (landings) is added by Open, without a change of version.
 const SchemaVersion = "3"
 
 const schema = `
@@ -90,14 +93,19 @@ CREATE TABLE IF NOT EXISTS facts (name TEXT NOT NULL, module TEXT NOT NULL, conc
 CREATE INDEX IF NOT EXISTS facts_concept ON facts (concept);
 CREATE INDEX IF NOT EXISTS facts_name ON facts (name);
 CREATE INDEX IF NOT EXISTS facts_module ON facts (module);
+-- Each refresh that moved the index to another commit: landed, the commit it read, and previous, the commit it
+-- replaced ('' for the first). The post-landing registry check of a landing compares those two commits.
+CREATE TABLE IF NOT EXISTS landings (landed TEXT PRIMARY KEY, previous TEXT NOT NULL) WITHOUT ROWID;
 `
 
-var tables = []string{"meta", "sources", "modules", "decls", "uses", "edges", "consts", "atoms", "facts"}
+var tables = []string{"meta", "sources", "modules", "decls", "uses", "edges", "consts", "atoms", "facts", "landings"}
 
 // Store is an open index: the SQLite file at path, and the declaration graph beside it at path + ".graph".
 type Store struct {
 	db   *sql.DB
 	path string
+	// release gives back the shared hold on the writer lock of a store opened in a read-only directory.
+	release func()
 
 	graphOnce sync.Once
 	g         *graph
@@ -128,25 +136,51 @@ func Open(path string) (*Store, error) {
 }
 
 // OpenReadOnly opens an existing, initialized index without creating files, initializing the schema, or enabling
-// WAL. Gate decisions use it so their reads cannot modify a project's tree.
-func OpenReadOnly(path string) (*Store, error) {
+// WAL: the gate opens it so that its reads cannot modify a project's tree, and the post-landing commands because
+// the landing program mounts their index directory read-only.
+//
+// SQLite reads a WAL database only through its shared-memory file, which it cannot create in a read-only
+// directory. There the index is opened immutable, reading the database file alone, while the store holds the
+// writer lock shared: no refresh writes until the store is closed, and the refresh before it has checkpointed its
+// write-ahead log into the file. A non-empty log left beside the file (a refresh that did not finish) is refused,
+// since the file alone would then be out of date.
+func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 	if info, err := os.Stat(path); err != nil {
 		return nil, err
 	} else if info.IsDir() {
 		return nil, fmt.Errorf("index %s is a directory", path)
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(120000)")
+	dsn := "file:" + path + "?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(120000)"
+	var release func()
+	if unix.Access(filepath.Dir(path), unix.W_OK) != nil {
+		var err error
+		if release, err = lockFile(ctx, path+".lock", false); err != nil {
+			return nil, fmt.Errorf("hold the writer lock of the read-only index %s: %w", path, err)
+		}
+		if info, err := os.Stat(path + "-wal"); err == nil && info.Size() > 0 {
+			release()
+			return nil, fmt.Errorf("the read-only index %s has a write-ahead log that only a writable directory can read: refresh it once", path)
+		} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			release()
+			return nil, err
+		}
+		dsn = "file:" + path + "?mode=ro&immutable=1&_pragma=query_only(ON)"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		if release != nil {
+			release()
+		}
 		return nil, err
 	}
-	s := &Store{db: db, path: path}
-	version, err := s.Meta(context.Background(), "schema")
+	s := &Store{db: db, path: path, release: release}
+	version, err := s.Meta(ctx, "schema")
 	if err != nil {
-		_ = db.Close()
+		_ = s.Close()
 		return nil, fmt.Errorf("open the index read-only: %w", err)
 	}
 	if version != SchemaVersion {
-		_ = db.Close()
+		_ = s.Close()
 		return nil, fmt.Errorf("index schema %q, want %q", version, SchemaVersion)
 	}
 	return s, nil
@@ -176,8 +210,15 @@ func (s *Store) init(ctx context.Context) error {
 	return s.setMeta(ctx, s.db, "schema", SchemaVersion)
 }
 
-// Close closes the index.
-func (s *Store) Close() error { return s.db.Close() }
+// Close closes the index, and gives back the read-only store's hold on the writer lock.
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.release != nil {
+		s.release()
+		s.release = nil
+	}
+	return err
+}
 
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -198,20 +239,42 @@ func (s *Store) Meta(ctx context.Context, k string) (string, error) {
 	return v, err
 }
 
-// lock takes the index's exclusive writer lock, a file beside it, so that two refreshes never interleave.
-func (s *Store) lock() (func(), error) {
-	f, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+// lock takes the index's exclusive writer lock, a file beside it, so that two refreshes never interleave. It waits
+// for the lock until ctx ends.
+func (s *Store) lock(ctx context.Context) (func(), error) {
+	return lockFile(ctx, s.path+".lock", true)
+}
+
+// lockFile takes the flock on path, exclusive (creating the file) or shared (opening it read-only, so that it
+// works in a read-only directory), and waits for it until ctx ends: a blocking flock would not notice a signal.
+func lockFile(ctx context.Context, path string, exclusive bool) (func(), error) {
+	flag, how := os.O_RDONLY, unix.LOCK_SH
+	if exclusive {
+		flag, how = os.O_CREATE|os.O_RDWR, unix.LOCK_EX
+	}
+	f, err := os.OpenFile(path, flag, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, err
+	for wait := time.Millisecond; ; wait = min(2*wait, 250*time.Millisecond) {
+		err := unix.Flock(int(f.Fd()), how|unix.LOCK_NB)
+		if err == nil {
+			return func() {
+				_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+				_ = f.Close()
+			}, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			_ = f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
 	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
 }
 
 // deleteCompiled drops what the exporter read from one module.
@@ -229,4 +292,17 @@ func (s *Store) ModuleCount(ctx context.Context) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM modules`).Scan(&n)
 	return n, err
+}
+
+// Landing gives the commit that the refresh to landed replaced (empty for the index's first commit), and whether a
+// refresh recorded landed at all.
+func (s *Store) Landing(ctx context.Context, landed string) (previous string, recorded bool, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT previous FROM landings WHERE landed = ?`, landed).Scan(&previous)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("read the landing of %s: %w", landed, err)
+	}
+	return previous, true, nil
 }

@@ -352,3 +352,57 @@ func TestExtractRegistryArchiveRefusesEntriesOutsideTheRegistry(t *testing.T) {
 		}
 	}
 }
+
+// leanGateFixture is the Lean fixture tree, compiled, with a format-2 registry holding concepts (file name to
+// content), committed, and a configuration that reads the compiled part; the index is refreshed. It needs Lean and
+// the sandbox.
+func leanGateFixture(t *testing.T, concepts map[string]string) (dir, tree, config string) {
+	t.Helper()
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("the successful gate path compiles untrusted source: set DECLINDEX_SANDBOX_TEST=1 in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	dir = t.TempDir()
+	tree = filepath.Join(dir, "tree")
+	fixture, err := os.ReadFile(filepath.Join("..", "..", "declindex", "testdata", "lean", "Fixture.lean"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(tree, "Fixture.lean"), string(fixture))
+	lean, err := declindex.FindLean(context.Background(), t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := declindex.CompileModule(context.Background(), lean, nil, tree, "Fixture"); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
+	for name, body := range concepts {
+		writeTestFile(t, filepath.Join(tree, "registry", "concepts", name), body)
+	}
+	config = filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", ".")
+	git(t, tree, "commit", "-qm", "fixture")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	return dir, tree, config
+}
+
+// A concept file that the loader refuses stops neither a refresh that reads the compiled part nor the gate: both
+// note the file as a registry defect and go on without it.
+func TestAMalformedConceptFileStopsNeitherRefreshNorTheGate(t *testing.T) {
+	dir, _, config := leanGateFixture(t, map[string]string{
+		"Fx.Bad.yaml": "name: Fx.Bad\nhome: Fixture.lean\nmeaning: Register x2 is aligned. It stays so.\n",
+	})
+	proposal := filepath.Join(dir, "proposal.json")
+	writeTestFile(t, proposal, `{"id":"p9","concept":{"name":"Fresh","home":"Fresh.lean","meaning":"A fresh fact."},"source":"def Fresh : Prop := True\n"}`)
+	r := invoke(t, "--config", config, "gate", "--proposer", "function:open_file", proposal)
+	if r.code != 0 || !strings.Contains(r.errOut, "concepts/Fx.Bad.yaml") {
+		t.Fatalf("gate with one malformed concept file: want exit 0 and a defect note naming it, got %+v", r)
+	}
+}

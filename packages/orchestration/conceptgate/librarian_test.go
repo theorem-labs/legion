@@ -3,10 +3,49 @@ package conceptgate
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
+
+// A librarian command that exits but leaves a descendant holding its output (here one in a session of its own,
+// which the process-group kill cannot reach) does not keep the gate waiting for that descendant.
+func TestCommandLibrarianDoesNotWaitForADescendantHoldingItsOutput(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid is not on PATH")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant")
+	script := filepath.Join(dir, "librarian.sh")
+	body := "#!/bin/sh\nsetsid sh -c 'echo $$ > " + pidFile + "; exec sleep 60' &\nwhile [ ! -s " + pidFile + " ]; do sleep 0.05; done\nexit 0\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if raw, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	librarian := CommandLibrarian{Command: []string{script}, WorkDir: dir}
+	done := make(chan error, 1)
+	go func() {
+		done <- librarian.Review(context.Background(), ReviewRequest{ID: "near-id", Proposer: "role", Kind: "near"})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a librarian command that exited 0: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Review still waits for the descendant that holds the command's output, 30 s after the command exited")
+	}
+}
 
 func TestCommandLibrarianWritesDelimitedUntrustedProposal(t *testing.T) {
 	dir := t.TempDir()

@@ -34,16 +34,17 @@ type Tree struct {
 
 // RefreshOptions control one refresh.
 type RefreshOptions struct {
-	// Commit is the source commit the build is of; it is recorded as the index's commit.
+	// Commit is the source commit the build is of; it is recorded as the index's commit, and a change of commit as
+	// a landing (see Store.Landing).
 	Commit string
-	// PreviousCommit is the index commit that this refresh replaces after a landed synchronisation.
-	PreviousCommit string
 	// CheckLandedCoverage makes RefreshAt compare Commit with the persisted index before it runs a landed sync.
 	CheckLandedCoverage bool
 	// Jobs bounds the parallel readers; zero is min(48, CPUs).
 	Jobs int
-	// Compiled turns on the compiled part (types, compiled hashes, atoms, facts); nil skips it.
-	Compiled *CompiledOptions
+	// Compiled gives the options of the compiled part (types, compiled hashes, atoms, facts); nil skips that part.
+	// It runs after the reference files are read and committed, under the same writer lock, because the registry's
+	// forms import the modules that the index then knows. The commit's compiled part is complete only once it ran.
+	Compiled func(context.Context) (*CompiledOptions, error)
 	// Log receives one line of progress per phase; nil discards it.
 	Log io.Writer
 }
@@ -206,7 +207,7 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 	if s.beforeRefreshLock != nil {
 		s.beforeRefreshLock()
 	}
-	unlock, err := s.lock()
+	unlock, err := s.lock(ctx)
 	if err != nil {
 		return RefreshStats{}, err
 	}
@@ -219,7 +220,7 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 		if dirty {
 			return RefreshStats{}, errors.New("the tree has tracked changes")
 		}
-		covering, err := s.indexCoversLandedCommit(ctx, tree.Source, opt.Commit)
+		covering, err := s.indexCoversLandedCommit(ctx, tree.Source, opt.Commit, opt.Compiled != nil)
 		if err != nil {
 			return RefreshStats{}, err
 		}
@@ -367,11 +368,11 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	if sourceBlobs != nil {
 		meta["sources"] = "git"
 	}
-	if opt.Commit != previousCommit {
-		meta["prev_commit"] = previousCommit
-	}
-	if opt.PreviousCommit != "" {
-		meta["prev_commit"] = opt.PreviousCommit
+	if opt.Commit != "" && opt.Commit != previousCommit {
+		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO landings (landed, previous) VALUES (?, ?)`,
+			opt.Commit, previousCommit); err != nil {
+			return st, err
+		}
 	}
 	// The graph file is written after the commit. A new generation token marks it out of date until a graph of
 	// this generation is written, so a failed write is repaired by the next refresh and never read meanwhile.
@@ -410,9 +411,17 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 			time.Since(t1).Round(time.Millisecond))
 	}
 	if opt.Compiled != nil {
-		if st.Exported, st.Rematched, err = s.refreshCompiled(ctx, tree, opt.Compiled, files, opt.Log); err != nil {
+		co, err := opt.Compiled(ctx)
+		if err != nil {
 			return st, err
 		}
+		if st.Exported, st.Rematched, err = s.refreshCompiled(ctx, tree, co, files, opt.Commit, opt.Log); err != nil {
+			return st, err
+		}
+	}
+	// A reader in a read-only directory reads the database file alone (OpenReadOnly), so the log goes into it now.
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return st, fmt.Errorf("checkpoint the index: %w", err)
 	}
 	st.Elapsed = time.Since(t0)
 	logf(opt.Log, "index: %d re-read, %d removed, %d unreadable, %d declarations newer than their build, %d compiled modules read, %d re-matched, %s",

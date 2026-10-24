@@ -17,7 +17,8 @@ import (
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
-type ledgerOperation struct {
+// registerOperation is one registration that `ledger --emit` writes for the landing program to apply.
+type registerOperation struct {
 	Op            string `json:"op"`
 	Name          string `json:"name"`
 	Owner         string `json:"owner"`
@@ -25,9 +26,19 @@ type ledgerOperation struct {
 	VersionRead   int64  `json:"version_read"`
 }
 
+// librarianOperation is one near pair that `ledger --emit` writes for the landing program to deliver to the
+// librarian: the envelope is the exact text that the librarian command would read from its --proposal file.
+type librarianOperation struct {
+	Op       string `json:"op"`
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Proposer string `json:"proposer"`
+	Envelope string `json:"envelope"`
+}
+
 type contractsFileLedger struct {
 	contracts  []ledger.Contract
-	operations []ledgerOperation
+	operations []registerOperation
 }
 
 func (l *contractsFileLedger) Contracts(context.Context, string) ([]ledger.Contract, error) {
@@ -35,10 +46,25 @@ func (l *contractsFileLedger) Contracts(context.Context, string) ([]ledger.Contr
 }
 
 func (l *contractsFileLedger) RegisterContract(_ context.Context, _ string, name, owner, hash string, _ bool) (ledger.Contract, error) {
-	l.operations = append(l.operations, ledgerOperation{
+	l.operations = append(l.operations, registerOperation{
 		Op: "register", Name: name, Owner: owner, StatementHash: hash,
 	})
 	return ledger.Contract{Name: name, Owner: owner, StatementHash: hash, Version: 1}, nil
+}
+
+// emittedLibrarian keeps each review request as an operation: the landing hook has no network, so the landing
+// program delivers them.
+type emittedLibrarian struct {
+	operations []librarianOperation
+}
+
+func (l *emittedLibrarian) Review(_ context.Context, r conceptgate.ReviewRequest) error {
+	envelope, err := conceptgate.Envelope(r)
+	if err != nil {
+		return err
+	}
+	l.operations = append(l.operations, librarianOperation{Op: "librarian", ID: r.ID, Kind: r.Kind, Proposer: r.Proposer, Envelope: envelope})
+	return nil
 }
 
 type ledgerCommandReport struct {
@@ -67,21 +93,17 @@ func (r *ledgerRegistryCommandReport) Defective() bool {
 }
 
 // cmdLedger runs after a landing. With a contracts file, it emits the registrations that the landing program
-// applies in its LAND_COMMIT transaction; a DSN is reserved for an operator's manual check.
+// applies in its LAND_COMMIT transaction, and the near pairs for it to deliver to the librarian; a DSN is reserved
+// for an operator's manual check, which registers and calls the librarian itself.
 func cmdLedger(ctx context.Context, e *env, args []string) int {
-	dsn := e.getenv("LEDGER_DSN")
-	var contractsFile, emit string
+	var dsnFile, contractsFile, emit string
 	for i := 0; i < len(args); i++ {
 		if i+1 >= len(args) {
 			return fail(e.stderr, &usageError{"ledger options need a path"})
 		}
 		switch args[i] {
 		case "--dsn-file":
-			raw, err := os.ReadFile(args[i+1])
-			if err != nil {
-				return fail(e.stderr, &unableError{err})
-			}
-			dsn = strings.TrimSpace(string(raw))
+			dsnFile = args[i+1]
 		case "--contracts-file":
 			contractsFile = args[i+1]
 		case "--emit":
@@ -94,8 +116,23 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 	if (contractsFile == "") != (emit == "") {
 		return fail(e.stderr, &usageError{"--contracts-file and --emit must be used together"})
 	}
+	if dsnFile != "" && contractsFile != "" {
+		return fail(e.stderr, &usageError{"--dsn-file is the operator's ledger check; --contracts-file and --emit are the landing hook's: use one"})
+	}
+	dsn := e.getenv("LEDGER_DSN")
+	if dsnFile != "" {
+		raw, err := os.ReadFile(dsnFile)
+		if err != nil {
+			return fail(e.stderr, &unableError{err})
+		}
+		dsn = strings.TrimSpace(string(raw))
+	}
 	if contractsFile == "" && dsn == "" {
 		return fail(e.stderr, &usageError{"LEDGER_DSN or --dsn-file is required for an operator ledger check"})
+	}
+	landed := e.getenv("LAND_COMMIT")
+	if landed != "" && !isCommitID(landed) {
+		return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 lowercase hexadecimal characters"})
 	}
 	if e.cfg.Repo == "" {
 		return fail(e.stderr, &usageError{"the configuration names no repo"})
@@ -107,7 +144,8 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 			return fail(e.stderr, &unableError{err})
 		}
 	}
-	if err := e.open(true); err != nil {
+	// The landing hook mounts the index directory read-only.
+	if err := e.openReadOnly(ctx, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -115,21 +153,25 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 	if indexCommit != treeHead(e.cfg.Tree) {
 		return fail(e.stderr, &unableError{fmt.Errorf("the index is at %q, not the tree's commit: refresh it after the landing first", indexCommit)})
 	}
-	if commit := e.getenv("LAND_COMMIT"); commit != "" {
-		if !isCommitID(commit) {
-			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 hexadecimal characters"})
-		}
-		covers, err := ledgerCommitCovers(ctx, e.cfg.Tree, commit, indexCommit)
+	if landed != "" {
+		covers, err := ledgerCommitCovers(ctx, e.cfg.Tree, landed, indexCommit)
 		if err != nil {
 			return fail(e.stderr, &unableError{err})
 		}
 		if !covers {
-			return fail(e.stderr, &unableError{fmt.Errorf("LAND_COMMIT %s is neither the index's commit nor its ancestor", commit)})
+			return fail(e.stderr, &unableError{fmt.Errorf("LAND_COMMIT %s is neither the index's commit nor its ancestor", landed)})
 		}
 	}
 
 	var l declindex.ContractLedger
 	var emitted *contractsFileLedger
+	var librarian conceptgate.Librarian
+	var emittedReviews *emittedLibrarian
+	work, err := os.MkdirTemp("", "declindex-ledger-")
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	defer os.RemoveAll(work)
 	if contractsFile != "" {
 		raw, err := os.ReadFile(contractsFile)
 		if err != nil {
@@ -144,6 +186,8 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		}
 		emitted = &contractsFileLedger{contracts: contracts}
 		l = emitted
+		emittedReviews = &emittedLibrarian{}
+		librarian = emittedReviews
 	} else {
 		existing, err := ledger.OpenExisting(ctx, dsn)
 		if err != nil {
@@ -151,6 +195,7 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		}
 		defer existing.Close()
 		l = existing
+		librarian = conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: filepath.Join(work, "librarian")}
 	}
 	r, err := e.store.CheckLedger(ctx, l, e.cfg.Repo, e.cfg.Contracts, owners)
 	if err != nil {
@@ -160,12 +205,19 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		}
 		return fail(e.stderr, &unableError{err})
 	}
+	registry := recheckLedgerRegistry(ctx, e, r.Commit, landed, librarian, work)
 	if emitted != nil {
-		if err := writeLedgerOperations(emit, emitted.operations); err != nil {
+		operations := make([]any, 0, len(emitted.operations)+len(emittedReviews.operations))
+		for _, op := range emitted.operations {
+			operations = append(operations, op)
+		}
+		for _, op := range emittedReviews.operations {
+			operations = append(operations, op)
+		}
+		if err := writeLedgerOperations(emit, operations); err != nil {
 			return fail(e.stderr, &unableError{err})
 		}
 	}
-	registry := recheckLedgerRegistry(ctx, e, r.Commit)
 	if c := e.printJSON(ledgerCommandReport{Commit: r.Commit, Contracts: r, Registry: registry}); c != 0 {
 		return c
 	}
@@ -178,83 +230,102 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 	}
 	fmt.Fprintf(e.stderr, "declindex ledger at %s: %d contracts, %d registered, %d defects, %d gone, %d unowned, %d ambiguous; registry: %d added, %d near, %d defects\n",
 		r.Commit, r.Contracts, len(r.Registered), len(r.Defects), len(r.Gone), len(r.Unowned), len(r.Ambiguous), added, near, defects)
-	if r.Defective() || registry != nil && registry.Defective() {
+	switch {
+	case registry != nil && registry.Unable != "":
+		// The landing program runs this landing's check again until its recheck runs (or an operator skips it).
+		return 75
+	case r.Defective() || registry != nil && registry.Defective():
 		return 1
-	}
-	if registry != nil && registry.Unable != "" {
-		return 3
 	}
 	return 0
 }
 
-func recheckLedgerRegistry(ctx context.Context, e *env, commit string) *ledgerRegistryCommandReport {
+// recheckLedgerRegistry rechecks the registry concepts that the landing of landed (the index's commit when empty)
+// added, as committed at the index's commit. A cause that stops the recheck is the report's Unable.
+func recheckLedgerRegistry(ctx context.Context, e *env, indexCommit, landed string, librarian conceptgate.Librarian, work string) *ledgerRegistryCommandReport {
 	if e.cfg.Registry == "" {
 		return nil
 	}
 	report := newLedgerRegistryCommandReport()
+	if err := fillRegistryRecheck(ctx, e, indexCommit, landed, librarian, work, report); err != nil {
+		report.Unable = err.Error()
+	}
+	return report
+}
+
+func fillRegistryRecheck(ctx context.Context, e *env, indexCommit, landed string, librarian conceptgate.Librarian, work string, report *ledgerRegistryCommandReport) error {
 	tree, err := filepath.EvalSymlinks(e.cfg.Tree)
 	if err != nil {
-		report.Unable = fmt.Sprintf("resolve tree: %v", err)
-		return report
+		return fmt.Errorf("resolve tree: %w", err)
 	}
 	registry, err := e.cfg.GateRegistryDir()
 	if err != nil {
-		report.Unable = err.Error()
-		return report
+		return err
 	}
 	relative, err := registryPathRelativeToTree(tree, registry)
 	if err != nil {
-		report.Unable = err.Error()
-		return report
+		return err
 	}
-	previous, err := e.store.Meta(ctx, "prev_commit")
-	if err != nil {
-		report.Unable = fmt.Sprintf("read prev_commit: %v", err)
-		return report
+	if landed == "" {
+		landed = indexCommit
 	}
-	added, err := addedRegistryConcepts(ctx, tree, relative, previous, commit)
+	previous, recorded, err := e.store.Landing(ctx, landed)
 	if err != nil {
-		report.Unable = err.Error()
-		return report
+		return err
 	}
-	report.Added = added
-	snapshot, cleanup, err := snapshotGateRegistry(ctx, tree, commit, relative, filepath.Dir(e.cfg.DB))
+	switch {
+	case recorded:
+		if report.Added, err = addedRegistryConcepts(ctx, tree, relative, previous, landed); err != nil {
+			return err
+		}
+	case landed == indexCommit:
+		return fmt.Errorf("the index has no record of the landing of its commit %s: refresh the index", landed)
+	default:
+		// A later landing's refresh read this commit; the check of that landing rechecks this one's additions.
+		fmt.Fprintf(e.stderr, "note: no refresh stopped at %s; the check of the landing that read it rechecks its additions\n", short(landed))
+	}
+	snapshot, cleanup, err := snapshotGateRegistry(ctx, tree, indexCommit, relative, work)
 	if err != nil {
-		report.Unable = fmt.Sprintf("snapshot registry: %v", err)
-		return report
+		return fmt.Errorf("snapshot registry: %w", err)
 	}
 	defer cleanup()
 	reg, defects, err := conceptgate.Load(snapshot)
 	if err != nil {
-		report.Unable = fmt.Sprintf("load registry: %v", err)
-		return report
+		return fmt.Errorf("load registry: %w", err)
 	}
 	report.Defects = append(report.Defects, defects...)
-	if len(added) == 0 {
-		return report
+	// An added file that the loader refused or keyed wrongly is already a defect; the rest are rechecked.
+	loaded := map[string]bool{}
+	for _, c := range reg.Concepts {
+		loaded[filepath.ToSlash(filepath.Join(relative, "concepts", conceptgate.Key(c)+".yaml"))] = true
 	}
-	recheckEnv := *e
-	recheckEnv.cfg.Tree, recheckEnv.cfg.Registry = tree, snapshot
-	compiled, err := compiledOptions(ctx, &recheckEnv)
+	var recheck []string
+	for _, path := range report.Added {
+		if loaded[path] {
+			recheck = append(recheck, path)
+		}
+	}
+	if len(recheck) == 0 {
+		return nil
+	}
+	compiled, err := e.cfg.Compiled(ctx, declindex.FormsModule{}, e.stderr)
 	if err != nil {
-		report.Unable = fmt.Sprintf("prepare registry recheck: %v", err)
-		return report
+		return fmt.Errorf("prepare registry recheck: %w", err)
 	}
+	spec := e.cfg.TreeSpec()
+	spec.Source = tree
 	gate := &conceptgate.Gate{
 		Index:     e.store,
-		Tree:      recheckEnv.cfg.TreeSpec(),
+		Tree:      spec,
 		Registry:  snapshot,
 		Compiled:  compiled,
-		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: filepath.Join(filepath.Dir(e.cfg.DB), "proposals")},
-		WorkDir:   filepath.Join(filepath.Dir(e.cfg.DB), "proposals"),
+		Librarian: librarian,
+		WorkDir:   filepath.Join(work, "proposals"),
 	}
-	rechecked, err := conceptgate.Recheck(ctx, gate, reg, added)
+	rechecked, err := conceptgate.Recheck(ctx, gate, reg, recheck)
 	report.Defects = append(report.Defects, rechecked.Defects...)
 	report.Near = append(report.Near, rechecked.Near...)
-	if err != nil {
-		report.Unable = err.Error()
-	}
-	return report
+	return err
 }
 
 func registryPathRelativeToTree(tree, registry string) (string, error) {
@@ -269,17 +340,20 @@ func registryPathRelativeToTree(tree, registry string) (string, error) {
 	return filepath.ToSlash(relative), nil
 }
 
+// addedRegistryConcepts lists the concept files (the .yaml files directly under concepts/, which the loader
+// reads) that the commits previous..commit added. Rename detection is off: a file added in the landing that deleted
+// a similar one is an addition.
 func addedRegistryConcepts(ctx context.Context, tree, registry, previous, commit string) ([]string, error) {
+	added := []string{}
 	if previous == "" || commit == "" {
-		return []string{}, nil
+		return added, nil
 	}
 	concepts := filepath.ToSlash(filepath.Join(registry, "concepts"))
-	raw, err := exec.CommandContext(ctx, "git", "-C", tree, "diff", "--name-only", "--diff-filter=A", "-z", previous, commit, "--", concepts).Output()
+	raw, err := exec.CommandContext(ctx, "git", "-C", tree, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", previous, commit, "--", concepts).Output()
 	if err != nil {
 		return nil, fmt.Errorf("list registry additions from %s to %s: %w", previous, commit, err)
 	}
 	prefix := concepts + "/"
-	var added []string
 	for _, path := range strings.Split(string(raw), "\x00") {
 		if !strings.HasPrefix(path, prefix) {
 			continue
@@ -305,6 +379,7 @@ func ledgerCommitCovers(ctx context.Context, tree, landed, indexed string) (bool
 	}
 	return true, nil
 }
+
 func temporaryLedgerError(err error) error {
 	var networkErr net.Error
 	if errors.As(err, &networkErr) || errors.Is(err, context.DeadlineExceeded) {
@@ -313,7 +388,7 @@ func temporaryLedgerError(err error) error {
 	return err
 }
 
-func writeLedgerOperations(path string, operations []ledgerOperation) error {
+func writeLedgerOperations(path string, operations []any) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err

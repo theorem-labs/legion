@@ -60,10 +60,10 @@ func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error 
 	}
 }
 
-// indexCoversLandedCommit reports whether the complete persisted index has already read commit or a descendant.
-// RefreshAt calls it while holding its writer lock, so a retry never mistakes a tree left at a failed build for an
-// advanced index.
-func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string) (string, error) {
+// indexCoversLandedCommit reports whether the complete persisted index has already read commit or a descendant,
+// with its compiled part too when compiled is set. RefreshAt calls it while holding its writer lock, so a retry
+// never mistakes a tree left at a failed build, or an index whose compiled step failed, for an advanced index.
+func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string, compiled bool) (string, error) {
 	indexed, err := s.Meta(ctx, "commit")
 	if err != nil {
 		return "", err
@@ -84,6 +84,15 @@ func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string
 	}
 	if graph == "" || graphToken(s.path+".graph") != graph {
 		return "", nil
+	}
+	if compiled {
+		at, err := s.Meta(ctx, "compiled_commit")
+		if err != nil {
+			return "", err
+		}
+		if at != indexed {
+			return "", nil
+		}
 	}
 	if indexed == commit {
 		return indexed, nil

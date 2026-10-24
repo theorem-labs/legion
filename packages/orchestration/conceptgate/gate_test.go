@@ -107,7 +107,7 @@ func gateWith(t *testing.T, compiled bool) (*Gate, *recordingLibrarian) {
 	spec := declindex.Tree{Source: tree, Lib: tree, Roots: declindex.Roots{"Fixture": true}}
 	opt := declindex.RefreshOptions{Commit: gitHead(t, tree)}
 	if compiled {
-		opt.Compiled = co
+		opt.Compiled = func(context.Context) (*declindex.CompiledOptions, error) { return co, nil }
 	}
 	if _, err := s.Refresh(ctx, spec, opt); err != nil {
 		t.Fatal(err)
@@ -251,5 +251,46 @@ func TestGateWithoutASandboxCannotDecide(t *testing.T) {
 	}
 	if _, defects, err := Load(g.Registry); err != nil || len(lib.got) != 0 || len(defects) != 0 {
 		t.Fatal("the gate acted without a sandbox")
+	}
+}
+
+// A pending concept whose stored source no longer compiles (here it names a constant the tree does not have) is a
+// defect of that concept, left out of the forms: it does not stop the gate from deciding an unrelated proposal.
+func TestAStalePendingConceptIsADefectNotAnInability(t *testing.T) {
+	g, _ := gateForTest(t)
+	ctx := context.Background()
+	options := DecideOptions{Proposer: "function:open_file", ProposalBytes: []byte(`{"id":"p"}`)}
+	fresh := proposal("p7", "Fresh", "def Fresh (x : Nat) : Prop := x < 3 ∧ x ≠ 1")
+	if v, err := g.Decide(ctx, fresh, options); err != nil || v.Outcome != Added || len(v.Defects) != 0 {
+		t.Fatalf("control: %+v, %v", v, err)
+	}
+	const key = "00112233445566778899aabbccddeeff"
+	pending := "name: Old.Pending\nhome: Old.lean\nmeaning: A concept that an earlier landing added.\nproposal: old\n" +
+		"proposer: function:old_owner\ncompiled_hash: " + key + "\nsource: |\n" +
+		"  import Fixture\n  def Old.Pending (x : Nat) : Prop := Fx.RenamedSince x\n"
+	if err := os.WriteFile(filepath.Join(g.Registry, "concepts", key+".yaml"), []byte(pending), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v, err := g.Decide(ctx, fresh, options)
+	if err != nil || v.Outcome != Added {
+		t.Fatalf("an unrelated proposal after one stale pending concept: %+v, %v", v, err)
+	}
+	if len(v.Defects) != 1 || v.Defects[0].Path != "concepts/"+key+".yaml" || !strings.Contains(v.Defects[0].Message, "Old.Pending") {
+		t.Fatalf("defects %+v, want the stale pending concept", v.Defects)
+	}
+}
+
+// accepted_near records a librarian's decision; a proposal cannot supply it. Without --accepted-by the addition
+// carries no accepted_near, whatever the proposal says, so it cannot suppress the post-landing recheck.
+func TestGateDropsAProposalsOwnAcceptedNear(t *testing.T) {
+	g, _ := gateForTest(t)
+	p := proposal("p8", "Fresh8", "def Fresh8 (x : Nat) : Prop := x < 5 ∧ x ≠ 2")
+	p.Concept.AcceptedNear = []string{"Fx.Frame"}
+	v, err := g.Decide(context.Background(), p, DecideOptions{Proposer: "role"})
+	if err != nil || v.Outcome != Added || v.Addition == nil {
+		t.Fatalf("decide: %+v, %v", v, err)
+	}
+	if strings.Contains(v.Addition.Content, "accepted_near") {
+		t.Fatalf("the addition keeps the proposal's accepted_near:\n%s", v.Addition.Content)
 	}
 }

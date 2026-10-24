@@ -43,7 +43,7 @@ Commands:
                                {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>}
   ledger [--dsn-file PATH | --contracts-file FILE --emit FILE]
                                check the ledger and newly landed registry concepts; file mode emits registrations
-                               for the landing program and never connects to the ledger
+                               and near pairs for the landing program and never connects to the ledger
   land-hash                    the landing program's hasher: LAND_TREE, LAND_GIT_DIR, LAND_NAMES or LAND_NAMES_FILE
                                (a matching JSON array) in; name<TAB>hash<TAB>path out
 
@@ -57,7 +57,7 @@ Exit codes:
   states: 0 answered; 1 name not found; 2 usage; 3 unable
   same: 0 answered; 1 name not found; 2 usage; 3 unable
   gate: 0 added; 1 duplicate; 2 usage; 3 unable; 4 near; 5 name taken
-  ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry
+  ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry (also when the registry recheck of a landing cannot run)
   land-hash: 0 answered; 2 usage; 3 unable`
 
 type usageError struct{ msg string }
@@ -156,8 +156,9 @@ func (e *env) open(needIndex bool) error {
 	return e.openWith(needIndex, declindex.Open)
 }
 
-func (e *env) openReadOnly(needIndex bool) error {
-	return e.openWith(needIndex, declindex.OpenReadOnly)
+// openReadOnly opens the index without writing it or its directory, which the landing hooks mount read-only.
+func (e *env) openReadOnly(ctx context.Context, needIndex bool) error {
+	return e.openWith(needIndex, func(path string) (*declindex.Store, error) { return declindex.OpenReadOnly(ctx, path) })
 }
 
 func (e *env) openWith(needIndex bool, open func(string) (*declindex.Store, error)) error {
@@ -255,29 +256,17 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	var sync func(context.Context) error
 	if commit := e.getenv("LAND_COMMIT"); commit != "" {
 		if !isCommitID(commit) {
-			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 hexadecimal characters"})
+			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 lowercase hexadecimal characters"})
 		}
-		previous, err := e.store.Meta(ctx, "commit")
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		opt.Commit, opt.PreviousCommit, opt.CheckLandedCoverage = commit, previous, true
+		opt.Commit, opt.CheckLandedCoverage = commit, true
 		sync = declindex.Sync(e.cfg, commit, e.stderr)
+	}
+	if e.cfg.Lean.Export {
+		opt.Compiled = func(ctx context.Context) (*declindex.CompiledOptions, error) { return compiledOptions(ctx, e) }
 	}
 	st, err := e.store.RefreshAt(ctx, tree, opt, sync)
 	if errors.Is(err, declindex.ErrAlreadyPast) {
 		return 0
-	}
-	if err == nil && e.cfg.Lean.Export {
-		// The forms module imports the registered concepts' modules, which the index knows only once the
-		// reference files are read: the compiled part runs second.
-		var co *declindex.CompiledOptions
-		if co, err = compiledOptions(ctx, e); err == nil {
-			opt.Compiled = co
-			var cst declindex.RefreshStats
-			cst, err = e.store.Refresh(ctx, tree, opt)
-			st.Exported, st.Rematched, st.Elapsed = cst.Exported, cst.Rematched, st.Elapsed+cst.Elapsed
-		}
 	}
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
@@ -293,12 +282,13 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	return 0
 }
 
+// isCommitID accepts a full object id as Git prints it: 40 lowercase hexadecimal characters.
 func isCommitID(commit string) bool {
 	if len(commit) != 40 {
 		return false
 	}
 	for _, r := range commit {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			return false
 		}
 	}

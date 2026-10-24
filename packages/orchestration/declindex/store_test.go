@@ -3,13 +3,16 @@ package declindex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // goldenTree copies testdata/golden into a fresh directory that is both the source tree and the library
@@ -331,7 +334,7 @@ func TestRefreshAtSerializesTheSyncStepWithTheWriterLock(t *testing.T) {
 
 func TestOpenReadOnlyRequiresAnInitializedIndex(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "index.sqlite")
-	if _, err := OpenReadOnly(path); err == nil {
+	if _, err := OpenReadOnly(context.Background(), path); err == nil {
 		t.Fatal("opened a missing index read-only")
 	}
 	writer, err := Open(path)
@@ -341,12 +344,117 @@ func TestOpenReadOnlyRequiresAnInitializedIndex(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reader, err := OpenReadOnly(path)
+	reader, err := OpenReadOnly(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reader.Close() })
 	if version, err := reader.Meta(context.Background(), "schema"); err != nil || version != SchemaVersion {
 		t.Fatalf("read-only schema: %q, %v", version, err)
+	}
+}
+
+// A refresh queued behind the writer lock ends when its context ends (a SIGTERM to a queued `refresh`), rather
+// than waiting for the lock.
+func TestARefreshWaitingForTheWriterLockEndsWithItsContext(t *testing.T) {
+	tree := goldenTree(t)
+	s := openStore(t)
+	holder, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a refresh whose context ended while it waited for the lock: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = syscall.Flock(int(holder.Fd()), syscall.LOCK_UN)
+		<-done
+		t.Fatal("the refresh kept waiting for the writer lock after its context ended")
+	}
+}
+
+// The index directory of a post-landing check is read-only. The index there opens read-only, and a refresh waits
+// until the reader is done, so the reader never sees a refresh half written.
+func TestOpenReadOnlyReadsAnIndexInAReadOnlyDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(dir, "index.sqlite")
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := goldenTree(t)
+	if _, err := writer.Refresh(context.Background(), tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	reader, err := OpenReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open read-only in a read-only directory: %v", err)
+	}
+	if commit, err := reader.Meta(context.Background(), "commit"); err != nil || commit != "one" {
+		t.Fatalf("commit %q, %v", commit, err)
+	}
+	if n, err := reader.ModuleCount(context.Background()); err != nil || n != 2 {
+		t.Fatalf("modules %d, %v", n, err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	other, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := other.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a refresh while the read-only reader is open: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.Refresh(context.Background(), tree, RefreshOptions{Commit: "two"}); err != nil {
+		t.Fatalf("a refresh after the reader closed: %v", err)
+	}
+}
+
+// Each refresh that moves the index to another commit records that landing with the commit it replaced, so a
+// post-landing check of one landing compares the same two commits however many landings came after it.
+func TestRefreshRecordsEachLandingWithItsPreviousCommit(t *testing.T) {
+	tree := goldenTree(t)
+	s := openStore(t)
+	ctx := context.Background()
+	for _, commit := range []string{"one", "two", "two", "three"} {
+		if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: commit}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for commit, want := range map[string]string{"one": "", "two": "one", "three": "two"} {
+		previous, ok, err := s.Landing(ctx, commit)
+		if err != nil || !ok || previous != want {
+			t.Errorf("landing %s: previous %q, recorded %v, %v; want %q", commit, previous, ok, err, want)
+		}
+	}
+	if _, ok, err := s.Landing(ctx, "four"); err != nil || ok {
+		t.Fatalf("an unrecorded landing: recorded %v, %v", ok, err)
 	}
 }

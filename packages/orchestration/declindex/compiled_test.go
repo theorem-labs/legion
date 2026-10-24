@@ -33,11 +33,16 @@ func compiledTree(t *testing.T) (Tree, *CompiledOptions) {
 	}
 }
 
+// compiledWith is the compiled step of a refresh with fixed options.
+func compiledWith(co *CompiledOptions) func(context.Context) (*CompiledOptions, error) {
+	return func(context.Context) (*CompiledOptions, error) { return co, nil }
+}
+
 func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	tree, co := compiledTree(t)
 	s := openStore(t)
 	ctx := context.Background()
-	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co})
+	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +89,7 @@ func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	if !contains(same, "Fx.swapped") || contains(same, "Fx.other_reg") {
 		t.Errorf("same atoms as Fx.inline: %v", same)
 	}
-	again, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co})
+	again, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +97,7 @@ func TestRefreshReadsTheCompiledModules(t *testing.T) {
 		t.Fatalf("an unchanged build was exported again: %d", again.Exported)
 	}
 	co.Forms.Concepts[0].Forms = spForms[:1]
-	changed, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co})
+	changed, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +148,7 @@ func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 	stamp("User", "u")
 	tree.Roots["User"] = true
 	s := openStore(t)
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co}); err != nil {
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
 		t.Fatal(err)
 	}
 	if c, err := s.Constant(ctx, "user_frame"); err != nil || len(c.Facts) != 1 || c.Facts[0].How != "via:Fx.Frame" {
@@ -161,7 +166,7 @@ func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 	}
 	stamp("Fixture", "b")
 	stamp("User", "u")
-	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: co})
+	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +203,7 @@ func TestRefreshRematchesEverythingWhenAFormlessConceptsBodyChanges(t *testing.T
 	tree.Roots["Restate"] = true
 	co.Forms = FormsModule{Imports: []string{"Fixture"}, Concepts: []ConceptForms{{Concept: "Fx.Frame"}}}
 	s := openStore(t)
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co}); err != nil {
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
 		t.Fatal(err)
 	}
 	if c, err := s.Constant(ctx, "restate"); err != nil || len(c.Facts) != 1 || c.Facts[0].Concept != "Fx.Frame" {
@@ -213,7 +218,7 @@ func TestRefreshRematchesEverythingWhenAFormlessConceptsBodyChanges(t *testing.T
 		t.Fatal(err)
 	}
 	stamp("Fixture", "b")
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: co}); err != nil {
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: compiledWith(co)}); err != nil {
 		t.Fatal(err)
 	}
 	if c, err := s.Constant(ctx, "restate"); err != nil || len(c.Facts) != 0 {

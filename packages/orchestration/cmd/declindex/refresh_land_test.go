@@ -162,12 +162,12 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		previous, err := s.Meta(context.Background(), "prev_commit")
+		previous, recorded, err := s.Landing(context.Background(), f.second)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if commit != f.second || previous != f.first {
-			t.Fatalf("index commit %q, prev_commit %q; want %q, %q", commit, previous, f.second, f.first)
+		if commit != f.second || !recorded || previous != f.first {
+			t.Fatalf("index commit %q, landing of it replaced %q (recorded %v); want %q, %q", commit, previous, recorded, f.second, f.first)
 		}
 	})
 	t.Run("refuses a dirty tracked tree", func(t *testing.T) {

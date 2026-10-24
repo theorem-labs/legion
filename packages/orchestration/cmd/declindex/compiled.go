@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/conceptgate"
@@ -16,7 +18,8 @@ import (
 	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
-// compiledOptions reads the registry, if the configuration names one, and prepares the exporter.
+// compiledOptions are refresh's compiled step: the registry's forms module, if the configuration names a registry,
+// and the exporter. A registry defect is a note; the forms leave its concept out.
 func compiledOptions(ctx context.Context, e *env) (*declindex.CompiledOptions, error) {
 	var forms declindex.FormsModule
 	if e.cfg.Registry != "" {
@@ -111,7 +114,8 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 		}
 		return rc
 	}
-	for name, same := range out {
+	for _, name := range slices.Sorted(maps.Keys(out)) {
+		same := out[name]
 		fmt.Fprintf(e.stdout, "%s: %d declarations share a relation atom\n", name, len(same))
 		for _, s := range same {
 			fmt.Fprintln(e.stdout, "  "+s)
@@ -292,7 +296,7 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &unableError{err})
 	}
 	e.cfg.Tree, e.cfg.Registry, e.cfg.DB = tree, registry, state
-	if err := e.openReadOnly(true); err != nil {
+	if err := e.openReadOnly(ctx, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -313,7 +317,12 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if gateAfterRegistryStatus != nil {
 		gateAfterRegistryStatus()
 	}
-	snapshot, cleanup, err := snapshotGateRegistry(ctx, e.cfg.Tree, commit, rel, filepath.Dir(state))
+	work, err := os.MkdirTemp("", "declindex-gate-")
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	defer os.RemoveAll(work)
+	snapshot, cleanup, err := snapshotGateRegistry(ctx, e.cfg.Tree, commit, rel, work)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
@@ -331,14 +340,17 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &usageError{fmt.Sprintf("%s: %v", args[0], err)})
 	}
 	e.staleNote(ctx)
-	co, err := compiledOptions(ctx, e)
+	co, err := e.cfg.Compiled(ctx, declindex.FormsModule{}, e.stderr)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	work := filepath.Join(filepath.Dir(state), "proposals")
+	proposals := filepath.Join(work, "proposals")
 	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, AdditionRoot: filepath.ToSlash(rel), Compiled: co,
-		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: work}, WorkDir: work}
+		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: proposals}, WorkDir: proposals}
 	v, err := g.Decide(ctx, p, conceptgate.DecideOptions{Proposer: proposer, AcceptedBy: acceptedBy, ProposalBytes: raw})
+	for _, defect := range v.Defects {
+		fmt.Fprintf(e.stderr, "declindex: registry defect: %s\n", defect)
+	}
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}

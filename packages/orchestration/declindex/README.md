@@ -1,6 +1,6 @@
 # The declaration index and the similarity gate
 
-`cmd/declindex` answers questions about a built Lean project and protects the concept registry that its owners share. The command's help is the short command reference; this document describes the persisted data and the landing contracts. The container acceptance drivers are in [e2e/README.md](e2e/README.md); do not substitute a devbox-host sandbox run.
+`cmd/declindex` answers questions about a built Lean project and protects the concept registry that its owners share. The command's help is the short command reference; this document describes the persisted data and the landing contracts. The container acceptance drivers are in [e2e/README.md](e2e/README.md).
 
 ## Index data and storage
 
@@ -9,7 +9,7 @@ The index has two parts in one SQLite file next to the build:
 - The `.ilean` part records declarations, source positions, direct uses, and declaration edges. It also records `sources`: every indexed Lean source path and the Git blob ID of the bytes that the index read. A changed source can therefore be distinguished from a source that the index already read.
 - The compiled part reads `.olean` files with an exporter built by the tree's Lean toolchain. It records each constant's printed type, compiled statement hash, relation atoms, and the registry facts that its statement states.
 
-The index metadata has `commit`, the Git commit it read, and `prev_commit`, the commit it replaced during the latest refresh. A post-landing registry check compares those two commits. A module whose source is newer than its build, or whose recorded declaration position no longer holds its name, is unreadable until a build replaces the output; affected queries exit 3.
+The index metadata has `commit`, the Git commit it read, and `compiled_commit`, the commit whose compiled part it holds; the gate and the post-landing recheck refuse an index whose two differ. The `landings` table records each refresh that moved the index to another commit: that commit and the commit it replaced. The post-landing registry check of a landing compares those two commits, however many landings came after it. A module whose source is newer than its build, or whose recorded declaration position no longer holds its name, is unreadable until a build replaces the output; affected queries exit 3.
 
 The declaration graph is intentionally not in the Postgres ledger. SQLite stores the declaration, use, edge, compiled-constant, atom, fact, source, and metadata tables, with the reach graph in a sibling file. Postgres stores contract owners, statement hashes, versions, and change-lock reads. This keeps index queries local to the build and keeps ledger transactions limited to the data that coordinates landings.
 
@@ -30,7 +30,7 @@ A concept with forms and no stored source is matched through its forms, whether 
 
 One concept per file lets an owner open a change lock on only the proposed addition. The gate writes no registry file. `addition.path` is relative to the repository root and slash-separated, for example `registry/concepts/<compiled_hash>.yaml`, so it names the same file in every worktree. The owner writes the returned `addition.content` to that path in its own worktree, opens or extends its migration with `ledger open --write <addition.path>`, and lands it normally.
 
-The loader reports duplicate names, duplicate compiled hashes, wrongly keyed files, and missing `extends` targets as registry defects. `refresh` and `gate` report those defects as notes and continue. `ledger` reports them in its registry result and exits 1. A format-1 registry is not accepted.
+The loader reports these registry defects: a concept file it refuses (YAML that does not decode, an unknown key, a concept that fails its checks, such as a two-sentence meaning), which it leaves out; duplicate names; duplicate compiled hashes; wrongly keyed files; and missing `extends` targets. The gate also reports a pending concept whose stored source the text filter or Lean refuses, and leaves it out of the forms. A defect is one concept's: `refresh` and `gate` report defects as notes and continue, and `ledger` reports them in its registry result and exits 1. Only a missing, malformed or format-1 `registry.yaml` stops them.
 
 Stored source is untrusted input. Refresh and the ordinary registry forms module never compile it. Only the gate and the post-landing recheck compile stored source, and both do so in the sandbox.
 
@@ -42,7 +42,7 @@ An owner runs:
 declindex --config <cfg> gate --proposer <owner-id> [--accepted-by <owner-id>] PROPOSAL.json
 ```
 
-`PROPOSAL.json` has `id`, `concept` (`name`, `home`, `meaning`, and optional `extends`), and `source`, a Lean module that declares the concept. It carries no forms. Before deciding, the gate requires the sandbox, an index with a compiled part at the tree's HEAD, and a clean registry directory. Failure of any of those checks is exit 3 with a cause on stderr and no librarian request.
+`PROPOSAL.json` has `id`, `concept` (`name`, `home`, `meaning`, and optional `extends`), and `source`, a Lean module that declares the concept. It carries no forms, and any `accepted_by` or `accepted_near` it carries is ignored. Before deciding, the gate requires the sandbox, an index at the tree's HEAD whose compiled part is of that commit, and a clean registry directory. Failure of any of those checks is exit 3 with a cause on stderr and no librarian request. The verdict's `defects` list the registry defects that the decision left out; the gate also prints them as notes.
 
 | Exit | Verdict | Owner action |
 | --- | --- | --- |
@@ -61,30 +61,32 @@ For every near result, the configured `librarian: [cmd, args…]` receives:
 cmd args… --id <verdict-id> --proposer <owner-id> --proposal <file>
 ```
 
-The file is mode 0600 in the gate work directory and is removed after the command exits. It contains fixed text, the deterministic ID and validated proposer outside a nonce-delimited block, and one JSON line inside the block. The JSON carries the verdict and the untrusted proposal. The command receives empty standard input. Exit 0 means delivery; another exit or a 120-second timeout makes the gate exit 3. The post-landing recheck uses the same command with `--id recheck-<added-hash>-<other-key>` and `kind: "recheck"` in the envelope.
+The file is mode 0600 in the gate's temporary work directory and is removed after the command exits. It contains fixed text, the deterministic ID and validated proposer outside a nonce-delimited block, and one JSON line inside the block. The JSON carries the verdict and the untrusted proposal. The command receives empty standard input. Exit 0 means delivery; another exit or a 120-second timeout makes the gate exit 3. The post-landing recheck sends the same envelope with `--id recheck-<added-hash>-<other-key>` and `kind: "recheck"`; see `ledger` for who delivers it.
 
 ### Untrusted source confinement
 
-The gate and recheck apply three controls before accepting a stored or proposed source:
+The gate applies three controls before it accepts a proposed source or a pending concept's stored source; the post-landing recheck applies the last two to an added concept's stored source, which has landed:
 
 1. A text filter rejects obvious executable forms.
 2. Lean's parser allow-list admits declarations and limited surrounding syntax, and refuses forms that execute during elaboration.
 3. `confine` runs checking, compilation, and export in a fresh Landlock and seccomp sandbox. It requires Landlock ABI 3 or later, allows writes only to fresh scratch directories, permits only the launched process, and blocks later `execve`, forks, sockets, mounts, namespace operations, and other privileged interfaces.
 
-Without that sandbox, the source is not compiled and the relevant operation exits 3. The sandbox controls are tested in containers by `e2e/sandbox-e2e.sh` ([e2e/README.md](e2e/README.md)), and by the gate's Lean tests where `DECLINDEX_SANDBOX_TEST=1` (a disposable container or CI runner).
+Without that sandbox, the source is not compiled and the gate exits 3 (the recheck, 75). The sandbox controls are tested in containers by `e2e/sandbox-e2e.sh` ([e2e/README.md](e2e/README.md)), and by the gate's Lean tests where `DECLINDEX_SANDBOX_TEST=1` (a disposable container or CI runner).
 
 ## Landing interfaces
 
 ### Landing containers
 
-The landing program's container contract decides each container's mounts and network. Besides `TMPDIR`, where sandboxed and toolchain runs make their scratch directories, `declindex` needs these writable places and nothing else:
+The landing program's container contract decides each container's mounts and network. Besides `TMPDIR`, where `declindex` makes its registry snapshots, its proposal work and the sandboxed and toolchain runs' scratch directories, it needs these writable places and nothing else:
 
 | Command | Writes |
 | --- | --- |
 | `refresh` with `LAND_COMMIT` | The tree (fetch from `remote`, checkout, `build`) and the index directory. |
-| `ledger` | The index directory, for its registry snapshot, and the `--emit` file. |
-| `gate` | The index directory: its state and proposal work. |
-| `land-hash` | Nothing. It reads `LAND_GIT_DIR` and `LAND_BUILD_DIR`. |
+| `ledger` | The `--emit` file. The index directory can be read-only. |
+| `gate` | The index directory only to build the exporter, when no refresh with `lean.export` built it there first. |
+| `land-hash` | Nothing. It reads the index, `LAND_GIT_DIR` and `LAND_BUILD_DIR`; the index directory can be read-only. |
+
+In a read-only index directory, `ledger` and `land-hash` read the database file alone and hold the index's writer lock shared while they read, so a refresh of the same index waits for them; a refresh checkpoints its write-ahead log into the file when it finishes. The recheck in `ledger` uses the exporter that `refresh` with `lean.export` built in the index directory.
 
 The configuration's absolute paths, such as the toolchain, `lean.cc`, `remote` and the owner map, must exist at the same paths inside the container. A container image with the pinned toolchain copies it from a worker image pinned by digest, as `e2e/Dockerfile` does (the required `LEAN_IMAGE` build argument; [e2e/README.md](e2e/README.md)).
 
@@ -98,9 +100,9 @@ The landing hook invokes:
 declindex refresh --config <cfg> && declindex ledger --config <cfg>
 ```
 
-The landing program sets `LAND_COMMIT` and `LAND_PART`; `declindex` reads `LAND_COMMIT` and does not read `LAND_PART`. With a 40-hex `LAND_COMMIT`, `refresh` runs under the index writer lock. It refuses tracked tree changes, recognizes an index that already covers the commit, fetches a missing commit from configured `remote`, checks out the commit, runs configured `build` within `build_timeout` (six hours by default), records `sources`, and stores the replaced commit as `prev_commit`.
+The landing program sets `LAND_COMMIT` and `LAND_PART`; `declindex` reads `LAND_COMMIT` and does not read `LAND_PART`. With a 40-hex lowercase `LAND_COMMIT`, `refresh` runs under the index writer lock. It refuses tracked tree changes, recognizes an index that already covers the commit, fetches a missing commit from configured `remote`, checks out the commit, runs configured `build` within `build_timeout` (six hours by default), records `sources`, reads the reference files, and records the landing (the commit and the one it replaced). With `lean.export` it then reads the compiled part under the same lock. An index covers the commit only when it read that commit or a descendant completely: without unreadable modules, with its declaration graph, and with the compiled part when `lean.export` is on. So a retry after a failed build, reference read or compiled step runs again. A refresh queued behind another's lock ends when it gets SIGTERM, SIGINT or SIGHUP.
 
-`refresh` exits 0 after reading the build, 3 when it cannot safely read it, 75 for a failed fetch, build timeout, or signalled build, and 2 for usage. A configured build that exits nonzero exits 3.
+`refresh` exits 0 after reading the build, 3 when it cannot safely read it, 75 for a failed fetch, build timeout, or signalled build, and 2 for usage. A configured build that exits nonzero exits 3. A registry defect is a note, not a failure.
 
 ### `land-hash`
 
@@ -134,11 +136,14 @@ The `hash` is the 16-hex text statement hash and `path` is the repository-relati
 
 ### `ledger`
 
-`ledger` checks the ledger only after the index is at the tree's HEAD. It opens the ledger through `ledger.OpenExisting`: a database without every required schema version, or without the configured repository, is not changed and is unable to check. The DSN comes from `LEDGER_DSN` or `--dsn-file`. The landing adapter can instead use `--contracts-file FILE --emit FILE`; that mode emits required registrations and never connects to Postgres.
+`ledger` checks the ledger only after the index is at the tree's HEAD. It opens the index read-only. It opens the ledger through `ledger.OpenExisting`: a database without every required schema version, or without the configured repository, is not changed and is unable to check. The DSN comes from `LEDGER_DSN` or `--dsn-file`, for an operator's check. The landing hook instead uses `--contracts-file FILE --emit FILE`; that mode never connects to Postgres or runs the librarian command, and `--dsn-file` with it is a usage error.
 
 The contract check registers selected, owned declarations that the ledger lacks, then compares every ledger contract whose name has no `:` with the index by exact name across every module. It reports a changed hash as a defect, no declaration as gone, and multiple declarations as ambiguous. Names with `:` are non-Lean ledger contracts and are not compared with declarations.
 
-The registry check reads the registry as committed at the index's commit, never the working tree, so a local edit after `refresh` does not change what it audits. It lists the files directly under `concepts/` with a `.yaml` extension that were added in `prev_commit..commit` (the files the registry loader reads), and recompiles each added source only in the sandbox. It records additions, loader and recheck defects, near pairs, and an inability reason in the `registry` JSON member. Every near pair runs the librarian command once unless its accepted-near record suppresses it.
+The registry check reads the registry as committed at the index's commit, never the working tree, so a local edit after `refresh` does not change what it audits. It checks one landing: `LAND_COMMIT`, or the index's commit without it. It lists the files directly under `concepts/` with a `.yaml` extension (the files the registry loader reads) that the commits from the commit that landing's refresh replaced to that landing's commit added, with rename detection off, so a file added next to a deleted, similar one is an addition. When no refresh stopped at `LAND_COMMIT` (a later landing's refresh read it), the landing that read it rechecks its additions. Each added concept that the loader read is recompiled from its stored source only in the sandbox. The check records additions, loader and recheck defects (a stored source that Lean refuses or does not compile is one), near pairs, and an inability reason in the `registry` JSON member. Each near pair not suppressed by an accepted-near record goes to the librarian once:
+
+- With `--emit`, the hook has no network: after the registration lines, the emit file gets one line per near pair, `{"op":"librarian","id":"recheck-<added key>-<other key>","kind":"recheck","proposer":"<owner id of the added concept>","envelope":"<the text the librarian command would read from its --proposal file>"}`, for the landing program to deliver with the librarian command.
+- With a DSN, `ledger` runs the librarian command itself, as the gate does.
 
 The JSON output is:
 
@@ -146,7 +151,7 @@ The JSON output is:
 {"commit":"…","contracts":{…},"registry":{"added":[],"defects":[],"near":[],"unable":""}}
 ```
 
-The final stderr line counts contracts, registrations, contract defects, gone, unowned, ambiguous, and registry additions, near pairs, and defects. `ledger` exits 0 only when both checks are clean; 1 for a contract hash defect, gone, unowned, ambiguous contract, registry defect, or added near pair; 3 when it cannot check; 75 for a ledger connection failure; and 2 for usage. If a recheck is unable but either check found a defect, it exits 1 and includes the inability in the report.
+The final stderr line counts contracts, registrations, contract defects, gone, unowned, ambiguous, and registry additions, near pairs, and defects. `ledger` exits 0 only when both checks are clean; 1 for a contract hash defect, gone, unowned, ambiguous contract, registry defect, or added near pair; 3 when it cannot check the contracts; 75 for a ledger connection failure, and when the registry recheck cannot run at all (no sandbox or toolchain, a missing landing record, an exporter that does not run), whatever else it found, so that the landing program runs the check of that landing again; and 2 for usage.
 
 ## Baseline measurements
 

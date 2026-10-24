@@ -86,19 +86,43 @@ func Key(c Concept) string {
 	return c.Name
 }
 
+// checkForms refuses a form that is not one lambda term.
+func (c Concept) checkForms() error {
+	return declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}.Check()
+}
+
 // Render returns the canonical YAML for one concept file.
 func Render(c Concept) ([]byte, error) {
 	if err := c.check(); err != nil {
 		return nil, err
 	}
-	if err := (declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}).Check(); err != nil {
+	if err := c.checkForms(); err != nil {
 		return nil, err
 	}
 	return yaml.Marshal(c)
 }
 
-// Load reads a format-2 registry directory. Defects describe duplicate concepts, invalid file keys, and unknown
-// extensions; they do not stop callers from checking the valid entries.
+// decodeConcept reads one concept file: known keys only, and a concept that passes its checks.
+func decodeConcept(raw []byte) (Concept, error) {
+	var c Concept
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil {
+		return Concept{}, err
+	}
+	if err := c.check(); err != nil {
+		return Concept{}, err
+	}
+	if err := c.checkForms(); err != nil {
+		return Concept{}, err
+	}
+	return c, nil
+}
+
+// Load reads a format-2 registry directory. Defects describe the concept files that the loader refuses (YAML that
+// does not decode, an unknown key, a concept that fails its checks), which it leaves out, and duplicate concepts,
+// invalid file keys and unknown extensions; they do not stop callers from checking the valid entries. Only a
+// registry.yaml that is missing, malformed or of another format, or a file that cannot be read, is an error.
 func Load(dir string) (Registry, []Defect, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -142,24 +166,16 @@ func Load(dir string) (Registry, []Defect, error) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yaml" {
 			continue
 		}
-		path := filepath.Join(concepts, entry.Name())
-		raw, err := os.ReadFile(path)
+		relative := filepath.ToSlash(filepath.Join("concepts", entry.Name()))
+		raw, err := os.ReadFile(filepath.Join(concepts, entry.Name()))
 		if err != nil {
 			return Registry{}, nil, err
 		}
-		var c Concept
-		dec := yaml.NewDecoder(bytes.NewReader(raw))
-		dec.KnownFields(true)
-		if err := dec.Decode(&c); err != nil {
-			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
+		c, err := decodeConcept(raw)
+		if err != nil {
+			defects = append(defects, Defect{Path: relative, Message: err.Error()})
+			continue
 		}
-		if err := c.check(); err != nil {
-			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
-		}
-		if err := (declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}).Check(); err != nil {
-			return Registry{}, nil, fmt.Errorf("%s: %w", path, err)
-		}
-		relative := filepath.ToSlash(filepath.Join("concepts", entry.Name()))
 		expected := filepath.ToSlash(filepath.Join("concepts", Key(c)+".yaml"))
 		if relative != expected {
 			defects = append(defects, Defect{Path: relative, Message: "file is named " + relative + ", want " + expected})

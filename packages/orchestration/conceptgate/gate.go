@@ -1,6 +1,7 @@
 package conceptgate
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -66,6 +68,9 @@ type Verdict struct {
 	CompiledHash string    `json:"compiled_hash,omitempty"`
 	VerdictID    string    `json:"verdict_id"`
 	Addition     *Addition `json:"addition,omitempty"`
+	// Defects are the registry defects that the decision left out: refused concept files, and pending concepts
+	// whose stored source no longer compiles.
+	Defects []Defect `json:"defects,omitempty"`
 }
 
 // DecideOptions are the identity and source bytes that bind a decision to the command invocation.
@@ -142,7 +147,8 @@ func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.Forms
 }
 
 // Decide compares a proposal with the registry and the index. An added verdict carries a canonical file; the
-// gate never writes to the registry.
+// gate never writes to the registry. The verdict's defects are the registry's: files the loader refused, and
+// pending concepts whose stored source no longer compiles, which the decision leaves out.
 func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (Verdict, error) {
 	bytes := options.ProposalBytes
 	if bytes == nil {
@@ -174,63 +180,45 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	if err := checkProposalSource(p.Source); err != nil {
 		return v, err
 	}
-	check := g.CheckSandbox
-	if check == nil {
-		check = declindex.CheckSandbox
-	}
-	if err := check(ctx, g.Compiled.Exporter.Lean); err != nil {
+	if err := g.checkSandbox(ctx); err != nil {
 		return v, fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)
 	}
-	if d, err := g.Index.Meta(ctx, "compiled"); err != nil {
-		return v, err
-	} else if d == "" {
-		return v, fmt.Errorf("the index was read without its compiled part, so the gate has no compiled statements to compare")
-	}
-	base, err := g.Index.Meta(ctx, "commit")
+	base, err := g.compiledCommit(ctx)
 	if err != nil {
 		return v, err
 	}
-	reg, _, err := Load(g.Registry)
+	reg, defects, err := Load(g.Registry)
 	if err != nil {
 		return v, err
 	}
+	v.Defects = defects
 	if p.Concept.Extends != "" {
 		if _, ok := reg.Find(p.Concept.Extends); !ok {
 			return v, fmt.Errorf("concept %s extends %s, which is not registered", p.Concept.Name, p.Concept.Extends)
 		}
 	}
-	refuse := func(existing, at, reason string) (Verdict, error) {
-		v.Outcome, v.Existing, v.ExistingAt, v.Reason = Refused, existing, at, reason
-		return v, nil
-	}
-	taken := func(existing, at, reason string) (Verdict, error) {
-		v.Outcome, v.Existing, v.ExistingAt, v.Reason = NameTaken, existing, at, reason
+	decided := func(outcome Outcome, existing, at, reason string) (Verdict, error) {
+		v.Outcome, v.Existing, v.ExistingAt, v.Reason = outcome, existing, at, reason
 		return v, nil
 	}
 	if c, ok := reg.Find(p.Concept.Name); ok {
-		return taken(c.Name, c.Home, "a concept of this name is registered")
+		return decided(NameTaken, c.Name, c.Home, "a concept of this name is registered")
 	}
-	if found, err := g.Index.Resolve(ctx, p.Concept.Name); err != nil {
-		return v, err
-	} else {
-		for _, f := range found {
-			if f.Name == p.Concept.Name {
-				return taken(f.Name, f.At(), "a declaration of this name exists")
-			}
-		}
-	}
-	consts, err := g.export(ctx, reg, p)
+	found, err := g.Index.Resolve(ctx, p.Concept.Name)
 	if err != nil {
 		return v, err
 	}
-	own := map[string]bool{}
-	var decl *declindex.Constant
-	for i, c := range consts {
-		own[c.Name] = true
-		if c.Name == p.Concept.Name {
-			decl = &consts[i]
+	for _, f := range found {
+		if f.Name == p.Concept.Name {
+			return decided(NameTaken, f.Name, f.At(), "a declaration of this name exists")
 		}
 	}
+	consts, pending, err := g.export(ctx, reg, p)
+	v.Defects = append(v.Defects, pending...)
+	if err != nil {
+		return v, err
+	}
+	own, decl := ownConstants(consts, p.Concept.Name)
 	if decl == nil {
 		return v, fmt.Errorf("the proposal's source does not declare %s", p.Concept.Name)
 	}
@@ -251,7 +239,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 			return v, err
 		}
 		if (rc.Hash != "" && rc.Hash == decl.Hash) || (c.CompiledHash != "" && c.CompiledHash == decl.Hash) {
-			return refuse(c.Name, c.Home, "the compiled statement equals the registered concept's")
+			return decided(Refused, c.Name, c.Home, "the compiled statement equals the registered concept's")
 		}
 		if rc.Hash == "" && c.CompiledHash == "" && len(c.Forms) == 0 && c.Source == "" {
 			unknown = append(unknown, c.Name)
@@ -262,20 +250,17 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 		return v, err
 	}
 	if len(same) > 0 {
-		return refuse(same[0].Name, same[0].At(), "the compiled statement equals an existing declaration's")
+		return decided(Refused, same[0].Name, same[0].At(), "the compiled statement equals an existing declaration's")
 	}
 	for _, c := range consts {
 		for _, f := range c.Facts {
-			if f.How == "direct" || (strings.HasPrefix(f.How, "via:") && own[strings.TrimPrefix(f.How, "via:")]) {
+			if statesOwnFact(f.How, own) {
 				v.Matches = append(v.Matches, Match{Concept: f.Concept, How: f.How, Declaration: c.Name})
 			}
 		}
 	}
 	if len(v.Matches) > 0 || len(unknown) > 0 {
-		sort.Slice(v.Matches, func(i, j int) bool {
-			a, b := v.Matches[i], v.Matches[j]
-			return a.Concept+a.Declaration+a.How < b.Concept+b.Declaration+b.How
-		})
+		sortMatches(v.Matches)
 		if options.AcceptedBy == "" {
 			v.Outcome, v.Reason = Near, "the proposal restates a registered concept's fact"
 			if len(v.Matches) == 0 {
@@ -296,7 +281,8 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	c.Proposer = options.Proposer
 	c.CompiledHash = decl.Hash
 	c.Source = p.Source
-	c.AcceptedBy = options.AcceptedBy
+	// accepted_by and accepted_near record the librarian's decision: never the proposal's own.
+	c.AcceptedBy, c.AcceptedNear = options.AcceptedBy, nil
 	if options.AcceptedBy != "" {
 		seen := map[string]bool{}
 		for _, m := range v.Matches {
@@ -320,6 +306,63 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	return v, nil
 }
 
+// checkSandbox is the one check that the sandbox runs the gate's toolchain, before any untrusted source compiles.
+func (g *Gate) checkSandbox(ctx context.Context) error {
+	check := g.CheckSandbox
+	if check == nil {
+		check = declindex.CheckSandbox
+	}
+	return check(ctx, g.Compiled.Exporter.Lean)
+}
+
+// compiledCommit is the index's commit, refused unless the index read its compiled part at that commit: the gate
+// and the recheck compare compiled statements, so an index whose compiled step did not finish would compare with
+// another commit's.
+func (g *Gate) compiledCommit(ctx context.Context) (string, error) {
+	commit, err := g.Index.Meta(ctx, "commit")
+	if err != nil {
+		return "", err
+	}
+	compiled, err := g.Index.Meta(ctx, "compiled_commit")
+	if err != nil {
+		return "", err
+	}
+	switch compiled {
+	case commit:
+		return commit, nil
+	case "":
+		return "", errors.New("the index was read without its compiled part, so the gate has no compiled statements to compare")
+	default:
+		return "", fmt.Errorf("the index's compiled part is of %s, not of its commit %s: refresh the index", compiled, commit)
+	}
+}
+
+// ownConstants are the names of the constants that a proposal's source declares, and the one named name.
+func ownConstants(consts []declindex.Constant, name string) (map[string]bool, *declindex.Constant) {
+	own := map[string]bool{}
+	var decl *declindex.Constant
+	for i, c := range consts {
+		own[c.Name] = true
+		if c.Name == name {
+			decl = &consts[i]
+		}
+	}
+	return own, decl
+}
+
+// statesOwnFact says whether a fact that a proposal's constant states, as how, is the proposal's own statement:
+// directly, or through a definition the proposal itself declares.
+func statesOwnFact(how string, own map[string]bool) bool {
+	return how == "direct" || strings.HasPrefix(how, "via:") && own[strings.TrimPrefix(how, "via:")]
+}
+
+// sortMatches orders matches by concept, then declaration, then how.
+func sortMatches(ms []Match) {
+	slices.SortFunc(ms, func(a, b Match) int {
+		return cmp.Or(strings.Compare(a.Concept, b.Concept), strings.Compare(a.Declaration, b.Declaration), strings.Compare(a.How, b.How))
+	})
+}
+
 // additionPath is the repository-relative, slash-separated path of the addition file with key: the path that its
 // owner writes in its own worktree and opens with `ledger open --write`.
 func (g *Gate) additionPath(key string) (string, error) {
@@ -337,12 +380,26 @@ func (g *Gate) additionPath(key string) (string, error) {
 	return path.Join(root, "concepts", key+".yaml"), nil
 }
 
+// conceptFile is the registry-relative path of a concept's file, as Load names it in a defect.
+func conceptFile(c Concept) string { return "concepts/" + Key(c) + ".yaml" }
+
+// sourceFailed says whether err is the failure of an untrusted source itself: refused by Lean's parser allow-list,
+// or rejected by Lean. Any other error is the gate's own inability.
+func sourceFailed(err error) bool {
+	return errors.Is(err, declindex.ErrRefusedSource) || errors.Is(err, declindex.ErrSourceFailed)
+}
+
 // pendingForms compiles the sources of registry concepts that are not yet declared by the index. It runs only
-// from the gate's confined export path; refresh and FormsModule never receive those source bytes.
-func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exporter, run, exclude string) (declindex.FormsModule, error) {
+// from the gate's confined export path; refresh and FormsModule never receive those source bytes. A pending
+// concept whose source the text filter or Lean refuses is a defect of that concept, left out of the forms.
+func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exporter, run, exclude string) (declindex.FormsModule, []Defect, error) {
 	fm, err := Forms(ctx, g.Index, reg)
 	if err != nil {
-		return fm, err
+		return fm, nil, err
+	}
+	var defects []Defect
+	defect := func(c Concept, format string, args ...any) {
+		defects = append(defects, Defect{Path: conceptFile(c), Message: fmt.Sprintf("pending concept %s: ", c.Name) + fmt.Sprintf(format, args...)})
 	}
 	seenImports := map[string]bool{}
 	for _, i := range fm.Imports {
@@ -355,7 +412,7 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		compiled, err := g.Index.Constant(ctx, c.Name)
 		var nf *declindex.NotFoundError
 		if err != nil && !errors.As(err, &nf) {
-			return fm, err
+			return fm, defects, err
 		}
 		if err == nil && compiled.Hash != "" {
 			continue
@@ -364,25 +421,35 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 			continue
 		}
 		if c.CompiledHash == "" {
-			return fm, fmt.Errorf("pending concept %s has source but no compiled hash", c.Name)
+			defect(c, "it has source but no compiled hash")
+			continue
 		}
 		if err := checkProposalSource(c.Source); err != nil {
-			return fm, fmt.Errorf("pending concept %s: %w", c.Name, err)
+			defect(c, "%v", err)
+			continue
 		}
 		check, err := declindex.NewScratch(run)
 		if err != nil {
-			return fm, err
+			return fm, defects, err
 		}
 		if err := ex.CheckSource(ctx, []byte(c.Source), ex.SearchPath, check); err != nil {
-			return fm, fmt.Errorf("check pending concept %s: %w", c.Name, err)
+			if !sourceFailed(err) {
+				return fm, defects, fmt.Errorf("check pending concept %s: %w", c.Name, err)
+			}
+			defect(c, "%v", err)
+			continue
 		}
 		dir, err := declindex.NewScratch(run)
 		if err != nil {
-			return fm, err
+			return fm, defects, err
 		}
 		module := "DeclIndexPending" + c.CompiledHash
 		if err := declindex.CompileConfined(ctx, ex.Lean, ex.SearchPath, dir, module, []byte(c.Source)); err != nil {
-			return fm, fmt.Errorf("compile pending concept %s: %w", c.Name, err)
+			if !sourceFailed(err) {
+				return fm, defects, fmt.Errorf("compile pending concept %s: %w", c.Name, err)
+			}
+			defect(c, "its stored source no longer compiles: %v", err)
+			continue
 		}
 		ex.SearchPath = append(ex.SearchPath, dir)
 		if !seenImports[module] {
@@ -391,44 +458,49 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		}
 		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
 	}
-	return fm, nil
+	return fm, defects, nil
 }
 
 // export checks the proposal, compiles it against the build and reads it with the registry's forms, each step in
 // the sandbox with a fresh scratch directory of its own below one run directory that the gate owns and removes.
-func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declindex.Constant, error) {
+// It also gives the defects of the pending concepts it left out of the forms. When the proposal's own source is
+// refused or does not compile, the error satisfies sourceFailed.
+func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declindex.Constant, []Defect, error) {
 	if err := os.MkdirAll(g.WorkDir, 0o700); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	run, err := declindex.NewScratch(g.WorkDir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer os.RemoveAll(run)
 	ex := *g.Compiled.Exporter
 	ex.ScratchDir, ex.Confined = run, true
 	co := *g.Compiled
 	co.Exporter, co.Confined = &ex, true
-	if co.Forms, err = g.pendingForms(ctx, reg, &ex, run, p.Concept.Name); err != nil {
-		return nil, err
+	forms, defects, err := g.pendingForms(ctx, reg, &ex, run, p.Concept.Name)
+	if err != nil {
+		return nil, defects, err
 	}
+	co.Forms = forms
 	check, err := declindex.NewScratch(run)
 	if err != nil {
-		return nil, err
+		return nil, defects, err
 	}
 	if err := ex.CheckSource(ctx, []byte(p.Source), ex.SearchPath, check); err != nil {
-		return nil, err
+		return nil, defects, err
 	}
 	compiled, err := declindex.NewScratch(run)
 	if err != nil {
-		return nil, err
+		return nil, defects, err
 	}
 	if err := declindex.CompileConfined(ctx, ex.Lean, ex.SearchPath, compiled, ProposalModule, []byte(p.Source)); err != nil {
-		return nil, fmt.Errorf("the proposal does not compile: %w", err)
+		return nil, defects, fmt.Errorf("the proposal does not compile: %w", err)
 	}
 	roots := declindex.Roots{ProposalModule: true}
 	for r := range g.Tree.Roots {
 		roots[r] = true
 	}
-	return co.Export(ctx, roots, []string{ProposalModule}, []string{compiled})
+	consts, err := co.Export(ctx, roots, []string{ProposalModule}, []string{compiled})
+	return consts, defects, err
 }
