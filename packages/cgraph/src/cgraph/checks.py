@@ -162,6 +162,8 @@ def accesses(graph: dict[str, Any]) -> dict[str, Any]:
     for function in functions:
         c_values, entries = c_targets.get(function, {}), image_entries.get(function, {})
         image_names = set().union(*(names for _, names in entries.values())) if entries else set()
+        # A name at the start of a merged-globals block the machine code forms: its address is formed.
+        image_names |= set(analysis["image"].get("block_start_names", {}).get(function, []))
         for name, item in sorted(c_values.items()):
             pair = (function, name)
             kind = item["target_class"]
@@ -235,6 +237,23 @@ def accesses(graph: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _register_relative(
+    offset: int, size: int, item: dict[str, Any], displacements: set[int], constants: list[int]
+) -> str | None:
+    """How the machine code reaches a field ``offset`` bytes from a base register, if it does."""
+    if offset in displacements:
+        return "memory_displacement"
+    if offset in constants:
+        return "addi_field_address"
+    if -offset in constants or (offset < 0 and -offset in displacements):
+        return "negative_addi_container_offset"
+    if any(offset < value < offset + size for value in displacements):
+        return "narrower_access_inside_field"
+    if item.get("bitfield") and ({offset & ~3, offset & ~7} & displacements):
+        return "bitfield_storage_unit"
+    return None
+
+
 def structure(graph: dict[str, Any]) -> dict[str, Any]:
     """Embeddings against clang's record layout, memberships against their C site, field offsets against the image."""
     analysis = graph["analysis"]
@@ -248,8 +267,19 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
     ]
     offsets, constants = analysis["image"]["memory_offsets"], analysis["image"]["addi_constants"]
     global_offsets: dict[str, set[int]] = collections.defaultdict(set)
+    # Each function's image addresses into each global, by every name of the global.
+    image_offsets: dict[str, dict[str, set[int]]] = collections.defaultdict(lambda: collections.defaultdict(set))
     for entry in analysis["image"]["globals"]:
         global_offsets[entry["function"]].add(entry["offset"])
+        for name in {entry["global"], *entry.get("aliases", [])}:
+            image_offsets[entry["function"]][name].add(entry["offset"])
+    # Where each struct sits inside each global the function's C names (link, from clang's layouts).
+    places: dict[str, dict[str, list[tuple[str, list[int]]]]] = collections.defaultdict(
+        lambda: collections.defaultdict(list)
+    )
+    for function, entries in analysis.get("global_struct_offsets", {}).items():
+        for entry in entries:
+            places[function][entry["struct"]].append((entry["global"], entry["offsets"]))
     candidates = []
     excluded: collections.Counter[str] = collections.Counter()
     for function, fields in sorted(analysis["field_accesses"].items()):
@@ -266,22 +296,62 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 # An object on the stack or in registers: the compiler keeps it in registers.
                 excluded[f"{base}_object"] += 1
                 continue
-            offset = item["displacement"] if item.get("displacement", -1) >= 0 else item["offset"]
+            displacement = item.get("displacement", -1)
+            # A container_of displacement is negative (the member's offset subtracted): match it as is.
+            if displacement >= 0 or (base == "container_of" and displacement < -1):
+                offset = displacement
+            else:
+                offset = item["offset"]
             if offset < 0 and base != "container_of":
                 continue
             size = max(1, item.get("size", 1) or 1)
+            # Where the image may keep an inner address in a register instead of the folded sum: the
+            # element of a variable index (``element_displacement``), or a global's member (the field's
+            # own offset).
+            alternates = [offset]
+            if item.get("element_displacement") is not None:
+                alternates.append(item["element_displacement"])
+            if item.get("inner_displacement") is not None:
+                alternates.append(item["inner_displacement"])
+            if base == "global" and item.get("offset", -1) >= 0:
+                alternates.append(item["offset"])
+            register = next(
+                (
+                    found
+                    for candidate_offset in alternates
+                    if (
+                        found := _register_relative(
+                            candidate_offset, size, item, displacements, constants.get(function, [])
+                        )
+                    )
+                ),
+                None,
+            )
             if base == "global" and offset in global_offsets[function]:
                 method = "global_address_offset"
-            elif offset in displacements:
-                method = "memory_displacement"
-            elif offset in constants.get(function, []):
-                method = "addi_field_address"
-            elif -offset in constants.get(function, []) or (offset < 0 and -offset in displacements):
-                method = "negative_addi_container_offset"
-            elif any(offset < value < offset + size for value in displacements):
-                method = "narrower_access_inside_field"
-            elif item.get("bitfield") and ({offset & ~3, offset & ~7} & displacements):
-                method = "bitfield_storage_unit"
+            elif register is not None:
+                method = register
+            elif offset == 0 and item.get("address"):
+                # &p->m (or an array member decaying to a pointer) at offset 0 is the base pointer itself.
+                method = "member_address_at_zero"
+            elif any(
+                own + place in image_offsets[function].get(name, ())
+                for own in [item["offset"] if item.get("offset", -1) >= 0 else offset]
+                for name, at in places[function][item["struct"]]
+                for place in at
+            ):
+                # The C names a global that is (or holds) the struct, and the image addresses it where
+                # the field sits: the field's own offset in its struct at a place that struct has in the
+                # global (a "." chain's displacement is from an outer struct, whose place is covered).
+                method = "global_object_field"
+            elif any(
+                own + place <= value < own + place + size
+                for own in [item["offset"] if item.get("offset", -1) >= 0 else offset]
+                for name, at in places[function][item["struct"]]
+                for value in image_offsets[function].get(name, ())
+                for place in at
+            ):
+                method = "global_object_narrower_access"
             elif offset >= 2048:
                 method = "no_match_beyond_12_bit_displacement"
             else:

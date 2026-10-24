@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,10 @@ Unit = dict[str, Any]
 _EVENT_LISTS = ("accesses", "unevaluated", "list_calls", "indirect", "function_pointers", "field_accesses")
 _FIELD_KEYS = ("struct", "field", "offset", "displacement", "base", "size", "bitfield")
 _CORE_FORMAT = "cgraph/link-core/v1"
+# Bounds on a struct's places inside a global: elements of one array, nesting depth, places kept.
+_MAX_ELEMENTS = 64
+_MAX_DEPTH = 8
+_MAX_PLACES = 4096
 
 
 @functools.cache
@@ -215,9 +219,11 @@ class Linker:
         self.contracts = contracts
         self.definitions: dict[tuple[str, str, int], Definition] = {}
         self.by_name: dict[str, list[Definition]] = collections.defaultdict(list)
+        defining_units: dict[tuple[str, str, int], list[str]] = collections.defaultdict(list)
         for tu, facts in self.tus.items():
             for name, function in facts["functions"].items():
                 key = (name, function["file"], function["line"])
+                defining_units[key].append(tu)
                 if key not in self.definitions:
                     definition = Definition(
                         name, function["file"], function["line"], function["static"], tu,
@@ -237,9 +243,20 @@ class Linker:
             else:
                 self.primary[definition.id] = definition
         self.records: dict[str, dict[str, Any]] = {}
+        # Each file-scope global's initializer: the addresses of other globals it stores. Facts
+        # before U2's ``global_initializers`` have none.
+        self.initializers: dict[tuple[str, str | None], dict[str, dict[str, Any]]] = collections.defaultdict(dict)
         for facts in self.tus.values():
             for key, record in facts["records"].items():
                 self.records.setdefault(key, record)
+            for item in facts.get("global_initializers", []):
+                holder = (item["global"]["name"], item["global"].get("def"))
+                self.initializers[holder][jsonio.canonical(item)] = item
+        self.records_by_name: dict[str, list[str]] = collections.defaultdict(list)
+        for record_key, record in self.records.items():
+            self.records_by_name[record["name"]].append(record_key)
+        self.place_cache: dict[tuple[str, str], dict[str, list[int]]] = {}
+        self.relative_place_cache: dict[str, dict[str, set[int]]] = {}
         header_records: dict[str, set[str]] = collections.defaultdict(set)
         for record in self.records.values():
             file = record["def"].rsplit(":", 1)[0]
@@ -263,7 +280,16 @@ class Linker:
                             self.global_ids[unit["name"]].add(identity)
         self.symbol_cache: dict[tuple[str, str, int], list[Symbol]] = {}
         self.callee_cache: dict[tuple[str, str, int], set[str]] = {}
-        self.effective_cache: dict[tuple[str, str, tuple[str, str, int]], Effective] = {}
+        self.effective_cache: dict[tuple[str, str, tuple[str, str, int], bool], Effective] = {}
+        self.own_cache: dict[tuple[str, str, int], tuple[frozenset[str], frozenset[str]]] = {}
+        # A header's static function is compiled into each unit that includes it, with that unit's
+        # view of its callees. Its facts are those of the unit whose image copy the node is.
+        for key, definition in self.definitions.items():
+            if definition.static and not definition.file.endswith(".c") and len(defining_units[key]) > 1:
+                copies = {symbol.file for symbol in self.symbols(definition)}
+                compiled = [tu for tu in defining_units[key] if os.path.basename(tu) in copies]
+                if compiled:
+                    definition.tu = compiled[0]
 
     # Identities ----------------------------------------------------------------------------
 
@@ -272,6 +298,58 @@ class Linker:
         if function is None:
             return None
         return self.definitions[(name, function["file"], function["line"])]
+
+    def initializer_values(self, unit: Unit, field: str | None) -> list[dict[str, Any]]:
+        """The global addresses ``unit``'s initializer stores in ``field`` (in any field when the
+        access names the whole global, or a field the initializer item does not name), in C4 order."""
+        items = self.initializers.get((unit["name"], unit.get("def")), {})
+        return [
+            items[key]
+            for key in sorted(items)
+            if field is None or items[key].get("field") is None or items[key]["field"] == field
+        ]
+
+    def struct_places(self, name: str, record: str) -> dict[str, list[int]]:
+        """Each struct's offsets inside global ``name`` of struct type ``record``: the record itself, every
+        record it embeds at any depth, and each element of an embedded array or of the global's own
+        array (its count from the image symbol's size), from clang's layouts."""
+        key = (name, record)
+        if key in self.place_cache:
+            return self.place_cache[key]
+        places: dict[str, set[int]] = collections.defaultdict(set)
+        symbols = self.image.object_symbols.get(name, [])
+        for record_key in sorted(self.records_by_name.get(record, [])):
+            size = self.records[record_key].get("size", -1)
+            count = symbols[0].size // size if symbols and size > 0 and symbols[0].size % size == 0 else 1
+            for element in range(max(1, min(count, _MAX_ELEMENTS))):
+                for struct, offsets in self._relative_places(record_key, 0).items():
+                    places[struct] |= {element * max(size, 0) + offset for offset in offsets}
+        result = {struct: sorted(offsets)[:_MAX_PLACES] for struct, offsets in places.items()}
+        self.place_cache[key] = result
+        return result
+
+    def _relative_places(self, record_key: str, depth: int) -> dict[str, set[int]]:
+        cached = self.relative_place_cache.get(record_key)
+        if cached is not None:
+            return cached
+        record = self.records[record_key]
+        places: dict[str, set[int]] = collections.defaultdict(set)
+        places[record["name"]].add(0)
+        if depth < _MAX_DEPTH:
+            for field in record["fields"]:
+                child_key = f"{field.get('record')}@{field.get('record_def')}"
+                child = self.records.get(child_key)
+                if field.get("pointer") or child is None or child.get("size", -1) <= 0 or field["offset"] < 0:
+                    continue
+                size = child["size"]
+                count = field["size"] // size if field.get("size", -1) >= size and field["size"] % size == 0 else 1
+                nested = self._relative_places(child_key, depth + 1)
+                for element in range(min(count, _MAX_ELEMENTS)):
+                    base = field["offset"] + element * size
+                    for struct, offsets in nested.items():
+                        places[struct] |= {base + offset for offset in offsets}
+        self.relative_place_cache[record_key] = places
+        return places
 
     def node_of(self, definition: Definition) -> Definition:
         """The definition that is the node of ``definition``'s id: the strong one of a weak pair."""
@@ -365,14 +443,17 @@ class Linker:
 
     # Folding -------------------------------------------------------------------------------
 
-    def effective(self, tu: str, name: str, caller: Definition, stack: tuple[str, ...] = ()) -> Effective:
+    def effective(
+        self, tu: str, name: str, caller: Definition, stack: tuple[str, ...] = (), pointers: bool = True
+    ) -> Effective:
         """The events of ``name`` (as unit ``tu`` defines it) inside the image code of ``caller``.
 
         A visible helper is folded where the caller's image code has no direct call to it: the
-        compiler inlined it there. A helper the image calls stays a call.
+        compiler inlined it there. A helper the image calls stays a call. With ``pointers``, a
+        function whose address the C passes is folded too where the image shows it (below).
         """
         caller_key = (caller.name, caller.file, caller.line)
-        key = (tu, name, caller_key)
+        key = (tu, name, caller_key, pointers)
         if key in self.effective_cache:
             return self.effective_cache[key]
         events = self.tus[tu]["functions"][name]["events"]
@@ -391,7 +472,7 @@ class Linker:
             ):
                 helper = self.visible(tu, callee)
                 assert helper is not None
-                child = self.effective(tu, callee, caller, (*stack, name))
+                child = self.effective(tu, callee, caller, (*stack, name), pointers)
                 bound = _bind(child, call["arguments"])
                 # A helper folded under a __builtin_constant_p choice is itself left to the image.
                 mark = {"conditional": True} if call.get("conditional") else {}
@@ -419,7 +500,7 @@ class Linker:
                     addressed = self.image_globals(caller)
                     helper = self.visible(tu, callee)
                     assert helper is not None
-                    child = self.effective(tu, callee, caller, (*stack, name))
+                    child = self.effective(tu, callee, caller, (*stack, name), pointers)
                     bound = _bind(child, call["arguments"])
                     for item in bound.calls:
                         if item["callee"] in callees and item["callee"] not in own and item["callee"] != callee:
@@ -433,31 +514,41 @@ class Linker:
                             and unit["name"] not in own_globals
                         ):
                             result.accesses.append({**_with_via(item, helper.id), "partial_inline": True})
+        if not pointers:
+            self.effective_cache[key] = result
+            return result
         # A function whose address the C passes, which the machine code neither calls nor forms:
-        # the compiler inlined it where the callee that takes the pointer was inlined.
+        # the compiler inlined it where the callee that takes the pointer was inlined. The image must
+        # show it: a call or a global of the target that the caller's own C (every helper folded,
+        # no function through a pointer) does not explain.
         formed = self.image_address_targets(caller)
         kept = []
         for pointer in result.function_pointers:
             target = pointer["target"]
             helper = self.visible(tu, target)
-            if (
-                helper is None
-                or target in callees
-                or target in formed
-                or target in stack
-                or target == name
-                or not self.symbols(caller)
-            ):
+            if helper is None or target in stack or target == name or not self.symbols(caller):
                 kept.append(pointer)
                 continue
+            caller_calls, caller_globals = self.own_events(caller)
+            addressed = self.image_globals(caller)
             child = self.effective(tu, target, caller, (*stack, name))
-            # Fold only what the caller's machine code shows: a call or a global of the target.
-            shown = {item["callee"] for item in child.calls} & callees or {
-                item["unit"]["name"]
+            calls_shown = [
+                item for item in child.calls if item["callee"] in callees and item["callee"] not in caller_calls
+            ]
+            globals_shown = [
+                item
                 for item in child.accesses
-                if item.get("unit") is not None and item["unit"]["kind"] == "global"
-            } & self.image_globals(caller)
-            if not shown:
+                if item.get("unit") is not None
+                and item["unit"]["kind"] == "global"
+                and item["unit"]["name"] in addressed
+                and item["unit"]["name"] not in caller_globals
+            ]
+            if target in callees or target in formed or not (calls_shown or globals_shown):
+                # The image calls the target or passes its address on, or shows nothing of it. Where it
+                # also inlined a copy (an action a helper calls through its parameter on an error
+                # path), the calls and globals that only that copy explains are the copy's.
+                result.calls += [{**_with_via(item, helper.id), "partial_inline": True} for item in calls_shown]
+                result.accesses += [{**_with_via(item, helper.id), "partial_inline": True} for item in globals_shown]
                 kept.append(pointer)
                 continue
             result.calls += [_with_via(item, helper.id) for item in child.calls]
@@ -472,6 +563,46 @@ class Linker:
         self.effective_cache[key] = result
         return result
 
+    def own_events(self, caller: Definition) -> tuple[frozenset[str], frozenset[str]]:
+        """The callees and the globals of the caller's own C: every helper the image inlines folded,
+        no function whose address the C passes."""
+        key = (caller.name, caller.file, caller.line)
+        if key not in self.own_cache:
+            result = self.effective(caller.tu, caller.name, caller, (), pointers=False)
+            self.own_cache[key] = (
+                frozenset(item["callee"] for item in result.calls),
+                frozenset(
+                    item["unit"]["name"]
+                    for item in result.accesses
+                    if item.get("unit") is not None and item["unit"]["kind"] == "global"
+                ),
+            )
+        return self.own_cache[key]
+
+
+def _rebase(access: dict[str, Any], argument: dict[str, Any] | None) -> dict[str, Any]:
+    """A field access a helper makes through its parameter, as its caller's code makes it.
+
+    Only an argument whose ``displacement`` the facts give (a member's address reached from a pointer,
+    ``f(&p->m)``, or 0 for the pointer itself) is that far from the caller's pointer: the displacement
+    is added and the caller's parameter kept. A pointer loaded through the parameter (``f(p->q)``)
+    is another object, so the access keeps its own displacement and names no parameter."""
+    if argument is None:
+        return {**access, "param": None}
+    if "displacement" in argument:
+        displacement = access["displacement"] + argument["displacement"] if access["displacement"] >= 0 else -1
+        rebased = {**access, "displacement": displacement, "param": argument.get("param")}
+        if argument["displacement"] != 0 and access["displacement"] >= 0:
+            # The machine code may keep the member's address in a register: the access's own
+            # displacement from it, the innermost one.
+            rebased["inner_displacement"] = access.get("inner_displacement", access["displacement"])
+        return rebased
+    unit = argument.get("unit")
+    if unit is not None and unit["kind"] == "global" and unit.get("field") is None and argument.get("param") is None:
+        # The address of a whole global: the field is that far into the global.
+        return {**access, "base": "global", "param": None}
+    return {**access, "param": None}
+
 
 def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
     """Give the accesses a helper makes through its parameters the state its caller passed."""
@@ -481,7 +612,12 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
         list_calls=list(child.list_calls),
         indirect=list(child.indirect),
         function_pointers=list(child.function_pointers),
-        field_accesses=list(child.field_accesses),
+        field_accesses=[
+            _rebase(item, arguments[item["param"]] if item["param"] < len(arguments) else None)
+            if item.get("param") is not None
+            else item
+            for item in child.field_accesses
+        ],
         folds=list(child.folds),
         unbound=list(child.unbound),
     )
@@ -502,10 +638,30 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
         rebound = []
         for item in call["arguments"]:
             index = item.get("param")
-            if item.get("unit") is None and index is not None and index < len(arguments):
-                rebound.append(arguments[index])
-            else:
+            if index is None or index >= len(arguments):
                 rebound.append(item)
+            elif "displacement" in item:
+                # The parameter itself (0) or a member of it: the caller's argument, that much further.
+                outer = arguments[index]
+                if "displacement" in outer:
+                    rebound.append(
+                        {
+                            **item,
+                            "param": outer.get("param"),
+                            "displacement": item["displacement"] + outer["displacement"],
+                        }
+                    )
+                elif item["displacement"] == 0:
+                    rebound.append(outer)
+                else:
+                    rebound.append({**item, "param": None})
+            elif item.get("unit") is None:
+                # An untyped value derived from the parameter: the caller's argument stands for it, as a
+                # value, not as a pointer an offset can rebase.
+                rebound.append({key: value for key, value in arguments[index].items() if key != "displacement"})
+            else:
+                # A value loaded through the parameter (p->q): another object.
+                rebound.append({**item, "param": None})
         bound.calls.append({**call, "arguments": rebound})
     return bound
 
@@ -630,6 +786,8 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
             ):
                 functions[helper.id] = linker.node_of(helper)
                 pending.append(helper.id)
+    specialized = _specialized_parameters(linker, functions)
+    specializations: set[tuple[str, int, str]] = set()
     builder = GraphBuilder()
     analysis: dict[str, Any] = {
         "folds": [],
@@ -765,8 +923,13 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
     c_calls: collections.Counter[tuple[str, str]] = collections.Counter()
     c_targets: dict[str, list[dict[str, Any]]] = {}
     field_accesses: dict[str, list[dict[str, Any]]] = {}
+    global_struct_offsets: dict[str, list[dict[str, Any]]] = {}
+    named_records: dict[str, dict[str, str]] = collections.defaultdict(dict)
     list_calls: list[tuple[str, dict[str, Any]]] = []
     image_pairs: set[tuple[str, str]] = set()
+    # The C names at the start of each merged-globals block a function's machine code forms: the image
+    # gives the block, the address is that of each name there.
+    block_start_names: dict[str, set[str]] = collections.defaultdict(set)
     for identity, definition in sorted(functions.items()):
         result = effective[identity]
         image_facts = linker.image_facts(definition)
@@ -775,12 +938,15 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                 function = item.get("function") or identity
                 if ":" not in function:
                     function = identity
+                detail = item.get("detail")
+                if item["reason"] == "merged_globals_block_base" and isinstance(detail, dict):
+                    block_start_names[identity] |= set(detail.get("names", []))
                 exclude(
                     item["kind"],
                     item["reason"],
                     function,
                     item.get("target"),
-                    item.get("detail"),
+                    detail,
                     item.get("provenance", []),
                 )
         image_calls = {call["target"]: call for fact in image_facts for call in fact.calls}
@@ -817,8 +983,42 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                     function_node(target, call["target"], call["provenance"])
                     builder.edge("call", identity, target, call["provenance"], image_only=True, tail=call["tail"])
         targets: dict[str, str] = {}
-        for access in result.accesses:
+        addressed = image_globals[identity]
+        # Every call site gives the parameter one global, and the image addresses it, or an address
+        # its initializer stores: the compiler specialized the function to that global.
+        bound_parameters = {
+            index: value
+            for index, value in specialized.get(identity, {}).items()
+            if value["name"] in addressed
+            or any(item["target"]["name"] in addressed for item in linker.initializer_values(value, None))
+        }
+        here = [{"source": "c", "file": definition.file, "line": definition.line}]
+        # An access through such a parameter is the global's. The C records none for a dereference
+        # of a scalar (``*pos``) or a field through the pointer (``tk->f`` is struct state): the
+        # global the image addresses is read.
+        implied = [
+            {"unit": value, "access": "read", "field": None, "provenance": here, "parameter": index, "implied": True}
+            for index, value in sorted(bound_parameters.items())
+            if value["name"] in addressed
+        ]
+        for access in [*result.accesses, *implied]:
             unit = access.get("unit")
+            bound_global = bound_parameters.get(access.get("param", -1)) if unit is None else None
+            if bound_global is not None:
+                unit = dict(bound_global)
+                access = {
+                    **access,
+                    "unit": unit,
+                    "field": unit.get("field"),
+                    "param": None,
+                    "parameter": access["param"],
+                }
+            if access.get("parameter") is not None:
+                if access.get("implied") and unit is not None and unit["name"] in targets:
+                    continue
+                specializations.add(
+                    (identity, access["parameter"], str(linker.unit_id(bound_parameters[access["parameter"]])))
+                )
             if unit is None:
                 exclude(
                     "access",
@@ -830,10 +1030,10 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                 )
                 continue
             unit_id = linker.unit_id(unit)
-            if access.get("conditional") and unit["kind"] == "global" and unit["name"] not in image_globals[identity]:
+            if access.get("conditional") and unit["kind"] == "global" and unit["name"] not in addressed:
                 exclude("access", "image_decided", identity, unit_id, {"event": "access"}, access["provenance"])
                 continue
-            if access.get("generic") and (unit["kind"] != "global" or unit["name"] not in image_globals[identity]):
+            if access.get("generic") and (unit["kind"] != "global" or unit["name"] not in addressed):
                 # In a _Generic association whose selection could not be read: a global the
                 # machine code addresses stays; a struct access cannot be confirmed and goes.
                 exclude("access", "generic_unconfirmed", identity, unit_id, {"event": "access"}, access["provenance"])
@@ -855,6 +1055,22 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
             )
             if unit["kind"] == "global":
                 targets[unit["name"]] = "per_cpu" if target.startswith("percpu:") else _c_class(config, unit["name"])
+                if unit.get("record"):
+                    named_records[identity][unit["name"]] = unit["record"]
+                for item in linker.initializer_values(unit, access.get("field")):
+                    _initializer_value(
+                        builder, config, state_node, identity, str(unit_id), item, access, addressed, targets
+                    )
+        for index, value in sorted(bound_parameters.items()):
+            if value["name"] not in addressed:
+                # The image forms only the addresses the global's initializer stores: the compiler
+                # read the field and folded its value. The global itself is not addressed.
+                specializations.add((identity, index, str(linker.unit_id(value))))
+                for item in linker.initializer_values(value, None):
+                    _initializer_value(
+                        builder, config, state_node, identity, str(linker.unit_id(value)), item,
+                        {"provenance": here}, addressed, targets,
+                    )  # fmt: skip
         # Globals the function's machine code addresses that its C (after folding) does not name:
         # the access a compiler moved here by inlining, or one written in assembly.
         for fact in image_facts:
@@ -897,6 +1113,23 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                     "provenance": slot["provenance"],
                 }
             )
+            # A slot of a table of the function's own unit, whose target the image calls directly:
+            # the C initializer and the machine code agree on the target.
+            for table in linker.tus[definition.tu]["tables"]:
+                if table["ops_struct"] != slot["ops_struct"]:
+                    continue
+                for entry in table["entries"]:
+                    if entry["field"] == slot["field"] and entry["target"] in image_calls:
+                        target = linker.resolve(definition.tu, entry["target"])
+                        function_node(target, entry["target"], table["provenance"])
+                        builder.edge(
+                            "call_indirect",
+                            identity,
+                            target,
+                            slot["provenance"] + table["provenance"],
+                            resolution="table_slot",
+                            slot=f"{table['name']}.{slot['field']}",
+                        )
         for pointer in result.function_pointers:
             target = linker.resolve(definition.tu, pointer["target"])
             function_node(target, pointer["target"], pointer["provenance"])
@@ -920,14 +1153,18 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
             for name, kind in sorted(targets.items())
         ]
         field_accesses[identity] = sorted(
-            {
-                jsonio.canonical({key: item.get(key, -1) for key in _FIELD_KEYS}): {
-                    key: item.get(key, -1) for key in _FIELD_KEYS
-                }
-                for item in result.field_accesses
-            }.values(),
+            {jsonio.canonical(_field_access(item)): _field_access(item) for item in result.field_accesses}.values(),
             key=jsonio.canonical,
         )
+        structs = {item["struct"] for item in field_accesses[identity]}
+        inside = [
+            {"global": name, "struct": struct, "offsets": offsets}
+            for name, record in sorted(named_records[identity].items())
+            for struct, offsets in sorted(linker.struct_places(name, record).items())
+            if struct in structs
+        ]
+        if inside:
+            global_struct_offsets[identity] = inside
 
     tables = sorted(
         (table for unit_facts in linker.tus.values() for table in unit_facts["tables"]),
@@ -974,10 +1211,18 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
             "parse_errors": {
                 tu: linker.tus[tu]["errors"] for tu in sorted(linker.part_files) if linker.tus[tu]["errors"]
             },
+            "global_struct_offsets": global_struct_offsets,
+            "specialized_parameters": [
+                {"function": function, "parameter": index, "global": target}
+                for function, index, target in sorted(specializations)
+            ],
         }
     )
     for key in ("folds", "indirect_slots"):
         analysis[key] = sorted(analysis[key], key=jsonio.canonical)
+    analysis["image"]["block_start_names"] = {
+        identity: sorted(names) for identity, names in sorted(block_start_names.items())
+    }
     return {
         "format": _CORE_FORMAT,
         "nodes": nodes,
@@ -1029,7 +1274,6 @@ def _assemble(
         builder,
         linker,
         contracts,
-        analysis["callback_tables"],
         analysis["part_functions"],
         exclusions,
         {contract_id: linker.primary[identity] for contract_id, identity in join.resolved.items()},
@@ -1083,16 +1327,27 @@ def _callback_edges(
     builder: GraphBuilder,
     linker: Linker,
     contracts: ContractGraph,
-    tables: list[dict[str, Any]],
     functions: Collection[str],
     exclusions: list[dict[str, Any]],
     by_contract: dict[str, Definition],
 ) -> list[dict[str, Any]]:
-    """Callback edges with every contract edge from a part function either linked or excluded."""
-    fields: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
-    for table in tables:
-        for entry in table["entries"]:
-            fields[(table["name"], entry["target"])].add(entry["field"])
+    """Callback edges with every contract edge from a part function either linked or excluded.
+
+    The contract graph names a slot's table by name only. A static table of the source's own unit
+    is the one its code reads; another unit's table of the same name is not. A table the source's
+    unit does not define is read from any unit that does (an external table)."""
+    fields: dict[tuple[str, str], dict[str, set[str]]] = collections.defaultdict(lambda: collections.defaultdict(set))
+    defined_in: dict[str, set[str]] = collections.defaultdict(set)
+    for tu, facts in linker.tus.items():
+        for table in facts["tables"]:
+            defined_in[table["name"]].add(tu)
+            for entry in table["entries"]:
+                fields[(table["name"], tu)][entry["target"]].add(entry["field"])
+
+    def initializer(table: str, source: Definition, target: str) -> set[str]:
+        units = [source.tu] if source.tu in defined_in[table] else sorted(defined_in[table])
+        return set().union(*(fields[(table, tu)].get(target, set()) for tu in units))
+
     part_ids = set(functions)
 
     def exclude(
@@ -1142,7 +1397,7 @@ def _callback_edges(
             continue
         for item in evidence:
             table = item.split(":", 1)[1]
-            field_names = fields.get((table, target.name), set())
+            field_names = initializer(table, source, target.name)
             if not field_names:
                 exclude("no_c_initializer", source, target, edge, {"table": table})
                 continue
@@ -1200,6 +1455,118 @@ def _image_analysis(
         "globals_by_function": image_globals,
         "call_pairs": len(image_pairs),
     }
+
+
+def _initializer_value(
+    builder: GraphBuilder,
+    config: Config,
+    state_node: Callable[..., str | None],
+    identity: str,
+    holder: str,
+    item: dict[str, Any],
+    access: dict[str, Any],
+    addressed: Collection[str],
+    targets: dict[str, str],
+) -> None:
+    """A global whose address the holder's initializer stores, where the function's machine code
+    forms it: the compiler read the holder's field and folded the stored address."""
+    value = item["target"]
+    if value["name"] not in addressed:
+        return
+    state = state_node(value, item["provenance"])
+    if state is None:
+        return
+    builder.edge(
+        "access",
+        identity,
+        state,
+        access["provenance"] + item["provenance"],
+        access="read",
+        field=None,
+        initializer=holder,
+    )
+    targets[value["name"]] = "per_cpu" if state.startswith("percpu:") else _c_class(config, value["name"])
+
+
+def _field_access(item: dict[str, Any]) -> dict[str, Any]:
+    """A field access as the structure check reads it. ``address`` marks a member whose value is only
+    its address (``&p->m``, an array member decaying to a pointer); ``element_displacement`` is the
+    displacement past a variable index; ``param`` is the parameter the base pointer is."""
+    access = {key: item.get(key, -1) for key in _FIELD_KEYS}
+    if item.get("address"):
+        access["address"] = True
+    for key in ("element_displacement", "inner_displacement", "param"):
+        if item.get(key) is not None:
+            access[key] = item[key]
+    return access
+
+
+def _specialized_parameters(linker: Linker, functions: dict[str, Definition]) -> dict[str, dict[int, Unit]]:
+    """For each static function of the part, the parameters every call site of its unit gives one
+    global: directly, or through a parameter of a static caller every call site of which does. A
+    function whose address its unit takes may be called from anywhere, and has none."""
+    calls: dict[str, dict[str, list[tuple[str, list[dict[str, Any]]]]]] = {}
+    taken: dict[str, set[str]] = {}
+
+    def index(tu: str) -> tuple[dict[str, list[tuple[str, list[dict[str, Any]]]]], set[str]]:
+        if tu not in calls:
+            sites: dict[str, list[tuple[str, list[dict[str, Any]]]]] = collections.defaultdict(list)
+            names: set[str] = set()
+            for caller, function in linker.tus[tu]["functions"].items():
+                for call in function["events"]["calls"]:
+                    sites[call["callee"]].append((caller, call["arguments"]))
+                names |= {pointer["target"] for pointer in function["events"]["function_pointers"]}
+            for table in linker.tus[tu]["tables"]:
+                names |= {entry["target"] for entry in table["entries"]}
+            calls[tu], taken[tu] = dict(sites), names
+        return calls[tu], taken[tu]
+
+    def given(tu: str, name: str, parameter: int, seen: frozenset[tuple[str, int]]) -> Unit | None:
+        sites, addressed = index(tu)
+        definition = linker.visible(tu, name)
+        if (
+            (name, parameter) in seen
+            or name in addressed
+            or not sites.get(name)
+            or not definition
+            or not definition.static
+        ):
+            return None
+        found: Unit | None = None
+        for caller, arguments in sites[name]:
+            if parameter >= len(arguments):
+                return None
+            argument = arguments[parameter]
+            if argument.get("param") is not None:
+                # The caller's own parameter pointer (displacement 0, or an untyped value); a member of
+                # it or a pointer loaded through it is not one global.
+                if argument.get("displacement", 0) != 0 or ("displacement" not in argument and argument.get("unit")):
+                    return None
+                value = given(tu, caller, argument["param"], seen | {(name, parameter)})
+            else:
+                value = argument.get("unit")
+            if value is None or value["kind"] != "global":
+                return None
+            if found is not None and (found["name"], found.get("def"), found.get("field")) != (
+                value["name"], value.get("def"), value.get("field"),
+            ):  # fmt: skip
+                return None
+            found = value
+        return found
+
+    result: dict[str, dict[int, Unit]] = {}
+    for identity, definition in sorted(functions.items()):
+        if not definition.static:
+            continue
+        count = linker.tus[definition.tu]["functions"][definition.name].get("parameters", 0)
+        bound = {
+            parameter: value
+            for parameter in range(count)
+            if (value := given(definition.tu, definition.name, parameter, frozenset())) is not None
+        }
+        if bound:
+            result[identity] = bound
+    return result
 
 
 def _owned(function: dict[str, Any]) -> bool:

@@ -355,7 +355,6 @@ def test_every_contract_callback_drop_has_a_c3_classification() -> None:
             link.GraphBuilder(),
             linker,
             contract_graph,
-            [table for unit in facts.values() for table in unit["tables"]],
             {source.id: source},
             exclusions,
             {contract_id: linker.primary[identity] for contract_id, identity in join.resolved.items()},

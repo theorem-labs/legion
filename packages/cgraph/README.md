@@ -79,7 +79,33 @@ a function of the part when the unit compiled a copy of it: the image calls it, 
 address (a table of operations, a stored hook, a pointer in a file-scope initializer) and nothing
 calls it. A helper is folded into a caller where the caller's machine code does not call it, so the
 C layer sees what the compiler inlined. A helper the image calls stays a call; its calls that the
-caller's machine code also makes are the caller's too (the helper is inlined at another site).
+caller's machine code also makes are the caller's too (the helper is inlined at another site). A
+header's static function that several units define takes the facts of the unit whose image copy it
+is (its ELF `FILE` symbol).
+
+These rules follow what the machine code shows, each only where it shows it:
+
+- A function whose address the C passes (a callback, a deferred free) is folded into the caller where
+  the caller's machine code neither calls it nor forms its address, and makes a call or addresses a
+  global that only that function explains, not the caller's own C. Where the image forms the address
+  and also inlined a copy (an action a helper calls on its error path), the calls and globals only
+  the copy explains are the caller's, marked `partial_inline`.
+- A static function's parameter that every call site of its unit gives one global (directly, or
+  through a static caller's parameter, which the facts may also type as its struct), in a function
+  whose address the unit does not take, is that global where the machine code addresses it (or an
+  address its initializer stores): `analysis.specialized_parameters`.
+- A folded helper's field access through its parameter is rebased to the caller only where the
+  argument's `displacement` is given (0 for the caller's pointer itself, the member's offset for
+  `wb_exit(&bdi->wb)`): the displacement is added, the argument's own parameter kept, and the access's
+  own displacement stays as `inner_displacement`, for code that keeps the member's address in a
+  register. A pointer loaded through the parameter (`f(path->dentry)`) is another object and is not
+  rebased. A parameter is followed to its callers' globals (above) on the same rule.
+- A read of a global whose file-scope initializer stores other globals' addresses reaches each of
+  those globals the machine code forms (the compiler folded the field's value); the edge names the
+  holder in `initializer`.
+- A call through a slot of a table that the function's own unit defines is a `call_indirect` edge
+  (`resolution: table_slot`) where the image calls the initializer's target. A contract graph's slot
+  edge needs that table's initializer; another unit's table of the same name does not count.
 
 ## Nodes and ids
 
@@ -121,18 +147,26 @@ topic, the id has every character outside `[A-Za-z0-9_:-]` percent-encoded, so i
 
 Each run writes `checks.json`: C calls against image calls (disagreements classified: a callback the
 compiler devirtualized, a caller with a weak alternate, a tail call), state accesses against image
-addresses, embeddings against clang's layout, and field accesses against the machine code. A field
+addresses (a C global at the start of a merged-globals block the function's machine code forms
+counts as addressed: `analysis.image.block_start_names`), embeddings against clang's layout, and
+field accesses against the machine code. A field
 matches at its displacement from the base register: the sum of offsets along the member chain,
 through constant subscripts, through a local every definition of which points the same way
 (`d = &desc->irq_data`) and through an inline helper that returns such an address, less the member
-offset a `container_of` subtracts. Past a variable index the facts also give the displacement from
-the indexed element (`element_displacement`), for code that keeps the element's address in a
-register. A field access through a parameter names it (`param`), and so does a call argument that is
-a member's address (`displacement`), so a folded callee's offsets rebase onto its caller's. It
-matches as a load or store displacement, an `addi` constant or its
-negative, a global's address offset, a narrower access inside the field, or a bitfield's storage
-unit; accesses to objects on the stack or in registers, and functions whose machine code makes no
-memory access, are counted apart.
+offset a `container_of` subtracts (negative included). Past a variable index the facts also give the
+displacement from the indexed element (`element_displacement`), and a global member's own offset
+stands for code that keeps the member's address in a register; both are tried after the sum. A field
+access through a parameter names it (`param`), and so does a call argument that is a member's address
+(`displacement`), so a folded callee's offsets rebase onto its caller's. It matches as a load or
+store displacement, an `addi` constant or its negative, a global's address offset, a narrower access
+inside the field, a bitfield's storage unit, the base itself for a member whose address is taken at
+offset 0 (`member_address_at_zero`), or an address inside a global the function's C names: the
+field's own offset in its struct at a place that struct has there (`global_object_field`, or
+`global_object_narrower_access` inside the field's bytes). Link gives those places in
+`analysis.global_struct_offsets` from clang's layouts: the global's own struct, each struct it embeds
+at any depth, and each element of an embedded array or of the global's own array (counted from the
+image symbol's size). Accesses to objects on the stack or in registers, and functions whose machine
+code makes no memory access, are counted apart.
 
 The hard checks fail the run (exit 1), each with a test that makes it fail alone: a parse error; a
 function of the part's files that the image holds but the graph lacks; a global the part's code
