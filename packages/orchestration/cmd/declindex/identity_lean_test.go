@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
@@ -106,6 +109,38 @@ func TestSameNamedDeclarationsOfTwoModulesAreAnsweredApart(t *testing.T) {
 	}
 	if len(same) != 2 || !slices.Equal(got["A"], []string{"UseA.lowA"}) || !slices.Equal(got["B"], []string{"UseB.lowB"}) {
 		t.Errorf("same bound: %+v; want A's bound to share an atom with UseA's lowA only, and B's with UseB's lowB only", same)
+	}
+}
+
+// A compiled hash counts each constant that a statement names with the module that declares it. A proposal that
+// defines B's `Value` again is not an exact duplicate of A's definition of A's `Value`, though both read `Value`:
+// the gate adds it. One that defines A's `Value` again is: the gate refuses it.
+func TestTheGateHashesAConstantWithItsModule(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	config, tree, lean := leanRegistryTree(t, "A", "B")
+	for _, m := range []struct{ name, source string }{
+		{"A", "def Value : Nat := 1\ndef Original : Nat := Value\nexample : Original = 1 := rfl\n"},
+		{"B", "def Value : Nat := 2\n"},
+	} {
+		writeTestFile(t, filepath.Join(tree, m.name+".lean"), m.source)
+		if err := declindex.CompileModule(context.Background(), lean, nil, tree, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	land(t, config, tree, "add A and B")
+	gateAddition(t, config, "different", "Different", "Different.lean", "import B\n\ndef Different : Nat := Value\nexample : Different = 2 := rfl\n")
+	proposal := filepath.Join(t.TempDir(), "copy.json")
+	writeTestFile(t, proposal, `{"id":"copy","concept":{"name":"Copy","home":"Copy.lean","meaning":"A copy of A's value."},`+
+		`"source":"import A\n\ndef Copy : Nat := Value\n"}`)
+	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+	var v conceptgate.Verdict
+	if err := json.Unmarshal([]byte(r.out), &v); err != nil || r.code != 1 || v.Outcome != conceptgate.Refused || v.Existing != "Original" {
+		t.Fatalf("gate a copy of A's Original: want exit 1, refused as Original, got %+v, %+v (%v)", r, v, err)
 	}
 }
 

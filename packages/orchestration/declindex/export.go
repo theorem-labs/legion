@@ -291,6 +291,10 @@ type Manifest struct {
 	Types    bool       `json:"types"`
 	// Budget is the node budget of one constant's walk (DefaultBudget).
 	Budget int `json:"budget"`
+	// Home, when set, is the module that the hashes count the constants of Modules as declared in: a proposal,
+	// compiled as a module of its own, is hashed as of the module of its home file, where it lands. Else each
+	// constant counts with the module that declares it.
+	Home string `json:"home"`
 }
 
 // DefaultBudget is the node budget of one constant's walk.

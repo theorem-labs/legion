@@ -69,16 +69,19 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 			continue
 		}
 		proposal := Proposal{ID: concept.Proposal, Concept: concept, Source: concept.Source}
-		home, landed, err := landedDeclaration(ctx, g.Index, concept)
+		found, landed, err := landedDeclaration(ctx, g.Index, concept)
 		if err != nil {
 			return report, fmt.Errorf("recheck %s: %w", concept.Name, err)
 		}
 		var constants []declindex.Constant
 		var pending []Defect
 		if landed {
-			constants, pending, err = g.landedConstants(ctx, reg, home, concept.Declarations)
+			constants, pending, err = g.landedConstants(ctx, reg, found, concept.Declarations)
 		} else {
-			constants, pending, err = g.export(ctx, reg, proposal)
+			var home string
+			if home, err = homeModule(ctx, g.Index, concept); err == nil {
+				constants, pending, err = g.export(ctx, reg, proposal, home)
+			}
 		}
 		for _, d := range pending {
 			defect(d)

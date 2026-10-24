@@ -178,9 +178,15 @@ func TestRecheckIDsMatchTheLedgerRuleForAnyName(t *testing.T) {
 	}
 }
 
+// exportedHash is the compiled hash that the gate gives p's concept: hashed as of the module of its home file.
 func exportedHash(t *testing.T, g *Gate, reg Registry, p Proposal) string {
 	t.Helper()
-	constants, _, err := g.export(context.Background(), reg, p)
+	ctx := context.Background()
+	home, err := homeModule(ctx, g.Index, p.Concept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	constants, _, err := g.export(ctx, reg, p, home)
 	if err != nil {
 		t.Fatal(err)
 	}

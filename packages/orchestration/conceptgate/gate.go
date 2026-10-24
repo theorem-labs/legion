@@ -254,7 +254,11 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 			return decided(NameTaken, f.Name, f.At(), "a declaration of this name exists")
 		}
 	}
-	consts, pending, err := g.export(ctx, reg, p)
+	home, err := homeModule(ctx, g.Index, p.Concept)
+	if err != nil {
+		return v, err
+	}
+	consts, pending, err := g.export(ctx, reg, p, home)
 	v.Defects = append(v.Defects, pending...)
 	if err != nil {
 		return v, err
@@ -332,7 +336,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	c.Proposal = p.ID
 	c.Proposer = options.Proposer
 	c.CompiledHash = decl.Hash
-	c.Declarations = slices.Sorted(maps.Keys(own))
+	c.Declarations = landedNames(own, home)
 	c.Source = p.Source
 	// accepted_by and accepted_near record the librarian's decision: never the proposal's own.
 	c.AcceptedBy, c.AcceptedNear = options.AcceptedBy, nil
@@ -542,24 +546,50 @@ func (g *Gate) landedConstants(ctx context.Context, reg Registry, d declindex.Fo
 	if !slices.Contains(parts, d.Name) {
 		return nil, nil, fmt.Errorf("the index declares %s in %s but holds no compiled constant of it: refresh the index with lean.export on", d.Name, d.At())
 	}
-	consts, defects, err := g.read(ctx, reg, nil, d.Module)
+	consts, defects, err := g.read(ctx, reg, nil, d.Module, "")
 	if err != nil {
 		return nil, defects, err
 	}
 	return slices.DeleteFunc(consts, func(c declindex.Constant) bool { return !slices.Contains(parts, c.Name) }), defects, nil
 }
 
-// export checks the proposal, compiles it against the build and reads it with the registry's forms (read).
-func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declindex.Constant, []Defect, error) {
-	return g.read(ctx, reg, &p, ProposalModule)
+// export checks the proposal, compiles it against the build and reads it with the registry's forms (read), hashed
+// as of home, the module of the proposal's home file (homeModule).
+func (g *Gate) export(ctx context.Context, reg Registry, p Proposal, home string) ([]declindex.Constant, []Defect, error) {
+	return g.read(ctx, reg, &p, ProposalModule, home)
+}
+
+// homeModule is the module of the concept c's home file, where its declaration lands: the module that the index
+// read there, else the one that a Lean file at that path builds.
+func homeModule(ctx context.Context, s *declindex.Store, c Concept) (string, error) {
+	if m, err := s.ModuleAt(ctx, c.Home); err != nil || m != "" {
+		return m, err
+	}
+	return strings.ReplaceAll(strings.TrimSuffix(path.Clean(c.Home), ".lean"), "/", "."), nil
+}
+
+// landedNames are the names of a proposal's constants, own, as they are once it lands in the module home: a private
+// name holds its module, the proposal's here and home's there.
+func landedNames(own map[string]bool, home string) []string {
+	private := "_private." + ProposalModule + "."
+	out := make([]string, 0, len(own))
+	for n := range own {
+		if rest, ok := strings.CutPrefix(n, private); ok {
+			n = "_private." + home + "." + rest
+		}
+		out = append(out, n)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // read reads module with the registry's forms, each step in the sandbox with a fresh scratch directory of its own
 // below one run directory that the gate owns and removes. With a proposal p, it first checks p's source and
 // compiles it as module against the build, and the forms leave p's concept out (pendingForms); without one, module
-// is the landed build's. It also gives the defects of the pending concepts it left out of the forms. When the
-// proposal's own source is refused or does not compile, the error satisfies sourceFailed.
-func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module string) ([]declindex.Constant, []Defect, error) {
+// is the landed build's. home, when set, is the module that module's constants are hashed as of. It also gives the
+// defects of the pending concepts it left out of the forms. When the proposal's own source is refused or does not
+// compile, the error satisfies sourceFailed.
+func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module, home string) ([]declindex.Constant, []Defect, error) {
 	if err := os.MkdirAll(g.WorkDir, 0o700); err != nil {
 		return nil, nil, err
 	}
@@ -595,6 +625,6 @@ func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module strin
 		roots[module] = true
 		extra = []string{compiled}
 	}
-	consts, err := co.Export(ctx, roots, []string{module}, extra)
+	consts, err := co.Export(ctx, roots, []string{module}, extra, home)
 	return consts, defects, err
 }

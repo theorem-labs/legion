@@ -86,15 +86,16 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 	return &x, m, src, nil
 }
 
-// Export reads the given compiled modules with the registry's forms: the gate's view of a proposal. extra lists
-// further library directories (the proposal's) and roots the project's roots plus the proposal's.
-func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, extra []string) ([]Constant, error) {
+// Export reads the given compiled modules with the registry's forms: the gate's view of a proposal or of a landed
+// module. extra lists further library directories (the proposal's), roots the project's roots plus the proposal's,
+// and home, when set, the module that the hashes count the modules' constants as declared in (Manifest.Home).
+func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, extra []string, home string) ([]Constant, error) {
 	x, m, _, err := co.prepare(ctx, roots)
 	if err != nil {
 		return nil, err
 	}
 	x.SearchPath = slices.Concat(x.SearchPath, extra)
-	m.Modules = modules
+	m.Modules, m.Home = modules, home
 	return x.Run(ctx, m)
 }
 
@@ -385,7 +386,8 @@ type Compiled struct {
 	Type   string `json:"type"`
 	// Hash is the compiled statement hash: equal for two declarations whose elaborated statements are equal up to
 	// the names of their binders and of the declaration itself, and up to how a numeral of core Lean's Nat and
-	// BitVec instances is written. Any other numeral counts with its type and instance, which give its value.
+	// BitVec instances is written. Any other numeral counts with its type and instance, which give its value. Each
+	// constant that a statement names counts with the module that declares it.
 	Hash  string   `json:"compiled_hash"`
 	Atoms []string `json:"atoms,omitempty"`
 	Facts []Fact   `json:"facts,omitempty"`

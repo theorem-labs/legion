@@ -31,7 +31,8 @@ type Concept struct {
 	AcceptedBy   string   `yaml:"accepted_by,omitempty" json:"accepted_by,omitempty"`
 	AcceptedNear []string `yaml:"accepted_near,omitempty" json:"accepted_near,omitempty"`
 	// Declarations are the constants that Source declares, as the gate compiled it: the concept's own, and its
-	// proposal's helpers and their parts. The post-landing recheck reads them in the module of the home file.
+	// proposal's helpers and their parts, each named as it is once it lands in the module of the home file, where
+	// the post-landing recheck reads them.
 	Declarations []string `yaml:"declarations,omitempty" json:"declarations,omitempty"`
 	Source       string   `yaml:"source,omitempty" json:"source,omitempty"`
 }
