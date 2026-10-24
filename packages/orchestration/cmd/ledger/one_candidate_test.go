@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,8 +8,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-
-	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
 // One candidate gets the same exit code from check and from land, through flags and through one request file, also
@@ -103,25 +99,9 @@ func TestReadyCheckAndLandAgreeOnRecordFlags(t *testing.T) {
 }
 
 func TestDeferredCheckExitsFiveAndRequestFilesRejectUnknownFields(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
-	if code, _, stderr := call("repo", "ensure", "r", "0"); code != 0 {
-		t.Fatalf("ensure: code=%d stderr=%q", code, stderr)
-	}
-	if code, _, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1"); code != 0 {
-		t.Fatalf("open: code=%d stderr=%q", code, stderr)
-	}
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1")
 	assertIncomplete := func(code int, stdout, stderr string) {
 		t.Helper()
 		var result struct {

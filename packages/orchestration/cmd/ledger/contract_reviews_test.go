@@ -1,15 +1,11 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
-
-	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
 // repo ensure takes a repository and a landing-round limit only: an upstream owner is not a repository setting.
@@ -142,30 +138,5 @@ func TestMixedOwnerLandingRecordsEachExplicitReview(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("contract list changes %#v, want %#v", got, want)
-	}
-}
-
-type ledgerCall func(args ...string) (int, string, string)
-
-func ledgerCommand(t *testing.T) ledgerCall {
-	t.Helper()
-	dsn := testpg.Database(t, "ledger_contract_reviews_command")
-	return func(args ...string) (int, string, string) {
-		t.Helper()
-		var stdout, stderr bytes.Buffer
-		code := run(context.Background(), args, func(key string) string {
-			if key == "LEDGER_DSN" {
-				return dsn
-			}
-			return ""
-		}, &stdout, &stderr)
-		return code, stdout.String(), stderr.String()
-	}
-}
-
-func mustExit(t *testing.T, call ledgerCall, want int, args ...string) {
-	t.Helper()
-	if code, _, stderr := call(args...); code != want {
-		t.Fatalf("%v: code=%d stderr=%q, want %d", args, code, stderr, want)
 	}
 }

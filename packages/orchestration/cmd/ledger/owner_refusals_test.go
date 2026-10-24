@@ -244,26 +244,10 @@ func TestRefuseOwnerCommandReadsTheRevisionAsAnInteger(t *testing.T) {
 // owner is the exact node id, the stored item and its item.enqueued event say so, and the exit codes
 // are 0 for an enqueue or a repeat, 1 for an item another owner holds, and 2 for usage errors.
 func TestOwnerCommandsRoundTrip(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
+	call := ledgerCommand(t)
 	invoke := func(args ...string) string {
 		t.Helper()
-		code, out, errOut := call(args...)
-		if code != 0 {
-			t.Fatalf("%v exited %d: %s", args, code, errOut)
-		}
-		return out
+		return mustRun(t, call, args...)
 	}
 	invoke("repo", "ensure", "r", "3")
 	invoke("enqueue", "r", "item-1", "function:get_mountpoint")

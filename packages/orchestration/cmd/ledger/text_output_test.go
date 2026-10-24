@@ -2,14 +2,11 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
 // goSyntax matches what fmt prints for a Go value and JSON never contains outside a string: a struct or slice
@@ -29,19 +26,7 @@ const (
 // Each command that returns a value runs once without --json. A result with a text form prints that text; a read
 // command prints the JSON that --json prints; every other result prints that JSON indented.
 func TestTextOutputIsNeverGoSyntax(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_text_output")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
+	call := ledgerCommand(t)
 	for _, args := range [][]string{{"repo", "ensure", "r", "0"}, {"enqueue", "r", "item-1", "owner:a"}, {"enqueue", "r", "item-2", "owner:a"}} {
 		if code, _, stderr := call(append([]string{"--json"}, args...)...); code != 0 {
 			t.Fatalf("%v exited %d: %s", args, code, stderr)

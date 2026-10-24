@@ -1,35 +1,17 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
-
-	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
 // TestSupervisedLeaseCommandsCatchExpiryAndRenewalRegressions catches a zero TTL being rejected,
 // serialising an expiry that does not exist, or allowing that lease to be renewed.
 func TestSupervisedLeaseCommandsCatchExpiryAndRenewalRegressions(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_supervised_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String()
-	}
-	if code, out := call("repo", "ensure", "r", "3"); code != 0 {
-		t.Fatalf("ensure exited %d: %s", code, out)
-	}
-	code, claimJSON := call("--json", "claim", "r", "item", "supervisor:worker", "0")
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "3")
+	code, claimJSON, _ := call("--json", "claim", "r", "item", "supervisor:worker", "0")
 	if code != 0 {
 		t.Fatalf("claim supervised lease exited %d: %s", code, claimJSON)
 	}
@@ -41,7 +23,7 @@ func TestSupervisedLeaseCommandsCatchExpiryAndRenewalRegressions(t *testing.T) {
 		t.Fatalf("supervised claim JSON has expires_at: %s", claimJSON)
 	}
 
-	if code, out := call("--json", "renew", "r", "item", "supervisor:worker", "1", "1m"); code != 1 || !strings.Contains(out, `"reason":"supervised_lease"`) {
+	if code, out, _ := call("--json", "renew", "r", "item", "supervisor:worker", "1", "1m"); code != 1 || !strings.Contains(out, `"reason":"supervised_lease"`) {
 		t.Fatalf("renew supervised lease exited %d with %s, want supervised_lease refusal", code, out)
 	}
 }
@@ -49,28 +31,12 @@ func TestSupervisedLeaseCommandsCatchExpiryAndRenewalRegressions(t *testing.T) {
 // TestExpireCommandPrintsAnEmptyListWhenNothingExpires catches a sweep that frees nothing printing null instead of a
 // list. A supervised lease never expires, so a sweep beside one frees nothing, and its output is still a list.
 func TestExpireCommandPrintsAnEmptyListWhenNothingExpires(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_expire_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
-	if code, _, stderr := call("repo", "ensure", "r", "3"); code != 0 {
-		t.Fatalf("ensure exited %d: %s", code, stderr)
-	}
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "3")
 	if code, stdout, stderr := call("--json", "expire", "r"); code != 0 || stdout != "[]\n" {
 		t.Fatalf("expire with no lease: code=%d stdout=%q stderr=%q, want []", code, stdout, stderr)
 	}
-	if code, _, stderr := call("claim", "r", "item", "supervisor:worker", "0"); code != 0 {
-		t.Fatalf("supervised claim exited %d: %s", code, stderr)
-	}
+	mustExit(t, call, 0, "claim", "r", "item", "supervisor:worker", "0")
 	if code, stdout, stderr := call("--json", "expire", "r"); code != 0 || stdout != "[]\n" {
 		t.Fatalf("expire beside a supervised lease: code=%d stdout=%q stderr=%q, want []", code, stdout, stderr)
 	}
@@ -81,22 +47,8 @@ func TestExpireCommandPrintsAnEmptyListWhenNothingExpires(t *testing.T) {
 // leases existed, and it is still refused, so a script that computes a ttl of zero gets an error, not a lease that
 // only a supervisor can free.
 func TestClaimCommandTakesOnlyTheLiteralZeroAsSupervised(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_zero_ttl_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
-	if code, _, stderr := call("repo", "ensure", "r", "3"); code != 0 {
-		t.Fatalf("ensure exited %d: %s", code, stderr)
-	}
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "3")
 	for _, ttl := range []string{"0s", "0m", "-0s", "0.0s", "0h0m0s"} {
 		code, stdout, stderr := call("--json", "claim", "r", "item-"+ttl, "holder", ttl)
 		if code != 2 || !strings.Contains(stderr, "0 for a supervised lease") {
@@ -115,20 +67,10 @@ func TestClaimCommandTakesOnlyTheLiteralZeroAsSupervised(t *testing.T) {
 // end. Without --json, a supervised lease says that it is supervised and prints no end, and a fixed-end lease, claimed
 // or renewed, prints its end.
 func TestLeaseCommandsTextNamesASupervisedLease(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_lease_text")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
+	call := ledgerCommand(t)
 	invoke := func(args ...string) string {
 		t.Helper()
-		var out, err bytes.Buffer
-		if code := run(context.Background(), args, getenv, &out, &err); code != 0 {
-			t.Fatalf("%v exited %d: %s", args, code, err.String())
-		}
-		return out.String()
+		return mustRun(t, call, args...)
 	}
 	invoke("repo", "ensure", "r", "3")
 	if got := invoke("claim", "r", "item", "supervisor:worker", "0"); got != "item holder=supervisor:worker generation=1 supervised\n" {

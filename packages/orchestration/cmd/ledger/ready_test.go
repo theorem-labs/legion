@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -10,8 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
 type readyListRecord struct {
@@ -34,26 +30,10 @@ type readyListRecord struct {
 }
 
 func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_ready_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
+	call := ledgerCommand(t)
 	invoke := func(args ...string) string {
 		t.Helper()
-		code, out, stderr := call(args...)
-		if code != 0 {
-			t.Fatalf("%v exited %d: %s", args, code, stderr)
-		}
-		return out
+		return mustRun(t, call, args...)
 	}
 
 	invoke("repo", "ensure", "r", "0")
@@ -107,20 +87,10 @@ func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
 // prints {} for changed_contracts and [] for reviews and approved_pinned in ready, ready-list and its migration.ready
 // event, and a landing with no review prints [] for reviews in its migration.landed event.
 func TestReadyRecordsPrintEmptyCollectionsInBothForms(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_ready_shapes")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
+	call := ledgerCommand(t)
 	invoke := func(args ...string) string {
 		t.Helper()
-		var out, err bytes.Buffer
-		if code := run(context.Background(), args, getenv, &out, &err); code != 0 {
-			t.Fatalf("%v exited %d: %s", args, code, err.String())
-		}
-		return out.String()
+		return mustRun(t, call, args...)
 	}
 	empty := func(what, output string, fields map[string]json.RawMessage) {
 		t.Helper()
@@ -196,33 +166,18 @@ func TestReadyRecordsPrintEmptyCollectionsInBothForms(t *testing.T) {
 // land: a second = in a changed contract, and an @ in a review's contract name. A name with @ in a changed contract or
 // an approved pinned contract splits one way, so ready takes it, as check and land do.
 func TestReadyFlagsRejectAmbiguousDelimiters(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_ready_delimiters")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		return run(context.Background(), args, getenv, &out, &err), err.String()
-	}
-	if code, stderr := call("repo", "ensure", "r", "0"); code != 0 {
-		t.Fatalf("ensure: code=%d stderr=%q", code, stderr)
-	}
-	if code, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean"); code != 0 {
-		t.Fatalf("open: code=%d stderr=%q", code, stderr)
-	}
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
 	for _, args := range [][]string{
 		{"ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C=name=hash"},
 		{"ready", "r", "M-1", "1", "--head", "head", "--review", "C@name=alice@head"},
 	} {
-		if code, stderr := call(args...); code != 2 || !strings.Contains(stderr, "request-file") {
+		if code, _, stderr := call(args...); code != 2 || !strings.Contains(stderr, "request-file") {
 			t.Fatalf("%v: code=%d stderr=%q; want delimiter usage refusal", args, code, stderr)
 		}
 	}
-	if code, stderr := call("ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C@name=hash",
+	if code, _, stderr := call("ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C@name=hash",
 		"--approved-pinned", "C@name"); code != 0 {
 		t.Fatalf("names with @: code=%d stderr=%q; want them taken as check and land take them", code, stderr)
 	}
