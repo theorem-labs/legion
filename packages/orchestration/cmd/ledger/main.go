@@ -515,13 +515,18 @@ func duration(value string) (time.Duration, error) {
 	return d, nil
 }
 
-// leaseLength is a claim's lease length: 0 is a supervised lease with no end, anything else a
-// duration.
+// leaseLength is a claim's lease length: the literal 0 is a supervised lease with no end, anything else a positive
+// duration. A duration that is zero, such as 0s, is refused rather than read as supervised, so a computed length that
+// comes out zero is an error and not a lease that only a supervisor can free.
 func leaseLength(value string) (time.Duration, error) {
 	if value == "0" {
 		return 0, nil
 	}
-	return duration(value)
+	d, err := duration(value)
+	if err == nil && d == 0 {
+		return 0, usagef("lease length %q is zero; give 0 for a supervised lease, or a positive duration", value)
+	}
+	return d, err
 }
 
 // roundLimit parses a repository's landing-round limit into the range of the schema's integer column.

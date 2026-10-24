@@ -75,3 +75,38 @@ func TestExpireCommandPrintsAnEmptyListWhenNothingExpires(t *testing.T) {
 		t.Fatalf("expire beside a supervised lease: code=%d stdout=%q stderr=%q, want []", code, stdout, stderr)
 	}
 }
+
+// TestClaimCommandTakesOnlyTheLiteralZeroAsSupervised catches a duration that is zero, such as 0s, granting a lease
+// that never ends. Only the literal 0 asks for a supervised lease; a zero duration was refused before supervised
+// leases existed, and it is still refused, so a script that computes a ttl of zero gets an error, not a lease that
+// only a supervisor can free.
+func TestClaimCommandTakesOnlyTheLiteralZeroAsSupervised(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_zero_ttl_command")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	call := func(args ...string) (int, string, string) {
+		t.Helper()
+		var out, err bytes.Buffer
+		code := run(context.Background(), args, getenv, &out, &err)
+		return code, out.String(), err.String()
+	}
+	if code, _, stderr := call("repo", "ensure", "r", "3"); code != 0 {
+		t.Fatalf("ensure exited %d: %s", code, stderr)
+	}
+	for _, ttl := range []string{"0s", "0m", "-0s", "0.0s", "0h0m0s"} {
+		code, stdout, stderr := call("--json", "claim", "r", "item-"+ttl, "holder", ttl)
+		if code != 2 || !strings.Contains(stderr, "0 for a supervised lease") {
+			t.Fatalf("claim with ttl %q: code=%d stdout=%q stderr=%q, want exit 2 naming the supervised spelling", ttl, code, stdout, stderr)
+		}
+		if code, stdout, _ := call("--json", "item", "r", "item-"+ttl); code != 3 {
+			t.Fatalf("claim with ttl %q created item: code=%d stdout=%q", ttl, code, stdout)
+		}
+	}
+	if code, stdout, stderr := call("--json", "claim", "r", "item-0", "holder", "0"); code != 0 || strings.Contains(stdout, "expires_at") {
+		t.Fatalf("claim with ttl 0: code=%d stdout=%q stderr=%q, want a supervised lease", code, stdout, stderr)
+	}
+}
