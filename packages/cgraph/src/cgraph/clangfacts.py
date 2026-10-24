@@ -1144,9 +1144,12 @@ class _Extractor:
         dead: frozenset[int] = frozenset()
         decided: frozenset[int] = frozenset()
         overwritten: frozenset[int] = frozenset()
+        uncompiled: frozenset[int] = frozenset()
         settled = False
         for _ in range(_ANALYSIS_ROUNDS):
-            walk = _FunctionWalk(self, definition, labels, dead, decided, overwritten, returns_discarded)
+            walk = _FunctionWalk(
+                self, definition, labels, dead, decided, overwritten, uncompiled, returns_discarded=returns_discarded
+            )
             walk.walk(definition, None, 0, None)
             walk.finish()
             if not settled:
@@ -1157,11 +1160,14 @@ class _Extractor:
                     continue
             never_read, image_read = walk.never_read(), walk.read_only_where_the_image_decides()
             stored_again = walk.overwritten_stores()
-            if never_read <= dead and image_read <= decided and stored_again <= overwritten:
+            # Only a subtraction of two locals asks which stores are compiled (``same_value``).
+            not_code = frozenset(walk.uncompiled_stores) if walk.subtractions else frozenset()
+            if never_read <= dead and image_read <= decided and stored_again <= overwritten and not_code <= uncompiled:
                 break
             dead |= never_read
             decided |= image_read - dead
             overwritten |= stored_again
+            uncompiled |= not_code
         self.analyzing.discard(name)
         # A walk that met the depth bound is kept for as deep a horizon as it saw, so a function's
         # own facts (asked at nesting 0) come from a walk that saw its callees whole.
@@ -1448,6 +1454,25 @@ _ASSIGN = 22
 _ZEROING = (3, 17)
 # CXBinaryOperatorKind EQ and NE.
 _EQUALITY = (15, 16)
+# CXBinaryOperatorKind Shl.
+_SHIFT_LEFT = 8
+
+
+def _shifted_out(node: ci.Cursor) -> bool:
+    """``(x << a) << b`` whose constant counts add up to at least the bits of its type: every bit of
+    ``x`` is shifted out (fs/read_write.c pos_from_hilo's ``((loff_t)high << 32) << 32`` on rv64)."""
+    if node.kind != K.BINARY_OPERATOR or libclang.binary_kind(node) != _SHIFT_LEFT:
+        return False
+    width: int = node.type.get_canonical().get_size() * 8
+    total = 0
+    while node.kind == K.BINARY_OPERATOR and libclang.binary_kind(node) == _SHIFT_LEFT:
+        operands = _children(node)
+        count = libclang.constant_int(operands[1]) if len(operands) == 2 else None
+        if count is None or count < 0:
+            return False
+        total += count
+        node = _strip(operands[0])
+    return width > 0 and total >= width
 
 
 def _is_plain_assignment(node: ci.Cursor) -> bool:
@@ -2577,6 +2602,7 @@ class _FunctionWalk:
         dead_variables: frozenset[int] = frozenset(),
         decided_variables: frozenset[int] = frozenset(),
         overwritten: frozenset[int] = frozenset(),
+        uncompiled: frozenset[int] = frozenset(),
         returns_discarded: bool = False,
     ) -> None:
         self.x = extractor
@@ -2610,6 +2636,12 @@ class _FunctionWalk:
         self.store_sites: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
         self.address_taken: set[int] = set()
         self.overwritten = overwritten
+        # The stores the previous walk met in code that is not compiled (after an exit, in a dead
+        # branch), and those this walk meets there.
+        self.uncompiled = uncompiled
+        self.uncompiled_stores: set[int] = set()
+        self.subtractions = False  # a subtraction of two locals or parameters is code
+        self.local_stores: dict[int, list[ci.Cursor]] | None = None
         self.same_outcomes: set[int] = set()  # the ifs whose two outcomes give the same, without effect
         # What compiled code does besides computing values: effects (a call of a function that has
         # one, an asm the compiler keeps, a volatile access, a store outside the function's locals, a
@@ -2639,6 +2671,8 @@ class _FunctionWalk:
         self.uses: dict[str, collections.Counter[int]] | None = None
         # Each local's and parameter's plain assignments: the value and where the assignment is.
         self.definitions: dict[int, list[tuple[ci.Cursor, _Place | None]]] = collections.defaultdict(list)
+        # Each local's ``for`` loops whose step part steps it by a constant, by the loop's hash.
+        self.step_loops: dict[int, dict[int, ci.Cursor]] = collections.defaultdict(dict)
         self.parents: dict[int, ci.Cursor] = {}
         self.label_holders: set[int] = set()  # the nodes that hold a label or a case
         self.loops: list[_Place] = []
@@ -3366,9 +3400,16 @@ class _FunctionWalk:
         takes its address. When a parameter's own value and the values a walk assigns it disagree
         and those values are all one container_of (an rb_entry walk), the parameter stays the base
         and the machine code may keep the member's address instead. The members of the definitions
-        are folded away when every other use of the local is the base of a member access."""
+        are folded away when every other use of the local is the base of a member access. A local a
+        ``for`` header's step only steps by a constant (for_each_managed_zone_pgdat's ``zone =
+        pgdat->node_zones; ...; zone++``) points, inside that loop, where its definitions point on the
+        first pass; the register the loop steps holds it after that."""
         uses = self.local_uses()
-        if uses["written"][variable.hash]:
+        stepped = uses["stepped"][variable.hash]
+        if uses["written"][variable.hash] > stepped:
+            return None
+        loops = list(self.step_loops.get(variable.hash, {}).values())
+        if stepped and (len(loops) != 1 or not self.within(use, loops[0])):
             return None
         definitions, entry = self.reaching(variable, use)
         key = (variable.hash, tuple(sorted(definition.hash for definition in definitions)), entry)
@@ -3385,6 +3426,8 @@ class _FunctionWalk:
                 address = replace(own, inner=walked.bits)
         if address is None or address.base == "unknown":
             return None
+        if stepped:
+            address = replace(address, inner=0)
         if uses["references"][variable.hash] - uses["assigned"][variable.hash] == uses["bases"][variable.hash]:
             self.inner.update(member.hash for member in members)
         self.derived_cache[key] = address
@@ -3557,15 +3600,40 @@ class _FunctionWalk:
             current = self.parents.get(current.hash)
         return False
 
+    def stepping_loop(self, node: ci.Cursor) -> ci.Cursor | None:
+        """The ``for`` loop whose step part ``node`` is, or one operand of a comma there
+        (``(idx)++, (zone)++``), where it is ``v++``, ``v--`` or ``v op= c`` by a constant."""
+        operands = _children(node)
+        if node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR and (
+            len(operands) != 2 or libclang.constant_int(operands[1]) is None
+        ):
+            return None
+        child, parent = node, self.parents.get(node.hash)
+        while parent is not None and (
+            parent.kind in (K.PAREN_EXPR, K.UNEXPOSED_EXPR)
+            or (parent.kind == K.BINARY_OPERATOR and libclang.binary_kind(parent) == _COMMA)
+        ):
+            child, parent = parent, self.parents.get(parent.hash)
+        if parent is None or parent.kind != K.FOR_STMT:
+            return None
+        header = _children(parent)[:-1]
+        roles = self.header_roles(header)
+        if roles is None:
+            return None
+        role = next((name for part, name in zip(header, roles, strict=True) if part.hash == child.hash), None)
+        return parent if role == "step" else None
+
     def local_uses(self) -> dict[str, collections.Counter[int]]:
         """Per local or parameter, by its cursor's hash: references, plain assignments to it (each kept
         with where it is), writes the derivation cannot follow (``+=``, ``++``, ``&local`` unless an
-        inline callee never reads it), and uses as a member access's base; also each node's parent,
-        the nodes that hold a label or a case, the function's loops, and whether it jumps back."""
+        inline callee never reads it), among those the constant steps of a ``for`` header's step part
+        (``stepped``, each with its loop: for_each_managed_zone_pgdat's ``zone++``), and uses as a
+        member access's base; also each node's parent, the nodes that hold a label or a case, the
+        function's loops, and whether it jumps back."""
         if self.uses is not None:
             return self.uses
         uses: dict[str, collections.Counter[int]] = {
-            name: collections.Counter() for name in ("references", "assigned", "written", "bases")
+            name: collections.Counter() for name in ("references", "assigned", "written", "stepped", "bases")
         }
 
         def local(node: ci.Cursor | None) -> int | None:
@@ -3610,6 +3678,10 @@ class _FunctionWalk:
                 self.definitions[target].append((operands[1], _place(node)))
             elif kind == K.COMPOUND_ASSIGNMENT_OPERATOR or (kind == K.UNARY_OPERATOR and libclang.is_increment(node)):
                 uses["written"][target] += 1
+                loop = self.stepping_loop(node)
+                if loop is not None:
+                    uses["stepped"][target] += 1
+                    self.step_loops[target][loop.hash] = loop
             elif kind == K.UNARY_OPERATOR and libclang.is_address_of(node):
                 if not self.ignored_address(node):
                     uses["written"][target] += 1
@@ -3636,6 +3708,70 @@ class _FunctionWalk:
             and not self.stored_into(node)
         ]
         return bool(uses) and all(self.cancelled(node, bits, depth + 1) for node in uses)
+
+    def same_value(self, left: ci.Cursor, right: ci.Cursor) -> bool:
+        """Two locals or parameters that hold one value: the same one, or one whose every store in
+        compiled code copies the other, whose own value no compiled store changes (page_cache_ra_order's
+        ``index = start``, whose other stores are behind ``goto fallback``). Neither's address is taken."""
+        names = [_bare(left), _bare(right)]
+        variables = [
+            node.referenced
+            for node in names
+            if node.kind == K.DECL_REF_EXPR and node.referenced is not None and _is_local(node.referenced)
+        ]
+        if len(variables) != 2:
+            return False
+        self.subtractions = True
+        first, second = variables
+        if first.hash == second.hash:
+            return True
+        return self.copies(first, second) or self.copies(second, first)
+
+    def copies(self, copy: ci.Cursor, source: ci.Cursor) -> bool:
+        """Every store to ``copy`` in compiled code is ``copy = source`` (also as its initializer), at
+        least one is, and no store to ``source`` is compiled; nothing takes either's address."""
+        stores = self.stores_to()
+        if any(self.address_of(variable) for variable in (copy, source)):
+            return False
+        if any(store.hash not in self.uncompiled for store in stores.get(source.hash, [])):
+            return False
+        compiled = [store for store in stores.get(copy.hash, []) if store.hash not in self.uncompiled]
+        if not all(_is_plain_assignment(store) for store in compiled):
+            return False
+        values = [_children(store)[1] for store in compiled]
+        initializer = libclang.var_initializer(copy) if copy.kind == K.VAR_DECL else None
+        if initializer is not None:
+            values.append(initializer)
+        return bool(values) and all(
+            _bare(value).kind == K.DECL_REF_EXPR
+            and _bare(value).referenced is not None
+            and _bare(value).referenced.hash == source.hash
+            for value in values
+        )
+
+    def stores_to(self) -> dict[int, list[ci.Cursor]]:
+        """The stores (``=``, ``op=``, ``++``) to each local or parameter of the function, by its hash."""
+        if self.local_stores is None:
+            found: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
+            for node in self.cursor.walk_preorder():
+                target = _store_target(node)
+                bare = _bare(target) if target is not None else None
+                if bare is not None and bare.kind == K.DECL_REF_EXPR and bare.referenced is not None:
+                    found[bare.referenced.hash].append(node)
+            self.local_stores = found
+        return self.local_stores
+
+    def address_of(self, variable: ci.Cursor) -> bool:
+        """The function takes the variable's address (``&v``)."""
+        return any(
+            node.kind == K.UNARY_OPERATOR
+            and libclang.is_address_of(node)
+            and _children(node)
+            and _bare(_children(node)[0]).kind == K.DECL_REF_EXPR
+            and _bare(_children(node)[0]).referenced is not None
+            and _bare(_children(node)[0]).referenced.hash == variable.hash
+            for node in self.cursor.walk_preorder()
+        )
 
     def stored_into(self, reference: ci.Cursor) -> bool:
         """``reference`` is what a plain assignment stores into."""
@@ -4283,14 +4419,20 @@ class _FunctionWalk:
         if (
             reason is None
             and parent is not None
-            and parent.kind not in _STATEMENT_PARENTS
-            and kind.is_expression()
+            and parent.kind != K.COMPOUND_STMT
             and node.hash not in self.statement_values
             and _statement_position(parent, index)
+            and (
+                kind.is_expression()
+                or self.x.branches_without_effect(node, self.dead_variables)
+                or (kind in _LOOPS and self.x.loop_without_effect(node, self.cursor, self.dead_variables))
+            )
         ):
-            # An expression statement that is a loop's body or an if's branch (scoped_guard(mutex,
-            # &lock) val = ...): its value is discarded, so only its effects are code. A block's
-            # statements are discarded where the block is walked.
+            # An expression statement, or a statement without effect (an if whose branches have no
+            # effect, a loop without effect), that is a loop's body, an if's branch or the statement
+            # of a label or a case (scoped_guard(mutex, &lock) val = ...; sched_balance_rq's next: if
+            # (p->sched_task_hot) schedstat_inc(...)): only its effects are code. A block's statements
+            # are discarded where the block is walked.
             self.statement_values.add(node.hash)
             self.discard(node, parent, index, generic)
             return
@@ -4332,6 +4474,8 @@ class _FunctionWalk:
                 self.read_sites[node.referenced.hash].append(node)
                 self.read_guards[node.referenced.hash].append(None if self.conditional else tuple(self.guard_stack))
         stored = _store_target(node)
+        if stored is not None and reason is not None:
+            self.uncompiled_stores.add(node.hash)
         if stored is not None and _strip_parens(stored).kind == K.DECL_REF_EXPR:
             # v = e stores into v without reading it. v op= e and v++ read v only to store into it,
             # unless their own value is used (pcpu_dump_alloc_info's while (v /= 10)).
@@ -4490,6 +4634,17 @@ class _FunctionWalk:
                     return
         if kind == K.BINARY_OPERATOR and len(children) == 2 and reason is None:
             operator = libclang.binary_kind(node)
+            if _shifted_out(node):
+                # pos_from_hilo's (high << 32) << 32: the value is 0, so the shifted operand is not read.
+                self.discard(children[0], node, 0, generic)
+                self.walk(children[1], node, 1, reason, generic)
+                return
+            if operator == libclang.SUBTRACT and self.same_value(children[0], children[1]):
+                # page_cache_ra_order's index - start, where index = start and nothing compiled
+                # writes either otherwise: 0, so neither is read.
+                self.discard(children[0], node, 0, generic)
+                self.discard(children[1], node, 1, generic)
+                return
             if operator in _ZEROING:
                 zero = next((i for i in (1, 0) if libclang.constant_int(children[i]) == 0), None)
                 if zero is not None:

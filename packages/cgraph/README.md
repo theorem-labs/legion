@@ -32,11 +32,16 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   decides nothing, because another unit may replace it),
   the cases a `switch` on a value clang folds does not reach (`switch (sizeof(x))`,
   `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or `||`, an operand of `&` or `*`
-  whose other operand is 0 (`IS_DAX(inode)` without `CONFIG_FS_DAX`), the left operand of an `&&`
+  whose other operand is 0 (`IS_DAX(inode)` without `CONFIG_FS_DAX`), the operand of left shifts by
+  constants that add up to its width (`pos_from_hilo`'s `((loff_t)high << 32) << 32` on rv64), both
+  operands of `a - b` where `a` and `b` hold one value (a local whose every compiled store copies the
+  other, which no compiled store changes: `page_cache_ra_order`'s `index = start` before `goto
+  fallback`), the left operand of an `&&`
   whose right one is 0 or of an `||` whose right one is 1, where the right one has no effect
   (`!pgdat || !numa_demotion_enabled` without NUMA; in `mm != &init_mm && !ptlock_init(ptdesc)` the
   left operand decides whether the lock is initialized), discarded values (`(void)x`, `(x, 0)`, an
-  expression statement such as `get_user_ns(ns);`, also as an `if`'s branch or a loop's body, an
+  expression statement such as `get_user_ns(ns);`, also as an `if`'s branch, a loop's body or a
+  label's or a case's statement, which holds for the statements without effect below too, an
   `if` whose branches have no effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)`
   without `CONFIG_PM`, an `if (c) return v;` whose return and the rest of its block give the same
   without an effect (`rcutree_online_cpu`'s `return 0` before `tick_dep_clear(); return 0;`), a loop
@@ -183,7 +188,10 @@ These rules follow what the machine code shows, each only where it shows it:
 - A local's or parameter's address is derived from the values that reach each use: the assignments
   before it (or after it, around a loop or a backward goto), less those an assignment on every path
   overwrites (also a `for` header's: the condition's `(p = next_task(p)) != &init_task` in the body,
-  the init in the whole loop), without null pointers (`for (; se; se = NULL)`, a helper that returns
+  the init in the whole loop; a local the header's step only steps by a constant, as
+  `for_each_managed_zone_pgdat`'s `zone++`, is derived inside that loop as its first pass, with the
+  stepped register as `inner_displacement`), without null pointers (`for (; se; se = NULL)`, a
+  helper that returns
   NULL), through `?:`, `({ ... })`, `_Generic`, pointer arithmetic, an array's decay, and the return
   of any helper of the unit. A helper not declared inline, one that returns NULL or an address (a
   select the compiler keeps), and a `c ? container_of(...) : NULL` nothing tests also give

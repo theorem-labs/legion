@@ -147,3 +147,34 @@ def test_an_index_s_constant_may_stay_in_the_index_register(
     assert (item["field"], item["displacement"], item["index_displacement"]) == record
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert f"function:{function}" not in {entry["function"] for entry in offsets["misses"]}
+
+
+def test_a_pointer_a_loop_steps_points_where_its_start_does_on_the_first_pass(fold_build: dict[str, Any]) -> None:
+    """fd_zone_sum: addi a1, a2, -0x800; addi a1, a1, -0x5f8 (the list node less 3712 plus 136), ld
+    a3, 0x0(a1), then addi a1, a1, 0x4c0 (llvm-objdump)."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_zone_sum"]
+    (item,) = [item for item in accesses if item["field"] == "managed"]
+    assert (item["field"], item["base"], item["displacement"], item["inner_displacement"]) == (
+        "managed",
+        "container_of",
+        -3576,
+        136,
+    )
+
+
+def test_a_value_shifted_out_is_not_read(fold_facts: dict[str, Any], fold_build: dict[str, Any]) -> None:
+    """fd_position: ld a0, 0x0(a0); ret (llvm-objdump): a4 is never loaded."""
+    own = {item["field"] for item in fold_facts["functions"]["fd_position"]["events"]["field_accesses"]}
+    assert own == {"a3"}
+    assert folded_fields(fold_build, "fd_position") == {"a3"}
+
+
+def test_an_if_without_effect_under_a_label_is_not_code(fold_build: dict[str, Any]) -> None:
+    """fd_label: beqz a1, +4; ret; sd zero, 0x8(a0); ret (llvm-objdump): hot is never read."""
+    assert folded_fields(fold_build, "fd_label") == {"n"}
+
+
+def test_a_variable_less_its_copy_is_not_read(fold_build: dict[str, Any]) -> None:
+    """fd_copy: mv a0, a1; ret (llvm-objdump): index - start is 0, and index's other stores are not
+    compiled."""
+    assert folded_fields(fold_build, "fd_copy") == set()

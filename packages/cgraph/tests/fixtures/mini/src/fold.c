@@ -279,3 +279,95 @@ void fd_index_folded(struct fd_table *t, int k, long v)
 {
 	t->act[k - 1].h = v;
 }
+
+/* mm/vmscan.c lruvec_lru_size: for_each_managed_zone_pgdat(zone, lruvec_pgdat(lruvec), ...) starts
+ * zone at pgdat->node_zones, pgdat a container_of of the lruvec, and steps it: on the first pass the
+ * code reaches managed at the list node less 3712 plus 136, then adds a zone's size. */
+struct fd_zone {
+	long pad[17];
+	long managed;
+	long rest[134];
+};
+struct fd_node {
+	struct fd_zone zones[3];
+	long pad[8];
+	struct list_node vec;
+};
+
+static inline long fd_managed(const struct fd_zone *z)
+{
+	return z->managed;
+}
+
+long fd_zone_sum(struct list_node *vec, int high)
+{
+	struct fd_node *node = container_of(vec, struct fd_node, vec);
+	struct fd_zone *zone;
+	long sum = 0;
+	int i;
+
+	for (i = 0, zone = node->zones; i <= high; i++, zone++)
+		sum += fd_managed(zone);
+	return sum;
+}
+
+/* fs/read_write.c pos_from_hilo(high, low): (((loff_t)high << HALF_LONG_BITS) << HALF_LONG_BITS) |
+ * low on rv64, where high is shifted out: __riscv_sys_preadv never loads pos_h. */
+struct fd_regs {
+	unsigned long a3;
+	unsigned long a4;
+};
+
+static inline unsigned long long fd_hilo(unsigned long high, unsigned long low)
+{
+	return (((unsigned long long)high << 32) << 32) | low;
+}
+
+unsigned long long fd_position(const struct fd_regs *r)
+{
+	return fd_hilo(r->a4, r->a3);
+}
+
+/* kernel/sched/fair.c detach_tasks without SCHEDSTATS: next: if (p->sched_task_hot)
+ * schedstat_inc(...), an if under a label whose branch is empty: only its condition's effects are
+ * code, and it has none (llvm-objdump: beqz a1, +4; ret; sd zero, 0x8(a0); ret). */
+struct fd_task_hot {
+	unsigned int hot : 1;
+	long n;
+};
+
+void fd_label(struct fd_task_hot *p, int k)
+{
+	if (k)
+		goto next;
+	p->n = 0;
+next:
+	if (p->hot)
+		do { } while (0);
+}
+
+/* mm/readahead.c page_cache_ra_order without THP: start = readahead_index(ractl); index = start;
+ * then goto fallback before index changes, and ra->size - (index - start): index - start is 0, so
+ * neither is read (llvm-objdump: mv a0, a1; ret). */
+struct fd_ra {
+	unsigned long idx;
+	unsigned long size;
+};
+
+static inline int fd_large(void)
+{
+	return 0;
+}
+
+unsigned long fd_copy(struct fd_ra *r, unsigned long n)
+{
+	unsigned long start = r->idx;
+	unsigned long index = start;
+
+	if (!fd_large())
+		goto fallback;
+	index = r->size;
+	index += 2;
+fallback:
+	return n - (index - start);
+}
