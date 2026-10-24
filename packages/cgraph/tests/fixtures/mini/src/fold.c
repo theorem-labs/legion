@@ -53,6 +53,7 @@ int fd_check_all(struct fd_limits *l)
 			goto out;
 	return 0;
 out:
+	obj_free(l);
 	return -1;
 }
 
@@ -149,4 +150,107 @@ static inline void fd_wait_start(struct fd_dl_rq *dl_rq, struct fd_dl_entity *se
 void fd_unused_entity(struct fd_dl_entity *se)
 {
 	fd_wait_start(fd_dl_rq_of_se(se), se);
+}
+
+/* fs/namespace.c may_use_mount: is_mounted(&mnt->mnt), where is_mounted takes the mount back with
+ * real_mount's container_of, so the machine code never forms &mnt->mnt. */
+static inline struct fd_out *fd_real(struct fd_in *p)
+{
+	return container_of(p, struct fd_out, m);
+}
+
+static inline int fd_mounted(struct fd_in *p)
+{
+	return fd_real(p)->ns != 0;
+}
+
+int fd_through_helper(struct fd_out *o)
+{
+	return fd_mounted(&o->m);
+}
+
+/* mark_mounts_for_expiry: the mount is itself a container_of of a list node. */
+int fd_from_list(struct list_node *n)
+{
+	struct fd_out *o = container_of(n, struct fd_out, link);
+
+	return fd_mounted(&o->m);
+}
+
+/* kernel/sched/fair.c update_curr_fair: update_curr(cfs_rq_of(&rq->donor->se)), where cfs_rq_of's
+ * p = task_of(se) takes the task back and reads its cpu. */
+struct fd_task {
+	long pad[3];
+	int cpu;
+	struct fd_in se;
+};
+struct fd_cpu_rq {
+	long pad;
+	struct fd_task *donor;
+};
+
+static inline int fd_cpu_of(struct fd_in *se)
+{
+	const struct fd_task *p = container_of(se, struct fd_task, se);
+
+	return p->cpu;
+}
+
+int fd_donor_cpu(struct fd_cpu_rq *rq)
+{
+	return fd_cpu_of(&rq->donor->se);
+}
+
+/* A helper that reads through the member's address: the machine code forms it, or adds to it. */
+static inline long fd_first(struct fd_in *p)
+{
+	return p->a[0];
+}
+
+long fd_member_read(struct fd_out *o)
+{
+	return fd_first(&o->m);
+}
+
+/* kernel/sched/deadline.c start_dl_timer: dl_rq = dl_rq_of_se(dl_se); rq = rq_of_dl_rq(dl_rq), a
+ * container_of that takes back the member dl_rq_of_se's &rq->dl gives. */
+struct fd_ent {
+	long x;
+	struct fd_out *owner;
+};
+
+static inline struct fd_in *fd_in_of(struct fd_ent *e)
+{
+	return &e->owner->m;
+}
+
+long *fd_returned(struct fd_ent *e)
+{
+	struct fd_in *in = fd_in_of(e);
+	struct fd_out *o = fd_real(in);
+
+	return o->ns;
+}
+
+/* The same member address read through: the machine code adds to it. */
+long fd_returned_read(struct fd_ent *e)
+{
+	return fd_in_of(e)->a[1];
+}
+
+/* A container_of of another member does not take the address back: &t->b stays (ld 0x28 is inside
+ * it, at b.a[1]). */
+struct fd_two {
+	struct fd_in a;
+	struct fd_in b;
+};
+
+static inline long fd_two_read(struct fd_in *p)
+{
+	return container_of(p, struct fd_two, a)->a.a[1];
+}
+
+long fd_not_taken_back(struct fd_two *t)
+{
+	return fd_two_read(&t->b);
 }

@@ -340,6 +340,28 @@ def _container(node: ci.Cursor) -> tuple[ci.Cursor, int] | None:
     return None
 
 
+def _member_bits(node: ci.Cursor) -> int | None:
+    """The bits a member address ``&p->a.b`` adds to the pointer ``p`` it is reached through: the
+    offsets of its members up to the first ``->``, or None for another expression."""
+    node, bits = _strip(node), 0
+    while node.kind == K.MEMBER_REF_EXPR and node.referenced is not None and node.referenced.kind == K.FIELD_DECL:
+        children = _children(node)
+        if not children:
+            return None
+        base = _unnamed_base(children[0])
+        typ = base.type.get_canonical()
+        through = typ.kind == TK.POINTER
+        record = typ.get_pointee().get_canonical() if through else typ
+        offset = record.get_offset(node.referenced.spelling) if record.kind == TK.RECORD else -1
+        if offset < 0:
+            return None
+        bits += offset
+        if through:
+            return bits
+        node = _strip(base)
+    return None
+
+
 def _static_address(node: ci.Cursor) -> tuple[ci.Cursor, int] | None:
     """The global and the bits into it a file-scope initializer's address constant names: ``&g``,
     ``&g.a.b``, ``&g.a[2]``, or a global array that decays to its address."""
@@ -440,6 +462,8 @@ class _Extractor:
         )  # fmt: skip
         self.ignored_cache: dict[str, tuple[frozenset[int], int | None]] = {}
         self.returned: dict[str, _Address | None] = {}
+        self.returned_bits: dict[str, int | None] = {}
+        self.cancel_cache: dict[tuple[str, int, int], bool] = {}
         self.null_helpers: set[str] = set()  # the helpers whose every return is a null pointer
         self.nullable_helpers: set[str] = set()  # the helpers that return a null pointer or an address
         self.texts: dict[Path, bytes] = {}
@@ -561,6 +585,45 @@ class _Extractor:
             return False
         self.returned_address(node.referenced.spelling)
         return node.referenced.spelling in self.null_helpers
+
+    def returned_member(self, name: str) -> int | None:
+        """The bits a helper's returned member address adds to the pointer it is reached through,
+        where every return of the helper is such an address of the same bits (dl_rq_of_se's ``return
+        &rq_of_dl_se(dl_se)->dl;``), else None."""
+        if name in self.returned_bits:
+            return self.returned_bits[name]
+        self.returned_bits[name] = None
+        definition = self.evaluator.definitions.get(name)
+        if definition is None or self.is_weak(definition):
+            return None
+        found: set[int | None] = set()
+        for node in definition.walk_preorder():
+            if node.kind == K.RETURN_STMT:
+                values = _children(node)
+                address = _strip(values[0]) if values else None
+                if address is None or address.kind != K.UNARY_OPERATOR or not libclang.is_address_of(address):
+                    return None
+                found.add(_member_bits(_children(address)[0]) if _children(address) else None)
+        bits = found.pop() if len(found) == 1 else None
+        self.returned_bits[name] = bits
+        return bits
+
+    def cancels(self, name: str, position: int, bits: int) -> bool:
+        """Every use of a helper's parameter takes ``bits`` back off it with container_of (fs/mount.h
+        is_mounted's real_mount(mnt), kernel/sched/sched.h cfs_rq_of's p = task_of(se)): where the
+        compiler inlines the helper, a member address of those bits passed there is never formed."""
+        key = (name, position, bits)
+        if key in self.cancel_cache:
+            return self.cancel_cache[key]
+        # A helper that reaches itself again takes nothing back on that way.
+        self.cancel_cache[key] = False
+        definition = self.evaluator.definitions.get(name)
+        parameters = list(definition.get_arguments() or []) if definition is not None else []
+        if definition is None or self.is_weak(definition) or position >= len(parameters):
+            return False
+        result = _FunctionWalk(self, definition).variable_cancelled(parameters[position], bits)
+        self.cancel_cache[key] = result
+        return result
 
     # State units ---------------------------------------------------------------------------
 
@@ -2549,6 +2612,10 @@ class _FunctionWalk:
         # this walk discards, which have an effect: such a call of a helper is folded the same way.
         self.returns_discarded = returns_discarded
         self.unused_calls: set[int] = set()
+        # Member addresses a call's argument passes to a helper that takes them back with
+        # container_of (the member's hash, the helper), and the member addresses the function returns.
+        self.cancelled_members: dict[int, str] = {}
+        self.returned_members: set[int] = set()
         # Field addresses: each member chain's topmost member gets the chain's address; the members
         # below it (and the ones a local's definition folds away) are addressed only through it.
         self.chained: set[int] = set()
@@ -3542,6 +3609,71 @@ class _FunctionWalk:
         self.uses = uses
         return uses
 
+    def variable_cancelled(self, variable: ci.Cursor, bits: int, depth: int = 0) -> bool:
+        """Every use of a local or parameter (``_is_local``) takes ``bits`` back off its value with
+        container_of (``cancelled``); a store into it is no use. container_of's type check reads its
+        pointer only in typeof, which is not computed."""
+        if depth > 8 or not _is_local(variable):
+            return False
+        self.local_uses()
+        uses = [
+            node
+            for node in _effect_nodes(
+                self.cursor, lambda node, children: [] if node.kind == K.STATIC_ASSERT else children
+            )
+            if node.kind == K.DECL_REF_EXPR
+            and node.referenced is not None
+            and node.referenced.hash == variable.hash
+            and not self.stored_into(node)
+        ]
+        return bool(uses) and all(self.cancelled(node, bits, depth + 1) for node in uses)
+
+    def stored_into(self, reference: ci.Cursor) -> bool:
+        """``reference`` is what a plain assignment stores into."""
+        parent = self.parents.get(reference.hash)
+        operands = _children(parent) if parent is not None else []
+        return parent is not None and _is_plain_assignment(parent) and operands[0].hash == reference.hash
+
+    def cancelled(self, node: ci.Cursor, bits: int, depth: int = 0) -> bool:
+        """The value of ``node`` is used only to take ``bits`` back off it with container_of
+        (``(type *)(__mptr - offsetof(type, member))``): directly, through the locals it initializes,
+        or as an argument at a parameter a helper of the unit uses only that way (``cancels``). Then
+        the member address of those bits it holds is never formed."""
+        self.local_uses()
+        child, parent = node, self.parents.get(node.hash)
+        while parent is not None and (
+            (parent.kind in (K.PAREN_EXPR, K.UNEXPOSED_EXPR) and len(_children(parent)) == 1)
+            or (parent.kind == K.CSTYLE_CAST_EXPR and _children(parent)[-1].hash == child.hash)
+        ):
+            child, parent = parent, self.parents.get(parent.hash)
+        if parent is None:
+            return False
+        operands = _children(parent)
+        if parent.kind == K.VAR_DECL:
+            initializer = libclang.var_initializer(parent)
+            return (
+                initializer is not None
+                and initializer.hash == child.hash
+                and self.variable_cancelled(parent, bits, depth)
+            )
+        if (
+            parent.kind == K.BINARY_OPERATOR
+            and libclang.binary_kind(parent) == libclang.SUBTRACT
+            and len(operands) == 2
+            and operands[0].hash == child.hash
+            and child.type.get_canonical().kind == TK.POINTER
+        ):
+            value = libclang.constant_int(operands[1])
+            return value is not None and value * _element_bytes(child) * 8 == bits
+        if parent.kind == K.CALL_EXPR and parent.referenced is not None and parent.referenced.kind == K.FUNCTION_DECL:
+            arguments = list(parent.get_arguments() or [])
+            offset = len(operands) - len(arguments)
+            position = (
+                next((index for index, operand in enumerate(operands) if operand.hash == child.hash), -1) - offset
+            )
+            return position >= 0 and self.x.cancels(parent.referenced.spelling, position, bits)
+        return False
+
     def passed_through(self, node: ci.Cursor) -> ci.Cursor:
         """An expression past the helper calls that return their argument unchanged
         (spin_lock_irqsave's spinlock_check(lock)): spin_lock_irqsave(sst->lock_irqsave, ...) names
@@ -3809,6 +3941,14 @@ class _FunctionWalk:
                     element = canonical.get_array_element_type().get_size()
                     if element > 0:
                         access["element_size"] = element
+                if where.hash in self.cancelled_members:
+                    # An argument a helper takes back with container_of (is_mounted(&mnt->mnt)): not
+                    # formed where the image inlines that helper (link drops it there).
+                    access["cancelled_by"] = self.cancelled_members[where.hash]
+                if where.hash in self.returned_members:
+                    # The member address the function returns (dl_rq_of_se's &rq->dl): not formed
+                    # where a caller takes it back with container_of (a call's ``result_cancelled``).
+                    access["returned"] = True
             if self.conditional:
                 # Under a __builtin_constant_p choice, or an argument a callee the image may inline
                 # ignores: compiled only where the image has it.
@@ -3918,6 +4058,11 @@ class _FunctionWalk:
             # Nothing uses the call's value: a folded helper keeps only what its effects need, the
             # events of its walk with its returns discarded (the function's ``value_unused``).
             event["value_unused"] = True
+        returned = self.x.returned_member(callee)
+        if returned is not None and self.cancelled(node, returned):
+            # The caller takes the member address the helper returns back with container_of
+            # (start_dl_timer's rq_of_dl_rq(dl_rq_of_se(dl_se))): folded, it is never formed.
+            event["result_cancelled"] = True
         self.events["calls"].append(event)
         membership = self.x.vocabulary.membership.get(callee)
         if membership is not None:
@@ -4229,6 +4374,11 @@ class _FunctionWalk:
             # WARN_ON_ONCE stays).
             self.discard(children[0], node, 0, generic)
             return
+        if kind == K.RETURN_STMT and children and reason is None:
+            returned = _strip(children[0])
+            if returned.kind == K.UNARY_OPERATOR and libclang.is_address_of(returned) and _children(returned):
+                # The member address the function returns (``returned``).
+                self.returned_members.add(_strip(_children(returned)[0]).hash)
         if kind == K.STATIC_ASSERT:
             # container_of's type check, ((type *)0)->member: compiled only for its type.
             for child_index, child in enumerate(children):
@@ -4498,6 +4648,8 @@ class _FunctionWalk:
             offset = len(children) - len(arguments)
             for child_index, child in enumerate(children):
                 position = child_index - offset if child_index >= offset else None
+                if position is not None and reason is None and node.referenced is not None:
+                    self.mark_cancelled(child, node.referenced.spelling, position)
                 if position is None or not (position in ignored or (variadic and position >= named)):
                     self.walk(child, node, child_index, reason, generic)
                 elif inline:
@@ -4516,6 +4668,17 @@ class _FunctionWalk:
             return
         for child_index, child in enumerate(children):
             self.walk(child, node, child_index, reason, generic)
+
+    def mark_cancelled(self, argument: ci.Cursor, callee: str, position: int) -> None:
+        """An argument ``&p->m`` at a parameter the callee takes back with container_of
+        (``cancels``): the member's record names the callee (``cancelled_by``)."""
+        node = _strip(argument)
+        if node.kind != K.UNARY_OPERATOR or not libclang.is_address_of(node) or not _children(node):
+            return
+        member = _strip(_children(node)[0])
+        bits = _member_bits(member)
+        if bits is not None and self.x.cancels(callee, position, bits):
+            self.cancelled_members[member.hash] = callee
 
     def returned_object(self) -> str | None:
         """The struct local every return of the function returns by value (``return _t;``)."""

@@ -484,19 +484,38 @@ class Linker:
         for kind in _EVENT_LISTS:
             setattr(result, kind, _resolved(events[kind], table))
         callees = self.image_callees(caller)
-        for call in _resolved(events["calls"], table):
+        calls = _resolved(events["calls"], table)
+
+        def folds(call: dict[str, Any]) -> bool:
             callee = call["callee"]
-            if (
+            return bool(
                 call.get("visible")
                 and not call.get("generic")
                 and callee not in callees
                 and callee not in stack
                 and callee != name
-            ):
+            )
+
+        folded = {call["callee"] for call in calls if folds(call)}
+        # A member address passed to a helper that takes it back with container_of (is_mounted(&mnt->mnt))
+        # is never formed where the helper is folded.
+        result.field_accesses = [item for item in result.field_accesses if item.get("cancelled_by") not in folded]
+        for call in calls:
+            callee = call["callee"]
+            if folds(call):
                 helper = self.visible(tu, callee)
                 assert helper is not None
                 child = self.effective(tu, callee, caller, (*stack, name), pointers, bool(call.get("value_unused")))
                 bound = _bind(child, call["arguments"])
+                # The member address the helper returns, which the caller takes back with container_of
+                # (start_dl_timer's rq_of_dl_rq(dl_rq_of_se(dl_se))), is never formed; elsewhere it is
+                # no longer what this code returns.
+                cancelled = bool(call.get("result_cancelled"))
+                bound.field_accesses = [
+                    {key: value for key, value in item.items() if key != "returned"}
+                    for item in bound.field_accesses
+                    if not (cancelled and item.get("returned"))
+                ]
                 returned = self.tus[tu]["functions"][callee].get("returns_object")
                 if returned is not None and call.get("result_object") is not None:
                     # class_task_rq_lock_constructor returns its local _t, which is the caller's guard.

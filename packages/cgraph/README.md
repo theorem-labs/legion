@@ -234,6 +234,13 @@ These rules follow what the machine code shows, each only where it shows it:
   callee ignores) is marked `value_unused`; the facts give the callee a second event set,
   `value_unused`, from its walk with each return's value discarded, and link folds that set there:
   `rq_clock_task`'s `WARN_ON_ONCE` test stays and its read of `rq->clock_task` goes.
+- A member address the machine code never forms because container_of takes it back is no field
+  access where the helper that does so is folded: an argument `&p->m` at a parameter whose every use
+  is `container_of(·, T, m)` (directly, through a local it initializes, or through another helper's
+  such parameter: `is_mounted(&mnt->mnt)`, `cfs_rq_of(&rq->donor->se)`) is recorded with
+  `cancelled_by`, the helper, and a helper's returned member address (`returned`, `dl_rq_of_se`'s
+  `&rq->dl`) is dropped at a call marked `result_cancelled`, whose value the caller takes back the
+  same way (`rq_of_dl_rq(dl_rq_of_se(dl_se))`).
 - A helper folded under a `__builtin_constant_p` choice marks all its events `conditional`, field
   accesses too: the machine code decides whether that branch was compiled, so a conditional field
   access with no match is excluded as `image_decided` (below).

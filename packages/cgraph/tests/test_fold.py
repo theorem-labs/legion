@@ -57,6 +57,15 @@ def test_a_loop_that_may_leave_the_function_is_code(
     assert fields <= folded_fields(fold_build, function)
 
 
+def test_the_label_a_loop_jumps_to_is_code(fold_facts: dict[str, Any], fold_build: dict[str, Any]) -> None:
+    """fd_check_all's goto out in the loop is code, so out: and its obj_free are (llvm-objdump: the
+    blt to the label, then tail obj_free)."""
+    assert "obj_free" in {call["callee"] for call in fold_facts["functions"]["fd_check_all"]["events"]["calls"]}
+    graph = fold_build["graph"]
+    edges = {(edge["kind"], edge["target"]) for edge in graph["edges"] if edge["source"] == "function:fd_check_all"}
+    assert ("call", "function:obj_free") in edges
+
+
 def call_of(facts: dict[str, Any], function: str, callee: str) -> dict[str, Any]:
     (call,) = [call for call in facts["functions"][function]["events"]["calls"] if call["callee"] == callee]
     return call
@@ -92,3 +101,37 @@ def test_a_call_whose_value_is_used_keeps_the_reads_that_make_it(
     """llvm-objdump of fd_used_order: ld a1, 0x0(a0); andi; beqz; lbu a0, 0x8(a0)."""
     assert "value_unused" not in call_of(fold_facts, "fd_used_order", "fd_folio_order")
     assert folded_fields(fold_build, "fd_used_order") == {"flags", "order"}
+
+
+@pytest.mark.parametrize(
+    ("function", "fields"),
+    [
+        # ld a0, 0x40(a0): ns, from the parameter; m at 32 is never formed.
+        ("fd_through_helper", {"ns"}),
+        # ld a0, -0x8(a0): ns, 72 below the list node.
+        ("fd_from_list", {"ns"}),
+        # ld a0, 0x8(a0); lw a0, 0x18(a0): the donor, then its cpu.
+        ("fd_donor_cpu", {"donor", "cpu"}),
+        # ld a0, 0x8(a0); ld a0, 0x40(a0): the owner, then its ns.
+        ("fd_returned", {"owner", "ns"}),
+    ],
+)
+def test_a_member_address_a_container_of_takes_back_is_not_formed(
+    fold_build: dict[str, Any], function: str, fields: set[str]
+) -> None:
+    assert folded_fields(fold_build, function) == fields
+
+
+@pytest.mark.parametrize(
+    ("function", "fields"),
+    [
+        # ld a0, 0x20(a0): m.a[0], at the member's address.
+        ("fd_member_read", {"m", "a"}),
+        # ld a0, 0x8(a0); ld a0, 0x28(a0): the owner, then m.a[1].
+        ("fd_returned_read", {"owner", "m", "a"}),
+        # ld a0, 0x28(a0): a container_of of member a, not of b, so &t->b is kept (b.a[1] is inside it).
+        ("fd_not_taken_back", {"b", "a"}),
+    ],
+)
+def test_a_member_address_read_through_stays(fold_build: dict[str, Any], function: str, fields: set[str]) -> None:
+    assert folded_fields(fold_build, function) == fields
