@@ -100,36 +100,7 @@ func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, ext
 // SameCompiled lists the declarations (generated constants counted as their declaration) whose compiled
 // statement hash is hash: exact restatements.
 func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) {
-	var names []string
-	rows, err := s.db.QueryContext(ctx, `SELECT name FROM consts WHERE cstmt = ? ORDER BY name`, hash)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var n string
-		if err := r.Scan(&n); err != nil {
-			return err
-		}
-		names = append(names, n)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	o := &owners{s: s, cache: map[string]Found{}}
-	if err := o.preload(ctx, names); err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
-	var out []Found
-	for _, n := range names {
-		f, err := o.of(ctx, n)
-		if err != nil {
-			return nil, err
-		}
-		if !seen[f.Name] {
-			seen[f.Name] = true
-			out = append(out, f)
-		}
-	}
-	return out, nil
+	return s.distinctOwners(ctx, `SELECT name FROM consts WHERE cstmt = ? ORDER BY name`, hash)
 }
 
 // refreshCompiled re-reads the compiled modules whose .olean changed (all of them when the exporter or the
@@ -384,16 +355,11 @@ func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
 	return c, err
 }
 
-// owners maps constant names to the declarations they belong to: the longest declared name each extends
-// (`X.mk` is X's constructor).
-type owners struct {
-	s     *Store
-	cache map[string]Found
-}
-
-// preload resolves many constant names at once: one query per 500 candidate names (each name and its dotted
-// prefixes), not one lookup per name. A wide concept has tens of thousands of statements.
-func (o *owners) preload(ctx context.Context, names []string) error {
+// owners maps each constant name to the declaration it belongs to: the longest declared name it extends (`X.mk`
+// is X's constructor), or the name alone when it extends none. It resolves all the names at once: one query per
+// 500 candidate names (each name and its dotted prefixes), not one lookup per name. A wide concept has tens of
+// thousands of statements.
+func (s *Store) owners(ctx context.Context, names []string) (map[string]Found, error) {
 	cands := map[string]bool{}
 	for _, n := range names {
 		for p := n; p != ""; {
@@ -409,7 +375,7 @@ func (o *owners) preload(ctx context.Context, names []string) error {
 	found := map[string]Found{}
 	for i := 0; i < len(list); i += 500 {
 		chunk := list[i:min(i+500, len(list))]
-		rows, err := o.s.db.QueryContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
+		rows, err := s.db.QueryContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
 			FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
 		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var f Found
@@ -424,14 +390,15 @@ func (o *owners) preload(ctx context.Context, names []string) error {
 			return nil
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
+	out := make(map[string]Found, len(names))
 	for _, n := range names {
-		o.cache[n] = Found{Name: n}
+		out[n] = Found{Name: n}
 		for p := n; p != ""; {
 			if f, ok := found[p]; ok {
-				o.cache[n] = f
+				out[n] = f
 				break
 			}
 			i := strings.LastIndexByte(p, '.')
@@ -441,36 +408,38 @@ func (o *owners) preload(ctx context.Context, names []string) error {
 			p = p[:i]
 		}
 	}
-	return nil
+	return out, nil
 }
 
-func (o *owners) of(ctx context.Context, name string) (Found, error) {
-	if f, ok := o.cache[name]; ok {
-		return f, nil
+// distinctOwners lists the declarations that the constants the query names belong to (see owners), each once, in
+// the order of its first constant.
+func (s *Store) distinctOwners(ctx context.Context, query string, args ...any) ([]Found, error) {
+	var names []string
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var n string
+		if err := r.Scan(&n); err != nil {
+			return err
+		}
+		names = append(names, n)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	for n := name; n != ""; {
-		var f Found
-		var rel string
-		err := o.s.db.QueryRowContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
-			FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.name = ? LIMIT 1`, n).
-			Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel)
-		if err == nil {
-			f.Path = sourcePath(rel, f.Module)
-			o.cache[name] = f
-			return f, nil
-		}
-		if err != sql.ErrNoRows {
-			return Found{}, err
-		}
-		i := strings.LastIndexByte(n, '.')
-		if i < 0 {
-			break
-		}
-		n = n[:i]
+	owner, err := s.owners(ctx, names)
+	if err != nil {
+		return nil, err
 	}
-	f := Found{Name: name}
-	o.cache[name] = f
-	return f, nil
+	seen := map[string]bool{}
+	var out []Found
+	for _, n := range names {
+		if f := owner[n]; !seen[f.Name] {
+			seen[f.Name] = true
+			out = append(out, f)
+		}
+	}
+	return out, nil
 }
 
 // Stating is one statement that states a registered concept's fact.
@@ -498,20 +467,17 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	if err != nil {
 		return nil, err
 	}
-	o := &owners{s: s, cache: map[string]Found{}}
 	consts := make([]string, len(rs))
 	for i, r := range rs {
 		consts[i] = r.name
 	}
-	if err := o.preload(ctx, consts); err != nil {
+	owner, err := s.owners(ctx, consts)
+	if err != nil {
 		return nil, err
 	}
 	out := make([]Stating, 0, len(rs))
 	for _, r := range rs {
-		f, err := o.of(ctx, r.name)
-		if err != nil {
-			return nil, err
-		}
+		f := owner[r.name]
 		st := Stating{Decl: f.Name, Const: r.name, Module: r.module, How: r.how}
 		if f.Path != "" {
 			st.At = f.At()
@@ -524,35 +490,14 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 // SameAtoms lists the declarations whose statements share a relation atom with name's statement: who else
 // states one of its facts in the same form.
 func (s *Store) SameAtoms(ctx context.Context, name string) ([]string, error) {
-	var names []string
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT b.name FROM atoms a JOIN atoms b ON b.atom = a.atom
+	found, err := s.distinctOwners(ctx, `SELECT DISTINCT b.name FROM atoms a JOIN atoms b ON b.atom = a.atom
 		WHERE a.name = ? AND b.name <> a.name`, name)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var n string
-		if err := r.Scan(&n); err != nil {
-			return err
-		}
-		names = append(names, n)
-		return nil
-	})
 	if err != nil {
 		return nil, err
 	}
-	o := &owners{s: s, cache: map[string]Found{}}
-	if err := o.preload(ctx, names); err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
 	var out []string
-	for _, n := range names {
-		f, err := o.of(ctx, n)
-		if err != nil {
-			return nil, err
-		}
-		if !seen[f.Name] {
-			seen[f.Name] = true
-			out = append(out, f.Name)
-		}
+	for _, f := range found {
+		out = append(out, f.Name)
 	}
 	sort.Strings(out)
 	return out, nil
