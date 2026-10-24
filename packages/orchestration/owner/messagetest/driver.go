@@ -38,6 +38,9 @@ type Options struct {
 	Nodes  []string // the two owners; none means pickNodes chooses them from the graph
 	Kills  int      // how many owner panes to kill
 	Out    string   // the run's directory, absolute and new or empty
+	// AllowMissingKinds are the topic kinds (TopicKinds) the two nodes may lack: the run fails on any other kind
+	// that no topic of the nodes has, and the report lists each allowed kind they lack.
+	AllowMissingKinds []string
 
 	Deploy   ownerpkg.Deploy // the operator's deployment: its graph, its ledger_dsn_file and the keys the test copies
 	Owner    string          // the owner executable the test owners run
@@ -94,6 +97,7 @@ type driver struct {
 	listenerToken string
 	routing       ownerpkg.Routing
 	topics        ownerpkg.Topics     // the test graph's topics.json
+	arrivalPicks  []arrivalTopic      // the topic of each kind the nodes hold, which the arrival step publishes on
 	subscribe     map[string][]string // the topics each owner must subscribe to
 	expected      Expected
 	offers        map[string]string // need version → the offer its answer queues (expectAnswered)
@@ -202,7 +206,10 @@ func runName(at time.Time) (string, error) {
 const cleanupTimeout = 2 * time.Minute
 
 func (o Options) check() error {
+	unknown := slices.DeleteFunc(slices.Clone(o.AllowMissingKinds), func(kind string) bool { return slices.Contains(TopicKinds, kind) })
 	switch {
+	case len(unknown) > 0:
+		return fmt.Errorf("allowed missing kinds %s: the topic kinds are %s", strings.Join(unknown, ", "), strings.Join(TopicKinds, ", "))
 	case o.Prefix != "" && !ownerpkg.ValidTopicPrefix(o.Prefix):
 		return fmt.Errorf("prefix %q is not a prefix under notifications. that ends in a dot", o.Prefix)
 	case len(o.Nodes) != 0 && (len(o.Nodes) != 2 || o.Nodes[0] == o.Nodes[1]):
@@ -316,6 +323,9 @@ func (d *driver) setup(ctx context.Context) error {
 		return err
 	}
 	d.topics = topics
+	if err := d.pickArrivalTopics(); err != nil {
+		return err
+	}
 	d.bare = filepath.Join(out, "repo.git")
 	if err := createCopy(d.bare, filepath.Join(out, "seed"), copyConfig(d.run, d.prefix, graphDir), d.nodes); err != nil {
 		return err
@@ -797,26 +807,56 @@ func (d *driver) publish(ctx context.Context, step, kind, topic, item string) (P
 	return publication, nil
 }
 
-// arrival publishes one notice on each topic kind the two owners hold, then on the fact and concept topics the
-// source owner subscribed to, and waits until the session of every receiver recorded each of them.
-func (d *driver) arrival(ctx context.Context) error {
+// pickArrivalTopics picks the topic of each kind that the arrival step publishes on. A kind that no topic of the two
+// nodes has stops the run, before any daemon or owner session runs, unless the operator allowed it
+// (--allow-missing-kinds); the report lists each allowed kind the nodes lack.
+func (d *driver) pickArrivalTopics() error {
 	var held []string
 	for _, node := range d.nodes {
 		held = append(held, d.topics.Owners[node]...)
 	}
-	held = slices.Compact(slices.Sorted(slices.Values(held)))
-	type notice struct{ kind, topic string }
-	var notices []notice
-	for _, kind := range TopicKinds {
-		for _, topic := range held {
-			if topicKind(topic) == kind {
-				notices = append(notices, notice{kind, topic})
-				break
-			}
+	picks, missing := arrivalTopics(held)
+	var refused []string
+	for _, kind := range missing {
+		if slices.Contains(d.opts.AllowMissingKinds, kind) {
+			d.report.AllowedMissingKinds = append(d.report.AllowedMissingKinds, kind)
+		} else {
+			refused = append(refused, kind)
 		}
 	}
+	if len(refused) > 0 {
+		return fmt.Errorf("the nodes %s hold no topic of the kinds %s, so the arrival step cannot show a delivery of them; "+
+			"choose nodes that hold them, or pass --allow-missing-kinds %s to run without them", strings.Join(d.nodes, ", "),
+			strings.Join(refused, ", "), strings.Join(refused, ","))
+	}
+	d.arrivalPicks = picks
+	return nil
+}
+
+// arrivalTopic is the topic the arrival step publishes one notice on for a topic kind.
+type arrivalTopic struct{ kind, topic string }
+
+// arrivalTopics picks, for each of TopicKinds, the first topic of held in sort order with that kind, and lists the
+// kinds that no topic of held has.
+func arrivalTopics(held []string) (picks []arrivalTopic, missing []string) {
+	held = slices.Compact(slices.Sorted(slices.Values(held)))
+	for _, kind := range TopicKinds {
+		index := slices.IndexFunc(held, func(topic string) bool { return topicKind(topic) == kind })
+		if index < 0 {
+			missing = append(missing, kind)
+			continue
+		}
+		picks = append(picks, arrivalTopic{kind, held[index]})
+	}
+	return picks, missing
+}
+
+// arrival publishes one notice on each topic kind the two owners hold, then on the fact and concept topics the
+// source owner subscribed to, and waits until the session of every receiver recorded each of them.
+func (d *driver) arrival(ctx context.Context) error {
+	notices := slices.Clone(d.arrivalPicks)
 	for _, topic := range []string{d.prefix + "fact." + testFact + ".users", d.prefix + "fact." + testFact + ".needs", d.prefix + "concepts"} {
-		notices = append(notices, notice{strings.TrimPrefix(topic, d.prefix), topic})
+		notices = append(notices, arrivalTopic{strings.TrimPrefix(topic, d.prefix), topic})
 	}
 	var publications []Publication
 	for _, n := range notices {

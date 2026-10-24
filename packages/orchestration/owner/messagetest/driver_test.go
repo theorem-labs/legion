@@ -138,7 +138,7 @@ func setupStopOptions(t *testing.T, prefix string) Options {
 	t.Helper()
 	fn, st := "function:c@x/y.c", "struct:t"
 	dir := writeGraphDir(t, map[string]string{fn: "function", st: "struct"},
-		map[string][]string{fn: everyKind("function:c%40x%2Fy%2Ec", st), st: {"all", "node.struct:t.needs"}}, [][2]string{{fn, st}})
+		map[string][]string{fn: everyKind("function:c%40x%2Fy%2Ec", st), st: {"all", "node.struct:t.needs", "node.struct:u.linked"}}, [][2]string{{fn, st}})
 	return Options{
 		Prefix: prefix, Nodes: []string{fn, st}, Kills: 3, Out: filepath.Join(t.TempDir(), "run"),
 		Deploy: ownerpkg.Deploy{GraphDir: dir, LedgerDSNFile: filepath.Join(t.TempDir(), "ledger-dsn")},
@@ -173,6 +173,60 @@ func TestRunRefusesFewerKillsThanMoments(t *testing.T) {
 	}
 }
 
+// setupFailure is the error of a run's setup step, or "" when it had none.
+func setupFailure(report Report) string {
+	for _, step := range report.Steps {
+		if step.Name == "setup" {
+			return step.Error
+		}
+	}
+	return ""
+}
+
+// The arrival step publishes one notice on each topic kind the two nodes hold. A kind that no topic of the nodes has
+// fails the run in its setup, before any daemon or owner session runs, unless --allow-missing-kinds names it; the
+// report then lists it. A name that is no topic kind is refused.
+func TestRunFailsOnATopicKindTheNodesLackUnlessItIsAllowed(t *testing.T) {
+	fn, st := "function:c@x/y.c", "struct:t"
+	noLinked := writeGraphDir(t, map[string]string{fn: "function", st: "struct"},
+		map[string][]string{fn: everyKind("function:c%40x%2Fy%2Ec", st), st: {"all", "node.struct:t.needs"}}, [][2]string{{fn, st}})
+	run := func(allowed ...string) Report {
+		opts := setupStopOptions(t, "")
+		opts.Deploy.GraphDir, opts.AllowMissingKinds = noLinked, allowed
+		report, err := Run(t.Context(), opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return report
+	}
+
+	report := run()
+	if failure := setupFailure(report); !strings.Contains(failure, "linked") || !strings.Contains(failure, "--allow-missing-kinds") ||
+		len(report.AllowedMissingKinds) != 0 || report.Passed {
+		t.Fatalf("a run whose nodes hold no linked topic: setup %q, allowed missing %v, passed %t", failure, report.AllowedMissingKinds, report.Passed)
+	}
+	if _, err := os.Stat(filepath.Join(report.Out, "deploy.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("the setup went on past the missing kind and wrote the test deployment: %v", err)
+	}
+
+	report = run("linked", "all")
+	if failure := setupFailure(report); strings.Contains(failure, "linked") || !slices.Equal(report.AllowedMissingKinds, []string{"linked"}) {
+		t.Fatalf("a run that allows linked: setup %q, allowed missing %v; want linked listed and no failure of it", failure, report.AllowedMissingKinds)
+	}
+	if _, err := os.Stat(filepath.Join(report.Out, "deploy.yaml")); err != nil {
+		t.Fatalf("a run that allows linked stopped at the kinds: %v", err)
+	}
+	if markdown, err := os.ReadFile(filepath.Join(report.Out, "report.md")); err != nil || !strings.Contains(string(markdown), "`--allow-missing-kinds`: `linked`") {
+		t.Fatalf("report.md does not list the allowed missing kind: %v\n%s", err, markdown)
+	}
+
+	opts := setupStopOptions(t, "")
+	opts.AllowMissingKinds = []string{"linkd"}
+	if _, err := Run(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "linkd") {
+		t.Fatalf("Run allowing the missing kind linkd: %v, want a refusal that names it", err)
+	}
+}
+
 // assertRunPrefix checks that every topic of the run is under want: the report, the test graph's topics.json and every
 // topic in it, the test copy's topic_prefix, and the fact and concept topics the driver gives the source owner.
 func assertRunPrefix(t *testing.T, report Report, out, want string) {
@@ -184,7 +238,7 @@ func assertRunPrefix(t *testing.T, report Report, out, want string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if topics.Prefix != want || !slices.Equal(topics.Owners["struct:t"], []string{want + "all", want + "node.struct:t.needs"}) {
+	if topics.Prefix != want || !slices.Equal(topics.Owners["struct:t"], []string{want + "all", want + "node.struct:t.needs", want + "node.struct:u.linked"}) {
 		t.Fatalf("topics.json = %+v, want every topic under %q", topics, want)
 	}
 	config, err := ownerpkg.LoadConfig(&ownerpkg.Repo{Path: filepath.Join(out, "repo.git")})

@@ -20,28 +20,31 @@ const (
 
 // Report is the message test's result: DIR/report.json, and DIR/report.md for a person.
 type Report struct {
-	Run         string        `json:"run"`
-	Prefix      string        `json:"prefix"`
-	Nodes       []string      `json:"nodes"`
-	Edge        string        `json:"edge"`
-	Seed        int64         `json:"seed"`
-	Out         string        `json:"out"`
-	Daemon      Daemon        `json:"daemon"`
-	Revisions   Revisions     `json:"revisions"`
-	StartedAt   time.Time     `json:"started_at"`
-	FinishedAt  time.Time     `json:"finished_at"`
-	Seconds     float64       `json:"seconds"`
-	Steps       []StepTiming  `json:"steps"`
-	Panes       []PaneCheck   `json:"panes"`
-	Published   []Publication `json:"published"`
-	Deliveries  []Delivery    `json:"deliveries"`
-	KillLog     []Kill        `json:"kills"`
-	Restart     *Restart      `json:"restart,omitempty"`
-	Expected    Expected      `json:"expected"`
-	Interrupted string        `json:"interrupted,omitempty"` // why the run stopped before its steps ended: the signal
-	Teardown    Teardown      `json:"teardown"`
-	Failures    []Failure     `json:"failures"`
-	Passed      bool          `json:"passed"`
+	Run    string   `json:"run"`
+	Prefix string   `json:"prefix"`
+	Nodes  []string `json:"nodes"`
+	Edge   string   `json:"edge"`
+	// AllowedMissingKinds are the topic kinds the nodes lack that --allow-missing-kinds allowed: the arrival step
+	// published no notice of them.
+	AllowedMissingKinds []string      `json:"allowed_missing_kinds"`
+	Seed                int64         `json:"seed"`
+	Out                 string        `json:"out"`
+	Daemon              Daemon        `json:"daemon"`
+	Revisions           Revisions     `json:"revisions"`
+	StartedAt           time.Time     `json:"started_at"`
+	FinishedAt          time.Time     `json:"finished_at"`
+	Seconds             float64       `json:"seconds"`
+	Steps               []StepTiming  `json:"steps"`
+	Panes               []PaneCheck   `json:"panes"`
+	Published           []Publication `json:"published"`
+	Deliveries          []Delivery    `json:"deliveries"`
+	KillLog             []Kill        `json:"kills"`
+	Restart             *Restart      `json:"restart,omitempty"`
+	Expected            Expected      `json:"expected"`
+	Interrupted         string        `json:"interrupted,omitempty"` // why the run stopped before its steps ended: the signal
+	Teardown            Teardown      `json:"teardown"`
+	Failures            []Failure     `json:"failures"`
+	Passed              bool          `json:"passed"`
 }
 
 // Teardown is what the run stopped and removed when it ended: every daemon process it started, every owner process
@@ -174,6 +177,11 @@ func (r Report) markdown() string {
 	fmt.Fprintf(&b, "# Owner message test %s\n\n", r.Run)
 	fmt.Fprintf(&b, "- Result: **%s**\n- Duration: %.1f s (%s to %s)\n- Prefix: `%s`\n- Nodes: %s\n- Edge: `%s`\n- Kill seed: %d\n",
 		verdict, r.Seconds, r.StartedAt.Format(time.RFC3339), r.FinishedAt.Format(time.RFC3339), r.Prefix, code(r.Nodes), r.Edge, r.Seed)
+	allowed := "none"
+	if len(r.AllowedMissingKinds) > 0 {
+		allowed = code(r.AllowedMissingKinds)
+	}
+	fmt.Fprintf(&b, "- Topic kinds the nodes lack, allowed by `--allow-missing-kinds`: %s\n", allowed)
 	fmt.Fprintf(&b, "- Daemon: `%s start --config %s` (port %d, tmux socket `%s`, log `%s`), panes running `%s`\n\n", r.Daemon.Executable, r.Daemon.Config, r.Daemon.Port, r.Daemon.Socket, r.Daemon.Log, r.Daemon.Omp)
 	r.Revisions.markdown(&b)
 	b.WriteString("## Steps\n\n| Step | Seconds | Error |\n| --- | --- | --- |\n")

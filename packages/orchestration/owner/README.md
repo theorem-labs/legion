@@ -61,7 +61,7 @@ Steps:
 | `reply <item> <reason> <file> [--premise-owner <id>]` | Records the reply, routes it by `PROTOCOL.yaml` `reasons`; `program-defect` and `false-shared-assumption` also write `escalations/<hex16>.yaml` and queue `escalation:` for `escalations` |
 | `done <need or offer item> --superseded r<n>` | Completes the item as `superseded:r<n>` with no record, when r<n> is later than the item's and exists: the source's need record, or the target's spec, is at r<n> or newer |
 | `returned <item>` | Prints the C13 `reason`, `detail`, `log`, `batch` and `key` of the return event. The producer requires `reason` and `key` (exit 4 without either) and writes an empty `batch`, `detail` or `log` when it was not given one: such a field prints as `(absent)`, and the JSON leaves it out |
-| `message-test [--prefix P] [--nodes A,B] [--kills N] --out DIR` | Runs the message test (below) and writes `DIR/report.json` and `DIR/report.md`; exit 0 only when every assertion held |
+| `message-test [--prefix P] [--nodes A,B] [--kills N] [--allow-missing-kinds K,...] --out DIR` | Runs the message test (below) and writes `DIR/report.json` and `DIR/report.md`; exit 0 only when every assertion held |
 | `message-test topics` | A test owner's topics: `owner topics` plus the fact and concept topics the driver gives it in the test deployment's `<state_dir>/message-test/topics.json` (plan Task 1.8 step 4: the driver subscribes a test owner to topics no node owner holds); no other command reads that file |
 | `message-test subscribed` | Records the topics the test owner subscribed to, at `message-test/subscribed.yaml` |
 | `message-test saw <delivery id> <topic>` | Records one delivery once, at `message-test/saw/<hex16(id)>.yaml`, with `Owner-Delivery` and `Owner-Topic` trailers |
@@ -102,7 +102,10 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    `git --version` and the SHA-256 of each graph input.
 2. **Nodes.** `--nodes A,B`, or else the first function whose id holds `@`, `/` and `.` with a data structure it
    accesses, such that the two hold every topic kind. The code names no project, so the plan's
-   `function:get_mountpoint@fs/namespace.c,struct:mountpoint` is passed with `--nodes`.
+   `function:get_mountpoint@fs/namespace.c,struct:mountpoint` is passed with `--nodes`. A topic kind (`needs`,
+   `callers`, `callees`, `users`, `neighbors`, `linked`, `all`) that no topic of the two nodes has fails the run in
+   setup, before the daemon starts, unless `--allow-missing-kinds` names it; the report lists each allowed kind the
+   nodes lack.
 3. **Wake.** `start:<node>@1` for each; both panes must start within 60 s on the tmux socket
    `legion-<project token>`, each process with `LEGION_OWNER`, `LEGION_LEDGER_REPOSITORY` and
    `LEGION_LEDGER_DSN_FILE` (C8; a `_KEY` name is credential-shaped and the daemon strips it from panes) and working

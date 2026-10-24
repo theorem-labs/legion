@@ -253,3 +253,19 @@ func TestParseDriverFlagsRefusesFewerKillsThanMoments(t *testing.T) {
 		t.Fatalf("--kills 3 = %+v, %v", flags, err)
 	}
 }
+
+// --allow-missing-kinds names the topic kinds the nodes may lack, comma-separated; a name that is no topic kind is a
+// usage error.
+func TestParseDriverFlagsReadsTheAllowedMissingKinds(t *testing.T) {
+	flags, err := parseDriverFlags([]string{"--allow-missing-kinds", "linked,callees", "--out", "/runs/one"})
+	if err != nil || !reflect.DeepEqual(flags.allowMissingKinds, []string{"linked", "callees"}) {
+		t.Fatalf("--allow-missing-kinds linked,callees = %+v, %v", flags, err)
+	}
+	for _, value := range []string{"linkd", "linked,", ""} {
+		_, err := parseDriverFlags([]string{"--allow-missing-kinds", value, "--out", "/runs/one"})
+		var usage *usageError
+		if !errors.As(err, &usage) {
+			t.Errorf("--allow-missing-kinds %q: %v, want a usage error", value, err)
+		}
+	}
+}

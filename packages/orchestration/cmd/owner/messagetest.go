@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,7 +18,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const messageTestUsage = "message-test [--prefix P] [--nodes A,B] [--kills N] --out DIR | message-test topics | " +
+const messageTestUsage = "message-test [--prefix P] [--nodes A,B] [--kills N] [--allow-missing-kinds K,...] --out DIR | message-test topics | " +
 	"message-test subscribed | message-test saw <delivery id> <topic> | message-test answer <item>"
 
 // parseMessageTest reads `owner message-test`: a test owner's command, or the driver's options.
@@ -58,10 +59,11 @@ func parseMessageTest(args []string) (func(*session) (any, error), error) {
 }
 
 type driverFlags struct {
-	prefix string
-	nodes  []string
-	kills  int
-	out    string
+	prefix            string
+	nodes             []string
+	kills             int
+	allowMissingKinds []string
+	out               string
 }
 
 func parseDriverFlags(args []string) (driverFlags, error) {
@@ -91,6 +93,15 @@ func parseDriverFlags(args []string) (driverFlags, error) {
 					len(messagetest.Moments), strings.Join(messagetest.Moments, ", "), value)
 			}
 			flags.kills = kills
+		case "--allow-missing-kinds":
+			kinds := strings.Split(value, ",")
+			for _, kind := range kinds {
+				if !slices.Contains(messagetest.TopicKinds, kind) {
+					return driverFlags{}, usagef("--allow-missing-kinds takes topic kinds of %s, comma-separated, not %q",
+						strings.Join(messagetest.TopicKinds, ", "), value)
+				}
+			}
+			flags.allowMissingKinds = kinds
 		case "--out":
 			flags.out = value
 		default:
@@ -318,7 +329,7 @@ func (s *session) messageTestRun(flags driverFlags) (any, error) {
 		}
 	}()
 	report, err := messagetest.Run(ctx, messagetest.Options{
-		Prefix: flags.prefix, Nodes: flags.nodes, Kills: flags.kills, Out: out,
+		Prefix: flags.prefix, Nodes: flags.nodes, Kills: flags.kills, AllowMissingKinds: flags.allowMissingKinds, Out: out,
 		Deploy: deploy, Owner: owner, Legion: legion,
 		Environ: os.Environ(), Getenv: s.getenv, Progress: s.stderr, Timeouts: messagetest.DefaultTimeouts(),
 	})
