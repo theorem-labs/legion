@@ -1276,6 +1276,11 @@ def _mentions_parameter(expression: dict[str, Any] | None) -> bool:
     return "p" in expression or any(_mentions_parameter(operand) for operand in expression.get("a", []))
 
 
+# How a guard expression states a variable at a reference: (the variable's declaration, the reference,
+# the depth) to the values it may hold there, or None.
+_Resolve = Callable[[ci.Cursor, ci.Cursor, int], "dict[str, Any] | None"]
+
+
 class _Evaluator:
     """What the compiler folds that clang's evaluator alone does not: inline helpers that return one
     value (or one truth value, where only the truth is tested), locals that keep their initializer,
@@ -1295,12 +1300,31 @@ class _Evaluator:
         self.weak = weak
         self.helpers: dict[str, tuple[int | None, int | None]] = {}
         self.locals: dict[int, int | None] = {}
+        self.values: dict[tuple[int, bool], int | None] = {}
+        self.deciding: dict[int, bool] = {}
+        self.written: dict[int, frozenset[int]] = {}
+
+    def image_decides(self, cursor: ci.Cursor) -> bool:
+        """``__builtin_constant_p`` or ``__builtin_object_size`` inside: the image decides. Once per cursor."""
+        key = cursor.hash
+        if key not in self.deciding:
+            self.deciding[key] = _mentions(cursor, _IMAGE_DECIDES)
+        return self.deciding[key]
 
     def evaluate(self, cursor: ci.Cursor, depth: int = 0, truth: bool = False) -> int | None:
         """The value clang or this evaluator folds the expression to. Where ``truth``, only the truth
         of the value is tested (a condition, an operand of ``!``, ``&&`` or ``||``), and an inline
         helper whose returns differ but agree in truth gives that truth value."""
-        if _mentions(cursor, _IMAGE_DECIDES):
+        if depth == 0:
+            # Guards and argument values evaluate each subexpression again: once per cursor.
+            key = (cursor.hash, truth)
+            if key not in self.values:
+                self.values[key] = self.evaluate_uncached(cursor, truth)
+            return self.values[key]
+        return self.evaluate_uncached(cursor, truth, depth)
+
+    def evaluate_uncached(self, cursor: ci.Cursor, truth: bool, depth: int = 0) -> int | None:
+        if self.image_decides(cursor):
             return None
         value = libclang.constant_int(cursor)
         if value is not None or depth > 6:
@@ -1369,25 +1393,30 @@ class _Evaluator:
         function = variable.semantic_parent
         if initializer is None or function is None:
             return None
-        key = variable.hash
-        for node in function.walk_preorder():
-            if node.kind not in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR, K.UNARY_OPERATOR):
-                continue
-            operands = _children(node)
-            target = operands[0] if operands else None
-            while target is not None and target.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and _children(target):
-                target = _children(target)[0]
-            if target is None or target.kind != K.DECL_REF_EXPR or target.referenced is None:
-                continue
-            if target.referenced.hash != key:
-                continue
-            if (
-                node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR
-                or (node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node))
-                or (node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node)))
-            ):
-                return None
-        return initializer
+        return None if variable.hash in self.written_in(function) else initializer
+
+    def written_in(self, function: ci.Cursor) -> frozenset[int]:
+        """The variables a function assigns, changes in place or takes the address of, by hash."""
+        key = function.hash
+        if key not in self.written:
+            found: set[int] = set()
+            for node in function.walk_preorder():
+                if node.kind not in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR, K.UNARY_OPERATOR):
+                    continue
+                operands = _children(node)
+                target = operands[0] if operands else None
+                while target is not None and target.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR) and _children(target):
+                    target = _children(target)[0]
+                if target is None or target.kind != K.DECL_REF_EXPR or target.referenced is None:
+                    continue
+                if (
+                    node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR
+                    or (node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node))
+                    or (node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node)))
+                ):
+                    found.add(target.referenced.hash)
+            self.written[key] = frozenset(found)
+        return self.written[key]
 
     def local(self, variable: ci.Cursor, depth: int) -> int | None:
         """A local's value when its initializer evaluates and nothing writes it or takes its address."""
@@ -1401,58 +1430,58 @@ class _Evaluator:
         return value
 
     def expression(
-        self, cursor: ci.Cursor, parameters: dict[int, int], depth: int = 0, truth: bool = False
+        self, cursor: ci.Cursor, resolve: _Resolve, depth: int = 0, truth: bool = False
     ) -> dict[str, Any] | None:
-        """The expression as link evaluates it at a fold (link._evaluate): a constant, a parameter of
-        ``parameters`` (by cursor hash; those the function never writes), an operation on those, or
-        None where a value is unknown (a field read, a call that does not fold)."""
+        """The expression as link evaluates it at a fold (link._evaluate): a constant, an operation, and
+        each variable as ``resolve`` states the values it may hold (a parameter, or a choice among
+        values), or None where a value is unknown (a field read, a call that does not fold)."""
         typed = _integer_type(cursor.type) if cursor.kind.is_expression() else None
         value = self.evaluate(cursor, truth=truth)
         if value is not None:
             return {"c": value, **(typed or {})}
-        if depth > 12 or _mentions(cursor, _IMAGE_DECIDES):
+        if depth > 12 or self.image_decides(cursor):
             return None
         kind, inner = cursor.kind, _children(cursor)
         if kind == K.PAREN_EXPR and inner:
-            return self.expression(inner[-1], parameters, depth + 1, truth)
+            return self.expression(inner[-1], resolve, depth + 1, truth)
         if kind in (K.UNEXPOSED_EXPR, K.CSTYLE_CAST_EXPR) and inner:
-            operand = self.expression(inner[-1], parameters, depth + 1, truth)
+            operand = self.expression(inner[-1], resolve, depth + 1, truth)
             if operand is None or typed is None:
                 return None
             same = all(operand.get(key) == typed.get(key) for key in ("w", "s", "b"))
             return operand if same else {"op": "cast", "a": [operand], **typed}
         if kind == K.DECL_REF_EXPR and cursor.referenced is not None and typed is not None:
             referenced = cursor.referenced
-            if referenced.kind == K.PARM_DECL:
-                index = parameters.get(referenced.hash)
-                return {"p": index, **typed} if index is not None else None
             parent = referenced.semantic_parent
-            if referenced.kind == K.VAR_DECL and parent is not None and parent.kind == K.FUNCTION_DECL:
-                initializer = self.kept_initializer(referenced)
-                operand = self.expression(initializer, parameters, depth + 1) if initializer is not None else None
-                return None if operand is None else {"op": "cast", "a": [operand], **typed}
+            if referenced.kind == K.PARM_DECL or (
+                referenced.kind == K.VAR_DECL and parent is not None and parent.kind == K.FUNCTION_DECL
+            ):
+                held = resolve(referenced, cursor, depth + 1)
+                if held is None:
+                    return None
+                if "p" in held:
+                    return {**held, **typed}
+                return {"op": "cast", "a": [held], **typed}
             return None
         if typed is None:
             return None
         if kind == K.UNARY_OPERATOR and inner:
             name = _UNARY_NAMES.get(libclang.unary_kind(cursor))
-            operand = self.expression(inner[0], parameters, depth + 1, truth=name == "!")
+            operand = self.expression(inner[0], resolve, depth + 1, truth=name == "!")
             return None if name is None or operand is None else {"op": name, "a": [operand], **typed}
         if kind == K.BINARY_OPERATOR and len(inner) == 2:
             name = _BINARY_NAMES.get(libclang.binary_kind(cursor))
             if name is None:
                 return None
             logical = name in ("&&", "||")
-            operands = [self.expression(part, parameters, depth + 1, truth=logical) for part in inner]
+            operands = [self.expression(part, resolve, depth + 1, truth=logical) for part in inner]
             return None if operands == [None, None] else {"op": name, "a": operands, **typed}
         if kind == K.CONDITIONAL_OPERATOR and len(inner) == 3:
-            operands = [
-                self.expression(part, parameters, depth + 1, truth=index == 0) for index, part in enumerate(inner)
-            ]
+            operands = [self.expression(part, resolve, depth + 1, truth=index == 0) for index, part in enumerate(inner)]
             return None if operands == [None, None, None] else {"op": "?:", "a": operands, **typed}
         if kind == K.CALL_EXPR and cursor.referenced is not None and cursor.referenced.spelling == "__builtin_expect":
             arguments = list(cursor.get_arguments() or [])
-            return self.expression(arguments[0], parameters, depth + 1, truth) if arguments else None
+            return self.expression(arguments[0], resolve, depth + 1, truth) if arguments else None
         return None
 
     def exits(self, statement: ci.Cursor, loop: bool = False) -> bool:
@@ -1547,7 +1576,12 @@ class _FunctionWalk:
         self.guard_ids: dict[str, int] = {}
         self.guard_stack: list[int] = []
         self.case_guards: dict[int, tuple[dict[str, Any], bool]] = {}
-        self.unwritten: dict[int, int] | None = None
+        self.holding: set[int] = set()  # the variables whose values are being stated (a cycle is unknown)
+        self.positions: dict[str, Any] | None = None
+        # Per label, the guards each goto in code reached it under (None: under a choice the image
+        # makes, or a label whose address is taken), in the order the walk met them.
+        self.goto_guards: dict[str, list[list[dict[str, Any]] | None]] = collections.defaultdict(list)
+        self.jumps: dict[str, Any] | None = None
         self.labelled: dict[int, bool] = {}
 
     def finish(self) -> None:
@@ -1579,21 +1613,125 @@ class _FunctionWalk:
 
     # Guards ---------------------------------------------------------------------------------
 
-    def guard_parameters(self) -> dict[int, int]:
-        """The parameters the function never writes, by cursor hash: a guard or an argument value may
-        name them, since they hold the caller's argument throughout."""
-        if self.unwritten is None:
-            self.unwritten = {
-                parameter.hash: index
-                for index, parameter in enumerate(self.cursor.get_arguments() or [])
-                if not self.written(parameter)
-            }
-        return self.unwritten
+    def held(self, variable: ci.Cursor, reference: ci.Cursor, depth: int) -> dict[str, Any] | None:
+        """The values a parameter or local may hold at ``reference``, for link to decide at a fold:
+        a parameter nothing writes is the caller's argument; one whose address escapes only after the
+        reference, which no loop or label puts before the escape, too. A variable that plain
+        assignments write may hold its first value (the argument, or the initializer) or any value
+        assigned: a choice, decided only where every choice agrees."""
+        key = variable.hash
+        if key in self.holding or depth > 12:
+            return None
+        uses = self.local_uses()
+        index = self.parameters.get(key) if variable.kind == K.PARM_DECL else None
+        if uses["written"][key]:
+            if index is None or uses["assigned"][key] or not self.escapes_after(variable, reference):
+                return None
+            return {"p": index}
+        self.holding.add(key)
+        try:
+            if index is not None:
+                values: list[dict[str, Any] | None] = [{"p": index}]
+            else:
+                initializer = libclang.var_initializer(variable)
+                if initializer is None:
+                    return None
+                values = [self.x.evaluator.expression(initializer, self.held, depth + 1)]
+            values += [
+                self.x.evaluator.expression(definition, self.held, depth + 1)
+                for definition in self.definitions.get(key, [])
+            ]
+        finally:
+            self.holding.discard(key)
+        if any(value is None for value in values):
+            return None
+        choice = values[0]
+        for value in values[1:]:
+            choice = {"op": "?:", "a": [None, choice, value]}
+        return choice
+
+    def escapes_after(self, parameter: ci.Cursor, reference: ci.Cursor) -> bool:
+        """Every write to the parameter is ``&parameter`` after the reference in the function's text, the
+        reference is in no loop, and no label is before it: control reaches it before any escape."""
+        if self.positions is None:
+            loops: set[int] = set()
+            labels: list[int] = []
+            escapes: dict[int, list[int]] = collections.defaultdict(list)
+            other: set[int] = set()
+            for node in self.cursor.walk_preorder():
+                if node.kind in (K.WHILE_STMT, K.FOR_STMT, K.DO_STMT):
+                    loops.update(child.hash for child in node.walk_preorder())
+                elif node.kind == K.LABEL_STMT:
+                    labels.append(node.extent.start.offset)
+                operands = _children(node)
+                target = _strip(operands[0]) if operands else None
+                if target is None or target.kind != K.DECL_REF_EXPR or target.referenced is None:
+                    continue
+                if node.kind == K.UNARY_OPERATOR and libclang.is_address_of(node):
+                    escapes[target.referenced.hash].append(node.extent.start.offset)
+                elif node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR or (
+                    node.kind == K.UNARY_OPERATOR and libclang.is_increment(node)
+                ):
+                    other.add(target.referenced.hash)
+            self.positions = {"loops": loops, "labels": labels, "escapes": escapes, "other": other}
+        positions = self.positions
+        key = parameter.hash
+        at = reference.extent.end.offset
+        if key in positions["other"] or reference.hash in positions["loops"]:
+            return False
+        if reference.extent.start.file is None or self.cursor.extent.start.file is None:
+            return False
+        if reference.extent.start.file.name != self.cursor.extent.start.file.name:
+            return False
+        if any(label < at for label in positions["labels"]):
+            return False
+        return bool(positions["escapes"][key]) and all(offset > at for offset in positions["escapes"][key])
 
     def guard_expression(self, condition: ci.Cursor, truth: bool = True) -> dict[str, Any] | None:
         """The condition as an expression on the parameters, when it names one."""
-        expression = self.x.evaluator.expression(condition, self.guard_parameters(), truth=truth)
+        expression = self.x.evaluator.expression(condition, self.held, truth=truth)
         return expression if _mentions_parameter(expression) else None
+
+    def label_guard(self, label: ci.Cursor, fallthrough: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+        """The guard on a label's code: reached by the gotos met before it and, unless ``fallthrough`` is
+        None, by control falling into it under those guards; so compiled where any of them is. None
+        when a goto after the label (a loop) or a computed goto may reach it, or one way is unguarded."""
+        if self.jumps is None:
+            later: set[str] = set()
+            places: dict[str, int] = {}
+            gotos: list[tuple[str, int]] = []
+            for node in self.cursor.walk_preorder():
+                if node.kind == K.LABEL_STMT:
+                    places[node.spelling] = node.extent.start.offset
+                elif node.kind in (K.GOTO_STMT, K.ADDR_LABEL_EXPR, K.INDIRECT_GOTO_STMT):
+                    targets = [child.spelling for child in _children(node) if child.kind == K.LABEL_REF]
+                    if node.kind != K.GOTO_STMT or not targets:
+                        later.update(places)  # a computed goto may reach any label
+                        later.add("*")
+                    gotos += [(target, node.extent.start.offset) for target in targets]
+            later |= {target for target, offset in gotos if target in places and offset > places[target]}
+            self.jumps = {"later": later}
+        name = label.spelling
+        if name in self.jumps["later"] or "*" in self.jumps["later"]:
+            return None
+        ways = list(self.goto_guards.get(name, []))
+        if fallthrough is not None:
+            ways.append(fallthrough)
+        if not ways or any(not way for way in ways):
+            return None
+        typed = {"w": 32, "s": True}
+        terms = []
+        for way in ways:
+            assert way is not None
+            factors = [guard["e"] if guard["v"] else {"op": "!", "a": [guard["e"]], **typed} for guard in way]
+            term = factors[0]
+            for factor in factors[1:]:
+                term = {"op": "&&", "a": [term, factor], **typed}
+            terms.append(term)
+        either = terms[0]
+        for term in terms[1:]:
+            either = {"op": "||", "a": [either, term], **typed}
+        return either
 
     def has_label(self, node: ci.Cursor) -> bool:
         """A label inside that control may enter from outside, past any condition around it: a goto
@@ -1915,7 +2053,7 @@ class _FunctionWalk:
                 item["param"] = address.param
         # The value the argument passes, where it is a constant or depends on the caller's parameters:
         # the guards of a folded callee are decided by it (link._bind).
-        value = self.x.evaluator.expression(expression, self.guard_parameters())
+        value = self.x.evaluator.expression(expression, self.held)
         if value is not None and ("c" in value or _mentions_parameter(value)):
             item["expr"] = value
         return item
@@ -2311,6 +2449,12 @@ class _FunctionWalk:
             if kind in (K.GOTO_STMT, K.ADDR_LABEL_EXPR):
                 # A goto in code, or a label whose address is taken (&&label): the label is code.
                 self.goto_targets.update(child.spelling for child in children if child.kind == K.LABEL_REF)
+                way = (
+                    None if self.conditional or kind != K.GOTO_STMT else [self.guard_table[i] for i in self.guard_stack]
+                )
+                for child in children:
+                    if child.kind == K.LABEL_REF:
+                        self.goto_guards[child.spelling].append(way)
             elif kind == K.DECL_REF_EXPR and _is_local(node.referenced) and node.hash not in self.stores:
                 self.reads[node.referenced.hash] += 1
         stored = _store_target(node)
@@ -2476,6 +2620,8 @@ class _FunctionWalk:
             exit_guards = 0  # guards on the rest of the block, from `if (C) return;` before it
             value_last = parent is not None and parent.kind == K.StmtExpr
             for child_index, child in enumerate(children):
+                # The ways control falls in here: under this block's guards, or none after an exit.
+                fallthrough = None if dead else [self.guard_table[i] for i in self.guard_stack]
                 if child.kind == K.LABEL_STMT:
                     # A label is code when control falls into it or a goto in code targets it.
                     dead = dead and child.spelling not in self.live_labels
@@ -2485,6 +2631,14 @@ class _FunctionWalk:
                     # Control enters here through a label, past the conditions before it.
                     del self.guard_stack[len(self.guard_stack) - exit_guards :]
                     exit_guards = 0
+                if child.kind == K.LABEL_STMT and not dead:
+                    # Only forward gotos and falling in reach it: its code is under their guards, unless
+                    # another label inside lets control in another way.
+                    body = _children(child)
+                    reach = None if body and self.has_label(body[-1]) else self.label_guard(child, fallthrough)
+                    if reach is not None:
+                        self.push_guard(reach, True)
+                        exit_guards += 1
                 case_guard = self.case_guards.get(child.hash)
                 if dead:
                     self.walk(child, node, child_index, "after_exit", generic)

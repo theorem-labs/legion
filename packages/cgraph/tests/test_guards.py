@@ -232,3 +232,97 @@ def test_an_array_member_whose_address_is_taken_gives_its_element_size(tmp_path:
     fields = facts["functions"]["walk"]["events"]["field_accesses"]
     (info,) = [item for item in fields if item["field"] == "info"]
     assert (info["offset"], info.get("address"), info["element_size"]) == (24, True, 32)
+
+
+def test_a_parameter_whose_address_is_taken_later_holds_the_argument_before(tmp_path: Path) -> None:
+    """warn_if_node_offline passes &gfp_mask to pr_warn after the conditions that decide it."""
+    facts = facts_of(
+        tmp_path,
+        """
+        void show(const gfp_t *p);
+        static inline void offline(int node, gfp_t gfp_mask)
+        {
+            gfp_t warn_gfp = gfp_mask & (4u | 2u);
+            if (warn_gfp != (4u | 2u))
+                return;
+            pr();
+            show(&gfp_mask);
+            if (gfp_mask == 6u)
+                late();
+        }
+        """,
+    )
+    assert compiled(facts, "offline", [unknown(), constant(0x400)]) == set()
+    # After its address escapes the parameter may hold anything: `gfp_mask == 6u` stays open.
+    assert compiled(facts, "offline", [unknown(), constant(0x406)]) == {"pr", "show", "late"}
+
+
+def test_a_parameter_the_function_assigns_is_any_value_it_may_hold(tmp_path: Path) -> None:
+    """__mutex_lock_common: `if (!use_ww_ctx) ww_ctx = NULL;`, then `if (ww_ctx)`. With a NULL
+    ww_ctx both values are NULL; with another, the branch is open."""
+    facts = facts_of(
+        tmp_path,
+        """
+        static inline int common(struct dev *ctx, int use_ctx)
+        {
+            if (!use_ctx)
+                ctx = (void *)0;
+            if (ctx)
+                warn();
+            kept();
+            return 0;
+        }
+        """,
+    )
+    assert compiled(facts, "common", [constant(0), constant(0)]) == {"kept"}
+    assert compiled(facts, "common", [unknown(), constant(0)]) == {"warn", "kept"}
+
+
+def test_code_past_a_label_only_forward_gotos_reach_is_under_their_guards(tmp_path: Path) -> None:
+    """__devm_clk_get: `if (init) { ret = init(clk); if (ret) goto err_clk_init; } ... return clk;
+    err_clk_init: clk_put(clk); err_clk_get: ...`; devm_clk_get passes NULL for init."""
+    facts = facts_of(
+        tmp_path,
+        """
+        int probe(void);
+        static inline int get(int (*init)(void), int bad)
+        {
+            int ret = 0;
+            if (bad)
+                goto err_get;
+            if (init) {
+                ret = init();
+                if (ret)
+                    goto err_init;
+            }
+            kept();
+            return 0;
+        err_init:
+            err();
+        err_get:
+            lab();
+            return ret;
+        }
+        """,
+    )
+    null = {"unit": None, "param": None, "expr": {"c": 0, "w": 64, "s": False}}
+    assert compiled(facts, "get", [null, unknown()]) == {"kept", "lab"}
+    assert compiled(facts, "get", [unknown(), unknown()]) == {"kept", "err", "lab"}
+
+
+def test_a_label_a_later_goto_reaches_gets_no_guard(tmp_path: Path) -> None:
+    facts = facts_of(
+        tmp_path,
+        """
+        static inline void retry(int (*init)(void))
+        {
+            return;
+        again:
+            err();
+            if (init)
+                goto again;
+        }
+        """,
+    )
+    null = {"unit": None, "param": None, "expr": {"c": 0, "w": 64, "s": False}}
+    assert compiled(facts, "retry", [null]) == set()
