@@ -1,5 +1,11 @@
 // Package ledger is the orchestration ledger: work-item leases, migrations and their change locks, the contract
-// ledger and an append-only event log, all in Postgres. Every operation runs in one transaction.
+// ledger, the landing program's batches and an append-only event log, all in Postgres. Every operation runs in one
+// transaction.
+//
+// The ledger trusts its callers. Every check it makes runs in this Go API, and its callers' database logins can
+// rewrite any row with raw SQL, which no check here stops. No protection against a forged write or a bypass is built
+// until one is seen. Each event names the database login whose session appended it (Event.Login), so the log shows
+// which login made each write.
 package ledger
 
 import (

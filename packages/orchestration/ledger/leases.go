@@ -77,24 +77,31 @@ func (s *Store) Enqueue(ctx context.Context, repo, id, owner string) error {
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		var existingOwner, state string
-		err := tx.QueryRow(ctx, `INSERT INTO work_items (repo, id, owner) VALUES ($1, $2, $3)
-			ON CONFLICT DO NOTHING RETURNING owner, state`, repo, id, owner).Scan(&existingOwner, &state)
-		if errors.Is(err, pgx.ErrNoRows) {
-			if err := tx.QueryRow(ctx, `SELECT owner, state FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`,
-				repo, id).Scan(&existingOwner, &state); err != nil {
-				return err
-			}
-			if existingOwner == owner && state == "open" {
-				return nil
-			}
-			return refuse(ReasonExists, "item %s already belongs to owner %s in state %s", id, existingOwner, state)
-		}
-		if err != nil {
+		return enqueueItem(ctx, tx, repo, id, owner)
+	})
+}
+
+// enqueueItem is Enqueue inside tx, which already holds the repository's row lock: it creates the open item id for
+// owner and appends item.enqueued, returns with nothing appended when that item is already open for owner, and
+// refuses (ReasonExists) an item that another owner has or that is done.
+func enqueueItem(ctx context.Context, tx pgx.Tx, repo, id, owner string) error {
+	var existingOwner, state string
+	err := tx.QueryRow(ctx, `INSERT INTO work_items (repo, id, owner) VALUES ($1, $2, $3)
+		ON CONFLICT DO NOTHING RETURNING owner, state`, repo, id, owner).Scan(&existingOwner, &state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT owner, state FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`,
+			repo, id).Scan(&existingOwner, &state); err != nil {
 			return err
 		}
-		return event(ctx, tx, repo, "item.enqueued", id, owner, map[string]any{"owner": owner})
-	})
+		if existingOwner == owner && state == "open" {
+			return nil
+		}
+		return refuse(ReasonExists, "item %s already belongs to owner %s in state %s", id, existingOwner, state)
+	}
+	if err != nil {
+		return err
+	}
+	return event(ctx, tx, repo, "item.enqueued", id, owner, map[string]any{"owner": owner})
 }
 
 // HasOpenWork reports whether owner names at least one open item in repository.
