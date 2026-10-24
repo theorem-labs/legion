@@ -274,7 +274,7 @@ func addedRegistryConcepts(ctx context.Context, p project, previous, commit stri
 	if previous == "" || commit == "" {
 		return added, nil
 	}
-	concepts := p.rel + "/concepts"
+	concepts := p.rel + "/" + conceptsDir
 	// The pathspec is relative to the tree, where git runs; the paths it prints are relative to the repository.
 	raw, err := exec.CommandContext(ctx, "git", "-C", p.tree, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", previous, commit, "--", concepts).Output()
 	if err != nil {
@@ -283,7 +283,7 @@ func addedRegistryConcepts(ctx context.Context, p project, previous, commit stri
 	prefix := p.prefix + concepts + "/"
 	for _, path := range strings.Split(string(raw), "\x00") {
 		name, ok := strings.CutPrefix(path, prefix)
-		if !ok || strings.Contains(name, "/") || filepath.Ext(name) != ".yaml" {
+		if !ok || strings.Contains(name, "/") || filepath.Ext(name) != conceptExt {
 			continue
 		}
 		added = append(added, path)

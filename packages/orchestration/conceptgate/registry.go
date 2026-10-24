@@ -55,9 +55,7 @@ type RefusedFile struct {
 }
 
 // Key is the refused file's name without its concepts/ prefix or .yaml suffix.
-func (r RefusedFile) Key() string {
-	return strings.TrimSuffix(strings.TrimPrefix(r.Path, "concepts/"), ".yaml")
-}
+func (r RefusedFile) Key() string { return conceptKey(r.Path) }
 
 // Defect is a registry inconsistency that does not prevent the gate or refresh from using the registry.
 type Defect struct {
@@ -103,6 +101,22 @@ func Key(c Concept) string {
 	}
 	return c.Name
 }
+
+// The registry's layout: the file of the concept with key k is concepts/k.yaml below the registry directory, and
+// the loader reads only the .yaml files directly in concepts/.
+const (
+	conceptsDir = "concepts"
+	conceptExt  = ".yaml"
+)
+
+// conceptPath is the registry-relative, slash-separated path of the concept file with key.
+func conceptPath(key string) string { return conceptsDir + "/" + key + conceptExt }
+
+// conceptFile is the registry-relative path of a concept's file, as Load names it in a defect.
+func conceptFile(c Concept) string { return conceptPath(Key(c)) }
+
+// conceptKey is the key of the concept file at file, a slash- or system-separated path: its name without .yaml.
+func conceptKey(file string) string { return strings.TrimSuffix(filepath.Base(file), conceptExt) }
 
 // checkForms refuses a form that is not one lambda term.
 func (c Concept) checkForms() error {
@@ -170,7 +184,7 @@ func Load(dir string) (Registry, []Defect, error) {
 	if err := dec.Decode(&r); err != nil {
 		return Registry{}, nil, fmt.Errorf("%s: %w", root, err)
 	}
-	concepts := filepath.Join(dir, "concepts")
+	concepts := filepath.Join(dir, conceptsDir)
 	entries, err := os.ReadDir(concepts)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -182,10 +196,10 @@ func Load(dir string) (Registry, []Defect, error) {
 	names := map[string]string{}
 	hashes := map[string]string{}
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yaml" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != conceptExt {
 			continue
 		}
-		relative := filepath.ToSlash(filepath.Join("concepts", entry.Name()))
+		relative := conceptsDir + "/" + entry.Name()
 		raw, err := os.ReadFile(filepath.Join(concepts, entry.Name()))
 		if err != nil {
 			return Registry{}, nil, err
@@ -203,7 +217,7 @@ func Load(dir string) (Registry, []Defect, error) {
 			r.Refused = append(r.Refused, RefusedFile{Path: relative, Name: held.Name, CompiledHash: held.CompiledHash, Defect: defect})
 			continue
 		}
-		expected := filepath.ToSlash(filepath.Join("concepts", Key(c)+".yaml"))
+		expected := conceptFile(c)
 		if relative != expected {
 			defects = append(defects, Defect{Path: relative, Message: "file is named " + relative + ", want " + expected})
 		}
@@ -224,7 +238,7 @@ func Load(dir string) (Registry, []Defect, error) {
 	for _, c := range r.Concepts {
 		if c.Extends != "" {
 			if _, ok := names[c.Extends]; !ok {
-				defects = append(defects, Defect{Path: filepath.ToSlash(filepath.Join("concepts", Key(c)+".yaml")), Message: "concept " + c.Name + " extends " + c.Extends + ", which is not registered"})
+				defects = append(defects, Defect{Path: conceptFile(c), Message: "concept " + c.Name + " extends " + c.Extends + ", which is not registered"})
 			}
 		}
 	}

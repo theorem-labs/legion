@@ -372,11 +372,8 @@ func (g *Gate) additionPath(key string) (string, error) {
 	if !filepath.IsLocal(filepath.FromSlash(g.AdditionRoot)) {
 		return "", fmt.Errorf("the registry's path in the repository, %q, is not a path inside it", g.AdditionRoot)
 	}
-	return path.Join(g.AdditionRoot, "concepts", key+".yaml"), nil
+	return path.Join(g.AdditionRoot, conceptPath(key)), nil
 }
-
-// conceptFile is the registry-relative path of a concept's file, as Load names it in a defect.
-func conceptFile(c Concept) string { return "concepts/" + Key(c) + ".yaml" }
 
 // sourceFailed says whether err is the failure of an untrusted source itself: refused by Lean's parser allow-list,
 // or rejected by Lean. Any other error is the gate's own inability.
