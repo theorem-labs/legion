@@ -2,6 +2,7 @@ package declindex
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,23 +131,19 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 			return nil, fmt.Errorf("contract name rule: %w", err)
 		}
 	}
+	var out []Found
 	rows, err := s.db.QueryContext(ctx, `SELECT d.name, d.short, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
 		FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.kind IN (`+placeholders(len(rule.Kinds))+`)
 		ORDER BY d.name, d.module`, anys(rule.Kinds)...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Found
-	for rows.Next() {
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var f Found
 		var short, rel string
-		if err := rows.Scan(&f.Name, &short, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
-			return nil, err
+		if err := r.Scan(&f.Name, &short, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
+			return err
 		}
 		f.Path = sourcePath(rel, f.Module)
 		if !name.MatchString(short) {
-			continue
+			return nil
 		}
 		for _, g := range globs {
 			if g.MatchString(f.Path) {
@@ -154,8 +151,12 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 				break
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // LedgerDefect is a contract whose hash in the ledger is not the index's hash at the index's commit: a landing
@@ -197,23 +198,16 @@ func (s *Store) ledgerDeclarations(ctx context.Context, names []string) (map[str
 		chunk := names[i:min(i+500, len(names))]
 		rows, err := s.db.QueryContext(ctx, `SELECT name, module, stmt_hash FROM decls WHERE name IN (`+
 			placeholders(len(chunk))+`)`, anys(chunk)...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
+		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var name string
 			var declaration ledgerDeclaration
-			if err := rows.Scan(&name, &declaration.module, &declaration.hash); err != nil {
-				rows.Close()
-				return nil, err
+			if err := r.Scan(&name, &declaration.module, &declaration.hash); err != nil {
+				return err
 			}
 			out[name] = append(out[name], declaration)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
+			return nil
+		})
+		if err != nil {
 			return nil, err
 		}
 	}

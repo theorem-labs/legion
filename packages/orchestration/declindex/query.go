@@ -27,24 +27,24 @@ func (f Found) At() string { return f.Path + ":" + strconv.Itoa(f.Line) }
 // declared in two namespaces gives both.
 func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 	short := q[strings.LastIndexByte(q, '.')+1:]
+	var out []Found
 	rows, err := s.db.QueryContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
 		FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.short = ?`, short)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Found
-	for rows.Next() {
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var f Found
 		var rel string
-		if err := rows.Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
-			return nil, err
+		if err := r.Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
+			return err
 		}
 		if f.Name != q && !strings.HasSuffix(f.Name, "."+q) {
-			continue
+			return nil
 		}
 		f.Path = sourcePath(rel, f.Module)
 		out = append(out, f)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Name != out[j].Name {
@@ -52,7 +52,7 @@ func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 		}
 		return out[i].Module < out[j].Module
 	})
-	return out, rows.Err()
+	return out, nil
 }
 
 func sourcePath(rel, module string) string {
@@ -121,19 +121,15 @@ func (s *Store) declared(ctx context.Context, q querier, names []string) (map[st
 	for i := 0; i < len(names); i += 500 {
 		chunk := names[i:min(i+500, len(names))]
 		rows, err := q.QueryContext(ctx, `SELECT name FROM decls WHERE name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
+		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var n string
-			if err := rows.Scan(&n); err != nil {
-				rows.Close()
-				return nil, err
+			if err := r.Scan(&n); err != nil {
+				return err
 			}
 			out[n] = true
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+			return nil
+		})
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -158,21 +154,17 @@ func anys(ss []string) []any {
 // source never declares (a structure's fields and constructor, equation lemmas). A use of `h.wp` is recorded as
 // `X.wp`; it is a use of X.
 func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT target FROM uses WHERE target >= ? AND target < ?`, name+".", name+"/")
-	if err != nil {
-		return nil, err
-	}
 	var cands []string
-	for rows.Next() {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT target FROM uses WHERE target >= ? AND target < ?`, name+".", name+"/")
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var t string
-		if err := rows.Scan(&t); err != nil {
-			rows.Close()
-			return nil, err
+		if err := r.Scan(&t); err != nil {
+			return err
 		}
 		cands = append(cands, t)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	declared, err := s.declared(ctx, s.db, cands)
@@ -190,19 +182,15 @@ func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 		chunk := keys[i:min(i+500, len(keys))]
 		rows, err := s.db.QueryContext(ctx, `SELECT module, line, col, parent, cls FROM uses WHERE target IN (`+
 			placeholders(len(chunk))+`)`, anys(chunk)...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
+		err = eachRow(rows, err, func(r *sql.Rows) error {
 			u := useRow{target: name}
-			if err := rows.Scan(&u.module, &u.line, &u.col, &u.parent, &u.class); err != nil {
-				rows.Close()
-				return nil, err
+			if err := r.Scan(&u.module, &u.line, &u.col, &u.parent, &u.class); err != nil {
+				return err
 			}
 			out = append(out, u)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+			return nil
+		})
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -218,23 +206,20 @@ type paths struct {
 
 func (p *paths) of(ctx context.Context, module string) (string, error) {
 	if p.cache == nil {
+		cache := map[string]string{}
 		rows, err := p.s.db.QueryContext(ctx, `SELECT module, rel FROM modules`)
+		err = eachRow(rows, err, func(r *sql.Rows) error {
+			var m, rel string
+			if err := r.Scan(&m, &rel); err != nil {
+				return err
+			}
+			cache[m] = sourcePath(rel, m)
+			return nil
+		})
 		if err != nil {
 			return "", err
 		}
-		p.cache = map[string]string{}
-		for rows.Next() {
-			var m, rel string
-			if err := rows.Scan(&m, &rel); err != nil {
-				rows.Close()
-				return "", err
-			}
-			p.cache[m] = sourcePath(rel, m)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return "", err
-		}
+		p.cache = cache
 	}
 	if v, ok := p.cache[module]; ok {
 		return v, nil

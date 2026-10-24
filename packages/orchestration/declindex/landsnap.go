@@ -61,56 +61,44 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 		return LandSnapshot{}, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT path, blob FROM sources`)
-	if err != nil {
-		return LandSnapshot{}, err
-	}
-	for rows.Next() {
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var path, blob string
-		if err := rows.Scan(&path, &blob); err != nil {
-			rows.Close()
-			return LandSnapshot{}, err
+		if err := r.Scan(&path, &blob); err != nil {
+			return err
 		}
 		snapshot.Sources[path] = blob
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return LandSnapshot{}, err
 	}
 	rows, err = tx.QueryContext(ctx, `SELECT rel, module FROM modules`)
-	if err != nil {
-		return LandSnapshot{}, err
-	}
-	for rows.Next() {
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var module LandModule
-		if err := rows.Scan(&module.Rel, &module.Module); err != nil {
-			rows.Close()
-			return LandSnapshot{}, err
+		if err := r.Scan(&module.Rel, &module.Module); err != nil {
+			return err
 		}
 		snapshot.Modules[module.Rel] = module
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return LandSnapshot{}, err
 	}
 	for i := 0; i < len(names); i += 500 {
 		chunk := names[i:min(i+500, len(names))]
 		rows, err = tx.QueryContext(ctx, `SELECT d.name, d.module, d.stmt_hash, COALESCE(m.rel, '')
 			FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
-		if err != nil {
-			return LandSnapshot{}, err
-		}
-		for rows.Next() {
+		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var declaration LandDeclaration
 			var rel string
-			if err := rows.Scan(&declaration.Name, &declaration.Module, &declaration.StmtHash, &rel); err != nil {
-				rows.Close()
-				return LandSnapshot{}, err
+			if err := r.Scan(&declaration.Name, &declaration.Module, &declaration.StmtHash, &rel); err != nil {
+				return err
 			}
 			declaration.Path = sourcePath(rel, declaration.Module)
 			snapshot.Declarations[declaration.Name] = append(snapshot.Declarations[declaration.Name], declaration)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+			return nil
+		})
+		if err != nil {
 			return LandSnapshot{}, err
 		}
 	}

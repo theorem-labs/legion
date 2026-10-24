@@ -3,6 +3,7 @@ package declindex
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -47,19 +48,15 @@ func (g *graph) id(name string) (uint32, bool) {
 func buildGraph(ctx context.Context, q querier) (*graph, error) {
 	declared := map[string]bool{}
 	rows, err := q.QueryContext(ctx, `SELECT name FROM decls`)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return nil, err
+		if err := r.Scan(&n); err != nil {
+			return err
 		}
 		declared[n] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	owner := map[string]string{}
@@ -82,31 +79,27 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 		owner[t] = o
 		return o
 	}
-	rows, err = q.QueryContext(ctx, `SELECT target, dst, module, `+propagates+` FROM edges e`)
-	if err != nil {
-		return nil, err
-	}
 	type edge struct {
 		src, dst, mod string
 		prop          bool
 	}
 	var edges []edge
 	nameSet, modSet := map[string]bool{}, map[string]bool{}
-	for rows.Next() {
+	rows, err = q.QueryContext(ctx, `SELECT target, dst, module, `+propagates+` FROM edges e`)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var e edge
 		var target string
-		if err := rows.Scan(&target, &e.dst, &e.mod, &e.prop); err != nil {
-			rows.Close()
-			return nil, err
+		if err := r.Scan(&target, &e.dst, &e.mod, &e.prop); err != nil {
+			return err
 		}
 		if e.src = own(target); e.src == e.dst {
-			continue
+			return nil
 		}
 		nameSet[e.src], nameSet[e.dst], modSet[e.mod] = true, true, true
 		edges = append(edges, e)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	g := &graph{names: keys(nameSet), modules: keys(modSet)}

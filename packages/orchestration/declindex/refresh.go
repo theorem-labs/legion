@@ -156,38 +156,38 @@ func parallel(n, jobs int, f func(int)) {
 type stored struct{ module, ileanKey, oleanKey string }
 
 func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
+	out := map[string]stored{}
 	rows, err := s.db.QueryContext(ctx, `SELECT rel, module, ilean_key, olean_key FROM modules`)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var rel string
+		var st stored
+		if err := r.Scan(&rel, &st.module, &st.ileanKey, &st.oleanKey); err != nil {
+			return err
+		}
+		out[rel] = st
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := map[string]stored{}
-	for rows.Next() {
-		var rel string
-		var st stored
-		if err := rows.Scan(&rel, &st.module, &st.ileanKey, &st.oleanKey); err != nil {
-			return nil, err
-		}
-		out[rel] = st
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *Store) storedSources(ctx context.Context) (map[string]string, error) {
+	out := map[string]string{}
 	rows, err := s.db.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var path, blob string
+		if err := r.Scan(&path, &blob); err != nil {
+			return err
+		}
+		out[path] = blob
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := map[string]string{}
-	for rows.Next() {
-		var path, blob string
-		if err := rows.Scan(&path, &blob); err != nil {
-			return nil, err
-		}
-		out[path] = blob
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func logf(w io.Writer, format string, args ...any) {

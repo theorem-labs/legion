@@ -100,21 +100,17 @@ func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, ext
 // SameCompiled lists the declarations (generated constants counted as their declaration) whose compiled
 // statement hash is hash: exact restatements.
 func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name FROM consts WHERE cstmt = ? ORDER BY name`, hash)
-	if err != nil {
-		return nil, err
-	}
 	var names []string
-	for rows.Next() {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM consts WHERE cstmt = ? ORDER BY name`, hash)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return nil, err
+		if err := r.Scan(&n); err != nil {
+			return err
 		}
 		names = append(names, n)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	o := &owners{s: s, cache: map[string]Found{}}
@@ -276,19 +272,15 @@ func (s *Store) defHashes(ctx context.Context, modules []string) (map[string]str
 		chunk := modules[i:min(i+500, len(modules))]
 		rows, err := s.db.QueryContext(ctx, `SELECT name, cstmt FROM consts WHERE kind = 'def' AND module IN (`+
 			placeholders(len(chunk))+`)`, anys(chunk)...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
+		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var n, h string
-			if err := rows.Scan(&n, &h); err != nil {
-				rows.Close()
-				return nil, err
+			if err := r.Scan(&n, &h); err != nil {
+				return err
 			}
 			out[n] = h
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+			return nil
+		})
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -369,31 +361,27 @@ func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
 		return c, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT atom FROM atoms WHERE name = ? ORDER BY atom`, name)
-	if err != nil {
-		return c, err
-	}
-	for rows.Next() {
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var a string
-		if err := rows.Scan(&a); err != nil {
-			rows.Close()
-			return c, err
+		if err := r.Scan(&a); err != nil {
+			return err
 		}
 		c.Atoms = append(c.Atoms, a)
-	}
-	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT concept, how FROM facts WHERE name = ? ORDER BY concept, how`, name)
+		return nil
+	})
 	if err != nil {
 		return c, err
 	}
-	defer rows.Close()
-	for rows.Next() {
+	rows, err = s.db.QueryContext(ctx, `SELECT concept, how FROM facts WHERE name = ? ORDER BY concept, how`, name)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var f Fact
-		if err := rows.Scan(&f.Concept, &f.How); err != nil {
-			return c, err
+		if err := r.Scan(&f.Concept, &f.How); err != nil {
+			return err
 		}
 		c.Facts = append(c.Facts, f)
-	}
-	return c, rows.Err()
+		return nil
+	})
+	return c, err
 }
 
 // owners maps constant names to the declarations they belong to: the longest declared name each extends
@@ -423,23 +411,19 @@ func (o *owners) preload(ctx context.Context, names []string) error {
 		chunk := list[i:min(i+500, len(list))]
 		rows, err := o.s.db.QueryContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
 			FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
+		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var f Found
 			var rel string
-			if err := rows.Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
-				rows.Close()
+			if err := r.Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
 				return err
 			}
 			f.Path = sourcePath(rel, f.Module)
 			if _, ok := found[f.Name]; !ok {
 				found[f.Name] = f
 			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+			return nil
+		})
+		if err != nil {
 			return err
 		}
 	}
@@ -500,22 +484,18 @@ type Stating struct {
 
 // States lists the statements that state a concept's fact, directly, through a definition, or by using it.
 func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, module, how FROM facts WHERE concept = ? ORDER BY module, name, how`, concept)
-	if err != nil {
-		return nil, err
-	}
 	type row struct{ name, module, how string }
 	var rs []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.name, &r.module, &r.how); err != nil {
-			rows.Close()
-			return nil, err
+	rows, err := s.db.QueryContext(ctx, `SELECT name, module, how FROM facts WHERE concept = ? ORDER BY module, name, how`, concept)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var x row
+		if err := r.Scan(&x.name, &x.module, &x.how); err != nil {
+			return err
 		}
-		rs = append(rs, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		rs = append(rs, x)
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	o := &owners{s: s, cache: map[string]Found{}}
@@ -544,22 +524,18 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 // SameAtoms lists the declarations whose statements share a relation atom with name's statement: who else
 // states one of its facts in the same form.
 func (s *Store) SameAtoms(ctx context.Context, name string) ([]string, error) {
+	var names []string
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT b.name FROM atoms a JOIN atoms b ON b.atom = a.atom
 		WHERE a.name = ? AND b.name <> a.name`, name)
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for rows.Next() {
+	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return nil, err
+		if err := r.Scan(&n); err != nil {
+			return err
 		}
 		names = append(names, n)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	o := &owners{s: s, cache: map[string]Found{}}
