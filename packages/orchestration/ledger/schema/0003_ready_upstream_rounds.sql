@@ -1,10 +1,8 @@
--- Ready migration records are the exact landing inputs an owner declared. A later ready replaces the record;
--- a takeover, extension, abandonment or failed landing round clears all ready columns together.
+-- A ready migration's record is the exact statement records an owner declared for its landing. A later ready replaces
+-- it; a takeover, extension, abandonment or failed landing round clears all ready columns together.
 ALTER TABLE migrations
-    ADD COLUMN ready_head text,
     ADD COLUMN ready_at timestamptz,
     ADD COLUMN ready_event bigint,
-    ADD COLUMN ready_changed_contracts jsonb,
     ADD COLUMN ready_records jsonb;
 CREATE INDEX migrations_ready_event ON migrations (repo, ready_event) WHERE ready_event IS NOT NULL;
 

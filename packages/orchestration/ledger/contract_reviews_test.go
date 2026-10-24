@@ -64,18 +64,7 @@ func TestPerContractReviews(t *testing.T) {
 				changes[name] = "hash-2"
 			}
 			migration := must(open(t, s, "M-1", "alice", []string{"a.lean"}, reads))
-			request := ledger.LandRequest{
-				Repo:             "r",
-				Migration:        migration.ID,
-				Generation:       migration.Generation,
-				Commit:           "commit-1",
-				ChangedPaths:     []string{"a.lean"},
-				Current:          reads,
-				ChangedContracts: changes,
-				Head:             "head-1",
-				ReviewedHead:     test.reviewedHead,
-				Reviews:          test.reviews,
-			}
+			request := ledger.LandRequest{Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-1", ChangedPaths: []string{"a.lean"}, Current: reads, StatementRecords: ledger.StatementRecords{ChangedContracts: changes, Head: "head-1", ReviewedHead: test.reviewedHead, Reviews: test.reviews}}
 			check := must(s.Check(ctx, checkRequestFor(request)))
 			if test.wantRefusal {
 				if check.Pass || len(check.Violations) != 1 || check.Violations[0].Kind != ledger.ReasonStatementUnreviewed {
@@ -110,13 +99,8 @@ func TestUpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
 	must(s.EnsureRepoWithUpstreamOwner(ctx, "r", 3, "upstream"))
 
 	denied := must(open(t, s, "M-denied", "alice", []string{"a.lean"}, nil))
-	deniedRequest := ledger.LandRequest{
-		Repo: "r", Migration: denied.ID, Generation: denied.Generation, Commit: "commit-denied",
-		ChangedPaths: []string{"a.lean"}, Current: map[string]string{}, Upstream: "upstream-commit",
-	}
-	_, err := s.Ready(ctx, ledger.ReadyRequest{
-		Repo: "r", ID: denied.ID, Generation: denied.Generation, Head: "head-denied", Upstream: "upstream-commit",
-	})
+	deniedRequest := ledger.LandRequest{Repo: "r", Migration: denied.ID, Generation: denied.Generation, Commit: "commit-denied", ChangedPaths: []string{"a.lean"}, Current: map[string]string{}, StatementRecords: ledger.StatementRecords{Upstream: "upstream-commit"}}
+	_, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: denied.ID, Generation: denied.Generation, StatementRecords: ledger.StatementRecords{Head: "head-denied", Upstream: "upstream-commit"}})
 	wantRefusal(t, err, ledger.ReasonUpstreamNotAllowed)
 	deniedCheck := must(s.Check(ctx, checkRequestFor(deniedRequest)))
 	if deniedCheck.Pass || len(deniedCheck.Violations) != 1 || deniedCheck.Violations[0].Kind != ledger.ReasonUpstreamNotAllowed {
@@ -126,15 +110,8 @@ func TestUpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
 
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 	unreviewed := must(open(t, s, "M-unreviewed", "upstream", []string{"b.lean"}, map[string]string{"C": "hash-1"}))
-	unreviewedRequest := ledger.LandRequest{
-		Repo: "r", Migration: unreviewed.ID, Generation: unreviewed.Generation, Commit: "commit-unreviewed",
-		ChangedPaths: []string{"b.lean"}, Current: map[string]string{"C": "hash-1"}, ChangedContracts: map[string]string{"C": "hash-2"},
-		Head: "head-unreviewed", Upstream: "upstream-commit",
-	}
-	if _, err := s.Ready(ctx, ledger.ReadyRequest{
-		Repo: "r", ID: unreviewed.ID, Generation: unreviewed.Generation, Head: "head-unreviewed",
-		ChangedContracts: map[string]string{"C": "hash-2"}, Upstream: "upstream-commit",
-	}); err != nil {
+	unreviewedRequest := ledger.LandRequest{Repo: "r", Migration: unreviewed.ID, Generation: unreviewed.Generation, Commit: "commit-unreviewed", ChangedPaths: []string{"b.lean"}, Current: map[string]string{"C": "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-2"}, Head: "head-unreviewed", Upstream: "upstream-commit"}}
+	if _, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: unreviewed.ID, Generation: unreviewed.Generation, StatementRecords: ledger.StatementRecords{Head: "head-unreviewed", ChangedContracts: map[string]string{"C": "hash-2"}, Upstream: "upstream-commit"}}); err != nil {
 		t.Fatalf("ready accepts upstream owner provenance: %v", err)
 	}
 	unreviewedCheck := must(s.Check(ctx, checkRequestFor(unreviewedRequest)))
@@ -145,11 +122,7 @@ func TestUpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
 
 	must(s.RegisterContract(ctx, "r", "P", "alice", "hash-p1", true))
 	pinned := must(open(t, s, "M-pinned", "upstream", []string{"c.lean"}, map[string]string{"P": "hash-p1"}))
-	pinnedRequest := ledger.LandRequest{
-		Repo: "r", Migration: pinned.ID, Generation: pinned.Generation, Commit: "commit-pinned",
-		ChangedPaths: []string{"c.lean"}, Current: map[string]string{"P": "hash-p1"}, ChangedContracts: map[string]string{"P": "hash-p2"},
-		Head: "head-pinned", Upstream: "upstream-commit", Reviews: []ledger.Review{{Contract: "P", Reviewer: "alice", Head: "head-pinned"}},
-	}
+	pinnedRequest := ledger.LandRequest{Repo: "r", Migration: pinned.ID, Generation: pinned.Generation, Commit: "commit-pinned", ChangedPaths: []string{"c.lean"}, Current: map[string]string{"P": "hash-p1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"P": "hash-p2"}, Head: "head-pinned", Upstream: "upstream-commit", Reviews: []ledger.Review{{Contract: "P", Reviewer: "alice", Head: "head-pinned"}}}}
 	pinnedCheck := must(s.Check(ctx, checkRequestFor(pinnedRequest)))
 	if pinnedCheck.Pass || len(pinnedCheck.Violations) != 1 || pinnedCheck.Violations[0].Kind != ledger.ReasonPinned {
 		t.Fatalf("pinned upstream check: %+v", pinnedCheck)
@@ -277,11 +250,7 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 			}
 			must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 			migration := must(open(t, s, test.migration, test.owner, []string{"a.lean"}, map[string]string{"C": "hash-1"}))
-			request := ledger.LandRequest{
-				Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-1",
-				ChangedPaths: []string{"a.lean"}, Current: map[string]string{"C": "hash-1"}, ChangedContracts: map[string]string{"C": "hash-2"},
-				Head: "head-1", CompatibilityProof: test.proof, Reviews: test.reviews, ReviewedHead: test.reviewed, Upstream: test.upstream,
-			}
+			request := ledger.LandRequest{Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-1", ChangedPaths: []string{"a.lean"}, Current: map[string]string{"C": "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-2"}, Head: "head-1", CompatibilityProof: test.proof, Reviews: test.reviews, ReviewedHead: test.reviewed, Upstream: test.upstream}}
 			if _, err := s.Land(ctx, request); err != nil {
 				t.Fatal(err)
 			}
@@ -319,12 +288,7 @@ func TestContractJSONReadsBack(t *testing.T) {
 		must(s.RegisterContract(ctx, "r", change.name, "alice", "hash-1", false))
 		migration := must(open(t, s, "M-"+change.name, change.owner, []string{change.name + ".lean"},
 			map[string]string{change.name: "hash-1"}))
-		must(s.Land(ctx, ledger.LandRequest{
-			Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-" + change.name,
-			ChangedPaths: []string{change.name + ".lean"}, Current: map[string]string{change.name: "hash-1"},
-			ChangedContracts: map[string]string{change.name: "hash-2"}, Head: "head-" + change.name,
-			CompatibilityProof: change.proof, ReviewedHead: change.reviewed, Reviews: change.reviews, Upstream: change.upstream,
-		}))
+		must(s.Land(ctx, ledger.LandRequest{Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-" + change.name, ChangedPaths: []string{change.name + ".lean"}, Current: map[string]string{change.name: "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{change.name: "hash-2"}, Head: "head-" + change.name, CompatibilityProof: change.proof, ReviewedHead: change.reviewed, Reviews: change.reviews, Upstream: change.upstream}}))
 	}
 	must(s.RegisterContract(ctx, "r", "Unchanged", "alice", "hash-1", false))
 
@@ -359,14 +323,10 @@ func TestMixedOwnersRecordEachExplicitReview(t *testing.T) {
 	must(s.RegisterContract(ctx, "r", "D", "bob", "hash-1", false))
 	reads := map[string]string{"C": "hash-1", "D": "hash-1"}
 	migration := must(open(t, s, "M-mixed", "alice", []string{"a.lean"}, reads))
-	request := ledger.LandRequest{
-		Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-1",
-		ChangedPaths: []string{"a.lean"}, Current: reads, ChangedContracts: map[string]string{"C": "hash-2", "D": "hash-2"},
-		Head: "head-1", ReviewedHead: "head-1", Reviews: []ledger.Review{
-			{Contract: "D", Reviewer: "bob", Head: "head-1"},
-			{Contract: "C", Reviewer: "alice", Head: "head-1"},
-		},
-	}
+	request := ledger.LandRequest{Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-1", ChangedPaths: []string{"a.lean"}, Current: reads, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-2", "D": "hash-2"}, Head: "head-1", ReviewedHead: "head-1", Reviews: []ledger.Review{
+		{Contract: "D", Reviewer: "bob", Head: "head-1"},
+		{Contract: "C", Reviewer: "alice", Head: "head-1"},
+	}}}
 	if check := must(s.Check(ctx, checkRequestFor(request))); !check.Pass {
 		t.Fatalf("check of a mixed-owner change with each owner's review: %+v", check)
 	}
@@ -388,12 +348,7 @@ func TestMixedOwnersRecordEachExplicitReview(t *testing.T) {
 }
 
 func checkRequestFor(request ledger.LandRequest) ledger.CheckRequest {
-	return ledger.CheckRequest{
-		Repo: request.Repo, ID: request.Migration, Generation: request.Generation, Commit: request.Commit,
-		Changed: request.ChangedPaths, Current: request.Current, ChangedContracts: request.ChangedContracts,
-		ApprovedPinned: request.ApprovedPinned, Head: request.Head, CompatibilityProof: request.CompatibilityProof,
-		ReviewedHead: request.ReviewedHead, Reviews: request.Reviews, Upstream: request.Upstream,
-	}
+	return ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: request.Repo, Migration: request.Migration, Generation: request.Generation, Commit: request.Commit, ChangedPaths: request.ChangedPaths, Current: request.Current, StatementRecords: ledger.StatementRecords{ChangedContracts: request.ChangedContracts, ApprovedPinned: request.ApprovedPinned, Head: request.Head, CompatibilityProof: request.CompatibilityProof, ReviewedHead: request.ReviewedHead, Reviews: request.Reviews, Upstream: request.Upstream}}}
 }
 
 func landError(s *ledger.Store, request ledger.LandRequest) error {

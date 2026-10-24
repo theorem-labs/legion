@@ -192,7 +192,10 @@ func TestReadyRecordsPrintEmptyCollectionsInBothForms(t *testing.T) {
 	}
 }
 
-func TestReadyFlagsRejectNamesContainingDelimiters(t *testing.T) {
+// A flag value that cannot be split one way is a usage error that points to the request file, as it is for check and
+// land: a second = in a changed contract, and an @ in a review's contract name. A name with @ in a changed contract or
+// an approved pinned contract splits one way, so ready takes it, as check and land do.
+func TestReadyFlagsRejectAmbiguousDelimiters(t *testing.T) {
 	dsn := testpg.Database(t, "ledger_ready_delimiters")
 	getenv := func(key string) string {
 		if key == "LEDGER_DSN" {
@@ -212,13 +215,15 @@ func TestReadyFlagsRejectNamesContainingDelimiters(t *testing.T) {
 		t.Fatalf("open: code=%d stderr=%q", code, stderr)
 	}
 	for _, args := range [][]string{
-		{"ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C@name=hash"},
 		{"ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C=name=hash"},
 		{"ready", "r", "M-1", "1", "--head", "head", "--review", "C@name=alice@head"},
-		{"ready", "r", "M-1", "1", "--head", "head", "--approved-pinned", "C@name"},
 	} {
 		if code, stderr := call(args...); code != 2 || !strings.Contains(stderr, "request-file") {
 			t.Fatalf("%v: code=%d stderr=%q; want delimiter usage refusal", args, code, stderr)
 		}
+	}
+	if code, stderr := call("ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C@name=hash",
+		"--approved-pinned", "C@name"); code != 0 {
+		t.Fatalf("names with @: code=%d stderr=%q; want them taken as check and land take them", code, stderr)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -94,5 +95,48 @@ func TestCheckRetriedAfterADeadlockReportsOneAttempt(t *testing.T) {
 	}
 	if !reflect.DeepEqual(recorded, [][]string{want}) {
 		t.Fatalf("migration.checked events record %v, want one event with %v", recorded, want)
+	}
+}
+
+// TestCheckSharesTheContractsItReads catches a check that takes its read contracts for update. A session that holds
+// contract C under a share lock, as a running check does, must not block a check of another migration that read C;
+// a session that holds C for update, as a landing does, must.
+func TestCheckSharesTheContractsItReads(t *testing.T) {
+	s, dsn := newStoreDSN(t)
+	ctx := context.Background()
+	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
+	m := must(open(t, s, "M-1", "alice", []string{"a.lean"}, map[string]string{"C": "hash-1"}))
+	request := checkRequestFor(landRequest(m, "c", []string{"a.lean"}, map[string]string{"C": "hash-1"}, nil, nil))
+
+	locker := must(pgx.Connect(ctx, dsn))
+	defer locker.Close(ctx)
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	shared := must(locker.Begin(ctx))
+	must(shared.Exec(ctx, `SELECT 1 FROM contracts WHERE repo = 'r' AND name = 'C' FOR SHARE`))
+	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	res, err := s.Check(bounded, request)
+	if err != nil || !res.Pass {
+		t.Fatalf("check beside a contract another session shares: %+v, %v; want a pass without waiting", res, err)
+	}
+	if err := shared.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	exclusive := must(locker.Begin(ctx))
+	defer func() { _ = exclusive.Rollback(ctx) }()
+	must(exclusive.Exec(ctx, `SELECT 1 FROM contracts WHERE repo = 'r' AND name = 'C' FOR UPDATE`))
+	checked := make(chan error, 1)
+	go func() {
+		_, err := s.Check(ctx, request)
+		checked <- err
+	}()
+	waitForBlockedConnections(t, observer, 1)
+	if err := exclusive.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-checked; err != nil {
+		t.Fatal(err)
 	}
 }

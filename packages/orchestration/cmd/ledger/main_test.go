@@ -425,14 +425,14 @@ func TestDeferredCheckExitsFiveAndRequestFilesRejectUnknownFields(t *testing.T) 
 	assertIncomplete(code, stdout, stderr)
 
 	request := filepath.Join(t.TempDir(), "check.json")
-	if err := os.WriteFile(request, []byte(`{"repo":"r","id":"M-1","generation":1,"commit":"candidate","changed":["a.lean"],"defer_reads":true}`), 0o600); err != nil {
+	if err := os.WriteFile(request, []byte(`{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a.lean"],"defer_reads":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	code, stdout, stderr = call("--json", "check", "--request-file", request)
 	assertIncomplete(code, stdout, stderr)
 
 	unknown := filepath.Join(t.TempDir(), "unknown.json")
-	if err := os.WriteFile(unknown, []byte(`{"repo":"r","id":"M-1","generation":1,"commit":"candidate","changed":["a.lean"],"unknown":true}`), 0o600); err != nil {
+	if err := os.WriteFile(unknown, []byte(`{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a.lean"],"unknown":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if code, _, stderr := call("check", "--request-file", unknown); code != 2 || !strings.Contains(stderr, "unknown field") {
@@ -586,7 +586,7 @@ func TestJSONRequestFilesPreserveEqualsNamesAndHashes(t *testing.T) {
 	invoke("open", "--request-file", openFile)
 	extendFile := writeRequest("extend.json", `{"repo":"r","id":"M-1","generation":1,"writes":["b=c.lean"],"reads":{}}`)
 	invoke("extend", "--request-file", extendFile)
-	checkFile := writeRequest("check.json", `{"repo":"r","id":"M-1","generation":1,"commit":"candidate","changed":["a=b.lean","b=c.lean"],"current":{"A=B":"h=1"}}`)
+	checkFile := writeRequest("check.json", `{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a=b.lean","b=c.lean"],"current":{"A=B":"h=1"}}`)
 	check := invoke("--json", "check", "--request-file", checkFile)
 	var checked struct {
 		Pass bool `json:"pass"`
@@ -906,7 +906,7 @@ func TestStatementRecordsRoundTripThroughRequestFiles(t *testing.T) {
 		{"a review at another head", `"head":"h=ead","reviewed_head":"other"`, false, "statement_unreviewed"},
 		{"a review with no head", `"reviewed_head":"h=ead"`, false, "invalid_candidate"},
 	} {
-		check := writeRequest(fmt.Sprintf("check-%d.json", i), `{"repo":"r","id":"M-1","generation":1,"commit":"candidate","changed":["a.lean"],`+
+		check := writeRequest(fmt.Sprintf("check-%d.json", i), `{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a.lean"],`+
 			`"current":{"A=B":"h=1","X":"x"},"changed_contracts":{"A=B":"h=2"},`+test.records+`}`)
 		code, stdout, stderr := call("--json", "check", "--request-file", check)
 		if test.pass {

@@ -17,29 +17,108 @@ const (
 	CheckOutcomeIncomplete = "incomplete"
 )
 
-// CheckRequest asks whether a candidate change may land for a migration.
-type CheckRequest struct {
+// StatementRecords are the records a candidate carries for its statement change, the same in a ready record, a check
+// and a landing: the changed contracts with their new statement hashes, the head the landing program built, the
+// records that clear the change, the pinned contracts a person approved, and an upstream commit as provenance.
+type StatementRecords struct {
+	ChangedContracts map[string]string `json:"changed_contracts"`
+	// Head is the member's branch head that the landing program built. A statement change requires it.
+	Head string `json:"head"`
+	// CompatibilityProof is the fully qualified name of a declaration that proves that each changed contract gives
+	// its callers all that the old one gave.
+	CompatibilityProof string `json:"compatibility_proof"`
+	// ReviewedHead is the commit at which an agent's review of the change passed.
+	ReviewedHead string   `json:"reviewed_head"`
+	Reviews      []Review `json:"reviews"`
+	// ApprovedPinned names pinned contracts with a person's approval to change.
+	ApprovedPinned []string `json:"approved_pinned"`
+	Upstream       string   `json:"upstream"`
+}
+
+// validate checks the records' shape, which ready, check and land share: a changed contract has a name and a hash, a
+// review has all three fields, an approved pinned contract has a name, and no value has leading or trailing
+// whitespace.
+func (r StatementRecords) validate() error {
+	for name, hash := range r.ChangedContracts {
+		if err := checkRecord("changed contract name", name, true); err != nil {
+			return err
+		}
+		if err := checkRecord("changed contract hash", hash, true); err != nil {
+			return err
+		}
+	}
+	for _, record := range []struct{ label, value string }{
+		{"head", r.Head}, {"compatibility proof", r.CompatibilityProof}, {"reviewed head", r.ReviewedHead}, {"upstream", r.Upstream},
+	} {
+		if err := checkRecord(record.label, record.value, false); err != nil {
+			return err
+		}
+	}
+	for _, review := range r.Reviews {
+		for _, field := range []struct{ label, value string }{
+			{"review contract", review.Contract}, {"reviewer", review.Reviewer}, {"review head", review.Head},
+		} {
+			if err := checkRecord(field.label, field.value, true); err != nil {
+				return err
+			}
+		}
+	}
+	for _, name := range r.ApprovedPinned {
+		if err := checkRecord("approved pinned name", name, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkRecord(label, value string, required bool) error {
+	trimmed := strings.TrimSpace(value)
+	if required && trimmed == "" {
+		return invalid("%s is empty", label)
+	}
+	if trimmed != value {
+		return invalid("%s %q has leading or trailing whitespace", label, value)
+	}
+	return nil
+}
+
+// withEmptyLists gives absent lists and maps their empty value, so a stored record has one shape whether its request
+// came from flags or from JSON.
+func (r StatementRecords) withEmptyLists() StatementRecords {
+	if r.ChangedContracts == nil {
+		r.ChangedContracts = map[string]string{}
+	}
+	if r.Reviews == nil {
+		r.Reviews = []Review{}
+	}
+	if r.ApprovedPinned == nil {
+		r.ApprovedPinned = []string{}
+	}
+	return r
+}
+
+// LandRequest is the candidate that Land validates and closes: a migration at its generation, the commit that lands,
+// the paths it changes, the current hash of each declared read, and its statement records.
+type LandRequest struct {
 	Repo       string `json:"repo"`
-	ID         string `json:"id"`
+	Migration  string `json:"migration"`
 	Generation int64  `json:"generation"`
 	Commit     string `json:"commit"`
-	// Changed is every path the candidate adds, modifies or deletes, relative to the repository root.
-	Changed []string `json:"changed"`
+	// ChangedPaths is every path the candidate adds, modifies or deletes, relative to the repository root.
+	ChangedPaths []string `json:"changed_paths"`
 	// Current maps a read's name to its statement hash in the candidate's base. An empty hash means the statement
 	// no longer exists; a name missing from the map was not hashed, so that read cannot be decided.
 	Current map[string]string `json:"current"`
-	// ApprovedPinned names pinned contracts with a person's approval to change.
-	ApprovedPinned []string `json:"approved_pinned"`
-	// DeferReads omits read-hash checks for a pre-build candidate. It can only produce an incomplete result.
+	StatementRecords
+}
+
+// CheckRequest asks whether a candidate may land. It is the LandRequest that Land would receive, so one request file
+// serves both commands.
+type CheckRequest struct {
+	LandRequest
+	// DeferReads omits the comparison of the candidate's read hashes and the landed commit, for a check before the
+	// build. It can only produce a refused or an incomplete result.
 	DeferReads bool `json:"defer_reads"`
-	// ChangedContracts and its statement records are the same as Land receives, under the same rules: changed
-	// contracts need Head, even with a compatibility proof, or the candidate is invalid_candidate.
-	ChangedContracts   map[string]string `json:"changed_contracts"`
-	Head               string            `json:"head"`
-	CompatibilityProof string            `json:"compatibility_proof"`
-	ReviewedHead       string            `json:"reviewed_head"`
-	Reviews            []Review          `json:"reviews"`
-	Upstream           string            `json:"upstream"`
 }
 
 // Violation is one reason a candidate must not land. Kind is the refusal reason (a Reason constant) that Land gives for
@@ -55,7 +134,7 @@ type Violation struct {
 }
 
 // CheckResult is the landing decision. Outcome is pass, refused, or incomplete. Pass is true only for pass.
-// Deferred lists declared reads that a deferred check intentionally did not validate.
+// Deferred lists declared reads whose hashes a deferred check intentionally did not compare.
 type CheckResult struct {
 	Migration  string      `json:"migration"`
 	Generation int64       `json:"generation"`
@@ -65,229 +144,41 @@ type CheckResult struct {
 	Violations []Violation `json:"violations"`
 }
 
-// checkStatementChange validates a candidate's changed contracts and the records that clear its statement change, as
-// Land and Check receive them. A record is either absent ("") or a value with no surrounding whitespace.
-func checkStatementChange(changes map[string]string, head, proof, reviewed string, reviews []Review, upstream string) error {
-	for name, hash := range changes {
-		if strings.TrimSpace(name) == "" || strings.TrimSpace(hash) == "" {
-			return invalid("changed contracts need a name and a statement hash")
-		}
-	}
-	for _, record := range []struct{ name, value string }{
-		{"head", head}, {"compatibility proof", proof}, {"reviewed head", reviewed}, {"upstream", upstream},
-	} {
-		if record.value != strings.TrimSpace(record.value) {
-			return invalid("%s %q is blank or has leading or trailing whitespace", record.name, record.value)
-		}
-	}
-	for _, review := range reviews {
-		for _, field := range []struct{ name, value string }{
-			{"review contract", review.Contract}, {"reviewer", review.Reviewer}, {"review head", review.Head},
-		} {
-			if strings.TrimSpace(field.value) == "" || field.value != strings.TrimSpace(field.value) {
-				return invalid("%s %q is blank or has leading or trailing whitespace", field.name, field.value)
-			}
-		}
-	}
-	return nil
-}
-
-func reviewClears(review Review, contract Contract, head string) bool {
-	return review.Contract == contract.Name && review.Reviewer == contract.Owner && review.Head == head
-}
-
-// statementUnreviewed explains which statement changes lack a compatibility proof or an owner review at head.
-func statementUnreviewed(contracts []Contract, head, proof, reviewed string, reviews []Review) (string, []string) {
-	if len(contracts) == 0 || proof != "" {
-		return "", nil
-	}
-	sameOwner := true
-	for _, contract := range contracts[1:] {
-		if contract.Owner != contracts[0].Owner {
-			sameOwner = false
-			break
-		}
-	}
-	cleared := make(map[string]struct{}, len(contracts))
-	if head != "" && reviewed == head && sameOwner {
-		for _, contract := range contracts {
-			cleared[contract.Name] = struct{}{}
-		}
-	}
-	for _, review := range reviews {
-		for _, contract := range contracts {
-			if reviewClears(review, contract, head) {
-				cleared[contract.Name] = struct{}{}
-			}
-		}
-	}
-	missing := make([]string, 0, len(contracts))
-	for _, contract := range contracts {
-		if _, ok := cleared[contract.Name]; !ok {
-			missing = append(missing, contract.Name)
-		}
-	}
-	if len(missing) == 0 {
-		return "", nil
-	}
-	subject := "contract " + missing[0] + " changes its statement"
-	if len(missing) > 1 {
-		subject = "contracts " + strings.Join(missing, ", ") + " change their statements"
-	}
-	at := "the head that lands"
-	if head != "" {
-		at = head
-	}
-	review := "no review"
-	switch {
-	case reviewed != "" && head != "" && reviewed != head:
-		review = "a review that passed at " + reviewed + ", not at " + head
-	case reviewed != "" && head != "" && !sameOwner:
-		review = "a reviewed head at " + reviewed + ", but it clears every changed contract only when they have the same owner"
-	case reviewed != "":
-		review = "a review that passed at " + reviewed + ", but no head to compare it with"
-	}
-	return fmt.Sprintf("%s; a statement change lands only with a compatibility proof or an agent's review at %s, "+
-		"and this one has no compatibility proof and %s", subject, at, review), missing
-}
-
-// statementViolations reports each changed registered contract that the candidate's records do not clear.
-func statementViolations(ctx context.Context, q querier, m Migration, req CheckRequest) ([]Violation, error) {
-	declared := make([]string, 0, len(req.ChangedContracts))
-	for _, name := range sortedNames(req.ChangedContracts) {
-		if _, ok := m.Reads[name]; ok {
-			declared = append(declared, name)
-		}
-	}
-	if len(declared) == 0 {
-		return nil, nil
-	}
-	rows, err := q.Query(ctx, `SELECT name, owner FROM contracts WHERE repo = $1 AND name = ANY($2) ORDER BY name`, req.Repo, declared)
-	if err != nil {
-		return nil, err
-	}
-	registered, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Contract, error) {
-		var contract Contract
-		err := row.Scan(&contract.Name, &contract.Owner)
-		return contract, err
-	})
-	if err != nil {
-		return nil, err
-	}
-	why, missing := statementUnreviewed(registered, req.Head, req.CompatibilityProof, req.ReviewedHead, req.Reviews)
-	if why == "" {
-		return nil, nil
-	}
-	return []Violation{{Kind: ReasonStatementUnreviewed, Name: missing[0], Message: why}}, nil
-}
-
 // refusalForViolation is the refusal Land gives for a violation: a violation's kind is its refusal reason.
 func refusalForViolation(v Violation) error {
 	return &Refusal{Reason: v.Kind, Message: v.Message}
 }
 
-func contractReadsAtVersions(ctx context.Context, tx pgx.Tx, repo string, migration Migration) (map[string]Contract, error) {
-	contracts := map[string]Contract{}
-	for _, name := range sortedNames(migration.ReadVersions) {
-		recorded := migration.ReadVersions[name]
-		if recorded == nil {
-			var registered bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM contracts WHERE repo = $1 AND name = $2)`, repo, name).Scan(&registered); err != nil {
-				return nil, err
-			}
-			if registered {
-				return nil, refuse(ReasonStaleRead, "migration %s did not record a version for contract %s", migration.ID, name)
-			}
-			continue
-		}
-		current, err := loadContract(ctx, tx, repo, name, true)
-		if err != nil {
-			var missing *NotFoundError
-			if errors.As(err, &missing) {
-				return nil, refuse(ReasonStaleRead, "recorded contract %s no longer exists", name)
-			}
-			return nil, err
-		}
-		if current.Version != *recorded || current.StatementHash != migration.Reads[name] {
-			return nil, refuse(ReasonStaleRead, "migration %s read contract %s at version %d hash %s, current version is %d hash %s",
-				migration.ID, name, *recorded, migration.Reads[name], current.Version, current.StatementHash)
-		}
-		contracts[name] = current
+// cleanCandidate validates a candidate's shape and normalizes its paths before they are compared to declared writes.
+// A malformed candidate is invalid input for check and land alike, before either reads the ledger. An absent path
+// list stays absent, for the precondition to refuse.
+func cleanCandidate(req CheckRequest) (CheckRequest, error) {
+	if err := req.validate(); err != nil {
+		return CheckRequest{}, err
 	}
-	return contracts, nil
+	if req.ChangedPaths == nil {
+		return req, nil
+	}
+	changed := make([]string, 0, len(req.ChangedPaths))
+	for _, path := range req.ChangedPaths {
+		cleaned, err := cleanRepoPath(path)
+		if err != nil {
+			return CheckRequest{}, err
+		}
+		changed = append(changed, cleaned)
+	}
+	sort.Strings(changed)
+	req.ChangedPaths = changed
+	return req, nil
 }
 
-// checkContractViolations runs Land's version, declaration, pinned and statement checks without changing contracts.
-func checkContractViolations(ctx context.Context, tx pgx.Tx, migration Migration, req CheckRequest) ([]Violation, error) {
-	approved := make(map[string]struct{}, len(req.ApprovedPinned))
-	for _, name := range req.ApprovedPinned {
-		approved[name] = struct{}{}
-	}
-	var contracts map[string]Contract
-	if !req.DeferReads {
-		var err error
-		contracts, err = contractReadsAtVersions(ctx, tx, req.Repo, migration)
-		if err != nil {
-			var refusal *Refusal
-			if errors.As(err, &refusal) && refusal.Reason == ReasonStaleRead {
-				return []Violation{{Kind: ReasonStaleRead, Message: refusal.Message}}, nil
-			}
-			return nil, err
-		}
-	}
-	var violations []Violation
-	for _, name := range sortedNames(req.ChangedContracts) {
-		recorded, declared := migration.ReadVersions[name]
-		if !declared {
-			violations = append(violations, Violation{Kind: ReasonUndeclaredContract, Name: name,
-				Message: fmt.Sprintf("migration %s did not declare contract %s as a read", migration.ID, name)})
-			continue
-		}
-		var current Contract
-		if req.DeferReads {
-			var err error
-			current, err = loadContract(ctx, tx, req.Repo, name, false)
-			if err != nil {
-				var missing *NotFoundError
-				if errors.As(err, &missing) {
-					continue
-				}
-				return nil, err
-			}
-		} else {
-			if recorded == nil {
-				violations = append(violations, Violation{Kind: ReasonStaleRead, Name: name,
-					Message: fmt.Sprintf("migration %s did not record a contract version for %s", migration.ID, name)})
-				continue
-			}
-			current = contracts[name]
-			if current.Name == "" {
-				violations = append(violations, Violation{Kind: ReasonStaleRead, Name: name,
-					Message: fmt.Sprintf("migration %s did not read current contract %s", migration.ID, name)})
-				continue
-			}
-		}
-		if current.Pinned {
-			if _, ok := approved[name]; !ok {
-				violations = append(violations, Violation{Kind: ReasonPinned, Name: name,
-					Message: fmt.Sprintf("contract %s is pinned; a person must approve its change", name)})
-			}
-		}
-	}
-	statement, err := statementViolations(ctx, tx, migration, req)
-	if err != nil {
-		return nil, err
-	}
-	return append(violations, statement...), nil
-}
-
-// candidatePrecondition reports the candidate metadata that Land refuses before it checks migration state.
+// candidatePrecondition reports the candidate metadata that cannot describe a complete landing.
 func candidatePrecondition(req CheckRequest) (Violation, bool) {
 	var message string
 	switch {
-	case req.Changed == nil:
+	case req.ChangedPaths == nil:
 		message = "missing changed paths"
-	case len(req.Changed) == 0 && len(req.ChangedContracts) > 0:
+	case len(req.ChangedPaths) == 0 && len(req.ChangedContracts) > 0:
 		message = "changed contracts need at least one changed path"
 	case len(req.ChangedContracts) > 0 && req.Head == "":
 		message = "changed contracts need the head that the landing program built"
@@ -300,26 +191,180 @@ func candidatePrecondition(req CheckRequest) (Violation, bool) {
 	return Violation{Kind: ReasonInvalidCandidate, Message: message}, true
 }
 
-// cleanCheckRequest validates and normalizes candidate paths before they are compared to declared writes, and
-// validates the candidate's changed contracts and statement records.
-func cleanCheckRequest(req CheckRequest) (CheckRequest, error) {
-	if err := checkStatementChange(req.ChangedContracts, req.Head, req.CompatibilityProof, req.ReviewedHead, req.Reviews, req.Upstream); err != nil {
-		return CheckRequest{}, err
-	}
-	changed := make([]string, 0, len(req.Changed))
-	for _, path := range req.Changed {
-		cleaned, err := cleanRepoPath(path)
-		if err != nil {
-			return CheckRequest{}, err
-		}
-		changed = append(changed, cleaned)
-	}
-	sort.Strings(changed)
-	req.Changed = changed
-	return req, nil
+// verdict is the landing decision for a candidate: every reason it must not land, in order, its changed registered
+// contracts under the caller's lock, in name order, and the record that clears each one it clears.
+type verdict struct {
+	violations []Violation
+	changed    []Contract
+	cleared    map[string]LastChange
 }
 
-// checkViolations evaluates every candidate check against a migration locked by the caller.
+// evaluate runs every landing rule on a cleaned candidate, for a migration and repository the caller has locked.
+// Check and Land both call it, so one candidate gets the same violations, in the same order, from both. lock is the row
+// lock it takes on each contract the migration read: shareLock for a check, updateLock for a landing. DeferReads skips
+// only the comparison of the caller's read hashes and the landed commit; every rule that needs only the ledger runs.
+func evaluate(ctx context.Context, tx pgx.Tx, repository Repository, m Migration, req CheckRequest, lock string) (verdict, error) {
+	var v verdict
+	if precondition, ok := candidatePrecondition(req); ok {
+		v.violations = append(v.violations, precondition)
+	}
+	violations, err := checkViolations(ctx, tx, m, req)
+	if err != nil {
+		return verdict{}, err
+	}
+	v.violations = append(v.violations, violations...)
+	contracts, stale, err := readFence(ctx, tx, req.Repo, m, lock)
+	if err != nil {
+		return verdict{}, err
+	}
+	v.violations = append(v.violations, stale...)
+	reported := make(map[string]bool, len(stale))
+	for _, violation := range stale {
+		reported[violation.Name] = true
+	}
+	approved := make(map[string]bool, len(req.ApprovedPinned))
+	for _, name := range req.ApprovedPinned {
+		approved[name] = true
+	}
+	for _, name := range sortedNames(req.ChangedContracts) {
+		_, declared := m.ReadVersions[name]
+		current, read := contracts[name]
+		switch {
+		case !declared:
+			v.violations = append(v.violations, Violation{Kind: ReasonUndeclaredContract, Name: name,
+				Message: fmt.Sprintf("migration %s did not declare contract %s as a read", m.ID, name)})
+		case reported[name]:
+		case !read:
+			// The migration declared the read before the contract was registered, and it is not registered now.
+			v.violations = append(v.violations, Violation{Kind: ReasonStaleRead, Name: name,
+				Message: fmt.Sprintf("migration %s did not record a contract version for %s", m.ID, name)})
+		default:
+			if current.Pinned && !approved[name] {
+				v.violations = append(v.violations, Violation{Kind: ReasonPinned, Name: name,
+					Message: fmt.Sprintf("contract %s is pinned; a person must approve its change", name)})
+			}
+			v.changed = append(v.changed, current)
+		}
+	}
+	v.cleared = clearStatements(v.changed, req.StatementRecords)
+	var missing []string
+	for _, contract := range v.changed {
+		if _, ok := v.cleared[contract.Name]; !ok {
+			missing = append(missing, contract.Name)
+		}
+	}
+	if len(missing) > 0 {
+		v.violations = append(v.violations, Violation{Kind: ReasonStatementUnreviewed, Name: missing[0],
+			Message: unreviewedMessage(v.changed, missing, req.StatementRecords)})
+	}
+	if upstream, blocked := upstreamViolation(repository, m, req.Upstream); blocked {
+		v.violations = append(v.violations, upstream)
+	}
+	return v, nil
+}
+
+// readFence checks each contract the migration read against the ledger: the contract must still be at the version and
+// hash the migration recorded. It needs no build, so it runs for a deferred check too. It returns the contracts it
+// read under lock, and one stale_read violation for each read that moved, vanished, or was declared without a
+// version although the contract is registered.
+func readFence(ctx context.Context, tx pgx.Tx, repo string, m Migration, lock string) (map[string]Contract, []Violation, error) {
+	contracts := map[string]Contract{}
+	var stale []Violation
+	for _, name := range sortedNames(m.ReadVersions) {
+		recorded := m.ReadVersions[name]
+		current, err := loadContract(ctx, tx, repo, name, lock)
+		var missing *NotFoundError
+		switch {
+		case errors.As(err, &missing):
+			if recorded != nil {
+				stale = append(stale, Violation{Kind: ReasonStaleRead, Name: name,
+					Message: fmt.Sprintf("recorded contract %s no longer exists", name)})
+			}
+		case err != nil:
+			return nil, nil, err
+		case recorded == nil:
+			stale = append(stale, Violation{Kind: ReasonStaleRead, Name: name,
+				Message: fmt.Sprintf("migration %s did not record a version for contract %s", m.ID, name)})
+		case current.Version != *recorded || current.StatementHash != m.Reads[name]:
+			stale = append(stale, Violation{Kind: ReasonStaleRead, Name: name, Message: fmt.Sprintf(
+				"migration %s read contract %s at version %d hash %s, current version is %d hash %s",
+				m.ID, name, *recorded, m.Reads[name], current.Version, current.StatementHash)})
+		default:
+			contracts[name] = current
+		}
+	}
+	return contracts, stale, nil
+}
+
+// clearStatements gives the record that clears each changed contract's statement change, in priority order: the
+// compatibility proof clears every one; a review that names the contract, by its owner in the ledger, at the head
+// clears that one; and a reviewed head equal to the head clears every one, as their owner's review, when they all
+// have one owner. A contract with no entry is not cleared. Each record carries the upstream commit as provenance.
+func clearStatements(contracts []Contract, r StatementRecords) map[string]LastChange {
+	reviewedHead := r.Head != "" && r.ReviewedHead == r.Head && oneOwner(contracts)
+	cleared := make(map[string]LastChange, len(contracts))
+	for _, contract := range contracts {
+		change := LastChange{Upstream: r.Upstream}
+		review, reviewed := ownerReview(contract, r)
+		switch {
+		case r.CompatibilityProof != "":
+			change.Proof = r.CompatibilityProof
+		case reviewed:
+			change.Review = &review
+		case reviewedHead:
+			change.Review = &Review{Contract: contract.Name, Reviewer: contract.Owner, Head: r.ReviewedHead}
+		default:
+			continue
+		}
+		cleared[contract.Name] = change
+	}
+	return cleared
+}
+
+// ownerReview finds a review that names the contract, by its owner, at the candidate's head.
+func ownerReview(contract Contract, r StatementRecords) (Review, bool) {
+	for _, review := range r.Reviews {
+		if review.Contract == contract.Name && review.Reviewer == contract.Owner && review.Head == r.Head {
+			return review, true
+		}
+	}
+	return Review{}, false
+}
+
+func oneOwner(contracts []Contract) bool {
+	for _, contract := range contracts {
+		if contract.Owner != contracts[0].Owner {
+			return false
+		}
+	}
+	return true
+}
+
+// unreviewedMessage explains why the missing contracts' statement changes are not cleared.
+func unreviewedMessage(contracts []Contract, missing []string, r StatementRecords) string {
+	subject := "contract " + missing[0] + " changes its statement"
+	if len(missing) > 1 {
+		subject = "contracts " + strings.Join(missing, ", ") + " change their statements"
+	}
+	at := "the head that lands"
+	if r.Head != "" {
+		at = r.Head
+	}
+	review := "no review"
+	switch {
+	case r.ReviewedHead != "" && r.Head != "" && r.ReviewedHead != r.Head:
+		review = "a review that passed at " + r.ReviewedHead + ", not at " + r.Head
+	case r.ReviewedHead != "" && r.Head != "" && !oneOwner(contracts):
+		review = "a reviewed head at " + r.ReviewedHead + ", but it clears every changed contract only when they have the same owner"
+	case r.ReviewedHead != "":
+		review = "a review that passed at " + r.ReviewedHead + ", but no head to compare it with"
+	}
+	return fmt.Sprintf("%s; a statement change lands only with a compatibility proof or an agent's review at %s, "+
+		"and this one has no compatibility proof and %s", subject, at, review)
+}
+
+// checkViolations evaluates the migration's state, the candidate's paths and its read hashes, for a migration locked
+// by the caller.
 func checkViolations(ctx context.Context, q querier, m Migration, req CheckRequest) ([]Violation, error) {
 	var violations []Violation
 	add := func(v Violation) { violations = append(violations, v) }
@@ -335,15 +380,15 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 		add(Violation{Kind: ReasonEscalated, Message: fmt.Sprintf(
 			"migration %s was escalated to the steward: %s", m.ID, m.EscalationReason)})
 	}
-	ours, err := migrationWrites(ctx, q, req.Repo, req.ID)
+	ours, err := migrationWrites(ctx, q, req.Repo, req.Migration)
 	if err != nil {
 		return nil, err
 	}
-	sets, err := openWriteSets(ctx, q, req.Repo, req.ID)
+	sets, err := openWriteSets(ctx, q, req.Repo, req.Migration)
 	if err != nil {
 		return nil, err
 	}
-	for _, path := range req.Changed {
+	for _, path := range req.ChangedPaths {
 		if coveredBy(ours, path) {
 			continue
 		}
@@ -355,9 +400,8 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 		}
 		add(v)
 	}
-	names := sortedNames(m.Reads)
 	if !req.DeferReads {
-		for _, name := range names {
+		for _, name := range sortedNames(m.Reads) {
 			recorded := m.Reads[name]
 			current, ok := req.Current[name]
 			switch {
@@ -406,43 +450,33 @@ func upstreamViolation(repository Repository, migration Migration, upstream stri
 	}, true
 }
 
-// Check decides whether a candidate change may land for a migration. It writes nothing but the event that
-// records its decision. A refusal of the request itself (an unknown migration, a bad path) is an error; every
-// reason the candidate must not land is a violation in the result.
+// Check decides whether a candidate change may land for a migration, by the rules Land applies. It writes nothing but
+// the event that records its decision. A refusal of the request itself (an unknown migration, a malformed candidate)
+// is an error; every reason the candidate must not land is a violation in the result.
 func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error) {
-	precondition, hasPrecondition := candidatePrecondition(req)
-	cleaned, err := cleanCheckRequest(req)
+	cleaned, err := cleanCandidate(req)
 	if err != nil {
 		return CheckResult{}, err
 	}
-	res := CheckResult{Migration: cleaned.ID, Generation: cleaned.Generation, Deferred: []string{}}
+	var res CheckResult
 	err = s.tx(ctx, func(tx pgx.Tx) error {
+		// A retried attempt starts from an empty result, so the result holds only what the committed attempt found.
+		res = CheckResult{Migration: cleaned.Migration, Generation: cleaned.Generation, Deferred: []string{}, Violations: []Violation{}}
 		repository, err := lockRepo(ctx, tx, cleaned.Repo, false)
 		if err != nil {
 			return err
 		}
-		migration, err := loadMigration(ctx, tx, cleaned.Repo, cleaned.ID, true)
+		migration, err := loadMigration(ctx, tx, cleaned.Repo, cleaned.Migration, true)
 		if err != nil {
 			return err
 		}
+		v, err := evaluate(ctx, tx, repository, migration, cleaned, shareLock)
+		if err != nil {
+			return err
+		}
+		res.Violations = append(res.Violations, v.violations...)
 		if cleaned.DeferReads {
 			res.Deferred = sortedNames(migration.Reads)
-		}
-		if hasPrecondition {
-			res.Violations = append(res.Violations, precondition)
-		}
-		violations, err := checkViolations(ctx, tx, migration, cleaned)
-		if err != nil {
-			return err
-		}
-		res.Violations = append(res.Violations, violations...)
-		contract, err := checkContractViolations(ctx, tx, migration, cleaned)
-		if err != nil {
-			return err
-		}
-		res.Violations = append(res.Violations, contract...)
-		if upstream, blocked := upstreamViolation(repository, migration, cleaned.Upstream); blocked {
-			res.Violations = append(res.Violations, upstream)
 		}
 		switch {
 		case len(res.Violations) > 0:
@@ -457,11 +491,11 @@ func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error
 		for _, violation := range res.Violations {
 			kinds = append(kinds, violation.Kind)
 		}
-		return event(ctx, tx, cleaned.Repo, "migration.checked", cleaned.ID, "", map[string]any{
+		return event(ctx, tx, cleaned.Repo, "migration.checked", cleaned.Migration, "", map[string]any{
 			"generation": cleaned.Generation,
 			"pass":       res.Pass,
 			"outcome":    res.Outcome,
-			"changed":    len(cleaned.Changed),
+			"changed":    len(cleaned.ChangedPaths),
 			"deferred":   res.Deferred,
 			"violations": kinds,
 		})

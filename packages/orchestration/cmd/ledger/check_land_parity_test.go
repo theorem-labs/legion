@@ -36,7 +36,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			kind: "invalid_candidate",
 			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
-				candidate.check.Changed = nil
+				candidate.check.ChangedPaths = nil
 				candidate.land.ChangedPaths = nil
 				return candidate
 			},
@@ -47,7 +47,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
-				candidate.check.Changed = []string{}
+				candidate.check.ChangedPaths = []string{}
 				candidate.land.ChangedPaths = []string{}
 				parityStatement(&candidate, "head-1", "head-1")
 				return candidate
@@ -118,7 +118,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			kind: ledger.ReasonUndeclaredWrite,
 			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
-				candidate.check.Changed = []string{"outside.lean"}
+				candidate.check.ChangedPaths = []string{"outside.lean"}
 				candidate.land.ChangedPaths = []string{"outside.lean"}
 				return candidate
 			},
@@ -362,9 +362,7 @@ func parityOpen(t *testing.T, s *ledger.Store, id, path string, reads map[string
 	}
 	current := copyStringMap(reads)
 	return landCheckCandidate{
-		check: ledger.CheckRequest{
-			Repo: "r", ID: m.ID, Generation: m.Generation, Commit: "candidate", Changed: []string{path}, Current: current,
-		},
+		check: ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: m.ID, Generation: m.Generation, Commit: "candidate", ChangedPaths: []string{path}, Current: current}},
 		land: ledger.LandRequest{
 			Repo: "r", Migration: m.ID, Generation: m.Generation, Commit: "candidate", ChangedPaths: []string{path}, Current: copyStringMap(reads),
 		},
@@ -482,8 +480,8 @@ func assertLandResult(t *testing.T, code int, stdout, stderr, kind string) {
 }
 
 func checkFlagArgs(request ledger.CheckRequest) []string {
-	args := []string{"--json", "check", request.Repo, request.ID, strconv.FormatInt(request.Generation, 10)}
-	appendCandidateFlags(&args, request.Changed, request.Current, request.ChangedContracts, request.Commit, request.ApprovedPinned,
+	args := []string{"--json", "check", request.Repo, request.Migration, strconv.FormatInt(request.Generation, 10)}
+	appendCandidateFlags(&args, request.ChangedPaths, request.Current, request.ChangedContracts, request.Commit, request.ApprovedPinned,
 		request.DeferReads, request.Head, request.CompatibilityProof, request.ReviewedHead, request.Reviews, request.Upstream)
 	return args
 }

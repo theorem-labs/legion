@@ -33,11 +33,15 @@ func scanContract(row contractRow) (Contract, error) {
 	return c, err
 }
 
-func loadContract(ctx context.Context, q querier, repo, name string, forUpdate bool) (Contract, error) {
-	query := `SELECT ` + contractColumns + ` FROM contracts WHERE repo = $1 AND name = $2`
-	if forUpdate {
-		query += ` FOR UPDATE`
-	}
+// Row locks a read of a contract may take: none, a share lock for a check, or an update lock for a write.
+const (
+	noLock     = ""
+	shareLock  = " FOR SHARE"
+	updateLock = " FOR UPDATE"
+)
+
+func loadContract(ctx context.Context, q querier, repo, name, lock string) (Contract, error) {
+	query := `SELECT ` + contractColumns + ` FROM contracts WHERE repo = $1 AND name = $2` + lock
 	c, err := scanContract(q.QueryRow(ctx, query, repo, name))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, &NotFoundError{What: "contract", ID: name}
@@ -79,7 +83,7 @@ func (s *Store) Contract(ctx context.Context, repo, name string) (Contract, erro
 	var c Contract
 	err := s.tx(ctx, func(tx pgx.Tx) error {
 		var err error
-		c, err = loadContract(ctx, tx, repo, name, false)
+		c, err = loadContract(ctx, tx, repo, name, noLock)
 		return err
 	})
 	return c, err
@@ -128,7 +132,7 @@ func (s *Store) TransferContract(ctx context.Context, repo, name, fromOwner, toO
 	}
 	var c Contract
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		current, err := loadContract(ctx, tx, repo, name, true)
+		current, err := loadContract(ctx, tx, repo, name, updateLock)
 		if err != nil {
 			return err
 		}
@@ -252,7 +256,7 @@ func (s *Store) RecordAgreement(ctx context.Context, repo, id string, parties []
 		}
 		a.Reads = make(map[string]int64, len(reads))
 		for _, name := range names {
-			current, err := loadContract(ctx, tx, repo, name, true)
+			current, err := loadContract(ctx, tx, repo, name, updateLock)
 			if err != nil {
 				return err
 			}
@@ -282,96 +286,29 @@ func (s *Store) StaleAgreements(ctx context.Context, repo string) ([]Agreement, 
 	return out, err
 }
 
-// LandRequest is the candidate that Land validates and closes. ChangedPaths and Current are the same candidate
-// inputs Check receives. Current supplies every declared read; registered contracts also receive a version fence.
-type LandRequest struct {
-	Repo             string            `json:"repo"`
-	Migration        string            `json:"migration"`
-	Generation       int64             `json:"generation"`
-	Commit           string            `json:"commit"`
-	ChangedPaths     []string          `json:"changed_paths"`
-	Current          map[string]string `json:"current"`
-	ChangedContracts map[string]string `json:"changed_contracts"`
-	ApprovedPinned   []string          `json:"approved_pinned"`
-	// Head is the member's branch head that the landing program built. A statement change requires it.
-	Head string `json:"head"`
-	// CompatibilityProof is the fully qualified name of a declaration that proves that each changed contract gives
-	// its callers all that the old one gave.
-	CompatibilityProof string `json:"compatibility_proof"`
-	// ReviewedHead is the commit at which an agent's review of the change passed.
-	ReviewedHead string   `json:"reviewed_head"`
-	Reviews      []Review `json:"reviews"`
-	Upstream     string   `json:"upstream"`
-}
-
-// clearingRecord returns the one record that cleared an advanced contract, in priority order: the compatibility
-// proof, then an explicit review naming the contract with its owner and the head, then the reviewed head as that
-// owner's review. contract is the row Land read under its lock, so its owner is the one the review rule checked.
-func clearingRecord(req LandRequest, contract Contract) (proof string, review Review, ok bool) {
-	if req.CompatibilityProof != "" {
-		return req.CompatibilityProof, Review{}, true
-	}
-	for _, candidate := range req.Reviews {
-		if reviewClears(candidate, contract, req.Head) {
-			return "", candidate, true
-		}
-	}
-	if req.Head != "" && req.ReviewedHead == req.Head {
-		return "", Review{Contract: contract.Name, Reviewer: contract.Owner, Head: req.ReviewedHead}, true
-	}
-	return "", Review{}, false
-}
-
-// contractLastChange is the last_change record of an advanced contract: the record that cleared it, with the
-// upstream commit beside it when the landing carries upstream provenance.
-func contractLastChange(req LandRequest, contract Contract) (*LastChange, error) {
-	proof, review, ok := clearingRecord(req, contract)
-	if !ok {
-		return nil, invalid("changed contract %s has no clearing record", contract.Name)
-	}
-	change := &LastChange{Proof: proof, Upstream: req.Upstream}
-	if proof == "" {
-		change.Review = &review
-	}
-	return change, nil
-}
-
 // Land validates a complete candidate, advances its changed contracts, makes dependent agreements stale, and closes
 // the migration at the supplied commit. It holds the repository, migration and contract locks through every step.
 //
-// A candidate with changed contracts changes a statement, and it needs Head. Each changed registered contract must be
-// cleared by one record: the CompatibilityProof, which clears every one; a review in Reviews that names the contract,
-// whose Reviewer is the contract's owner in the ledger and whose Head is the request's Head; or a ReviewedHead equal to
-// Head, which clears them only when every changed contract has one owner, and then counts as that owner's review.
-// Otherwise Land refuses with statement_unreviewed, naming every contract left uncleared, after the shared checks and
-// the pinned approvals and before any write. A candidate with no changed contracts changes proofs only and needs none
-// of these records. Upstream is accepted only when the migration's owner is the repository's upstream owner, and is
-// refused with upstream_not_allowed otherwise. It is provenance only: it clears neither the statement rule nor a pinned
-// contract. The ledger trusts its caller for these records, as it does for ApprovedPinned: it does not build the proof
-// declaration or confirm that the review happened. It stores the record that cleared each advanced contract, with the
-// upstream commit beside it, as that contract's last_change, and keeps the request's records in the migration.landed
-// event.
+// Land applies the rules Check applies, through the same evaluation, and refuses with the first violation Check
+// would list. A candidate with changed contracts changes a statement, and it needs Head. Each changed registered
+// contract must be cleared by one record: the CompatibilityProof, which clears every one; a review in Reviews that
+// names the contract, whose Reviewer is the contract's owner in the ledger and whose Head is the request's Head; or a
+// ReviewedHead equal to Head, which clears them only when every changed contract has one owner, and then counts as that
+// owner's review. A candidate with no changed contracts changes proofs only and needs none of these records. Upstream
+// is accepted only when the migration's owner is the repository's upstream owner. It is provenance only: it clears
+// neither the statement rule nor a pinned contract. The ledger trusts its caller for these records, as it does for
+// ApprovedPinned: it does not build the proof declaration or confirm that the review happened. It stores the record
+// that cleared each advanced contract, with the upstream commit beside it, as that contract's last_change, and keeps
+// the request's records in the migration.landed event.
 func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
-	candidateRequest := CheckRequest{
-		Repo: req.Repo, ID: req.Migration, Generation: req.Generation, Commit: req.Commit, Changed: req.ChangedPaths,
-		Current: req.Current, ApprovedPinned: req.ApprovedPinned, ChangedContracts: req.ChangedContracts, Head: req.Head,
-		CompatibilityProof: req.CompatibilityProof, ReviewedHead: req.ReviewedHead, Reviews: req.Reviews, Upstream: req.Upstream,
-	}
-	if precondition, ok := candidatePrecondition(candidateRequest); ok {
-		return Migration{}, refusalForViolation(precondition)
-	}
-	candidate, err := cleanCheckRequest(candidateRequest)
+	candidate, err := cleanCandidate(CheckRequest{LandRequest: req})
 	if err != nil {
 		return Migration{}, err
 	}
-	names := sortedNames(req.ChangedContracts)
+	req = candidate.LandRequest
 	reviews := req.Reviews
 	if reviews == nil {
 		reviews = []Review{}
-	}
-	approved := make(map[string]struct{}, len(req.ApprovedPinned))
-	for _, name := range req.ApprovedPinned {
-		approved[name] = struct{}{}
 	}
 	var landed Migration
 	err = s.tx(ctx, func(tx pgx.Tx) error {
@@ -379,55 +316,23 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 		if err != nil {
 			return err
 		}
-		migration, err := lockOpenAt(ctx, tx, req.Repo, req.Migration, req.Generation)
+		migration, err := loadMigration(ctx, tx, req.Repo, req.Migration, true)
 		if err != nil {
 			return err
 		}
-		violations, err := checkViolations(ctx, tx, migration, candidate)
+		v, err := evaluate(ctx, tx, repository, migration, candidate, updateLock)
 		if err != nil {
 			return err
 		}
-		if len(violations) > 0 {
-			return refusalForViolation(violations[0])
+		if len(v.violations) > 0 {
+			return refusalForViolation(v.violations[0])
 		}
-		contracts, err := contractReadsAtVersions(ctx, tx, req.Repo, migration)
-		if err != nil {
-			return err
-		}
-		statementContracts := make([]Contract, 0, len(names))
-		for _, name := range names {
-			recorded, declared := migration.ReadVersions[name]
-			if !declared {
-				return refuse(ReasonUndeclaredContract, "migration %s did not declare contract %s as a read", migration.ID, name)
-			}
-			if recorded == nil {
-				return refuse(ReasonStaleRead, "migration %s did not record a contract version for %s", migration.ID, name)
-			}
-			current := contracts[name]
-			if current.Name == "" {
-				return refuse(ReasonStaleRead, "migration %s did not read current contract %s", migration.ID, name)
-			}
-			if current.Pinned {
-				if _, ok := approved[name]; !ok {
-					return refuse(ReasonPinned, "contract %s is pinned; a person must approve its change", name)
-				}
-			}
-			statementContracts = append(statementContracts, current)
-		}
-		if why, _ := statementUnreviewed(statementContracts, req.Head, req.CompatibilityProof, req.ReviewedHead, req.Reviews); why != "" {
-			return refuse(ReasonStatementUnreviewed, "%s", why)
-		}
-		if upstream, blocked := upstreamViolation(repository, migration, req.Upstream); blocked {
-			return refusalForViolation(upstream)
-		}
-		for _, name := range names {
-			current := contracts[name]
-			var advanced Contract
-			lastChange, err := contractLastChange(req, current)
-			if err != nil {
-				return err
-			}
-			advanced, err = scanContract(tx.QueryRow(ctx, `UPDATE contracts SET statement_hash = $3, version = version + 1,
+		names := make([]string, 0, len(v.changed))
+		for _, current := range v.changed {
+			name := current.Name
+			names = append(names, name)
+			lastChange := v.cleared[name]
+			advanced, err := scanContract(tx.QueryRow(ctx, `UPDATE contracts SET statement_hash = $3, version = version + 1,
 				last_change = $4, updated_at = clock_timestamp() WHERE repo = $1 AND name = $2
 				RETURNING `+contractColumns, req.Repo, name, req.ChangedContracts[name], lastChange))
 			if err != nil {

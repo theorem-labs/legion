@@ -18,16 +18,7 @@ import (
 // landRequest is a candidate for migration m. A statement change in it carries an agent's review at its head, so a test
 // of another rule is not refused for want of one.
 func landRequest(m ledger.Migration, commit string, paths []string, current, changes map[string]string, approved []string) ledger.LandRequest {
-	request := ledger.LandRequest{
-		Repo:             "r",
-		Migration:        m.ID,
-		Generation:       m.Generation,
-		Commit:           commit,
-		ChangedPaths:     paths,
-		Current:          current,
-		ChangedContracts: changes,
-		ApprovedPinned:   approved,
-	}
+	request := ledger.LandRequest{Repo: "r", Migration: m.ID, Generation: m.Generation, Commit: commit, ChangedPaths: paths, Current: current, StatementRecords: ledger.StatementRecords{ChangedContracts: changes, ApprovedPinned: approved}}
 	if len(changes) > 0 {
 		request.Head, request.ReviewedHead = commit+"-head", commit+"-head"
 	}
@@ -284,17 +275,7 @@ func TestLandRevalidatesCandidatePathsAndReadOnlyDependencies(t *testing.T) {
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 	reader := must(open(t, s, "M-reader", "alice", []string{"reader.lean"}, map[string]string{"C": "hash-1"}))
 	writer := must(open(t, s, "M-writer", "bob", []string{"writer.lean"}, map[string]string{"C": "hash-1"}))
-	must(s.Land(ctx, ledger.LandRequest{
-		Repo:             "r",
-		Migration:        writer.ID,
-		Generation:       writer.Generation,
-		Commit:           "writer-commit",
-		ChangedPaths:     []string{"writer.lean"},
-		Current:          map[string]string{"C": "hash-1"},
-		ChangedContracts: map[string]string{"C": "hash-2"},
-		Head:             "writer-head",
-		ReviewedHead:     "writer-head",
-	}))
+	must(s.Land(ctx, ledger.LandRequest{Repo: "r", Migration: writer.ID, Generation: writer.Generation, Commit: "writer-commit", ChangedPaths: []string{"writer.lean"}, Current: map[string]string{"C": "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-2"}, Head: "writer-head", ReviewedHead: "writer-head"}}))
 	_, err := s.Land(ctx, ledger.LandRequest{
 		Repo:         "r",
 		Migration:    reader.ID,
@@ -350,43 +331,13 @@ func TestLandRejectsContractVersionABAAndUndeclaredContract(t *testing.T) {
 		{"M-back-1", "back-1.lean", "hash-2", "hash-1"},
 	} {
 		migration := must(open(t, s, change.id, "bob", []string{change.path}, map[string]string{"C": change.before}))
-		must(s.Land(ctx, ledger.LandRequest{
-			Repo:             "r",
-			Migration:        migration.ID,
-			Generation:       migration.Generation,
-			Commit:           migration.ID + "-commit",
-			ChangedPaths:     []string{change.path},
-			Current:          map[string]string{"C": change.before},
-			ChangedContracts: map[string]string{"C": change.after},
-			Head:             migration.ID + "-head",
-			ReviewedHead:     migration.ID + "-head",
-		}))
+		must(s.Land(ctx, ledger.LandRequest{Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: migration.ID + "-commit", ChangedPaths: []string{change.path}, Current: map[string]string{"C": change.before}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": change.after}, Head: migration.ID + "-head", ReviewedHead: migration.ID + "-head"}}))
 	}
-	_, err := s.Land(ctx, ledger.LandRequest{
-		Repo:             "r",
-		Migration:        old.ID,
-		Generation:       old.Generation,
-		Commit:           "old-commit",
-		ChangedPaths:     []string{"old.lean"},
-		Current:          map[string]string{"C": "hash-1"},
-		ChangedContracts: map[string]string{"C": "hash-3"},
-		Head:             "old-head",
-		ReviewedHead:     "old-head",
-	})
+	_, err := s.Land(ctx, ledger.LandRequest{Repo: "r", Migration: old.ID, Generation: old.Generation, Commit: "old-commit", ChangedPaths: []string{"old.lean"}, Current: map[string]string{"C": "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-3"}, Head: "old-head", ReviewedHead: "old-head"}})
 	wantRefusal(t, err, ledger.ReasonStaleRead)
 
 	undeclared := must(open(t, s, "M-undeclared", "carol", []string{"undeclared.lean"}, nil))
-	_, err = s.Land(ctx, ledger.LandRequest{
-		Repo:             "r",
-		Migration:        undeclared.ID,
-		Generation:       undeclared.Generation,
-		Commit:           "undeclared-commit",
-		ChangedPaths:     []string{"undeclared.lean"},
-		Current:          map[string]string{},
-		ChangedContracts: map[string]string{"C": "hash-4"},
-		Head:             "undeclared-head",
-		ReviewedHead:     "undeclared-head",
-	})
+	_, err = s.Land(ctx, ledger.LandRequest{Repo: "r", Migration: undeclared.ID, Generation: undeclared.Generation, Commit: "undeclared-commit", ChangedPaths: []string{"undeclared.lean"}, Current: map[string]string{}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-4"}, Head: "undeclared-head", ReviewedHead: "undeclared-head"}})
 	wantRefusal(t, err, ledger.ReasonUndeclaredContract)
 }
 
@@ -480,15 +431,7 @@ func TestLandRequiresChangedPathsPresenceAndConsistency(t *testing.T) {
 	wantRefusal(t, err, ledger.ReasonInvalidCandidate)
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 	changed := must(open(t, s, "M-changed", "alice", []string{"b.lean"}, map[string]string{"C": "hash-1"}))
-	_, err = s.Land(ctx, ledger.LandRequest{
-		Repo:             "r",
-		Migration:        changed.ID,
-		Generation:       changed.Generation,
-		Commit:           "changed-commit",
-		ChangedPaths:     []string{},
-		Current:          map[string]string{"C": "hash-1"},
-		ChangedContracts: map[string]string{"C": "hash-2"},
-	})
+	_, err = s.Land(ctx, ledger.LandRequest{Repo: "r", Migration: changed.ID, Generation: changed.Generation, Commit: "changed-commit", ChangedPaths: []string{}, Current: map[string]string{"C": "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-2"}}})
 	wantRefusal(t, err, ledger.ReasonInvalidCandidate)
 	empty := must(open(t, s, "M-empty", "alice", []string{"c.lean"}, nil))
 	landed := must(s.Land(ctx, ledger.LandRequest{
@@ -764,11 +707,7 @@ func TestCheckReportsAStatementChangeWithNeitherRecordBeforeLand(t *testing.T) {
 	m := must(open(t, s, "M-1", "alice", []string{"a.lean"}, map[string]string{"C": "hash-1", "X.external": "x1"}))
 	check := func(changes map[string]string, head, proof, reviewed string) ledger.CheckResult {
 		t.Helper()
-		return must(s.Check(ctx, ledger.CheckRequest{
-			Repo: "r", ID: m.ID, Generation: m.Generation, Commit: "candidate", Changed: []string{"a.lean"},
-			Current:          map[string]string{"C": "hash-1", "X.external": "x1"},
-			ChangedContracts: changes, Head: head, CompatibilityProof: proof, ReviewedHead: reviewed,
-		}))
+		return must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: m.ID, Generation: m.Generation, Commit: "candidate", ChangedPaths: []string{"a.lean"}, Current: map[string]string{"C": "hash-1", "X.external": "x1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: changes, Head: head, CompatibilityProof: proof, ReviewedHead: reviewed}}}))
 	}
 	changeC := map[string]string{"C": "hash-2"}
 	for _, unreviewed := range []struct{ name, head, reviewed, names string }{
@@ -851,8 +790,8 @@ func TestCheckRejectsMalformedStatementRecords(t *testing.T) {
 		{Head: "head-1", ChangedContracts: map[string]string{"C": " "}},
 		{Head: "head-1", ChangedContracts: map[string]string{"": "hash-2"}},
 	} {
-		request.Repo, request.ID, request.Generation, request.Commit = "r", m.ID, m.Generation, "candidate"
-		request.Changed, request.Current = []string{"a.lean"}, map[string]string{"C": "hash-1"}
+		request.Repo, request.Migration, request.Generation, request.Commit = "r", m.ID, m.Generation, "candidate"
+		request.ChangedPaths, request.Current = []string{"a.lean"}, map[string]string{"C": "hash-1"}
 		_, err := s.Check(ctx, request)
 		var invalid *ledger.InvalidError
 		if !errors.As(err, &invalid) {

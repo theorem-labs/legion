@@ -89,13 +89,16 @@ func TestExpiredLeaseIsRegrantedAndOldHolderIsRefusedByGeneration(t *testing.T) 
 	wantRefusal(t, err, ledger.ReasonDone)
 }
 
+// TestRenewMovesAndPersistsExpiryByRequestedLength renews a lease before it ends and checks that the end moves by the
+// requested length and is stored: after the first end passes, the holder still holds the item and completes it. The
+// lengths leave seconds of slack, so a loaded machine cannot let the lease end before the renew or the completion.
 func TestRenewMovesAndPersistsExpiryByRequestedLength(t *testing.T) {
 	s, dsn := newStoreDSN(t)
 	ctx := context.Background()
 	observer := must(pgx.Connect(ctx, dsn))
 	defer observer.Close(ctx)
-	l := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
-	ttl := 300 * time.Millisecond
+	l := must(s.Claim(ctx, "r", "item", "alice", 2*time.Second))
+	ttl := 10 * time.Second
 	r := must(s.Renew(ctx, "r", "item", "alice", l.Generation, ttl))
 	if r.Generation != l.Generation {
 		t.Fatalf("renew changed the generation: %d -> %d", l.Generation, r.Generation)

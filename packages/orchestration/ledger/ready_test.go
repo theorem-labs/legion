@@ -11,20 +11,10 @@ import (
 )
 
 func readyRequest(id string, generation int64, head string) ledger.ReadyRequest {
-	return ledger.ReadyRequest{
-		Repo:               "r",
-		ID:                 id,
-		Generation:         generation,
-		Head:               head,
-		ChangedContracts:   map[string]string{"A.contract": "hash-2", "B.contract": "hash-3"},
-		CompatibilityProof: "A.compatibility",
-		ReviewedHead:       head,
-		Reviews: []ledger.Review{
-			{Contract: "A.contract", Reviewer: "alice", Head: head},
-			{Contract: "B.contract", Reviewer: "bob", Head: head},
-		},
-		ApprovedPinned: []string{"A.contract", "B.contract"},
-	}
+	return ledger.ReadyRequest{Repo: "r", ID: id, Generation: generation, StatementRecords: ledger.StatementRecords{Head: head, ChangedContracts: map[string]string{"A.contract": "hash-2", "B.contract": "hash-3"}, CompatibilityProof: "A.compatibility", ReviewedHead: head, Reviews: []ledger.Review{
+		{Contract: "A.contract", Reviewer: "alice", Head: head},
+		{Contract: "B.contract", Reviewer: "bob", Head: head},
+	}, ApprovedPinned: []string{"A.contract", "B.contract"}}}
 }
 
 func TestReadyRoundTripsEveryFieldOrdersByEventAndReplaces(t *testing.T) {
