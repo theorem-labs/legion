@@ -258,13 +258,11 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	defer e.close()
 	tree := e.cfg.TreeSpec()
 	opt := declindex.RefreshOptions{Jobs: e.cfg.Jobs, Log: e.stderr}
-	var sync func(context.Context) error
 	if commit := e.getenv("LAND_COMMIT"); commit != "" {
 		if !declindex.IsObjectID(commit) {
 			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 lowercase hexadecimal characters"})
 		}
-		opt.Commit, opt.CheckLandedCoverage = commit, true
-		sync = declindex.Sync(e.cfg, commit, e.stderr)
+		opt.Commit, opt.Landed = commit, declindex.Sync(e.cfg, commit, e.stderr)
 	} else if head, err := declindex.TreeHead(ctx, e.cfg.Tree); err != nil {
 		// A build outside Git is indexed without a commit, which no ledger or gate check accepts.
 		fmt.Fprintf(e.stderr, "note: the index records no commit: %v\n", err)
@@ -274,7 +272,7 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	if e.cfg.Lean.Export {
 		opt.Compiled = func(ctx context.Context) (*declindex.CompiledOptions, error) { return compiledOptions(ctx, e) }
 	}
-	st, err := e.store.RefreshAt(ctx, tree, opt, sync)
+	st, err := e.store.Refresh(ctx, tree, opt)
 	if errors.Is(err, declindex.ErrAlreadyPast) {
 		return 0
 	}

@@ -134,8 +134,8 @@ type Store struct {
 	pathsMu       sync.Mutex
 	snapshotPaths map[string]string
 
-	// beforeRefreshLock is a test hook. It runs immediately before RefreshAt attempts the refresh lock.
-	beforeRefreshLock func()
+	// afterRefreshLock is a test hook. Refresh runs it once it holds the refresh lock, before the landed sync.
+	afterRefreshLock func(context.Context) error
 }
 
 // Open opens (creating it if needed) the index at path. An index of another schema version is emptied, so the

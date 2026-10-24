@@ -28,9 +28,9 @@ type Config struct {
 	Jobs      int      `yaml:"jobs"`
 	// Registry is the concept registry directory (see package conceptgate), relative to Tree.
 	Registry string `yaml:"registry"`
-	// Build runs in Tree after RefreshAt has moved it to LAND_COMMIT.
+	// Build runs in Tree after a landed refresh (Sync) has moved it to LAND_COMMIT.
 	Build []string `yaml:"build"`
-	// Remote is the sole remote RefreshAt fetches LAND_COMMIT from when Tree lacks it.
+	// Remote is the sole remote Sync fetches LAND_COMMIT from when Tree lacks it.
 	Remote string `yaml:"remote"`
 	// BuildTimeout bounds Build; LoadConfig defaults it to six hours.
 	BuildTimeout time.Duration `yaml:"build_timeout"`

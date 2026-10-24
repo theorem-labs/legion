@@ -35,9 +35,10 @@ type RefreshOptions struct {
 	// Commit is the source commit the build is of; it is recorded as the index's commit, and a change of commit as
 	// a landing (see Store.Landing).
 	Commit string
-	// CheckLandedCoverage makes RefreshAt refuse a tree with tracked changes and then compare Commit with the
-	// persisted index, before it runs a landed sync.
-	CheckLandedCoverage bool
+	// Landed is the post-landing synchronisation (Sync) that Refresh runs under its refresh lock before it reads the
+	// tree; nil refreshes the tree as it is. With it, Refresh first refuses a tree with tracked changes, and gives
+	// ErrAlreadyPast without running it when the persisted index already covers Commit.
+	Landed func(context.Context) error
 	// Jobs bounds the parallel readers; zero is min(48, CPUs).
 	Jobs int
 	// Compiled gives the options of the compiled part (types, compiled hashes, atoms, facts); nil skips that part.
@@ -196,26 +197,24 @@ func logf(w io.Writer, format string, args ...any) {
 	}
 }
 
-// Refresh brings the index to the tree's current build. It is RefreshAt without a post-landing synchronisation.
+// Refresh brings the index to the tree's current build. It holds the refresh lock across the landed sync
+// (RefreshOptions.Landed) and the refresh: a post-landing fetch, checkout and build cannot race a second index
+// refresh, and a reader of the tree in a read-only directory observes only the result after both complete. The
+// refresh takes the write lock only while it writes the index (Store.write), so a reader of the index alone reads
+// the index of the refresh before while the sync runs.
 func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
-	return s.RefreshAt(ctx, tree, opt, nil)
-}
-
-// RefreshAt holds the refresh lock across syncTree and the refresh: a post-landing fetch, checkout and build cannot
-// race a second index refresh, and a reader of the tree in a read-only directory observes only the result after
-// both complete. The refresh takes the write lock only while it writes the index (Store.write), so a reader of the
-// index alone reads the index of the refresh before while syncTree runs.
-func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, syncTree func(context.Context) error) (RefreshStats, error) {
-	if s.beforeRefreshLock != nil {
-		s.beforeRefreshLock()
-	}
 	unlock, err := s.lockRefresh(ctx)
 	if err != nil {
 		return RefreshStats{}, err
 	}
 	defer unlock()
-	if syncTree != nil && opt.CheckLandedCoverage {
-		// The one check that the tree is clean, before a landed sync (Sync) checks out another commit there.
+	if s.afterRefreshLock != nil {
+		if err := s.afterRefreshLock(ctx); err != nil {
+			return RefreshStats{}, err
+		}
+	}
+	if opt.Landed != nil {
+		// The one check that the tree is clean, before the landed sync checks out another commit there.
 		if err := requireCleanTree(ctx, tree.Source); err != nil {
 			return RefreshStats{}, err
 		}
@@ -227,9 +226,7 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 			logf(opt.Log, "declindex: index at %s covers LAND_COMMIT %s", covering, opt.Commit)
 			return RefreshStats{}, ErrAlreadyPast
 		}
-	}
-	if syncTree != nil {
-		if err := syncTree(ctx); err != nil {
+		if err := opt.Landed(ctx); err != nil {
 			return RefreshStats{}, err
 		}
 	}

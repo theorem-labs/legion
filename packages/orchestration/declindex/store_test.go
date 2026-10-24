@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -291,45 +292,44 @@ func TestRefreshRereadsAModuleWhoseSourceChangedInPlace(t *testing.T) {
 	}
 }
 
-func TestRefreshAtSerializesTheSyncStepWithTheRefreshLock(t *testing.T) {
+// A refresh's step under the refresh lock (the landed sync) never runs while another refresh holds the lock: the
+// second refresh waits for the lock, here until its context ends, and runs once the first is done.
+func TestRefreshSerializesTheSyncStepWithTheRefreshLock(t *testing.T) {
 	tree := goldenTree(t)
 	s := openStore(t)
 	ctx := context.Background()
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	firstDone := make(chan error, 1)
-	go func() {
-		_, err := s.RefreshAt(ctx, tree, RefreshOptions{Commit: "one"}, func(context.Context) error {
+	var steps atomic.Int32
+	s.afterRefreshLock = func(context.Context) error {
+		if steps.Add(1) == 1 {
 			close(entered)
 			<-release
-			return nil
-		})
+		}
+		return nil
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"})
 		firstDone <- err
 	}()
 	<-entered
-	secondAttempted := make(chan struct{})
-	s.beforeRefreshLock = func() { close(secondAttempted) }
-	secondStarted := make(chan struct{})
-	secondDone := make(chan error, 1)
-	go func() {
-		_, err := s.RefreshAt(ctx, tree, RefreshOptions{Commit: "two"}, func(context.Context) error {
-			close(secondStarted)
-			return nil
-		})
-		secondDone <- err
-	}()
-	<-secondAttempted
-	select {
-	case <-secondStarted:
-		t.Fatal("the second sync ran while the first refresh lock was held")
-	default:
+	short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	if _, err := s.Refresh(short, tree, RefreshOptions{Commit: "two"}); !errors.Is(err, context.DeadlineExceeded) {
+		close(release)
+		<-firstDone
+		t.Fatalf("a second refresh while the first held the refresh lock: %v; want it to wait", err)
+	}
+	if n := steps.Load(); n != 1 {
+		t.Fatalf("%d steps ran under the refresh lock while the first refresh held it; want 1", n)
 	}
 	close(release)
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-secondDone; err != nil {
-		t.Fatal(err)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); err != nil || steps.Load() != 2 {
+		t.Fatalf("the second refresh after the first: %v, %d steps; want 2", err, steps.Load())
 	}
 }
 
@@ -544,7 +544,7 @@ func TestAnIndexOnlyReaderReadsWhileARefreshSyncs(t *testing.T) {
 		t.Fatal(err)
 	}
 	synced := false
-	_, err = writer.RefreshAt(ctx, tree, RefreshOptions{Commit: "two"}, func(context.Context) error {
+	writer.afterRefreshLock = func(context.Context) error {
 		synced = true
 		if err := os.Chmod(dir, 0o555); err != nil {
 			return err
@@ -569,7 +569,9 @@ func TestAnIndexOnlyReaderReadsWhileARefreshSyncs(t *testing.T) {
 			t.Errorf("a reader of the index and the tree during a refresh's sync: %v; want it to wait for the refresh", err)
 		}
 		return nil
-	})
+	}
+	_, err = writer.Refresh(ctx, tree, RefreshOptions{Commit: "two"})
+	writer.afterRefreshLock = nil
 	if err != nil || !synced {
 		t.Fatalf("the refresh: %v, synced %v", err, synced)
 	}
@@ -593,7 +595,7 @@ func TestAReaderOfTheTreeAndARefreshExcludeEachOtherInAWritableDirectory(t *test
 	if _, err := writer.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = writer.RefreshAt(ctx, tree, RefreshOptions{Commit: "two"}, func(context.Context) error {
+	writer.afterRefreshLock = func(context.Context) error {
 		wait, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		if reader, err := OpenReadOnly(wait, path, IndexOnly); err != nil {
@@ -610,7 +612,9 @@ func TestAReaderOfTheTreeAndARefreshExcludeEachOtherInAWritableDirectory(t *test
 			t.Errorf("a reader of the index and the tree during a refresh's sync in a writable directory: %v; want it to wait", err)
 		}
 		return nil
-	})
+	}
+	_, err = writer.Refresh(ctx, tree, RefreshOptions{Commit: "two"})
+	writer.afterRefreshLock = nil
 	if err != nil {
 		t.Fatalf("the refresh: %v", err)
 	}

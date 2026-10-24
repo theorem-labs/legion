@@ -23,9 +23,9 @@ func (e *TempError) Error() string { return e.Err.Error() }
 
 func (e *TempError) Unwrap() error { return e.Err }
 
-// Sync returns the synchronisation that RefreshAt runs while it holds the index's refresh lock: it fetches an
-// otherwise absent commit, checks it out, and runs the configured build before the index reads it. Pass it with
-// CheckLandedCoverage: RefreshAt then refuses a tree with tracked changes before it runs it.
+// Sync returns the post-landing synchronisation that Refresh runs under the index's refresh lock
+// (RefreshOptions.Landed): it fetches an otherwise absent commit, checks it out, and runs the configured build before
+// the index reads it.
 func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error {
 	return func(ctx context.Context) error {
 		has, err := hasCommit(ctx, cfg.Tree, commit)
@@ -55,7 +55,7 @@ func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error 
 }
 
 // indexCoversLandedCommit reports whether the complete persisted index has already read commit or a descendant,
-// with its compiled part too when compiled is set. RefreshAt calls it while holding its refresh lock, so a retry
+// with its compiled part too when compiled is set. Refresh calls it while holding its refresh lock, so a retry
 // never mistakes a tree left at a failed build, or an index whose compiled step failed, for an advanced index.
 func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string, compiled bool) (string, error) {
 	indexed, err := s.Meta(ctx, "commit")
