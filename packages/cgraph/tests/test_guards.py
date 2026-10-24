@@ -603,3 +603,51 @@ def test_a_helper_s_value_on_its_parameters_guards_the_code_it_decides(tmp_path:
     assert compiled(facts, "offline", [constant(1), constant(6)]) == {"node_state", "pr"}
     assert compiled(facts, "normal", [unknown(), unknown(), constant(0)]) == {"has_special", "warn", "kept"}
     assert compiled(facts, "normal", [unknown(), unknown(), constant(1)]) == {"has_special", "note", "kept"}
+
+
+def test_two_arguments_that_read_one_value_compare_equal(tmp_path: Path) -> None:
+    """switch_hrtimer_base: `this_cpu_base = this_cpu_ptr(&hrtimer_bases); new_cpu_base =
+    get_target_base(this_cpu_base, pinned);`, which returns its base without CONFIG_HOTPLUG_CPU and
+    NO_HZ_COMMON; `again:` past both, `new_cpu_base = this_cpu_base; goto again;`. Then
+    hrtimer_suitable_target's `if (new_cpu_base == this_cpu_base) return true;` always returns."""
+    facts = facts_of(
+        tmp_path,
+        """
+        struct base { int online; long next; };
+        struct base *this_ptr(void);
+        static inline int is_online(struct base *b) { if (1) return 1; return b->online; }
+        static inline struct base *target(struct base *b, int pinned) { if (!is_online(b)) return (void *)0; return b; }
+        static int suitable(struct base *new_base, struct base *this_base)
+        {
+            if (new_base == this_base)
+                return 1;
+            note();
+            return new_base->next > 0;
+        }
+        void switch_base(int pinned)
+        {
+            struct base *new_base, *this_base;
+            this_base = this_ptr();
+            new_base = target(this_base, pinned);
+        again:
+            if (!suitable(new_base, this_base)) {
+                new_base = this_base;
+                goto again;
+            }
+            kept();
+        }
+        void other_base(struct base *given)
+        {
+            struct base *one = this_ptr();
+            struct base *two = this_ptr();
+            suitable(one, two);
+            suitable(given, given);
+        }
+        """,
+    )
+    calls = {name: facts["functions"][name]["events"]["calls"] for name in ("switch_base", "other_base")}
+    (switched,) = [call for call in calls["switch_base"] if call["callee"] == "suitable"]
+    assert compiled(facts, "suitable", switched["arguments"]) == set()
+    two, same = [call for call in calls["other_base"] if call["callee"] == "suitable"]
+    assert compiled(facts, "suitable", two["arguments"]) == {"note"}
+    assert compiled(facts, "suitable", same["arguments"]) == set()

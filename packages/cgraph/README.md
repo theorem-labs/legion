@@ -192,8 +192,12 @@ These rules follow what the machine code shows, each only where it shows it:
   value and each value assigned, one that `|=`, `&=` or `^=` change also each value those make of
   it, and a call of a helper of the unit is its template with the arguments put in
   (`node_online(this_node)` is `this_node == 0` without NUMA). A guard is decided where every value
-  it may take agrees. A call argument gives the value it passes (`expr`: a constant, a choice, or an
-  expression on the caller's own parameters, at each type's width). At a
+  it may take agrees, and an `==` or `!=` between two reads of one value is decided whatever that
+  value is: a pointer local set once (by its initializer or one assignment no loop or label repeats)
+  whose value the facts cannot state is named `{"v": name}` (switch_hrtimer_base's new_cpu_base is
+  this_cpu_base whichever store set it). A call argument gives the value it passes (`expr`: a
+  constant, a choice, a named value, or an expression on the caller's own parameters, at each
+  type's width). At a
   fold, link puts the arguments in; a call or an access a guard decides against becomes `unevaluated`
   with reason `constant_argument` (an exclusion), other events are dropped, and the guards still open
   carry up to the next fold.

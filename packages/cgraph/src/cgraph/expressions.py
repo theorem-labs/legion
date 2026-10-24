@@ -1,10 +1,11 @@
 """Guard expressions: the C integer expressions the facts state and link decides at a fold.
 
-An expression is JSON: ``{"c": n}`` a constant, ``{"p": i}`` the function's parameter ``i``, ``None`` a
-value the facts cannot name, or ``{"op": name, "a": [operands]}``: a C operator by its spelling
-(``"neg"`` and ``"~"`` and ``"!"`` unary, ``"cast"`` a conversion), ``"in"`` (the operand is one of
-``"set"``), or ``"?:"``, whose None condition makes it a choice between its two values. Each carries
-its C type: its width ``w`` in bits, its signedness ``s``, and ``b`` for _Bool.
+An expression is JSON: ``{"c": n}`` a constant, ``{"p": i}`` the function's parameter ``i``, ``{"v":
+name}`` the one value a variable holds that the facts cannot state, ``None`` a value the facts cannot
+name, or ``{"op": name, "a": [operands]}``: a C operator by its spelling (``"neg"`` and ``"~"`` and
+``"!"`` unary, ``"cast"`` a conversion), ``"in"`` (the operand is one of ``"set"``), or ``"?:"``, whose
+None condition makes it a choice between its two values. Each carries its C type: its width ``w`` in
+bits, its signedness ``s``, and ``b`` for _Bool.
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ def values(expression: Expression | None) -> frozenset[int] | None:
     parameter, a value the facts cannot name) or there are too many to keep. ``&&``, ``||`` and ``?:``
     take what the operand that decides them gives, as C evaluates them; ``x & 0`` and ``x * 0`` are 0
     whatever ``x`` is."""
-    if expression is None or "p" in expression:
+    if expression is None or "p" in expression or "v" in expression:
         return None
     if "c" in expression:
         return frozenset({normalized(int(expression["c"]), expression)})
@@ -89,6 +90,9 @@ def values(expression: Expression | None) -> frozenset[int] | None:
     second = values(operands[1])
     if operator in ("*", "&") and frozenset({0}) in (first, second):
         return frozenset({0})
+    if (first is None or second is None) and operator in ("==", "!=") and same(operands[0], operands[1]):
+        # Two reads of one value: switch_hrtimer_base's new_cpu_base, set from this_cpu_base.
+        return frozenset({int(operator == "==")})
     if first is None or second is None:
         return None
     binary = _BINARY[operator]
@@ -121,10 +125,40 @@ def mentions_parameter(expression: Expression | None) -> bool:
     return "p" in expression or any(mentions_parameter(operand) for operand in expression.get("a", []))
 
 
+def canonical(expression: Expression | None) -> Expression | None:
+    """The expression as one value the facts name (a constant, a parameter, a variable's one value,
+    an operation on those), without the casts that keep a type, and a choice whose sides are all that
+    value as it; None where it may be one of several values or one the facts cannot name."""
+    if expression is None or "op" not in expression:
+        return expression
+    raw = expression["a"]
+    operands = [canonical(operand) for operand in raw]
+    if expression["op"] == "?:" and raw[0] is None:
+        return operands[1] if operands[1] is not None and operands[1] == operands[2] else None
+    first = operands[0] if operands else None
+    if first is None or any(operand is None for operand in operands):
+        return None
+    if expression["op"] == "cast" and all(first.get(key) == expression.get(key) for key in _TYPE_KEYS):
+        return first
+    return {**expression, "a": operands}
+
+
+def same(first: Expression | None, second: Expression | None) -> bool:
+    """The two expressions are one value: each names it, and they name it alike."""
+    named = canonical(first)
+    return named is not None and named == canonical(second)
+
+
+def stated(expression: Expression | None) -> bool:
+    """The expression says something of the value at a fold: the values it may take, a parameter of
+    the function, or the one value it names."""
+    return values(expression) is not None or mentions_parameter(expression) or canonical(expression) is not None
+
+
 def substitute(expression: Expression | None, arguments: list[Expression | None]) -> Expression | None:
     """The expression in the caller's terms: each parameter becomes its argument, as the parameter's
     type holds it, or unknown where no argument is stated."""
-    if expression is None or "c" in expression:
+    if expression is None or "c" in expression or "v" in expression:
         return expression
     if "p" in expression:
         index = expression["p"]

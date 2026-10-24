@@ -2342,7 +2342,8 @@ class _FunctionWalk:
         assignments write may hold its first value (the argument, or the initializer; a local read
         before every store reads an indeterminate value) or any value assigned, and one that ``|=``,
         ``&=`` or ``^=`` change also what each makes of those (dequeue_entity's ``action |=
-        DO_DETACH``): a choice, decided only where every choice agrees."""
+        DO_DETACH``): a choice, decided only where every choice agrees. A pointer set once whose
+        value cannot be stated is named instead (``symbol``)."""
         key = variable.hash
         if key in self.holding or depth > _EXPRESSION_DEPTH:
             return None
@@ -2368,7 +2369,7 @@ class _FunctionWalk:
         finally:
             self.holding.discard(key)
         if not values or any(value is None for value in values) or any(operand is None for _, operand in operands):
-            return None
+            return self.symbol(variable)
         choice = values[0]
         for value in values[1:]:
             choice = {"op": "?:", "a": [None, choice, value]}
@@ -2389,9 +2390,37 @@ class _FunctionWalk:
             return None
         return found
 
-    def escapes_after(self, parameter: ci.Cursor, reference: ci.Cursor) -> bool:
-        """Every write to the parameter is ``&parameter`` after the reference in the function's text, the
-        reference is in no loop, and no label is before it: control reaches it before any escape."""
+    def symbol(self, variable: ci.Cursor) -> dict[str, Any] | None:
+        """A pointer local the function sets once, by its initializer or one plain assignment that no
+        loop or label repeats, and changes in no other way: every read after that store reads one
+        value, which the facts name (``{"v": name}``) though they cannot state it, so that two reads
+        are one value (switch_hrtimer_base's new_cpu_base, set from this_cpu_base or as it)."""
+        key = variable.hash
+        typed = _integer_type(variable.type)
+        if variable.kind != K.VAR_DECL or variable.storage_class in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN):
+            return None
+        if typed is None or variable.type.get_canonical().kind != TK.POINTER or self.local_uses()["written"][key]:
+            return None
+        initializer = libclang.var_initializer(variable)
+        definitions = [definition for definition, _ in self.definitions.get(key, [])]
+        if initializer is not None:
+            definitions.append(variable)
+        if len(definitions) != 1:
+            return None
+        (definition,) = definitions
+        layout = self.layout()
+        start = definition.extent.start
+        if definition.hash in layout["loops"] or start.file is None or self.cursor.extent.start.file is None:
+            return None
+        if start.file.name != self.cursor.extent.start.file.name or any(
+            label < start.offset for label in layout["labels"]
+        ):
+            return None
+        return {"v": self.x.object_name(variable), **typed}
+
+    def layout(self) -> dict[str, Any]:
+        """The function's nodes inside a loop and its labels' offsets, and per variable the offsets of
+        ``&variable`` and whether it is changed otherwise (``op=``, ``++``)."""
         if self.positions is None:
             loops: set[int] = set()
             labels: list[int] = []
@@ -2413,7 +2442,12 @@ class _FunctionWalk:
                 ):
                     other.add(target.referenced.hash)
             self.positions = {"loops": loops, "labels": labels, "escapes": escapes, "other": other}
-        positions = self.positions
+        return self.positions
+
+    def escapes_after(self, parameter: ci.Cursor, reference: ci.Cursor) -> bool:
+        """Every write to the parameter is ``&parameter`` after the reference in the function's text, the
+        reference is in no loop, and no label is before it: control reaches it before any escape."""
+        positions = self.layout()
         key = parameter.hash
         at = reference.extent.end.offset
         if key in positions["other"] or reference.hash in positions["loops"]:
@@ -3173,7 +3207,7 @@ class _FunctionWalk:
         # The value the argument passes, where it is a constant or depends on the caller's parameters:
         # the guards of a folded callee are decided by it (link._bind).
         value = self.x.evaluator.expression(expression, self.held)
-        if expressions.values(value) is not None or expressions.mentions_parameter(value):
+        if expressions.stated(value):
             item["expr"] = value
         return item
 
