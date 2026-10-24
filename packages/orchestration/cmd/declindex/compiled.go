@@ -311,6 +311,12 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
+	// An addition names its file from the repository's root: the tree's path in its repository, which refresh
+	// recorded in the index, then the registry's path in the tree.
+	prefix, err := e.store.Meta(ctx, "source_prefix")
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
 	if err := gateRegistryClean(e.cfg.Tree, rel); err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
@@ -345,7 +351,7 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &unableError{err})
 	}
 	proposals := filepath.Join(work, "proposals")
-	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, AdditionRoot: filepath.ToSlash(rel), Compiled: co,
+	g := &conceptgate.Gate{Index: e.store, Tree: e.cfg.TreeSpec(), Registry: e.cfg.Registry, AdditionRoot: prefix + filepath.ToSlash(rel), Compiled: co,
 		Librarian: conceptgate.CommandLibrarian{Command: e.cfg.Librarian, WorkDir: proposals}, WorkDir: proposals}
 	v, err := g.Decide(ctx, p, conceptgate.DecideOptions{Proposer: proposer, AcceptedBy: acceptedBy, ProposalBytes: raw})
 	for _, defect := range v.Defects {

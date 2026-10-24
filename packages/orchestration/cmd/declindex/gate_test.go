@@ -250,6 +250,61 @@ func TestGatePrintsCanonicalAdditionPathAfterSnapshotCleanup(t *testing.T) {
 	}
 }
 
+// A tree below its repository's root: the addition path is still repository-relative, the tree's path in the
+// repository (which refresh records in the index) followed by the registry's path in the tree.
+func TestGatePrintsTheAdditionPathOfATreeBelowTheRepositoryRoot(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("the successful gate path compiles untrusted source: set DECLINDEX_SANDBOX_TEST=1 in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	tree := filepath.Join(repo, "proj")
+	fixture, err := os.ReadFile(filepath.Join("..", "..", "declindex", "testdata", "lean", "Fixture.lean"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(tree, "Fixture.lean"), string(fixture))
+	lean, err := declindex.FindLean(context.Background(), t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := declindex.CompileModule(context.Background(), lean, nil, tree, "Fixture"); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
+	writeTestFile(t, filepath.Join(repo, "README"), "a repository whose Lean project is below its root\n")
+	config := filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: repo/proj\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	git(t, repo, "init", "-q")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "fixture")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	proposal := filepath.Join(dir, "proposal.json")
+	writeTestFile(t, proposal, `{"id":"p","concept":{"name":"Fresh","home":"Fresh.lean","meaning":"A fresh fact."},"source":"def Fresh : Prop := True\n"}`)
+	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+	if r.code != 0 {
+		t.Fatalf("gate: %+v", r)
+	}
+	var verdict struct {
+		CompiledHash string `json:"compiled_hash"`
+		Addition     struct {
+			Path string `json:"path"`
+		} `json:"addition"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &verdict); err != nil {
+		t.Fatal(err)
+	}
+	want := "proj/registry/concepts/" + verdict.CompiledHash + ".yaml"
+	if verdict.CompiledHash == "" || verdict.Addition.Path != want {
+		t.Fatalf("addition path %q, want %q", verdict.Addition.Path, want)
+	}
+}
+
 // The gate's registry snapshot comes from `git archive`, whose entries name tree paths; extraction must still refuse
 // any entry that would write outside the snapshot root or outside the registry, and links.
 func TestExtractRegistryArchiveRefusesEntriesOutsideTheRegistry(t *testing.T) {
