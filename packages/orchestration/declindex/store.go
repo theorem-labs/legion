@@ -437,6 +437,21 @@ func (s *Store) lockRefresh(ctx context.Context) (func(), error) {
 	return lockFile(ctx, s.path+refreshLockSuffix, true)
 }
 
+// writeTx runs f in one transaction of the index under the write lock (write), and commits it when f succeeds.
+func (s *Store) writeTx(ctx context.Context, log io.Writer, f func(*sql.Tx) error) error {
+	return s.write(ctx, log, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := f(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+}
+
 // write runs f, a write of the index, while it holds the index's write lock exclusive, and then moves the
 // write-ahead log into the database file (checkpoint). A reader in a read-only directory holds that lock shared and
 // reads the database file alone, so it reads the index as it was before f or as f left it, never during f. When f
