@@ -244,6 +244,34 @@ def test_a_pointer_target_whose_address_is_formed_lends_the_calls_of_its_inlined
     assert c_calls(graph, "function:run") == {"function:register"}
 
 
+def _released(image_calls_kfree: bool) -> dict[str, Any]:
+    """bdi_put: kref_put(&bdi->refcnt, release_bdi), and kref_put calls release(kref): release_bdi's
+    wb.completions is 288 from the kref, which is 64 into the bdi the caller holds."""
+    put = function("put", static=True)
+    put["events"]["parameter_calls"] = [
+        {"param": 1, "arguments": [{**parameter(0), "displacement": 0, "base": "pointer"}], "provenance": where()}
+    ]
+    release = function("release", static=True, calls=(call("kfree", visible=False),))
+    release["events"]["field_accesses"] = [
+        {"struct": "wb", "field": "completions", "offset": 248, "displacement": 288, "base": "container_of",
+         "size": 8, "bitfield": False, "param": 0, "provenance": where()}
+    ]  # fmt: skip
+    kref = {**parameter(0), "displacement": 64, "base": "pointer"}
+    named = {"unit": None, "param": None, "function": "release"}
+    run = function("run", calls=(call("put", kref, named),), pointers=("release",))
+    tus = {"a.c": unit(run, put, release), "b.c": unit(function("kfree", "b.c"))}
+    shown = image_calls("kfree") if image_calls_kfree else []
+    image = StubImage({"run": [(0x100, False, "")], "kfree": [(0x200, False, "")]}, {0x100: FunctionFacts(calls=shown)})
+    return build(tus, image)
+
+
+def test_a_pointer_target_a_folded_helper_calls_takes_the_arguments_of_that_call() -> None:
+    (item,) = _released(True)["analysis"]["field_accesses"]["function:run"]
+    assert (item["displacement"], item["param"]) == (352, 0)
+    # Not folded where the image shows nothing of it: no field of it is the caller's.
+    assert _released(False)["analysis"]["field_accesses"].get("function:run", []) == []
+
+
 # A header function's copy and the unit that compiled it --------------------------------------
 
 

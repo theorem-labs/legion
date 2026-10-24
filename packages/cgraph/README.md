@@ -140,9 +140,13 @@ These rules follow what the machine code shows, each only where it shows it:
 
 - A function whose address the C passes (a callback, a deferred free) is folded into the caller where
   the caller's machine code neither calls it nor forms its address, and makes a call or addresses a
-  global that only that function explains, not the caller's own C. Where the image forms the address
-  and also inlined a copy (an action a helper calls on its error path), the calls and globals only
-  the copy explains are the caller's, marked `partial_inline`.
+  global that only that function explains, not the caller's own C. Where a folded helper calls the
+  function through the parameter it was passed in (the facts' `parameter_calls`: kref_put's
+  `release(kref)`, an argument's `function` naming release_bdi), its parameters are that call's
+  arguments in the caller's terms, so its fields are rebased and its guards decided as a helper's;
+  otherwise its events are under the guards of the pointer's use only. Where the image forms the
+  address and also inlined a copy (an action a helper calls on its error path), the calls and
+  globals only the copy explains are the caller's, marked `partial_inline`.
 - A static function's parameter that every call site of its unit gives one global (directly, or
   through a static caller's parameter, which the facts may also type as its struct), in a function
   whose address the unit does not take, is that global where the machine code addresses it (or an

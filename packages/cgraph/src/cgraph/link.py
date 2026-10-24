@@ -206,6 +206,9 @@ class Effective:
     field_accesses: list[dict[str, Any]] = field(default_factory=list)
     folds: list[dict[str, Any]] = field(default_factory=list)
     unbound: list[dict[str, Any]] = field(default_factory=list)
+    # Per function the code passes to a folded helper, the arguments that helper calls it with
+    # (kref_put's release(kref)), in this code's terms.
+    pointer_calls: dict[str, list[list[dict[str, Any]]]] = field(default_factory=dict)
 
 
 def _with_via(item: dict[str, Any], helper: str) -> dict[str, Any]:
@@ -499,6 +502,7 @@ class Linker:
                 result.folds.append({"helper": helper.id, "provenance": call["provenance"]})
                 result.folds += bound.folds
                 result.unbound += [_under(item, guards) for item in bound.unbound]
+                self.pointer_calls(tu, callee, call, result)
             else:
                 result.calls.append({**call, "tu": tu})
                 if call.get("visible") and callee in callees and callee not in stack and callee != name:
@@ -573,22 +577,52 @@ class Linker:
                 ]
                 kept.append(pointer)
                 continue
-            # The target's own guards are on its parameters, which no argument of this code binds:
-            # its events are under the guards of the pointer's use only.
             guards = pointer.get("guards", [])
-            result.calls += [_reframed(_with_via(item, helper.id), guards) for item in child.calls]
-            for kind in _EVENT_LISTS:
-                if kind != "function_pointers":
-                    getattr(result, kind).extend(
-                        _reframed(_with_via(item, helper.id), guards) for item in getattr(child, kind)
-                    )
-            kept += [_reframed(_with_via(item, helper.id), guards) for item in child.function_pointers]
+            passed = {jsonio.canonical(arguments): arguments for arguments in result.pointer_calls.get(target, [])}
+            if len(passed) == 1:
+                # A folded helper calls it through its parameter (kref_put's release(kref)): its
+                # parameters are those arguments, so its fields are rebased and its guards decided.
+                bound = _bind(child, next(iter(passed.values())))
+                result.calls += [_under(_with_via(item, helper.id), guards) for item in bound.calls]
+                for kind in _EVENT_LISTS:
+                    if kind != "function_pointers":
+                        getattr(result, kind).extend(
+                            _under(_with_via(item, helper.id), guards) for item in getattr(bound, kind)
+                        )
+                kept += [_under(_with_via(item, helper.id), guards) for item in bound.function_pointers]
+                result.unbound += [_under(item, guards) for item in bound.unbound]
+            else:
+                # Its own guards are on its parameters, which no argument of this code binds: its
+                # events are under the guards of the pointer's use only.
+                result.calls += [_reframed(_with_via(item, helper.id), guards) for item in child.calls]
+                for kind in _EVENT_LISTS:
+                    if kind != "function_pointers":
+                        getattr(result, kind).extend(
+                            _reframed(_with_via(item, helper.id), guards) for item in getattr(child, kind)
+                        )
+                kept += [_reframed(_with_via(item, helper.id), guards) for item in child.function_pointers]
+                result.unbound += [_reframed(item, guards) for item in child.unbound]
             result.folds.append({"helper": helper.id, "provenance": pointer["provenance"], "through": "pointer"})
             result.folds += child.folds
-            result.unbound += [_reframed(item, guards) for item in child.unbound]
         result.function_pointers = kept
         self.effective_cache[key] = result
         return result
+
+    def pointer_calls(self, tu: str, helper: str, call: dict[str, Any], result: Effective) -> None:
+        """The calls a folded helper makes through a parameter its caller passes a function in: that
+        function's arguments in the caller's terms, kept per function in ``result.pointer_calls``."""
+        record = self.tus[tu]["functions"][helper]
+        through = _resolved(record["events"].get("parameter_calls", []), record.get("guards", []))
+        for item in through:
+            passed = call["arguments"][item["param"]] if item["param"] < len(call["arguments"]) else {}
+            target = passed.get("function")
+            if target is None:
+                continue
+            restated = {"callee": target, "arguments": item["arguments"], "provenance": item["provenance"]}
+            if item.get("guards"):
+                restated["guards"] = item["guards"]
+            for bound in _bind(Effective(calls=[restated]), call["arguments"]).calls:
+                result.pointer_calls.setdefault(target, []).append(bound["arguments"])
 
     def own_events(self, caller: Definition) -> tuple[frozenset[str], frozenset[str]]:
         """The callees and the globals of the caller's own C: every helper the image inlines folded,

@@ -2245,6 +2245,7 @@ class _FunctionWalk:
             kind: _Tagged(self)
             for kind in (
                 "calls", "accesses", "unevaluated", "list_calls", "indirect", "function_pointers", "field_accesses",
+                "parameter_calls",
             )
         }  # fmt: skip
         self.conditional = 0  # depth of __builtin_constant_p branches being walked
@@ -3173,11 +3174,17 @@ class _FunctionWalk:
         """What a call argument names: its state unit, the parameter it derives from, and, for an
         address the facts can follow (wb_exit(&bdi->wb), prepare_alloc_pages(..., &ac, ...),
         clk_core_free_parent_map(container_of(ref, ...))), what that address adds to its base and
-        what the base is, so a folded callee's field offsets can be rebased onto the caller's."""
+        what the base is, so a folded callee's field offsets can be rebased onto the caller's. A
+        function the argument names (kref_put's release_bdi) is ``function``."""
         item: dict[str, Any] = {
             "unit": self.held_global(expression) or self.x.unit_from_ref(expression) or self.global_storage(expression),
             "param": self.parameter_root(expression),
         }
+        named = _strip(expression)
+        if named.kind == K.UNARY_OPERATOR and libclang.is_address_of(named) and _children(named):
+            named = _strip(_children(named)[0])
+        if named.kind == K.DECL_REF_EXPR and named.referenced is not None and named.referenced.kind == K.FUNCTION_DECL:
+            item["function"] = named.referenced.spelling
         if expression.type.get_canonical().kind == TK.POINTER:
             members: list[ci.Cursor] = []
             address = self.pointer(expression, 0, members, 0)
@@ -3410,6 +3417,18 @@ class _FunctionWalk:
                     )
             return
         if reason is not None:
+            return
+        through = callee_expression.referenced if callee_expression.kind == K.DECL_REF_EXPR else None
+        position = self.parameters.get(through.hash) if through is not None else None
+        if through is not None and position is not None and not self.written(through):
+            # kref_put's release(kref): the function its caller passes is called with these arguments.
+            self.events["parameter_calls"].append(
+                {
+                    "param": position,
+                    "arguments": [self.argument(argument) for argument in arguments],
+                    "provenance": [self.x.location(node)],
+                }
+            )
             return
         callee_expression = head
         for child in callee_expression.walk_preorder():

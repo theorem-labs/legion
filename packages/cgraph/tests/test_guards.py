@@ -651,3 +651,30 @@ def test_two_arguments_that_read_one_value_compare_equal(tmp_path: Path) -> None
     two, same = [call for call in calls["other_base"] if call["callee"] == "suitable"]
     assert compiled(facts, "suitable", two["arguments"]) == {"note"}
     assert compiled(facts, "suitable", same["arguments"]) == set()
+
+
+def test_a_call_through_a_parameter_gives_its_arguments_and_a_function_argument_its_name(tmp_path: Path) -> None:
+    """bdi_put: kref_put(&bdi->refcnt, release_bdi); kref_put calls release(kref) when the count drops."""
+    facts = facts_of(
+        tmp_path,
+        """
+        struct kref { int refcount; };
+        struct bdi { long id[8]; struct kref refcnt; long state; };
+        static inline int put(struct kref *kref, void (*release)(struct kref *kref))
+        {
+            if (--kref->refcount == 0) {
+                release(kref);
+                return 1;
+            }
+            return 0;
+        }
+        static void release_bdi(struct kref *ref) { note(); }
+        void bdi_put(struct bdi *bdi) { put(&bdi->refcnt, release_bdi); }
+        """,
+    )
+    (through,) = facts["functions"]["put"]["events"]["parameter_calls"]
+    (kref,) = through["arguments"]
+    assert (through["param"], kref["param"], kref["displacement"]) == (1, 0, 0)
+    (call,) = facts["functions"]["bdi_put"]["events"]["calls"]
+    assert call["arguments"][1]["function"] == "release_bdi"
+    assert (call["arguments"][0]["param"], call["arguments"][0]["displacement"]) == (0, 64)
