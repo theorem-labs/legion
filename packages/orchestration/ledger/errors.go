@@ -10,6 +10,7 @@ const (
 	ReasonNotHolder          = "not_holder"          // the item is held by someone else
 	ReasonLeaseHeld          = "lease_held"          // the item has a live lease
 	ReasonLeaseExpired       = "lease_expired"       // the caller's lease ended
+	ReasonSupervisedLease    = "supervised_lease"    // the lease has no end: its supervisor frees it
 	ReasonDone               = "done"                // the item already has a result
 	ReasonNotOpen            = "not_open"            // the migration has landed or been abandoned
 	ReasonExists             = "exists"              // a migration with that name already exists
@@ -18,9 +19,11 @@ const (
 	ReasonImportConflict     = "import_conflict"     // a pilot record disagrees with the ledger's copy
 	ReasonNotOwner           = "not_owner"           // the caller does not own the contract
 	ReasonStaleRead          = "stale_read"          // a recorded contract hash is no longer current
+	ReasonUnverifiedRead     = "unverified_read"     // the caller did not supply a current hash for a declared read
 	ReasonStaleVersion       = "stale_version"       // an agreement did not read the current contract version
 	ReasonPinned             = "pinned"              // a person must approve the pinned contract's change
 	ReasonEscalated          = "escalated"           // the migration awaits a steward's decision
+	ReasonInvalidCandidate   = "invalid_candidate"   // candidate metadata cannot describe a complete landing
 	ReasonUndeclaredWrite    = "undeclared_write"    // the candidate writes a path outside the migration lock
 	ReasonUndeclaredContract = "undeclared_contract" // the migration did not declare the changed contract as a read
 	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.

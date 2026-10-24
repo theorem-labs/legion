@@ -18,19 +18,6 @@ const (
 	StateAbandoned = "abandoned"
 )
 
-// Kinds of check violation. Any violation means the candidate must not land.
-const (
-	ViolationNotOpen         = "not_open"         // the migration has landed or been abandoned
-	ViolationStaleGeneration = "stale_generation" // the candidate comes from a generation that was taken over
-	ViolationEscalated       = "escalated"        // it used up its landing rounds; the steward decides first
-	ViolationUndeclaredWrite = "undeclared_write" // a changed path outside the declared writes
-	ViolationStaleRead       = "stale_read"       // a read's statement hash changed, or the statement is gone
-	ViolationUnverifiedRead  = "unverified_read"  // no current hash was supplied for a read, so it cannot be decided
-	ViolationOverlap         = "overlap"          // the declared writes overlap another open migration's
-	// A changed registered contract has neither a compatibility proof nor an agent's review at the candidate's head.
-	ViolationStatementUnreviewed = "statement_unreviewed"
-)
-
 // OpenRequest declares a migration: what it writes (files, or directories ending in "/", new files included)
 // and the statement hash of each declaration it read.
 type OpenRequest struct {
@@ -63,41 +50,21 @@ type Migration struct {
 	ReadVersions     map[string]*int64 `json:"read_versions,omitempty"`
 }
 
-// CheckRequest asks whether a candidate change may land for a migration.
-type CheckRequest struct {
+// RoundRequest records a failed landing round: the ready record whose candidate failed, and the round's idempotency
+// key.
+type RoundRequest struct {
 	Repo       string `json:"repo"`
 	ID         string `json:"id"`
 	Generation int64  `json:"generation"`
-	// Changed is every path the candidate adds, modifies or deletes, relative to the repository root.
-	Changed []string `json:"changed"`
-	// Current maps a read's name to its statement hash in the candidate's base. An empty hash means the statement
-	// no longer exists; a name missing from the map was not hashed, so that read cannot be decided.
-	Current map[string]string `json:"current"`
-	// ChangedContracts, CompatibilityProof and ReviewedHead are the statement change and its records, as Land
-	// receives them. Head is optional here: without it, only a compatibility proof can clear a statement change.
-	ChangedContracts   map[string]string `json:"changed_contracts"`
-	Head               string            `json:"head"`
-	CompatibilityProof string            `json:"compatibility_proof"`
-	ReviewedHead       string            `json:"reviewed_head"`
-}
-
-// Violation is one reason a candidate must not land.
-type Violation struct {
-	Kind     string `json:"kind"`
-	Path     string `json:"path,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Recorded string `json:"recorded,omitempty"`
-	Current  string `json:"current,omitempty"`
-	Other    string `json:"other,omitempty"`
-	Message  string `json:"message"`
-}
-
-// CheckResult is the landing decision. Pass is true only with no violations.
-type CheckResult struct {
-	Migration  string      `json:"migration"`
-	Generation int64       `json:"generation"`
-	Pass       bool        `json:"pass"`
-	Violations []Violation `json:"violations"`
+	Reason     string `json:"reason"`
+	Batch      string `json:"batch"`
+	Key        string `json:"key"`
+	// ReadyEvent is the ready_event of the ready record the landing program took the failed candidate from, as
+	// ready-list prints it. The round clears the migration's ready record only while that record is still the stored
+	// one, so an owner's newer submission survives the return of an older one.
+	ReadyEvent int64  `json:"ready_event"`
+	Detail     string `json:"detail"`
+	Log        string `json:"log"`
 }
 
 type querier interface {
@@ -336,14 +303,24 @@ func lockOpenAt(ctx context.Context, tx pgx.Tx, repo, id string, gen int64) (Mig
 	if err != nil {
 		return m, err
 	}
+	return m, requireOpenAt(m, gen)
+}
+
+// escalatedMessage says why an escalated migration waits: check's violation and ready's refusal give the same text.
+func escalatedMessage(m Migration) string {
+	return fmt.Sprintf("migration %s was escalated to the steward: %s", m.ID, m.EscalationReason)
+}
+
+// requireOpenAt refuses migration m unless it is open at generation gen.
+func requireOpenAt(m Migration, gen int64) error {
 	if m.State != StateOpen {
-		return m, refuse(ReasonNotOpen, "migration %s is %s", id, m.State)
+		return refuse(ReasonNotOpen, "migration %s is %s", m.ID, m.State)
 	}
 	if gen != m.Generation {
-		return m, refuse(ReasonStaleGeneration, "migration %s is at generation %d (owner %s), not %d",
-			id, m.Generation, m.Owner, gen)
+		return refuse(ReasonStaleGeneration, "migration %s is at generation %d (owner %s), not %d",
+			m.ID, m.Generation, m.Owner, gen)
 	}
-	return m, nil
+	return nil
 }
 
 // ExtendMigration adds declared writes and reads to an open migration, under the same overlap rule as
@@ -381,8 +358,12 @@ func (s *Store) ExtendMigration(ctx context.Context, repo, id string, gen int64,
 		if err := upsertReads(ctx, tx, repo, id, reads); err != nil {
 			return err
 		}
+		readyCleared, err := clearReady(ctx, tx, repo, id)
+		if err != nil {
+			return err
+		}
 		if err := event(ctx, tx, repo, "migration.extended", id, cur.Owner, map[string]any{
-			"generation": gen, "writes": writeStrings(ws), "reads": reads,
+			"generation": gen, "writes": writeStrings(ws), "reads": reads, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}
@@ -404,12 +385,16 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 		if err != nil {
 			return err
 		}
+		readyCleared, err := clearReady(ctx, tx, repo, id)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE migrations SET owner = $3, generation = generation + 1 WHERE repo = $1 AND id = $2`,
 			repo, id, owner); err != nil {
 			return err
 		}
 		if err := event(ctx, tx, repo, "migration.taken_over", id, owner, map[string]any{
-			"from_owner": cur.Owner, "from_generation": gen, "generation": gen + 1,
+			"from_owner": cur.Owner, "from_generation": gen, "generation": gen + 1, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}
@@ -419,188 +404,70 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 	return m, err
 }
 
-// cleanCheckRequest validates and normalizes candidate paths before they are compared to declared writes, and
-// validates the candidate's changed contracts and statement records.
-func cleanCheckRequest(req CheckRequest) (CheckRequest, error) {
-	if err := checkStatementChange(req.ChangedContracts, req.Head, req.CompatibilityProof, req.ReviewedHead); err != nil {
-		return CheckRequest{}, err
+// RecordRound records one landing round the migration failed (its candidate was sent back). The key alone makes it
+// idempotent: a repeated key returns the migration as it is now, even after a takeover or with another reason, without
+// counting or recording a second failure. The round clears the migration's ready record only when that record is
+// still the one the round consumed (req.ReadyEvent): a newer submission from the owner stays listed, and the round
+// still counts, because the older candidate really failed. When the repository's limit is set and the migration has
+// now used that many rounds, it is escalated to the steward.
+func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, error) {
+	if req.Key == "" {
+		return Migration{}, invalid("a round needs an idempotency key")
 	}
-	changed := make([]string, 0, len(req.Changed))
-	for _, path := range req.Changed {
-		cleaned, err := cleanRepoPath(path)
-		if err != nil {
-			return CheckRequest{}, err
-		}
-		changed = append(changed, cleaned)
+	if req.ReadyEvent < 1 {
+		return Migration{}, invalid("a round needs the ready event of the record it consumed")
 	}
-	sort.Strings(changed)
-	req.Changed = changed
-	return req, nil
-}
 
-// checkViolations evaluates every candidate check against a migration locked by the caller.
-func checkViolations(ctx context.Context, q querier, m Migration, req CheckRequest) ([]Violation, error) {
-	var violations []Violation
-	add := func(v Violation) { violations = append(violations, v) }
-	if m.State != StateOpen {
-		add(Violation{Kind: ViolationNotOpen, Message: fmt.Sprintf("migration %s is %s", m.ID, m.State)})
-	}
-	if req.Generation != m.Generation {
-		add(Violation{Kind: ViolationStaleGeneration, Message: fmt.Sprintf(
-			"candidate is from generation %d; migration %s is at generation %d (owner %s)",
-			req.Generation, m.ID, m.Generation, m.Owner)})
-	}
-	if m.EscalatedAt != nil {
-		add(Violation{Kind: ViolationEscalated, Message: fmt.Sprintf(
-			"migration %s was escalated to the steward: %s", m.ID, m.EscalationReason)})
-	}
-	ours, err := migrationWrites(ctx, q, req.Repo, req.ID)
-	if err != nil {
-		return nil, err
-	}
-	sets, err := openWriteSets(ctx, q, req.Repo, req.ID)
-	if err != nil {
-		return nil, err
-	}
-	for _, path := range req.Changed {
-		if coveredBy(ours, path) {
-			continue
-		}
-		v := Violation{Kind: ViolationUndeclaredWrite, Path: path,
-			Message: fmt.Sprintf("%s is outside migration %s's declared writes", path, m.ID)}
-		if other := holderOf(sets, path); other != "" {
-			v.Other = other
-			v.Message += "; open migration " + other + " declares it"
-		}
-		add(v)
-	}
-	names := sortedNames(m.Reads)
-	for _, name := range names {
-		recorded := m.Reads[name]
-		current, ok := req.Current[name]
-		switch {
-		case !ok:
-			add(Violation{Kind: ViolationUnverifiedRead, Name: name, Recorded: recorded,
-				Message: fmt.Sprintf("no current hash for read %s, so it cannot be checked", name)})
-		case current == "":
-			add(Violation{Kind: ViolationStaleRead, Name: name, Recorded: recorded,
-				Message: fmt.Sprintf("read %s no longer exists (recorded hash %s)", name, recorded)})
-		case current != recorded:
-			add(Violation{Kind: ViolationStaleRead, Name: name, Recorded: recorded, Current: current,
-				Message: fmt.Sprintf("read %s changed: recorded %s, now %s", name, recorded, current)})
-		}
-	}
-	if m.State == StateOpen {
-		ids := make([]string, 0, len(sets))
-		for id := range sets {
-			ids = append(ids, id)
-		}
-		sort.Strings(ids)
-		for _, id := range ids {
-			for _, clash := range clashes(ours, sets[id]) {
-				add(Violation{Kind: ViolationOverlap, Path: clash.Ours, Other: id,
-					Message: fmt.Sprintf("declared %s overlaps open migration %s's %s", clash.Ours, id, clash.Theirs)})
-			}
-		}
-	}
-	return violations, nil
-}
-
-// Check decides whether a candidate change may land for a migration. It writes nothing but the event that
-// records its decision. A refusal of the request itself (an unknown migration, a bad path) is an error; every
-// reason the candidate must not land is a violation in the result.
-func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error) {
-	cleaned, err := cleanCheckRequest(req)
-	if err != nil {
-		return CheckResult{}, err
-	}
-	res := CheckResult{Migration: cleaned.ID, Generation: cleaned.Generation}
-	err = s.tx(ctx, func(tx pgx.Tx) error {
-		res.Violations = nil
-		if _, err := lockRepo(ctx, tx, cleaned.Repo, false); err != nil {
-			return err
-		}
-		migration, err := loadMigration(ctx, tx, cleaned.Repo, cleaned.ID, true)
-		if err != nil {
-			return err
-		}
-		res.Violations, err = checkViolations(ctx, tx, migration, cleaned)
-		if err != nil {
-			return err
-		}
-		// Land decides the statement rule after its contract checks, so it is not one of the shared violations.
-		statement, err := statementViolations(ctx, tx, migration, cleaned)
-		if err != nil {
-			return err
-		}
-		res.Violations = append(res.Violations, statement...)
-		res.Pass = len(res.Violations) == 0
-		kinds := make([]string, 0, len(res.Violations))
-		for _, violation := range res.Violations {
-			kinds = append(kinds, violation.Kind)
-		}
-		return event(ctx, tx, cleaned.Repo, "migration.checked", cleaned.ID, "", map[string]any{
-			"generation": cleaned.Generation, "pass": res.Pass, "changed": len(cleaned.Changed), "violations": kinds,
-		})
-	})
-	if res.Violations == nil {
-		res.Violations = []Violation{}
-	}
-	return res, err
-}
-
-func coveredBy(ws []writePath, p string) bool {
-	for _, w := range ws {
-		if w.covers(p) {
-			return true
-		}
-	}
-	return false
-}
-
-func holderOf(sets map[string][]writePath, p string) string {
-	ids := make([]string, 0, len(sets))
-	for id := range sets {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		if coveredBy(sets[id], p) {
-			return id
-		}
-	}
-	return ""
-}
-
-// RecordRound records one landing round the migration failed (its candidate was sent back). When the
-// repository's limit is set and the migration has now used that many rounds, it is escalated to the steward.
-func (s *Store) RecordRound(ctx context.Context, repo, id string, gen int64, reason string) (Migration, error) {
 	var m Migration
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		r, err := lockRepo(ctx, tx, repo, false)
+		r, err := lockRepo(ctx, tx, req.Repo, false)
 		if err != nil {
 			return err
 		}
-		cur, err := lockOpenAt(ctx, tx, repo, id, gen)
+		cur, err := loadMigration(ctx, tx, req.Repo, req.ID, true)
 		if err != nil {
 			return err
 		}
+
+		var known bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM round_keys WHERE repo = $1 AND migration = $2 AND key = $3)`,
+			req.Repo, req.ID, req.Key).Scan(&known); err != nil {
+			return err
+		}
+		if known {
+			m = cur
+			return nil
+		}
+		if err := requireOpenAt(cur, req.Generation); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key) VALUES ($1, $2, $3)`,
+			req.Repo, req.ID, req.Key); err != nil {
+			return err
+		}
+
 		rounds := cur.LandingRounds + 1
-		if _, err := tx.Exec(ctx, `UPDATE migrations SET landing_rounds = $3 WHERE repo = $1 AND id = $2`, repo, id, rounds); err != nil {
+		readyCleared, err := clearReadyEvent(ctx, tx, req.Repo, req.ID, req.ReadyEvent)
+		if err != nil {
 			return err
 		}
-		if err := event(ctx, tx, repo, "migration.round_failed", id, "", map[string]any{
-			"generation": gen, "landing_rounds": rounds, "reason": reason,
+		if _, err := tx.Exec(ctx, `UPDATE migrations SET landing_rounds = $3 WHERE repo = $1 AND id = $2`,
+			req.Repo, req.ID, rounds); err != nil {
+			return err
+		}
+		if err := event(ctx, tx, req.Repo, "migration.round_failed", req.ID, "", map[string]any{
+			"generation": req.Generation, "landing_rounds": rounds, "reason": req.Reason, "batch": req.Batch, "key": req.Key,
+			"detail": req.Detail, "log": req.Log, "ready_event": req.ReadyEvent, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}
 		if r.MaxLandingRounds > 0 && rounds >= r.MaxLandingRounds && cur.EscalatedAt == nil {
-			why := fmt.Sprintf("failed %d of %d landing rounds; last: %s", rounds, r.MaxLandingRounds, reason)
-			if err := escalate(ctx, tx, repo, id, why); err != nil {
+			why := fmt.Sprintf("failed %d of %d landing rounds; last: %s", rounds, r.MaxLandingRounds, req.Reason)
+			if err := escalate(ctx, tx, req.Repo, req.ID, why); err != nil {
 				return err
 			}
 		}
-		m, err = loadMigration(ctx, tx, repo, id, false)
+		m, err = loadMigration(ctx, tx, req.Repo, req.ID, false)
 		return err
 	})
 	return m, err
@@ -719,12 +586,16 @@ func (s *Store) Abandon(ctx context.Context, repo, id string, gen int64, reason 
 		if err != nil {
 			return err
 		}
+		readyCleared, err := clearReady(ctx, tx, repo, id)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE migrations SET state = $3, closed_at = clock_timestamp(), close_reason = $4
 			WHERE repo = $1 AND id = $2`, repo, id, StateAbandoned, reason); err != nil {
 			return err
 		}
 		if err := event(ctx, tx, repo, "migration.abandoned", id, cur.Owner, map[string]any{
-			"generation": gen, "reason": reason, "released": cur.Writes,
+			"generation": gen, "reason": reason, "released": cur.Writes, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}
