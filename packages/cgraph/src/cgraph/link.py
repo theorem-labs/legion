@@ -41,6 +41,8 @@ _ADDRESS_KEYS = frozenset({"displacement", "base", "object", "object_size", "ele
 _CORE_FORMAT = "cgraph/link-core/v1"
 # The events a fold under a __builtin_constant_p choice marks ``conditional``, besides calls.
 _MARKED = ("accesses", "field_accesses")
+# A guard's outcome at a fold where its arguments decide against the event (``_decision``).
+_AGAINST: Any = object()
 # Image items naming every C name at an address the code forms, where the image cannot tell which
 # the C meant: the start of a merged-globals block, a zero-size marker at a function's start.
 _ADDRESS_NAMES = ("merged_globals_block_base", "code_marker_at_function_start")
@@ -852,20 +854,37 @@ def _under(item: dict[str, Any], guards: list[dict[str, Any]]) -> dict[str, Any]
     return {**item, "guards": [*item.get("guards", []), *guards]}
 
 
-def _decided(guards: list[dict[str, Any]], arguments: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+def _decided(
+    guards: list[dict[str, Any]], arguments: list[dict[str, Any]], decisions: dict[int, Any] | None = None
+) -> list[dict[str, Any]] | None:
     """The guards that still depend on a parameter once the arguments are bound, or None when one is
-    decided against the event."""
+    decided against the event. ``decisions`` keeps each guard's outcome for these arguments by the
+    guard's identity (with the guard, so that no identity is reused while it is kept): a helper's
+    events share their guards (its table's, and those of the calls that folded it), so each is decided
+    once per fold, and the guards it leaves stay shared a fold up."""
+    decisions = {} if decisions is None else decisions
     left = []
-    values = _argument_values(arguments)
     for guard in guards:
-        expression = expressions.substitute(guard["e"], values)
-        truth = expressions.truth(expression)
-        if truth is None:
-            if expressions.mentions_parameter(expression):
-                left.append({"e": expression, "v": guard["v"]})
-        elif bool(truth) != guard["v"]:
+        key = id(guard)
+        if key not in decisions:
+            decisions[key] = (guard, _decision(guard, _argument_values(arguments)))
+        outcome = decisions[key][1]
+        if outcome is _AGAINST:
             return None
+        if outcome is not None:
+            left.append(outcome)
     return left
+
+
+def _decision(guard: dict[str, Any], values: list[dict[str, Any] | None]) -> Any:
+    """One guard with the arguments' values put in: ``_AGAINST`` where every value it may take is
+    against the event, None where every one is for it or it no longer names a parameter, else the
+    guard on the caller's parameters."""
+    expression = expressions.substitute(guard["e"], values)
+    truth = expressions.truth(expression)
+    if truth is not None:
+        return None if bool(truth) == guard["v"] else _AGAINST
+    return {"e": expression, "v": guard["v"]} if expressions.mentions_parameter(expression) else None
 
 
 def _guarded(bound: Effective, child: Effective, arguments: list[dict[str, Any]]) -> Effective:
@@ -883,13 +902,14 @@ def _guarded(bound: Effective, child: Effective, arguments: list[dict[str, Any]]
             )
         call["arguments"] = restated
     dead: list[dict[str, Any]] = []
+    decisions: dict[int, Any] = {}
     for kind in ("calls", *_EVENT_LISTS, "unbound"):
         kept = []
         for item in getattr(bound, kind):
             if not item.get("guards"):
                 kept.append(item)
                 continue
-            left = _decided(item["guards"], arguments)
+            left = _decided(item["guards"], arguments, decisions)
             if left is not None:
                 kept.append({**item, "guards": left} if left else {k: v for k, v in item.items() if k != "guards"})
             elif kind == "unevaluated":

@@ -272,6 +272,18 @@ def test_a_pointer_target_a_folded_helper_calls_takes_the_arguments_of_that_call
     assert _released(False)["analysis"]["field_accesses"].get("function:run", []) == []
 
 
+def test_a_guard_its_events_share_is_decided_once_per_fold(monkeypatch: Any) -> None:
+    """A helper's events share their guards: a fold decides each once, and what it leaves stays shared."""
+    decided: list[dict[str, Any]] = []
+    decision = link._decision
+    monkeypatch.setattr(link, "_decision", lambda guard, values: decided.append(guard) or decision(guard, values))
+    open_guard = {"e": {"op": "&", "a": [{"p": 0, "w": 32, "s": True}, {"c": 4, "w": 32, "s": True}]}, "v": True}
+    events = [{**call(name, visible=False), "guards": [open_guard]} for name in ("a", "b", "c")]
+    bound = link._bind(link.Effective(calls=events), [{**parameter(2), "expr": {"p": 2, "w": 32, "s": True}}])
+    assert len(decided) == 1
+    assert len({id(item["guards"][0]) for item in bound.calls}) == 1
+
+
 # A header function's copy and the unit that compiled it --------------------------------------
 
 
