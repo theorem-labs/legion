@@ -1,0 +1,20 @@
+# The order of each owner's queue (INFRA-109 section 3.3 item 3). People wrote version 1:
+# first the needs that stop the most instructions, and the leaves of the call graph before their callers.
+version: 1
+order:
+  - {key: stopped_instructions, direction: descending}
+  - {key: call_height, direction: ascending}
+  - {key: enqueued_at, direction: ascending}
+definitions:
+  stopped_instructions: >-
+    For an item about edge S->T or about owner S: the image instructions of S's Lean directory plus those of every
+    function of the active set that reaches S through call edges of graph.json. For a data structure or subsystem
+    S: the instructions of every function of the active set that accesses S. For a fact owner: the instructions of
+    the functions whose owners state the fact. For an interface or produce item: the instructions of the functions
+    that take the interface (measures.json). For an upstream-review item: the instructions of every function of the
+    slice, because his main waits on it (step 3 item 1). Instructions per directory come from the newest score
+    JSON's skeleton.node_instructions; before the first score every value is 0 and the next key decides.
+  call_height: >-
+    The longest call path from the item's subject to a function of the active set with no callee in the set, over
+    the strongly connected components of the set's call edges; 0 for a leaf, a data structure, a fact and an
+    upstream review.

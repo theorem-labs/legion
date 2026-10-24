@@ -1,0 +1,21 @@
+{
+  "format": "cgraph/graph/v1",
+  "part": "slice",
+  "files": ["kernel/callee.c", "kernel/caller.c", "kernel/second.c"],
+  "inputs": {},
+  "nodes": [
+    {"id": "function:callee", "kind": "function", "name": "callee", "part": true, "c_file": "kernel/callee.c", "line": 1, "contract": "Linux/kernel/callee/Callee", "provenance": []},
+    {"id": "function:caller", "kind": "function", "name": "caller", "part": true, "c_file": "kernel/caller.c", "line": 1, "contract": "Linux/kernel/caller/Caller", "provenance": []},
+    {"id": "function:second@kernel/second.c", "kind": "function", "name": "second", "part": true, "c_file": "kernel/second.c", "line": 1, "contract": "Linux/kernel/second/Second", "provenance": []},
+    {"id": "struct:state", "kind": "struct", "name": "state", "c_file": "include/state.h", "line": 1, "provenance": []},
+    {"id": "subsystem:cluster", "kind": "subsystem", "name": "cluster", "members": ["struct:state"], "guard_locks": [], "provenance": []}
+  ],
+  "edges": [
+    {"kind": "access", "source": "function:caller", "target": "struct:state", "access": "read", "field": "value", "provenance": [{"source": "c", "file": "kernel/caller.c", "line": 2}]},
+    {"kind": "access", "source": "function:second@kernel/second.c", "target": "struct:state", "access": "write", "field": "value", "provenance": [{"source": "c", "file": "kernel/second.c", "line": 2}]},
+    {"kind": "call", "source": "function:caller", "target": "function:callee", "image": "direct", "provenance": [{"source": "c", "file": "kernel/caller.c", "line": 3}]},
+    {"kind": "call", "source": "function:second@kernel/second.c", "target": "function:callee", "image": "direct", "provenance": [{"source": "c", "file": "kernel/second.c", "line": 3}]},
+    {"kind": "in_subsystem", "source": "struct:state", "target": "subsystem:cluster", "provenance": [{"source": "c", "file": "include/state.h", "line": 1}]}
+  ],
+  "analysis": {}
+}

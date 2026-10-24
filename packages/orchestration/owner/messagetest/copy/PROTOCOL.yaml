@@ -1,0 +1,20 @@
+# The message test's protocol manifest: epoch 1 of the owner protocol, with its message types and reasons and no
+# trials, proposals or fixed items. It is the only protocol of the test's own copy.
+epoch: 1
+trials: []
+proposals: []
+trial_landings: 20
+message_types: [start, need, offer, accept, reply, agreed, lean, translation, proved, stale, returned, rebuild,
+                produce, interface, upstream, upstream-review, concept, concept-answer, split, split-review,
+                proposal, escalation, decision, complete]
+reasons:
+  proved-incompatible:      {to: [source, target], next: "the caller changes its need or the callee its offer"}
+  missing-premise:          {to: [premise_owner], next: "the fact goes to its data-structure or cross-cutting owner"}
+  proof-incomplete:         {to: [source, target], next: "the same owners try again", escalate_after: 3}
+  superseded:               {to: [], next: "no step"}
+  translation-error:        {to: [lean_writer], next: "the writer changes the Lean statement; the English agreement stays"}
+  program-defect:           {to: [escalations], next: "a person decides", requires: [counterexample, bugs_row]}
+  false-shared-assumption:  {to: [escalations], next: "a person decides; the fix changes the top statement"}
+escalation: []
+start_order: []
+fixed: []

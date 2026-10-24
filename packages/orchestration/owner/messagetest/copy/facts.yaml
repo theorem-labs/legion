@@ -1,0 +1,4 @@
+# The message test's one fact: its users' topic, its owner's needs topic and the concepts topic carry the fact
+# notices of the test.
+facts:
+  - {name: stack-alignment, owner: fact-stack-alignment, concept: null}

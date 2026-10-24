@@ -1,0 +1,20 @@
+epoch: 1
+trials:
+  - {epoch: 2, proposal: p1, owners: ["function:second@kernel/second.c"], started_at: 0123456789ab, landings_scored: 0}
+proposals: []
+trial_landings: 20
+message_types: [start, need, offer, accept, reply, agreed, lean, translation, proved, stale, returned, rebuild,
+                produce, interface, upstream, upstream-review, concept, concept-answer, split, split-review,
+                proposal, escalation, decision, complete]
+reasons:
+  proved-incompatible:      {to: [source, target], next: "the caller changes its need or the callee its offer"}
+  missing-premise:          {to: [premise_owner], next: "the fact goes to its data-structure or cross-cutting owner"}
+  proof-incomplete:         {to: [source, target], next: "the same owners try again", escalate_after: 3}
+  superseded:               {to: [], next: "no step"}
+  translation-error:        {to: [lean_writer], next: "the writer changes the Lean statement; the English agreement stays"}
+  program-defect:           {to: [escalations], next: "a person decides (docs/PARALLEL-PROVING-WORKFLOW.md §8)", requires: [counterexample, bugs_row]}
+  false-shared-assumption:  {to: [escalations], next: "a person decides; the fix changes the top statement"}
+escalation:
+  - {when: "a reply program-defect or false-shared-assumption", person: true}
+start_order: []
+fixed: []

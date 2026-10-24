@@ -1,0 +1,3 @@
+{
+  "stack-alignment": {"users": ["function:caller"]}
+}

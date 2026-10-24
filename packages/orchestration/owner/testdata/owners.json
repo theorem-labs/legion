@@ -1,0 +1,68 @@
+{
+  "format": "cgraph/owners/v1",
+  "part": "slice",
+  "counts": {
+    "data_structure": 1,
+    "function": 3,
+    "subsystem": 1
+  },
+  "eligible": [
+    "function:callee",
+    "function:caller",
+    "function:second@kernel/second.c",
+    "struct:state",
+    "subsystem:cluster"
+  ],
+  "owners": [
+    {
+      "id": "function:callee",
+      "role": "function",
+      "kind": "function",
+      "name": "callee",
+      "c_file": "kernel/callee.c",
+      "contract": "Linux/kernel/callee/Callee",
+      "subsystem": null,
+      "neighbors": 2
+    },
+    {
+      "id": "function:caller",
+      "role": "function",
+      "kind": "function",
+      "name": "caller",
+      "c_file": "kernel/caller.c",
+      "contract": "Linux/kernel/caller/Caller",
+      "subsystem": null,
+      "neighbors": 3
+    },
+    {
+      "id": "function:second@kernel/second.c",
+      "role": "function",
+      "kind": "function",
+      "name": "second",
+      "c_file": "kernel/second.c",
+      "contract": "Linux/kernel/second/Second",
+      "subsystem": null,
+      "neighbors": 3
+    },
+    {
+      "id": "struct:state",
+      "role": "data_structure",
+      "kind": "struct",
+      "name": "state",
+      "c_file": "include/state.h",
+      "contract": null,
+      "subsystem": "subsystem:cluster",
+      "neighbors": 3
+    },
+    {
+      "id": "subsystem:cluster",
+      "role": "subsystem",
+      "kind": "subsystem",
+      "name": "cluster",
+      "c_file": null,
+      "contract": null,
+      "subsystem": null,
+      "neighbors": 3
+    }
+  ]
+}
