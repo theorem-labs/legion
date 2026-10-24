@@ -14535,7 +14535,12 @@ var LEGION_ROLES = [
   "reviewer",
   "merger"
 ];
+var STANDING_OWNER_ROLE = "owner";
+var LEGION_CLAIM_ROLES = [...LEGION_ROLES, STANDING_OWNER_ROLE];
 var DISPATCH_KEY_PATTERN = /^([A-Z][A-Z0-9]*)-([0-9]+)$/;
+function isLegionRole(role) {
+  return LEGION_ROLES.some((candidate) => candidate === role);
+}
 // ../contracts/src/repo.ts
 function canonicalRepo(owner, repo) {
   return `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase().replace(/\.git$/, "")}`;

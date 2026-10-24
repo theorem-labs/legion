@@ -37185,7 +37185,12 @@ var LEGION_ROLES = [
   "reviewer",
   "merger"
 ];
+var STANDING_OWNER_ROLE = "owner";
+var LEGION_CLAIM_ROLES = [...LEGION_ROLES, STANDING_OWNER_ROLE];
 var DISPATCH_KEY_PATTERN = /^([A-Z][A-Z0-9]*)-([0-9]+)$/;
+function isLegionRole(role) {
+  return LEGION_ROLES.some((candidate) => candidate === role);
+}
 // ../contracts/src/repo.ts
 function canonicalRepo(owner, repo) {
   return `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase().replace(/\.git$/, "")}`;
@@ -44254,9 +44259,9 @@ var LegionStateResponse = exports_external.strictObject({
 });
 var LegionRegisterResponse = exports_external.strictObject({
   claimToken: nonEmptyString,
-  tree: nonEmptyString,
-  issue: nonEmptyString,
-  role: exports_external.enum(LEGION_ROLES),
+  tree: exports_external.string(),
+  issue: exports_external.string(),
+  role: exports_external.enum(LEGION_CLAIM_ROLES),
   generation: exports_external.number().int().positive(),
   secret: nonEmptyString,
   promptAgents: exports_external.array(nonEmptyString)
@@ -44307,9 +44312,9 @@ var legionDeliveryView = exports_external.strictObject({
 });
 var LegionOperatorClaimResponse = exports_external.strictObject({
   token: nonEmptyString,
-  tree: nonEmptyString,
-  issue: nonEmptyString,
-  role: exports_external.enum(LEGION_ROLES),
+  tree: exports_external.string(),
+  issue: exports_external.string(),
+  role: exports_external.enum(LEGION_CLAIM_ROLES),
   generation: exports_external.number().int().nonnegative(),
   state: exports_external.enum(LEGION_CLAIM_STATES),
   session: exports_external.string(),
@@ -48015,6 +48020,9 @@ function recordFrom(state, issue2) {
 var ROOT_COMPLETION_REFUSAL = "handoff_complete is not available to a root architect session, which runs no phase";
 async function executePhaseOp(runtime, input) {
   const { daemon, claim } = runtime;
+  if (!isLegionRole(claim.role)) {
+    throw new Error("workflow operations are unavailable to a standing owner");
+  }
   const parsed = PhaseOpArguments.safeParse(input);
   const issues = parsed.success ? [] : parsed.error.issues;
   const unknownFields = issues.filter((issue2) => issue2.code === "unrecognized_keys");
