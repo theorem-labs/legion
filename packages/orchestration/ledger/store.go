@@ -109,19 +109,27 @@ func (s *Store) tx(ctx context.Context, fn func(pgx.Tx) error) error {
 	}
 }
 
+// repositoryColumns selects a repository in the order scanRepository reads it.
+const repositoryColumns = `name, max_landing_rounds, coalesce(upstream_owner, ''), escalation_owners, created_at`
+
+// scanRepository reads a row of repositoryColumns. A missing repository is NotFoundError.
+func scanRepository(row pgx.Row, name string) (Repository, error) {
+	var r Repository
+	err := row.Scan(&r.Name, &r.MaxLandingRounds, &r.UpstreamOwner, &r.EscalationOwners, &r.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, &NotFoundError{What: "repository", ID: name}
+	}
+	return r, err
+}
+
 // lockRepo takes the repository's row lock, which serialises every change to its migrations' locks, and returns
 // the repository. A missing repository is NotFoundError.
 func lockRepo(ctx context.Context, tx pgx.Tx, name string, forUpdate bool) (Repository, error) {
-	q := `SELECT name, max_landing_rounds, coalesce(upstream_owner, ''), created_at FROM repositories WHERE name = $1`
+	q := `SELECT ` + repositoryColumns + ` FROM repositories WHERE name = $1`
 	if forUpdate {
 		q += ` FOR UPDATE`
 	} else {
 		q += ` FOR SHARE`
 	}
-	var c Repository
-	err := tx.QueryRow(ctx, q, name).Scan(&c.Name, &c.MaxLandingRounds, &c.UpstreamOwner, &c.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return c, &NotFoundError{What: "repository", ID: name}
-	}
-	return c, err
+	return scanRepository(tx.QueryRow(ctx, q, name), name)
 }

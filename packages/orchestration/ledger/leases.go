@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,7 +14,8 @@ import (
 type EnsureRepoOption func(*ensureRepoOptions)
 
 type ensureRepoOptions struct {
-	upstreamOwner *string
+	upstreamOwner    *string
+	escalationOwners *[]string
 }
 
 // WithUpstreamOwner sets the migration owner allowed to attach upstream provenance. An empty owner clears it.
@@ -23,7 +25,22 @@ func WithUpstreamOwner(owner string) EnsureRepoOption {
 	}
 }
 
-// EnsureRepo creates the repository record, or updates its landing-round limit and selected configuration if it exists.
+// WithEscalationOwners replaces the owners a landing escalation may be enqueued for with owners, stored sorted and
+// each once. No owners clears them; an empty or blank owner is invalid.
+func WithEscalationOwners(owners ...string) EnsureRepoOption {
+	return func(options *ensureRepoOptions) {
+		set := slices.Clone(owners)
+		if set == nil {
+			set = []string{}
+		}
+		slices.Sort(set)
+		set = slices.Compact(set)
+		options.escalationOwners = &set
+	}
+}
+
+// EnsureRepo creates the repository record, or updates its landing-round limit and the configuration its options
+// name if it exists. A change appends one repository.configured event with the whole configuration.
 func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds int, options ...EnsureRepoOption) (Repository, error) {
 	if name == "" {
 		return Repository{}, invalid("empty repository name")
@@ -39,29 +56,41 @@ func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds in
 	if config.upstreamOwner != nil && *config.upstreamOwner != "" {
 		configuredOwner = *config.upstreamOwner
 	}
+	escalationOwners := []string{}
+	if config.escalationOwners != nil {
+		escalationOwners = *config.escalationOwners
+		for _, owner := range escalationOwners {
+			if strings.TrimSpace(owner) == "" {
+				return Repository{}, invalid("escalation owner %q is blank", owner)
+			}
+		}
+	}
 	var r Repository
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		var previousRounds int
-		var previousOwner string
-		err := tx.QueryRow(ctx, `SELECT max_landing_rounds, coalesce(upstream_owner, '') FROM repositories WHERE name = $1 FOR UPDATE`, name).
-			Scan(&previousRounds, &previousOwner)
-		exists := err == nil
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		previous, err := lockRepo(ctx, tx, name, true)
+		var missing *NotFoundError
+		exists := !errors.As(err, &missing)
+		if err != nil && exists {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds, upstream_owner) VALUES ($1, $2, $3)
+		r, err = scanRepository(tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds, upstream_owner, escalation_owners)
+			VALUES ($1, $2, $3, $5)
 			ON CONFLICT (name) DO UPDATE SET max_landing_rounds = EXCLUDED.max_landing_rounds,
-				upstream_owner = CASE WHEN $4 THEN EXCLUDED.upstream_owner ELSE repositories.upstream_owner END
-			RETURNING name, max_landing_rounds, coalesce(upstream_owner, ''), created_at`, name, maxLandingRounds, configuredOwner, config.upstreamOwner != nil).
-			Scan(&r.Name, &r.MaxLandingRounds, &r.UpstreamOwner, &r.CreatedAt); err != nil {
+				upstream_owner = CASE WHEN $4 THEN EXCLUDED.upstream_owner ELSE repositories.upstream_owner END,
+				escalation_owners = CASE WHEN $6 THEN EXCLUDED.escalation_owners ELSE repositories.escalation_owners END
+			RETURNING `+repositoryColumns, name, maxLandingRounds, configuredOwner, config.upstreamOwner != nil,
+			escalationOwners, config.escalationOwners != nil), name)
+		if err != nil {
 			return err
 		}
-		if exists && previousRounds == maxLandingRounds && (config.upstreamOwner == nil || previousOwner == r.UpstreamOwner) {
+		if exists && previous.MaxLandingRounds == r.MaxLandingRounds && previous.UpstreamOwner == r.UpstreamOwner &&
+			slices.Equal(previous.EscalationOwners, r.EscalationOwners) {
 			return nil
 		}
 		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{
-			"max_landing_rounds": maxLandingRounds,
+			"max_landing_rounds": r.MaxLandingRounds,
 			"upstream_owner":     r.UpstreamOwner,
+			"escalation_owners":  r.EscalationOwners,
 		})
 	})
 	return r, err

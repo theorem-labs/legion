@@ -2,7 +2,6 @@ package ledger
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -30,11 +29,7 @@ func (s *Store) Status(ctx context.Context, repo string) (Status, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	err = tx.QueryRow(ctx, `SELECT name, max_landing_rounds, coalesce(upstream_owner, ''), created_at FROM repositories WHERE name = $1`, repo).
-		Scan(&st.Repository.Name, &st.Repository.MaxLandingRounds, &st.Repository.UpstreamOwner, &st.Repository.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return st, &NotFoundError{What: "repository", ID: repo}
-	}
+	st.Repository, err = scanRepository(tx.QueryRow(ctx, `SELECT `+repositoryColumns+` FROM repositories WHERE name = $1`, repo), repo)
 	if err != nil {
 		return st, err
 	}
