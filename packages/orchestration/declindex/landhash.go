@@ -1,7 +1,6 @@
 package declindex
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -168,13 +167,10 @@ func gitTreeSources(ctx context.Context, gitDir, treeID, prefix string, pathspec
 		return nil, fmt.Errorf("list LAND_TREE sources: %w", err)
 	}
 	out := map[string]string{}
-	for len(raw) > 0 {
-		end := bytes.IndexByte(raw, 0)
-		if end < 0 {
-			return nil, fmt.Errorf("git ls-tree output is not NUL terminated")
+	for record, err := range nulRecords("git ls-tree", raw) {
+		if err != nil {
+			return nil, err
 		}
-		record := string(raw[:end])
-		raw = raw[end+1:]
 		fields, path, ok := strings.Cut(record, "\t")
 		if !ok {
 			return nil, fmt.Errorf("git ls-tree record has no path")
