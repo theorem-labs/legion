@@ -66,6 +66,42 @@ func TestRecordsParseSpecRefusesUnknownFrontKey(t *testing.T) {
 	}
 }
 
+// ParseClaims is the one claim-tree parser, for a spec's body and a need's alike: it reads CRLF line ends as LF,
+// skips blank lines, numbers an error by its line within the tree, and refuses a tree with no claim. It needs no
+// front matter.
+func TestParseClaimsReadsAClaimTreeWithNoFrontMatter(t *testing.T) {
+	claims, err := ParseClaims([]byte("1. [C1] A reader sees the stored value. by: code include/state.h:1\r\n\r\n    1. [C2] A writer holds the lock. uses: struct:state#C1 by: uses\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Claim{
+		{ID: "C1", Depth: 1, Text: "A reader sees the stored value.", By: []string{"code include/state.h:1"}},
+		{ID: "C2", Depth: 2, Text: "A writer holds the lock.", Uses: []string{"struct:state#C1"}, By: []string{"uses"}},
+	}
+	if !reflect.DeepEqual(claims, want) {
+		t.Fatalf("ParseClaims = %#v, want %#v", claims, want)
+	}
+	if _, err := ParseClaims([]byte("1. [C1] A claim. by: code a.c:1\n\nnot a claim\n")); err == nil || !strings.Contains(err.Error(), "claim line 3") {
+		t.Fatalf("ParseClaims of a bad third line error = %v, want one naming claim line 3", err)
+	}
+	for _, body := range []string{"", "\n\n", "\r\n"} {
+		if _, err := ParseClaims([]byte(body)); err == nil || !strings.Contains(err.Error(), "no claims") {
+			t.Errorf("ParseClaims(%q) error = %v, want a refused empty claim tree", body, err)
+		}
+	}
+}
+
+// A spec's claims are its body's claim tree, numbered from the line after its front matter.
+func TestParseSpecNumbersClaimLinesWithinTheClaimTree(t *testing.T) {
+	spec := "---\nowner: struct:state\nrevision: 1\nepoch: 1\nauthor_model: m\n---\n1. [C1] A claim. by: code a.c:1\nnot a claim\n"
+	if _, _, err := ParseSpec([]byte(spec)); err == nil || !strings.Contains(err.Error(), "claim line 2") {
+		t.Fatalf("ParseSpec error = %v, want one naming claim line 2", err)
+	}
+	if _, _, err := ParseSpec([]byte("---\nowner: struct:state\nrevision: 1\nepoch: 1\nauthor_model: m\n---\n")); err == nil || !strings.Contains(err.Error(), "no claims") {
+		t.Fatalf("ParseSpec of a spec with no claims error = %v", err)
+	}
+}
+
 func TestRecordsLintClaims(t *testing.T) {
 	tests := []struct {
 		name     string

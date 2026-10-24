@@ -44,7 +44,7 @@ func readNeedDraft(file string) (needInput, error) {
 	if fields.Resolves == nil {
 		fields.Resolves = []string{}
 	}
-	claims, err := parseClaimTree(body)
+	claims, err := ownerpkg.ParseClaims(body)
 	if err != nil {
 		return needInput{}, refusef("need draft %s: %v", file, err)
 	}
@@ -82,7 +82,7 @@ func readSpecDraft(file, owner string) (specInput, error) {
 	if fields.Owner != "" && fields.Owner != owner {
 		return specInput{}, refusef("spec draft %s is for %s, not %s", file, fields.Owner, owner)
 	}
-	claims, err := parseClaimTree(body)
+	claims, err := ownerpkg.ParseClaims(body)
 	if err != nil {
 		return specInput{}, refusef("spec draft %s: %v", file, err)
 	}
@@ -150,12 +150,6 @@ func splitFrontMatter(data []byte) ([]byte, []byte, error) {
 		return nil, nil, errors.New("front matter must end with a --- line")
 	}
 	return rest[:end+1], rest[end+len("\n---\n"):], nil
-}
-
-// parseClaimTree checks a claim tree with the spec parser, which owns the claim grammar.
-func parseClaimTree(body []byte) ([]ownerpkg.Claim, error) {
-	_, claims, err := ownerpkg.ParseSpec(append([]byte("---\nowner: draft\nrevision: 1\nepoch: 1\nauthor_model: draft\n---\n"), body...))
-	return claims, err
 }
 
 func marshalNeedRecord(front ownerpkg.NeedFront, body []byte) ([]byte, error) {

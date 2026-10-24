@@ -55,7 +55,7 @@ func (e LintError) Error() string {
 var claimLine = regexp.MustCompile(`^( *)([1-9][0-9]*)\. \[(C[1-9][0-9]*)\] (.+)$`)
 var claimID = regexp.MustCompile(`^C[1-9][0-9]*$`)
 
-// ParseSpec strictly parses a spec's YAML front matter and its numbered claim tree.
+// ParseSpec strictly parses a spec's YAML front matter and its numbered claim tree (ParseClaims).
 func ParseSpec(data []byte) (SpecFront, []Claim, error) {
 	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
 	if len(lines) < 3 || lines[0] != "---" {
@@ -80,22 +80,32 @@ func ParseSpec(data []byte) (SpecFront, []Claim, error) {
 	if err := front.validate(); err != nil {
 		return SpecFront{}, nil, err
 	}
+	claims, err := ParseClaims([]byte(strings.Join(lines[end+1:], "\n")))
+	if err != nil {
+		return SpecFront{}, nil, err
+	}
+	return front, claims, nil
+}
 
-	claims := make([]Claim, 0, len(lines)-end-1)
-	for lineNumber, line := range lines[end+1:] {
+// ParseClaims parses a numbered claim tree, the body of a spec or a need after its front matter: CRLF line ends are
+// read as LF, blank lines are skipped, an error names its line within the tree, and a tree with no claim is refused.
+func ParseClaims(body []byte) ([]Claim, error) {
+	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
+	claims := make([]Claim, 0, len(lines))
+	for lineNumber, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		claim, err := parseClaim(line)
 		if err != nil {
-			return SpecFront{}, nil, fmt.Errorf("claim line %d: %w", lineNumber+1, err)
+			return nil, fmt.Errorf("claim line %d: %w", lineNumber+1, err)
 		}
 		claims = append(claims, claim)
 	}
 	if len(claims) == 0 {
-		return SpecFront{}, nil, errors.New("spec has no claims")
+		return nil, errors.New("the claim tree has no claims")
 	}
-	return front, claims, nil
+	return claims, nil
 }
 
 func (f SpecFront) validate() error {

@@ -82,7 +82,7 @@ func (s *session) need(target, file string, outside bool, answers []string) (any
 			if prevFront, prevBody, err = parseNeedRecord(previous); err != nil {
 				return ownerpkg.Record{}, fmt.Errorf("read the previous need %s: %w", recordPath, err)
 			}
-			if prevClaims, err = parseClaimTree(prevBody); err != nil {
+			if prevClaims, err = ownerpkg.ParseClaims(prevBody); err != nil {
 				return ownerpkg.Record{}, fmt.Errorf("read the previous need %s: %w", recordPath, err)
 			}
 		}
