@@ -45,16 +45,18 @@ generates from it (`X.eq_1`, `X._unfold`, `X.rec`, `X.match_1`), by a placeholde
 that a copy under a new name hashes equal; an auxiliary definition Lean makes while elaborating (a matcher, an
 abstracted proof) by its content, since a copy elsewhere gets its own or reuses an existing one; any other
 constant, a sub-declaration the user wrote (`X.base`) included, by its name as its source writes it (a private
-name without its module's prefix) and the module that `moduleOf` gives it, since two modules that are never
-imported together can each declare one name. -/
+name without its module's prefix) and the identity that `moduleOf` gives it: the module that declares it, since two
+modules that are never imported together can each declare one name, or for a constant that Lean merges across
+modules (a public theorem, a proposition axiom) the hash of its type (Main.lean, `identify`). -/
 structure HashCtx where
   levels : List Name := []
   self : List Name := []
   env? : Option Environment := none
   moduleOf : Name → Name := fun _ => .anonymous
 
-/-- The constant `n` as a hash counts it: its name as its source writes it, and its module. A private name holds
-the module that compiled it, which `moduleOf` already gives (and can count as another, see `Manifest.home`). -/
+/-- The constant `n` as a hash counts it: its name as its source writes it, and its identity (`HashCtx.moduleOf`). A
+private name holds the module that compiled it, which `moduleOf` already gives (and can count as another, see
+`Manifest.home`). -/
 def constId (ctx : HashCtx) (n : Name) : List H :=
   [H.ofString ((privateToUserName? n).getD n).toString, H.ofString (ctx.moduleOf n).toString]
 

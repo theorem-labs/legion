@@ -144,6 +144,45 @@ func TestTheGateHashesAConstantWithItsModule(t *testing.T) {
 	}
 }
 
+// Lean imports two theorems of one name and statement from two modules as one constant, and keeps the module that
+// loaded first. A reference to such a theorem has one identity however the index read it: B's `Original` names B's
+// `dup`, which A declares too. A proposal that imports B and states `Original`'s statement again is an exact
+// duplicate, after a refresh that read A and B in one exporter group and after one that read B alone.
+func TestTheGateRefusesACopyOfAMergedTheoremReferenceHoweverTheIndexWasRead(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	config, tree, lean := leanRegistryTree(t, "A", "B")
+	compile := func(name, source string) {
+		t.Helper()
+		writeTestFile(t, filepath.Join(tree, name+".lean"), source)
+		if err := declindex.CompileModule(context.Background(), lean, nil, tree, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compile("A", "theorem dup : True := trivial\n")
+	compile("B", "theorem dup : True := trivial\ntheorem Original : dup = dup := rfl\n")
+	land(t, config, tree, "add A and B")
+	proposal := filepath.Join(t.TempDir(), "copy.json")
+	writeTestFile(t, proposal, `{"id":"copy","concept":{"name":"Different","home":"Different.lean","meaning":"B's Original again."},`+
+		`"source":"import B\n\ntheorem Different : dup = dup := rfl\n"}`)
+	refused := func(label string) {
+		t.Helper()
+		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+		var v conceptgate.Verdict
+		if err := json.Unmarshal([]byte(r.out), &v); err != nil || r.code != 1 || v.Outcome != conceptgate.Refused || v.Existing != "Original" {
+			t.Errorf("gate a copy of B's Original %s: want exit 1, refused as Original, got %+v, %+v (%v)", label, r, v, err)
+		}
+	}
+	refused("after a refresh that read A and B together")
+	compile("B", "theorem dup : True := trivial\ntheorem Original : dup = dup := rfl\ntheorem spare : True := trivial\n")
+	land(t, config, tree, "add a theorem to B")
+	refused("after a refresh that read B alone")
+}
+
 // A name whose source writes it with a leading `_` is a declaration like any other: two modules that each declare
 // `_Value` are never imported together, and a refresh with the compiled part reads them in two exporter groups, as
 // it reads two modules that each declare `Value`.

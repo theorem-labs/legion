@@ -29,9 +29,12 @@ func (e *TempError) Unwrap() error { return e.Err }
 
 // Sync returns the post-landing synchronisation that Refresh runs under the index's refresh lock
 // (RefreshOptions.Landed): it fetches an otherwise absent commit, checks it out, and runs the configured build before
-// the index reads it. Worktrees of one repository share its refs, and each holds the refresh lock of its own index,
-// so a fetch writes the remote's branches only under a namespace of this run, which it deletes when the sync ends
-// (the checkout holds the commit through HEAD): no ref outlives the run for another run to move.
+// the index reads it. The remote can hold the landed commit under a ref that is not a branch (a landing program's
+// clone), so the fetch asks for the commit by its id; only when the remote refuses that (a server that allows only
+// the tips it advertises) does it fetch the remote's branches. Worktrees of one repository share its refs, and each
+// holds the refresh lock of its own index, so a fetch writes refs only under a namespace of this run, which it
+// deletes when the sync ends (the checkout holds the commit through HEAD): no ref outlives the run for another run
+// to move.
 func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error {
 	return func(ctx context.Context) error {
 		has, err := hasCommit(ctx, cfg.Tree, commit)
@@ -44,8 +47,14 @@ func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error 
 				return err
 			}
 			defer deleteRefs(cfg.Tree, ns, log)
-			if err := runGit(ctx, cfg.Tree, log, "fetch", "--no-tags", "--no-write-fetch-head", cfg.Remote, "+refs/heads/*:"+ns+"*"); err != nil {
-				return &TempError{Err: fmt.Errorf("fetch %q: %w", cfg.Remote, err)}
+			fetch := func(refspec string) error {
+				return runGit(ctx, cfg.Tree, log, "fetch", "--no-tags", "--no-write-fetch-head", cfg.Remote, refspec)
+			}
+			if err := fetch("+" + commit + ":" + ns + "landed"); err != nil {
+				logf(log, "sync: the fetch of %s by its id failed (%v); fetching the remote's branches", commit, err)
+				if err := fetch("+refs/heads/*:" + ns + "heads/*"); err != nil {
+					return &TempError{Err: fmt.Errorf("fetch %q: %w", cfg.Remote, err)}
+				}
 			}
 			has, err = hasCommit(ctx, cfg.Tree, commit)
 			if err != nil {

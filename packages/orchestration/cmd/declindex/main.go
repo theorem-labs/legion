@@ -332,12 +332,12 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	if st.TreeHead, err = declindex.TreeHead(ctx, e.cfg.Tree); err != nil {
 		fmt.Fprintf(e.stderr, "note: %v\n", err)
 	}
+	writeWithoutForms(e.stderr, declindex.ClashModules(st.WithoutForms), st.WithoutForms)
 	if e.g.json {
 		return e.printJSON(st)
 	}
 	fmt.Fprintf(e.stdout, "index at %s, built %s, %d modules, %s unreadable; tree at %s\n", st.Commit, st.Built,
 		st.Modules, st.Errors, st.TreeHead)
-	writeWithoutForms(e.stderr, declindex.ClashModules(st.WithoutForms), st.WithoutForms)
 	return 0
 }
 

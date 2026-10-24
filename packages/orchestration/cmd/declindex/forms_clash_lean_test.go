@@ -109,7 +109,14 @@ func TestRefreshReadsADuplicateThatTheFormsImportsHoldWithTheForms(t *testing.T)
 			FormsDeclaredIn []string `json:"forms_declared_in"`
 		} `json:"without_forms"`
 	}
-	decode(t, invoke(t, "--config", config, "--json", "status"), &st)
+	sr := invoke(t, "--config", config, "--json", "status")
+	decode(t, sr, &st)
+	// The JSON mode names the index defect on stderr as the text mode does.
+	for _, want := range []string{withoutFormsCount, withoutFormsC, withoutFormsUseC} {
+		if !strings.Contains(sr.errOut, want+"\n") {
+			t.Errorf("status --json: stderr lacks %q:\n%s", want, sr.errOut)
+		}
+	}
 	if len(st.WithoutForms) != 2 {
 		t.Fatalf("status --json: without_forms %+v, want C's and UseC's clash on dup", st.WithoutForms)
 	}
@@ -128,6 +135,59 @@ func TestRefreshReadsADuplicateThatTheFormsImportsHoldWithTheForms(t *testing.T)
 	}
 	git(t, tree, "commit", "-qam", "change UseA")
 	checkDefect("refresh after UseA changed", invoke(t, "--config", config, "refresh"))
+}
+
+// Two axioms of one name whose type Lean finds a proposition (`axiom dup : True`) import together in any order: Both,
+// which imports Home (A's axiom) and UseB (B's), compiles. So UseB is read with the forms, which import Home, and
+// states Reflexive's fact; refresh names no index defect.
+func TestRefreshReadsWithTheFormsAModuleWhosePropositionAxiomTheFormsImportsDeclareElsewhere(t *testing.T) {
+	requireLake(t)
+	ctx := context.Background()
+	lean, err := declindex.FindLean(ctx, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "tree")
+	for _, m := range []struct{ name, source string }{
+		{"A", "axiom dup : True\n"},
+		{"B", "axiom dup : True\n"},
+		{"Home", "import A\ntheorem Reflexive (n : Nat) : n = n := rfl\n"},
+		{"UseB", "import B\ntheorem useB (n : Nat) : n = n := rfl\n"},
+		{"Both", "import Home\nimport UseB\nexample : True := dup\n"},
+	} {
+		writeTestFile(t, filepath.Join(tree, m.name+".lean"), m.source)
+		if err := declindex.CompileModule(ctx, lean, nil, tree, m.name); err != nil {
+			t.Fatalf("compile %s: %v", m.name, err)
+		}
+	}
+	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
+	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
+		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
+	config := filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, UseB, Both]\nregistry: registry\n"+
+		"lean:\n  export: true\n  jobs: 1\n")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-qm", "proposition axioms")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 || strings.Contains(r.errOut, "index defect") {
+		t.Fatalf("refresh: want exit 0 and no index defect, got %+v", r)
+	}
+	var states map[string][]struct {
+		Declaration string `json:"declaration"`
+		Module      string `json:"declaration_module"`
+	}
+	decode(t, invoke(t, "--config", config, "--json", "states", "Reflexive"), &states)
+	var got []string
+	for _, s := range states["Reflexive"] {
+		if d := s.Module + "." + s.Declaration; !slices.Contains(got, d) {
+			got = append(got, d)
+		}
+	}
+	slices.Sort(got)
+	if want := []string{"Home.Reflexive", "UseB.useB"}; !slices.Equal(got, want) {
+		t.Errorf("states Reflexive: declarations %q, want %q", got, want)
+	}
 }
 
 // Lean merges two axioms of one name only when a cheap check finds their type a proposition, which it does not for

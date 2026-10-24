@@ -297,9 +297,11 @@ type loadRule struct {
 }
 
 // joins reports whether the declarations have (a group's) and ms (a module's, sorted) of the name n load together.
-// Where the two hold two axioms between them, they must be the same declarations. Else they must share one, or Lean
-// must import a module of each together: with at most one axiom, Lean's relation is transitive, so one such pair
-// joins the two sets.
+// They must share one, or Lean must import a module of each together: Lean's relation needs one type, which each set,
+// loaded, has, and one such pair gives both sets. Where the two hold two axioms between them and are not the same set,
+// Lean must also import each pair of the axioms' modules together, which it does in any order only when the type is
+// a proposition by its cheap check: two axioms that only a theorem loaded before them reconciles do not. A module
+// that declares the name imports no other declaration of it, so such a pair meets exactly its two declarations.
 func (r *loadRule) joins(n string, have map[string]bool, ms []string) bool {
 	shared := 0
 	for _, m := range ms {
@@ -307,23 +309,33 @@ func (r *loadRule) joins(n string, have map[string]bool, ms []string) bool {
 			shared++
 		}
 	}
-	count := 0
+	var axioms []string
 	if ax := r.axioms[n]; len(ax) >= 2 {
 		for m := range have {
 			if ax[m] {
-				count++
+				axioms = append(axioms, m)
 			}
 		}
 		for _, m := range ms {
 			if ax[m] && !have[m] {
-				count++
+				axioms = append(axioms, m)
 			}
 		}
 	}
-	switch {
-	case count >= 2:
-		return shared == len(ms) && len(have) == len(ms)
-	case shared > 0:
+	if len(axioms) >= 2 {
+		if shared == len(ms) && len(have) == len(ms) {
+			return true
+		}
+		slices.Sort(axioms)
+		for i, a := range axioms {
+			for _, b := range axioms[i+1:] {
+				if !r.loadTogether(a, b) {
+					return false
+				}
+			}
+		}
+	}
+	if shared > 0 {
 		return true
 	}
 	for _, h := range slices.Sorted(maps.Keys(have)) {
@@ -409,8 +421,9 @@ func (g *declGroup) clashes(r *loadRule, c declSets) []string {
 // that relation is transitive and does not depend on the order, so two such sets of declarations of a name load
 // together when they share one, or when Lean imports a module of each together (loads, an import that reads nothing:
 // the index cannot compare elaborated statements). Two axioms may have loaded only because a theorem came before
-// them, so two sets that hold two axioms between them load together only when they are the same set: the first
-// module of the environment that imports any of them then imports them all in the order it built with. A module
+// them, so two sets that hold two axioms between them load together when they are the same set (the first module of
+// the environment that imports any of them then imports them all in the order it built with), or when Lean imports
+// each pair of the axioms' modules together, which makes the order irrelevant (loadRule.joins). A module
 // joins a group when, for every name that both declare, the two sets load together. A module that does not load
 // with base goes into a group of apart, to be read without base, and each name that clashes is recorded with it. A
 // project that declares no name twice gives one group. Every declaration that a reference file records counts, also

@@ -82,8 +82,8 @@ func indexWith(t *testing.T, decls [][3]string, imports [][2]string) *Store {
 // not for `∀ (p : Nat → Prop) (n : Nat), p n → p n`; a theorem of the same type subsumes each of them. So Home, which
 // imports the theorem first and then A's and B's axiom `dup`, builds, but an environment that imports A and B before
 // the theorem does not, though each of A's and B's declarations is one that Home's imports hold. Where two axioms
-// meet, a module joins a group only with the same declarations of the name. One axiom with the theorem is safe in
-// any order.
+// meet, a module joins a group only with the same declarations of the name, unless Lean imports the two axioms'
+// modules together, which it does not here (no Lean). One axiom with the theorem is safe in any order.
 func TestExportGroupsKeepsApartTwoAxiomsThatATheoremReconciles(t *testing.T) {
 	ctx := context.Background()
 	decls := [][3]string{{"dup", "A", "axiom"}, {"dup", "B", "axiom"}, {"dup", "Thm", "theorem"}}
@@ -108,6 +108,37 @@ func TestExportGroupsKeepsApartTwoAxiomsThatATheoremReconciles(t *testing.T) {
 	}
 	if !slices.EqualFunc(plan.groups, [][]string{{"A"}}, slices.Equal) || len(plan.apart) != 0 {
 		t.Errorf("one axiom and the theorem: read with the forms %v and without them %v; want A with them", plan.groups, plan.apart)
+	}
+}
+
+// Two axioms of one name whose type Lean finds a proposition by its cheap check (`axiom dup : True` in A and in B)
+// import together in any order. Where two sets of declarations hold two axioms between them and differ, the planner
+// asks Lean whether each pair of the axioms' modules imports together (a module that declares a name imports no other
+// declaration of it, so the pair meets exactly those two), and joins the sets when Lean imports every pair. Home, which
+// the forms import, imports A; UseB imports B.
+func TestExportGroupsAsksLeanWhetherTwoAxiomsImportTogether(t *testing.T) {
+	ctx := context.Background()
+	s := indexWith(t, [][3]string{{"dup", "A", "axiom"}, {"dup", "B", "axiom"}}, [][2]string{{"Home", "A"}, {"UseB", "B"}})
+	for _, c := range []struct {
+		lean        bool
+		with, apart [][]string
+	}{{true, [][]string{{"UseB"}}, nil}, {false, nil, [][]string{{"UseB"}}}} {
+		var asked [][]string
+		loads := func(_ context.Context, pair []string) (bool, error) {
+			asked = append(asked, pair)
+			return c.lean, nil
+		}
+		plan, err := exportGroups(ctx, s.q, []string{"UseB"}, []string{"Home"}, loads)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.EqualFunc(plan.groups, c.with, slices.Equal) || !slices.EqualFunc(plan.apart, c.apart, slices.Equal) {
+			t.Errorf("Lean imports A and B together: %v; read with the forms %v and without them %v, want %v and %v",
+				c.lean, plan.groups, plan.apart, c.with, c.apart)
+		}
+		if !slices.ContainsFunc(asked, func(p []string) bool { return slices.Equal(p, []string{"A", "B"}) }) {
+			t.Errorf("Lean imports A and B together: %v; the planner asked Lean about %v, want the pair [A B]", c.lean, asked)
+		}
 	}
 }
 

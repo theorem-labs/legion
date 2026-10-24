@@ -72,10 +72,53 @@ partial def binderNames : Expr → List String
   | .forallE n _ b _ => n.toString :: binderNames b
   | _ => []
 
-def record (cfg : MatchConfig) (moduleOf : Name → Name) (types : Bool) (m : Name) (c : Name) (ci : ConstantInfo) :
-    StateRefT St MetaM Json := do
+mutual
+/-- Records in `ids` the identity that a reference to each constant of `e` counts in the hashes (`identify`), and,
+for an auxiliary definition that the hash reads by content, of the constants of its type and value. -/
+partial def identifyIn (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Name) (e : Expr) : MetaM Unit := do
+  let env ← getEnv
+  for c in e.getUsedConstants do
+    if (← ids.get).contains c then continue
+    match env.find? c with
+    | some ci =>
+      if isElabAux env c then
+        ids.modify (·.insert c (base c))
+        for x in ci.type :: ci.value?.toList do identifyIn ids base x
+      else identify ids base c ci
+    | none => ids.modify (·.insert c (base c))
+
+/-- The identity of a reference to `n` in the hashes. Lean imports two public theorems of one name and type, or a
+theorem and an axiom, or two axioms whose type is a proposition, from two modules as one constant, and keeps the
+module that loaded first (Environment.lean, subsumesInfo): which one depends on which other modules the exporter
+imports with it. So a reference to a public theorem, or to an axiom whose type is a proposition, counts by the hash
+of its type, and any other constant, which Lean never merges, by the module that declares it (`base`). -/
+partial def identify (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Name) (n : Name) (ci : ConstantInfo) :
+    MetaM Unit := do
+  ids.modify (·.insert n (base n))
+  let merged ← match ci with
+    | .thmInfo _ => pure !isPrivateName n
+    | .axiomInfo _ => if isPrivateName n then pure false else (try Meta.isProp ci.type catch _ => pure false)
+    | _ => pure false
+  if !merged then return
+  identifyIn ids base ci.type
+  let tbl ← ids.get
+  let h := hashOf { levels := ci.levelParams, moduleOf := fun c => tbl.getD c (base c) } [ci.type]
+  ids.modify (·.insert n (Name.mkSimple s!"type:{h.hex}"))
+end
+
+/-- One JSON line for the constant `c` of the target module `m`. `ids` holds the identities that the hashes count
+references by (`identify`), `base` the module of a constant that Lean does not merge. -/
+def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Name) (types : Bool) (m : Name)
+    (c : Name) (ci : ConstantInfo) : StateRefT St MetaM Json := do
   let env ← getEnv
   let exprs := statementExprs env ci
+  let mut w : Walk := {}
+  for e in exprs do
+    w ← walk cfg e w
+  for e in exprs ++ ci.value?.toList ++ w.atoms.toList do
+    identifyIn ids base e
+  let tbl ← ids.get
+  let moduleOf : Name → Name := fun c => tbl.getD c (base c)
   let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci, env? := some env, moduleOf := moduleOf }
   let fields : List String := match ci with
     | .inductInfo v => v.ctors.flatMap fun k =>
@@ -84,9 +127,6 @@ def record (cfg : MatchConfig) (moduleOf : Name → Name) (types : Bool) (m : Na
         | none => []
     | _ => []
   let h := fields.foldl (fun h n => H.mix h (H.ofString n)) (hashOf hctx exprs)
-  let mut w : Walk := {}
-  for e in exprs do
-    w ← walk cfg e w
   let fs := facts cfg w
   let mut atoms : Array String := #[]
   for a in w.atoms do
@@ -140,13 +180,15 @@ def main (args : List String) : IO UInt32 := do
     conceptDecls := manifest.concepts.foldl (fun m r => m.insert (toName r.const) r.concept) {}
     roots := manifest.roots.toList.map toName
     budget := manifest.budget }
-  -- The module of a constant as the hashes count it: the one that declares it, or `home` for a target module.
+  -- The module of a constant that Lean does not merge, as the hashes count it: the one that declares it, or `home`
+  -- for a target module. A merged one counts by its type (`identify`).
   let targets : NameSet := manifest.modules.foldl (fun s t => s.insert (toName t)) {}
-  let moduleOf : Name → Name := fun n =>
+  let base : Name → Name := fun n =>
     let m := match env.getModuleIdxFor? n with
       | some idx => env.header.moduleNames[idx.toNat]!
       | none => env.mainModule
     if !manifest.home.isEmpty && targets.contains m then toName manifest.home else m
+  let ids ← IO.mkRef ({} : Std.HashMap Name Name)
   let ctx : Core.Context := { fileName := "<declexport>", fileMap := default, maxHeartbeats := 0 }
   let out ← IO.getStdout
   let act : StateRefT St MetaM Nat := do
@@ -157,7 +199,7 @@ def main (args : List String) : IO UInt32 := do
       for c in env.header.moduleData[idx.toNat]!.constNames do
         let some ci := env.find? c | continue
         if auxiliary env c ci then continue
-        let j ← record cfg moduleOf manifest.types m c ci
+        let j ← record cfg ids base manifest.types m c ci
         out.putStrLn j.compress
         n := n + 1
     return n
