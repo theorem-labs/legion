@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -60,6 +62,82 @@ func TestTheDriversTmuxCommandsUseTheRunsTmuxDirectory(t *testing.T) {
 	}
 	if panes, err := run.ownerPanes(ctx); err != nil || len(panes) != 0 {
 		t.Fatalf("after killServer the run's server lists %v, %v", panes, err)
+	}
+}
+
+// kill-server returns before the tmux server has gone: until its last client has left, the exiting server closes each
+// new connection, and tmux says "server exited unexpectedly" (server_accept in tmux's server.c). That server has no
+// pane, and it is stopped. A stopped control-mode client holds the server in its exit here, as a slow machine does for
+// a moment.
+func TestAnExitingTmuxServerHasNoPanesAndIsStopped(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is not installed; the pane listing reads a real tmux server")
+	}
+	ctx := context.Background()
+	run := tmuxServer{socket: fmt.Sprintf("mt-exit-%d", os.Getpid()), tmpDir: shortTempDir(t)}
+	if out, err := run.command(ctx, "-f", "/dev/null", "new-session", "-d", "sleep 300").CombinedOutput(); err != nil {
+		t.Fatalf("start a server: %v: %s", err, out)
+	}
+	t.Cleanup(func() { _ = run.command(ctx, "kill-server").Run() })
+	client := run.command(ctx, "-C", "attach")
+	stdin, err := client.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.Process.Signal(syscall.SIGCONT)
+		_ = stdin.Close()
+		_ = client.Process.Kill()
+		_ = client.Wait()
+	})
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if out, _ := run.command(ctx, "list-clients", "-F", "#{client_pid}").Output(); strings.TrimSpace(string(out)) != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the control-mode client did not attach")
+		}
+	}
+	if err := client.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run.command(ctx, "kill-server").CombinedOutput(); err != nil {
+		t.Fatalf("kill-server: %v: %s", err, out)
+	}
+	if out, _ := run.command(ctx, "list-panes", "-a").CombinedOutput(); !strings.Contains(string(out), "server exited unexpectedly") {
+		t.Fatalf("the stopped client did not hold the server in its exit: list-panes said %q", out)
+	}
+	if panes, err := run.ownerPanes(ctx); err != nil || len(panes) != 0 {
+		t.Errorf("the exiting server lists %v, %v; want no pane and no error", panes, err)
+	}
+	if err := run.killServer(ctx); err != nil {
+		t.Errorf("killServer of the exiting server: %v", err)
+	}
+}
+
+// A tmux error that is no answer about the server stays an error: tmux refuses a socket directory that others may
+// write, and that is no "no server".
+func TestATmuxErrorIsNoAnswerAboutTheServer(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is not installed; the pane listing reads a real tmux server")
+	}
+	ctx := context.Background()
+	run := tmuxServer{socket: fmt.Sprintf("mt-unsafe-%d", os.Getpid()), tmpDir: shortTempDir(t)}
+	socketDir := filepath.Join(run.tmpDir, fmt.Sprintf("tmux-%d", os.Getuid()))
+	if err := os.Mkdir(socketDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socketDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if panes, err := run.ownerPanes(ctx); err == nil {
+		t.Errorf("ownerPanes under an unsafe socket directory = %v, no error", panes)
+	}
+	if err := run.killServer(ctx); err == nil {
+		t.Error("killServer under an unsafe socket directory: no error")
 	}
 }
 
