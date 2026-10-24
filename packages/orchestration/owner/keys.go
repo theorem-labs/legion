@@ -27,6 +27,9 @@ func NoticeKey(s string) string {
 // Key is the stable filesystem key for an owner id.
 func Key(id string) string { return "K" + Hex16(id) }
 
+// Branch is an owner's branch in the copy: owner/<Key(id)>.
+func Branch(id string) string { return "owner/" + Key(id) }
+
 // EdgeID is the stable identifier for a directed edge.
 func EdgeID(source, target string) string { return source + "->" + target }
 

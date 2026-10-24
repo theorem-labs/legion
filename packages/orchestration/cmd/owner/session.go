@@ -51,15 +51,7 @@ func (s *session) load() error {
 	if s.repo == "" {
 		return usagef("LEGION_LEDGER_REPOSITORY is unset")
 	}
-	deployPath := s.deployPath
-	if deployPath == "" {
-		home := strings.TrimSpace(s.getenv("HOME"))
-		if home == "" {
-			return usagef("--deploy is not given and HOME is unset")
-		}
-		deployPath = filepath.Join(home, ".config", "owner", "deploy.yaml")
-	}
-	deploy, err := ownerpkg.LoadDeploy(deployPath)
+	deploy, err := s.loadDeploy()
 	if err != nil {
 		return err
 	}
@@ -73,6 +65,19 @@ func (s *session) load() error {
 	}
 	s.config, s.loaded = config, true
 	return nil
+}
+
+// loadDeploy reads the deployment file: --deploy, else $HOME/.config/owner/deploy.yaml.
+func (s *session) loadDeploy() (ownerpkg.Deploy, error) {
+	path := s.deployPath
+	if path == "" {
+		home := strings.TrimSpace(s.getenv("HOME"))
+		if home == "" {
+			return ownerpkg.Deploy{}, usagef("--deploy is not given and HOME is unset")
+		}
+		path = filepath.Join(home, ".config", "owner", "deploy.yaml")
+	}
+	return ownerpkg.LoadDeploy(path)
 }
 
 // ledger opens the ledger the way every owner process does: from LEGION_LEDGER_DSN_FILE (C8).
@@ -126,7 +131,7 @@ func (s *session) mainFile(file string) ([]byte, error) {
 	return data, nil
 }
 
-func branch(owner string) string { return "owner/" + ownerpkg.Key(owner) }
+func branch(owner string) string { return ownerpkg.Branch(owner) }
 
 // lastCommit is the newest commit of rev that touched file, or "" when rev does not exist.
 func (s *session) lastCommit(rev, file string) (string, error) {

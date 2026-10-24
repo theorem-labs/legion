@@ -634,7 +634,7 @@ func (d *driver) wake(ctx context.Context) error {
 // report shows it beside.
 func (d *driver) awaitSubscriptions(ctx context.Context) error {
 	client := &http.Client{Timeout: 10 * time.Second}
-	dir := "legion-" + projectToken(daemonProject(d.run)) + "-owner-" // the claim token in each owner's working directory (C9)
+	dir := "legion-" + ProjectToken(daemonProject(d.run)) + "-owner-" // the claim token in each owner's working directory (C9)
 	var read time.Time
 	pending := "; the listener was not read yet"
 	err := d.wait(ctx, d.opts.Timeouts.Subscribed, "each owner session to subscribe to its topics", func() (bool, error) {
@@ -687,6 +687,10 @@ func (d *driver) panes(ctx context.Context) (map[string]pane, error) {
 	return panes, nil
 }
 
+// ours reports whether pid is a process of the run: its environment names the run's ledger repository. A PID that a
+// process of another run now holds, or one that exited, is not.
+func (d *driver) ours(pid int) bool { return processEnv(pid)["LEGION_LEDGER_REPOSITORY"] == d.run }
+
 // watch notes, in the process tree under root, each process of the run (its LEGION_LEDGER_REPOSITORY is the run's)
 // and each session transcript a process holds open.
 func (d *driver) watch(owner string, root int) {
@@ -695,7 +699,7 @@ func (d *driver) watch(owner string, root int) {
 	}
 	for queue := []int{root}; len(queue) > 0; queue = queue[1:] {
 		pid := queue[0]
-		if processEnv(pid)["LEGION_LEDGER_REPOSITORY"] == d.run {
+		if d.ours(pid) {
 			d.ownerPIDs[pid] = owner
 		}
 		for _, transcript := range openTranscripts(pid) {
@@ -1210,7 +1214,7 @@ func (d *driver) stopPane(p pane) {
 		added = false
 		for queue := []int{p.Root}; len(queue) > 0; queue = queue[1:] {
 			pid := queue[0]
-			if !stopped[pid] && processEnv(pid)["LEGION_LEDGER_REPOSITORY"] == d.run {
+			if !stopped[pid] && d.ours(pid) {
 				_ = syscall.Kill(pid, syscall.SIGSTOP)
 				stopped[pid], added = true, true
 			}
@@ -1225,7 +1229,7 @@ func (d *driver) stopPane(p pane) {
 func (d *driver) killPaneTree(ctx context.Context, p pane) error {
 	var tree []int
 	for queue := []int{p.Root}; len(queue) > 0; queue = queue[1:] {
-		if processEnv(queue[0])["LEGION_LEDGER_REPOSITORY"] == d.run {
+		if d.ours(queue[0]) {
 			tree = append(tree, queue[0])
 		}
 		queue = append(queue, children(queue[0])...)
@@ -1235,15 +1239,14 @@ func (d *driver) killPaneTree(ctx context.Context, p pane) error {
 			return err
 		}
 	}
-	ours := func(pid int) bool { return processEnv(pid)["LEGION_LEDGER_REPOSITORY"] == d.run }
 	for _, pid := range tree {
-		if ours(pid) {
+		if d.ours(pid) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
 	deadline := time.Now().Add(max(d.opts.Timeouts.DaemonStop, time.Second))
 	for {
-		left := slices.DeleteFunc(slices.Clone(tree), func(pid int) bool { return !ours(pid) })
+		left := slices.DeleteFunc(slices.Clone(tree), func(pid int) bool { return !d.ours(pid) })
 		if len(left) == 0 {
 			return nil
 		}
@@ -1503,7 +1506,7 @@ func (d *driver) stopOwners(ctx context.Context) error {
 	pids := slices.Sorted(maps.Keys(d.ownerPIDs))
 	d.report.Teardown.OwnerPIDs = pids
 	running := func() []int {
-		return slices.DeleteFunc(slices.Clone(pids), func(pid int) bool { return processEnv(pid)["LEGION_LEDGER_REPOSITORY"] != d.run })
+		return slices.DeleteFunc(slices.Clone(pids), func(pid int) bool { return !d.ours(pid) })
 	}
 	// awaitExit waits, up to the daemon's stop timeout, until none of the run's owner processes runs, and returns
 	// those that still do.

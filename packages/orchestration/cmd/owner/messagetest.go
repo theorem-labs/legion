@@ -69,7 +69,7 @@ type driverFlags struct {
 }
 
 func parseDriverFlags(args []string) (driverFlags, error) {
-	flags := driverFlags{kills: 5}
+	flags := driverFlags{kills: messagetest.DefaultKills}
 	for len(args) > 0 {
 		if len(args) < 2 {
 			return driverFlags{}, usagef("%s needs a value; %s", args[0], messageTestUsage)
@@ -128,9 +128,7 @@ func (s *session) messageTestTopicsOf() ([]string, error) {
 		return nil, unable(err)
 	}
 	for _, topic := range extra[s.owner] {
-		if !containsString(topics, topic) {
-			topics = append(topics, topic)
-		}
+		topics = appendNew(topics, topic)
 	}
 	return topics, nil
 }
@@ -347,15 +345,7 @@ type messageTestResult struct {
 // It is the operator's program, not an owner's: it reads no launch variable, and its ledger is the deployment's
 // ledger_dsn_file alone, which it gives the supervisor, so the test owners get it as LEGION_LEDGER_DSN_FILE.
 func (s *session) messageTestRun(flags driverFlags) (any, error) {
-	deployPath := s.deployPath
-	if deployPath == "" {
-		home := strings.TrimSpace(s.getenv("HOME"))
-		if home == "" {
-			return nil, usagef("--deploy is not given and HOME is unset")
-		}
-		deployPath = filepath.Join(home, ".config", "owner", "deploy.yaml")
-	}
-	deploy, err := ownerpkg.LoadDeploy(deployPath)
+	deploy, err := s.loadDeploy()
 	if err != nil {
 		return nil, err
 	}

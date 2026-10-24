@@ -3,9 +3,10 @@ package messagetest
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -231,13 +232,8 @@ func (r Report) markdown() string {
 	}
 	b.WriteString("\n## Owner panes\n\n| Owner | Pane | PID | Start (s) | Launch variables | Directory | Sessions | Subscribed (listener) | Subscribed record |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
 	for _, pane := range r.Panes {
-		names := make([]string, 0, len(pane.Env))
-		for name := range pane.Env {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		vars := make([]string, 0, len(names))
-		for _, name := range names {
+		vars := make([]string, 0, len(pane.Env))
+		for _, name := range slices.Sorted(maps.Keys(pane.Env)) {
 			vars = append(vars, fmt.Sprintf("`%s=%s`", name, pane.Env[name]))
 		}
 		fmt.Fprintf(&b, "| `%s` | %s | %d | %s | %s | `%s` | %s | %d topics | %d topics |\n", pane.Owner, pane.Pane, pane.PID, seconds(pane.StartSeconds),
@@ -352,12 +348,7 @@ func (r Revisions) markdown(b *strings.Builder) {
 	} {
 		fmt.Fprintf(b, "- `%s`: %s\n", tool.name, cell(tool.output))
 	}
-	names := make([]string, 0, len(r.Graph))
-	for name := range r.Graph {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(r.Graph)) {
 		fmt.Fprintf(b, "- Graph input `%s`: `%s`\n", name, r.Graph[name])
 	}
 	b.WriteString("\n")

@@ -219,12 +219,3 @@ func isNotFound(err error) bool {
 	var notFound *ledger.NotFoundError
 	return errors.As(err, &notFound)
 }
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
-}

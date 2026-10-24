@@ -1,8 +1,6 @@
 package main
 
 import (
-	"time"
-
 	"github.com/sjawhar/legion/orchestration/ledger"
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 )
@@ -82,7 +80,7 @@ func (s *session) checkNotHeldByOther(store *ledger.Store, item string) error {
 	if err != nil {
 		return err
 	}
-	if current.Holder != "" && current.Holder != s.owner && (current.ExpiresAt == nil || current.ExpiresAt.After(time.Now())) {
+	if current.Holder != s.owner && ownerpkg.LeaseLive(current) {
 		return refusef("%s is held by %s", item, current.Holder)
 	}
 	return nil

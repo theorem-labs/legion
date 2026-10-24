@@ -212,6 +212,12 @@ func (r Repo) CommitTrailers(sha string) (map[string][]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParseTrailers(output), nil
+}
+
+// ParseTrailers reads git's %(trailers:only,unfold) output: each key with its values in the order git prints them. A
+// line without a colon is no trailer.
+func ParseTrailers(output string) map[string][]string {
 	trailers := make(map[string][]string)
 	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		key, value, found := strings.Cut(line, ":")
@@ -221,7 +227,7 @@ func (r Repo) CommitTrailers(sha string) (map[string][]string, error) {
 		key = strings.TrimSpace(key)
 		trailers[key] = append(trailers[key], strings.TrimSpace(value))
 	}
-	return trailers, nil
+	return trailers
 }
 
 // MergeTree writes and returns the merge tree for m and u, with paths that conflict.

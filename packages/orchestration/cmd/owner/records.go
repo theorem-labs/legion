@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,7 +71,7 @@ func (s *session) reviewers(owner, subject string, revision int) ([]string, erro
 		if err := review.Unmarshal(data); err != nil {
 			return nil, fmt.Errorf("read review %s: %w", name, err)
 		}
-		if review.Subject == subject && review.Revision == revision && !containsString(models, review.Model) {
+		if review.Subject == subject && review.Revision == revision && !slices.Contains(models, review.Model) {
 			models = append(models, review.Model)
 		}
 	}

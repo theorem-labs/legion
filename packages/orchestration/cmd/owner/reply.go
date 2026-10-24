@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -39,7 +40,7 @@ func (s *session) accept(item string) (any, error) {
 		return nil, refusef("%s's spec is r%d now; run owner done %s --superseded r%d", target, step.specFront.Revision, item, step.specFront.Revision)
 	}
 	want := "need:" + ref.Subject + "@" + step.needHash
-	if !containsString(step.specFront.Answers, want) {
+	if !slices.Contains(step.specFront.Answers, want) {
 		return nil, refusef("%s's spec r%d does not answer the current need %s; reply superseded or wait for the new offer", target, step.specFront.Revision, want)
 	}
 	reply := ownerpkg.Reply{Kind: "accept", Edge: ref.Subject, Answers: map[string]string{"need": step.needHash, "offer": step.specHash}, Epoch: p.epoch, Text: "Accepted."}
@@ -85,12 +86,7 @@ func (s *session) reply(item, reason, file, premiseOwner string) (any, error) {
 	}
 	rule, ok := m.Reasons[reason]
 	if !ok {
-		var reasons []string
-		for name := range m.Reasons {
-			reasons = append(reasons, name)
-		}
-		sort.Strings(reasons)
-		return nil, usagef("reason %q is not one of %s", reason, strings.Join(reasons, ", "))
+		return nil, usagef("reason %q is not one of %s", reason, strings.Join(slices.Sorted(maps.Keys(m.Reasons)), ", "))
 	}
 	source, target, err := ownerpkg.ParseEdgeID(ref.Subject)
 	if err != nil {

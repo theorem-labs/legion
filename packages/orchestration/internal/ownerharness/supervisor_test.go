@@ -165,7 +165,7 @@ func TestSupervisorStartsAnOwnerFromItsTemplateWithTheLaunchVariables(t *testing
 		}
 	}
 	dir, _ := os.Readlink("/proc/" + pid + "/cwd")
-	if want := filepath.Join(f.config.StateDir, "owners", "legion-"+projectToken(f.config.Project)+"-owner-"+messagetest.EncodeOwnerName(graphOwner)); dir != want {
+	if want := filepath.Join(f.config.StateDir, "owners", "legion-"+messagetest.ProjectToken(f.config.Project)+"-owner-"+messagetest.EncodeOwnerName(graphOwner)); dir != want {
 		t.Fatalf("working directory = %q, want %q", dir, want)
 	}
 	if start, err := os.ReadFile(env["LEGION_OWNER_START_FILE"]); err != nil || !strings.Contains(string(start), graphOwner) {

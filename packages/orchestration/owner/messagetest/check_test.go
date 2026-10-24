@@ -360,14 +360,7 @@ func without(arrivals []Arrival, delivery string) []Arrival {
 }
 
 func withoutEvent(events []ledger.Event, kind, subject string) []ledger.Event {
-	var kept []ledger.Event
-	for _, event := range events {
-		if event.Kind == kind && event.Subject == subject {
-			continue
-		}
-		kept = append(kept, event)
-	}
-	return kept
+	return slices.DeleteFunc(slices.Clone(events), func(event ledger.Event) bool { return event.Kind == kind && event.Subject == subject })
 }
 
 func retopic(arrivals []Arrival, owner, delivery, topic string) {

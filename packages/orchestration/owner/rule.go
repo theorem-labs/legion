@@ -1,6 +1,7 @@
 package owner
 
 import (
+	"cmp"
 	"fmt"
 	"sort"
 	"strings"
@@ -74,33 +75,23 @@ func (r Rule) Sort(items []PrioritizedItem) {
 
 func (r Rule) before(left, right PrioritizedItem) bool {
 	for _, key := range r.Order {
-		var cmp int
+		var order int
 		switch key.Key {
 		case "stopped_instructions":
-			cmp = compareInts(left.StoppedInstructions, right.StoppedInstructions)
+			order = cmp.Compare(left.StoppedInstructions, right.StoppedInstructions)
 		case "call_height":
-			cmp = compareInts(left.CallHeight, right.CallHeight)
+			order = cmp.Compare(left.CallHeight, right.CallHeight)
 		case "enqueued_at":
-			cmp = compareInts(left.Position, right.Position)
+			order = cmp.Compare(left.Position, right.Position)
 		}
 		if key.Direction == "descending" {
-			cmp = -cmp
+			order = -order
 		}
-		if cmp != 0 {
-			return cmp < 0
+		if order != 0 {
+			return order < 0
 		}
 	}
 	return false
-}
-
-func compareInts(left, right int) int {
-	switch {
-	case left < right:
-		return -1
-	case left > right:
-		return 1
-	}
-	return 0
 }
 
 // RuleInputs are the facts the rule's definitions read. NodeCounts maps a node id to the image instructions of its
@@ -125,9 +116,11 @@ func (in RuleInputs) Priority(item ledger.Item) (Priority, error) {
 	return priorities[item.ID], nil
 }
 
-// Priorities computes the rule's values for every item, keyed by item id.
+// Priorities computes the rule's values for every item, keyed by item id. The stopped instructions of a subject are
+// computed once: many items of one queue share their subject.
 func (in RuleInputs) Priorities(items []ledger.Item) (map[string]Priority, error) {
 	heights := in.callHeights()
+	stopped := map[string]int{}
 	out := make(map[string]Priority, len(items))
 	for _, item := range items {
 		ref, err := ParseItemID(item.ID)
@@ -150,7 +143,12 @@ func (in RuleInputs) Priorities(items []ledger.Item) (map[string]Priority, error
 		if err != nil {
 			return nil, fmt.Errorf("item %s: %w", item.ID, err)
 		}
-		out[item.ID] = Priority{StoppedInstructions: in.stopped(subject), CallHeight: heights[subject]}
+		count, ok := stopped[subject]
+		if !ok {
+			count = in.stopped(subject)
+			stopped[subject] = count
+		}
+		out[item.ID] = Priority{StoppedInstructions: count, CallHeight: heights[subject]}
 	}
 	return out, nil
 }

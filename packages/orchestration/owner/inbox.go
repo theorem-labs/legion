@@ -77,7 +77,7 @@ func inboxEntry(item ledger.Item, config Config) (InboxItem, error) {
 		return InboxItem{}, err
 	}
 	switch ref.Type {
-	case "start":
+	case "start", "split-review":
 		entry.Record, entry.RecordOwner = SpecRecord(recordsRoot, ref.Subject), ref.Subject
 	case "need":
 		source, target, err := ParseEdgeID(ref.Subject)
@@ -105,8 +105,6 @@ func inboxEntry(item ledger.Item, config Config) (InboxItem, error) {
 			return InboxItem{}, fmt.Errorf("owner configuration has no paths.edge_record")
 		}
 		entry.Record, entry.RecordOwner = config.Paths.EdgeRecord(source, target), source
-	case "split-review":
-		entry.Record, entry.RecordOwner = SpecRecord(recordsRoot, ref.Subject), ref.Subject
 	case "rebuild":
 		entry.Record = ref.Subject
 	case "returned":
