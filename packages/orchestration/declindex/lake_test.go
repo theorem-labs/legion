@@ -110,7 +110,7 @@ func TestFreshClassifiesLakeBuildOutputs(t *testing.T) {
 	writeLakeFile(t, base+".trace", `{"schemaVersion":"next","inputs":[],"synthetic":false}`)
 	stale("unknown schema")
 
-	// The plan's E5 control: the build directory's source rewritten after the build, its trace unchanged.
+	// A control: the build directory's source rewritten after the build, its trace unchanged.
 	writeLakeFile(t, base+".trace", trace(false, hash))
 	writeLakeFile(t, sourcePath, "one\ntwo rewritten\n")
 	stale("rewritten built source")
