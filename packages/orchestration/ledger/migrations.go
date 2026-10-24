@@ -174,8 +174,8 @@ type CheckRequest struct {
 	ApprovedPinned []string `json:"approved_pinned"`
 	// DeferReads omits read-hash checks for a pre-build candidate. It can only produce an incomplete result.
 	DeferReads bool `json:"defer_reads"`
-	// ChangedContracts and its statement records are the same as Land receives. Head is optional here: without it,
-	// only a compatibility proof can clear a statement change.
+	// ChangedContracts and its statement records are the same as Land receives, under the same rules: changed
+	// contracts need Head, even with a compatibility proof, or the candidate is invalid_candidate.
 	ChangedContracts   map[string]string `json:"changed_contracts"`
 	Head               string            `json:"head"`
 	CompatibilityProof string            `json:"compatibility_proof"`
