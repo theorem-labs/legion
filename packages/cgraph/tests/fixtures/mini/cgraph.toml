@@ -18,6 +18,9 @@ files = ["src/flow.c"]
 [parts.facts]
 files = ["src/facts.c"]
 
+[parts.dead]
+files = ["src/dead.c"]
+
 [c]
 flags = ["-nostdinc", "-I{c_tree}/include/override", "-I{c_tree}/include", "--target=riscv64-unknown-elf",
          "-march=rv64imac", "-mabi=lp64", "-std=gnu2x", "-ffreestanding", "-fms-extensions", "-DMODULE={stem}"]

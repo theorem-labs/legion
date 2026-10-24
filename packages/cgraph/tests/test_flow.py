@@ -87,7 +87,8 @@ def test_an_argument_the_inline_callee_ignores_is_not_an_access(flow: dict[str, 
         for item in flow["exclusions"]["items"]
         if item["function"] == "function:flow_ignored"
     }
-    assert reasons == {("global:all_bags", "ignored_argument")}
+    # The empty note_bag has no effect, so its call is not compiled either.
+    assert reasons == {("global:all_bags", "ignored_argument"), ("function:note_bag@src/flow.c", "discarded")}
 
 
 def test_code_after_a_builtin_decided_exit_is_left_to_the_image(flow: dict[str, Any]) -> None:
@@ -389,8 +390,10 @@ def test_a_discarded_value_is_never_read(fct_facts: dict[str, Any]) -> None:
 def test_an_argument_a_macro_defined_inline_stub_ignores_is_not_an_access(fct_facts: dict[str, Any]) -> None:
     events = fact_events(fct_facts, "fct_ignored_macro")
     assert events["accesses"] == []
-    assert {(item["unit"]["name"], item["reason"]) for item in events["unevaluated"]} == {
-        ("all_bags", "ignored_argument")
+    assert {(item.get("call") or item["unit"]["name"], item["reason"]) for item in events["unevaluated"]} == {
+        ("all_bags", "ignored_argument"),
+        # The stub has no effect, so its call is not compiled either.
+        ("fct_note", "discarded"),
     }
 
 
@@ -494,3 +497,125 @@ def test_a_switch_on_a_helper_with_several_returns_keeps_every_case(fct_facts: d
     events = fact_events(fct_facts, "fct_helper_switch")
     assert {item["displacement"] for item in events["field_accesses"]} == {48, 40}
     assert not [item for item in events["unevaluated"] if item["reason"] == "dead_branch"]
+
+
+@pytest.fixture(scope="module")
+def dead_facts() -> dict[str, Any]:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    source = "src/dead.c"
+    return clangfacts.extract(
+        source,
+        loaded.inputs.c_tree,
+        commands.template_arguments(loaded.flags, loaded.inputs.c_tree, source),
+        loaded.vocabulary,
+    )
+
+
+@pytest.fixture(scope="module")
+def dead_build(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    out = tmp_path_factory.mktemp("dead")
+    result = build(FIXTURE, "dead", out)
+    return {"result": result, **{name: read(out, f"{name}.json") for name in ("graph", "checks", "exclusions")}}
+
+
+def callees(facts: dict[str, Any], function: str) -> set[str]:
+    return {call["callee"] for call in fact_events(facts, function)["calls"]}
+
+
+def unevaluated(facts: dict[str, Any], function: str) -> set[tuple[str | None, str]]:
+    """(the call or the state's name, the reason) of each item the facts leave out."""
+    return {
+        (item.get("call") or (item.get("unit") or {}).get("name"), item["reason"])
+        for item in fact_events(facts, function)["unevaluated"]
+    }
+
+
+def test_a_label_reached_only_by_a_dead_goto_is_not_code(dead_facts: dict[str, Any]) -> None:
+    """__slab_free's slab_empty: with CONFIG_SLUB_TINY (llvm-objdump: li a0, 0; ret)."""
+    assert callees(dead_facts, "dd_dead_label") == set()
+    assert ("obj_free", "after_exit") in unevaluated(dead_facts, "dd_dead_label")
+    # A label a live goto reaches, before or after the goto, is code.
+    assert callees(dead_facts, "dd_live_label") == {"obj_free", "box_weight"}
+
+
+@pytest.mark.parametrize(
+    ("function", "left_out"),
+    [
+        # (void)(dd_lockp(b)): lockdep_assert_held(__rq_lockp(rq)).
+        ("dd_void_call", {("dd_lockp", "discarded")}),
+        # ((void)(dd_current()->size), 0): cpu_to_node(raw_smp_processor_id()).
+        ("dd_comma_call", {("dd_current", "discarded"), ("box", "discarded")}),
+        # dd_remove_file(b, &dd_attr_dev);: device_remove_file, external, only reads.
+        ("dd_del", {("dd_remove_file", "discarded"), ("dd_attr_dev", "discarded")}),
+        # dd_get_ns(ns); and dd_quiet(b);: get_user_ns(new->user_ns); and clk_pm_runtime_put(core);.
+        ("dd_statement_calls", {("dd_get_ns", "discarded"), ("dd_quiet", "discarded")}),
+        # tl = this_cpu_ptr(...) read only by a stub, and flags &= mask read only by a stub.
+        ("dd_dead_store", {("dd_offsets", "discarded"), ("dd_mask", "discarded")}),
+    ],
+)
+def test_a_value_nothing_reads_is_not_computed(
+    dead_facts: dict[str, Any], function: str, left_out: set[tuple[str, str]]
+) -> None:
+    """llvm-objdump: each of these functions is a bare ret (or li a0, 0; ret)."""
+    events = fact_events(dead_facts, function)
+    assert (events["calls"], events["accesses"], events["field_accesses"]) == ([], [], [])
+    assert left_out <= unevaluated(dead_facts, function)
+
+
+def test_an_effect_or_a_loop_that_may_not_end_stays_code(dead_facts: dict[str, Any]) -> None:
+    """llvm-objdump of dd_kept: jal obj_alloc, then the increment of dd_flag; dd_count's loop is gone."""
+    assert callees(dead_facts, "dd_kept") == {"obj_alloc", "dd_wait"}
+    assert ("dd_count", "discarded") in unevaluated(dead_facts, "dd_kept")
+    assert ("dd_flag", "write") in {
+        (item["unit"]["name"], item["access"]) for item in fact_events(dead_facts, "dd_kept")["accesses"]
+    }
+
+
+@pytest.mark.parametrize(
+    ("function", "left_out"),
+    [
+        # dd_from passes its namespace only to dd_from_inner, which reads it only in sizeof.
+        ("dd_transitive", {("dd_current_ns", "ignored_argument")}),
+        # dd_stats reads its parameter only after `if (!dd_stats_enabled()) return;`.
+        ("dd_dead_use", {("dd_boxes", "ignored_argument")}),
+    ],
+)
+def test_an_argument_no_live_code_of_the_callee_reads_is_not_computed(
+    dead_facts: dict[str, Any], function: str, left_out: set[tuple[str, str]]
+) -> None:
+    events = fact_events(dead_facts, function)
+    assert (events["accesses"], events["field_accesses"]) == ([], [])
+    assert left_out <= unevaluated(dead_facts, function)
+
+
+def test_an_argument_an_external_callee_with_an_effect_ignores_is_left_to_the_image(
+    dead_facts: dict[str, Any], dead_build: dict[str, Any]
+) -> None:
+    """dd_reset_file stores, so its call stays; the image inlines it and forms no &dd_attr_dev."""
+    (access,) = fact_events(dead_facts, "dd_reset")["accesses"]
+    assert (access["unit"]["name"], access.get("conditional")) == ("dd_attr_dev", True)
+    assert ("access", "global:dd_attr_dev") not in edges_from(dead_build["graph"], "function:dd_reset")
+    decided = {
+        (item["function"], item["target"], item["reason"])
+        for item in dead_build["exclusions"]["items"]
+        if item["function"] == "function:dd_reset"
+    }
+    assert ("function:dd_reset", "global:dd_attr_dev", "image_decided") in decided
+
+
+def test_a_symbol_named_only_in_typeof_is_no_access(dead_facts: dict[str, Any]) -> None:
+    """runtime_const_ptr(__dentry_cache): the address is patched into the instruction (j obj_free)."""
+    accesses = fact_events(dead_facts, "dd_runtime_free")["accesses"]
+    assert "dd_cache" not in {item["unit"]["name"] for item in accesses}
+    assert ("dd_cache", "type") in unevaluated(dead_facts, "dd_runtime_free")
+
+
+def test_a_field_read_under_a_builtin_choice_is_marked_conditional(dead_facts: dict[str, Any]) -> None:
+    """rht_key_get_hash: the image of dd_builtin_field is mv a0, a1; ret."""
+    (access,) = fact_events(dead_facts, "dd_builtin_field")["field_accesses"]
+    assert (access["field"], access.get("conditional")) == ("size", True)
+
+
+def test_the_dead_part_has_no_access_only_the_c_has(dead_build: dict[str, Any]) -> None:
+    assert dead_build["result"].passes, dead_build["result"].hard_checks
+    assert dead_build["checks"]["access_layer"]["pairs"]["only_c"] == []
