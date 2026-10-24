@@ -227,3 +227,13 @@ func TestReadyFlagsRejectAmbiguousDelimiters(t *testing.T) {
 		t.Fatalf("names with @: code=%d stderr=%q; want them taken as check and land take them", code, stderr)
 	}
 }
+
+// ready without --head is a usage error that names the flag, through flags, as before this change.
+func TestReadyWithoutHeadNamesTheFlag(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+	if code, _, stderr := call("--json", "ready", "r", "M-1", "1"); code != 2 || !strings.Contains(stderr, "ready needs --head") {
+		t.Fatalf("ready without --head: code=%d stderr=%q", code, stderr)
+	}
+}

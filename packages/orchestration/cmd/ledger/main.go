@@ -791,6 +791,9 @@ func parseReadyFlags(args []string) (ledger.StatementRecords, error) {
 			return ledger.StatementRecords{}, usagef("unknown ready flag %q", flag)
 		}
 	}
+	if records.Head == "" {
+		return ledger.StatementRecords{}, usagef("ready needs --head")
+	}
 	return records, nil
 }
 
