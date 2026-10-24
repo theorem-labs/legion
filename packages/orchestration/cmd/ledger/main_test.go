@@ -99,7 +99,7 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 
 	invoke("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
 	invoke("extend", "r", "M-1", "1", "--write", "b.lean")
-	check := invoke("--json", "check", "r", "M-1", "1", "--path", "a.lean", "--path", "b.lean")
+	check := invoke("--json", "check", "r", "M-1", "1", "--commit", "candidate", "--path", "a.lean", "--path", "b.lean")
 	var checked struct {
 		Pass bool `json:"pass"`
 	}
@@ -107,7 +107,7 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 		t.Fatalf("clean check: %v %q", err, check)
 	}
 	invoke("takeover", "r", "M-1", "bob", "1")
-	invoke("round", "r", "M-1", "2", "failed")
+	invoke("round", "r", "M-1", "2", "failed", "--key", "round-1", "--ready-event", "1099511627776")
 	roundStatus := invoke("--json", "status", "r")
 	var openStatus struct {
 		Migrations []struct {
@@ -252,7 +252,7 @@ func TestCheckRefusalExitsOneWithJSONResult(t *testing.T) {
 	if code, _, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "owned.lean"); code != 0 {
 		t.Fatalf("open exit=%d stderr=%s", code, stderr)
 	}
-	code, stdout, stderr := call("--json", "check", "r", "M-1", "1", "--path", "outside.lean")
+	code, stdout, stderr := call("--json", "check", "r", "M-1", "1", "--commit", "candidate", "--path", "outside.lean")
 	if code != 1 {
 		t.Fatalf("refused check exit=%d stdout=%s stderr=%s; want 1", code, stdout, stderr)
 	}
@@ -296,7 +296,7 @@ func TestLandReadsJSONRequestFile(t *testing.T) {
 	invoke("land", "--request-file", file)
 }
 
-func TestLandJSONRequestRequiresChangedPaths(t *testing.T) {
+func TestLandJSONRequestMapsMissingChangedPathsToInvalidCandidate(t *testing.T) {
 	dsn := testpg.Database(t, "ledger_command")
 	getenv := func(key string) string {
 		if key == "LEDGER_DSN" {
@@ -320,12 +320,12 @@ func TestLandJSONRequestRequiresChangedPaths(t *testing.T) {
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if code, stderr := call("land", "--request-file", file); code != 2 || !strings.Contains(stderr, "changed paths") {
+	if code, stderr := call("land", "--request-file", file); code != 1 || !strings.Contains(stderr, "invalid_candidate") {
 		t.Fatalf("missing changed_paths: code=%d stderr=%q", code, stderr)
 	}
 }
 
-func TestLandFlagsRequireChangedPathsOrNoPaths(t *testing.T) {
+func TestLandFlagsMapMissingChangedPathsToInvalidCandidate(t *testing.T) {
 	dsn := testpg.Database(t, "ledger_command")
 	getenv := func(key string) string {
 		if key == "LEDGER_DSN" {
@@ -345,7 +345,7 @@ func TestLandFlagsRequireChangedPathsOrNoPaths(t *testing.T) {
 		t.Fatalf("open: code=%d stderr=%s", code, stderr)
 	}
 	land := []string{"land", "--repo", "r", "--migration", "M-1", "--generation", "1", "--commit", "commit-1"}
-	if code, stderr := call(land...); code != 2 || !strings.Contains(stderr, "--path") {
+	if code, stderr := call(land...); code != 1 || !strings.Contains(stderr, "invalid_candidate") {
 		t.Fatalf("land without --path or --no-paths: code=%d stderr=%q", code, stderr)
 	}
 	if code, stderr := call(append(land, "--no-paths", "--path", "a.lean")...); code != 2 || !strings.Contains(stderr, "--no-paths") {
@@ -376,7 +376,7 @@ func TestRepeatableListFlagsPreserveCommaPaths(t *testing.T) {
 	invoke("open", "r", "M-1", "alice", "base", "branch",
 		"--write", "a,b.lean", "--read", "X=hash")
 	result := invoke("--json", "check", "r", "M-1", "1",
-		"--path", "a,b.lean", "--current", "X=hash")
+		"--commit", "candidate", "--path", "a,b.lean", "--current", "X=hash")
 	var check struct {
 		Pass bool `json:"pass"`
 	}
@@ -416,7 +416,7 @@ func TestJSONRequestFilesPreserveEqualsNamesAndHashes(t *testing.T) {
 	invoke("open", "--request-file", openFile)
 	extendFile := writeRequest("extend.json", `{"repo":"r","id":"M-1","generation":1,"writes":["b=c.lean"],"reads":{}}`)
 	invoke("extend", "--request-file", extendFile)
-	checkFile := writeRequest("check.json", `{"repo":"r","id":"M-1","generation":1,"changed":["a=b.lean","b=c.lean"],"current":{"A=B":"h=1"}}`)
+	checkFile := writeRequest("check.json", `{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a=b.lean","b=c.lean"],"current":{"A=B":"h=1"}}`)
 	check := invoke("--json", "check", "--request-file", checkFile)
 	var checked struct {
 		Pass bool `json:"pass"`
@@ -498,7 +498,7 @@ func TestStatementRecordFlagsKeepEqualsVerbatim(t *testing.T) {
 	invoke("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1")
 	records := []string{"--changed-contract", "C=hash-2", "--head", "h=1", "--compatibility-proof", "Spec.«a=b»",
 		"--reviewed-head", "r=1"}
-	check := invoke(append([]string{"--json", "check", "r", "M-1", "1", "--path", "a.lean", "--current", "C=hash-1"}, records...)...)
+	check := invoke(append([]string{"--json", "check", "r", "M-1", "1", "--commit", "candidate", "--path", "a.lean", "--current", "C=hash-1"}, records...)...)
 	if !strings.Contains(check, `"pass":true`) {
 		t.Fatalf("check with a compatibility proof: %q", check)
 	}
@@ -551,15 +551,15 @@ func TestStatementChangeRecordsRoundTrip(t *testing.T) {
 		approved              bool
 		checkPass             bool
 		code                  int    // the land's exit code
-		reason                string // the land's refusal, for exit code 1
+		reason                string // the refusal kind, for exit code 1
 	}{
 		{name: "proofs only", checkPass: true},
 		{name: "statement with no record", changes: true, head: "head-1", code: 1, reason: "statement_unreviewed"},
 		{name: "statement with a compatibility proof", changes: true, head: "head-1", proof: "Spec.C_compat", checkPass: true},
 		{name: "statement reviewed at its head", changes: true, head: "head-1", reviewed: "head-1", checkPass: true},
 		{name: "statement reviewed at another head", changes: true, head: "head-1", reviewed: "head-0", code: 1, reason: "statement_unreviewed"},
-		{name: "statement with no head", changes: true, proof: "Spec.C_compat", checkPass: true, code: 2},
-		{name: "pinned statement reviewed without approval", pinned: true, changes: true, head: "head-1", reviewed: "head-1", checkPass: true, code: 1, reason: "pinned"},
+		{name: "statement with no head", changes: true, proof: "Spec.C_compat", code: 1, reason: "invalid_candidate"},
+		{name: "pinned statement reviewed without approval", pinned: true, changes: true, head: "head-1", reviewed: "head-1", code: 1, reason: "pinned"},
 		{name: "pinned statement approved without record", pinned: true, changes: true, head: "head-1", approved: true, code: 1, reason: "statement_unreviewed"},
 		{name: "pinned statement approved and reviewed", pinned: true, changes: true, head: "head-1", reviewed: "head-1", approved: true, checkPass: true},
 	} {
@@ -568,7 +568,7 @@ func TestStatementChangeRecordsRoundTrip(t *testing.T) {
 			invoke("repo", "ensure", repo, "0")
 			invoke("contract", "register", repo, "C", "alice", "hash-1", strconv.FormatBool(test.pinned))
 			invoke("open", repo, "M-1", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1")
-			candidate := []string{"--path", "a.lean", "--current", "C=hash-1"}
+			candidate := []string{"--commit", "candidate", "--path", "a.lean", "--current", "C=hash-1"}
 			if test.changes {
 				candidate = append(candidate, "--changed-contract", "C=hash-2")
 			}
@@ -578,6 +578,9 @@ func TestStatementChangeRecordsRoundTrip(t *testing.T) {
 				if record.value != "" {
 					candidate = append(candidate, record.flag, record.value)
 				}
+			}
+			if test.approved {
+				candidate = append(candidate, "--approved-pinned", "C")
 			}
 
 			code, stdout, stderr := call(append([]string{"--json", "check", repo, "M-1", "1"}, candidate...)...)
@@ -596,15 +599,12 @@ func TestStatementChangeRecordsRoundTrip(t *testing.T) {
 					t.Fatalf("check: code=%d %+v; want a pass", code, checked)
 				}
 			} else if code != 1 || checked.Pass || len(checked.Violations) != 1 ||
-				checked.Violations[0].Kind != "statement_unreviewed" || checked.Violations[0].Name != "C" {
-				t.Fatalf("check: code=%d %+v; want one statement_unreviewed violation for C", code, checked)
+				checked.Violations[0].Kind != test.reason {
+				t.Fatalf("check: code=%d %+v; want one %s violation", code, checked, test.reason)
 			}
 
 			land := append([]string{"--json", "land", "--repo", repo, "--migration", "M-1", "--generation", "1",
 				"--commit", "commit-1"}, candidate...)
-			if test.approved {
-				land = append(land, "--approved-pinned", "C")
-			}
 			code, stdout, stderr = call(land...)
 			if code != test.code {
 				t.Fatalf("land: code=%d stdout=%q stderr=%q; want %d", code, stdout, stderr, test.code)
@@ -724,32 +724,32 @@ func TestStatementRecordsRoundTripThroughRequestFiles(t *testing.T) {
 		}
 	}
 	candidate := `"changed_paths":["a.lean"],"current":{"A=B":"h=1","X":"x"},"changed_contracts":{"A=B":"h=2"}`
-	// Each record reaches Check through its own JSON key: a matching review and a compatibility proof pass, with or
-	// without the head, and a review at another head or with no head to compare does not.
+	// A matching review or compatibility proof clears the statement rule only when the candidate also names its head.
 	for i, test := range []struct {
 		name, records string
 		pass          bool
+		kind          string
 	}{
-		{"a review at its head", `"head":"h=ead","reviewed_head":"h=ead"`, true},
-		{"a compatibility proof", `"head":"h=ead","compatibility_proof":"Spec.«a=b»"`, true},
-		{"a compatibility proof with no head", `"compatibility_proof":"Spec.«a=b»"`, true},
-		{"a review at another head", `"head":"h=ead","reviewed_head":"other"`, false},
-		{"a review with no head", `"reviewed_head":"h=ead"`, false},
+		{"a review at its head", `"head":"h=ead","reviewed_head":"h=ead"`, true, ""},
+		{"a compatibility proof", `"head":"h=ead","compatibility_proof":"Spec.«a=b»"`, true, ""},
+		{"a compatibility proof with no head", `"compatibility_proof":"Spec.«a=b»"`, false, "invalid_candidate"},
+		{"a review at another head", `"head":"h=ead","reviewed_head":"other"`, false, "statement_unreviewed"},
+		{"a review with no head", `"reviewed_head":"h=ead"`, false, "invalid_candidate"},
 	} {
-		check := writeRequest(fmt.Sprintf("check-%d.json", i), `{"repo":"r","id":"M-1","generation":1,"changed":["a.lean"],`+
+		check := writeRequest(fmt.Sprintf("check-%d.json", i), `{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a.lean"],`+
 			`"current":{"A=B":"h=1","X":"x"},"changed_contracts":{"A=B":"h=2"},`+test.records+`}`)
 		code, stdout, stderr := call("--json", "check", "--request-file", check)
 		if test.pass {
 			if code != 0 || !strings.Contains(stdout, `"pass":true`) {
 				t.Errorf("check with %s: code=%d stdout=%q stderr=%q; want a pass", test.name, code, stdout, stderr)
 			}
-		} else if code != 1 || !strings.Contains(stdout, `"kind":"statement_unreviewed"`) || !strings.Contains(stdout, `"name":"A=B"`) {
-			t.Errorf("check with %s: code=%d stdout=%q stderr=%q; want statement_unreviewed for A=B", test.name, code, stdout, stderr)
+		} else if code != 1 || !strings.Contains(stdout, `"kind":"`+test.kind+`"`) {
+			t.Errorf("check with %s: code=%d stdout=%q stderr=%q; want %s", test.name, code, stdout, stderr, test.kind)
 		}
 	}
 	noHead := writeRequest("no-head.json", `{"repo":"r","migration":"M-1","generation":1,"commit":"c",`+candidate+
 		`,"compatibility_proof":"Spec.«a=b»"}`)
-	if code, _, stderr := call("land", "--request-file", noHead); code != 2 || !strings.Contains(stderr, "head") {
+	if code, _, stderr := call("land", "--request-file", noHead); code != 1 || !strings.Contains(stderr, "invalid_candidate") {
 		t.Fatalf("land without head: code=%d stderr=%q", code, stderr)
 	}
 	land := writeRequest("land.json", `{"repo":"r","migration":"M-1","generation":1,"commit":"c",`+candidate+
