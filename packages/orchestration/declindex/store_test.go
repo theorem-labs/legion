@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -62,6 +63,26 @@ func refreshed(t *testing.T, tree Tree) *Store {
 	return s
 }
 
+// declaration is the one declaration whose full name is name; the test fails when it names none or several.
+func declaration(t *testing.T, s *Store, name string) Found {
+	t.Helper()
+	found, err := s.Resolve(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found = slices.DeleteFunc(found, func(f Found) bool { return f.Name != name })
+	if len(found) != 1 {
+		t.Fatalf("%s names %d declarations: %+v", name, len(found), found)
+	}
+	return found[0]
+}
+
+// answerFor is the answer about the one declaration whose full name is name (declaration).
+func answerFor(t *testing.T, s *Store, name string, opt AnswerOptions) (Answer, error) {
+	t.Helper()
+	return s.Answer(context.Background(), declaration(t, s, name), opt)
+}
+
 // referenceAnswer is one answer of the reference tool (testdata/golden/answers.json), without its `why` chains,
 // whose choice among equal paths depends on row order.
 type referenceAnswer struct {
@@ -83,9 +104,8 @@ func TestAnswersMatchReferenceTool(t *testing.T) {
 	if err := json.Unmarshal(raw, &want); err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
 	for name, w := range want {
-		got, err := s.Answer(ctx, name, AnswerOptions{Lines: true})
+		got, err := answerFor(t, s, name, AnswerOptions{Lines: true})
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -113,7 +133,7 @@ func TestAnswersMatchReferenceTool(t *testing.T) {
 
 func TestWhyNamesAChainForEveryReachedDirectory(t *testing.T) {
 	s := refreshed(t, goldenTree(t))
-	got, err := s.Answer(context.Background(), "Gold.Aligned", AnswerOptions{Why: true})
+	got, err := answerFor(t, s, "Gold.Aligned", AnswerOptions{Why: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +196,7 @@ func TestRefreshRereadsOnlyChangedModules(t *testing.T) {
 	if found, err := s.Resolve(ctx, "Gold2.FrameAt"); err != nil || len(found) != 0 {
 		t.Fatalf("a removed module's declaration still resolves: %v %v", found, err)
 	}
-	a, err := s.Answer(ctx, "Gold.Frame", AnswerOptions{})
+	a, err := answerFor(t, s, "Gold.Frame", AnswerOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +249,7 @@ func TestHashesAreTheStatementHashes(t *testing.T) {
 }
 
 // Lean names every `example` `_example`, so one name can be a declaration of many modules. Each is its own
-// statement: a change reaches all of them, each in its own directory.
+// declaration and statement: each counts as a user, and a change reaches all of them, each in its own directory.
 func TestReachCountsEachModulesExample(t *testing.T) {
 	dir := t.TempDir()
 	write := func(rel, ilean, src string) {
@@ -253,11 +273,11 @@ func TestReachCountsEachModulesExample(t *testing.T) {
 			"example (h : A.t) : True := trivial\n")
 	}
 	s := refreshed(t, Tree{Source: dir, Lib: dir, Roots: Roots{"A": true, "P": true, "Q": true}})
-	a, err := s.Answer(context.Background(), "A.t", AnswerOptions{})
+	a, err := answerFor(t, s, "A.t", AnswerOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Direct.Declarations != 1 || a.Direct.Directories != 2 {
+	if a.Direct.Declarations != 2 || a.Direct.Directories != 2 {
 		t.Fatalf("direct users %+v", a.Direct)
 	}
 	want := ReachCounts{StatementsChanged: 2, StatementDirectories: 2, AllDirectories: 2}
@@ -387,6 +407,24 @@ func TestARefreshWaitingForTheRefreshLockEndsWithItsContext(t *testing.T) {
 	}
 }
 
+// readOnlyDirectory makes dir read-only until the restore it gives, which the test's cleanup also runs: its mode,
+// which stops a writer that is not root, and OpenReadOnly's view of it (directoryWritable), which the mode does not
+// change for root.
+func readOnlyDirectory(t *testing.T, dir string) (restore func()) {
+	t.Helper()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	writable := directoryWritable
+	directoryWritable = func(string) bool { return false }
+	restore = func() {
+		directoryWritable = writable
+		_ = os.Chmod(dir, 0o755)
+	}
+	t.Cleanup(restore)
+	return restore
+}
+
 // The index directory of a post-landing check is read-only. The index there opens read-only, and a refresh waits
 // until the reader is done, so the reader never sees a refresh half written.
 func TestOpenReadOnlyReadsAnIndexInAReadOnlyDirectory(t *testing.T) {
@@ -403,10 +441,7 @@ func TestOpenReadOnlyReadsAnIndexInAReadOnlyDirectory(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	restore := readOnlyDirectory(t, dir)
 	reader, err := OpenReadOnly(context.Background(), path, IndexOnly)
 	if err != nil {
 		t.Fatalf("open read-only in a read-only directory: %v", err)
@@ -417,9 +452,7 @@ func TestOpenReadOnlyReadsAnIndexInAReadOnlyDirectory(t *testing.T) {
 	if n, err := reader.ModuleCount(context.Background()); err != nil || n != 2 {
 		t.Fatalf("modules %d, %v", n, err)
 	}
-	if err := os.Chmod(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	restore()
 	other, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -484,10 +517,7 @@ func TestAReadOnlyReaderWaitsForTheLocksOfWhatItReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	refreshLock, writeLock := openLockHolder(t, path+".lock"), openLockHolder(t, path+".write.lock")
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	readOnlyDirectory(t, dir)
 	read := func(scope ReadScope, wait time.Duration) error {
 		ctx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
@@ -546,10 +576,7 @@ func TestAnIndexOnlyReaderReadsWhileARefreshSyncs(t *testing.T) {
 	synced := false
 	writer.afterRefreshLock = func(context.Context) error {
 		synced = true
-		if err := os.Chmod(dir, 0o555); err != nil {
-			return err
-		}
-		defer func() { _ = os.Chmod(dir, 0o755) }()
+		defer readOnlyDirectory(t, dir)()
 		wait, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		if reader, err := OpenReadOnly(wait, path, IndexOnly); err != nil {
@@ -678,7 +705,7 @@ func TestASymlinkedIndexFileHasOneRefreshLockAndOneGraph(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	if _, err := reader.Answer(ctx, "Gold.Frame", AnswerOptions{}); err != nil {
+	if _, err := answerFor(t, reader, "Gold.Frame", AnswerOptions{}); err != nil {
 		t.Errorf("an answer of the resolved index after a refresh through its link: %v", err)
 	}
 }

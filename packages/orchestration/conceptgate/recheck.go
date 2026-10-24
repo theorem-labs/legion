@@ -20,10 +20,13 @@ type RecheckReport struct {
 	Near    []RecheckNear `json:"near,omitempty"`
 }
 
-// Recheck recompiles each added concept's stored source in the sandbox, checks its recorded hash, and sends each
-// near pair to the librarian once. The caller supplies paths added by the landing diff and the loaded registry.
-// An added file that is not a loaded concept, a stored source that Lean refuses or does not compile, and a pending
-// concept left out of the forms are defects; an error means that the recheck could not run.
+// Recheck checks each added concept against its recorded hash and the registry, and sends each near pair to the
+// librarian once. The caller supplies paths added by the landing diff and the loaded registry. When the landed build
+// declares the concept in the module of its home file, that declaration is the concept: its compiled hash must be
+// the recorded one, and its facts are compared with the registry's. Else the stored source is recompiled in the
+// sandbox and compared so. An added file that is not a loaded concept, a landed declaration with another hash, a
+// stored source that Lean refuses or does not compile, and a pending concept left out of the forms are defects; an
+// error means that the recheck could not run.
 func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (RecheckReport, error) {
 	var report RecheckReport
 	if err := g.checkSandbox(ctx); err != nil {
@@ -62,16 +65,24 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 			continue
 		}
 		proposal := Proposal{ID: concept.Proposal, Concept: concept, Source: concept.Source}
-		constants, pending, err := g.export(ctx, reg, proposal)
-		for _, d := range pending {
-			defect(d)
-		}
+		constants, err := landedConstants(ctx, g.Index, concept)
 		if err != nil {
-			if !sourceFailed(err) {
-				return report, fmt.Errorf("recheck %s: %w", concept.Name, err)
+			return report, fmt.Errorf("recheck %s: %w", concept.Name, err)
+		}
+		landed := constants != nil
+		if !landed {
+			var pending []Defect
+			constants, pending, err = g.export(ctx, reg, proposal)
+			for _, d := range pending {
+				defect(d)
 			}
-			defect(Defect{Path: path, Message: "stored source does not compile: " + err.Error()})
-			continue
+			if err != nil {
+				if !sourceFailed(err) {
+					return report, fmt.Errorf("recheck %s: %w", concept.Name, err)
+				}
+				defect(Defect{Path: path, Message: "stored source does not compile: " + err.Error()})
+				continue
+			}
 		}
 		own, decl := ownConstants(constants, concept.Name)
 		if decl == nil {
@@ -80,7 +91,11 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 		}
 		actual := decl.Hash
 		if actual != concept.CompiledHash {
-			defect(Defect{Path: path, Message: "compiled hash " + actual + " differs from recorded " + concept.CompiledHash})
+			message := "compiled hash " + actual + " differs from recorded " + concept.CompiledHash
+			if landed {
+				message = "the landed declaration is not the one the gate added: its " + message
+			}
+			defect(Defect{Path: path, Message: message})
 			continue
 		}
 		addedKey := Key(concept)

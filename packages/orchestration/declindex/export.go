@@ -80,11 +80,9 @@ func run(ctx context.Context, dir string, env []string, name string, args ...str
 	return nil
 }
 
-// BuildExporter builds the exporter with toolchain l below cacheDir, once for each version of its sources and
-// each toolchain, and returns the binary. Lake compiles the modules to objects; the binary is linked against the
-// toolchain's shared runtime (libleanshared), which needs no development libraries on the machine. cc is the C
-// compiler that links (LEAN_CC, else the toolchain's own clang, else cc when empty).
-func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, error) {
+// exporterVersion names what BuildExporter builds with toolchain l: a digest of the toolchain's path and of every
+// exporter source file, which it also gives, sorted.
+func exporterVersion(l Lean) (string, []string, error) {
 	h := sha256.New()
 	h.Write([]byte(l.Prefix))
 	var files []string
@@ -95,7 +93,7 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 		return err
 	})
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	sort.Strings(files)
 	for _, f := range files {
@@ -103,7 +101,19 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 		h.Write([]byte(f))
 		h.Write(data)
 	}
-	dir := filepath.Join(cacheDir, "exporter-"+hex.EncodeToString(h.Sum(nil))[:16])
+	return hex.EncodeToString(h.Sum(nil))[:16], files, nil
+}
+
+// BuildExporter builds the exporter with toolchain l below cacheDir, once for each version of its sources and
+// each toolchain (exporterVersion), and returns the binary. Lake compiles the modules to objects; the binary is
+// linked against the toolchain's shared runtime (libleanshared), which needs no development libraries on the
+// machine. cc is the C compiler that links (LEAN_CC, else the toolchain's own clang, else cc when empty).
+func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, error) {
+	version, files, err := exporterVersion(l)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(cacheDir, "exporter-"+version)
 	binPath := filepath.Join(dir, "declexport")
 	if _, err := os.Stat(binPath); err == nil {
 		return binPath, nil
@@ -324,6 +334,9 @@ type Constant struct {
 type Exporter struct {
 	Lean Lean
 	Bin  string
+	// Version names what Bin was built from: the exporter's sources and the toolchain (BuildExporter). The compiled
+	// part's digest covers it, and not Bin's path, which differs between the paths that name one index.
+	Version string
 	// SearchPath is LEAN_PATH: the project's library directory, its dependencies', and any extra directory
 	// (forms, proposals).
 	SearchPath []string
@@ -344,26 +357,41 @@ var ErrExporter = errors.New("exporter failed")
 
 // Run exports the manifest's modules, in parallel processes of at most ModulesPerProcess modules each.
 func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
-	if len(m.Modules) == 0 {
+	return x.RunEach(ctx, []Manifest{m})
+}
+
+// RunEach exports the modules of each manifest, in parallel processes of at most ModulesPerProcess modules each; a
+// process reads the modules of one manifest, which one Lean environment can import together.
+func (x *Exporter) RunEach(ctx context.Context, ms []Manifest) ([]Constant, error) {
+	total := 0
+	for _, m := range ms {
+		total += len(m.Modules)
+	}
+	if total == 0 {
 		return nil, nil
 	}
 	per := x.ModulesPerProcess
 	if per <= 0 {
-		per = (len(m.Modules) + max(1, x.Jobs) - 1) / max(1, x.Jobs)
+		per = (total + max(1, x.Jobs) - 1) / max(1, x.Jobs)
 	}
-	chunks := slices.Collect(slices.Chunk(m.Modules, per))
-	results := make([][]Constant, len(chunks))
-	errs := make([]error, len(chunks))
+	var runs []Manifest
+	for _, m := range ms {
+		for chunk := range slices.Chunk(m.Modules, per) {
+			mm := m
+			mm.Modules = chunk
+			runs = append(runs, mm)
+		}
+	}
+	results := make([][]Constant, len(runs))
+	errs := make([]error, len(runs))
 	var mu sync.Mutex
 	done := 0
-	parallel(len(chunks), max(1, x.Jobs), func(i int) {
-		mm := m
-		mm.Modules = chunks[i]
-		results[i], errs[i] = x.runOne(ctx, mm)
+	parallel(len(runs), max(1, x.Jobs), func(i int) {
+		results[i], errs[i] = x.runOne(ctx, runs[i])
 		mu.Lock()
 		done++
-		if errs[i] == nil && (done%10 == 0 || done == len(chunks)) {
-			logf(x.Log, "exporter: %d of %d module groups done", done, len(chunks))
+		if errs[i] == nil && (done%10 == 0 || done == len(runs)) {
+			logf(x.Log, "exporter: %d of %d module groups done", done, len(runs))
 		}
 		mu.Unlock()
 	})

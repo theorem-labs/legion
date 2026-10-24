@@ -225,14 +225,24 @@ func (c Config) TreeSpec() Tree {
 }
 
 // Compiled gives the options of the compiled part for this configuration: the tree's toolchain, the exporter
-// built with it below the index's directory, and the library directories of the tree and its Lake packages.
+// built with it below the index's directory, and the library directories of the tree and its Lake packages. The
+// index's directory is the one of the file it resolves to, as for its locks and graph (resolveIndex), so that every
+// path that names one index builds one exporter and one forms module.
 func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) (*CompiledOptions, error) {
 	l, err := FindLean(ctx, c.Tree, c.Lean.Toolchain)
 	if err != nil {
 		return nil, err
 	}
-	state := filepath.Dir(c.DB)
+	db, err := resolveIndex(c.DB)
+	if err != nil {
+		return nil, err
+	}
+	state := filepath.Dir(db)
 	bin, err := BuildExporter(ctx, l, c.Lean.CC, filepath.Join(state, "exporter"))
+	if err != nil {
+		return nil, err
+	}
+	version, _, err := exporterVersion(l)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +254,7 @@ func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) 
 	jobs := cmp.Or(c.Lean.Jobs, c.Jobs, defaultJobs())
 	per := cmp.Or(c.Lean.ModulesPerProcess, 400)
 	return &CompiledOptions{
-		Exporter: &Exporter{Lean: l, Bin: bin, SearchPath: search, Jobs: jobs, ModulesPerProcess: per, Log: log},
+		Exporter: &Exporter{Lean: l, Bin: bin, Version: version, SearchPath: search, Jobs: jobs, ModulesPerProcess: per, Log: log},
 		Forms:    forms,
 		Dir:      filepath.Join(state, "forms"),
 	}, nil

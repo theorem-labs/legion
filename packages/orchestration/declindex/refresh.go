@@ -367,7 +367,7 @@ func writeSources(ctx context.Context, tx *sql.Tx, stored, current map[string]st
 }
 
 // writeModules replaces the reference rows of the changed and gone modules (and the compiled rows of the gone ones)
-// with those of the re-read modules: their declarations, uses, modules rows and edges.
+// with those of the re-read modules: their imports, declarations, uses, modules rows and edges.
 func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 	if err := deleteModules(ctx, tx, slices.Concat(r.gone, relsOf(r.changed)), r.old); err != nil {
 		return err
@@ -378,11 +378,17 @@ func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 		}
 	}
 	decls := newBatch(tx, "INSERT", "decls", 6)
-	uses := newBatch(tx, "INSERT", "uses", 6)
+	uses := newBatch(tx, "INSERT", "uses", 7)
+	imports := newBatch(tx, "INSERT", "imports", 2)
 	modules := newBatch(tx, "INSERT", "modules", 4)
 	for i, md := range r.results {
 		if r.errs[i] != nil {
 			continue
+		}
+		for _, imported := range md.Imports {
+			if err := imports.add(ctx, md.Module, imported); err != nil {
+				return err
+			}
 		}
 		for _, d := range md.Decls {
 			if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash); err != nil {
@@ -390,7 +396,7 @@ func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 			}
 		}
 		for _, u := range md.Uses {
-			if err := uses.add(ctx, u.Target, u.Module, u.Line, u.Col, u.Parent, u.Class); err != nil {
+			if err := uses.add(ctx, u.Target, u.TargetModule, u.Module, u.Line, u.Col, u.Parent, u.Class); err != nil {
 				return err
 			}
 		}
@@ -400,7 +406,7 @@ func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 			return err
 		}
 	}
-	for _, b := range []*batch{modules, decls, uses} {
+	for _, b := range []*batch{modules, imports, decls, uses} {
 		if err := b.flush(ctx); err != nil {
 			return err
 		}
@@ -470,15 +476,15 @@ func (s *Store) writeGraph(ctx context.Context, tx *sql.Tx, token string, log io
 	return nil
 }
 
-// deleteModules deletes the reference rows of the modules at rels: the declarations, uses and edges of each one's
-// old module name, and its modules row. A refresh that re-reads every module runs these statements once for each,
-// so each is prepared once.
+// deleteModules deletes the reference rows of the modules at rels: the imports, declarations, uses and edges of each
+// one's old module name, and its modules row. A refresh that re-reads every module runs these statements once for
+// each, so each is prepared once.
 func deleteModules(ctx context.Context, tx *sql.Tx, rels []string, old map[string]stored) error {
 	if len(rels) == 0 {
 		return nil
 	}
 	var byModule []*sql.Stmt
-	for _, t := range []string{"decls", "uses", "edges"} {
+	for _, t := range []string{"imports", "decls", "uses", "edges"} {
 		stmt, err := tx.PrepareContext(ctx, "DELETE FROM "+t+" WHERE module = ?")
 		if err != nil {
 			return err
@@ -536,10 +542,10 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 }
 
 // insertEdges adds the declaration-level edges of the re-read modules: for each user declaration, the targets
-// it uses as recorded. Which declaration a target belongs to (`X.wp` is X's field while nothing declares `X.wp`)
-// depends on every module's declarations, so buildGraph decides it when it writes the graph.
+// it uses as recorded. Which declaration a target belongs to (`X.wp` is X's field while its module declares no
+// `X.wp`) depends on the declarations and imports of other modules, so buildGraph decides it when it writes the graph.
 func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []error) error {
-	edges := newBatch(tx, "INSERT", "edges", 5)
+	edges := newBatch(tx, "INSERT", "edges", 6)
 	for i, md := range results {
 		if errs[i] != nil {
 			continue
@@ -548,14 +554,14 @@ func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []e
 		for _, d := range md.Decls {
 			kind[d.Name] = d.Kind
 		}
-		type pair struct{ target, dst string }
+		type pair struct{ target, tmodule, dst string }
 		agg := map[pair]bool{}
 		var order []pair
 		for _, u := range md.Uses {
 			if u.Parent == "" {
 				continue
 			}
-			p := pair{u.Target, u.Parent}
+			p := pair{u.Target, u.TargetModule, u.Parent}
 			if _, ok := agg[p]; !ok {
 				order = append(order, p)
 			}
@@ -566,7 +572,7 @@ func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []e
 			if agg[p] {
 				stmt = 1
 			}
-			if err := edges.add(ctx, p.target, p.dst, md.Module, stmt, kind[p.dst]); err != nil {
+			if err := edges.add(ctx, p.target, p.tmodule, p.dst, md.Module, stmt, kind[p.dst]); err != nil {
 				return err
 			}
 		}

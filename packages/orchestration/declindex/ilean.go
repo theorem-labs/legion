@@ -37,9 +37,12 @@ type Decl struct {
 // Use is one reference that elaboration recorded to a declaration of the roots.
 type Use struct {
 	Target string
-	Module string
-	Line   int // 1-based
-	Col    int // 1-based, in code points
+	// TargetModule is the module that Lean recorded for Target: the one that declares it, or for a constant that
+	// Lean made where it is used (an equation lemma), that using module.
+	TargetModule string
+	Module       string
+	Line         int // 1-based
+	Col          int // 1-based, in code points
 	// Parent is the declaration that holds the use; empty at top level (open, attribute, variable).
 	Parent string
 	// Class says where in Parent the use is: "stmt" (its statement: type, binders, hypotheses, or anywhere in a
@@ -52,18 +55,35 @@ type Use struct {
 type ModuleData struct {
 	Rel    string // path of the module below the library directory, without suffix
 	Module string
-	Decls  []Decl
-	Uses   []Use
+	// Imports are the modules that the module imports directly.
+	Imports []string
+	Decls   []Decl
+	Uses    []Use
 	// Stale counts the declarations whose recorded position does not hold their name in the source: the source is
 	// newer than the reference file. Their statement hashes are left empty.
 	Stale int
 }
 
 type ileanFile struct {
-	Version    int                       `json:"version"`
-	Module     string                    `json:"module"`
-	Decls      map[string][]int          `json:"decls"`
-	References map[string]ileanReference `json:"references"`
+	Version       int                       `json:"version"`
+	Module        string                    `json:"module"`
+	DirectImports []ileanImport             `json:"directImports"`
+	Decls         map[string][]int          `json:"decls"`
+	References    map[string]ileanReference `json:"references"`
+}
+
+// ileanImport is `[module, isExported, isMeta, importAll]`, one direct import.
+type ileanImport struct{ Module string }
+
+func (i *ileanImport) UnmarshalJSON(b []byte) error {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if len(raw) == 0 {
+		return fmt.Errorf("import %s names no module", b)
+	}
+	return json.Unmarshal(raw[0], &i.Module)
 }
 
 type ileanReference struct {
@@ -121,6 +141,9 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 	md := ModuleData{Rel: rel, Module: f.Module}
 	if md.Module == "" {
 		md.Module = strings.ReplaceAll(rel, "/", ".")
+	}
+	for _, i := range f.DirectImports {
+		md.Imports = append(md.Imports, i.Module)
 	}
 	var s *source
 	if src != nil {
@@ -186,7 +209,8 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 					class = "stmt"
 				}
 			}
-			md.Uses = append(md.Uses, Use{Target: k.C.N, Module: md.Module, Line: u.Line + 1, Col: ci + 1, Parent: u.Parent, Class: class})
+			md.Uses = append(md.Uses, Use{Target: k.C.N, TargetModule: k.C.M, Module: md.Module, Line: u.Line + 1, Col: ci + 1,
+				Parent: u.Parent, Class: class})
 		}
 	}
 	sortUses(md.Uses)
@@ -198,6 +222,9 @@ func sortUses(us []Use) {
 		a, b := us[i], us[j]
 		if a.Target != b.Target {
 			return a.Target < b.Target
+		}
+		if a.TargetModule != b.TargetModule {
+			return a.TargetModule < b.TargetModule
 		}
 		if a.Module != b.Module {
 			return a.Module < b.Module

@@ -118,24 +118,37 @@ type Gate struct {
 // ProposalModule is the module name a proposal is compiled as.
 const ProposalModule = "DeclIndexProposal"
 
-// Forms gives the registry's forms module, importing the module of each registered concept that the index has.
-// A concept with forms and no stored source states its fact through those forms, so it is kept whether or not the
-// index declares its name. A source-bearing concept that the index does not yet declare is pending; only the gate
-// compiles it, in a sandbox, and then adds it to the forms module for that one decision.
+// Forms gives the registry's forms module, importing the module of each registered concept that the index declares
+// in the concept's home file. A concept with forms and no stored source states its fact through those forms, so it
+// is kept whether or not the index declares it. A source-bearing concept that the index does not yet declare is
+// pending; only the gate compiles it, in a sandbox, and then adds it to the forms module for that one decision.
 func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.FormsModule, error) {
-	fm := declindex.FormsModule{Imports: append([]string(nil), r.Imports...), Opens: append([]string(nil), r.Opens...)}
+	return forms(ctx, s, r, nil)
+}
+
+// forms is Forms without the modules of hidden: it imports none of them, and a concept that only they declare is
+// not declared.
+func forms(ctx context.Context, s *declindex.Store, r Registry, hidden map[string]bool) (declindex.FormsModule, error) {
+	fm := declindex.FormsModule{Opens: append([]string(nil), r.Opens...)}
 	seen := map[string]bool{}
-	for _, i := range fm.Imports {
+	for _, i := range r.Imports {
+		if !hidden[i] {
+			fm.Imports = append(fm.Imports, i)
+		}
 		seen[i] = true
 	}
 	for _, c := range r.Concepts {
+		home, err := s.ModuleAt(ctx, c.Home)
+		if err != nil {
+			return fm, err
+		}
 		found, err := s.Resolve(ctx, c.Name)
 		if err != nil {
 			return fm, err
 		}
 		declared := false
 		for _, f := range found {
-			if f.Name != c.Name {
+			if f.Name != c.Name || f.Module != home || hidden[f.Module] {
 				continue
 			}
 			declared = true
@@ -149,6 +162,19 @@ func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.Forms
 		}
 	}
 	return fm, nil
+}
+
+// conceptConstant is the compiled constant of the registered concept c: its name in the module of its home file.
+// Another module can declare the same name; it is not c's.
+func conceptConstant(ctx context.Context, s *declindex.Store, c Concept) (declindex.Compiled, error) {
+	module, err := s.ModuleAt(ctx, c.Home)
+	if err != nil {
+		return declindex.Compiled{}, err
+	}
+	if module == "" {
+		return declindex.Compiled{}, &declindex.NotFoundError{Name: c.Name}
+	}
+	return s.Constant(ctx, c.Name, module)
 }
 
 // Decide compares a proposal with the registry and the index. An added verdict carries a canonical file; the
@@ -245,7 +271,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	v.CompiledHash = decl.Hash
 	var unknown []string
 	for _, c := range reg.Concepts {
-		rc, err := g.Index.Constant(ctx, c.Name)
+		rc, err := conceptConstant(ctx, g.Index, c)
 		var nf *declindex.NotFoundError
 		switch {
 		case errors.As(err, &nf):
@@ -404,11 +430,19 @@ func admit(ctx context.Context, ex *declindex.Exporter, run, module, source stri
 	return dir, nil
 }
 
-// pendingForms compiles the sources of registry concepts that are not yet declared by the index. It runs only
-// from the gate's confined export path; refresh and FormsModule never receive those source bytes. A pending
-// concept whose source the text filter or Lean refuses is a defect of that concept, left out of the forms.
+// pendingForms gives the forms module of a decision on the proposal of the concept exclude, with the compiled
+// sources of the registry concepts that the index does not yet declare. It runs only from the gate's confined
+// export path; refresh and FormsModule never receive those source bytes. A pending concept whose source the text
+// filter or Lean refuses is a defect of that concept, left out of the forms. The proposal supplies exclude, also
+// when the index declares it outside its home file. Lean refuses two definitions of one name, so the forms then
+// import no module whose imports declare exclude (hiddenModules), and a concept whose compiled constant is in such a
+// module is pending.
 func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exporter, run, exclude string) (declindex.FormsModule, []Defect, error) {
-	fm, err := Forms(ctx, g.Index, reg)
+	hidden, err := hiddenModules(ctx, g.Index, exclude)
+	if err != nil {
+		return declindex.FormsModule{}, nil, err
+	}
+	fm, err := forms(ctx, g.Index, reg, hidden)
 	if err != nil {
 		return fm, nil, err
 	}
@@ -420,12 +454,12 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		if c.Name == exclude {
 			continue
 		}
-		compiled, err := g.Index.Constant(ctx, c.Name)
+		compiled, err := conceptConstant(ctx, g.Index, c)
 		var nf *declindex.NotFoundError
 		if err != nil && !errors.As(err, &nf) {
 			return fm, defects, err
 		}
-		if err == nil && compiled.Hash != "" {
+		if err == nil && compiled.Hash != "" && !hidden[compiled.Module] {
 			continue
 		}
 		if c.Source == "" {
@@ -455,6 +489,45 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
 	}
 	return fm, defects, nil
+}
+
+// hiddenModules are the modules in which the index declares name, and every module that imports one of them.
+func hiddenModules(ctx context.Context, s *declindex.Store, name string) (map[string]bool, error) {
+	found, err := s.Resolve(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	var modules []string
+	for _, f := range found {
+		if f.Name == name {
+			modules = append(modules, f.Module)
+		}
+	}
+	return s.Importers(ctx, modules)
+}
+
+// landedConstants are the compiled constants of the concept c's declaration in the module of its home file, and nil
+// when the index declares no c there.
+func landedConstants(ctx context.Context, s *declindex.Store, c Concept) ([]declindex.Constant, error) {
+	home, err := s.ModuleAt(ctx, c.Home)
+	if err != nil || home == "" {
+		return nil, err
+	}
+	found, err := s.Resolve(ctx, c.Name)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range found {
+		if f.Name != c.Name || f.Module != home {
+			continue
+		}
+		consts, err := s.DeclarationConstants(ctx, f)
+		if err == nil && len(consts) == 0 {
+			err = fmt.Errorf("the index declares %s in %s but holds no compiled constant of it: refresh the index with lean.export on", c.Name, f.At())
+		}
+		return consts, err
+	}
+	return nil, nil
 }
 
 // export checks the proposal, compiles it against the build and reads it with the registry's forms, each step in

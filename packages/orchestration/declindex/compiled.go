@@ -33,14 +33,14 @@ type CompiledOptions struct {
 	Dir string
 }
 
-// compiledDigest names what the compiled part was read with: the exporter and the forms. When it changes, every
-// module is read again.
+// compiledDigest names what the compiled part was read with: the exporter's version (not its path, which differs
+// between the paths that name one index) and the forms. When it changes, every module is read again.
 func compiledDigest(co *CompiledOptions, m Manifest, formsSource string) (string, error) {
 	j, err := json.Marshal(m.complete())
 	if err != nil {
 		return "", err
 	}
-	h := sha256.Sum256([]byte(co.Exporter.Bin + "\x00" + formsSource + "\x00" + string(j)))
+	h := sha256.Sum256([]byte(co.Exporter.Version + "\x00" + formsSource + "\x00" + string(j)))
 	return hex.EncodeToString(h[:]), nil
 }
 
@@ -101,7 +101,7 @@ func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, ext
 // SameCompiled lists the declarations (generated constants counted as their declaration) whose compiled
 // statement hash is hash: exact restatements.
 func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) {
-	return s.distinctOwners(ctx, `SELECT name FROM consts WHERE cstmt = ? ORDER BY name`, hash)
+	return s.distinctOwners(ctx, `SELECT name, module FROM consts WHERE cstmt = ? ORDER BY name, module`, hash)
 }
 
 // refreshCompiled re-reads the compiled modules whose .olean changed (all of them when the exporter or the
@@ -154,8 +154,11 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	if err != nil {
 		return 0, 0, err
 	}
-	m.Modules = todo
-	consts, err := x.Run(ctx, m)
+	runs, err := s.exportRuns(ctx, m, co.Forms.Imports, todo, log)
+	if err != nil {
+		return 0, 0, err
+	}
+	consts, err := x.RunEach(ctx, runs)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -167,8 +170,11 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			return 0, 0, err
 		}
 		if len(again) > 0 {
-			m.Modules = again
-			more, err := x.Run(ctx, m)
+			runs, err := s.exportRuns(ctx, m, co.Forms.Imports, again, log)
+			if err != nil {
+				return 0, 0, err
+			}
+			more, err := x.RunEach(ctx, runs)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -183,6 +189,49 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		return 0, 0, err
 	}
 	return len(todo), len(again), nil
+}
+
+// exportRuns gives the exporter runs that read modules with the manifest m, whose forms module imports forms: one
+// run for each group of modules that one Lean environment can import with those modules (exportGroups). A module
+// whose imports declare a name that the forms' imports declare in another module is read without the forms module,
+// keeping only the concepts matched by their own declaration whose name no two modules declare: no environment holds
+// both, so it states no fact of a written form, and its environment's declaration of a concept's name can be another
+// module's.
+func (s *Store) exportRuns(ctx context.Context, m Manifest, forms, modules []string, log io.Writer) ([]Manifest, error) {
+	var base []string
+	if len(m.Imports) > 0 {
+		base = forms
+	}
+	groups, apart, clashing, err := exportGroups(ctx, s.q, modules, base)
+	if err != nil {
+		return nil, err
+	}
+	var runs []Manifest
+	for _, g := range groups {
+		mm := m
+		mm.Modules = g
+		runs = append(runs, mm)
+	}
+	own := func(refs []ConstRef) []ConstRef {
+		var out []ConstRef
+		for _, r := range refs {
+			if r.Const == r.Concept && !clashing[r.Concept] {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+	without := 0
+	for _, g := range apart {
+		mm := m
+		mm.Modules, mm.Imports, mm.Forms, mm.Concepts = g, nil, own(m.Forms), own(m.Concepts)
+		runs = append(runs, mm)
+		without += len(g)
+	}
+	if without > 0 {
+		logf(log, "index: %d modules read without the registry's forms: they import a declaration of a name that the forms' imports declare in another module", without)
+	}
+	return runs, nil
 }
 
 // conceptBodies names the bodies of the concepts with no written form, which are matched by their declaration's
@@ -261,14 +310,15 @@ func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, w compiledRead) e
 }
 
 // defHashes are the compiled hashes of the definitions of the modules, before they are read again.
-func (s *Store) defHashes(ctx context.Context, modules []string) (map[string]string, error) {
-	out := map[string]string{}
-	err := eachRowIn(ctx, s.q, `SELECT name, cstmt FROM consts WHERE kind = 'def' AND module IN`, modules, func(r *sql.Rows) error {
-		var n, h string
-		if err := r.Scan(&n, &h); err != nil {
+func (s *Store) defHashes(ctx context.Context, modules []string) (map[declRef]string, error) {
+	out := map[declRef]string{}
+	err := eachRowIn(ctx, s.q, `SELECT name, module, cstmt FROM consts WHERE kind = 'def' AND module IN`, modules, func(r *sql.Rows) error {
+		var d declRef
+		var h string
+		if err := r.Scan(&d.name, &d.module, &h); err != nil {
 			return err
 		}
-		out[n] = h
+		out[d] = h
 		return nil
 	})
 	if err != nil {
@@ -278,29 +328,30 @@ func (s *Store) defHashes(ctx context.Context, modules []string) (map[string]str
 }
 
 // changedDefs are the definitions whose compiled statement is new, gone or different.
-func changedDefs(before map[string]string, consts []Constant) []string {
-	var out []string
-	seen := map[string]bool{}
+func changedDefs(before map[declRef]string, consts []Constant) []declRef {
+	var out []declRef
+	seen := map[declRef]bool{}
 	for _, c := range consts {
 		if c.Kind != "def" {
 			continue
 		}
-		seen[c.Name] = true
-		if before[c.Name] != c.Hash {
-			out = append(out, c.Name)
+		d := declRef{c.Module, c.Name}
+		seen[d] = true
+		if before[d] != c.Hash {
+			out = append(out, d)
 		}
 	}
-	for n := range before {
-		if !seen[n] {
-			out = append(out, n)
+	for d := range before {
+		if !seen[d] {
+			out = append(out, d)
 		}
 	}
-	sort.Strings(out)
+	slices.SortFunc(out, declRef.compare)
 	return out
 }
 
 // reachedModules are the modules, other than skip, of the statements that a change to defs changes.
-func (s *Store) reachedModules(defs, skip []string) ([]string, error) {
+func (s *Store) reachedModules(defs []declRef, skip []string) ([]string, error) {
 	if len(defs) == 0 {
 		return nil, nil
 	}
@@ -333,24 +384,25 @@ type Compiled struct {
 	Kind   string `json:"kind"`
 	Type   string `json:"type"`
 	// Hash is the compiled statement hash: equal for two declarations whose elaborated statements are equal up to
-	// the names of their binders and of the declaration itself.
+	// the names of their binders and of the declaration itself, and up to how a numeral of core Lean's Nat and
+	// BitVec instances is written. Any other numeral counts with its type and instance, which give its value.
 	Hash  string   `json:"compiled_hash"`
 	Atoms []string `json:"atoms,omitempty"`
 	Facts []Fact   `json:"facts,omitempty"`
 }
 
-// Constant reads one compiled constant.
-func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
-	c := Compiled{Name: name}
-	err := s.q.QueryRowContext(ctx, `SELECT module, kind, type, cstmt FROM consts WHERE name = ?`, name).
-		Scan(&c.Module, &c.Kind, &c.Type, &c.Hash)
+// Constant reads the compiled constant name of module.
+func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, error) {
+	c := Compiled{Name: name, Module: module}
+	err := s.q.QueryRowContext(ctx, `SELECT kind, type, cstmt FROM consts WHERE name = ? AND module = ?`, name, module).
+		Scan(&c.Kind, &c.Type, &c.Hash)
 	if err == sql.ErrNoRows {
 		return c, &NotFoundError{Name: name}
 	}
 	if err != nil {
 		return c, err
 	}
-	rows, err := s.q.QueryContext(ctx, `SELECT atom FROM atoms WHERE name = ? ORDER BY atom`, name)
+	rows, err := s.q.QueryContext(ctx, `SELECT atom FROM atoms WHERE name = ? AND module = ? ORDER BY atom`, name, module)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var a string
 		if err := r.Scan(&a); err != nil {
@@ -362,7 +414,7 @@ func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
 	if err != nil {
 		return c, err
 	}
-	rows, err = s.q.QueryContext(ctx, `SELECT concept, how FROM facts WHERE name = ? ORDER BY concept, how`, name)
+	rows, err = s.q.QueryContext(ctx, `SELECT concept, how FROM facts WHERE name = ? AND module = ? ORDER BY concept, how`, name, module)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var f Fact
 		if err := r.Scan(&f.Concept, &f.How); err != nil {
@@ -372,6 +424,60 @@ func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
 		return nil
 	})
 	return c, err
+}
+
+// DeclarationConstants are the compiled constants of the declaration d, one that Resolve gave: d's own, and those
+// that Lean generated from it (a structure's constructor and fields), each with its facts. It is empty when the
+// index read d's module without its compiled part.
+func (s *Store) DeclarationConstants(ctx context.Context, d Found) ([]Constant, error) {
+	byName := map[string]*Constant{}
+	var consts []declRef
+	rows, err := s.q.QueryContext(ctx, `SELECT name, kind, cstmt FROM consts WHERE module = ? AND
+		(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, d.Module, d.Name, d.Name+".", d.Name+"/")
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		c := &Constant{Module: d.Module}
+		if err := r.Scan(&c.Name, &c.Kind, &c.Hash); err != nil {
+			return err
+		}
+		byName[c.Name] = c
+		consts = append(consts, declRef{d.Module, c.Name})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	owner, err := s.owners(ctx, consts)
+	if err != nil {
+		return nil, err
+	}
+	var out []Constant
+	for _, c := range consts {
+		if o := owner[c]; o.Name != d.Name || o.Module != d.Module {
+			delete(byName, c.name)
+		}
+	}
+	rows, err = s.q.QueryContext(ctx, `SELECT name, concept, how FROM facts WHERE module = ? AND
+		(name = ? OR (name >= ? AND name < ?)) ORDER BY name, concept, how`, d.Module, d.Name, d.Name+".", d.Name+"/")
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var n string
+		var f Fact
+		if err := r.Scan(&n, &f.Concept, &f.How); err != nil {
+			return err
+		}
+		if c, ok := byName[n]; ok {
+			c.Facts = append(c.Facts, f)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range consts {
+		if k, ok := byName[c.name]; ok {
+			out = append(out, *k)
+		}
+	}
+	return out, nil
 }
 
 // dottedPrefixes yields name, then each shorter prefix that ends before one of its dots, while the prefix is not
@@ -391,69 +497,84 @@ func dottedPrefixes(name string) iter.Seq[string] {
 	}
 }
 
-// owners maps each constant name to the declaration it belongs to: the longest declared name it extends (`X.mk`
-// is X's constructor), or the name alone when it extends none. It resolves all the names at once: one query per
-// maxInParams candidate names (each name and its dotted prefixes), not one lookup per name. A wide concept has
-// tens of thousands of statements.
-func (s *Store) owners(ctx context.Context, names []string) (map[string]Found, error) {
-	cands := map[string]bool{}
-	for _, n := range names {
-		for p := range dottedPrefixes(n) {
-			cands[p] = true
+// owners maps each compiled constant to the declaration it belongs to (ownerResolver.owner: `X.mk` is X's
+// constructor), or to the constant itself, with no place, when it belongs to none. It resolves all the constants at
+// once: one query per maxInParams candidate names (each name and its dotted prefixes), not one lookup per constant.
+// A wide concept has tens of thousands of statements.
+func (s *Store) owners(ctx context.Context, consts []declRef) (map[declRef]Found, error) {
+	names := make([]string, len(consts))
+	for i, c := range consts {
+		names[i] = c.name
+	}
+	declaring, err := declaringPrefixes(ctx, s.q, names)
+	if err != nil {
+		return nil, err
+	}
+	resolver := newOwnerResolver(ctx, s.q, declaring)
+	ref := make(map[declRef]declRef, len(consts))
+	declared := map[string]bool{}
+	for _, c := range consts {
+		o, err := resolver.owner(c)
+		if err != nil {
+			return nil, err
+		}
+		ref[c] = o
+		if slices.Contains(declaring[o.name], o.module) {
+			declared[o.name] = true
 		}
 	}
-	found := map[string]Found{}
-	err := eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, slices.Sorted(maps.Keys(cands)), func(r *sql.Rows) error {
+	found := map[declRef]Found{}
+	err = eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, slices.Sorted(maps.Keys(declared)), func(r *sql.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
 		}
-		if _, ok := found[f.Name]; !ok {
-			found[f.Name] = f
+		if d := (declRef{f.Module, f.Name}); found[d].Name == "" {
+			found[d] = f
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]Found, len(names))
-	for _, n := range names {
-		out[n] = Found{Name: n}
-		for p := range dottedPrefixes(n) {
-			if f, ok := found[p]; ok {
-				out[n] = f
-				break
-			}
+	out := make(map[declRef]Found, len(consts))
+	for _, c := range consts {
+		o := ref[c]
+		if f, ok := found[o]; ok {
+			out[c] = f
+		} else {
+			out[c] = Found{Name: o.name, Module: o.module}
 		}
 	}
 	return out, nil
 }
 
-// distinctOwners lists the declarations that the constants the query names belong to (see owners), each once, in
-// the order of its first constant.
+// distinctOwners lists the declarations that the constants the query names (by name and module) belong to (see
+// owners), each once, in the order of its first constant.
 func (s *Store) distinctOwners(ctx context.Context, query string, args ...any) ([]Found, error) {
-	var names []string
+	var consts []declRef
 	rows, err := s.q.QueryContext(ctx, query, args...)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var n string
-		if err := r.Scan(&n); err != nil {
+		var c declRef
+		if err := r.Scan(&c.name, &c.module); err != nil {
 			return err
 		}
-		names = append(names, n)
+		consts = append(consts, c)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	owner, err := s.owners(ctx, names)
+	owner, err := s.owners(ctx, consts)
 	if err != nil {
 		return nil, err
 	}
-	seen := map[string]bool{}
+	seen := map[declRef]bool{}
 	var out []Found
-	for _, n := range names {
-		if f := owner[n]; !seen[f.Name] {
-			seen[f.Name] = true
+	for _, c := range consts {
+		f := owner[c]
+		if d := (declRef{f.Module, f.Name}); !seen[d] {
+			seen[d] = true
 			out = append(out, f)
 		}
 	}
@@ -485,9 +606,9 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	if err != nil {
 		return nil, err
 	}
-	consts := make([]string, len(rs))
+	consts := make([]declRef, len(rs))
 	for i, r := range rs {
-		consts[i] = r.name
+		consts[i] = declRef{r.module, r.name}
 	}
 	owner, err := s.owners(ctx, consts)
 	if err != nil {
@@ -495,7 +616,7 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	}
 	out := make([]Stating, 0, len(rs))
 	for _, r := range rs {
-		f := owner[r.name]
+		f := owner[declRef{r.module, r.name}]
 		st := Stating{Decl: f.Name, Const: r.name, Module: r.module, How: r.how}
 		if f.Path != "" {
 			st.At = f.At()
@@ -505,18 +626,16 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	return out, nil
 }
 
-// SameAtoms lists the declarations whose statements share a relation atom with name's statement: who else
-// states one of its facts in the same form.
-func (s *Store) SameAtoms(ctx context.Context, name string) ([]string, error) {
-	found, err := s.distinctOwners(ctx, `SELECT DISTINCT b.name FROM atoms a JOIN atoms b ON b.atom = a.atom
-		WHERE a.name = ? AND b.name <> a.name`, name)
+// SameAtoms lists the declarations whose statements share a relation atom with the statement of d, a declaration
+// that Resolve gave: who else states one of its facts in the same form.
+func (s *Store) SameAtoms(ctx context.Context, d Found) ([]Found, error) {
+	found, err := s.distinctOwners(ctx, `SELECT DISTINCT b.name, b.module FROM atoms a JOIN atoms b ON b.atom = a.atom
+		WHERE a.name = ? AND a.module = ? AND NOT (b.name = a.name AND b.module = a.module)`, d.Name, d.Module)
 	if err != nil {
 		return nil, err
 	}
-	var out []string
-	for _, f := range found {
-		out = append(out, f.Name)
-	}
-	sort.Strings(out)
-	return out, nil
+	slices.SortFunc(found, func(x, y Found) int {
+		return declRef{x.Module, x.Name}.compare(declRef{y.Module, y.Name})
+	})
+	return found, nil
 }

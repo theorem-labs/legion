@@ -116,6 +116,27 @@ func gateWith(t *testing.T, compiled bool) (*Gate, *recordingLibrarian) {
 	return &Gate{Index: s, Tree: spec, Registry: registry, AdditionRoot: "registry", Compiled: co, Librarian: lib, WorkDir: t.TempDir()}, lib
 }
 
+// indexModule adds the module name, with source, to the gate's tree as one more root, compiles and commits it, and
+// refreshes the gate's index, compiled part included, at that commit.
+func indexModule(t *testing.T, g *Gate, name, source string) {
+	t.Helper()
+	ctx := context.Background()
+	tree := g.Tree.Source
+	if err := os.WriteFile(filepath.Join(tree, name+".lean"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := declindex.CompileModule(ctx, g.Compiled.Exporter.Lean, nil, tree, name); err != nil {
+		t.Fatal(err)
+	}
+	g.Tree.Roots[name] = true
+	runGit(t, tree, "add", ".")
+	runGit(t, tree, "commit", "-qm", "add "+name)
+	opt := declindex.RefreshOptions{Commit: gitHead(t, tree), Compiled: func(context.Context) (*declindex.CompiledOptions, error) { return g.Compiled, nil }}
+	if _, err := g.Index.Refresh(ctx, g.Tree, opt); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
@@ -200,6 +221,43 @@ func TestGateDecidesEachKindOfProposal(t *testing.T) {
 	}
 	if len(lib.got) != 2 || lib.got[0].ID != lib.got[0].Verdict.VerdictID || lib.got[0].Proposer != options.Proposer || lib.got[0].Kind != "near" {
 		t.Fatalf("librarian got %+v", lib.got)
+	}
+}
+
+// A numeral's value is its instance's: `@OfNat.ofNat Nat 7 ⟨10⟩` is 10. A proposal of it is therefore not an exact
+// duplicate of an indexed `@OfNat.ofNat Nat 7 ⟨9⟩`, which Lean proves unequal to it, although both write 7. The
+// same numeral by the same instance is an exact duplicate, and so is a numeral of core Lean's Nat and BitVec
+// instances however it is written (`2`, `7#64` and a `7` of type `BitVec 64`).
+func TestGateTellsNumeralsApartByTheirInstance(t *testing.T) {
+	g, _ := gateForTest(t)
+	ctx := context.Background()
+	indexModule(t, g, "Numerals", "def Original : Nat := @OfNat.ofNat Nat 7 ⟨9⟩\ndef Two : Nat := 2\n")
+	decide := func(name, body string) Verdict {
+		t.Helper()
+		p := Proposal{ID: name, Concept: Concept{Name: name, Home: "New.lean", Meaning: "A proposed concept."},
+			Source: "import Fixture\nimport Numerals\n\n" + body + "\n"}
+		v, err := g.Decide(ctx, p, DecideOptions{Proposer: "role"})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		return v
+	}
+	same := decide("Same", "def Same : Nat := @OfNat.ofNat Nat 7 ⟨9⟩")
+	if same.Outcome != Refused || same.Existing != "Original" {
+		t.Fatalf("the same instance: %s naming %q (%s), want refused naming Original", same.Outcome, same.Existing, same.Reason)
+	}
+	different := decide("Different", "def Different : Nat := @OfNat.ofNat Nat 7 ⟨10⟩\ntheorem reallyDifferent : Different ≠ Original := by decide")
+	if different.Outcome != Added || different.CompiledHash == same.CompiledHash {
+		t.Errorf("another instance: %s naming %q (%s) with compiled hash %s, Original's %s; want added with another hash",
+			different.Outcome, different.Existing, different.Reason, different.CompiledHash, same.CompiledHash)
+	}
+	for _, c := range []struct{ name, body, existing string }{
+		{"MyTwo", "def MyTwo : Nat := 2", "Two"},
+		{"MyWord", "theorem MyWord (y : BitVec 64) (_h : y &&& 7 = 0) : True := trivial", "Fx.other_word"},
+	} {
+		if v := decide(c.name, c.body); v.Outcome != Refused || v.Existing != c.existing {
+			t.Errorf("%s: %s naming %q (%s), want refused naming %s", c.name, v.Outcome, v.Existing, v.Reason, c.existing)
+		}
 	}
 }
 

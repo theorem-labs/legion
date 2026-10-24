@@ -25,8 +25,8 @@ var defKinds = []string{"def", "abbrev", "instance", "structure", "class", "indu
 var keywords = []string{"theorem", "lemma", "def", "abbrev", "instance", "structure", "class", "inductive", "opaque",
 	"axiom", "example"}
 
-// isSpace is Python's str.isspace, so that hashes match the reference reader's: Unicode white space and the four
-// ASCII separators.
+// isSpace is Python's str.isspace, the white space that the reference reader collapses: Unicode white space and the
+// four ASCII separators.
 func isSpace(r rune) bool { return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f) }
 
 func isAlnum(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }
@@ -151,6 +151,57 @@ func skipString(text string, i, n int) int {
 	return i + 1
 }
 
+// literalEnd is the offset after the literal that starts at i, and false when none starts there: a string ("…",
+// with its escapes), a raw string (r"…", r#"…"#) or a character ('a', '\n', '\x41'). A `'` after a name's rune is
+// the name's prime (h'), and one that another `'` follows is notation's (Mathlib's set image): neither starts a
+// character.
+func literalEnd(text string, i, n int) (int, bool) {
+	switch {
+	case text[i] == '"':
+		return skipString(text, i, n), true
+	case text[i] == 'r' && wordBoundaryBefore(text, i, true):
+		j := i + 1
+		for j < n && text[j] == '#' {
+			j++
+		}
+		if j >= n || text[j] != '"' {
+			return 0, false
+		}
+		closing := `"` + strings.Repeat("#", j-i-1)
+		if k := strings.Index(text[j+1:n], closing); k >= 0 {
+			return j + 1 + k + len(closing), true
+		}
+		return n, true
+	case text[i] == '\'' && !nameRuneBefore(text, i) && i+1 < n:
+		j := i + 1
+		if text[j] == '\\' {
+			// The escaped rune, then the hex digits of a `\x41` or `\u03B1`.
+			j = next(text, j+1)
+			for j < n && strings.IndexByte("0123456789abcdefABCDEF", text[j]) >= 0 {
+				j++
+			}
+		} else if r, size := utf8.DecodeRuneInString(text[j:n]); r != '\'' && r != '\n' {
+			j += size
+		} else {
+			return 0, false
+		}
+		if j < n && text[j] == '\'' {
+			return j + 1, true
+		}
+	}
+	return 0, false
+}
+
+// nameRuneBefore reports whether the rune before i continues a name: a word rune, or the `'`, `!` or `?` that a name
+// can hold.
+func nameRuneBefore(text string, i int) bool {
+	if i == 0 {
+		return false
+	}
+	r, _ := utf8.DecodeLastRuneInString(text[:i])
+	return isWord(r) || r == '\'' || r == '!' || r == '?'
+}
+
 // skipLineComment returns the offset of the newline that ends the `--` comment at i, or n when no newline follows.
 func skipLineComment(text string, i, n int) int {
 	if j := strings.IndexByte(text[i:], '\n'); j >= 0 {
@@ -160,7 +211,7 @@ func skipLineComment(text string, i, n int) int {
 }
 
 // bodyStart is the offset of the first `:=`, line-initial `|` or `where` at bracket depth 0 in text[i:end],
-// skipping comments and strings: where a declaration's statement ends and its body begins.
+// skipping comments and literals: where a declaration's statement ends and its body begins.
 func bodyStart(text string, i, end int) (int, bool) {
 	depth, n := 0, min(len(text), end)
 	for i < n {
@@ -172,8 +223,9 @@ func bodyStart(text string, i, end int) (int, bool) {
 		case strings.HasPrefix(rest, "/-"):
 			i = skipBlockComment(text, i, n)
 			continue
-		case text[i] == '"':
-			i = skipString(text, i, n)
+		}
+		if j, ok := literalEnd(text, i, n); ok {
+			i = j
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(rest)
@@ -216,25 +268,38 @@ func wordBoundaryAfter(text string, i, end int, dot bool) bool {
 	return !(isWord(r) || (dot && r == '.'))
 }
 
-// stripComments drops `--` line comments and nested `/- -/` block comments (docstrings included) and keeps strings.
-func stripComments(s string) string {
+// normalize drops `--` line comments and nested `/- -/` block comments (docstrings included), keeps each literal as
+// written (literalEnd), and collapses each run of white space between tokens to one space, with none at either end.
+func normalize(s string) string {
 	var out strings.Builder
 	out.Grow(len(s))
 	n := len(s)
+	space := false // white space since the last token written
 	for i := 0; i < n; {
 		switch {
 		case strings.HasPrefix(s[i:], "--"):
 			i = skipLineComment(s, i, n)
+			continue
 		case strings.HasPrefix(s[i:], "/-"):
 			i = skipBlockComment(s, i, n)
-		case s[i] == '"':
-			j := skipString(s, i, n)
-			out.WriteString(s[i:min(j, n)])
-			i = j
-		default:
-			out.WriteByte(s[i])
-			i++
+			continue
 		}
+		var token string
+		if j, ok := literalEnd(s, i, n); ok {
+			token, i = s[i:min(j, n)], j
+		} else {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if isSpace(r) {
+				space, i = true, i+size
+				continue
+			}
+			token, i = s[i:i+size], i+size
+		}
+		if space && out.Len() > 0 {
+			out.WriteByte(' ')
+		}
+		space = false
+		out.WriteString(token)
 	}
 	return out.String()
 }
@@ -256,8 +321,9 @@ func declKind(text string, a, end int) string {
 	return kind
 }
 
-// StatementText is a declaration's statement as written, comments dropped and white space collapsed: its signature
-// for a theorem-like declaration, its whole text for a definition-like one (whose body is its meaning).
+// StatementText is a declaration's statement as written, comments dropped and the white space between its tokens
+// collapsed (a literal keeps its own): its signature for a theorem-like declaration, its whole text for a
+// definition-like one (whose body is its meaning).
 func StatementText(text string, start, end, sigFrom int, kind string) string {
 	b := end
 	if !slices.Contains(defKinds, kind) {
@@ -268,7 +334,7 @@ func StatementText(text string, start, end, sigFrom int, kind string) string {
 	if b < start {
 		return ""
 	}
-	return strings.Join(strings.FieldsFunc(stripComments(text[start:min(b, len(text))]), isSpace), " ")
+	return normalize(text[start:min(b, len(text))])
 }
 
 // StatementHash is the hash a change lock records for a declaration it read: the first 16 hex digits of the
