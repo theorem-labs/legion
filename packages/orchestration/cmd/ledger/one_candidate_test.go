@@ -132,3 +132,23 @@ func TestDeferredCheckExitsFiveAndRequestFilesRejectUnknownFields(t *testing.T) 
 		t.Fatalf("unknown request field: code=%d stderr=%q", code, stderr)
 	}
 }
+
+// --defer-reads is check's flag alone: land names it as a flag it does not know, and check's identity flags are
+// land's alone, so check names --repo as unknown. Neither treats the flag as one that takes a value.
+func TestCandidateFlagsNameTheFlagTheCommandDoesNotTake(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+	for _, probe := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"land", "--repo", "r", "--migration", "M-1", "--generation", "1", "--commit", "c", "--path", "a.lean", "--defer-reads"},
+			`unknown land flag "--defer-reads"`},
+		{[]string{"check", "r", "M-1", "1", "--commit", "c", "--path", "a.lean", "--repo", "r"}, `unknown check flag "--repo"`},
+	} {
+		if code, _, stderr := call(probe.args...); code != 2 || !strings.Contains(stderr, probe.want) {
+			t.Errorf("%v: code=%d stderr=%q, want exit 2 with %s", probe.args, code, stderr, probe.want)
+		}
+	}
+}

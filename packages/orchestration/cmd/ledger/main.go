@@ -339,7 +339,7 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			if err != nil {
 				return nil, true, err
 			}
-			request, err = parseCandidateFlags("check", args[3:])
+			request, err = parseCandidateFlags(candidateOptions{command: "check", deferReads: true}, args[3:])
 			if err != nil {
 				return nil, true, err
 			}
@@ -682,28 +682,38 @@ func parseRecordFlag(flag, value string, r *ledger.StatementRecords) (bool, erro
 	return true, nil
 }
 
+// candidateOptions are the flags a command takes beyond the candidate flags that check and land share.
+type candidateOptions struct {
+	command    string // the command's name, for usage errors
+	deferReads bool   // the command takes --defer-reads (check)
+	identity   bool   // the command names its migration with --repo, --migration and --generation (land)
+}
+
 // parseCandidateFlags reads the candidate of a check or a landing: its changed paths, current read hashes, landed
-// commit and statement records, and for land the migration it names. --no-paths distinguishes an empty candidate from
-// an omitted changed-path list; --defer-reads is check's alone.
-func parseCandidateFlags(command string, args []string) (ledger.CheckRequest, error) {
+// commit and statement records, and the flags that opts gives the command. --no-paths distinguishes an empty
+// candidate from an omitted changed-path list.
+func parseCandidateFlags(opts candidateOptions, args []string) (ledger.CheckRequest, error) {
 	request := ledger.CheckRequest{LandRequest: ledger.LandRequest{
 		Current:          map[string]string{},
 		StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{}},
 	}}
 	sawPath, noPaths := false, false
 	for len(args) > 0 {
-		switch {
-		case args[0] == "--no-paths":
+		switch args[0] {
+		case "--no-paths":
 			noPaths = true
 			args = args[1:]
 			continue
-		case args[0] == "--defer-reads" && command == "check":
+		case "--defer-reads":
+			if !opts.deferReads {
+				return ledger.CheckRequest{}, usagef("unknown %s flag %q", opts.command, args[0])
+			}
 			request.DeferReads = true
 			args = args[1:]
 			continue
 		}
 		if len(args) < 2 {
-			return ledger.CheckRequest{}, usagef("%s flags need values", command)
+			return ledger.CheckRequest{}, usagef("%s flags need values", opts.command)
 		}
 		flag, value := args[0], args[1]
 		args = args[2:]
@@ -713,39 +723,56 @@ func parseCandidateFlags(command string, args []string) (ledger.CheckRequest, er
 			}
 			continue
 		}
-		switch {
-		case flag == "--path":
+		if opts.identity {
+			if identity, err := parseIdentityFlag(flag, value, &request.LandRequest); identity {
+				if err != nil {
+					return ledger.CheckRequest{}, err
+				}
+				continue
+			}
+		}
+		switch flag {
+		case "--path":
 			sawPath = true
 			request.ChangedPaths = append(request.ChangedPaths, value)
-		case flag == "--current":
+		case "--current":
 			name, hash, err := parsePair(value, true)
 			if err != nil {
 				return ledger.CheckRequest{}, err
 			}
 			request.Current[name] = hash
-		case flag == "--commit":
+		case "--commit":
 			request.Commit = value
-		case flag == "--repo" && command == "land":
-			request.Repo = value
-		case flag == "--migration" && command == "land":
-			request.Migration = value
-		case flag == "--generation" && command == "land":
-			generation, err := integer(value)
-			if err != nil {
-				return ledger.CheckRequest{}, err
-			}
-			request.Generation = generation
 		default:
-			return ledger.CheckRequest{}, usagef("unknown %s flag %q", command, flag)
+			return ledger.CheckRequest{}, usagef("unknown %s flag %q", opts.command, flag)
 		}
 	}
 	if sawPath && noPaths {
-		return ledger.CheckRequest{}, usagef("%s takes --path or --no-paths, not both", command)
+		return ledger.CheckRequest{}, usagef("%s takes --path or --no-paths, not both", opts.command)
 	}
 	if noPaths {
 		request.ChangedPaths = []string{}
 	}
 	return request, nil
+}
+
+// parseIdentityFlag reads one of the flags that name land's migration into r, and reports whether flag is one.
+func parseIdentityFlag(flag, value string, r *ledger.LandRequest) (bool, error) {
+	switch flag {
+	case "--repo":
+		r.Repo = value
+	case "--migration":
+		r.Migration = value
+	case "--generation":
+		generation, err := integer(value)
+		if err != nil {
+			return true, err
+		}
+		r.Generation = generation
+	default:
+		return false, nil
+	}
+	return true, nil
 }
 
 func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
@@ -859,7 +886,7 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 	if request, jsonInput, err := requestFile[ledger.LandRequest](args); jsonInput {
 		return request, err
 	}
-	request, err := parseCandidateFlags("land", args)
+	request, err := parseCandidateFlags(candidateOptions{command: "land", identity: true}, args)
 	if err != nil {
 		return ledger.LandRequest{}, err
 	}
