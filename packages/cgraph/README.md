@@ -270,6 +270,11 @@ These rules follow what the machine code shows, each only where it shows it:
   guard decides against becomes `unevaluated` with reason `constant_argument` (an exclusion), or
   `conditional` for a guard with `image`; other events are dropped, and the guards still open carry
   up to the next fold.
+- An argument without effect to an inline function of the unit that reads the parameter only under
+  guards on its parameters is computed only where the call's arguments leave those guards open: none
+  where they decide against them (__set_fixmap's `pte_clear(&init_mm, …)`, whose mm reaches only
+  `__set_pte_at`'s flush under `pte_present(__pte(0))`), under them restated where they still name the
+  caller's parameters.
 - A call whose value nothing uses (a discarded value that has an effect, such as an argument the
   callee ignores) is marked `value_unused`; the facts give the callee a second event set,
   `value_unused`, from its walk with each return's value discarded, and link folds that set there:

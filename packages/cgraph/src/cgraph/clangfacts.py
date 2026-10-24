@@ -471,6 +471,7 @@ class _Extractor:
             self.ignored_parameters,
         )  # fmt: skip
         self.ignored_cache: dict[str, tuple[frozenset[int], int | None]] = {}
+        self.condition_cache: dict[str, tuple[list[list[dict[str, Any]]], int | None]] = {}
         self.returned: dict[str, _Address | None] = {}
         self.returned_bits: dict[str, int | None] = {}
         self.cancel_cache: dict[tuple[str, int, int], bool] = {}
@@ -998,6 +999,29 @@ class _Extractor:
         parameters = list(definition.get_arguments() or [])
         result = frozenset(position for position, parameter in enumerate(parameters) if parameter.hash in never_read)
         self.ignored_cache[name] = (result, self.horizon(start))
+        return result
+
+    def parameter_conditions(self, callee: ci.Cursor | None) -> list[list[dict[str, Any]]]:
+        """Per parameter of an inline function of the unit, the guards (on its parameters) under which
+        compiled code reads it (``_FunctionWalk.read_condition``): pte_clear's mm reaches only
+        __set_pte_at's ``if (pte_present(pteval) && …) flush_icache_pte(mm, pteval)``."""
+        if callee is None or callee.kind != K.FUNCTION_DECL or not self.inline_function(callee.spelling):
+            return []
+        name = callee.spelling
+        cached = self.reuse(self.condition_cache, name)
+        if cached is not None:
+            return cached
+        definition = self.evaluator.definitions.get(name)
+        if definition is None or self.is_weak(definition) or not self.may_follow(name):
+            return []
+        start = (self.nesting, self.depth_cuts)
+        self.nesting += 1
+        try:
+            walk = self.analysis(definition)
+        finally:
+            self.nesting -= 1
+        result = [walk.read_condition(parameter) for parameter in definition.get_arguments() or []]
+        self.condition_cache[name] = (result, self.horizon(start))
         return result
 
     def stored_parameters(self, callee: ci.Cursor | None) -> tuple[frozenset[int], dict[int, frozenset[int]]]:
@@ -2906,6 +2930,10 @@ class _FunctionWalk:
         self.events["field_accesses"] = [item for member, item in self.fields if member not in self.inner]
 
     def read_guard(self, variable: ci.Cursor) -> list[int]:
+        """``read_condition``'s guards as indexes into the function's table."""
+        return [self.guard_id(guard["e"], guard["v"]) for guard in self.read_condition(variable)]
+
+    def read_condition(self, variable: ci.Cursor) -> list[dict[str, Any]]:
         """The guards under which some read of the variable in compiled code is: those every read is
         under, and a guard that one of the reads' other guards all hold; none where a read is under no
         guard or where the image decides, or the variable may be read another way (its address, a
@@ -2921,10 +2949,12 @@ class _FunctionWalk:
             return []
         shared = [index for index in reads[0] if all(index in read for read in reads)]
         ways = {tuple(index for index in read if index not in shared) for read in reads}
+        kept = [self.guard_table[index] for index in shared if "v" in self.guard_table[index]]
+        kept = [guard for guard in kept if "image" not in guard]
         if () in ways:
-            return shared
+            return kept
         either = _any_way([[self.guard_table[index] for index in way] for way in sorted(ways)])
-        return shared if either is None else [*shared, self.guard_id(either, True)]
+        return kept if either is None else [*kept, {"e": either, "v": True}]
 
     def walk_held(self, variable: ci.Cursor, value: ci.Cursor, parent: ci.Cursor, index: int, generic: bool) -> None:
         """Walk the value a local is given, as code. Where it is a member's address (``remove =
@@ -5413,7 +5443,7 @@ class _FunctionWalk:
                     # A value the inline callee only stores into a local nothing reads.
                     self.discard(child, node, child_index, generic, "ignored_argument")
                 elif position is None or not (position in ignored or (variadic and position >= named)):
-                    self.walk(child, node, child_index, reason, generic)
+                    self.walk_read(node, child, child_index, position, reason, generic)
                 elif inline:
                     # A value only a parameter the inline callee never reads receives: only its
                     # effects are computed.
@@ -5430,6 +5460,36 @@ class _FunctionWalk:
             return
         for child_index, child in enumerate(children):
             self.walk(child, node, child_index, reason, generic)
+
+    def walk_read(
+        self, call: ci.Cursor, child: ci.Cursor, index: int, position: int | None, reason: str | None, generic: bool
+    ) -> None:
+        """Walk an argument the callee reads. Where the callee is inline and reads the parameter only
+        under guards on its parameters (``parameter_conditions``), an argument without effect is
+        computed only where the call's arguments leave those guards open: none where they decide
+        against them (__set_fixmap's pte_clear(&init_mm, …)), under them restated where they still
+        name the caller's parameters."""
+        conditions = self.x.parameter_conditions(call.referenced) if reason is None and position is not None else []
+        condition = conditions[position] if position is not None and position < len(conditions) else []
+        if not condition or not self.x.effect_free(child, self.dead_variables):
+            self.walk(child, call, index, reason, generic)
+            return
+        values = [self.x.evaluator.expression(argument, self.held) for argument in call.get_arguments() or []]
+        open_guards: list[tuple[dict[str, Any], bool]] = []
+        for guard in condition:
+            expression = expressions.substitute(guard["e"], values)
+            truth = expressions.truth(expression)
+            if truth is not None and bool(truth) != guard["v"]:
+                self.discard(child, call, index, generic, "ignored_argument")
+                return
+            if truth is None and expression is not None and expressions.mentions_parameter(expression):
+                open_guards.append((expression, guard["v"]))
+        for expression, value in open_guards:
+            self.push_guard(expression, value)
+        try:
+            self.walk(child, call, index, reason, generic)
+        finally:
+            del self.guard_stack[len(self.guard_stack) - len(open_guards) :]
 
     def mark_cancelled(self, argument: ci.Cursor, callee: str, position: int) -> None:
         """An argument ``&p->m`` at a parameter the callee takes back with container_of

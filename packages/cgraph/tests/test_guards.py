@@ -1009,6 +1009,34 @@ def test_a_local_holds_what_the_stores_that_reach_a_use_on_live_paths_give(tmp_p
     assert "warn" not in callees("writeout")
 
 
+PARAMETER_READ = """
+    typedef struct { unsigned long pte; } pte_t;
+    #define __pte(x) ((pte_t) { (x) })
+    struct mm { long x; };
+    extern struct mm init_mm;
+    void flush_icache(struct mm *mm, pte_t pte);
+    static inline int pte_present(pte_t pte) { return pte.pte & 1; }
+    static inline void set_pte_at(struct mm *mm, pte_t pteval) { if (pte_present(pteval)) flush_icache(mm, pteval); kept(); }
+    static inline void pte_clear(struct mm *mm) { set_pte_at(mm, __pte(0)); }
+    static inline void pte_mark(struct mm *mm) { set_pte_at(mm, __pte(3)); }
+    void set_fixmap(void) { pte_clear(&init_mm); }
+    void set_mark(void) { pte_mark(&init_mm); }
+"""
+
+
+def test_an_argument_its_callee_reads_only_where_the_call_s_arguments_rule_out_is_not_computed(tmp_path: Path) -> None:
+    """__set_fixmap: pte_clear(&init_mm, addr, ptep), whose mm reaches only __set_pte_at's flush_icache_pte
+    under pte_present(__pte(0)), false: the image forms no &init_mm (llvm-objdump: sd zero, no auipc)."""
+    facts = facts_of(tmp_path, PARAMETER_READ)
+
+    def globals_read(function: str) -> set[str]:
+        accesses = facts["functions"][function]["events"]["accesses"]
+        return {item["unit"]["name"] for item in accesses if item["unit"]["kind"] == "global"}
+
+    assert globals_read("set_fixmap") == set()
+    assert globals_read("set_mark") == {"init_mm"}
+
+
 WARN_ONCE = """
     void __warn_printk(const char *fmt, ...);
     #define unlikely(x) __builtin_expect(!!(x), 0)
