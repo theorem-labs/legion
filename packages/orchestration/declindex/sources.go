@@ -28,7 +28,7 @@ func readSources(tree Tree) (map[string]string, error) {
 		return nil, nil
 	}
 
-	paths := sourcePathspecs(tree.Roots)
+	paths := SourcePathspecs(tree.Roots)
 	args := append([]string{"-C", tree.Source, "ls-files", "-s", "-z", "--"}, paths...)
 	tracked, err := exec.Command("git", args...).Output()
 	if err != nil {
@@ -83,7 +83,10 @@ func readSources(tree Tree) (map[string]string, error) {
 	return sources, nil
 }
 
-func sourcePathspecs(roots Roots) []string {
+// SourcePathspecs are the Git pathspecs, relative to the tree, of the Lean sources below roots: each root's
+// directory and its own file. An empty root names no source and is dropped. Refresh records the sources these
+// select, and land-hash lists the same ones in LAND_TREE.
+func SourcePathspecs(roots Roots) []string {
 	keys := make([]string, 0, len(roots))
 	for root := range roots {
 		if root != "" {

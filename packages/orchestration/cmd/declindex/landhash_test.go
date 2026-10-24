@@ -468,6 +468,42 @@ func TestLandHashRefusesOnlyAPrintedPathThatCannotBePrinted(t *testing.T) {
 	})
 }
 
+// rewriteConfig replaces old with new in the fixture's configuration.
+func rewriteConfig(t *testing.T, config, old, new string) {
+	t.Helper()
+	raw, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(string(raw), old, new, 1)
+	if body == string(raw) {
+		t.Fatalf("configuration %q has no %q", raw, old)
+	}
+	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLandHashListsTheSourcesRefreshRecorded catches a hasher whose LAND_TREE pathspecs differ from the ones
+// refresh records sources with: refresh drops an empty root, and land-hash asked Git for the pathspec "/".
+func TestLandHashListsTheSourcesRefreshRecorded(t *testing.T) {
+	config := fixture(t)
+	rewriteConfig(t, config, "roots: [Golden, Sub]", `roots: [Golden, Sub, Sub, ""]`)
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "base")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	treeID := git(t, tree, "rev-parse", "HEAD^{tree}")
+	r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "Gold.frame_lo", "Gold2.FrameAt"), ""))
+	const want = "Gold.frame_lo\t9d9fba31f41fc258\tGolden.lean\nGold2.FrameAt\t7f52be71a38bde18\tSub/Wrap.lean\n"
+	if r.code != 0 || r.out != want {
+		t.Fatalf("empty and duplicate roots = %+v, want %q", r, want)
+	}
+}
+
 func TestLandHashRefusesAnIndexWithoutGitSources(t *testing.T) {
 	config := fixture(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {

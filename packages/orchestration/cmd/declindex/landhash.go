@@ -45,7 +45,8 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if !snapshot.HasSources {
 		return fail(e.stderr, &unableError{fmt.Errorf("the index has no git source blobs")})
 	}
-	candidate, err := gitTreeSources(ctx, gitDir, tree, e.cfg.Roots)
+	roots := e.cfg.TreeSpec().Roots
+	candidate, err := gitTreeSources(ctx, gitDir, tree, declindex.SourcePathspecs(roots))
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
@@ -65,10 +66,6 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 		info, err := os.Stat(buildDir)
 		if err != nil || !info.IsDir() {
 			return fail(e.stderr, &unableError{fmt.Errorf("LAND_BUILD_DIR %s is not a directory", buildDir)})
-		}
-		roots := declindex.Roots{}
-		for _, root := range e.cfg.Roots {
-			roots[root] = true
 		}
 		for _, path := range changed {
 			rel := strings.TrimSuffix(path, ".lean")
@@ -223,12 +220,13 @@ func parseLandNames(raw []byte) ([]string, error) {
 	return names, nil
 }
 
-func gitTreeSources(ctx context.Context, gitDir, tree string, roots []string) (map[string]string, error) {
+// gitTreeSources lists the Lean source blobs of LAND_TREE that pathspecs select, keyed by path.
+func gitTreeSources(ctx context.Context, gitDir, tree string, pathspecs []string) (map[string]string, error) {
 	if err := exec.CommandContext(ctx, "git", "--git-dir="+gitDir, "cat-file", "-e", tree+"^{tree}").Run(); err != nil {
 		return nil, fmt.Errorf("LAND_GIT_DIR cannot read LAND_TREE: %w", err)
 	}
 	args := []string{"--git-dir=" + gitDir, "ls-tree", "-r", "-z", "--full-tree", tree, "--"}
-	args = append(args, landPathspecs(roots)...)
+	args = append(args, pathspecs...)
 	raw, err := exec.CommandContext(ctx, "git", args...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("list LAND_TREE sources: %w", err)
@@ -252,16 +250,6 @@ func gitTreeSources(ctx context.Context, gitDir, tree string, roots []string) (m
 		out[path] = parts[2]
 	}
 	return out, nil
-}
-
-func landPathspecs(roots []string) []string {
-	roots = append([]string(nil), roots...)
-	sort.Strings(roots)
-	out := make([]string, 0, len(roots)*2)
-	for _, root := range roots {
-		out = append(out, root+"/", root+".lean")
-	}
-	return out
 }
 
 func gitBlob(ctx context.Context, gitDir, id string) ([]byte, error) {
