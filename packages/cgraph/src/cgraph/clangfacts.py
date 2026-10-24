@@ -1202,7 +1202,7 @@ class _Extractor:
                     labels |= walk.goto_targets
                     continue
             never_read, image_read = walk.never_read(), walk.read_only_where_the_image_decides()
-            stored_again = walk.overwritten_stores()
+            stored_again = walk.overwritten_stores() | walk.unseen_stores()
             # Only a subtraction of two locals asks which stores are compiled (``same_value``).
             not_code = frozenset(walk.uncompiled_stores) if walk.subtractions else frozenset()
             if never_read <= dead and image_read <= decided and stored_again <= overwritten and not_code <= uncompiled:
@@ -1693,6 +1693,23 @@ def _whole_local_address(expression: ci.Cursor) -> ci.Cursor | None:
     operand = _strip(_children(node)[0])
     variable = operand.referenced if operand.kind == K.DECL_REF_EXPR else None
     return variable if _is_local(variable) else None
+
+
+def _inside(place: _Place, scope: _Place) -> bool:
+    """``place`` lies in the text of ``scope``."""
+    return place[0] == scope[0] and scope[1] <= place[1] and place[2] <= scope[2]
+
+
+def _leaving(loop: ci.Cursor) -> Iterator[ci.Cursor]:
+    """The statements in a loop's body that leave it other than by its condition: its own breaks
+    (not those of a loop or switch inside it), and any goto."""
+    pending = [(_children(loop)[-1], 0)]
+    while pending:
+        node, depth = pending.pop()
+        if node.kind == K.GOTO_STMT or node.kind == K.INDIRECT_GOTO_STMT or (node.kind == K.BREAK_STMT and depth == 0):
+            yield node
+        inner = depth + 1 if node.kind in _LOOP_OR_SWITCH else depth
+        pending.extend((child, inner) for child in _children(node))
 
 
 def _address_of_local(expression: ci.Cursor, own: set[int] | None) -> bool:
@@ -2749,6 +2766,7 @@ class _FunctionWalk:
         self.parents: dict[int, ci.Cursor] = {}
         self.label_holders: set[int] = set()  # the nodes that hold a label or a case
         self.loops: list[_Place] = []
+        self.once_loops: list[tuple[_Place, int, ci.Cursor]] = []  # loops that run at most once, on a variable
         self.backward = False  # the function jumps back (a goto to an earlier label, a computed goto)
         # Guards: the conditions on the parameters under which the code being walked is compiled.
         self.guard_table: list[dict[str, Any]] = []
@@ -2845,6 +2863,32 @@ class _FunctionWalk:
             and not any(child.kind == K.UNEXPOSED_ATTR for child in node.get_children())
         ]
         return [variable for variable in [*parameters, *locals_] if not variable.type.is_volatile_qualified()]
+
+    def unseen_stores(self) -> frozenset[int]:
+        """The plain assignments, as statements, in the body of a loop that runs at most once, whose
+        value no read the walk counted can see (``reaching``): enqueue_task_fair's ``slice =
+        cfs_rq_min_slice(cfs_rq)`` at the end of each for_each_sched_entity loop without group
+        scheduling."""
+        self.local_uses()
+        if not self.once_loops:
+            return frozenset()
+        found: set[int] = set()
+        for key, stores in self.store_sites.items():
+            reads = self.read_sites.get(key, [])
+            if not reads or reads[0].referenced is None:
+                continue
+            variable = reads[0].referenced
+            seen = {value.hash for read in reads for value in self.reaching(variable, read)[0]}
+            for store in stores:
+                place = _place(store)
+                if (
+                    _is_plain_assignment(store)
+                    and place is not None
+                    and any(_inside(place, loop[0]) for loop in self.once_loops)
+                    and _children(store)[1].hash not in seen
+                ):
+                    found.add(store.hash)
+        return frozenset(found)
 
     def overwritten_stores(self) -> frozenset[int]:
         """The stores of a whole value to a local (its initial value, or a plain assignment as a
@@ -3551,13 +3595,61 @@ class _FunctionWalk:
                 (other, place) for other, place in values if other.hash != value.hash and keep(other, place)
             ]
             initializer, entry = None, False
-        found = [value for value, _ in values] + ([initializer] if initializer is not None else [])
+        found = [value for value, place in values if not self.left_with_loop(place, use)]
+        found += [initializer] if initializer is not None else []
         return [value for value in found if not _is_null(value) and not self.x.returns_null(value)], entry
 
     def reaches(self, definition: _Place | None, use: _Place | None) -> bool:
         if definition is None or use is None or definition[0] != use[0] or definition[1] <= use[2] or self.backward:
             return True
         return any(loop[0] == use[0] and loop[1] <= use[1] and definition[2] <= loop[2] for loop in self.loops)
+
+    def once_variable(self, loop: ci.Cursor) -> ci.Cursor | None:
+        """The variable of a ``for`` loop that runs at most once: its condition tests the variable and
+        its step sets it to a null pointer (for_each_sched_entity without group scheduling: ``for (;
+        se; se = NULL)``)."""
+        if loop.kind != K.FOR_STMT:
+            return None
+        header = _children(loop)[:-1]
+        roles = self.header_roles(header)
+        if roles is None:
+            return None
+        part = {role: node for role, node in zip(roles, header, strict=True)}
+        condition, step = part.get("condition"), part.get("step")
+        if condition is None or step is None:
+            return None
+        tested, step = _bare(condition), _bare(step)
+        if tested.kind != K.DECL_REF_EXPR or tested.referenced is None or not _is_plain_assignment(step):
+            return None
+        target, value = (_bare(operand) for operand in _children(step))
+        if target.kind != K.DECL_REF_EXPR or target.referenced is None or not _is_null(value):
+            return None
+        return tested.referenced if target.referenced.hash == tested.referenced.hash else None
+
+    def left_with_loop(self, definition: _Place | None, use: ci.Cursor) -> bool:
+        """A definition in the body of a loop that runs at most once on ``v`` reaches a use in a later
+        such loop on ``v`` only when control can leave the first loop after it other than by its
+        condition, which leaves with ``v`` null (enqueue_task_fair's two for_each_sched_entity loops:
+        the second runs only after the first one's break, before ``slice = cfs_rq_min_slice(...)``).
+        Nothing may write ``v`` between the loops, and no other loop, label or backward jump may let
+        control around."""
+        here = _place(use)
+        if definition is None or here is None or self.backward:
+            return False
+        first = next((loop for loop in self.once_loops if _inside(definition, loop[0])), None)
+        second = next((loop for loop in self.once_loops if _inside(here, loop[0])), None)
+        if first is None or second is None or first[1] != second[1] or first[0][2] >= second[0][1]:
+            return False
+        if any(loop[1] <= definition[1] and here[2] <= loop[2] for loop in self.loops):
+            return False
+        if self.local_uses()["written"][first[1]] or any(
+            place is None or first[0][2] <= place[1] < second[0][1] for _, place in self.definitions.get(first[1], [])
+        ):
+            return False
+        positions = self.layout()
+        if any(first[0][1] <= label <= here[2] for label in positions["labels"]):
+            return False
+        return not any((place := _place(node)) is None or place[1] >= definition[1] for node in _leaving(first[2]))
 
     def dominating(
         self, variable: ci.Cursor, use: ci.Cursor
@@ -3760,7 +3852,11 @@ class _FunctionWalk:
                     above = self.parents.get(above.hash)
             if kind in _LOOPS:
                 loop = _place(node)
-                if loop is not None:
+                once = self.once_variable(node)
+                if loop is not None and once is not None:
+                    # A loop that runs at most once carries no value from its end back to its start.
+                    self.once_loops.append((loop, once.hash, node))
+                elif loop is not None:
                     self.loops.append(loop)
             elif kind == K.INDIRECT_GOTO_STMT:
                 self.backward = True

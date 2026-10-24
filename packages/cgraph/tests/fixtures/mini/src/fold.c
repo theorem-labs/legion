@@ -472,3 +472,63 @@ unsigned long fd_mkclean_read(struct fd_pvmw *w)
 	fd_range_init(&range, w->address, fd_address_end(w));
 	return range.end;
 }
+
+/* kernel/sched/fair.c enqueue_task_fair without group scheduling: for_each_sched_entity(se) is for
+ * (; se; se = NULL), which runs at most once. slice = cfs_rq_min_slice(cfs_rq) at the end of the
+ * first loop reaches the second only through the first one's break, before it; at the end of the
+ * second, nothing reads it. So cfs_rq_min_slice is not computed (llvm-objdump: no load of q). */
+struct fd_cur {
+	int on;
+	long sl;
+};
+struct fd_queue {
+	long min;
+	struct fd_cur *curr;
+};
+struct fd_sched {
+	int on_rq;
+	long slice;
+};
+
+static inline long fd_min_slice(struct fd_queue *q)
+{
+	struct fd_cur *curr = q->curr;
+	long min = ~0L;
+
+	if (curr && curr->on)
+		min = curr->sl;
+	return min;
+}
+
+#define fd_each_entity(se) for (; se; se = NULL)
+
+void fd_enqueue(struct fd_queue *q, struct fd_sched *se)
+{
+	long slice = 0;
+
+	fd_each_entity(se) {
+		if (se->on_rq)
+			break;
+		obj_free(se);
+		slice = fd_min_slice(q);
+	}
+	fd_each_entity(se) {
+		se->slice = slice;
+		slice = fd_min_slice(q);
+	}
+}
+
+/* A break after the store lets the second loop see it. */
+void fd_enqueue_break(struct fd_queue *q, struct fd_sched *se)
+{
+	long slice = 0;
+
+	fd_each_entity(se) {
+		slice = fd_min_slice(q);
+		if (se->on_rq)
+			break;
+		obj_free(se);
+	}
+	fd_each_entity(se)
+		se->slice = slice;
+}

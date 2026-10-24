@@ -212,3 +212,14 @@ def test_a_value_stored_only_into_a_local_nothing_reads_is_not_computed(
     fields = folded_fields(fold_build, function)
     assert ("nr" in fields) == (function == "fd_mkclean_read")
     assert "address" in fields
+
+
+def test_a_store_no_pass_of_a_loop_that_runs_once_reads_is_not_computed(fold_build: dict[str, Any]) -> None:
+    """fd_enqueue (llvm-objdump): on_rq and slice through se, never q->curr: each slice =
+    fd_min_slice(q) is read by no pass of a for (; se; se = NULL) loop."""
+    assert folded_fields(fold_build, "fd_enqueue") == {"on_rq", "slice"}
+
+
+def test_a_store_a_break_carries_to_the_next_loop_stays(fold_build: dict[str, Any]) -> None:
+    """fd_enqueue_break: the break after slice = fd_min_slice(q) takes it to the second loop."""
+    assert {"curr", "on", "sl"} <= folded_fields(fold_build, "fd_enqueue_break")

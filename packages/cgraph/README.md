@@ -188,7 +188,11 @@ These rules follow what the machine code shows, each only where it shows it:
 - A local's or parameter's address is derived from the values that reach each use: the assignments
   before it (or after it, around a loop or a backward goto), less those an assignment on every path
   overwrites (also a `for` header's: the condition's `(p = next_task(p)) != &init_task` in the body,
-  the init in the whole loop; a local the header's step only steps by a constant, as
+  the init in the whole loop; a loop that runs at most once, `for (; se; se = NULL)` as
+  `for_each_sched_entity` without group scheduling, carries no value back to its start, and a value
+  stored in its body reaches a later such loop on the same variable only through a break or goto
+  after the store, so a store no pass reads is not computed: `enqueue_task_fair`'s `slice =
+  cfs_rq_min_slice(cfs_rq)`; a local the header's step only steps by a constant, as
   `for_each_managed_zone_pgdat`'s `zone++`, is derived inside that loop as its first pass, with the
   stepped register as `inner_displacement`), without null pointers (`for (; se; se = NULL)`, a
   helper that returns
