@@ -102,7 +102,7 @@ func TestUpstreamProvenanceNeitherClearsNorBlocks(t *testing.T) {
 
 	provenance := must(open(t, s, "M-provenance", "alice", []string{"a.lean"}, nil))
 	provenanceRequest := ledger.LandRequest{Repo: "r", Migration: provenance.ID, Generation: provenance.Generation, Commit: "commit-provenance", ChangedPaths: []string{"a.lean"}, Current: map[string]string{}, StatementRecords: ledger.StatementRecords{Upstream: "upstream-commit"}}
-	must(s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: provenance.ID, Generation: provenance.Generation, StatementRecords: ledger.StatementRecords{Head: "head-provenance", Upstream: "upstream-commit"}}))
+	must(s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: provenance.ID, Generation: provenance.Generation, Key: "ready-provenance", StatementRecords: ledger.StatementRecords{Head: "head-provenance", Upstream: "upstream-commit"}}))
 	if check := must(s.Check(ctx, checkRequestFor(provenanceRequest))); !check.Pass {
 		t.Fatalf("upstream provenance check: %+v", check)
 	}
@@ -111,7 +111,7 @@ func TestUpstreamProvenanceNeitherClearsNorBlocks(t *testing.T) {
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 	unreviewed := must(open(t, s, "M-unreviewed", "bob", []string{"b.lean"}, map[string]string{"C": "hash-1"}))
 	unreviewedRequest := ledger.LandRequest{Repo: "r", Migration: unreviewed.ID, Generation: unreviewed.Generation, Commit: "commit-unreviewed", ChangedPaths: []string{"b.lean"}, Current: map[string]string{"C": "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-2"}, Head: "head-unreviewed", Upstream: "upstream-commit"}}
-	if _, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: unreviewed.ID, Generation: unreviewed.Generation, StatementRecords: ledger.StatementRecords{Head: "head-unreviewed", ChangedContracts: map[string]string{"C": "hash-2"}, Upstream: "upstream-commit"}}); err != nil {
+	if _, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: unreviewed.ID, Generation: unreviewed.Generation, Key: "ready-unreviewed", StatementRecords: ledger.StatementRecords{Head: "head-unreviewed", ChangedContracts: map[string]string{"C": "hash-2"}, Upstream: "upstream-commit"}}); err != nil {
 		t.Fatalf("ready of an unreviewed statement change with upstream provenance: %v", err)
 	}
 	unreviewedCheck := must(s.Check(ctx, checkRequestFor(unreviewedRequest)))

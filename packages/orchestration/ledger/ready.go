@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,6 +16,9 @@ type ReadyRequest struct {
 	Repo       string `json:"repo"`
 	ID         string `json:"id"`
 	Generation int64  `json:"generation"`
+	// Key identifies one submission. A retry with the same key returns the record that submission stored and
+	// publishes nothing, even after a round consumed it; a new submission takes a new key.
+	Key string `json:"key"`
 	StatementRecords
 }
 
@@ -29,7 +33,8 @@ type ReadyRecord struct {
 }
 
 type readyEventData struct {
-	Generation int64 `json:"generation"`
+	Generation int64  `json:"generation"`
+	Key        string `json:"key"`
 	StatementRecords
 }
 
@@ -59,27 +64,47 @@ func clearReadyEvent(ctx context.Context, tx pgx.Tx, repo, id string, readyEvent
 // record names the head that was built. A later ready replaces the previous record and has the id of its own
 // migration.ready event. An absent list or map is recorded empty, so a record has one shape whether its request came
 // from flags or from JSON.
+//
+// The key names the submission. A repeated key returns the record as its migration.ready event stored it and
+// publishes nothing, whatever the rest of the request says and even after a round consumed that record, so a retry
+// after a lost answer cannot publish a returned candidate again. A new submission takes a new key.
 func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error) {
+	if req.Key == "" {
+		return ReadyRecord{}, invalid("a ready submission needs an idempotency key")
+	}
 	if err := checkRecord("head", req.Head, true); err != nil {
 		return ReadyRecord{}, err
 	}
 	if err := req.validate(); err != nil {
 		return ReadyRecord{}, err
 	}
-	ready := ReadyRecord{ID: req.ID, Generation: req.Generation, StatementRecords: req.withEmptyLists()}
+	var ready ReadyRecord
 	err := s.tx(ctx, func(tx pgx.Tx) error {
+		ready = ReadyRecord{ID: req.ID, Generation: req.Generation, StatementRecords: req.withEmptyLists()}
 		if _, err := lockRepo(ctx, tx, req.Repo, true); err != nil {
 			return err
 		}
-		migration, err := lockOpenAt(ctx, tx, req.Repo, req.ID, req.Generation)
+		migration, err := loadMigration(ctx, tx, req.Repo, req.ID, true)
 		if err != nil {
+			return err
+		}
+		var published int64
+		switch err := tx.QueryRow(ctx, `SELECT ready_event FROM ready_keys WHERE repo = $1 AND migration = $2 AND key = $3`,
+			req.Repo, req.ID, req.Key).Scan(&published); {
+		case err == nil:
+			ready, err = publishedReady(ctx, tx, published)
+			return err
+		case !errors.Is(err, pgx.ErrNoRows):
+			return err
+		}
+		if err := requireOpenAt(migration, req.Generation); err != nil {
 			return err
 		}
 		if migration.EscalatedAt != nil {
 			return refuse(ReasonEscalated, "migration %s was escalated to the steward: %s", req.ID, migration.EscalationReason)
 		}
 		event, err := eventRecord(ctx, tx, req.Repo, "migration.ready", req.ID, migration.Owner, readyEventData{
-			Generation: req.Generation, StatementRecords: ready.StatementRecords,
+			Generation: req.Generation, Key: req.Key, StatementRecords: ready.StatementRecords,
 		})
 		if err != nil {
 			return err
@@ -90,10 +115,26 @@ func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error
 			Scan(&ready.Owner); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, `INSERT INTO ready_keys (repo, migration, key, ready_event) VALUES ($1, $2, $3, $4)`,
+			req.Repo, req.ID, req.Key, event.ID); err != nil {
+			return err
+		}
 		ready.ReadyEvent, ready.ReadyAt = event.ID, event.At
 		return nil
 	})
 	return ready, err
+}
+
+// publishedReady is the ready record that the migration.ready event id published, read from that event.
+func publishedReady(ctx context.Context, q querier, id int64) (ReadyRecord, error) {
+	record := ReadyRecord{ReadyEvent: id}
+	var data readyEventData
+	if err := q.QueryRow(ctx, `SELECT subject, actor, at, data FROM events WHERE id = $1`, id).
+		Scan(&record.ID, &record.Owner, &record.ReadyAt, &data); err != nil {
+		return ReadyRecord{}, err
+	}
+	record.Generation, record.StatementRecords = data.Generation, data.withEmptyLists()
+	return record, nil
 }
 
 // ReadyMigrations lists every currently open migration that has a ready record, in the order that the ready events

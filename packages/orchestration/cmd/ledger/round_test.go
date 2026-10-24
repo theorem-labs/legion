@@ -163,7 +163,7 @@ func (cli roundCLI) readyEvent(head string) int64 {
 	var record struct {
 		ReadyEvent int64 `json:"ready_event"`
 	}
-	if err := json.Unmarshal([]byte(cli.invoke("--json", "ready", "r", "M-1", "1", "--head", head)), &record); err != nil ||
+	if err := json.Unmarshal([]byte(cli.invoke("--json", "ready", "r", "M-1", "1", "--key", "k-"+head, "--head", head)), &record); err != nil ||
 		record.ReadyEvent == 0 {
 		cli.t.Fatalf("ready %s: %v %+v", head, err, record)
 	}

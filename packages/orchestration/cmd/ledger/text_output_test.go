@@ -61,7 +61,7 @@ func TestTextOutputIsNeverGoSyntax(t *testing.T) {
 		{readJSON, []string{"contract", "list", "r"}},
 		{indentedJSON, []string{"open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean", "--read", "C=h1"}},
 		{indentedJSON, []string{"extend", "r", "M-1", "1", "--write", "b.lean"}},
-		{indentedJSON, []string{"ready", "r", "M-1", "1", "--head", "h1"}},
+		{indentedJSON, []string{"ready", "r", "M-1", "1", "--key", "k1", "--head", "h1"}},
 		{lineText, []string{"ready-list", "r"}},
 		{indentedJSON, []string{"round", "r", "M-1", "1", "build failed", "--key", "k1", "--ready-event", "1099511627776"}},
 		{indentedJSON, []string{"takeover", "r", "M-1", "carol", "1"}},

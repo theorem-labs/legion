@@ -6,6 +6,17 @@ ALTER TABLE migrations
     ADD COLUMN ready_records jsonb;
 CREATE INDEX migrations_ready_event ON migrations (repo, ready_event) WHERE ready_event IS NOT NULL;
 
+-- The idempotency key of each ready submission and the migration.ready event it published, so a retried submission
+-- returns what it stored and publishes nothing, even after a round consumed its record.
+CREATE TABLE ready_keys (
+    repo text NOT NULL,
+    migration text NOT NULL,
+    key text NOT NULL,
+    ready_event bigint NOT NULL,
+    PRIMARY KEY (repo, migration, key),
+    FOREIGN KEY (repo, migration) REFERENCES migrations(repo, id)
+);
+
 -- The record that advanced each contract's statement: its compatibility proof or its owner's review, with the
 -- upstream commit beside it for an upstream landing.
 ALTER TABLE contracts ADD COLUMN last_change jsonb;

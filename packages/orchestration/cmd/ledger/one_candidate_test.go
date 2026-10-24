@@ -85,7 +85,7 @@ func TestReadyCheckAndLandAgreeOnRecordFlags(t *testing.T) {
 		mustExit(t, call, 0, "open", "r", id, "alice", "base", "branch", "--write", id+".lean")
 		candidate := append([]string{"--commit", "c", "--path", id + ".lean", "--head", "head"}, probe.flag...)
 		for _, args := range [][]string{
-			append([]string{"--json", "ready", "r", id, "1", "--head", "head"}, probe.flag...),
+			append([]string{"--json", "ready", "r", id, "1", "--key", "k-" + id, "--head", "head"}, probe.flag...),
 			append([]string{"--json", "check", "r", id, "1"}, candidate...),
 			append([]string{"--json", "land", "--repo", "r", "--migration", id, "--generation", "1"}, candidate...),
 		} {

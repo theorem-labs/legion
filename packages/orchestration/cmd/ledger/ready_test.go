@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -39,11 +40,11 @@ func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
 	invoke("repo", "ensure", "r", "0")
 	invoke("open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
 	invoke("open", "r", "M-file", "bob", "base", "branch", "--write", "b.lean")
-	invoke("ready", "r", "M-flag", "1", "--head", "head-flag", "--changed-contract", "C.flag=hash-flag",
+	invoke("ready", "r", "M-flag", "1", "--key", "k-flag", "--head", "head-flag", "--changed-contract", "C.flag=hash-flag",
 		"--compatibility-proof", "C.compat", "--reviewed-head", "head-flag", "--review", "C.flag=alice@head-flag",
 		"--approved-pinned", "C.flag")
 
-	request := `{"repo":"r","id":"M-file","generation":1,"head":"head@file","changed_contracts":{"C@file":"hash=from-file"},"compatibility_proof":"C@compat","reviewed_head":"head@file","reviews":[{"contract":"C@file","reviewer":"alice=reviewer","head":"head@file"}],"approved_pinned":["C@file"]}`
+	request := `{"repo":"r","id":"M-file","generation":1,"key":"k-file","head":"head@file","changed_contracts":{"C@file":"hash=from-file"},"compatibility_proof":"C@compat","reviewed_head":"head@file","reviews":[{"contract":"C@file","reviewer":"alice=reviewer","head":"head@file"}],"approved_pinned":["C@file"]}`
 	file := filepath.Join(t.TempDir(), "ready.json")
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
@@ -104,11 +105,11 @@ func TestReadyRecordsPrintEmptyCollectionsInBothForms(t *testing.T) {
 	invoke("open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
 	invoke("open", "r", "M-file", "bob", "base", "branch", "--write", "b.lean")
 	file := filepath.Join(t.TempDir(), "ready.json")
-	if err := os.WriteFile(file, []byte(`{"repo":"r","id":"M-file","generation":1,"head":"head-file"}`), 0o600); err != nil {
+	if err := os.WriteFile(file, []byte(`{"repo":"r","id":"M-file","generation":1,"key":"k-file","head":"head-file"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{
-		{"--json", "ready", "r", "M-flag", "1", "--head", "head-flag"},
+		{"--json", "ready", "r", "M-flag", "1", "--key", "k-flag", "--head", "head-flag"},
 		{"--json", "ready", "--request-file", file},
 	} {
 		output := invoke(args...)
@@ -170,14 +171,14 @@ func TestReadyFlagsRejectAmbiguousDelimiters(t *testing.T) {
 	mustExit(t, call, 0, "repo", "ensure", "r", "0")
 	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
 	for _, args := range [][]string{
-		{"ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C=name=hash"},
-		{"ready", "r", "M-1", "1", "--head", "head", "--review", "C@name=alice@head"},
+		{"ready", "r", "M-1", "1", "--key", "k1", "--head", "head", "--changed-contract", "C=name=hash"},
+		{"ready", "r", "M-1", "1", "--key", "k1", "--head", "head", "--review", "C@name=alice@head"},
 	} {
 		if code, _, stderr := call(args...); code != 2 || !strings.Contains(stderr, "request-file") {
 			t.Fatalf("%v: code=%d stderr=%q; want delimiter usage refusal", args, code, stderr)
 		}
 	}
-	if code, _, stderr := call("ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C@name=hash",
+	if code, _, stderr := call("ready", "r", "M-1", "1", "--key", "k1", "--head", "head", "--changed-contract", "C@name=hash",
 		"--approved-pinned", "C@name"); code != 0 {
 		t.Fatalf("names with @: code=%d stderr=%q; want them taken as check and land take them", code, stderr)
 	}
@@ -188,7 +189,80 @@ func TestReadyWithoutHeadNamesTheFlag(t *testing.T) {
 	call := ledgerCommand(t)
 	mustExit(t, call, 0, "repo", "ensure", "r", "0")
 	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
-	if code, _, stderr := call("--json", "ready", "r", "M-1", "1"); code != 2 || !strings.Contains(stderr, "ready needs --head") {
+	if code, _, stderr := call("--json", "ready", "r", "M-1", "1", "--key", "k1"); code != 2 || !strings.Contains(stderr, "ready needs --head") {
 		t.Fatalf("ready without --head: code=%d stderr=%q", code, stderr)
+	}
+}
+
+// ready without --key is a usage error that names the flag, and records nothing.
+func TestReadyWithoutKeyNamesTheFlag(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+	if code, _, stderr := call("--json", "ready", "r", "M-1", "1", "--head", "H1"); code != 2 || !strings.Contains(stderr, "ready needs --key") {
+		t.Fatalf("ready without --key: code=%d stderr=%q", code, stderr)
+	}
+	if listed := mustRun(t, call, "--json", "ready-list", "r"); listed != "[]\n" {
+		t.Fatalf("ready without --key was recorded: %s", listed)
+	}
+}
+
+// The retry of a submission the landing program already returned publishes nothing, through flags and through a
+// request file: ready H1 with key k1, a round for its event, ready H1 with k1 again. ready-list stays empty, and only
+// one migration.ready event exists. ready H1 with k2 publishes it again (control).
+func TestReadyCommandRetryOfAConsumedSubmissionPublishesNothing(t *testing.T) {
+	for _, form := range []string{"flags", "request file"} {
+		t.Run(form, func(t *testing.T) {
+			call := ledgerCommand(t)
+			mustExit(t, call, 0, "repo", "ensure", "r", "0")
+			mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+			ready := func(key string) []string {
+				if form == "flags" {
+					return []string{"--json", "ready", "r", "M-1", "1", "--key", key, "--head", "H1"}
+				}
+				file := filepath.Join(t.TempDir(), key+".json")
+				body := `{"repo":"r","id":"M-1","generation":1,"key":"` + key + `","head":"H1"}`
+				if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return []string{"--json", "ready", "--request-file", file}
+			}
+			var first readyListRecord
+			if err := json.Unmarshal([]byte(mustRun(t, call, ready("k1")...)), &first); err != nil || first.ReadyEvent == 0 {
+				t.Fatalf("first ready: %v %+v", err, first)
+			}
+			mustRun(t, call, "--json", "round", "r", "M-1", "1", "H1 build failed", "--key", "round-1",
+				"--ready-event", strconv.FormatInt(first.ReadyEvent, 10))
+
+			var retry readyListRecord
+			if err := json.Unmarshal([]byte(mustRun(t, call, ready("k1")...)), &retry); err != nil || !reflect.DeepEqual(retry, first) {
+				t.Fatalf("retry of k1: %v %+v, want the record k1 stored %+v", err, retry, first)
+			}
+			if listed := mustRun(t, call, "--json", "ready-list", "r"); listed != "[]\n" {
+				t.Fatalf("the retry published the consumed submission again: %s", listed)
+			}
+			var events []struct {
+				Kind string `json:"kind"`
+			}
+			if err := json.Unmarshal([]byte(mustRun(t, call, "--json", "events", "r", "0", "M-1")), &events); err != nil {
+				t.Fatal(err)
+			}
+			readyEvents := 0
+			for _, event := range events {
+				if event.Kind == "migration.ready" {
+					readyEvents++
+				}
+			}
+			if readyEvents != 1 {
+				t.Fatalf("%d migration.ready events, want 1", readyEvents)
+			}
+
+			mustRun(t, call, ready("k2")...)
+			var listed []readyListRecord
+			if err := json.Unmarshal([]byte(mustRun(t, call, "--json", "ready-list", "r")), &listed); err != nil ||
+				len(listed) != 1 || listed[0].Head != "H1" || listed[0].ReadyEvent == first.ReadyEvent {
+				t.Fatalf("a new key did not publish H1 again: %v %+v", err, listed)
+			}
+		})
 	}
 }

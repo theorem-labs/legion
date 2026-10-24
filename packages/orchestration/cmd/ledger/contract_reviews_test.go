@@ -22,11 +22,11 @@ func TestReadyTakesUpstreamProvenanceFromAnyOwnerInBothCLIForms(t *testing.T) {
 	call := ledgerCommand(t)
 	mustExit(t, call, 0, "repo", "ensure", "r", "0")
 	mustExit(t, call, 0, "open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
-	mustExit(t, call, 0, "--json", "ready", "r", "M-flag", "1", "--head", "head", "--upstream", "upstream-commit")
+	mustExit(t, call, 0, "--json", "ready", "r", "M-flag", "1", "--key", "k-flag", "--head", "head", "--upstream", "upstream-commit")
 
 	mustExit(t, call, 0, "open", "r", "M-file", "bob", "base", "branch", "--write", "b.lean")
 	file := filepath.Join(t.TempDir(), "ready.json")
-	request := `{"repo":"r","id":"M-file","generation":1,"head":"head","upstream":"upstream-commit"}`
+	request := `{"repo":"r","id":"M-file","generation":1,"key":"k-file","head":"head","upstream":"upstream-commit"}`
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
 	}

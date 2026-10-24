@@ -300,7 +300,7 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			request = decoded
 		} else {
 			if len(args) < 3 {
-				return nil, false, usagef("ready <repo> <id> <generation> --head <sha> [--changed-contract <name=hash>] " +
+				return nil, false, usagef("ready <repo> <id> <generation> --key <key> --head <sha> [--changed-contract <name=hash>] " +
 					"[--compatibility-proof <name>] [--reviewed-head <sha>] [--review <contract=reviewer@head>] " +
 					"[--approved-pinned <name>] [--upstream <commit>]")
 			}
@@ -308,11 +308,11 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			if err != nil {
 				return nil, false, err
 			}
-			records, err := parseReadyFlags(args[3:])
+			request, err = parseReadyFlags(args[3:])
 			if err != nil {
 				return nil, false, err
 			}
-			request = ledger.ReadyRequest{Repo: args[0], ID: args[1], Generation: generation, StatementRecords: records}
+			request.Repo, request.ID, request.Generation = args[0], args[1], generation
 		}
 		return mutation(s.Ready(ctx, request))
 	case "ready-list":
@@ -784,27 +784,34 @@ func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
 	return request, nil
 }
 
-// parseReadyFlags reads a ready record's statement records.
-func parseReadyFlags(args []string) (ledger.StatementRecords, error) {
-	records := ledger.StatementRecords{ChangedContracts: map[string]string{}}
+// parseReadyFlags reads a ready submission's key and statement records.
+func parseReadyFlags(args []string) (ledger.ReadyRequest, error) {
+	request := ledger.ReadyRequest{StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{}}}
 	for len(args) > 0 {
 		if len(args) < 2 {
-			return ledger.StatementRecords{}, usagef("ready flags need values")
+			return ledger.ReadyRequest{}, usagef("ready flags need values")
 		}
 		flag, value := args[0], args[1]
 		args = args[2:]
-		record, err := parseRecordFlag(flag, value, &records)
+		if flag == "--key" {
+			request.Key = value
+			continue
+		}
+		record, err := parseRecordFlag(flag, value, &request.StatementRecords)
 		if err != nil {
-			return ledger.StatementRecords{}, err
+			return ledger.ReadyRequest{}, err
 		}
 		if !record {
-			return ledger.StatementRecords{}, usagef("unknown ready flag %q", flag)
+			return ledger.ReadyRequest{}, usagef("unknown ready flag %q", flag)
 		}
 	}
-	if records.Head == "" {
-		return ledger.StatementRecords{}, usagef("ready needs --head")
+	if request.Head == "" {
+		return ledger.ReadyRequest{}, usagef("ready needs --head")
 	}
-	return records, nil
+	if request.Key == "" {
+		return ledger.ReadyRequest{}, usagef("ready needs --key")
+	}
+	return request, nil
 }
 
 func parseReview(value string) (ledger.Review, error) {
