@@ -66,12 +66,14 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   symbol table gives a size but no function type, is code like any other, so it takes its address
   from the zero-size marker that often sits at its first instruction. Data addresses come from
   `auipc` arithmetic, shared anchors and compressed loads included, and count only inside the
-  declared size of an object symbol that `System.map` names. An address a register holds survives a
-  spill to a frame slot and the reload from it, until a store over any byte of the slot, a store
-  through the other frame register, or a move of the frame register. Where every path into a load
-  gives its base a known address but not the same one, the function reads each of those objects on
-  some path (`load_or_store_some_path`); where any path leaves the base unknown, no object is
-  claimed. A loop's first pass is a path too: a load or store whose base the loop changes reads the
+  declared size of an object symbol that `System.map` names. An address a register holds, an
+  unknown base plus a constant, or a known address plus an index survives a spill to a frame slot
+  and the reload from it, until a store over any byte of the slot, a store through the other frame
+  register, or a move of the frame register; a field reached from the reloaded register keeps its
+  whole offset (`pgdat + 3752 + 352`). Where every path into a load gives its base a known address
+  but not the same one, the function reads each of those objects on some path
+  (`load_or_store_some_path`); where any path leaves the base unknown, no object is claimed. A
+  loop's first pass is a path too: a load or store whose base the loop changes reads the
   address the loop enters with. An address formed with an `addi`, or an index added to a known
   address, is an access of its own only where the code uses it other than as the base of its loads
   and stores (passes, returns, stores or compares it); an index added for a table the next load

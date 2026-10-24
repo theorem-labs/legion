@@ -1041,3 +1041,27 @@ def test_a_far_call_passes_only_the_arguments_its_callee_takes(image: Image) -> 
         image.arity.clear()
         image.arity.update(saved)
     assert [(item["global"], item["offset"]) for item in facts.globals] == [("heap", heap.size)]
+
+
+def test_a_base_plus_a_constant_spilled_to_the_frame_keeps_its_offset(image: Image) -> None:
+    """``s2 = a0 + 2047; sd s2, 8(sp)``, s2 reused, ``ld s2, 8(sp); amoor.d zero, a1, (s2 + 352)``, as
+    shrink_node's ``&pgdat->flags`` (pgdat + 4104) across a call: the field is 2399 bytes from a0."""
+    start = image.functions["anchor_pair"][0].address
+    amoor = (0b01000 << 27) | (A1 << 20) | (A0 << 15) | (3 << 12) | (ZERO << 7) | 0x2F  # amoor.d zero, a1, (a0)
+    code = struct.pack(
+        "<7I", _addi(18, A0, 2047), _store(18, SP, 8), _addi(18, ZERO, 0), _load(18, SP, 8),
+        _addi(A0, 18, 352), amoor, RET,
+    )  # fmt: skip
+    assert 2399 in image.decode("synthetic", code, start).memory_offsets
+
+
+def test_an_indexed_address_spilled_to_the_frame_keeps_its_object_and_offset(image: Image) -> None:
+    """``s5 = &box_table + a0 + 200; sd s5, 8(sp)``, s5 reused, ``ld s5, 8(sp); sd zero, 40(s5)``, as
+    sched_balance_softirq's ``this_rq()->next_balance`` (runqueues + cpu offset + 2448): the store
+    is box_table's, at 240 bytes from it."""
+    facts = _at(
+        image, 21, image.object_symbols["box_table"][0].address, _add(21, 21, A0), _addi(21, 21, 200),
+        _store(21, SP, 8), _addi(21, ZERO, 0), _load(21, SP, 8), _store(ZERO, 21, 40),
+    )  # fmt: skip
+    assert ("box_table", "indexed_access") in _operations(facts)
+    assert 240 in facts.memory_offsets

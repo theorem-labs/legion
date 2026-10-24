@@ -13,7 +13,7 @@ import bisect
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from capstone import CS_ARCH_RISCV, CS_MODE_RISCV64, CS_MODE_RISCVC, CS_OP_IMM, CS_OP_MEM, CS_OP_REG, Cs
 from elftools.common.exceptions import ELFError
@@ -73,6 +73,8 @@ _CALLEE_SAVED = frozenset({"ra", *(f"s{number}" for number in range(12))})
 _ARGUMENTS = frozenset(f"a{number}" for number in range(8))
 # The instructions at a function's entry that save its registers, before its frame pointer is set.
 _PROLOGUE_LIMIT = 32
+# A value _State.meet keeps where both paths give it.
+_V = TypeVar("_V")
 
 
 @dataclass
@@ -81,8 +83,9 @@ class _State:
     are numbers, not addresses); registers that hold an unknown base plus a known constant
     (``relative``); registers that hold a known address plus an unknown offset (``anchored``: a
     per-CPU offset or an index added to the address of an object), with the address each was formed
-    from (``origin``); the frame slots holding an address the code spilled (``slots``, keyed by the
-    frame register and its displacement); and registers every path into a block gives a known
+    from (``origin``); the frame slots holding what a register spilled there held, an address, a
+    base plus a constant or an anchored address (``slots``, keyed by the frame register and its
+    displacement: ``(kind, value, origin)``); and registers every path into a block gives a known
     address (``choices``) or a known number (``numbers``), but not the same one: the value on each
     path."""
 
@@ -91,7 +94,7 @@ class _State:
     anchored: dict[int, int] = field(default_factory=dict)
     constants: set[int] = field(default_factory=set)
     origin: dict[int, int] = field(default_factory=dict)
-    slots: dict[tuple[int, int], int] = field(default_factory=dict)
+    slots: dict[tuple[int, int], tuple[str, int, int]] = field(default_factory=dict)
     choices: dict[int, frozenset[int]] = field(default_factory=dict)
     numbers: dict[int, frozenset[int]] = field(default_factory=dict)
 
@@ -108,7 +111,7 @@ class _State:
         )
 
     def meet(self, other: _State) -> _State:
-        def same(mine: dict[Any, int], theirs: dict[Any, int]) -> dict[Any, int]:
+        def same(mine: dict[Any, _V], theirs: dict[Any, _V]) -> dict[Any, _V]:
             return {key: value for key, value in mine.items() if theirs.get(key) == value}
 
         values = {
@@ -1387,12 +1390,13 @@ class Image:
         self._frame_slot(instruction, operands, state)
 
     def _frame_slot(self, instruction: Any, operands: list[Any], state: _State) -> None:
-        """A register holding an address, spilled to a frame slot and reloaded from it. Without
-        this the address is lost at the first join after the reload, although every path gives the
-        slot the same value. A store over any byte of a slot ends what it held, and so does any
-        store through the other frame register (whose distance to this one the code does not show)
-        or a move of the frame register itself. Spill slots are not memory the code passes on, so a
-        call does not end them."""
+        """A register holding an address, a base plus a constant (``relative``) or an anchored
+        address, spilled to a frame slot and reloaded from it (a value kept across calls in a long
+        function: shrink_node's pgdat + 3752, sched_balance_softirq's this_rq() + 2047). Without
+        this the value is lost at the reload, although every path gives the slot the same one. A
+        store over any byte of a slot ends what it held, and so does any store through the other
+        frame register (whose distance to this one the code does not show) or a move of the frame
+        register itself. Spill slots are not memory the code passes on, so a call does not end them."""
         mnemonic = instruction.mnemonic
         for register in _written_registers(instruction, operands):
             if register in {key[0] for key in state.slots}:
@@ -1413,12 +1417,31 @@ class Image:
                 for (slot_base, slot), value in state.slots.items()
                 if slot_base == base and (slot + 8 <= displacement or displacement + width <= slot)
             }
-            address = state.address(register) if mnemonic in _SPILLS else None
-            if address is not None:
-                state.slots[(base, displacement)] = address
+            held = self._spilled(register, state) if mnemonic in _SPILLS else None
+            if held is not None:
+                state.slots[(base, displacement)] = held
         elif (base, displacement) in state.slots:
-            state.values[register] = state.slots[(base, displacement)]
-            state.constants.discard(register)
+            kind, value, origin = state.slots[(base, displacement)]
+            if kind == "address":
+                state.values[register] = value
+                state.constants.discard(register)
+            elif kind == "relative":
+                state.relative[register] = value
+            else:
+                state.anchored[register] = value
+                state.origin[register] = origin
+
+    def _spilled(self, register: int, state: _State) -> tuple[str, int, int] | None:
+        """What a frame slot keeps of a register spilled to it: its address, its constant from an
+        unknown base, or its anchored address and origin; nothing for a number or an unknown value."""
+        address = state.address(register)
+        if address is not None:
+            return ("address", address, address)
+        if register in state.anchored:
+            return ("anchored", state.anchored[register], state.origin.get(register, state.anchored[register]))
+        if register in state.relative and register not in state.values:
+            return ("relative", state.relative[register], 0)
+        return None
 
     def _in_origin(self, address: int, origin: int) -> int:
         """An address formed from ``origin`` plus an index and a negative displacement
