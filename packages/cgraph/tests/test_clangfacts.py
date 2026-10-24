@@ -48,7 +48,7 @@ def test_parses_without_errors(units: dict[str, dict[str, Any]]) -> None:
 
 def test_a_unit_holds_its_functions_and_the_header_helpers_they_reach(units: dict[str, dict[str, Any]]) -> None:
     store = units["src/store.c"]["functions"]
-    assert store["box_new"]["main_file"] and not store["list_insert"]["main_file"]
+    assert store["box_new"]["owned"] and not store["list_insert"]["owned"]
     assert {"hash_insert", "bucket_of", "write_seqlk", "class_tree_constructor", "class_tree_destructor"} <= set(store)
     assert "list_insert" in units["src/bags.c"]["functions"]
 

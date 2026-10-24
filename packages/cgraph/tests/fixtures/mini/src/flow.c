@@ -168,3 +168,40 @@ int flow_nested_generic(struct box *value)
 {
 	return outer_weight(value);
 }
+
+/* A table names a header default, as fs/libfs.c's file operations name generic_setlease. */
+struct ops flow_ops = {
+	.get = box_get_default,
+};
+
+/* A function stores a header default, as hrtimer.c stores hrtimer_dummy_timeout. */
+void flow_set_hook(struct ops *o)
+{
+	o->get = box_get_none;
+}
+
+/* The call is inlined; the pointer gives clock_now a copy of its own. */
+long (*flow_clock)(void) = clock_now;
+
+long flow_clock_now(void)
+{
+	return clock_now();
+}
+
+int flow_inline_default(void)
+{
+	return box_inline_default();
+}
+
+long flow_measure(struct box *b)
+{
+	return measure(b);
+}
+
+long flow_measure_any(struct box *b)
+{
+	return measure_any(b);
+}
+
+/* The unit's own fragment, as kernel/rcu/tree.c includes tree_stall.h. */
+#include "flow_part.h"

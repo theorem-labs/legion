@@ -15,16 +15,19 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
 
 - **The C source**, parsed with libclang per translation unit, with the flags of a compilation
   database (`compile_commands.json`) or of `c.flags`. It gives accesses (read, write, lock, unlock,
-  alloc, free), direct calls, calls through function-pointer fields, function addresses passed as
-  arguments, callback tables, record layouts, and list or hash insertions. A field reached through
-  `->` or `*` belongs to the struct it points to; anonymous members are flattened.
+  allocate, free), direct calls, calls through function-pointer fields, the functions a function uses
+  as values (passes, stores, compares or names in an initializer), callback tables, record layouts,
+  and list or hash insertions. A field reached through `->` or `*` belongs to the struct it points
+  to; anonymous members are flattened.
 - **What the compiler removes is left out**, and kept with a reason: `sizeof`/`_Alignof` operands,
   `typeof` and cast types, const scalars, the unselected associations of `_Generic` (their types are
-  read from the macro bodies that write them), branches whose condition folds to a constant (also
-  through inline helpers that return one truth value and locals that keep their initializer), the
-  right operand of a decided `&&` or `||`, and statements after a `return`, `goto` or noreturn
-  builtin. Branches of `__builtin_constant_p` and `__builtin_object_size` are left to the machine
-  code: their calls and global accesses stay only where the image has them.
+  read from the macro bodies that write them, or, where a macro pastes them together, the one
+  association with the selection's own type is the selected one; a call of the function a `_Generic`
+  selects is a direct call), branches whose condition folds to a constant (also through inline
+  helpers that return one truth value and locals that keep their initializer), the right operand of
+  a decided `&&` or `||`, and statements after a `return`, `goto` or noreturn builtin. Branches of
+  `__builtin_constant_p` and `__builtin_object_size` are left to the machine code: their calls and
+  global accesses stay only where the image has them.
 - **Implied calls**: a local of a cleanup class (`c.cleanup.class_type`) calls its destructor with
   the constructor's arguments; a local with any other cleanup attribute calls the function it names
   (`c.cleanup.attribute_macros` maps macros such as `__free(x)` to that function).
@@ -39,10 +42,14 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   functions by image address (below); it confirms callback tables a C initializer also names, and
   gives the interfaces the measures map onto groups.
 
-A helper defined in a header or a file is folded into a caller where the caller's machine code does
-not call it, so the C layer sees what the compiler inlined. A helper the image calls stays a call and
-becomes a function of the part; its calls that the caller's machine code also makes are the caller's
-too (the helper is inlined at another site).
+A unit's own functions are those its file or a C file it includes defines, and those with external
+linkage that a header it includes defines (a fragment only that unit includes, as `kernel/rcu/tree.c`
+includes `tree_stall.h`). Each is a function of the part when the image holds it. A header's helper is
+a function of the part when the unit compiled a copy of it: the image calls it, or the unit takes its
+address (a table of operations, a stored hook, a pointer in a file-scope initializer) and nothing
+calls it. A helper is folded into a caller where the caller's machine code does not call it, so the
+C layer sees what the compiler inlined. A helper the image calls stays a call; its calls that the
+caller's machine code also makes are the caller's too (the helper is inlined at another site).
 
 ## Nodes and ids
 
@@ -164,7 +171,7 @@ base_type_min_containers = 2
 [c.calls]                            # callee-name patterns
 lock = "lock"
 unlock = "unlock"
-alloc = "alloc"
+allocate = "alloc"
 free = "free"
 free_object_after_first = "cache"    # these frees take the cache first, the object second
 

@@ -72,3 +72,9 @@ int stub_open(void)
 {
 	return bag_weight();
 }
+
+/* clock_now inlined; its only copy is flow.c's, so it is no function of a part without flow.c. */
+long bags_clock(void)
+{
+	return clock_now();
+}

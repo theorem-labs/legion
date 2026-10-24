@@ -1,12 +1,13 @@
 """One translation unit to facts: plain JSON that depends on that unit's text and nothing else.
 
-A unit's facts hold every function the unit defines in its own file, and every function of an
-included header that those functions reach (by a call, an implied cleanup call, or an address). For
-each function: its calls, its accesses to state, its list and hash insertions, its calls through a
-function-pointer field, the function addresses it passes, and the byte offsets of the fields it
-names. The unit also gives the layout of each record those accesses name, its callback tables
-(designated initializers of function-pointer fields), and the lines where a membership macro
-appears.
+A unit's facts hold every function the unit owns (those its file or a C file it includes defines, and
+those with external linkage that a header it includes defines), and every function of an included
+header that those functions reach (by a call, an implied cleanup call, or an address) or that a
+file-scope initializer names. For each function: its calls, its accesses to state, its list and hash
+insertions, its calls through a function-pointer field, the functions it uses as values (passes,
+stores or compares), and the byte offsets of the fields it names. The unit also gives the layout of
+each record those accesses name, its callback tables (designated initializers of function-pointer
+fields), and the lines where a membership macro appears.
 
 What the compiler does not evaluate is not an access: the operand of ``sizeof`` and ``_Alignof``,
 the controlling expression and the unselected associations of ``_Generic``, the type expressions
@@ -564,7 +565,17 @@ class _Extractor:
         libclang gives the association expressions but not their types, and a ``_Generic`` the
         kernel writes sits in a macro. So the macros the expression expands are read, the
         ``_Generic`` association lists in their bodies are parsed, and the list whose expressions
-        name what the AST's associations name gives each association its type."""
+        name what the AST's associations name gives each association its type. Where the text
+        cannot tell (associations a macro pastes together, as seqlock.h's ``__seqprop_case``), the
+        selection's own type can: it is the type of the expression it selects, so an association
+        that alone has that type is the selected one."""
+        selected = self._text_selection(node, bound)
+        if selected is None:
+            selected = _type_selection(node)
+        self.generic["selected" if selected is not None else "ambiguous"] += 1
+        return selected
+
+    def _text_selection(self, node: ci.Cursor, bound: ci.Cursor) -> set[int] | None:
         children = _children(node)
         control, arms = children[0], children[1:]
         candidates = {_normal_type(control.type.spelling), _normal_type(control.type.get_canonical().spelling)}
@@ -580,17 +591,13 @@ class _Extractor:
                 ):
                     tables.add(tuple(kind for kind, _ in table))
         if len(tables) != 1:
-            self.generic["ambiguous"] += 1
             return None
         names = list(next(iter(tables)))
         matches = {index for index, name in enumerate(names, 1) if name in candidates}
         if len(matches) == 1:
-            self.generic["selected"] += 1
             return matches
         if not matches and "default" in names:
-            self.generic["selected"] += 1
             return {names.index("default") + 1}
-        self.generic["ambiguous"] += 1
         return None
 
     def ignored_parameters(self, callee: ci.Cursor | None) -> frozenset[int]:
@@ -702,6 +709,19 @@ def _generic_tables(
 def _normal_type(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return re.sub(r"\s*\*\s*", "*", text)
+
+
+def _type_selection(node: ci.Cursor) -> set[int] | None:
+    """The one association whose type is the ``_Generic``'s own, or None when none or several are."""
+    if node.type.kind == TK.INVALID:
+        return None
+    wanted = node.type.get_canonical().spelling
+    matches = {
+        index
+        for index, association in enumerate(_children(node)[1:], 1)
+        if association.type.get_canonical().spelling == wanted
+    }
+    return matches if len(matches) == 1 else None
 
 
 # Builtins whose answer the compiler gives only while it optimizes: the image decides the branch.
@@ -908,6 +928,8 @@ class _FunctionWalk:
             "field_accesses": [],
         }
         self.conditional = 0  # depth of __builtin_constant_p branches being walked
+        self.callees: set[int] = set()  # the hashes of the references that name a direct call's callee
+        self.selections: dict[int, set[int] | None] = {}  # each _Generic's selection, by node hash
 
     def argument(self, expression: ci.Cursor) -> dict[str, Any]:
         return {"unit": self.x.unit_from_ref(expression), "param": self.parameter_root(expression)}
@@ -971,84 +993,35 @@ class _FunctionWalk:
             return "write"
         return "read"
 
-    def address_taken(self, expression: ci.Cursor) -> list[ci.Cursor]:
-        """Functions an expression uses as values; the direct callees of nested calls are not."""
-        found: list[ci.Cursor] = []
-
-        def visit(node: ci.Cursor) -> None:
-            if node.kind == K.CALL_EXPR:
-                for argument in node.get_arguments() or []:
-                    visit(argument)
-                return
-            referenced = node.referenced
-            if node.kind == K.DECL_REF_EXPR and referenced is not None and referenced.kind == K.FUNCTION_DECL:
-                found.append(node)
-            for child in node.get_children():
-                visit(child)
-
-        visit(expression)
-        return found
-
     def call(self, node: ci.Cursor, parent: ci.Cursor | None, reason: str | None, generic: bool = False) -> None:
         referenced = node.referenced
         arguments = list(node.get_arguments() or [])
+        head = next(iter(node.get_children()), None)
+        if head is None:
+            return
+        callee_expression = _strip(head)
         if referenced is not None and referenced.kind == K.FUNCTION_DECL:
-            callee = referenced.spelling
-            described = [self.argument(argument) for argument in arguments]
-            if reason is None and callee.startswith("__builtin_"):
-                # A compiler builtin: folded or emitted inline, not a call to a function of the program.
-                reason = "builtin"
-            if reason is not None:
-                self.events["unevaluated"].append(
-                    {"call": callee, "reason": reason, "provenance": [self.x.location(node)]}
-                )
-                return
-            event: dict[str, Any] = {"callee": callee, "arguments": described, "provenance": [self.x.location(node)]}
-            if generic:
-                # In a _Generic association whose selection could not be read: the image decides.
-                event["generic"] = True
-            if self.conditional:
-                # Under a __builtin_constant_p choice: the image decides.
-                event["conditional"] = True
-            self.events["calls"].append(event)
-            for argument in arguments:
-                for reference in self.address_taken(argument):
-                    self.events["function_pointers"].append(
-                        {"target": reference.referenced.spelling, "provenance": [self.x.location(reference)]}
+            # The callee's name is a call, not a use of the function's address.
+            self.callees.add(callee_expression.hash)
+            self.direct_call(node, parent, referenced.spelling, arguments, reason, generic)
+            return
+        if callee_expression.kind == K.GENERIC_SELECTION_EXPR:
+            # _Generic(x, a: f, b: g)(y) calls the function its selection names (seqlock.h's
+            # __seqprop); libclang names no callee for it.
+            selected = self.selection(callee_expression) if reason is None else set()
+            for index, association in enumerate(_children(callee_expression)[1:], 1):
+                name = _strip(association)
+                if name.kind != K.DECL_REF_EXPR or name.referenced is None or name.referenced.kind != K.FUNCTION_DECL:
+                    continue
+                self.callees.add(name.hash)
+                if selected is None or index in selected:
+                    self.direct_call(
+                        node, parent, name.referenced.spelling, arguments, reason, generic or selected is None
                     )
-            membership = self.x.vocabulary.membership.get(callee)
-            if membership is not None:
-                helpers = [
-                    next(
-                        (
-                            child.referenced.spelling
-                            for child in argument.walk_preorder()
-                            if child.kind == K.CALL_EXPR
-                            and child.referenced is not None
-                            and child.referenced.kind == K.FUNCTION_DECL
-                        ),
-                        None,
-                    )
-                    for argument in arguments
-                ]
-                self.events["list_calls"].append(
-                    {
-                        "operation": callee,
-                        "membership": membership,
-                        "arguments": [item["unit"] for item in described],
-                        "argument_helpers": helpers,
-                        "provenance": [self.x.location(node)],
-                    }
-                )
-            action = self.x.vocabulary.calls.action(callee)
-            if action is not None:
-                self.action(node, parent, callee, action, arguments)
             return
         if reason is not None:
             return
-        callee_expression = next(iter(node.get_children()), None)
-        if callee_expression is None:
-            return
+        callee_expression = head
         for child in callee_expression.walk_preorder():
             referenced = child.referenced
             if (
@@ -1067,6 +1040,65 @@ class _FunctionWalk:
                         }
                     )
                 return
+
+    def direct_call(
+        self,
+        node: ci.Cursor,
+        parent: ci.Cursor | None,
+        callee: str,
+        arguments: list[ci.Cursor],
+        reason: str | None,
+        generic: bool,
+    ) -> None:
+        described = [self.argument(argument) for argument in arguments]
+        if reason is None and callee.startswith("__builtin_"):
+            # A compiler builtin: folded or emitted inline, not a call to a function of the program.
+            reason = "builtin"
+        if reason is not None:
+            self.events["unevaluated"].append({"call": callee, "reason": reason, "provenance": [self.x.location(node)]})
+            return
+        event: dict[str, Any] = {"callee": callee, "arguments": described, "provenance": [self.x.location(node)]}
+        if generic:
+            # In a _Generic association whose selection could not be read: the image decides.
+            event["generic"] = True
+        if self.conditional:
+            # Under a __builtin_constant_p choice: the image decides.
+            event["conditional"] = True
+        self.events["calls"].append(event)
+        membership = self.x.vocabulary.membership.get(callee)
+        if membership is not None:
+            helpers = [
+                next(
+                    (
+                        child.referenced.spelling
+                        for child in argument.walk_preorder()
+                        if child.kind == K.CALL_EXPR
+                        and child.referenced is not None
+                        and child.referenced.kind == K.FUNCTION_DECL
+                    ),
+                    None,
+                )
+                for argument in arguments
+            ]
+            self.events["list_calls"].append(
+                {
+                    "operation": callee,
+                    "membership": membership,
+                    "arguments": [item["unit"] for item in described],
+                    "argument_helpers": helpers,
+                    "provenance": [self.x.location(node)],
+                }
+            )
+        action = self.x.vocabulary.calls.action(callee)
+        if action is not None:
+            self.action(node, parent, callee, action, arguments)
+
+    def selection(self, node: ci.Cursor) -> set[int] | None:
+        """The association a ``_Generic`` selects (see ``selected_associations``), read once per node."""
+        key = node.hash
+        if key not in self.selections:
+            self.selections[key] = self.x.selected_associations(node, self.cursor)
+        return self.selections[key]
 
     def action(
         self, node: ci.Cursor, parent: ci.Cursor | None, callee: str, action: str, arguments: list[ci.Cursor]
@@ -1115,6 +1147,13 @@ class _FunctionWalk:
     ) -> None:
         referenced = node.referenced
         if referenced is None:
+            return
+        if node.kind == K.DECL_REF_EXPR and referenced.kind == K.FUNCTION_DECL:
+            if reason is None and node.hash not in self.callees:
+                # A function used as a value: passed, stored, compared or named in an initializer.
+                self.events["function_pointers"].append(
+                    {"target": referenced.spelling, "provenance": [self.x.location(node)]}
+                )
             return
         if node.kind == K.DECL_REF_EXPR and _is_global_var(referenced):
             if parent is not None and parent.kind == K.MEMBER_REF_EXPR:
@@ -1191,7 +1230,7 @@ class _FunctionWalk:
                 self.walk(child, node, child_index, reason or unevaluated, generic)
             return
         if kind == K.GENERIC_SELECTION_EXPR and children:
-            selected = self.x.selected_associations(node, self.cursor) if reason is None else set()
+            selected = self.selection(node) if reason is None else set()
             self.walk(children[0], node, 0, reason or "generic_control", generic)
             for child_index, child in enumerate(children[1:], 1):
                 if selected is None:
@@ -1295,6 +1334,37 @@ def _definitions(tu: ci.TranslationUnit) -> dict[str, ci.Cursor]:
 def _main_file(cursor: ci.Cursor, main: Path) -> bool:
     location = cursor.location
     return location.file is not None and Path(location.file.name).resolve() == main
+
+
+def _owned(extractor: _Extractor, cursor: ci.Cursor, main: Path) -> bool:
+    """A definition the unit compiles as its own function: one of its file or of a C file it includes,
+    or one with external linkage that an included header gives. Such a header is the unit's own
+    fragment (kernel/rcu/tree.c includes tree_stall.h): an external definition two units included
+    would be defined twice. An inline definition is every includer's, and emits no definition."""
+    if _main_file(cursor, main) or extractor.relative(cursor.location.file.name).endswith(".c"):
+        return True
+    return bool(cursor.linkage == ci.LinkageKind.EXTERNAL and not _is_inline(extractor, cursor))
+
+
+def _initializer_functions(tu: ci.TranslationUnit, definitions: dict[str, ci.Cursor]) -> set[str]:
+    """The defined functions a file-scope initializer names: a table of operations, an initcall."""
+    found: set[str] = set()
+    for cursor in tu.cursor.get_children():
+        if cursor.kind != K.VAR_DECL:
+            continue
+        initializer = libclang.var_initializer(cursor)
+        if initializer is None:
+            continue
+        for child in initializer.walk_preorder():
+            referenced = child.referenced
+            if (
+                child.kind == K.DECL_REF_EXPR
+                and referenced is not None
+                and referenced.kind == K.FUNCTION_DECL
+                and referenced.spelling in definitions
+            ):
+                found.add(referenced.spelling)
+    return found
 
 
 def _tables(
@@ -1408,12 +1478,9 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
     includes = sorted({extractor.relative(include.include.name) for include in tu.get_includes()})
     include_probes = _include_probes(tu, main, arguments, extractor)
     definitions = _definitions(tu)
-    # The unit's own functions: those of its file and of the C files it includes.
-    pending = sorted(
-        name
-        for name, cursor in definitions.items()
-        if _main_file(cursor, main) or extractor.relative(cursor.location.file.name).endswith(".c")
-    )
+    # The unit's own functions, then every function they or a file-scope initializer reach.
+    owned = {name for name, cursor in definitions.items() if _owned(extractor, cursor, main)}
+    pending = sorted(owned | _initializer_functions(tu, definitions))
     functions: dict[str, Any] = {}
     exclusions: list[dict[str, Any]] = []
     while pending:
@@ -1449,7 +1516,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             # without a prototype, may take all of them.
             "parameters": _parameter_count(cursor),
             "result_registers": result_registers,
-            "main_file": _main_file(cursor, main),
+            "owned": name in owned,
             "returns": walk.returns(),
             "events": walk.events,
         }

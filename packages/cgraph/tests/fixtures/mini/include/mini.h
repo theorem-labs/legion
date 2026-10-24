@@ -137,6 +137,19 @@ int bag_weight(void);
 	struct bag *: (long)((struct bag *)(void *)(x))->n)
 #define inner_weight(x) _Generic((x), struct box *: box_weight(), struct bag *: bag_weight())
 #define outer_weight(x) inner_weight(x)
+/* _Generic choosing the function a call then calls, as seqlock.h's __seqprop: a call, not an address. */
+static inline long box_measure(struct box *b)
+{
+	return b->size;
+}
+static inline long bag_measure(struct bag *g)
+{
+	return g->n;
+}
+#define measure(x) _Generic((x), struct box *: box_measure, struct bag *: bag_measure)(x)
+/* Associations a macro pastes together, which no text reading resolves (seqlock.h's __seqprop_case). */
+#define measure_case(kind) struct kind *: kind##_measure
+#define measure_any(x) _Generic((x), measure_case(box), measure_case(bag))(x)
 
 /* Cleanup attributes outside the class convention: a free helper and a plain cleanup function. */
 #define __cleanup(func) __attribute__((__cleanup__(func)))
@@ -156,6 +169,28 @@ int arch_hook(void);
 int stub_open(void);
 #define CHECK_VALUE(e) ((void)sizeof(e))
 #define FEATURE_X 0
+
+/* Operations a table or a function names by address and nothing calls, as filelock.h's
+ * generic_setlease without file locking: the address gives each a copy in the unit that names it. */
+static inline int box_get_default(struct box *b)
+{
+	return b != NULL;
+}
+static inline int box_get_none(struct box *b)
+{
+	(void)b;
+	return 0;
+}
+/* A clock that a function calls, inlined, and a pointer names, as timekeeping.h's ktime_get_real. */
+static inline long clock_now(void)
+{
+	return 5;
+}
+/* A GNU inline definition: every includer sees it and none emits it, so no unit owns it. */
+extern inline __attribute__((__gnu_inline__)) int box_inline_default(void)
+{
+	return 4;
+}
 
 /* Per-CPU state: the current box lives in the thread pointer. */
 register struct box *current_box __asm__("tp");

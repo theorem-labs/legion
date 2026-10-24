@@ -131,7 +131,7 @@ def build(
             "with_call_path": with_path,
             "share_with_call_path": round(with_path / len(pairs), 4) if pairs else 0.0,
             "method": "Pairs of image functions of the part where one writes (write, "
-            "alloc or free) a data structure of a group the other accesses; "
+            "allocate or free) a data structure of a group the other accesses; "
             "groups with per-CPU state left out.",
         },
         "calls_sharing_state": {"call_sites": sum(sites for _, _, sites in call_sites), "sharing": sharing_sites},

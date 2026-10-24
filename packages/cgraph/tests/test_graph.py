@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import FIXTURE, build, edges, node, read
+from conftest import FIXTURE, add_contract_functions, build, edges, node, read, text_address
 
 from cgraph import clangfacts, commands, config, contracts, image, jsonio, link, structure
 from cgraph.errors import InputError
@@ -163,7 +163,7 @@ def fake_unit(name: str, calls: list[dict[str, Any]], accesses: list[dict[str, A
         "file": "a.c",
         "line": len(name),
         "static": True,
-        "main_file": True,
+        "owned": True,
         "returns": None,
         "events": events,
     }
@@ -462,23 +462,6 @@ def test_structure_drops_are_written_as_c3_items() -> None:
     assert {item["reason"] for item in membership_drops} == {"arguments_unresolved", "end_not_a_node"}
 
 
-def _address(copy: Path, name: str, copy_index: int = 0) -> str:
-    """The image address System.map gives a text symbol, as the contract graph writes it."""
-    found = [
-        line.split()[0]
-        for line in (copy / "image" / "System.map").read_text().splitlines()
-        if line.split()[2] == name and line.split()[1] in "Tt"
-    ]
-    return f"0x{int(found[copy_index], 16):x}"
-
-
-def _add_contract_functions(copy: Path, *functions: dict[str, Any]) -> None:
-    path = copy / "contracts.json"
-    graph = json.loads(path.read_text())
-    graph["nodes"] += [{"kind": "fn", "in_image": bool(item["addr"]), **item} for item in functions]
-    path.write_text(json.dumps(graph))
-
-
 def _claimed(owners: list[dict[str, Any]]) -> list[str]:
     claimed: list[str] = []
     for owner in owners:
@@ -515,7 +498,7 @@ ADDRESS_JOINS = [
 def test_a_contract_function_reaches_the_part_function_at_its_image_address(
     copy: Path, tmp_path: Path, identity: str, symbol: str, image_symbol: tuple[str, int], expected: str
 ) -> None:
-    _add_contract_functions(copy, {"id": identity, "syms": [symbol], "addr": _address(copy, *image_symbol)})
+    add_contract_functions(copy, {"id": identity, "syms": [symbol], "addr": text_address(copy, *image_symbol)})
     out = tmp_path / "out"
     result = build(copy, "both", out)
     assert result.passes, result.hard_checks
@@ -528,8 +511,8 @@ def test_a_contract_function_reaches_the_part_function_at_its_image_address(
 
 
 def test_every_contract_function_that_reaches_no_part_function_is_an_exclusion(copy: Path, tmp_path: Path) -> None:
-    anchor = _address(copy, "anchor_pair")
-    _add_contract_functions(
+    anchor = text_address(copy, "anchor_pair")
+    add_contract_functions(
         copy,
         # A macro, an always-inline helper or an assembly label: the contract graph gives no symbol.
         {"id": "Prog/src/store/ListInsert", "syms": [], "addr": ""},
@@ -568,15 +551,15 @@ def test_a_contract_function_of_another_part_is_recorded_not_dropped(copy: Path,
 
 
 def test_two_contract_functions_at_one_address_fail_the_unique_mapping_check(copy: Path, tmp_path: Path) -> None:
-    _add_contract_functions(
-        copy, {"id": "Prog/src/store/BoxNewAgain", "syms": ["box_new"], "addr": _address(copy, "box_new")}
+    add_contract_functions(
+        copy, {"id": "Prog/src/store/BoxNewAgain", "syms": ["box_new"], "addr": text_address(copy, "box_new")}
     )
     out = tmp_path / "out"
     result = build(copy, "both", out)
     failed = [item for item in result.hard_checks if not item["ok"]]
     assert [item["name"] for item in failed] == ["contract_mapping_unique"]
     assert failed[0]["items"] == [
-        {"address": _address(copy, "box_new"), "ids": ["Prog/src/store/BoxNew", "Prog/src/store/BoxNewAgain"]}
+        {"address": text_address(copy, "box_new"), "ids": ["Prog/src/store/BoxNew", "Prog/src/store/BoxNewAgain"]}
     ]
 
 

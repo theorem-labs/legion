@@ -599,11 +599,16 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
     image = linker.image
     roots: dict[str, Definition] = {}
     for tu in sorted(linker.part_files):
+        unit_file = os.path.basename(tu)
         for name, function in linker.tus[tu]["functions"].items():
-            if _owned(function):
-                definition = linker.visible(tu, name)
-                if definition is not None and linker.symbols(definition):
-                    roots[definition.id] = linker.node_of(definition)
+            definition = linker.visible(tu, name)
+            if definition is None:
+                continue
+            symbols = linker.symbols(definition)
+            # The unit's own functions, and every header function the unit compiled a copy of: a copy
+            # no part function calls exists because the unit takes its address (a table, a store).
+            if symbols and (_owned(function) or any(item.local and item.file == unit_file for item in symbols)):
+                roots[definition.id] = linker.node_of(definition)
     functions = dict(roots)
     effective: dict[str, Effective] = {}
     pending = sorted(functions)
@@ -1198,9 +1203,10 @@ def _image_analysis(
 
 
 def _owned(function: dict[str, Any]) -> bool:
-    """A function belongs to the unit that defines it in its own file or in a C file it includes
-    (a unit such as a scheduler's build file includes several .c files); a header's does not."""
-    return bool(function["main_file"] or function["file"].endswith(".c"))
+    """A function the unit compiles as its own: one its file or a C file it includes defines (a unit
+    such as a scheduler's build file includes several .c files), or one with external linkage that a
+    header only it includes defines (kernel/rcu/tree.c's tree_stall.h). A header's inline is not."""
+    return bool(function["owned"])
 
 
 def _functions_at(linker: Linker) -> dict[int, list[str]]:

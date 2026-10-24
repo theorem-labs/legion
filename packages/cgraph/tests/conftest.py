@@ -48,3 +48,20 @@ def edges(graph: dict[str, Any], kind: str, source: str | None = None) -> list[d
 
 def node(graph: dict[str, Any], identity: str) -> dict[str, Any]:
     return next(item for item in graph["nodes"] if item["id"] == identity)
+
+
+def text_address(root: Path, name: str, copy_index: int = 0) -> str:
+    """The image address System.map gives a text symbol, as the contract graph writes it."""
+    found = [
+        line.split()[0]
+        for line in (root / "image" / "System.map").read_text().splitlines()
+        if line.split()[2] == name and line.split()[1] in "Tt"
+    ]
+    return f"0x{int(found[copy_index], 16):x}"
+
+
+def add_contract_functions(root: Path, *functions: dict[str, Any]) -> None:
+    path = root / "contracts.json"
+    graph = json.loads(path.read_text())
+    graph["nodes"] += [{"kind": "fn", "in_image": bool(item["addr"]), **item} for item in functions]
+    path.write_text(json.dumps(graph))
