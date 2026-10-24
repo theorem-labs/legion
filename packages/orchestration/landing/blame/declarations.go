@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Declaration is one Lean declaration. It is identified by its file and its
@@ -28,11 +30,15 @@ func (d Declaration) ID() DeclarationID {
 }
 
 var (
-	declarationRE = regexp.MustCompile(`^\s*(?:@\[[^\]]*\]\s*)*((?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*)(?:def|theorem|lemma|structure|class|inductive|abbrev|instance|axiom|opaque|notation|macro|syntax|macro_rules|elab|alias)\s+(?:\(priority\s*:=\s*[^)]*\)\s*)?([^\s(:{\[⟨]+)`)
+	declarationRE = regexp.MustCompile(`^\s*(?:@\[[^\]]*\]\s*)*((?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*)(?:class\s+inductive|class\s+abbrev|def|theorem|lemma|structure|class|inductive|abbrev|instance|axiom|opaque|notation|macro|syntax|macro_rules|elab|alias)\s+(?:\(priority\s*:=\s*[^)]*\)\s*)?([^\s(:{\[⟨]+)`)
 	namespaceRE   = regexp.MustCompile(`^\s*namespace\s+(\S+)\s*$`)
-	sectionRE     = regexp.MustCompile(`^\s*(?:(?:noncomputable|public|private|meta)\s+)*section(?:\s+(\S+))?\s*$`)
+	sectionRE     = regexp.MustCompile(`^\s*(?:@\[[^\]]*\]\s*)*(?:(?:noncomputable|public|private|meta)\s+)*section(?:\s+(\S+))?\s*$`)
 	mutualRE      = regexp.MustCompile(`^\s*mutual\s*$`)
 	endRE         = regexp.MustCompile(`^\s*end(?:\s+(\S+))?\s*$`)
+	// modifierLineRE is a line of only attributes and modifiers, which apply
+	// to the declaration below it.
+	modifierLineRE = regexp.MustCompile(`^\s*(?:(?:@\[[^\]]*\]|private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)(?:\s+|$))+$`)
+	attributeRE    = regexp.MustCompile(`@\[[^\]]*\]`)
 	// commandRE is an unindented command that ends the previous declaration's
 	// body without declaring a name.
 	commandRE = regexp.MustCompile(`^(?:#|@\[|(?:open|variable|universe|set_option|attribute|export|example|instance|deriving|initialize|import|omit|include)\b)`)
@@ -70,13 +76,22 @@ type scanned struct {
 }
 
 // scanner reads Lean source one line at a time. It tracks the namespaces,
-// sections and mutual blocks that qualify declarations, block comments, and the
-// declaration whose body it is in.
+// sections and mutual blocks that qualify declarations, the block comments and
+// string literals that span lines, modifiers written on their own line above a
+// declaration, and the declaration whose body it is in.
 type scanner struct {
 	file    string
 	scopes  []scope
 	depth   int
 	current Declaration
+	// inString is set inside a string literal. rawHashes is the number of #
+	// that close a raw string literal, or -1 in an ordinary one.
+	inString  bool
+	rawHashes int
+	// pendingPrivate and pendingProtected come from lines that hold only
+	// attributes and modifiers; they apply to the next declaration.
+	pendingPrivate   bool
+	pendingProtected bool
 }
 
 // ScanDeclarations returns every declaration in one Lean source file, each with
@@ -143,10 +158,24 @@ func refersToNamespace(reference, namespace string) bool {
 }
 
 func (s *scanner) scan(line string) scanned {
+	startedInString := s.inString
 	code := s.uncomment(line)
 	if strings.TrimSpace(code) == "" {
 		return scanned{code: code}
 	}
+	if startedInString {
+		// The line continues a string literal, so nothing on it is a command.
+		s.pendingPrivate, s.pendingProtected = false, false
+		return scanned{code: code}
+	}
+	if modifierLineRE.MatchString(code) && !sectionRE.MatchString(code) {
+		words := strings.Fields(attributeRE.ReplaceAllString(code, " "))
+		s.pendingPrivate = s.pendingPrivate || containsString(words, "private")
+		s.pendingProtected = s.pendingProtected || containsString(words, "protected")
+		return scanned{code: code}
+	}
+	pendingPrivate, pendingProtected := s.pendingPrivate, s.pendingProtected
+	s.pendingPrivate, s.pendingProtected = false, false
 	if match := namespaceRE.FindStringSubmatch(code); match != nil {
 		s.current = Declaration{}
 		for _, part := range nameParts(match[1]) {
@@ -198,8 +227,8 @@ func (s *scanner) scan(line string) scanned {
 			File:      s.file,
 			Name:      s.qualify(strings.TrimSuffix(match[2], ".")),
 			Text:      strings.Join(strings.Fields(code), " "),
-			Private:   containsString(modifiers, "private"),
-			Protected: containsString(modifiers, "protected"),
+			Private:   pendingPrivate || containsString(modifiers, "private"),
+			Protected: pendingProtected || containsString(modifiers, "protected"),
 		}
 		s.current = declaration
 		return scanned{kind: declarationLine, code: code, declaration: declaration}
@@ -221,41 +250,122 @@ func (s *scanner) declared(line string) string {
 	return s.qualify(strings.TrimSuffix(match[2], "."))
 }
 
-// uncomment removes block comments, which may span lines and nest, and a
-// trailing line comment, outside string literals.
+// uncomment returns a line's code: it removes block comments, which may span
+// lines and nest, and a trailing line comment. Comment markers inside string
+// and character literals are code. A string literal, including a raw string
+// `r#"…"#`, may span lines, so the scanner carries it to the next line.
 func (s *scanner) uncomment(line string) string {
 	var out strings.Builder
-	inString := false
 	for index := 0; index < len(line); index++ {
+		current := line[index]
 		next := byte(0)
 		if index+1 < len(line) {
 			next = line[index+1]
 		}
 		switch {
-		case s.depth > 0 && line[index] == '-' && next == '/':
+		case s.depth > 0 && current == '-' && next == '/':
 			s.depth--
 			index++
-		case s.depth > 0 && line[index] == '/' && next == '-':
+		case s.depth > 0 && current == '/' && next == '-':
 			s.depth++
 			index++
 		case s.depth > 0:
-		case inString && line[index] == '\\' && next != 0:
-			out.WriteByte(line[index])
+		case s.inString && s.rawHashes >= 0:
+			out.WriteByte(current)
+			if current == '"' && strings.HasPrefix(line[index+1:], strings.Repeat("#", s.rawHashes)) {
+				out.WriteString(line[index+1 : index+1+s.rawHashes])
+				index += s.rawHashes
+				s.inString = false
+			}
+		case s.inString && current == '\\' && next != 0:
+			out.WriteByte(current)
 			out.WriteByte(next)
 			index++
-		case line[index] == '"':
-			inString = !inString
-			out.WriteByte(line[index])
-		case !inString && line[index] == '/' && next == '-':
+		case s.inString:
+			out.WriteByte(current)
+			if current == '"' {
+				s.inString = false
+			}
+		case current == '"':
+			s.inString, s.rawHashes = true, -1
+			out.WriteByte(current)
+		case current == 'r' && !identifierBefore(line, index):
+			hashes := 0
+			for index+1+hashes < len(line) && line[index+1+hashes] == '#' {
+				hashes++
+			}
+			if index+1+hashes < len(line) && line[index+1+hashes] == '"' {
+				out.WriteString(line[index : index+2+hashes])
+				index += 1 + hashes
+				s.inString, s.rawHashes = true, hashes
+				continue
+			}
+			out.WriteByte(current)
+		case current == '\'' && !identifierBefore(line, index):
+			end := charLiteralEnd(line, index)
+			if end < 0 {
+				out.WriteByte(current)
+				continue
+			}
+			out.WriteString(line[index : end+1])
+			index = end
+		case current == '/' && next == '-':
 			s.depth++
 			index++
-		case !inString && line[index] == '-' && next == '-':
+		case current == '-' && next == '-':
 			return out.String()
 		default:
-			out.WriteByte(line[index])
+			out.WriteByte(current)
 		}
 	}
 	return out.String()
+}
+
+// identifierBefore reports whether the byte before index continues an
+// identifier, so a quote or `r` there is part of a name, not a literal.
+func identifierBefore(line string, index int) bool {
+	if index == 0 {
+		return false
+	}
+	previous := line[index-1]
+	if previous >= utf8.RuneSelf {
+		return true
+	}
+	return previous == '_' || previous == '\'' || previous == '!' || previous == '?' || unicode.IsLetter(rune(previous)) || unicode.IsDigit(rune(previous))
+}
+
+// charLiteralEnd returns the index of the closing quote of a character
+// literal that opens at start, such as 'a', '"' or '\x41', or -1 when the quote
+// does not open one (a name literal such as 'Nat.succ).
+func charLiteralEnd(line string, start int) int {
+	index := start + 1
+	if index >= len(line) {
+		return -1
+	}
+	if line[index] == '\\' {
+		index++
+		if index >= len(line) {
+			return -1
+		}
+		switch line[index] {
+		case 'x':
+			index += 3
+		case 'u':
+			index += 5
+		default:
+			index++
+		}
+	} else {
+		character, size := utf8.DecodeRuneInString(line[index:])
+		if character == '\'' {
+			return -1
+		}
+		index += size
+	}
+	if index < len(line) && line[index] == '\'' {
+		return index
+	}
+	return -1
 }
 
 func (s *scanner) prefix() string {
