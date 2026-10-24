@@ -113,7 +113,7 @@ The landing program calls `declindex land-hash` twice for every registered contr
 
 A declaration is answered from the index only when `LAND_TREE` has its source file with the same blob as the indexed `sources` row. A module that the index read without a `sources` row, such as an ignored source file, is not answered from the index.
 
-The configured tree can be a directory below its repository's root. The index keys `sources` and declaration paths relative to the tree. `land-hash` finds the tree's directory in the repository with `git rev-parse --show-prefix` in the configured tree, so that tree must be inside its Git work tree where `land-hash` runs. It lists the sources of `LAND_TREE` below that directory, compares them with the index by their tree-relative paths, and prints each `path` with the directory in front. For a tree at the repository's root the directory is empty.
+The configured tree can be a directory below its repository's root. The index keys `sources` and declaration paths relative to the tree, and `refresh` records the tree's directory in the repository (`git rev-parse --show-prefix`). `land-hash` reads that directory from the index, never the configured tree: it lists the sources of `LAND_TREE` below that directory, compares them with the index by their tree-relative paths, and prints each `path` with the directory in front. For a tree at the repository's root the directory is empty.
 
 A changed module's build output is fresh only when all of these hold:
 

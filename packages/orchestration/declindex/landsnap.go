@@ -9,7 +9,10 @@ import (
 // LandSnapshot is the index state land-hash needs to answer one candidate tree. Its maps are read in one SQLite
 // transaction, so a concurrent refresh cannot combine one commit's sources with another commit's declarations.
 type LandSnapshot struct {
-	HasSources   bool
+	HasSources bool
+	// Prefix is the indexed tree's path below the root of its repository, with a trailing slash, empty at that
+	// root: the index keys sources and declaration paths relative to the tree.
+	Prefix       string
 	Sources      map[string]string
 	Modules      map[string]LandModule
 	Declarations map[string][]LandDeclaration
@@ -41,11 +44,20 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 		Modules:      map[string]LandModule{},
 		Declarations: map[string][]LandDeclaration{},
 	}
-	var sourceKind string
-	err = tx.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'sources'`).Scan(&sourceKind)
-	if err == nil {
-		snapshot.HasSources = sourceKind == "git"
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	meta := func(k string) (string, error) {
+		var v string
+		err := tx.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return v, err
+	}
+	sourceKind, err := meta("sources")
+	if err != nil {
+		return LandSnapshot{}, err
+	}
+	snapshot.HasSources = sourceKind == "git"
+	if snapshot.Prefix, err = meta("source_prefix"); err != nil {
 		return LandSnapshot{}, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT path, blob FROM sources`)

@@ -19,7 +19,8 @@ import (
 // cmdLandHash answers a landing's declaration reads at one Git tree. A module whose source LAND_TREE has with the
 // blob the index recorded comes from the index; changed modules come only from verified candidate build output.
 // The index keys sources and declarations relative to the configured tree; LAND_TREE is the repository's, so a
-// tree below the repository's root is listed below its SourcePrefix, and answers print paths with that prefix.
+// tree below the repository's root is listed below the prefix that refresh recorded, and answers print paths with
+// that prefix. It reads the index read-only and never the configured tree.
 func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"land-hash takes no arguments; it reads LAND_TREE, LAND_GIT_DIR, and LAND_NAMES"})
@@ -36,7 +37,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	if err := e.open(true); err != nil {
+	if err := e.openReadOnly(ctx, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -47,12 +48,8 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if !snapshot.HasSources {
 		return fail(e.stderr, &unableError{fmt.Errorf("the index has no git source blobs")})
 	}
-	roots := e.cfg.TreeSpec().Roots
-	prefix, err := declindex.SourcePrefix(e.cfg.Tree)
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	candidate, err := gitTreeSources(ctx, gitDir, tree, prefix, declindex.SourcePathspecs(roots))
+	prefix := snapshot.Prefix
+	candidate, err := gitTreeSources(ctx, gitDir, tree, prefix, declindex.SourcePathspecs(e.cfg.TreeSpec().Roots))
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
@@ -93,7 +90,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 			if err != nil {
 				return fail(e.stderr, &unableError{fmt.Errorf("read candidate %s.ilean: %w", rel, err)})
 			}
-			module, err := declindex.ParseModule(rel, ilean, blob, roots)
+			module, err := declindex.ParseModule(rel, ilean, blob, e.cfg.TreeSpec().Roots)
 			if err != nil {
 				return fail(e.stderr, &unableError{fmt.Errorf("parse candidate %s: %w", rel, err)})
 			}

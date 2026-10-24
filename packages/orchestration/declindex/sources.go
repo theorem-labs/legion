@@ -13,49 +13,50 @@ import (
 )
 
 // readSources records the blob of every Lean source below the configured roots as it exists in tree.Source, keyed
-// by its path relative to tree.Source. Git's index names unchanged tracked files; hash-object gives the bytes
-// refresh actually reads for modified and untracked files. Git lists both by paths from the work tree's root, so a
-// tree below that root strips its SourcePrefix. A source directory that is not a Git work tree has no source-blob
+// by its path relative to tree.Source, and tree.Source's prefix: its path below the root of its Git work tree,
+// with a trailing slash, empty at that root. Git's index names unchanged tracked files; hash-object gives the bytes
+// refresh actually reads for modified and untracked files. Git lists both by paths from the work tree's root, so
+// a tree below that root strips its prefix. A source directory that is not a Git work tree has no source-blob
 // snapshot.
-func readSources(tree Tree) (map[string]string, error) {
+func readSources(tree Tree) (blobs map[string]string, prefix string, err error) {
 	check := exec.Command("git", "-C", tree.Source, "rev-parse", "--is-inside-work-tree")
 	out, err := check.Output()
 	if err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
-			return nil, err
+			return nil, "", err
 		}
-		return nil, nil
+		return nil, "", nil
 	}
 	if strings.TrimSpace(string(out)) != "true" {
-		return nil, nil
+		return nil, "", nil
 	}
 
 	top, prefix, err := workTreeLocation(tree.Source)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	paths := SourcePathspecs(tree.Roots)
 	args := append([]string{"-C", tree.Source, "ls-files", "-s", "-z", "--full-name", "--"}, paths...)
 	tracked, err := exec.Command("git", args...).Output()
 	if err != nil {
-		return nil, fmt.Errorf("list tracked sources: %w", err)
+		return nil, "", fmt.Errorf("list tracked sources: %w", err)
 	}
 	sources, err := parseTrackedSources(tracked, prefix)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	args = append([]string{"-C", tree.Source, "status", "--porcelain", "-z", "--untracked-files=all", "--"}, paths...)
 	status, err := exec.Command("git", args...).Output()
 	if err != nil {
-		return nil, fmt.Errorf("list changed sources: %w", err)
+		return nil, "", fmt.Errorf("list changed sources: %w", err)
 	}
 	changed, err := changedSourcePaths(status, prefix)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(changed) == 0 {
-		return sources, nil
+		return sources, prefix, nil
 	}
 
 	toHash := make([]string, 0, len(changed))
@@ -65,12 +66,12 @@ func readSources(tree Tree) (map[string]string, error) {
 				delete(sources, p)
 				continue
 			}
-			return nil, fmt.Errorf("stat changed source %s: %w", p, err)
+			return nil, "", fmt.Errorf("stat changed source %s: %w", p, err)
 		}
 		toHash = append(toHash, p)
 	}
 	if len(toHash) == 0 {
-		return sources, nil
+		return sources, prefix, nil
 	}
 	sort.Strings(toHash)
 	// hash-object resolves --stdin-paths from the work tree's root, not from a subdirectory given with -C, so it
@@ -83,16 +84,16 @@ func readSources(tree Tree) (map[string]string, error) {
 	cmd.Stdin = strings.NewReader(stdin.String())
 	hashes, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("hash changed sources: %w", err)
+		return nil, "", fmt.Errorf("hash changed sources: %w", err)
 	}
 	ids := strings.Fields(string(hashes))
 	if len(ids) != len(toHash) {
-		return nil, fmt.Errorf("hash changed sources: got %d blob ids for %d paths", len(ids), len(toHash))
+		return nil, "", fmt.Errorf("hash changed sources: got %d blob ids for %d paths", len(ids), len(toHash))
 	}
 	for i, p := range toHash {
 		sources[p] = ids[i]
 	}
-	return sources, nil
+	return sources, prefix, nil
 }
 
 // SourcePathspecs are the Git pathspecs, relative to the tree, of the Lean sources below roots: each root's
@@ -113,15 +114,7 @@ func SourcePathspecs(roots Roots) []string {
 	return out
 }
 
-// SourcePrefix is dir's path below the root of its Git work tree, with a trailing slash, and empty at that root.
-// Git lists a repository's files by paths from its root; the index keys sources and declarations relative to the
-// tree, which is this prefix shorter.
-func SourcePrefix(dir string) (string, error) {
-	_, prefix, err := workTreeLocation(dir)
-	return prefix, err
-}
-
-// workTreeLocation gives the root of dir's Git work tree and dir's SourcePrefix below it.
+// workTreeLocation gives the root of dir's Git work tree and dir's prefix below it (see readSources).
 func workTreeLocation(dir string) (top, prefix string, err error) {
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel", "--show-prefix").Output()
 	if err != nil {

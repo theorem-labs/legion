@@ -42,9 +42,9 @@ func TestReadSourcesUsesTheSourceBytes(t *testing.T) {
 	writeSource(t, dir, "Root/Changed.lean", "def changed := 2\n")
 	writeSource(t, dir, "Root/Untracked.lean", "def untracked := 3\n")
 
-	got, err := readSources(Tree{Source: dir, Roots: Roots{"Root": true}})
-	if err != nil {
-		t.Fatal(err)
+	got, prefix, err := readSources(Tree{Source: dir, Roots: Roots{"Root": true}})
+	if err != nil || prefix != "" {
+		t.Fatalf("prefix %q, %v; want the repository's root", prefix, err)
 	}
 	want := map[string]string{}
 	for _, rel := range []string{"Root/Clean.lean", "Root/Changed.lean", "Root/Untracked.lean"} {
@@ -61,7 +61,7 @@ func TestReadSourcesUsesTheSourceBytes(t *testing.T) {
 }
 
 func TestReadSourcesSkipsANonGitTree(t *testing.T) {
-	got, err := readSources(Tree{Source: t.TempDir(), Roots: Roots{"Root": true}})
+	got, _, err := readSources(Tree{Source: t.TempDir(), Roots: Roots{"Root": true}})
 	if err != nil {
 		t.Fatal(err)
 	}

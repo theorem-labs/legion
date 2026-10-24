@@ -241,7 +241,7 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	var st RefreshStats
-	sourceBlobs, err := readSources(tree)
+	sourceBlobs, sourcePrefix, err := readSources(tree)
 	if err != nil {
 		return st, err
 	}
@@ -364,6 +364,8 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		"built":   time.Now().UTC().Format("2006-01-02T15:04Z"),
 		"errors":  fmt.Sprint(st.Unreadable),
 		"sources": "",
+		// The tree's path below the root of its repository: land-hash reads LAND_TREE below it.
+		"source_prefix": sourcePrefix,
 	}
 	if sourceBlobs != nil {
 		meta["sources"] = "git"
