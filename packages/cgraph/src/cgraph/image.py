@@ -58,6 +58,8 @@ _SPILLS = frozenset({"sd", "c.sd", "c.sdsp"})
 _RELOADS = frozenset({"ld", "c.ld", "c.ldsp"})
 # The symbols that mark a change from code to data, which name no object of their own.
 _MAPPING_SYMBOL = "$"
+# The most addresses a register may hold, one from each path into a block, before it is unknown.
+_MAX_CHOICES = 4
 
 
 @dataclass
@@ -66,8 +68,10 @@ class _State:
     are numbers, not addresses); registers that hold an unknown base plus a known constant
     (``relative``); registers that hold a known address plus an unknown offset (``anchored``: a
     per-CPU offset or an index added to the address of an object), with the address each was formed
-    from (``origin``); and the frame slots holding an address the code spilled (``slots``, keyed by
-    the frame register and its displacement)."""
+    from (``origin``); the frame slots holding an address the code spilled (``slots``, keyed by the
+    frame register and its displacement); and registers every path into a block gives a known
+    address (``choices``) or a known number (``numbers``), but not the same one: the value on each
+    path."""
 
     values: dict[int, int] = field(default_factory=dict)
     relative: dict[int, int] = field(default_factory=dict)
@@ -75,6 +79,8 @@ class _State:
     constants: set[int] = field(default_factory=set)
     origin: dict[int, int] = field(default_factory=dict)
     slots: dict[tuple[int, int], int] = field(default_factory=dict)
+    choices: dict[int, frozenset[int]] = field(default_factory=dict)
+    numbers: dict[int, frozenset[int]] = field(default_factory=dict)
 
     def copy(self) -> _State:
         return _State(
@@ -84,6 +90,8 @@ class _State:
             set(self.constants),
             dict(self.origin),
             dict(self.slots),
+            dict(self.choices),
+            dict(self.numbers),
         )
 
     def meet(self, other: _State) -> _State:
@@ -96,6 +104,18 @@ class _State:
             if (register in self.constants) == (register in other.constants)
         }
         anchored = same(self.anchored, other.anchored)
+
+        def per_path(mine: Any, theirs: Any, registers: set[int]) -> dict[int, frozenset[int]]:
+            merged: dict[int, frozenset[int]] = {}
+            for register in registers - set(values):
+                left, right = mine(register), theirs(register)
+                if left is not None and right is not None and len(left | right) <= _MAX_CHOICES:
+                    merged[register] = left | right
+            return merged
+
+        candidates = (set(self.values) | set(self.choices) | set(self.numbers)) & (
+            set(other.values) | set(other.choices) | set(other.numbers)
+        )
         return _State(
             values,
             same(self.relative, other.relative),
@@ -103,12 +123,31 @@ class _State:
             {register for register in values if register in self.constants},
             {register: value for register, value in same(self.origin, other.origin).items() if register in anchored},
             same(self.slots, other.slots),
+            per_path(self.possible, other.possible, candidates),
+            per_path(self.possible_numbers, other.possible_numbers, candidates),
         )
 
     def address(self, register: int) -> int | None:
         """The address a register holds: a known value that is not a ``lui``/``li`` number."""
         if register in self.values and register not in self.constants:
             return self.values[register]
+        return None
+
+    def possible(self, register: int) -> frozenset[int] | None:
+        """Every address the register may hold, one per path; None where some path leaves it
+        unknown or a number."""
+        if register in self.choices:
+            return self.choices[register]
+        address = self.address(register)
+        return None if address is None else frozenset({address})
+
+    def possible_numbers(self, register: int) -> frozenset[int] | None:
+        """Every number the register may hold, one per path; None where some path leaves it
+        unknown or an address."""
+        if register in self.numbers:
+            return self.numbers[register]
+        if register in self.values and register in self.constants:
+            return frozenset({self.values[register]})
         return None
 
 
@@ -170,6 +209,9 @@ def _anchored_value(
         left, right = (registers[1], registers[2]) if len(registers) == 3 else (registers[0], registers[1])
         for address, offset in ((left, right), (right, left)):
             known = state.address(address)
+            if offset in state.numbers:
+                # A number each path gives differently: the sum is one known address per path.
+                continue
             if known is not None and offset not in values and section_of(known) is not None:
                 return registers[0], known, known
             if address in anchored and offset not in values:
@@ -191,9 +233,41 @@ def _anchored_value(
     return None
 
 
-def _flow(decoder: Any, instructions: list[Any]) -> list[list[int]]:
+def _chosen_value(instruction: Any, operands: list[Any], state: _State) -> tuple[int, frozenset[int]] | None:
+    """A register that becomes one of several known addresses: ``mv`` of a register holding them,
+    ``addi`` of one (each address plus the immediate), or ``add`` of a known address and a number
+    each path gives differently (or of several addresses and one number)."""
+    mnemonic = instruction.mnemonic
+    kinds = [operand.type for operand in operands]
+    if mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in state.choices:
+        return operands[0].reg, state.choices[operands[1].reg]
+    if mnemonic in ("add", "c.add") and kinds and all(kind == CS_OP_REG for kind in kinds):
+        registers = [operand.reg for operand in operands]
+        left, right = (registers[1], registers[2]) if len(registers) == 3 else (registers[0], registers[1])
+        for address, number in ((left, right), (right, left)):
+            addresses, numbers = state.possible(address), state.possible_numbers(number)
+            if addresses is None or numbers is None or (len(addresses) == 1 and len(numbers) == 1):
+                continue
+            sums = frozenset((first + second) & _MASK for first in addresses for second in numbers)
+            if len(sums) <= _MAX_CHOICES:
+                return registers[0], sums
+        return None
+    if mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM]:
+        source, immediate = operands[1].reg, operands[2].imm
+    elif mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM]:
+        source, immediate = operands[0].reg, operands[1].imm
+    else:
+        return None
+    if source not in state.choices:
+        return None
+    return operands[0].reg, frozenset((address + immediate) & _MASK for address in state.choices[source])
+
+
+def _flow(decoder: Any, instructions: list[Any], never_returns: Any = None) -> list[list[int]]:
     """The successors of each instruction: the next one, a branch target, none after a return, an
-    indirect jump or a jump to an address outside the function."""
+    indirect jump, a jump to an address outside the function, or a call to a function that never
+    returns (``never_returns(address)``; panic, rest_init), after which the compiler places code
+    that only other paths reach."""
     index_of = {instruction.address: index for index, instruction in enumerate(instructions)}
     successors: list[list[int]] = []
     for index, instruction in enumerate(instructions):
@@ -209,9 +283,37 @@ def _flow(decoder: Any, instructions: list[Any]) -> list[list[int]]:
             successors.append([target] if target is not None else [])
         elif mnemonic in _ENDS or (mnemonic in {"jalr", "c.jalr"} and not _links(decoder, operands)):
             successors.append([])
+        elif never_returns is not None and (callee := _callee(decoder, instructions, index)) is not None:
+            successors.append([] if never_returns(callee) else following)
         else:
             successors.append(following)
     return successors
+
+
+def _callee(decoder: Any, instructions: list[Any], index: int) -> int | None:
+    """The address a call at ``index`` goes to: a ``jal`` target, or an ``auipc`` and ``jalr`` pair
+    (a call beyond the reach of ``jal``). None for anything else, a call through a register included."""
+    instruction = instructions[index]
+    operands = list(instruction.operands)
+    if instruction.mnemonic in ("jal", "c.jal") and operands and operands[-1].type == CS_OP_IMM:
+        return int(instruction.address + operands[-1].imm) & _MASK
+    if instruction.mnemonic != "jalr" or not index or not _links(decoder, operands):
+        return None
+    registers = [operand.reg for operand in operands if operand.type == CS_OP_REG]
+    memory = [operand for operand in operands if operand.type == CS_OP_MEM]
+    base, offset = (
+        (memory[0].mem.base, memory[0].mem.disp)
+        if memory
+        else (registers[-1], next((operand.imm for operand in operands if operand.type == CS_OP_IMM), 0))
+    )
+    previous = instructions[index - 1]
+    before = list(previous.operands)
+    if previous.mnemonic != "auipc" or not before or before[0].type != CS_OP_REG or before[0].reg != base:
+        return None
+    upper = before[1].imm & 0xFFFFF
+    if upper & 0x80000:
+        upper -= 0x100000
+    return int(previous.address + (upper << 12) + offset) & _MASK
 
 
 def _links(decoder: Any, operands: list[Any]) -> bool:
@@ -395,6 +497,8 @@ class Image:
         # Where unknown: _DEFAULT_ARGUMENTS arguments, _DEFAULT_RESULTS result registers.
         self.arity: dict[str, int] = {}
         self.results: dict[str, int] = {}
+        # Whether the function at an address cannot return, decided once per callee.
+        self.no_return: dict[int, bool] = {}
         self.image_cache = ImageCache(cache_directory, image, system_map, rules, Path(__file__))
 
     def _load_elf(self, image: Path, named: set[tuple[int, str]]) -> None:
@@ -517,14 +621,61 @@ class Image:
         index = bisect.bisect_right(self.text_starts, symbol.address)
         return self.text_starts[index] if index < len(self.text_starts) else symbol.address + 4
 
+    def _code(self, symbol: Symbol) -> bytes | None:
+        """A function's machine code, or None where it lies outside executable sections."""
+        section = self.section_of(symbol.address)
+        if section is None or not section[3]:
+            return None
+        data = self.section_data.get(section[2])
+        if data is None:
+            elf_section = self.elf.get_section_by_name(section[2])
+            data = elf_section.data() if elf_section is not None else b""
+            self.section_data[section[2]] = data
+        start = symbol.address - section[0]
+        return data[start : start + max(0, self._end(symbol) - symbol.address)]
+
+    def never_returns(self, address: int) -> bool:
+        """Whether the function that starts at ``address`` cannot return to its caller: its code
+        holds no return, no jump through a register and no jump out of itself, so it ends only in a
+        loop, a trap, or a call that does not return either (rest_init, panic). Where the code is
+        not fully decoded, or no sized function starts there, it may return."""
+        known = self.no_return.get(address)
+        if known is not None:
+            return known
+        result = False
+        name = self.text_at.get(address, "")
+        symbol = next((item for item in self.functions.get(name, []) if item.address == address and item.size), None)
+        code = self._code(symbol) if symbol is not None else None
+        if code:
+            instructions = list(self.decoder.disasm(code, address))
+            end = address + len(code)
+            result = sum(item.size for item in instructions) == len(code) and not any(
+                self._leaves(item, address, end) for item in instructions
+            )
+        self.no_return[address] = result
+        return result
+
+    def _leaves(self, instruction: Any, start: int, end: int) -> bool:
+        """Whether an instruction returns or jumps out of the function at [start, end)."""
+        mnemonic = instruction.mnemonic
+        operands = list(instruction.operands)
+        if mnemonic in ("ret", "jr", "c.jr", "mret", "sret"):
+            return True
+        if mnemonic in ("jalr", "c.jalr") and not _links(self.decoder, operands):
+            return True
+        if (mnemonic in _BRANCHES or mnemonic in ("j", "c.j")) and operands and operands[-1].type == CS_OP_IMM:
+            target = (instruction.address + operands[-1].imm) & _MASK
+            return not start <= target < end
+        return False
+
     def facts(self, symbol: Symbol) -> FunctionFacts:
         cached = self.cache.get(symbol.address)
         if cached is not None:
             return cached
         facts = FunctionFacts()
         self.cache[symbol.address] = facts
-        section = self.section_of(symbol.address)
-        if section is None or not section[3]:
+        code = self._code(symbol)
+        if code is None:
             return facts
         symbol_key = ""
         if self.image_cache.enabled:
@@ -539,13 +690,6 @@ class Image:
                         raise self.image_cache.malformed(facts_key)
                     self.cache[symbol.address] = loaded
                     return loaded
-        data = self.section_data.get(section[2])
-        if data is None:
-            elf_section = self.elf.get_section_by_name(section[2])
-            data = elf_section.data() if elf_section is not None else b""
-            self.section_data[section[2]] = data
-        start = symbol.address - section[0]
-        code = data[start : start + max(0, self._end(symbol) - symbol.address)]
         instructions = list(self.decoder.disasm(code, symbol.address))
         facts = self._decode(symbol.name, instructions)
         self.cache[symbol.address] = facts
@@ -584,7 +728,7 @@ class Image:
 
     def _decode(self, name: str, instructions: list[Any]) -> FunctionFacts:
         facts = FunctionFacts()
-        successors = _flow(self.decoder, instructions)
+        successors = _flow(self.decoder, instructions, self.never_returns)
         states = self._block_states(instructions, successors)
         before = dict(states)
         returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
@@ -857,6 +1001,17 @@ class Image:
                         function, (anchored[base] + displacement) & _MASK, instruction.address, "indexed_access", facts
                     )
                     facts.memory_offsets.add(anchored[base] - state.origin.get(base, anchored[base]) + displacement)
+                elif base in state.choices:
+                    # Every path into this load gives the base a known address, but not the same
+                    # one: the function reads each of those objects on some path.
+                    for address in sorted(state.choices[base]):
+                        self._record_address(
+                            function,
+                            (address + displacement) & _MASK,
+                            instruction.address,
+                            "load_or_store_some_path",
+                            facts,
+                        )
                 elif base in relative:
                     # A base register the code has already added a constant to: the field's offset
                     # from the object the register pointed at is the sum, which a load or store
@@ -878,21 +1033,28 @@ class Image:
                     self._call(function, instruction.address, target, tail, facts)
         if mnemonic in {"jal", "c.jal"} or (mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, operands)):
             # A call may change every caller-saved register.
-            for register in (*values, *relative, *anchored):
+            for register in (*values, *relative, *anchored, *state.choices, *state.numbers):
                 name = self.decoder.reg_name(register)
                 if name == "ra" or name.startswith(("a", "t")):
                     values.pop(register, None)
                     relative.pop(register, None)
                     anchored.pop(register, None)
+                    state.choices.pop(register, None)
+                    state.numbers.pop(register, None)
                     state.constants.discard(register)
         derived = _relative_value(instruction, operands, values, relative)
         indexed = _anchored_value(instruction, operands, state, self.section_of)
+        chosen = _chosen_value(instruction, operands, state)
         number = computed is not None and _is_number(instruction, operands, state)
         for register in _written_registers(instruction, operands):
             values.pop(register, None)
             relative.pop(register, None)
             anchored.pop(register, None)
+            state.choices.pop(register, None)
+            state.numbers.pop(register, None)
             state.constants.discard(register)
+        if chosen is not None:
+            state.choices[chosen[0]] = chosen[1]
         if computed is not None:
             destination, value = computed
             values[destination] = value

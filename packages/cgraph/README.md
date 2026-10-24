@@ -38,8 +38,13 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   from the zero-size marker that often sits at its first instruction. Data addresses come from
   `auipc` arithmetic, shared anchors and compressed loads included, and count only inside the
   declared size of an object symbol that `System.map` names. An address a register holds survives a
-  spill to a frame slot and the reload from it. Thread-pointer accesses are per-CPU state. Globals
-  the machine code addresses but the C does not name become nodes with image-only access edges.
+  spill to a frame slot and the reload from it. Where every path into a load gives its base a known
+  address but not the same one, the function reads each of those objects on some path
+  (`load_or_store_some_path`); where any path leaves the base unknown, no object is claimed. A call
+  to a function whose code has no return and no jump out of itself (`rest_init`, `panic`) does not
+  continue, so code the compiler places after it is reached only by its other paths.
+  Thread-pointer accesses are per-CPU state. Globals the machine code addresses but the C does not
+  name become nodes with image-only access edges.
 - **What the image cannot tell apart is named by every name it has.** An address one past the end of
   an object is that object's end pointer and, where another object starts there, that object too;
   both names are kept, and a C access to either matches. Where the symbol table has a symbol of its

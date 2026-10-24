@@ -80,21 +80,22 @@ def test_image_cache_reuses_every_function_without_decoding(tmp_path: Path) -> N
 def _decodes(
     cache: Path, name: str, arity: dict[str, int], results: dict[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> int:
-    """How many functions ``Image.facts`` disassembles for ``name`` with these C signatures."""
+    """How many times ``Image.facts`` disassembles ``name`` itself with these C signatures (deciding
+    whether a callee returns disassembles the callee, which is not a decode of ``name``)."""
     loaded = config.load(FIXTURE / "cgraph.toml")
     image = Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image, cache)
+    (symbol,) = image.functions[name]
     count = 0
     disassemble = image.decoder.disasm
 
-    def counting(*arguments: object) -> object:
+    def counting(code: bytes, address: int, *rest: object) -> object:
         nonlocal count
-        count += 1
-        return disassemble(*arguments)
+        count += address == symbol.address
+        return disassemble(code, address, *rest)
 
     monkeypatch.setattr(image.decoder, "disasm", counting)
     image.arity, image.results = arity, results
     try:
-        (symbol,) = image.functions[name]
         image.facts(symbol)
     finally:
         image.close()
@@ -642,3 +643,82 @@ def test_a_constant_a_shift_forms_is_an_offset(image: Image) -> None:
     start = image.functions["anchor_pair"][0].address
     code = struct.pack("<HHIII", 0x460D, 0x062E, _add(A0, A0, A2), _load(A1, A0, 0), RET)
     assert 6144 in image.decode("synthetic", code, start).memory_offsets
+
+
+def _two_paths(image: Image, second: bytes) -> FunctionFacts:
+    """``s1 = &pair_a``; on the fall-through path ``second`` sets s1 again; both paths then meet at
+    ``ld a1, 0(s1)``."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = (
+        struct.pack("<3I", _u(0x17, S1, high), _addi(S1, S1, low), _branch(A0, ZERO, 4 + len(second)))
+        + second
+        + struct.pack("<2I", _load(A1, S1, 0), RET)
+    )
+    return image.decode("synthetic", code, start)
+
+
+def test_an_address_each_path_forms_differently_names_every_object(image: Image) -> None:
+    """pair_a on one path and pair_b on the other: the load reads one of them on each path, so the
+    function accesses both, each on some path."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_b"][0].address - (start + 12))
+    facts = _two_paths(image, struct.pack("<2I", _u(0x17, S1, high), _addi(S1, S1, low)))
+    assert {("pair_a", "load_or_store_some_path"), ("pair_b", "load_or_store_some_path")} <= _operations(facts)
+
+
+def test_an_address_some_path_leaves_unknown_names_nothing(image: Image) -> None:
+    """pair_a on one path, a pointer loaded from memory on the other: the load's object is unknown
+    on that path, so no object is claimed."""
+    facts = _two_paths(image, struct.pack("<I", _load(S1, A0, 0)))
+    assert not {operation for _, operation in _operations(facts)} & {"load_or_store", "load_or_store_some_path"}
+
+
+def _after_a_call(image: Image, callee: str, far: bool) -> FunctionFacts:
+    """``s1 = &pair_a``; on one path a call to ``callee``, then (in layout, after the call) code that
+    sets ``s1 = &pair_b``; both paths meet at ``ld a1, 0(s1)``. ``far`` calls with auipc+jalr."""
+    start = image.functions["anchor_pair"][0].address
+    target = image.functions[callee][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    upper, lower = _split(target - (start + 12))
+    call = (
+        struct.pack("<2I", _u(0x17, RA, upper), _i(0x67, RA, 0, RA, lower))
+        if far
+        else struct.pack("<I", _jal(RA, target - (start + 12)))
+    )
+    after = 12 + len(call)
+    high_b, low_b = _split(image.object_symbols["pair_b"][0].address - (start + after))
+    code = (
+        struct.pack("<3I", _u(0x17, S1, high), _addi(S1, S1, low), _branch(A0, ZERO, len(call) + 12))
+        + call
+        + struct.pack("<4I", _u(0x17, S1, high_b), _addi(S1, S1, low_b), _load(A1, S1, 0), RET)
+    )
+    return image.decode("synthetic", code, start)
+
+
+@pytest.mark.parametrize("far", [False, True])
+def test_code_after_a_call_that_never_returns_is_not_reached_from_it(image: Image, far: bool) -> None:
+    """_start loops forever and has no return: nothing after a call to it runs, so the load reads
+    pair_a on the only path that reaches it."""
+    facts = _after_a_call(image, "_start", far)
+    assert ("pair_a", "load_or_store") in _operations(facts)
+    assert not {name for name, _ in _operations(facts)} & {"pair_b"}
+
+
+def test_code_after_a_call_that_returns_is_reached_from_it(image: Image) -> None:
+    """box_weight returns, so both paths reach the load: it reads pair_a or pair_b."""
+    facts = _after_a_call(image, "box_weight", far=False)
+    assert {("pair_a", "load_or_store_some_path"), ("pair_b", "load_or_store_some_path")} <= _operations(facts)
+
+
+def test_a_constant_each_path_gives_selects_one_object_per_path(image: Image) -> None:
+    """``c.li a2, 0`` on one path and ``c.li a2, 8`` on the other, then ``add a5, s1, a2`` with
+    s1 = &pair_a: the load reads pair_a or pair_b, as ``in_slab = cond ? &a : &b`` compiles."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack(
+        "<IIHIHIII", _u(0x17, S1, high), _addi(S1, S1, low), 0x4601, _branch(A0, ZERO, 6), 0x4621,
+        _add(A5, S1, A2), _load(A1, A5, 0), RET,
+    )  # fmt: skip
+    facts = image.decode("synthetic", code, start)
+    assert {("pair_a", "load_or_store_some_path"), ("pair_b", "load_or_store_some_path")} <= _operations(facts)
