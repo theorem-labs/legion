@@ -67,7 +67,7 @@ func (r *recording) saw(owner, id, topic string) {
 
 // arrive is the owner session's transcript recording one of the driver's notices.
 func (r *recording) arrive(owner, id, topic string) {
-	r.recorded.Arrivals = append(r.recorded.Arrivals, Arrival{Owner: owner, ID: id, Type: noticeType, Run: "r", Topic: topic,
+	r.recorded.Arrivals = append(r.recorded.Arrivals, Arrival{Owner: owner, ID: id, Type: noticeType, Run: "r", Topic: topic, Subject: topic,
 		Transcript: "/sessions/" + owner + ".jsonl", Line: len(r.recorded.Arrivals) + 1})
 }
 
@@ -153,9 +153,20 @@ func TestCheckFailsADeliveryThatWasNeverPublished(t *testing.T) {
 	}
 }
 
+// A delivery's topic is Envoy's record of it in the session's transcript: the envelope's topic, and the subject the
+// session's subscription took it on. Either one that is not the topic the driver published on is a wrong-topic
+// delivery, and fails the run.
 func TestCheckFailsADeliveryRecordedOnTheWrongTopic(t *testing.T) {
 	expected, r := passingRun()
 	retopic(r.recorded.Arrivals, fn, "evt-all", needs)
+	requireOnly(t, Check(expected, r.recorded), FailUnexpected, "evt-all on "+needs)
+
+	expected, r = passingRun()
+	for index, arrival := range r.recorded.Arrivals {
+		if arrival.Owner == fn && arrival.ID == "evt-all" {
+			r.recorded.Arrivals[index].Subject = needs
+		}
+	}
 	requireOnly(t, Check(expected, r.recorded), FailUnexpected, "evt-all on "+needs)
 }
 

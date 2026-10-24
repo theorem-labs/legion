@@ -136,7 +136,8 @@ type renderedEnvelope struct {
 }
 
 // delivered appends a delivery to the transcript as the custom message of type envoy-message that pi-envoy hands the
-// session: the rendered envelope, with the payload as message.
+// session: the rendered envelope, with the payload as message, and pi-envoy's record of the delivery as details (the
+// harness listener delivers a notice on its own topic, so that is its subject).
 func (t *transcript) delivered(envelope Envelope) error {
 	var payload any = envelope.Payload
 	var decoded map[string]any
@@ -152,7 +153,8 @@ func (t *transcript) delivered(envelope Envelope) error {
 	}
 	return t.append(map[string]any{
 		"type": "custom_message", "customType": "envoy-message", "content": string(content), "display": true,
-		"id": newID(""), "timestamp": time.Now().UTC(),
+		"details": map[string]string{"subject": envelope.Topic, "topic": envelope.Topic, "event_id": envelope.EventID, "dedupe_key": envelope.DedupeKey},
+		"id":      newID(""), "timestamp": time.Now().UTC(),
 	})
 }
 

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Each Envoy delivery's `envoy-message` custom message records the delivery in its `details`,
+  which Oh My Pi keeps in the session transcript and never sends the model: the subject the frame
+  arrived on, and its envelope's `topic`, `event_id` and `dedupe_key`. A reader of the transcript
+  (the owner message test) judges a delivery's topic by that record, not by the payload.
+
 ### Fixed
 
 - `dispatch read` of an issue's document prints the document's summary, including the links
