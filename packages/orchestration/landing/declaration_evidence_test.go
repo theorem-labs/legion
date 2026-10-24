@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/landing/blame"
@@ -95,6 +96,26 @@ func TestDeclarationEvidenceComparesWholeSignature(t *testing.T) {
 	evidence := memberEvidence(t, map[string]string{"Alpha.lean": base}, map[string]string{"Alpha.lean": member})
 
 	wantEvidence(t, evidence, blame.Name{Value: "Target", Kind: blame.Changed}, 3, "signature changed")
+}
+
+// Lean continues a term on an unindented line that starts with an
+// identifier: the binder `{A :` stays open into the next line. A change to a
+// later signature line changes the declaration, and a change to its body is
+// an edit inside it.
+func TestDeclarationEvidenceContinuesSignatureOnUnindentedLine(t *testing.T) {
+	const file = "Link.lean"
+	base := "private theorem Table.noLink_of [Inst] [Group G] {A :\n" +
+		"Table.Args G} (O : Table.Open A)\n" +
+		"    (F : Table.Fits A) : Table.NoLink A where\n" +
+		"  read := O.read\n" +
+		"  write := O.write\n"
+	name := blame.Name{Value: "Table.noLink_of", Kind: blame.Changed}
+
+	signature := memberEvidence(t, map[string]string{file: base}, map[string]string{file: strings.Replace(base, "Fits A", "Fits' A", 1)})
+	wantEvidence(t, signature, name, 3, "signature changed")
+
+	body := memberEvidence(t, map[string]string{file: base}, map[string]string{file: strings.Replace(base, "O.read", "O.read2", 1)})
+	wantEvidence(t, body, name, 2, "edited")
 }
 
 // candidateTree builds the candidate of base and members through the real Git

@@ -41,9 +41,11 @@ var (
 	// to the declaration below it.
 	modifierLineRE = regexp.MustCompile(`^\s*(?:(?:@\[[^\]]*\]|private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)(?:\s+|$))+$`)
 	attributeRE    = regexp.MustCompile(`@\[[^\]]*\]`)
-	// commandRE is an unindented command that ends the previous declaration's
-	// body without declaring a name.
-	commandRE = regexp.MustCompile(`^(?:#|@\[|(?:open|variable|universe|set_option|attribute|export|example|instance|deriving|initialize|import|omit|include)\b)`)
+	// commandRE is an unindented command that ends the previous declaration
+	// without declaring a name. Each word is a Lean keyword, so no term
+	// continuing a signature can start with it. A syntax line that names a
+	// declaration is read by declarationRE first.
+	commandRE = regexp.MustCompile(`^(?:#|@\[|(?:open|variable|universe|set_option|attribute|export|example|instance|deriving|initialize|import|omit|include)\b|(?:(?:local|scoped)\s+)?(?:macro_rules|elab_rules|syntax|declare_syntax_cat)\b)`)
 )
 
 type scopeKind int
@@ -90,20 +92,25 @@ type scanner struct {
 	// declarations holds the declarations read so far, in source order.
 	// While inDeclaration is set the scanner is in the signature or body of
 	// the last one, and while inSignature is also set its signature is still
-	// open: signature holds its normalised text so far.
+	// open: signature holds its normalised text so far, and brackets the
+	// depth of the brackets it leaves open.
 	declarations  []Declaration
 	inDeclaration bool
 	inSignature   bool
 	signature     []byte
+	brackets      int
 	// currentIsStructure is set when the current declaration was declared by
 	// structure or class, and currentMatchArm when a line that starts with
 	// `|` begins its body.
 	currentIsStructure bool
 	currentMatchArm    bool
 	// inString is set inside a string literal. rawHashes is the number of #
-	// that close a raw string literal, or -1 in an ordinary one.
+	// that close a raw string literal, or -1 in an ordinary one. literals
+	// holds the byte spans of the current line's code that are string or
+	// character literals.
 	inString  bool
 	rawHashes int
+	literals  [][2]int
 	// pendingPrivate, pendingProtected, and pendingText come from lines that
 	// hold only attributes and modifiers; they apply to the next declaration.
 	pendingPrivate   bool
@@ -253,14 +260,14 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 			Private:   pendingPrivate || containsString(modifiers, "private"),
 			Protected: pendingProtected || containsString(modifiers, "protected"),
 		})
-		s.inDeclaration, s.inSignature = true, true
+		s.inDeclaration, s.inSignature, s.brackets = true, true, 0
 		s.currentIsStructure = isStructureDecl(code)
 		switch match[2] {
 		case "def", "theorem", "lemma", "instance", "abbrev":
 			s.currentMatchArm = true
 		}
 		s.signature = appendFields(appendFields(s.signature[:0], pendingText), code)
-		if containsBodyStart(code) {
+		if s.opensBody(code) {
 			s.endSignature()
 		}
 		return scanned{kind: declarationLine, owned: true, signature: true}
@@ -269,21 +276,15 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 		s.endDeclaration()
 		return scanned{}
 	}
-	if s.inSignature && startsCommand(code) && !containsBodyStart(code) {
-		// A signature continues on indented lines and on lines that start
-		// with a bracket or an operator. An unindented word that does not
-		// begin the body starts a command the scanner does not name.
-		s.endDeclaration()
-		return scanned{}
-	}
 	return s.continuation(code, true)
 }
 
 // continuation records a line of the current declaration after its
 // declaration line: a signature line until the body starts, then a body line.
-// A line that starts with `|` begins the body of a definition whose body can be
-// a list of match arms; armMayStart is false on a line that starts inside a
-// string literal.
+// Lean continues a signature on any line, indented or not, until the `:=` or
+// `where` that starts the body. A line that starts with `|` begins the body of
+// a definition whose body can be a list of match arms; armMayStart is false
+// on a line that starts inside a string literal.
 func (s *scanner) continuation(code string, armMayStart bool) scanned {
 	if !s.inDeclaration {
 		return scanned{}
@@ -291,15 +292,44 @@ func (s *scanner) continuation(code string, armMayStart bool) scanned {
 	if !s.inSignature {
 		return scanned{owned: true}
 	}
-	if armMayStart && s.currentMatchArm && startsMatchArm(code) {
+	if armMayStart && s.currentMatchArm && s.brackets == 0 && startsMatchArm(code) {
 		s.endSignature()
 		return scanned{owned: true}
 	}
 	s.signature = appendFields(s.signature, code)
-	if containsBodyStart(code) {
+	if s.opensBody(code) {
 		s.endSignature()
 	}
 	return scanned{owned: true, signature: true}
+}
+
+// opensBody reports whether a code line of the open signature starts the
+// body: a `:=`, or a `where` that ends the line, outside every bracket the
+// signature has opened so far. It carries the bracket depth to the next line,
+// and skips the line's string and character literals.
+func (s *scanner) opensBody(code string) bool {
+	literal := 0
+	for index := 0; index < len(code); index++ {
+		if literal < len(s.literals) && index == s.literals[literal][0] {
+			index = s.literals[literal][1] - 1
+			literal++
+			continue
+		}
+		switch code[index] {
+		case '(', '[', '{':
+			s.brackets++
+		case ')', ']', '}':
+			if s.brackets > 0 {
+				s.brackets--
+			}
+		case ':':
+			if s.brackets == 0 && index+1 < len(code) && code[index+1] == '=' {
+				return true
+			}
+		}
+	}
+	trimmed := strings.TrimSpace(code)
+	return s.brackets == 0 && (trimmed == "where" || strings.HasSuffix(trimmed, " where"))
 }
 
 // endSignature stores the open signature as the current declaration's Text.
@@ -342,19 +372,15 @@ func startsMatchArm(code string) bool {
 	return code == "|" || strings.HasPrefix(code, "| ") || strings.HasPrefix(code, "|\t")
 }
 
-// startsCommand reports whether a code line starts in column 0 with a word,
-// as a command does.
-func startsCommand(code string) bool {
-	first := code[0]
-	return first == '_' || 'a' <= first && first <= 'z' || 'A' <= first && first <= 'Z'
-}
-
 // uncomment returns a line's code: it removes block comments, which may span
 // lines and nest, and a trailing line comment. Comment markers inside string
 // and character literals are code. A string literal, including a raw string
-// `r#"…"#`, may span lines, so the scanner carries it to the next line.
+// `r#"…"#`, may span lines, so the scanner carries it to the next line. It
+// records the span of each literal in the code in s.literals.
 func (s *scanner) uncomment(line string) string {
 	var out strings.Builder
+	s.literals = s.literals[:0]
+	literalStart := 0
 	for index := 0; index < len(line); index++ {
 		current := line[index]
 		next := byte(0)
@@ -375,6 +401,7 @@ func (s *scanner) uncomment(line string) string {
 				out.WriteString(line[index+1 : index+1+s.rawHashes])
 				index += s.rawHashes
 				s.inString = false
+				s.literals = append(s.literals, [2]int{literalStart, out.Len()})
 			}
 		case s.inString && current == '\\' && next != 0:
 			out.WriteByte(current)
@@ -384,9 +411,11 @@ func (s *scanner) uncomment(line string) string {
 			out.WriteByte(current)
 			if current == '"' {
 				s.inString = false
+				s.literals = append(s.literals, [2]int{literalStart, out.Len()})
 			}
 		case current == '"':
 			s.inString, s.rawHashes = true, -1
+			literalStart = out.Len()
 			out.WriteByte(current)
 		case current == 'r' && !identifierBefore(line, index):
 			hashes := 0
@@ -394,6 +423,7 @@ func (s *scanner) uncomment(line string) string {
 				hashes++
 			}
 			if index+1+hashes < len(line) && line[index+1+hashes] == '"' {
+				literalStart = out.Len()
 				out.WriteString(line[index : index+2+hashes])
 				index += 1 + hashes
 				s.inString, s.rawHashes = true, hashes
@@ -406,6 +436,7 @@ func (s *scanner) uncomment(line string) string {
 				out.WriteByte(current)
 				continue
 			}
+			s.literals = append(s.literals, [2]int{out.Len(), out.Len() + end + 1 - index})
 			out.WriteString(line[index : end+1])
 			index = end
 		case current == '/' && next == '-':
@@ -416,6 +447,9 @@ func (s *scanner) uncomment(line string) string {
 		default:
 			out.WriteByte(current)
 		}
+	}
+	if s.inString {
+		s.literals = append(s.literals, [2]int{literalStart, out.Len()})
 	}
 	return out.String()
 }
@@ -534,29 +568,6 @@ func isStructureDecl(code string) bool {
 		}
 	}
 	return false
-}
-
-// containsBodyStart reports whether a code line (already uncommented) begins
-// the definition body. It detects `:=` at bracket depth zero and a trailing
-// `where`.
-func containsBodyStart(code string) bool {
-	depth := 0
-	for i := 0; i < len(code); i++ {
-		switch code[i] {
-		case '(', '[', '{':
-			depth++
-		case ')', ']', '}':
-			if depth > 0 {
-				depth--
-			}
-		case ':':
-			if depth == 0 && i+1 < len(code) && code[i+1] == '=' {
-				return true
-			}
-		}
-	}
-	trimmed := strings.TrimSpace(code)
-	return trimmed == "where" || strings.HasSuffix(trimmed, " where")
 }
 
 // LineOwner describes one source line as the scan of its whole file found it.

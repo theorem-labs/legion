@@ -164,3 +164,98 @@ func TestScanDeclarationsJoinsSignatureLines(t *testing.T) {
 		}
 	}
 }
+
+// A signature ends only where its body starts: a `:=`, a closing `where`, or
+// a definition's first match arm, at bracket depth 0 across all its lines.
+// Lean continues a term on an unindented line, so such a line stays in the
+// signature, while a syntax command such as macro_rules ends the
+// declaration. Brackets inside string and character literals do not count.
+func TestScanDeclarationsEndsSignatureOnlyAtBody(t *testing.T) {
+	for _, test := range []struct {
+		name, source string
+		text         map[string]string
+		// owners is each line's owner: "sig Name" for a signature line,
+		// "body Name" for a body line and "" for a line of no declaration.
+		owners []string
+	}{{
+		name: "binder open across an unindented line",
+		source: "private theorem Table.noLink_of [Group G] {A :\n" +
+			"Table.Args G} (O : Table.Open A)\n" +
+			"    (F : Table.Fits A) : Table.NoLink A where\n" +
+			"  read := O.read\n",
+		text:   map[string]string{"Table.noLink_of": "private theorem Table.noLink_of [Group G] {A : Table.Args G} (O : Table.Open A) (F : Table.Fits A) : Table.NoLink A where"},
+		owners: []string{"sig Table.noLink_of", "sig Table.noLink_of", "sig Table.noLink_of", "body Table.noLink_of", ""},
+	}, {
+		name:   "operand after an operator on an unindented line",
+		source: "theorem iter_lt (n : Nat) :\n    ⊢ P n -∗\nctx n -∗\n        R n := by\n  trivial\n",
+		text:   map[string]string{"iter_lt": "theorem iter_lt (n : Nat) : ⊢ P n -∗ ctx n -∗ R n := by"},
+		owners: []string{"sig iter_lt", "sig iter_lt", "sig iter_lt", "sig iter_lt", "body iter_lt", ""},
+	}, {
+		name:   "list element on an unindented line",
+		source: "theorem t : P [a,\nBitVec.reduceNeg,\n    b] := by\n  trivial\n",
+		text:   map[string]string{"t": "theorem t : P [a, BitVec.reduceNeg, b] := by"},
+		owners: []string{"sig t", "sig t", "sig t", "body t", ""},
+	}, {
+		name:   "default value inside a binder that spans lines",
+		source: "def g (cfg : Nat\n    := 0)\n    (h : cfg = 0) : True := trivial\n",
+		text:   map[string]string{"g": "def g (cfg : Nat := 0) (h : cfg = 0) : True := trivial"},
+		owners: []string{"sig g", "sig g", "sig g", ""},
+	}, {
+		name:   "brackets inside literals",
+		source: "def s (x : String := \"(\") (c : Char := '[') : Nat :=\n  0\n",
+		text:   map[string]string{"s": "def s (x : String := \"(\") (c : Char := '[') : Nat :="},
+		owners: []string{"sig s", "body s", ""},
+	}, {
+		name:   "match arm inside a bracket of the signature",
+		source: "theorem m (h : (match n with\n  | 0 => True\n  | _ => False)) : True := trivial\n",
+		text:   map[string]string{"m": "theorem m (h : (match n with | 0 => True | _ => False)) : True := trivial"},
+		owners: []string{"sig m", "sig m", "sig m", ""},
+	}, {
+		name: "syntax commands end an open signature",
+		source: "syntax \"one\" : tactic\n" +
+			"declare_syntax_cat pat\n" +
+			"syntax \"two\" : pat\n" +
+			"syntax (ident <|> \"_\") : pat\n" +
+			"syntax \"three\" : tactic\n" +
+			"macro_rules\n" +
+			"  | `(tactic| three) => `(tactic| trivial)\n" +
+			"syntax \"four\" : tactic\n" +
+			"elab_rules : tactic\n" +
+			"  | `(tactic| four) => pure ()\n" +
+			"theorem after : True := trivial\n",
+		text: map[string]string{
+			`"one"`:   `syntax "one" : tactic`,
+			`"two"`:   `syntax "two" : pat`,
+			`"three"`: `syntax "three" : tactic`,
+			`"four"`:  `syntax "four" : tactic`,
+			"after":   "theorem after : True := trivial",
+		},
+		owners: []string{`sig "one"`, "", `sig "two"`, "", `sig "three"`, "", "", `sig "four"`, "", "", "sig after", ""},
+	}} {
+		t.Run(test.name, func(t *testing.T) {
+			got := ScanDeclarations("Signatures.lean", test.source)
+			if len(got) != len(test.text) {
+				t.Fatalf("ScanDeclarations() = %+v, want %d declarations", got, len(test.text))
+			}
+			for _, declaration := range got {
+				if want, found := test.text[declaration.Name]; !found || declaration.Text != want {
+					t.Errorf("%s Text = %q, want %q", declaration.Name, declaration.Text, want)
+				}
+			}
+			owners := ScanLineOwners("Signatures.lean", test.source)
+			shape := make([]string, len(owners))
+			for index, owner := range owners {
+				switch {
+				case owner.Owner.Name == "":
+				case owner.IsSignature:
+					shape[index] = "sig " + owner.Owner.Name
+				default:
+					shape[index] = "body " + owner.Owner.Name
+				}
+			}
+			if !sameStrings(shape, test.owners) {
+				t.Errorf("line owners = %q, want %q", shape, test.owners)
+			}
+		})
+	}
+}
