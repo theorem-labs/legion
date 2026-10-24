@@ -56,6 +56,23 @@ func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 	return out, nil
 }
 
+// declarationsNamed gives the declarations of each of the full names in names, by name.
+func (s *Store) declarationsNamed(ctx context.Context, names []string) (map[string][]Found, error) {
+	out := make(map[string][]Found, len(names))
+	err := eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, names, func(r *sql.Rows) error {
+		f, err := scanFound(r)
+		if err != nil {
+			return err
+		}
+		out[f.Name] = append(out[f.Name], f)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func sourcePath(rel, module string) string {
 	if rel == "" {
 		rel = strings.ReplaceAll(module, ".", "/")

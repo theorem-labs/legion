@@ -179,7 +179,7 @@ func TestCheckLedgerChecksEveryLeanNamedLedgerContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []LedgerDefect{{Contract: wrong[0].Name, At: sourcePath("", wrong[0].Module), LedgerHash: "different", Version: 1, IndexHash: wrong[0].StmtHash}}
+	want := []LedgerDefect{{Contract: wrong[0].Name, At: wrong[0].At(), LedgerHash: "different", Version: 1, IndexHash: wrong[0].StmtHash}}
 	if r.Matching != 1 || !reflect.DeepEqual(r.Defects, want) || r.Gone != nil || !r.Defective() {
 		t.Fatalf("ledger report %+v, want one matching, one exact-name defect, no gone contracts", r)
 	}

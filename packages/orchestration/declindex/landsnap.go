@@ -15,23 +15,14 @@ type LandSnapshot struct {
 	Prefix  string
 	Sources map[string]string
 	// Modules are the source modules that the index read, each by its source path without the .lean suffix.
-	Modules      map[string]bool
-	Declarations map[string][]LandDeclaration
-}
-
-// LandDeclaration is one exact requested declaration from the snapshot, under its name in Declarations.
-type LandDeclaration struct {
-	Module   string
-	Path     string
-	StmtHash string
+	Modules map[string]bool
+	// Declarations are the declarations of each requested name.
+	Declarations map[string][]Found
 }
 
 // LandSnapshot reads source blobs, modules, and declarations with names in names.
 func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot, error) {
-	snapshot := LandSnapshot{
-		Modules:      map[string]bool{},
-		Declarations: map[string][]LandDeclaration{},
-	}
+	snapshot := LandSnapshot{Modules: map[string]bool{}}
 	sourceKind, err := s.Meta(ctx, "sources")
 	if err != nil {
 		return LandSnapshot{}, err
@@ -55,16 +46,7 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 	if err != nil {
 		return LandSnapshot{}, err
 	}
-	err = eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, names, func(r *sql.Rows) error {
-		f, err := scanFound(r)
-		if err != nil {
-			return err
-		}
-		snapshot.Declarations[f.Name] = append(snapshot.Declarations[f.Name],
-			LandDeclaration{Module: f.Module, Path: f.Path, StmtHash: f.StmtHash})
-		return nil
-	})
-	if err != nil {
+	if snapshot.Declarations, err = s.declarationsNamed(ctx, names); err != nil {
 		return LandSnapshot{}, err
 	}
 	return snapshot, nil

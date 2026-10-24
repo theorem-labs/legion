@@ -60,7 +60,8 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 		}
 	}
 	sort.Strings(changed)
-	changedDecls := map[string][]landDeclaration{}
+	// The declarations an answer can print, by name, each with its repository-relative path.
+	changedDecls := map[string][]Found{}
 	if len(changed) > 0 {
 		if r.BuildDir == "" {
 			return nil, fmt.Errorf("LAND_BUILD_DIR is required for changed source files")
@@ -93,9 +94,9 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 			if module.Stale != 0 {
 				return nil, fmt.Errorf("%s: %d declarations do not match the candidate source", rel, module.Stale)
 			}
-			for _, declaration := range module.Decls {
-				changedDecls[declaration.Name] = append(changedDecls[declaration.Name], landDeclaration{
-					path: prefix + path, hash: declaration.StmtHash,
+			for _, d := range module.Decls {
+				changedDecls[d.Name] = append(changedDecls[d.Name], Found{
+					Name: d.Name, Module: d.Module, Kind: d.Kind, Line: d.Line, Path: prefix + path, StmtHash: d.StmtHash,
 				})
 			}
 		}
@@ -113,7 +114,8 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 			// from both must not count as unchanged.
 			indexedBlob, indexed := snapshot.Sources[declaration.Path]
 			if blob, inTree := candidate[declaration.Path]; indexed && inTree && blob == indexedBlob {
-				declarations = append(declarations, landDeclaration{path: prefix + declaration.Path, hash: declaration.StmtHash})
+				declaration.Path = prefix + declaration.Path
+				declarations = append(declarations, declaration)
 			}
 		}
 		answer, err := answerLandHash(name, declarations)
@@ -125,30 +127,27 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 	return answers, nil
 }
 
-// landDeclaration is one declaration an answer can print: path is repository-relative.
-type landDeclaration struct{ path, hash string }
-
-// answerLandHash gives name's answer line from the declarations found for it. A path the line prints must not
-// contain the line's separators: a tab, carriage return or newline, or the comma that joins an ambiguous answer's
-// paths. A path that no answer prints is not checked.
-func answerLandHash(name string, declarations []landDeclaration) (LandHashAnswer, error) {
+// answerLandHash gives name's answer line from the declarations found for it, with their repository-relative paths.
+// A path the line prints must not contain the line's separators: a tab, carriage return or newline, or the comma
+// that joins an ambiguous answer's paths. A path that no answer prints is not checked.
+func answerLandHash(name string, declarations []Found) (LandHashAnswer, error) {
 	if len(declarations) == 0 {
 		return LandHashAnswer{Name: name, Hash: "absent", Path: "-"}, nil
 	}
 	for _, declaration := range declarations {
-		if strings.ContainsAny(declaration.path, "\t\r\n,") {
-			return LandHashAnswer{}, fmt.Errorf("%s: source path %q cannot be printed safely", name, declaration.path)
+		if strings.ContainsAny(declaration.Path, "\t\r\n,") {
+			return LandHashAnswer{}, fmt.Errorf("%s: source path %q cannot be printed safely", name, declaration.Path)
 		}
 	}
 	if len(declarations) == 1 {
-		if declarations[0].hash == "" {
+		if declarations[0].StmtHash == "" {
 			return LandHashAnswer{}, fmt.Errorf("%s has no statement hash", name)
 		}
-		return LandHashAnswer{Name: name, Hash: declarations[0].hash, Path: declarations[0].path}, nil
+		return LandHashAnswer{Name: name, Hash: declarations[0].StmtHash, Path: declarations[0].Path}, nil
 	}
 	paths := make([]string, len(declarations))
 	for i, declaration := range declarations {
-		paths[i] = declaration.path
+		paths[i] = declaration.Path
 	}
 	sort.Strings(paths)
 	return LandHashAnswer{Name: name, Hash: "ambiguous", Path: strings.Join(paths, ",")}, nil
