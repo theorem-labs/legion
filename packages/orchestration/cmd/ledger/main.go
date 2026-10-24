@@ -103,13 +103,9 @@ parsed:
 	if err != nil {
 		var check *checkResultError
 		if errors.As(err, &check) {
-			if jsonOutput || read {
-				if encodeErr := json.NewEncoder(stdout).Encode(check.result); encodeErr != nil {
-					fmt.Fprintln(stderr, encodeErr)
-					return 4
-				}
-			} else {
-				fmt.Fprintln(stdout, check.result)
+			if encodeErr := writeResult(stdout, check.result, jsonOutput || read); encodeErr != nil {
+				fmt.Fprintln(stderr, encodeErr)
+				return 4
 			}
 			return check.exit
 		}
@@ -124,16 +120,27 @@ parsed:
 		return writeError(stderr, jsonOutput, err)
 	}
 	if value != nil {
-		if jsonOutput || read {
-			if err := json.NewEncoder(stdout).Encode(value); err != nil {
-				fmt.Fprintln(stderr, err)
-				return 4
-			}
-		} else {
-			fmt.Fprintln(stdout, value)
+		if err := writeResult(stdout, value, jsonOutput || read); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 4
 		}
 	}
 	return 0
+}
+
+// writeResult prints a command's result. With --json, and for a read command in either mode, it prints one line of
+// JSON. Otherwise it prints the result's text form when it has one (a lease line, the ready list), and else the same
+// JSON indented, so text output is never Go syntax.
+func writeResult(stdout io.Writer, value any, asJSON bool) error {
+	encoder := json.NewEncoder(stdout)
+	if !asJSON {
+		if text, ok := value.(fmt.Stringer); ok {
+			_, err := fmt.Fprintln(stdout, text)
+			return err
+		}
+		encoder.SetIndent("", "  ")
+	}
+	return encoder.Encode(value)
 }
 
 func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, error) {
