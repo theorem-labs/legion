@@ -131,17 +131,17 @@ func TestGraphWriteKeepsTheTwoNodesUnderThePrefix(t *testing.T) {
 	}
 }
 
-// With no prefix given, a run keeps the deployment graph's own prefix, the one the deployment's configuration names:
-// the test graph, the test copy's topic_prefix and the report all carry it, and the code holds no default of its own.
-func TestRunWithNoPrefixKeepsTheDeploymentGraphsPrefix(t *testing.T) {
+// runUntilSetupStops runs the message test on a graph of fn and st under prefix (empty: the graph's own). The
+// deployment names only its graph and a ledger DSN file that does not exist, so the run stops in setup once it has
+// written the test graph, the test copy and the driver's extra topics.
+func runUntilSetupStops(t *testing.T, prefix string) (Report, string) {
+	t.Helper()
 	fn, st := "function:c@x/y.c", "struct:t"
 	dir := writeGraphDir(t, map[string]string{fn: "function", st: "struct"},
 		map[string][]string{fn: everyKind("function:c%40x%2Fy%2Ec", st), st: {"all", "node.struct:t.needs"}}, [][2]string{{fn, st}})
 	out := filepath.Join(t.TempDir(), "run")
-	// The deployment names only its graph and a ledger DSN file, so the run stops at setup once it has written the
-	// test graph and the test copy.
 	report, err := Run(t.Context(), Options{
-		Nodes: []string{fn, st}, Out: out,
+		Prefix: prefix, Nodes: []string{fn, st}, Out: out,
 		Deploy: ownerpkg.Deploy{GraphDir: dir, LedgerDSNFile: filepath.Join(t.TempDir(), "ledger-dsn")},
 		Owner:  "/opt/bin/owner", Legion: "/opt/bin/legion",
 		Getenv: func(string) string { return "" }, Progress: io.Discard, Timeouts: Timeouts{Poll: time.Millisecond},
@@ -149,20 +149,48 @@ func TestRunWithNoPrefixKeepsTheDeploymentGraphsPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Prefix != source {
-		t.Fatalf("report prefix = %q, want the graph's %q", report.Prefix, source)
+	return report, out
+}
+
+// assertRunPrefix checks that every topic of the run is under want: the report, the test graph's topics.json and every
+// topic in it, the test copy's topic_prefix, and the fact and concept topics the driver gives the source owner.
+func assertRunPrefix(t *testing.T, report Report, out, want string) {
+	t.Helper()
+	if report.Prefix != want {
+		t.Fatalf("report prefix = %q, want %q", report.Prefix, want)
 	}
 	topics, err := ownerpkg.LoadTopics(filepath.Join(out, "graph", "topics.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if topics.Prefix != source || !slices.Equal(topics.Owners[st], []string{source + "all", source + "node.struct:t.needs"}) {
-		t.Fatalf("topics.json = %+v, want the graph's prefix %q", topics, source)
+	if topics.Prefix != want || !slices.Equal(topics.Owners["struct:t"], []string{want + "all", want + "node.struct:t.needs"}) {
+		t.Fatalf("topics.json = %+v, want every topic under %q", topics, want)
 	}
 	config, err := ownerpkg.LoadConfig(&ownerpkg.Repo{Path: filepath.Join(out, "repo.git")})
-	if err != nil || config.TopicPrefix != source {
-		t.Fatalf("the test copy's configuration = %+v, %v; want topic_prefix %q", config, err, source)
+	if err != nil || config.TopicPrefix != want {
+		t.Fatalf("the test copy's configuration = %+v, %v; want topic_prefix %q", config, err, want)
 	}
+	extra, err := LoadExtraTopics(filepath.Join(out, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := extra["function:c@x/y.c"]; !slices.Equal(got, []string{want + "fact.stack-alignment.needs", want + "concepts"}) {
+		t.Fatalf("the source owner's extra topics = %v, want them under %q", got, want)
+	}
+}
+
+// A run's topics are under the --prefix it is given and then its own name, so runs on one hub, with one --prefix or
+// started in the same second, never see each other's notices.
+func TestRunPutsItsTopicsUnderItsPrefixAndItsName(t *testing.T) {
+	report, out := runUntilSetupStops(t, "notifications.example-message-test.")
+	assertRunPrefix(t, report, out, "notifications.example-message-test."+report.Run+".")
+}
+
+// With no prefix given, a run's topics are under the deployment graph's own prefix, the one the deployment's
+// configuration names, and then its own name; the code holds no default prefix of its own.
+func TestRunWithNoPrefixPutsItsTopicsUnderTheGraphsPrefixAndItsName(t *testing.T) {
+	report, out := runUntilSetupStops(t, "")
+	assertRunPrefix(t, report, out, source+report.Run+".")
 }
 
 // The supervisor's configuration is the minimal standing-owners file of C33, with the operator bearer the daemon

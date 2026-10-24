@@ -31,7 +31,7 @@ import (
 
 // Options configure one run.
 type Options struct {
-	Prefix string   // the topic prefix, under notifications. and ending in a dot; empty means the graph's own
+	Prefix string   // under notifications. and ending in a dot, empty for the graph's own; the run's topics are under it, then the run's name
 	Nodes  []string // the two owners; none means pickNodes chooses them from the graph
 	Kills  int      // how many owner panes to kill
 	Out    string   // the run's directory, absolute and new or empty
@@ -67,7 +67,8 @@ type driver struct {
 	report *Report
 	rng    *rand.Rand
 
-	run            string // the ledger repository and the daemon's project
+	run            string // the run's name: its ledger repository and the daemon's project
+	prefix         string // the run's topic prefix: the --prefix, or the graph's, then the run's name and a dot
 	root           string // the copy's records root
 	nodes          []string
 	source, target string
@@ -114,7 +115,7 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	seed := now.UnixNano()
 	d := &driver{
 		opts: opts, rng: rand.New(rand.NewPCG(uint64(seed), uint64(seed)>>1)), run: run, root: "skeleton",
-		report: &Report{Prefix: opts.Prefix, Out: opts.Out, Seed: seed, StartedAt: now},
+		report: &Report{Out: opts.Out, Seed: seed, StartedAt: now},
 	}
 	d.report.Run = d.run
 	type step struct {
@@ -268,30 +269,33 @@ func (d *driver) setup(ctx context.Context) error {
 	d.report.Nodes = d.nodes
 	d.source, d.target = graph.edge(d.nodes)
 	d.report.Edge = ownerpkg.EdgeID(d.source, d.target)
-	if d.opts.Prefix == "" {
-		// No prefix given: the run keeps the one the deployment's graph names, which its owners use.
-		d.opts.Prefix = graph.topics.Prefix
+	base := d.opts.Prefix
+	if base == "" {
+		// No prefix given: the run's topics are under the one the deployment's graph names, which its owners use.
+		base = graph.topics.Prefix
 	}
-	d.report.Prefix = d.opts.Prefix
+	// Each run's topics are under a prefix of its own, so that runs on one hub never see each other's notices.
+	d.prefix = base + d.run + "."
+	d.report.Prefix = d.prefix
 
 	graphDir := filepath.Join(out, "graph")
-	topics, owners, err := graph.write(graphDir, d.opts.Prefix, d.nodes, d.source)
+	topics, owners, err := graph.write(graphDir, d.prefix, d.nodes, d.source)
 	if err != nil {
 		return err
 	}
 	d.topics = topics
 	d.bare = filepath.Join(out, "repo.git")
-	if err := createCopy(d.bare, filepath.Join(out, "seed"), copyConfig(d.run, d.opts.Prefix, graphDir), d.nodes); err != nil {
+	if err := createCopy(d.bare, filepath.Join(out, "seed"), copyConfig(d.run, d.prefix, graphDir), d.nodes); err != nil {
 		return err
 	}
 	factOwners := ownerpkg.FactOwners{"fact-" + testFact: testFact}
-	if d.routing, err = ownerpkg.NewRouting(d.opts.Prefix, factOwners); err != nil {
+	if d.routing, err = ownerpkg.NewRouting(d.prefix, factOwners); err != nil {
 		return err
 	}
 
 	// The source owner also subscribes to the fact owner's and the librarian's topics, which no node owner holds.
 	d.stateDir = filepath.Join(out, "state")
-	extra := map[string][]string{d.source: {d.opts.Prefix + "fact." + testFact + ".needs", d.opts.Prefix + "concepts"}}
+	extra := map[string][]string{d.source: {d.prefix + "fact." + testFact + ".needs", d.prefix + "concepts"}}
 	if err := writeJSON(ExtraTopicsPath(d.stateDir), extra); err != nil {
 		return err
 	}
@@ -686,8 +690,8 @@ func (d *driver) arrival(ctx context.Context) error {
 			}
 		}
 	}
-	for _, topic := range []string{d.opts.Prefix + "fact." + testFact + ".users", d.opts.Prefix + "fact." + testFact + ".needs", d.opts.Prefix + "concepts"} {
-		notices = append(notices, notice{strings.TrimPrefix(topic, d.opts.Prefix), topic})
+	for _, topic := range []string{d.prefix + "fact." + testFact + ".users", d.prefix + "fact." + testFact + ".needs", d.prefix + "concepts"} {
+		notices = append(notices, notice{strings.TrimPrefix(topic, d.prefix), topic})
 	}
 	var publications []Publication
 	for _, n := range notices {

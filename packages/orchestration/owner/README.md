@@ -79,12 +79,14 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
 
 1. **Setup.** The run's name is `message-test-<UTC stamp>-<8 random hex digits>`, so that two runs started in the
    same second share nothing: it names the ledger repository, the daemon's project and tmux socket, and the private
-   bearer directory. A ledger repository of that name in the ledger of the operator deployment's
-   `ledger_dsn_file` (the driver is the operator's program: it reads no launch variable, and the supervisor gives the
-   same file to the test owners as `LEGION_LEDGER_DSN_FILE`), a bare repository with the test's `skeleton/` files, a
-   graph directory with the two nodes' `owners.json`, their `topics.json` moved under `--prefix` (without it, the
-   deployment graph's own prefix), the deployment's `graph.json`, and a `facts.json` in which the source node states
-   `stack-alignment`; a test deployment `DIR/deploy.yaml`; and the daemon's minimal standing-owners file
+   bearer directory. The run's topic prefix is `--prefix` (without it, the deployment graph's own prefix), then the
+   run's name and a dot, so that runs on one hub never see each other's notices: every topic the owners subscribe to
+   and the driver publishes on is under it. A ledger repository of the run's name in the ledger of the operator
+   deployment's `ledger_dsn_file` (the driver is the operator's program: it reads no launch variable, and the
+   supervisor gives the same file to the test owners as `LEGION_LEDGER_DSN_FILE`), a bare repository with the test's
+   `skeleton/` files and the run's prefix as `topic_prefix`, a graph directory with the two nodes' `owners.json`, their
+   `topics.json` moved under the run's prefix, the deployment's `graph.json`, and a `facts.json` in which the source
+   node states `stack-alignment`; a test deployment `DIR/deploy.yaml`; and the daemon's minimal standing-owners file
    `DIR/daemon/legion.yaml` (C33: `project`, `state_dir`, `runtime: tmux`, its own `port`, `operator_token_file`, the
    Envoy keys, and `standing_owners` with `max_running: 2` and an `omp` template per node kind, prompt
    `DIR/daemon/owner.md`). The daemon's own database comes from `LEGION_POSTGRES_DSN`. It runs
@@ -125,7 +127,7 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
 `messagetest/owner.md` is the test owners' prompt. Owners publish under the copy's `topic_prefix`, which the
 deployment graph's `topics.json` repeats; both accept any prefix under `notifications.` that ends in a dot. A test run
 passes a `--prefix` of its own, such as `notifications.example-message-test.`, so that its traffic reaches no
-production owner.
+production owner; the run's own name under it keeps one run's traffic from another's.
 
 `internal/ownerharness` is test support that only `_test.go` files import (its guard test checks it), and no command
 builds it. The `cmd/owner` test binary runs it when linked as `legion` (a stand-in supervisor in the shape of the
