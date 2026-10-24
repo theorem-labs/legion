@@ -91,6 +91,8 @@ packages/orchestration/declindex/e2e/record-librarian \
 
 It appends `<UTC>\t<id>\t<proposer>\t<SHA-256>` to the record, copies the proposal to `$LIBRARIAN_RECORD.d/<id>`, and then executes the optional command after `--`. Its exit status is that command's status.
 
+To record in front of a real librarian, configure `librarian: [record-librarian, --, COMMAND, ARGS...]`. The gate appends `--id … --proposer … --proposal …` to that list, so `record-librarian` takes everything between the leading `--` and those six arguments as the command. It records the call, then runs `COMMAND ARGS... --id … --proposer … --proposal …`, and exits with its status.
+
 ## Ledger join
 
 Run the ledger join where `declindex`, `ledger`, Python 3, the configuration's indexed tree, and the ledger DSN are reachable. `JOIN_CANDIDATE_COMMIT` and `JOIN_CHANGED_HASH` must name the already prepared, real candidate; the driver does not invent a source mutation.
