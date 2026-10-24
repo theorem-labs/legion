@@ -286,7 +286,8 @@ These rules follow what the machine code shows, each only where it shows it:
   `rq_clock_task`'s `WARN_ON_ONCE` test stays and its read of `rq->clock_task` goes.
   A discarded value whose only effects are where the image makes a choice (`cpumask_empty`'s
   `find_first_bit`, after `bitmap_empty`'s `__builtin_constant_p` test returns, in `vmstat_cpu_dead`)
-  is `conditional`: the image decides whether it is compiled.
+  is `conditional`: the image decides whether it is compiled. So is a loop of such effects only
+  (`rcu_report_exp_cpu_mult`'s `for_each_leaf_node_cpu_mask` without `NO_HZ_FULL`).
   `&v` of a local passed to a parameter an inline callee only stores through (`range->end = end`),
   and, where nothing else reads `v`, a value the callee only stores there, are `conditional`: where
   the image inlines the callee neither is computed, where it calls the callee both are, so the image

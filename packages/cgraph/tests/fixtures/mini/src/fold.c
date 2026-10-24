@@ -687,3 +687,30 @@ long fd_make_vfsuid(struct fd_user_ns *ns, fd_kuid_t k)
 		return -1;
 	return uid;
 }
+
+/* kernel/rcu/tree_exp.h rcu_report_exp_cpu_mult without NO_HZ_FULL: for_each_leaf_node_cpu_mask(rnp,
+ * cpu, mask) { ...; if (!IS_ENABLED(CONFIG_NO_HZ_FULL) || ...) continue; ... }, whose cpumask_next
+ * has an effect only beside a __builtin_constant_p path: the image decides (llvm-objdump: no load of
+ * lo or hi). */
+struct fd_node_range {
+	int lo;
+	int hi;
+};
+
+static inline int fd_next(int n, unsigned int size)
+{
+	if (__builtin_constant_p(size) && size <= 64)
+		return n + 1;
+	__asm__ volatile("" ::: "memory");
+	return n + 2;
+}
+
+void fd_report_mult(struct fd_node_range *r, struct box *b)
+{
+	int cpu;
+
+	for (cpu = fd_next(r->lo - 1, 32); cpu <= r->hi; cpu = fd_next(cpu, 32))
+		if (!0 || cpu)
+			continue;
+	obj_free(b);
+}

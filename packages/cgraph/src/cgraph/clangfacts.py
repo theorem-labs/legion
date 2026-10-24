@@ -1150,13 +1150,17 @@ class _Extractor:
                 return children[:1]
         return children
 
-    def loop_without_effect(self, loop: ci.Cursor, function: ci.Cursor, dead: frozenset[int]) -> bool:
+    def loop_without_effect(
+        self, loop: ci.Cursor, function: ci.Cursor, dead: frozenset[int], image: bool = False
+    ) -> bool:
         """A loop that has no effect: it may be assumed to end (not a constant controlling
         expression), control leaves it only by its end (no return or goto in a part it reaches, as
         __aggregate_find's ``list_for_each_entry(...) if (...) return m;``), and it stores only to
         locals nothing outside it reads. flush_all_rcu_sheaves' ``list_for_each_entry(s,
         &slab_caches, list) { if (!cache_has_sheaves(s)) continue; ... }`` with CONFIG_SLUB_TINY
-        stores only its cursor; the compiler removes the whole loop."""
+        stores only its cursor; the compiler removes the whole loop. With ``image``, effects under a
+        choice the image makes do not count (rcu_report_exp_cpu_mult's for_each_leaf_node_cpu_mask,
+        whose cpumask_next is find_next_bit's small_const_nbits path or a call)."""
         if loop.kind not in _LOOPS or self.loop_may_not_end(loop) or _jumps_out(loop, 0, self.live_children):
             return False
         stored: set[int] = set()
@@ -1166,7 +1170,7 @@ class _Extractor:
             if variable is not None and _is_local(variable):
                 stored.add(variable.hash)
         declared = {node.hash for node in _effect_nodes(loop) if node.kind == K.VAR_DECL and _is_local(node)}
-        return self._effect_free(loop, stored | declared | dead, inlined=True) and not _referenced_outside(
+        return self._effect_free(loop, stored | declared | dead, inlined=True, image=image) and not _referenced_outside(
             function, loop, stored - declared
         )
 
@@ -5481,6 +5485,20 @@ class _FunctionWalk:
                 case_guard = self.case_guards.get(child.hash)
                 if dead:
                     self.walk(child, node, child_index, "after_exit", generic)
+                elif (
+                    case_guard is None
+                    and not self.conditional
+                    and child.kind in _LOOPS
+                    and not self.x.loop_without_effect(child, self.cursor, self.dead_variables)
+                    and self.x.loop_without_effect(child, self.cursor, self.dead_variables, image=True)
+                ):
+                    # A loop whose only effects are where the image makes a choice: the image decides
+                    # whether any of it is compiled (rcu_report_exp_cpu_mult's leaf-CPU loop).
+                    self.conditional += 1
+                    try:
+                        self.walk(child, node, child_index, None, generic)
+                    finally:
+                        self.conditional -= 1
                 elif case_guard is None and self.same_store(child):
                     # if (c) v = a; else v = b; where a and b are one value (make_vfsuid's uid =
                     # __kuid_val(kuid) or from_kuid(fs_userns, kuid) without CONFIG_USER_NS): c
