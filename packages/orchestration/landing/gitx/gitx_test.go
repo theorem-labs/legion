@@ -103,6 +103,23 @@ func TestChangeSetUsesMergeBase(t *testing.T) {
 	}
 }
 
+// A member that moves a file changes both paths, and a path with non-ASCII
+// bytes is listed as it is, not quoted.
+func TestChangeSetListsMovedAndNonASCIIPaths(t *testing.T) {
+	repo := newRepository(t)
+	base := repo.commit("Old.lean", "def kept := 0\ndef kept1 := 1\ndef kept2 := 2\ndef kept3 := 3\n")
+	run(t, repo.path, "mv", "Old.lean", "New.lean")
+	member := repo.commit("Alpha é.lean", "def added := 0\n")
+
+	set, err := ChangeSet(context.Background(), repo.path, base, Member{ID: "member", Head: member})
+	if err != nil {
+		t.Fatalf("ChangeSet() error = %v", err)
+	}
+	if got, want := set.Files, []string{"Alpha é.lean", "New.lean", "Old.lean"}; !sameStrings(got, want) {
+		t.Fatalf("ChangeSet() files = %#v, want %#v", got, want)
+	}
+}
+
 func TestDossierCase1KeepsEachMemberChangeSet(t *testing.T) {
 	repo := newRepository(t)
 	base := repo.commit("base", "base\n")

@@ -65,7 +65,7 @@ func TestRunConfirmsEvidenceBackedCulpritAndRebuilds(t *testing.T) {
 		"tree-keep":     {Green: true},
 	}}
 	runner := testRunner(ledger, builder)
-	runner.Git.(*gitFake).evidence["bad"] = blame.IndexDiff("-def gone := 0\n")
+	runner.Git.(*gitFake).evidence["bad"] = blame.IndexDeclarations([]blame.Declaration{{Name: "gone", Text: "def gone := 0"}}, nil)
 
 	batch, err := runner.Run(context.Background(), Input{
 		ID: "batch", Repository: "repo", Base: "base", Members: []Member{member("bad"), member("keep")},

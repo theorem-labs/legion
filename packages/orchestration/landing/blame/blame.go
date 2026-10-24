@@ -264,62 +264,6 @@ func IndexDeclarations(before, after []Declaration) Evidence {
 	return evidence
 }
 
-// IndexDiff extracts evidence from a unified diff. Production callers index
-// complete source declarations with IndexDeclarations; this keeps the compact
-// diff form useful for direct evidence tests.
-func IndexDiff(diff string) Evidence {
-	evidence := newEvidence()
-	added, removed := scanner{}, scanner{}
-	var scope Declaration
-	for _, line := range strings.Split(diff, "\n") {
-		switch {
-		case strings.HasPrefix(line, "--- "):
-			removed = scanner{file: diffPath(strings.TrimPrefix(line, "--- "), "a/")}
-			scope = Declaration{}
-			continue
-		case strings.HasPrefix(line, "+++ "):
-			added = scanner{file: diffPath(strings.TrimPrefix(line, "+++ "), "b/")}
-			scope = Declaration{}
-			continue
-		}
-		if match := hunkRE.FindStringSubmatch(line); match != nil {
-			if name := added.declared(match[1]); name != "" {
-				scope = Declaration{File: added.file, Name: name}
-				evidence.Inside[scope.ID()] = scope
-			}
-			continue
-		}
-		if len(line) == 0 || (line[0] != '+' && line[0] != '-') {
-			continue
-		}
-		sign, body := line[:1], line[1:]
-		source := &added
-		if sign == "-" {
-			source = &removed
-		}
-		result := source.scan(body)
-		if result.kind == declarationLine {
-			evidence.addDeclaration(result.declaration, sign)
-			scope = result.declaration
-			continue
-		}
-		if result.kind == namespaceLine && sign == "-" {
-			namespace := Declaration{File: source.file, Name: result.namespace}
-			evidence.Namespaces[namespace.ID()] = namespace
-			continue
-		}
-		if match := fieldRE.FindStringSubmatch(result.code); match != nil && scope.Name != "" {
-			field := scope.Name + "." + match[1]
-			if sign == "+" {
-				evidence.FieldsAdded[field] = struct{}{}
-			} else {
-				evidence.FieldsRemoved[field] = struct{}{}
-			}
-		}
-	}
-	return evidence
-}
-
 func newEvidence() Evidence {
 	return Evidence{
 		Removed:       declarationSet{},
@@ -346,14 +290,6 @@ func (e Evidence) addDeclaration(declaration Declaration, sign string) {
 		return
 	}
 	e.Removed[id] = declaration
-}
-
-func declarationName(line string) string {
-	result := (&scanner{}).scan(line)
-	if result.kind != declarationLine {
-		return ""
-	}
-	return result.declaration.Name
 }
 
 // EvidenceFor scores one member's evidence for a diagnostic name.

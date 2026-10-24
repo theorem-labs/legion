@@ -69,6 +69,48 @@ func TestBlameCommandExcludesListedMembers(t *testing.T) {
 	}
 }
 
+// An old member restates the base's own `def Shared := 0`, and another adds
+// a second Shared in another file. `land blame` compares each member's
+// additions with the base and candidate trees: the restatement is not
+// evidence, and the second Shared changed the candidate.
+func TestBlameCommandSuppressesRestatementOfTheBase(t *testing.T) {
+	repo := t.TempDir()
+	command(t, repo, "init", "-q")
+	command(t, repo, "config", "user.email", "test@example.invalid")
+	command(t, repo, "config", "user.name", "Test")
+	write(t, filepath.Join(repo, "Root.lean"), "def root := 0\n")
+	command(t, repo, "add", "Root.lean")
+	command(t, repo, "commit", "-qm", "root")
+	root := command(t, repo, "rev-parse", "HEAD")
+	write(t, filepath.Join(repo, "Alpha.lean"), "def Shared := 0\n")
+	command(t, repo, "add", "Alpha.lean")
+	command(t, repo, "commit", "-qm", "base")
+	base := command(t, repo, "rev-parse", "HEAD")
+	command(t, repo, "checkout", "-q", "-b", "stale", root)
+	write(t, filepath.Join(repo, "Alpha.lean"), "def Shared := 0\n")
+	command(t, repo, "add", "Alpha.lean")
+	command(t, repo, "commit", "-qm", "stale")
+	stale := command(t, repo, "rev-parse", "HEAD")
+	command(t, repo, "checkout", "-q", "-b", "duplicate", base)
+	write(t, filepath.Join(repo, "Beta.lean"), "def Shared := 1\n")
+	command(t, repo, "add", "Beta.lean")
+	command(t, repo, "commit", "-qm", "duplicate")
+	duplicate := command(t, repo, "rev-parse", "HEAD")
+
+	members := filepath.Join(t.TempDir(), "members.tsv")
+	log := filepath.Join(t.TempDir(), "build.log")
+	write(t, members, "stale\t"+stale+"\nduplicate\t"+duplicate+"\n")
+	write(t, log, "✖ [1/1] Building Alpha\nerror: Alpha.lean:1:1: environment already contains 'Shared'\n")
+	var output bytes.Buffer
+
+	if err := run(context.Background(), []string{"blame", "--repo", repo, "--base", base, "--members", members, "--log", log}, &output); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if got, want := output.String(), "duplicate\tAlpha\tShared\tadded\t3\tchanged in candidate\n"; got != want {
+		t.Fatalf("blame output = %q, want %q", got, want)
+	}
+}
+
 func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 	repo := t.TempDir()
 	command(t, repo, "init", "-q")

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 )
 
@@ -131,10 +132,18 @@ func ChangeSet(ctx context.Context, repo, base string, member Member) (Change, e
 	if err != nil {
 		return Change{}, fmt.Errorf("find merge base for %q: %w", member.ID, err)
 	}
-	files, err := gitLines(ctx, repo, "diff", "--name-only", mergeBase, head)
+	raw, err := git(ctx, repo, "diff", "--name-only", "--no-renames", "-z", mergeBase, head)
 	if err != nil {
 		return Change{}, fmt.Errorf("list member %q files: %w", member.ID, err)
 	}
+	var files []string
+	for _, path := range strings.Split(raw, "\x00") {
+		path = strings.TrimSpace(path)
+		if path != "" {
+			files = append(files, path)
+		}
+	}
+	sort.Strings(files)
 	return Change{Files: files, Ranges: []Range{{Base: mergeBase, Head: head}}}, nil
 }
 

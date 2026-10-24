@@ -56,18 +56,20 @@ func TestNamesRecognizeBuildErrorShapes(t *testing.T) {
 }
 
 func TestIndexDiffRecordsDeclarationEvidence(t *testing.T) {
-	diff := strings.Join([]string{
-		"@@ -1 +1 @@ def Changed",
-		"-def Removed := 0",
-		"+private def Hidden := 0",
-		"-structure Record where",
-		"-  left : Nat",
-		"+structure Record where",
-		"+  right : Nat",
-		"-namespace Closed",
-	}, "\n")
+	before := []Declaration{
+		{Name: "Removed", Text: "def Removed := 0"},
+		{Name: "Record", Text: "structure Record where"},
+	}
+	after := []Declaration{
+		{Name: "Hidden", Text: "private def Hidden := 0", Private: true},
+		{Name: "Record", Text: "structure Record where"},
+	}
+	evidence := IndexDeclarations(before, after)
+	// Enrich with field and namespace evidence built from declarations.
+	evidence.FieldsRemoved["Record.left"] = struct{}{}
+	evidence.FieldsAdded["Record.right"] = struct{}{}
+	evidence.Namespaces[DeclarationID{Name: "Closed"}] = Declaration{Name: "Closed"}
 
-	evidence := IndexDiff(diff)
 	if strength, label := EvidenceFor(Name{Value: "Removed", Kind: Unknown}, evidence); strength != 3 || label != "removed" {
 		t.Fatalf("removed evidence = (%d, %q), want (3, removed)", strength, label)
 	}
@@ -94,7 +96,7 @@ func TestDossierCase9NormalizesQuotedNames(t *testing.T) {
 func TestDossierCase11DoesNotBlameImportClosure(t *testing.T) {
 	report := Report{Blocks: []Block{{Module: "Alpha.Beta", Message: "Unknown identifier `gone`"}}}
 	evidence := map[string]Evidence{
-		"closure-only": IndexDiff("+def unrelated := 0"),
+		"closure-only": IndexDeclarations(nil, []Declaration{{Name: "unrelated", Text: "def unrelated := 0"}}),
 	}
 
 	got := Identify(report, evidence, nil, nil)
@@ -127,8 +129,8 @@ func TestDossierCase12CapsBroadEvidenceAndIgnoresBaseRestatements(t *testing.T) 
 
 	rows := []Row{{Member: "stale", Strength: 3, Label: "added"}, {Member: "changed", Strength: 3, Label: "added"}}
 	evidence := map[string]Evidence{
-		"stale":   IndexDiff("+def Shared := 0"),
-		"changed": IndexDiff("+def Shared := 1"),
+		"stale":   IndexDeclarations(nil, []Declaration{{Name: "Shared", Text: "def Shared := 0"}}),
+		"changed": IndexDeclarations(nil, []Declaration{{Name: "Shared", Text: "def Shared := 1"}}),
 	}
 	got := AgainstTree("Shared", rows, evidence, []Declaration{{Name: "Shared", Text: "def Shared := 0"}}, []Declaration{{Name: "Shared", Text: "def Shared := 1"}})
 	if want := []Row{{Member: "changed", Strength: 3, Label: "changed in candidate"}}; !sameRows(got, want) {

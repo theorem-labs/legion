@@ -88,10 +88,13 @@ type scanner struct {
 	// that close a raw string literal, or -1 in an ordinary one.
 	inString  bool
 	rawHashes int
-	// pendingPrivate and pendingProtected come from lines that hold only
-	// attributes and modifiers; they apply to the next declaration.
+	// pendingPrivate, pendingProtected, and pendingText come from lines that
+	// hold only attributes and modifiers; they apply to the next declaration.
 	pendingPrivate   bool
 	pendingProtected bool
+	pendingText      string
+	// currentIsStructure is true when current was declared by structure or class.
+	currentIsStructure bool
 }
 
 // ScanDeclarations returns every declaration in one Lean source file, each with
@@ -166,18 +169,21 @@ func (s *scanner) scan(line string) scanned {
 	if startedInString {
 		// The line continues a string literal, so nothing on it is a command.
 		s.pendingPrivate, s.pendingProtected = false, false
+		s.pendingText = ""
 		return scanned{code: code}
 	}
 	if modifierLineRE.MatchString(code) && !sectionRE.MatchString(code) {
 		words := strings.Fields(attributeRE.ReplaceAllString(code, " "))
 		s.pendingPrivate = s.pendingPrivate || containsString(words, "private")
 		s.pendingProtected = s.pendingProtected || containsString(words, "protected")
+		s.pendingText += strings.Join(strings.Fields(code), " ") + " "
 		return scanned{code: code}
 	}
-	pendingPrivate, pendingProtected := s.pendingPrivate, s.pendingProtected
-	s.pendingPrivate, s.pendingProtected = false, false
+	pendingPrivate, pendingProtected, pendingText := s.pendingPrivate, s.pendingProtected, s.pendingText
+	s.pendingPrivate, s.pendingProtected, s.pendingText = false, false, ""
 	if match := namespaceRE.FindStringSubmatch(code); match != nil {
 		s.current = Declaration{}
+		s.currentIsStructure = false
 		for _, part := range nameParts(match[1]) {
 			s.scopes = append(s.scopes, scope{kind: namespaceScope, name: part})
 		}
@@ -185,10 +191,9 @@ func (s *scanner) scan(line string) scanned {
 	}
 	if match := endRE.FindStringSubmatch(code); match != nil {
 		s.current = Declaration{}
+		s.currentIsStructure = false
 		parts := nameParts(match[1])
 		closed := s.prefix()
-		// An `end N` outside every scope the scanner has seen (a diff whose
-		// context lacks the opening line) still closes namespace N.
 		closesNamespace := len(s.scopes) == 0 && len(parts) != 0
 		if closesNamespace {
 			closed = strings.Join(parts, ".")
@@ -207,6 +212,7 @@ func (s *scanner) scan(line string) scanned {
 	}
 	if match := sectionRE.FindStringSubmatch(code); match != nil {
 		s.current = Declaration{}
+		s.currentIsStructure = false
 		parts := nameParts(match[1])
 		if len(parts) == 0 {
 			parts = []string{""}
@@ -218,36 +224,29 @@ func (s *scanner) scan(line string) scanned {
 	}
 	if mutualRE.MatchString(code) {
 		s.current = Declaration{}
+		s.currentIsStructure = false
 		s.scopes = append(s.scopes, scope{kind: mutualScope})
 		return scanned{code: code}
 	}
 	if match := declarationRE.FindStringSubmatch(code); match != nil {
 		modifiers := strings.Fields(match[1])
+		text := strings.TrimSpace(pendingText + strings.Join(strings.Fields(code), " "))
 		declaration := Declaration{
 			File:      s.file,
 			Name:      s.qualify(strings.TrimSuffix(match[2], ".")),
-			Text:      strings.Join(strings.Fields(code), " "),
+			Text:      text,
 			Private:   pendingPrivate || containsString(modifiers, "private"),
 			Protected: pendingProtected || containsString(modifiers, "protected"),
 		}
 		s.current = declaration
+		s.currentIsStructure = isStructureDecl(code)
 		return scanned{kind: declarationLine, code: code, declaration: declaration}
 	}
 	if commandRE.MatchString(code) {
 		s.current = Declaration{}
+		s.currentIsStructure = false
 	}
 	return scanned{code: code}
-}
-
-// declared returns the fully qualified name that a line, such as a hunk
-// header's context, declares in the scanner's current scope, or "". It does
-// not change the scanner.
-func (s *scanner) declared(line string) string {
-	match := declarationRE.FindStringSubmatch((&scanner{}).uncomment(line))
-	if match == nil {
-		return ""
-	}
-	return s.qualify(strings.TrimSuffix(match[2], "."))
 }
 
 // uncomment returns a line's code: it removes block comments, which may span
@@ -419,4 +418,90 @@ func diffPath(path, prefix string) string {
 		return ""
 	}
 	return strings.TrimPrefix(path, prefix)
+}
+
+// isStructureDecl reports whether a code line declares a structure or class.
+func isStructureDecl(code string) bool {
+	fields := strings.Fields(code)
+	for _, word := range fields {
+		switch word {
+		case "structure", "class":
+			return true
+		case "def", "theorem", "lemma", "inductive", "abbrev", "instance",
+			"axiom", "opaque", "notation", "macro", "syntax", "macro_rules",
+			"elab", "alias":
+			return false
+		}
+	}
+	return false
+}
+
+// containsBodyStart reports whether a code line (already uncommented) begins
+// the definition body. It detects `:=` at bracket depth zero and a trailing
+// `where`.
+func containsBodyStart(code string) bool {
+	depth := 0
+	for i := 0; i < len(code); i++ {
+		switch code[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ':':
+			if depth == 0 && i+1 < len(code) && code[i+1] == '=' {
+				return true
+			}
+		}
+	}
+	trimmed := strings.TrimSpace(code)
+	return trimmed == "where" || strings.HasSuffix(trimmed, " where")
+}
+
+// LineOwner describes which declaration owns a source line and what part of
+// the declaration the line belongs to.
+type LineOwner struct {
+	Owner       Declaration
+	IsSignature bool // true for the header and continuation lines before := or where
+	IsStructure bool // true when the owner was declared by structure or class
+}
+
+// ScanLineOwners returns one LineOwner per source line (0-indexed). Lines
+// outside any declaration's body have a zero owner. Comment-only and blank
+// lines inside a declaration keep the owner but are marked as non-signature
+// body lines.
+func ScanLineOwners(file, source string) []LineOwner {
+	s := scanner{file: file}
+	lines := strings.Split(source, "\n")
+	owners := make([]LineOwner, len(lines))
+	inSignature := false
+	for i, line := range lines {
+		wasInString := s.inString
+		result := s.scan(line)
+		code := strings.TrimSpace(result.code)
+		switch {
+		case result.kind == declarationLine:
+			inSignature = !containsBodyStart(result.code)
+			owners[i] = LineOwner{
+				Owner:       result.declaration,
+				IsSignature: true,
+				IsStructure: s.currentIsStructure,
+			}
+		case s.current.Name == "":
+			inSignature = false
+		case code == "":
+			// Blank or comment-only line: no evidence.
+		case !wasInString && modifierLineRE.MatchString(result.code) && !sectionRE.MatchString(result.code):
+			// Modifier/attribute line: belongs to the next declaration.
+		default:
+			if inSignature && containsBodyStart(result.code) {
+				owners[i] = LineOwner{Owner: s.current, IsSignature: true, IsStructure: s.currentIsStructure}
+				inSignature = false
+				continue
+			}
+			owners[i] = LineOwner{Owner: s.current, IsSignature: inSignature, IsStructure: s.currentIsStructure}
+		}
+	}
+	return owners
 }

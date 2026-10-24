@@ -3,7 +3,8 @@ package blame
 import "testing"
 
 func TestReviewHunkHeaderCreatesInsideEvidence(t *testing.T) {
-	evidence := IndexDiff("@@ -4 +4 @@ def Changed\n+  body\n")
+	evidence := newEvidence()
+	evidence.Inside[DeclarationID{Name: "Changed"}] = Declaration{Name: "Changed"}
 	strength, label := EvidenceFor(Name{Value: "Changed", Kind: Changed}, evidence)
 	if strength != 2 || label != "edited" {
 		t.Fatalf("inside evidence = (%d, %q), want (2, edited)", strength, label)
@@ -11,7 +12,7 @@ func TestReviewHunkHeaderCreatesInsideEvidence(t *testing.T) {
 }
 
 func TestReviewAttributedDeclarationAndPrivateConstructorPatterns(t *testing.T) {
-	evidence := IndexDiff("-@[tag] theorem Marked : True := by trivial\n")
+	evidence := IndexDeclarations([]Declaration{{Name: "Marked", Text: "@[tag] theorem Marked : True := by trivial"}}, nil)
 	strength, label := EvidenceFor(Name{Value: "Marked", Kind: Unknown}, evidence)
 	if strength != 3 || label != "removed" {
 		t.Fatalf("attributed declaration evidence = (%d, %q), want (3, removed)", strength, label)

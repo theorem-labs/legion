@@ -96,7 +96,7 @@ func recoveryScenarios() []recoveryScenario {
 		{name: "build blame", runner: func() (Runner, *ledgerFake) {
 			ledger := &ledgerFake{}
 			runner := testRunner(ledger, &builderFake{results: red})
-			runner.Git.(*gitFake).evidence["bad"] = blame.IndexDiff("-def gone := 0\n")
+			runner.Git.(*gitFake).evidence["bad"] = blame.IndexDeclarations([]blame.Declaration{{Name: "gone", Text: "def gone := 0"}}, nil)
 			return runner, ledger
 		}},
 	}
