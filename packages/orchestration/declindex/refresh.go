@@ -158,7 +158,7 @@ type stored struct{ module, ileanKey, oleanKey string }
 
 func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
 	out := map[string]stored{}
-	rows, err := s.db.QueryContext(ctx, `SELECT rel, module, ilean_key, olean_key FROM modules`)
+	rows, err := s.q.QueryContext(ctx, `SELECT rel, module, ilean_key, olean_key FROM modules`)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var rel string
 		var st stored
@@ -176,7 +176,7 @@ func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
 
 func (s *Store) storedSources(ctx context.Context) (map[string]string, error) {
 	out := map[string]string{}
-	rows, err := s.db.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	rows, err := s.q.QueryContext(ctx, `SELECT path, blob FROM sources`)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var path, blob string
 		if err := r.Scan(&path, &blob); err != nil {
@@ -284,7 +284,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	})
 	logf(opt.Log, "index: %d modules, %d reference files changed, %d gone, read in %s", len(files), len(changed),
 		len(gone), time.Since(t0).Round(time.Millisecond))
-	if err := s.write(ctx, func() error {
+	if err := s.write(ctx, opt.Log, func() error {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -373,8 +373,10 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 				return err
 			}
 		}
-		// The graph file is written after the commit. A new generation token marks it out of date until a graph of
-		// this generation is written, so a failed write is repaired by the next refresh and never read meanwhile.
+		// The graph file is written from this transaction's rows just before its commit, so a reader whose snapshot
+		// begins after the commit finds its graph in place. Its generation token is the index's: a reader refuses a
+		// graph of another generation (graph), and a graph write or commit that fails leaves the two of different
+		// generations, which the next refresh repairs.
 		token, err := s.Meta(ctx, "graph")
 		if err != nil {
 			return err
@@ -392,12 +394,9 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 				return err
 			}
 		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
 		if graphToken(s.path+".graph") != token {
 			t1 := time.Now()
-			g, err := buildGraph(ctx, s.db)
+			g, err := buildGraph(ctx, tx)
 			if err != nil {
 				return fmt.Errorf("build the declaration graph: %w", err)
 			}
@@ -409,7 +408,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 			logf(opt.Log, "index: declaration graph of %d declarations and %d edges written in %s", len(g.names), len(g.dst),
 				time.Since(t1).Round(time.Millisecond))
 		}
-		return nil
+		return tx.Commit()
 	}); err != nil {
 		return st, err
 	}

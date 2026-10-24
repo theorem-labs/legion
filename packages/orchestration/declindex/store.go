@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -112,8 +113,14 @@ const (
 
 // Store is an open index: the SQLite file at path, and the declaration graph beside it at path + ".graph".
 type Store struct {
-	db   *sql.DB
+	db *sql.DB
+	// q is what every read of the store goes through: the database, or for a store opened read-only its snapshot.
+	q    dbReader
 	path string
+	// snapshot is the one read transaction that a store opened read-only reads for its whole life, and graphFile the
+	// graph file that was in place when it began (OpenReadOnly).
+	snapshot  *sql.Tx
+	graphFile *os.File
 	// release gives back the shared holds on the locks of a store opened in a read-only directory.
 	release func()
 
@@ -137,7 +144,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, path: path}
+	s := &Store{db: db, q: db, path: path}
 	if err := s.init(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -160,8 +167,14 @@ const (
 )
 
 // OpenReadOnly opens an existing, initialized index without creating files, initializing the schema, or enabling
-// WAL: the gate opens it so that its reads cannot modify a project's tree, and the post-landing commands because
-// the landing program mounts their index directory read-only.
+// WAL: the gate opens it so that its reads cannot modify a project's tree, the post-landing commands because the
+// landing program mounts their index directory read-only, and the queries because they only read.
+//
+// The store reads one state of the index for its whole life: one read transaction, begun here and ended by Close,
+// carries every read, and the graph file it reads is the one in place when that transaction began (graph refuses a
+// later one). So a command never sees a refresh's write half done, nor rows of two refreshes. A refresh writes the
+// reference part and the compiled part in two transactions; a reader between them reads the compiled part of the
+// commit before, which its readers refuse (CompiledCommit).
 //
 // SQLite reads a WAL database only through its shared-memory file, which it cannot create in a read-only
 // directory. There the index is opened immutable, reading the database file alone, while the store holds, shared,
@@ -169,7 +182,7 @@ const (
 // meanwhile and each write before it has checkpointed its write-ahead log into the file; and for IndexAndTree the
 // refresh lock before it, so that no refresh changes the tree meanwhile. A non-empty log left beside the file (a
 // write that did not finish) is refused, since the file alone would then be out of date. In a writable directory
-// the store holds no lock, and SQLite reads each query from one committed state of the index.
+// the store holds no lock: a refresh can commit while it reads, and its checkpoint waits for the store to close.
 func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, error) {
 	if info, err := os.Stat(path); err != nil {
 		return nil, err
@@ -203,7 +216,14 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 		}
 		return nil, err
 	}
-	s := &Store{db: db, path: path, release: release}
+	s := &Store{db: db, q: db, path: path, release: release}
+	// One read transaction for the store's life, so that every read of it sees one committed state of the index. It
+	// lives until Close, not until ctx ends; its first read below begins the snapshot.
+	if s.snapshot, err = db.BeginTx(context.WithoutCancel(ctx), &sql.TxOptions{ReadOnly: true}); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("open the index read-only: %w", err)
+	}
+	s.q = s.snapshot
 	version, err := s.Meta(ctx, "schema")
 	if err != nil {
 		_ = s.Close()
@@ -212,6 +232,12 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 	if version != SchemaVersion {
 		_ = s.Close()
 		return nil, fmt.Errorf("index %s has schema %q, and this declindex reads schema %q: run declindex refresh, which rebuilds it", path, version, SchemaVersion)
+	}
+	// The graph file of this state: a refresh replaces it just before its commit, so this opens a later one only when
+	// a refresh replaced it after the snapshot's first read above, and graph() refuses that one. A reader keeps the
+	// file it opened when a later refresh replaces it.
+	if f, err := os.Open(path + ".graph"); err == nil {
+		s.graphFile = f
 	}
 	return s, nil
 }
@@ -246,7 +272,7 @@ func (s *Store) init(ctx context.Context) error {
 	if err != nil || version == SchemaVersion {
 		return err
 	}
-	return s.write(ctx, func() error {
+	return s.write(ctx, nil, func() error {
 		if _, err := s.db.ExecContext(ctx, schema); err != nil {
 			return fmt.Errorf("create the index schema: %w", err)
 		}
@@ -275,15 +301,23 @@ func (s *Store) init(ctx context.Context) error {
 // schemaVersion is the index's schema version, empty for a file without a meta table: a new one.
 func (s *Store) schemaVersion(ctx context.Context) (string, error) {
 	var meta int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).Scan(&meta)
+	err := s.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).Scan(&meta)
 	if err != nil || meta == 0 {
 		return "", err
 	}
 	return s.Meta(ctx, "schema")
 }
 
-// Close closes the index, and gives back the read-only store's holds on its locks.
+// Close closes the index: it ends the read-only store's snapshot and gives back its holds on the locks.
 func (s *Store) Close() error {
+	if s.snapshot != nil {
+		_ = s.snapshot.Rollback()
+		s.snapshot = nil
+	}
+	if s.graphFile != nil {
+		_ = s.graphFile.Close()
+		s.graphFile = nil
+	}
 	err := s.db.Close()
 	if s.release != nil {
 		s.release()
@@ -304,7 +338,7 @@ func (s *Store) setMeta(ctx context.Context, x execer, k, v string) error {
 // Meta reads one value the index keeps about itself (commit, built, schema, errors); empty when unset.
 func (s *Store) Meta(ctx context.Context, k string) (string, error) {
 	var v string
-	err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
+	err := s.q.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -337,11 +371,12 @@ func (s *Store) lockRefresh(ctx context.Context) (func(), error) {
 	return lockFile(ctx, s.path+refreshLockSuffix, true)
 }
 
-// write runs f, a write of the index, while it holds the index's write lock exclusive, and then checkpoints the
-// write-ahead log into the database file. A reader in a read-only directory holds that lock shared and reads the
-// database file alone, so it reads the index as it was before f or as f left it, never during f. When f fails,
-// write leaves the log to the store's close, which checkpoints it; such a reader refuses a non-empty log meanwhile.
-func (s *Store) write(ctx context.Context, f func() error) error {
+// write runs f, a write of the index, while it holds the index's write lock exclusive, and then moves the
+// write-ahead log into the database file (checkpoint). A reader in a read-only directory holds that lock shared and
+// reads the database file alone, so it reads the index as it was before f or as f left it, never during f. When f
+// fails, write leaves the log to the store's close, which checkpoints it; such a reader refuses a non-empty log
+// meanwhile.
+func (s *Store) write(ctx context.Context, log io.Writer, f func() error) error {
 	unlock, err := lockFile(ctx, s.path+writeLockSuffix, true)
 	if err != nil {
 		return err
@@ -350,10 +385,43 @@ func (s *Store) write(ctx context.Context, f func() error) error {
 	if err := f(); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return fmt.Errorf("checkpoint the index: %w", err)
+	return s.checkpoint(ctx, log)
+}
+
+// checkpoint moves the whole write-ahead log into the database file and empties it. A reader in a writable directory
+// reads one state of the index for its whole life (OpenReadOnly), and while it reads an earlier state from the log,
+// the log cannot be emptied: checkpoint waits for such readers, until ctx ends, and notes the wait on log once.
+// Readers that begin meanwhile read the database file and do not hold it up.
+func (s *Store) checkpoint(ctx context.Context, log io.Writer) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
 	}
-	return nil
+	defer conn.Close()
+	// Without a busy timeout, a checkpoint that a reader holds up says so at once, and the wait below sees ctx end.
+	if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout = 0`); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA busy_timeout = 120000`) }()
+	noted := false
+	for wait := time.Millisecond; ; wait = min(2*wait, 250*time.Millisecond) {
+		var busy, frames, moved int
+		if err := conn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &frames, &moved); err != nil {
+			return fmt.Errorf("checkpoint the index: %w", err)
+		}
+		if busy == 0 {
+			return nil
+		}
+		if !noted {
+			noted = true
+			logf(log, "index: waiting for readers of an earlier state of the index to finish, to move the write-ahead log into the database file")
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("checkpoint the index while readers read an earlier state of it: %w", ctx.Err())
+		case <-time.After(wait):
+		}
+	}
 }
 
 // lockFile takes the flock on path, exclusive (creating the file) or shared (opening it read-only, so that it
@@ -401,14 +469,14 @@ func deleteCompiled(ctx context.Context, x execer, module string) error {
 // ModuleCount is the number of modules the index read.
 func (s *Store) ModuleCount(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM modules`).Scan(&n)
+	err := s.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM modules`).Scan(&n)
 	return n, err
 }
 
 // Landing gives the commit that the refresh to landed replaced (empty for the index's first commit), and whether a
 // refresh recorded landed at all.
 func (s *Store) Landing(ctx context.Context, landed string) (previous string, recorded bool, err error) {
-	err = s.db.QueryRowContext(ctx, `SELECT previous FROM landings WHERE landed = ?`, landed).Scan(&previous)
+	err = s.q.QueryRowContext(ctx, `SELECT previous FROM landings WHERE landed = ?`, landed).Scan(&previous)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -416,4 +484,28 @@ func (s *Store) Landing(ctx context.Context, landed string) (previous string, re
 		return "", false, fmt.Errorf("read the landing of %s: %w", landed, err)
 	}
 	return previous, true, nil
+}
+
+// CompiledCommit is the index's commit, when the index's compiled part (types, compiled hashes, atoms and facts) is
+// of that commit. A refresh writes the compiled part after the reference part, in a second transaction, and a
+// compiled step that fails leaves the compiled part of an earlier commit; a reader that joined the two parts would
+// join two commits' rows, so it is refused. An index read without its compiled part (lean.export off) has none:
+// required refuses it; else it is accepted, and its compiled answers are empty.
+func (s *Store) CompiledCommit(ctx context.Context, required bool) (string, error) {
+	commit, err := s.Meta(ctx, "commit")
+	if err != nil {
+		return "", err
+	}
+	compiled, err := s.Meta(ctx, "compiled_commit")
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case compiled == commit, compiled == "" && !required:
+		return commit, nil
+	case compiled == "":
+		return "", errors.New("the index was read without its compiled part: refresh it with lean.export on")
+	default:
+		return "", fmt.Errorf("the index's compiled part is of %s, not of its commit %s: refresh the index", compiled, commit)
+	}
 }

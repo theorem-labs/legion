@@ -132,7 +132,7 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 		}
 	}
 	var out []Found
-	rows, err := s.db.QueryContext(ctx, `SELECT `+foundColumns+`, d.short`+foundFrom+` WHERE d.kind IN (`+
+	rows, err := s.q.QueryContext(ctx, `SELECT `+foundColumns+`, d.short`+foundFrom+` WHERE d.kind IN (`+
 		placeholders(len(rule.Kinds))+`) ORDER BY d.name, d.module`, anys(rule.Kinds)...)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var short string
@@ -192,7 +192,7 @@ type ledgerDeclaration struct {
 
 func (s *Store) ledgerDeclarations(ctx context.Context, names []string) (map[string][]ledgerDeclaration, error) {
 	out := make(map[string][]ledgerDeclaration, len(names))
-	err := eachRowIn(ctx, s.db, `SELECT name, module, stmt_hash FROM decls WHERE name IN`, names, func(r *sql.Rows) error {
+	err := eachRowIn(ctx, s.q, `SELECT name, module, stmt_hash FROM decls WHERE name IN`, names, func(r *sql.Rows) error {
 		var name string
 		var declaration ledgerDeclaration
 		if err := r.Scan(&name, &declaration.module, &declaration.hash); err != nil {

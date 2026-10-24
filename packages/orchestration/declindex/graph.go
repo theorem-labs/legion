@@ -248,11 +248,8 @@ func (r *reader) strings() []string {
 	return out
 }
 
-func loadGraph(path string) (*graph, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+// parseGraph reads the bytes of the graph file at path, which errors name.
+func parseGraph(path string, data []byte) (*graph, error) {
 	if !bytes.HasPrefix(data, []byte(graphMagic)) {
 		return nil, fmt.Errorf("%s is not a declaration graph of this version", path)
 	}

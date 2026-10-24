@@ -164,7 +164,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			// Nothing was read with the new exporter or forms: the compiled part is not complete for commit.
 			return 0, 0, nil
 		}
-		return 0, 0, s.write(ctx, func() error { return s.setMeta(ctx, s.db, "compiled_commit", commit) })
+		return 0, 0, s.write(ctx, log, func() error { return s.setMeta(ctx, s.db, "compiled_commit", commit) })
 	}
 	sort.Strings(todo)
 	before, err := s.defHashes(ctx, todo)
@@ -194,7 +194,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		}
 	}
 	// The exporter ran without the write lock; only the write of what it read holds it.
-	if err := s.write(ctx, func() error {
+	if err := s.write(ctx, log, func() error {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -248,7 +248,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 // defHashes are the compiled hashes of the definitions of the modules, before they are read again.
 func (s *Store) defHashes(ctx context.Context, modules []string) (map[string]string, error) {
 	out := map[string]string{}
-	err := eachRowIn(ctx, s.db, `SELECT name, cstmt FROM consts WHERE kind = 'def' AND module IN`, modules, func(r *sql.Rows) error {
+	err := eachRowIn(ctx, s.q, `SELECT name, cstmt FROM consts WHERE kind = 'def' AND module IN`, modules, func(r *sql.Rows) error {
 		var n, h string
 		if err := r.Scan(&n, &h); err != nil {
 			return err
@@ -327,7 +327,7 @@ type Compiled struct {
 // Constant reads one compiled constant.
 func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
 	c := Compiled{Name: name}
-	err := s.db.QueryRowContext(ctx, `SELECT module, kind, type, cstmt FROM consts WHERE name = ?`, name).
+	err := s.q.QueryRowContext(ctx, `SELECT module, kind, type, cstmt FROM consts WHERE name = ?`, name).
 		Scan(&c.Module, &c.Kind, &c.Type, &c.Hash)
 	if err == sql.ErrNoRows {
 		return c, &NotFoundError{Name: name}
@@ -335,7 +335,7 @@ func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
 	if err != nil {
 		return c, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT atom FROM atoms WHERE name = ? ORDER BY atom`, name)
+	rows, err := s.q.QueryContext(ctx, `SELECT atom FROM atoms WHERE name = ? ORDER BY atom`, name)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var a string
 		if err := r.Scan(&a); err != nil {
@@ -347,7 +347,7 @@ func (s *Store) Constant(ctx context.Context, name string) (Compiled, error) {
 	if err != nil {
 		return c, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT concept, how FROM facts WHERE name = ? ORDER BY concept, how`, name)
+	rows, err = s.q.QueryContext(ctx, `SELECT concept, how FROM facts WHERE name = ? ORDER BY concept, how`, name)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var f Fact
 		if err := r.Scan(&f.Concept, &f.How); err != nil {
@@ -388,7 +388,7 @@ func (s *Store) owners(ctx context.Context, names []string) (map[string]Found, e
 		}
 	}
 	found := map[string]Found{}
-	err := eachRowIn(ctx, s.db, foundSelect+` WHERE d.name IN`, slices.Sorted(maps.Keys(cands)), func(r *sql.Rows) error {
+	err := eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, slices.Sorted(maps.Keys(cands)), func(r *sql.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
@@ -418,7 +418,7 @@ func (s *Store) owners(ctx context.Context, names []string) (map[string]Found, e
 // the order of its first constant.
 func (s *Store) distinctOwners(ctx context.Context, query string, args ...any) ([]Found, error) {
 	var names []string
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.q.QueryContext(ctx, query, args...)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var n string
 		if err := r.Scan(&n); err != nil {
@@ -458,7 +458,7 @@ type Stating struct {
 func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	type row struct{ name, module, how string }
 	var rs []row
-	rows, err := s.db.QueryContext(ctx, `SELECT name, module, how FROM facts WHERE concept = ? ORDER BY module, name, how`, concept)
+	rows, err := s.q.QueryContext(ctx, `SELECT name, module, how FROM facts WHERE concept = ? ORDER BY module, name, how`, concept)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var x row
 		if err := r.Scan(&x.name, &x.module, &x.how); err != nil {

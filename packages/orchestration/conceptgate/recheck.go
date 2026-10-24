@@ -31,7 +31,7 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 	if err := g.checkSandbox(ctx); err != nil {
 		return report, fmt.Errorf("the recheck compiles stored source only in the sandbox: %w", err)
 	}
-	if _, err := g.compiledCommit(ctx); err != nil {
+	if _, err := g.Index.CompiledCommit(ctx, true); err != nil {
 		return report, err
 	}
 	byKey := map[string]Concept{}

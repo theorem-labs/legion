@@ -11,6 +11,12 @@ type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+// dbReader reads the index: the database itself, or one read transaction of it (Store.q).
+type dbReader interface {
+	querier
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // eachRow calls scan on every row of a query's result and closes rows. err is the query's own error, so a call
 // takes QueryContext's two results. The first error wins: the query's, a scan's, the iteration's, then Close's;
 // rows is closed on every path.

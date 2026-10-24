@@ -38,11 +38,15 @@ func cmdStates(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.open(true); err != nil {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
 	if _, err := e.staleNote(ctx); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	// The facts are the compiled part's, their declarations the reference part's: both must be of one commit.
+	if _, err := e.store.CompiledCommit(ctx, false); err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
 	out := map[string][]declindex.Stating{}
@@ -79,11 +83,15 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.open(true); err != nil {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
 	if _, err := e.staleNote(ctx); err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	// The atoms are the compiled part's, their declarations the reference part's: both must be of one commit.
+	if _, err := e.store.CompiledCommit(ctx, false); err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
 	out := map[string][]string{}

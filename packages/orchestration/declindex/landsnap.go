@@ -7,7 +7,8 @@ import (
 )
 
 // LandSnapshot is the index state land-hash needs to answer one candidate tree. Its maps are read in one SQLite
-// transaction, so a concurrent refresh cannot combine one commit's sources with another commit's declarations.
+// transaction (the store's snapshot, or one of their own), so a concurrent refresh cannot combine one commit's
+// sources with another commit's declarations.
 type LandSnapshot struct {
 	HasSources bool
 	// Prefix is the indexed tree's path below the root of its repository, with a trailing slash, empty at that
@@ -29,11 +30,15 @@ type LandDeclaration struct {
 
 // LandSnapshot reads source blobs, modules, and declarations with names in names from one read transaction.
 func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return LandSnapshot{}, err
+	tx := s.q
+	if s.snapshot == nil {
+		own, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return LandSnapshot{}, err
+		}
+		defer func() { _ = own.Rollback() }()
+		tx = own
 	}
-	defer func() { _ = tx.Rollback() }()
 	snapshot := LandSnapshot{
 		Sources:      map[string]string{},
 		Modules:      map[string]bool{},
@@ -89,9 +94,6 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 		return nil
 	})
 	if err != nil {
-		return LandSnapshot{}, err
-	}
-	if err := tx.Commit(); err != nil {
 		return LandSnapshot{}, err
 	}
 	return snapshot, nil

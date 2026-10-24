@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -132,7 +133,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if cfg.DB == "" {
 		return fail(stderr, &usageError{declindex.ErrNoDB.Error()})
 	}
-	return commands[cmd](ctx, &env{g: g, cfg: cfg, stdout: stdout, stderr: stderr, getenv: getenv}, rest)
+	// A command writes its output here and returns, closing the index, before anything reads the output: a
+	// command's snapshot of the index holds up a refresh's write (declindex.OpenReadOnly), so a slow reader of the
+	// output must not hold the snapshot.
+	var out bytes.Buffer
+	code := commands[cmd](ctx, &env{g: g, cfg: cfg, stdout: &out, stderr: stderr, getenv: getenv}, rest)
+	if _, err := out.WriteTo(stdout); err != nil && code == 0 {
+		return fail(stderr, &unableError{err})
+	}
+	return code
 }
 
 type env struct {
@@ -148,8 +157,8 @@ func (e *env) open(needIndex bool) error {
 	return e.openWith(needIndex, declindex.Open)
 }
 
-// openReadOnly opens the index without writing it or its directory, which the landing hooks mount read-only; scope
-// is what the command reads besides the index (declindex.OpenReadOnly).
+// openReadOnly opens the index without writing it or its directory, which the landing hooks mount read-only: one
+// snapshot of it, until close (declindex.OpenReadOnly). scope is what the command reads besides the index.
 func (e *env) openReadOnly(ctx context.Context, scope declindex.ReadScope, needIndex bool) error {
 	return e.openWith(needIndex, func(path string) (*declindex.Store, error) { return declindex.OpenReadOnly(ctx, path, scope) })
 }
@@ -296,7 +305,7 @@ func cmdStatus(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"status takes no arguments"})
 	}
-	if err := e.open(false); err != nil {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, false); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -356,7 +365,7 @@ func cmdWhere(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.open(true); err != nil {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -386,7 +395,7 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.open(true); err != nil {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -454,7 +463,7 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.open(true); err != nil {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()

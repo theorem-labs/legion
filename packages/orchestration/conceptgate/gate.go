@@ -186,7 +186,8 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	if err := g.checkSandbox(ctx); err != nil {
 		return v, fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)
 	}
-	base, err := g.compiledCommit(ctx)
+	// The gate compares compiled statements, so it needs the compiled part of the index's own commit.
+	base, err := g.Index.CompiledCommit(ctx, true)
 	if err != nil {
 		return v, err
 	}
@@ -340,28 +341,6 @@ func (g *Gate) checkSandbox(ctx context.Context) error {
 		check = declindex.CheckSandbox
 	}
 	return check(ctx, g.Compiled.Exporter.Lean)
-}
-
-// compiledCommit is the index's commit, refused unless the index read its compiled part at that commit: the gate
-// and the recheck compare compiled statements, so an index whose compiled step did not finish would compare with
-// another commit's.
-func (g *Gate) compiledCommit(ctx context.Context) (string, error) {
-	commit, err := g.Index.Meta(ctx, "commit")
-	if err != nil {
-		return "", err
-	}
-	compiled, err := g.Index.Meta(ctx, "compiled_commit")
-	if err != nil {
-		return "", err
-	}
-	switch compiled {
-	case commit:
-		return commit, nil
-	case "":
-		return "", errors.New("the index was read without its compiled part, so the gate has no compiled statements to compare")
-	default:
-		return "", fmt.Errorf("the index's compiled part is of %s, not of its commit %s: refresh the index", compiled, commit)
-	}
 }
 
 // ownConstants are the names of the constants that a proposal's source declares, and the one named name.

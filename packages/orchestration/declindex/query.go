@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"io/fs"
+	"math"
+	"os"
 	"path"
 	"slices"
 	"sort"
@@ -29,7 +33,7 @@ func (f Found) At() string { return f.Path + ":" + strconv.Itoa(f.Line) }
 func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 	short := q[strings.LastIndexByte(q, '.')+1:]
 	var out []Found
-	rows, err := s.db.QueryContext(ctx, foundSelect+` WHERE d.short = ?`, short)
+	rows, err := s.q.QueryContext(ctx, foundSelect+` WHERE d.short = ?`, short)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
@@ -135,7 +139,7 @@ func (s *Store) declared(ctx context.Context, q querier, names []string) (map[st
 // `X.wp`; it is a use of X.
 func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 	var cands []string
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT target FROM uses WHERE target >= ? AND target < ?`, name+".", name+"/")
+	rows, err := s.q.QueryContext(ctx, `SELECT DISTINCT target FROM uses WHERE target >= ? AND target < ?`, name+".", name+"/")
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var t string
 		if err := r.Scan(&t); err != nil {
@@ -147,7 +151,7 @@ func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	declared, err := s.declared(ctx, s.db, cands)
+	declared, err := s.declared(ctx, s.q, cands)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +162,7 @@ func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 		}
 	}
 	var out []useRow
-	err = eachRowIn(ctx, s.db, `SELECT module, line, col, parent, cls FROM uses WHERE target IN`, keys, func(r *sql.Rows) error {
+	err = eachRowIn(ctx, s.q, `SELECT module, line, col, parent, cls FROM uses WHERE target IN`, keys, func(r *sql.Rows) error {
 		u := useRow{target: name}
 		if err := r.Scan(&u.module, &u.line, &u.col, &u.parent, &u.class); err != nil {
 			return err
@@ -182,7 +186,7 @@ type paths struct {
 func (p *paths) of(ctx context.Context, module string) (string, error) {
 	if p.cache == nil {
 		cache := map[string]string{}
-		rows, err := p.s.db.QueryContext(ctx, `SELECT module, rel FROM modules`)
+		rows, err := p.s.q.QueryContext(ctx, `SELECT module, rel FROM modules`)
 		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var m, rel string
 			if err := r.Scan(&m, &rel); err != nil {
@@ -365,10 +369,22 @@ func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Re
 	return r, nil
 }
 
-// graph loads the declaration graph once per open index.
+// graph loads the declaration graph once per open index: for a store opened read-only, from the graph file that was
+// in place when its snapshot began, which a later refresh's replacement does not change.
 func (s *Store) graph() (*graph, error) {
 	s.graphOnce.Do(func() {
-		s.g, s.graphErr = loadGraph(s.path + ".graph")
+		var data []byte
+		switch {
+		case s.snapshot == nil:
+			data, s.graphErr = os.ReadFile(s.path + ".graph")
+		case s.graphFile == nil:
+			s.graphErr = fmt.Errorf("%s.graph: %w", s.path, fs.ErrNotExist)
+		default:
+			data, s.graphErr = io.ReadAll(io.NewSectionReader(s.graphFile, 0, math.MaxInt64))
+		}
+		if s.graphErr == nil {
+			s.g, s.graphErr = parseGraph(s.path+".graph", data)
+		}
 		if s.graphErr == nil {
 			if want, err := s.Meta(context.Background(), "graph"); err != nil {
 				s.graphErr = err
