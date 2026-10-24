@@ -92,28 +92,24 @@ func TestContractListShowsProofReviewAndUpstreamRecords(t *testing.T) {
 		t.Fatalf("contract list: code=%d stderr=%q", code, stderr)
 	}
 	var contracts []struct {
-		Name       string          `json:"name"`
-		LastChange json.RawMessage `json:"last_change"`
+		Name       string `json:"name"`
+		LastChange any    `json:"last_change"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &contracts); err != nil {
 		t.Fatal(err)
 	}
 	got := map[string]any{}
 	for _, contract := range contracts {
-		var change any
-		if err := json.Unmarshal(contract.LastChange, &change); err != nil {
-			t.Fatalf("%s last change %q: %v", contract.Name, contract.LastChange, err)
-		}
-		got[contract.Name] = change
+		got[contract.Name] = contract.LastChange
 	}
 	want := map[string]any{
 		"Proof":                map[string]any{"proof": "Spec.Proof.compat"},
 		"Review":               map[string]any{"review": map[string]any{"contract": "Review", "reviewer": "alice", "head": "head-review"}},
-		"Upstream":             map[string]any{"upstream": "upstream-commit", "reviews": []any{map[string]any{"contract": "Upstream", "reviewer": "alice", "head": "head-upstream"}}},
+		"Upstream":             map[string]any{"upstream": "upstream-commit", "review": map[string]any{"contract": "Upstream", "reviewer": "alice", "head": "head-upstream"}},
 		"ReviewedHead":         map[string]any{"review": map[string]any{"contract": "ReviewedHead", "reviewer": "alice", "head": "head-reviewed-head"}},
-		"UpstreamReviewedHead": map[string]any{"upstream": "upstream-commit", "reviews": []any{map[string]any{"contract": "UpstreamReviewedHead", "reviewer": "alice", "head": "head-upstream-reviewed-head"}}},
-		"UpstreamUnrelated":    map[string]any{"upstream": "upstream-commit", "reviews": []any{map[string]any{"contract": "UpstreamUnrelated", "reviewer": "alice", "head": "head-unrelated"}}},
-		"UpstreamExplicit":     map[string]any{"upstream": "upstream-commit", "reviews": []any{map[string]any{"contract": "UpstreamExplicit", "reviewer": "alice", "head": "head-explicit"}}},
+		"UpstreamReviewedHead": map[string]any{"upstream": "upstream-commit", "review": map[string]any{"contract": "UpstreamReviewedHead", "reviewer": "alice", "head": "head-upstream-reviewed-head"}},
+		"UpstreamUnrelated":    map[string]any{"upstream": "upstream-commit", "review": map[string]any{"contract": "UpstreamUnrelated", "reviewer": "alice", "head": "head-unrelated"}},
+		"UpstreamExplicit":     map[string]any{"upstream": "upstream-commit", "review": map[string]any{"contract": "UpstreamExplicit", "reviewer": "alice", "head": "head-explicit"}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("contract list changes %#v, want %#v", got, want)
@@ -139,19 +135,15 @@ func TestMixedOwnerLandingRecordsEachExplicitReview(t *testing.T) {
 		t.Fatalf("contract list: code=%d stderr=%q", code, stderr)
 	}
 	var contracts []struct {
-		Name       string          `json:"name"`
-		LastChange json.RawMessage `json:"last_change"`
+		Name       string `json:"name"`
+		LastChange any    `json:"last_change"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &contracts); err != nil {
 		t.Fatal(err)
 	}
 	got := map[string]any{}
 	for _, contract := range contracts {
-		var change any
-		if err := json.Unmarshal(contract.LastChange, &change); err != nil {
-			t.Fatalf("%s last change %q: %v", contract.Name, contract.LastChange, err)
-		}
-		got[contract.Name] = change
+		got[contract.Name] = contract.LastChange
 	}
 	want := map[string]any{
 		"C": map[string]any{"review": map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},

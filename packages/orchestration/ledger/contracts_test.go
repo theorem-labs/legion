@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -85,7 +86,7 @@ func TestContractsListsTheRepositorysContractsAtTheirCurrentVersions(t *testing.
 		t.Fatalf("contracts: %+v, want %+v", got, want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("contract %d: %+v, want %+v", i, got[i], want[i])
 		}
 	}

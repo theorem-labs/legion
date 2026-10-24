@@ -2,7 +2,6 @@ package ledger
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sort"
 	"strings"
@@ -22,7 +21,7 @@ func checkContractArgs(name, owner, hash string) error {
 	return nil
 }
 
-const contractColumns = `name, owner, statement_hash, version, pinned, coalesce(last_change::text, ''), updated_at`
+const contractColumns = `name, owner, statement_hash, version, pinned, last_change, updated_at`
 
 type contractRow interface {
 	Scan(dest ...any) error
@@ -30,9 +29,7 @@ type contractRow interface {
 
 func scanContract(row contractRow) (Contract, error) {
 	var c Contract
-	var lastChange string
-	err := row.Scan(&c.Name, &c.Owner, &c.StatementHash, &c.Version, &c.Pinned, &lastChange, &c.UpdatedAt)
-	c.LastChange = LastChange(lastChange)
+	err := row.Scan(&c.Name, &c.Owner, &c.StatementHash, &c.Version, &c.Pinned, &c.LastChange, &c.UpdatedAt)
 	return c, err
 }
 
@@ -327,36 +324,16 @@ func clearingRecord(req LandRequest, contract Contract) (proof string, review Re
 
 // contractLastChange is the last_change record of an advanced contract: the record that cleared it, with the
 // upstream commit beside it when the landing carries upstream provenance.
-func contractLastChange(req LandRequest, contract Contract) (LastChange, error) {
+func contractLastChange(req LandRequest, contract Contract) (*LastChange, error) {
 	proof, review, ok := clearingRecord(req, contract)
 	if !ok {
-		return "", invalid("changed contract %s has no clearing record", contract.Name)
+		return nil, invalid("changed contract %s has no clearing record", contract.Name)
 	}
-	switch {
-	case req.Upstream != "" && proof != "":
-		return marshalLastChange(struct {
-			Upstream string `json:"upstream"`
-			Proof    string `json:"proof"`
-		}{Upstream: req.Upstream, Proof: proof})
-	case req.Upstream != "":
-		return marshalLastChange(struct {
-			Upstream string   `json:"upstream"`
-			Reviews  []Review `json:"reviews"`
-		}{Upstream: req.Upstream, Reviews: []Review{review}})
-	case proof != "":
-		return marshalLastChange(struct {
-			Proof string `json:"proof"`
-		}{Proof: proof})
-	default:
-		return marshalLastChange(struct {
-			Review Review `json:"review"`
-		}{Review: review})
+	change := &LastChange{Proof: proof, Upstream: req.Upstream}
+	if proof == "" {
+		change.Review = &review
 	}
-}
-
-func marshalLastChange(record any) (LastChange, error) {
-	data, err := json.Marshal(record)
-	return LastChange(data), err
+	return change, nil
 }
 
 // Land validates a complete candidate, advances its changed contracts, makes dependent agreements stale, and closes
@@ -452,7 +429,7 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 			}
 			advanced, err = scanContract(tx.QueryRow(ctx, `UPDATE contracts SET statement_hash = $3, version = version + 1,
 				last_change = $4, updated_at = clock_timestamp() WHERE repo = $1 AND name = $2
-				RETURNING `+contractColumns, req.Repo, name, req.ChangedContracts[name], string(lastChange)))
+				RETURNING `+contractColumns, req.Repo, name, req.ChangedContracts[name], lastChange))
 			if err != nil {
 				return err
 			}

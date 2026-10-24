@@ -204,7 +204,7 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 			upstream:  "upstream-commit",
 			wantChange: map[string]any{
 				"upstream": "upstream-commit",
-				"reviews":  []any{map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
+				"review":   map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"},
 			},
 		},
 		{
@@ -215,7 +215,7 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 			upstream:  "upstream-commit",
 			wantChange: map[string]any{
 				"upstream": "upstream-commit",
-				"reviews":  []any{map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
+				"review":   map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"},
 			},
 		},
 		{
@@ -227,7 +227,7 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 			upstream:  "upstream-commit",
 			wantChange: map[string]any{
 				"upstream": "upstream-commit",
-				"reviews":  []any{map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
+				"review":   map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"},
 			},
 		},
 		{
@@ -242,7 +242,7 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 			upstream: "upstream-commit",
 			wantChange: map[string]any{
 				"upstream": "upstream-commit",
-				"reviews":  []any{map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"}},
+				"review":   map[string]any{"contract": "C", "reviewer": "alice", "head": "head-1"},
 			},
 		},
 		{
@@ -293,6 +293,58 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 			}
 			assertLastChange(t, contracts[0].LastChange, test.wantChange)
 		})
+	}
+}
+
+// TestContractJSONReadsBack lands one contract for each kind of last_change record, and leaves one unchanged, then
+// writes each contract as the command line does and reads it back: every record decodes into a ledger.Contract equal
+// to the one the ledger returned.
+func TestContractJSONReadsBack(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	must(s.EnsureRepo(ctx, "r", 3, ledger.WithUpstreamOwner("upstream")))
+	review := func(name string) []ledger.Review {
+		return []ledger.Review{{Contract: name, Reviewer: "alice", Head: "head-" + name}}
+	}
+	for _, change := range []struct {
+		name, owner, proof, reviewed, upstream string
+		reviews                                []ledger.Review
+	}{
+		{name: "Proof", owner: "alice", proof: "Spec.Proof.compat"},
+		{name: "Review", owner: "alice", reviews: review("Review")},
+		{name: "ReviewedHead", owner: "alice", reviewed: "head-ReviewedHead"},
+		{name: "UpstreamProof", owner: "upstream", proof: "Spec.UpstreamProof.compat", upstream: "upstream-commit"},
+		{name: "UpstreamReview", owner: "upstream", reviews: review("UpstreamReview"), upstream: "upstream-commit"},
+	} {
+		must(s.RegisterContract(ctx, "r", change.name, "alice", "hash-1", false))
+		migration := must(open(t, s, "M-"+change.name, change.owner, []string{change.name + ".lean"},
+			map[string]string{change.name: "hash-1"}))
+		must(s.Land(ctx, ledger.LandRequest{
+			Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-" + change.name,
+			ChangedPaths: []string{change.name + ".lean"}, Current: map[string]string{change.name: "hash-1"},
+			ChangedContracts: map[string]string{change.name: "hash-2"}, Head: "head-" + change.name,
+			CompatibilityProof: change.proof, ReviewedHead: change.reviewed, Reviews: change.reviews, Upstream: change.upstream,
+		}))
+	}
+	must(s.RegisterContract(ctx, "r", "Unchanged", "alice", "hash-1", false))
+
+	contracts := must(s.Contracts(ctx, "r"))
+	if len(contracts) != 6 {
+		t.Fatalf("contracts: %+v", contracts)
+	}
+	for _, contract := range contracts {
+		encoded, err := json.Marshal(contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded ledger.Contract
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("%s does not read back from %s: %v", contract.Name, encoded, err)
+		}
+		contract.UpdatedAt, decoded.UpdatedAt = contract.UpdatedAt.UTC(), decoded.UpdatedAt.UTC()
+		if !reflect.DeepEqual(decoded, contract) {
+			t.Fatalf("%s reads back as %+v from %s, want %+v", contract.Name, decoded, encoded, contract)
+		}
 	}
 }
 
@@ -349,11 +401,16 @@ func landError(s *ledger.Store, request ledger.LandRequest) error {
 	return err
 }
 
-func assertLastChange(t *testing.T, got ledger.LastChange, want any) {
+// assertLastChange compares the JSON that got writes with want, the record as the command line prints it.
+func assertLastChange(t *testing.T, got *ledger.LastChange, want any) {
 	t.Helper()
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var actual any
-	if err := json.Unmarshal([]byte(got), &actual); err != nil {
-		t.Fatalf("last change JSON %q: %v", got, err)
+	if err := json.Unmarshal(data, &actual); err != nil {
+		t.Fatalf("last change JSON %q: %v", data, err)
 	}
 	encoded, err := json.Marshal(want)
 	if err != nil {
