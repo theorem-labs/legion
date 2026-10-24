@@ -289,8 +289,8 @@ func daemonConfig(project, stateDir string, port int, envoyURL string, natsURLs 
 	}
 }
 
-// projectToken is the daemon's spelling of a project in its tmux socket and tokens: lowercase, letters and digits.
-func projectToken(project string) string {
+// ProjectToken is the daemon's spelling of a project in its tmux socket and tokens: lowercase, letters and digits.
+func ProjectToken(project string) string {
 	var out strings.Builder
 	for _, r := range strings.ToLower(project) {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
@@ -301,4 +301,10 @@ func projectToken(project string) string {
 }
 
 // DaemonSocket is the tmux socket (-L) of the daemon of project.
-func DaemonSocket(project string) string { return "legion-" + projectToken(project) }
+func DaemonSocket(project string) string { return "legion-" + ProjectToken(project) }
+
+// daemonProject is the project of a run's daemon: mt and the run's 8 random hex digits. The project names the
+// daemon's tmux socket, legion-<project>, which lives under the run's directory and must fit a Unix socket's path, so
+// it is short; two runs of one second draw other digits, so they have other projects. The ledger repository, the
+// topics and the bearer directory keep the run's full name.
+func daemonProject(run string) string { return "mt" + run[strings.LastIndexByte(run, '-')+1:] }

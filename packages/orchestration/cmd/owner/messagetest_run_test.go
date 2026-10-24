@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -86,7 +88,13 @@ func newHarnessRun(t *testing.T, ctx context.Context, env ...string) harnessRun 
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux is not installed; the message test's owners run in a real tmux server")
 	}
-	root := t.TempDir()
+	// The run's tmux socket is under its directory and must fit a Unix socket's 107 bytes, which a directory named
+	// for the test, as t.TempDir's is, would not leave room for.
+	root, err := os.MkdirTemp("", "mt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	dsnFile := filepath.Join(root, "ledger-dsn")
 	if err := os.WriteFile(dsnFile, []byte(testpg.Database(t, "owner_message_test")), 0o600); err != nil {
 		t.Fatal(err)
@@ -208,13 +216,12 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 			t.Errorf("step %q did not run cleanly: %+v", step, report.Steps)
 		}
 	}
-	if err := exec.Command("tmux", "-L", report.Daemon.Socket, "list-sessions").Run(); err == nil {
-		t.Fatalf("the daemon's tmux server %s still runs after the teardown", report.Daemon.Socket)
-	}
+	assertTheRunsTmuxServerIsGone(t, out, report.Daemon.Socket)
 	if !strings.Contains(string(output), "report "+filepath.Join(out, "report.md")) {
 		t.Fatalf("the command did not print the report path:\n%s", output)
 	}
 	assertDuplicatesAndOrderRecorded(t, report)
+	assertOwnerNoticesArrived(t, out, report)
 
 	// The Envoy bearer came from ENVOY_TOKEN, so the supervisor read it from a private file outside the run's
 	// directory, which the teardown removed.
@@ -318,9 +325,7 @@ func TestMessageTestStopsWhatItStartedWhenInterrupted(t *testing.T) {
 			t.Fatalf("the run's process %d still runs", pid)
 		}
 	}
-	if err := exec.Command("tmux", "-L", report.Daemon.Socket, "list-sessions").Run(); err == nil {
-		t.Fatalf("the daemon's tmux server %s still runs", report.Daemon.Socket)
-	}
+	assertTheRunsTmuxServerIsGone(t, harness.out, report.Daemon.Socket)
 	if _, err := os.Stat(filepath.Join(harness.state, "message-test", report.Run)); !os.IsNotExist(err) || teardown.TokenDir == "" {
 		t.Fatalf("the bearer directory %q after SIGINT: %v", teardown.TokenDir, err)
 	}
@@ -391,6 +396,125 @@ func assertDuplicatesAndOrderRecorded(t *testing.T, report messagetest.Report) {
 	}
 	if answers != 1 {
 		t.Errorf("the duplicated need is expected %d times, want once", answers)
+	}
+}
+
+// assertTheRunsTmuxServerIsGone checks that the run's tmux server ran under the run's own directory and went with it:
+// the report names TMUX_TMPDIR <out>/tmux and the socket in it, the teardown removed that directory, no socket of the
+// run is in tmux's default directory (tmux never removes a socket file when its server exits), and no process names
+// the socket, as the server's command line does.
+func assertTheRunsTmuxServerIsGone(t *testing.T, out, socket string) {
+	t.Helper()
+	var raw struct {
+		Daemon map[string]any `json:"daemon"`
+	}
+	if data, err := os.ReadFile(filepath.Join(out, "report.json")); err != nil || json.Unmarshal(data, &raw) != nil {
+		t.Fatalf("report.json: %v", err)
+	}
+	dir, uid := filepath.Join(out, "tmux"), "tmux-"+strconv.Itoa(os.Getuid())
+	if raw.Daemon["tmux_tmpdir"] != dir || raw.Daemon["tmux_socket_path"] != filepath.Join(dir, uid, socket) {
+		t.Errorf("the report's daemon = %v; want its tmux server at %s", raw.Daemon, filepath.Join(dir, uid, socket))
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("the run's tmux directory %s is left after the teardown: %v", dir, err)
+	}
+	defaults := os.Getenv("TMUX_TMPDIR")
+	if defaults == "" {
+		defaults = "/tmp"
+	}
+	if _, err := os.Lstat(filepath.Join(defaults, uid, socket)); !os.IsNotExist(err) {
+		t.Errorf("the run left the tmux socket %s: %v", filepath.Join(defaults, uid, socket), err)
+	}
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err == nil && entry.Name() != strconv.Itoa(os.Getpid()) && slices.ContainsFunc(bytes.Split(cmdline, []byte{0}), func(arg []byte) bool { return string(arg) == socket }) {
+			t.Errorf("process %s names the run's tmux socket after the teardown: %q", entry.Name(), cmdline)
+		}
+	}
+}
+
+// ownerNoticeReport is one of report.json's owner notices, as the end-to-end checks read it.
+type ownerNoticeReport struct {
+	Step    string `json:"step"`
+	Item    string `json:"item"`
+	Arrived bool   `json:"arrived"`
+}
+
+// assertOwnerNoticesArrived checks, in the source owner's own session transcripts, that the target owner's answer of
+// each need published the notice of the offer it queued itself, and that the source's session recorded it: on the
+// routing table's offer topic for a data structure (its users topic), from the target, naming the offer. The report
+// must show each of them arrived, with the step whose need the answer answered.
+func assertOwnerNoticesArrived(t *testing.T, out string, report messagetest.Report) {
+	t.Helper()
+	users := report.Prefix + "node." + ownerpkg.TopicToken(mtStruct) + ".users"
+	var offers []string
+	for _, outcome := range report.Expected.Outcomes {
+		if outcome.Owner == mtFunction && strings.HasPrefix(outcome.Item, "offer:") {
+			offers = append(offers, outcome.Item)
+		}
+	}
+	noticed := map[string]int{}
+	for _, pane := range report.Panes {
+		if pane.Owner != mtFunction {
+			continue
+		}
+		for _, dir := range pane.Transcripts {
+			paths, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range paths {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, line := range strings.Split(string(data), "\n") {
+					var entry struct {
+						CustomType string `json:"customType"`
+						Content    string `json:"content"`
+						Details    struct {
+							Topic   string `json:"topic"`
+							Subject string `json:"subject"`
+						} `json:"details"`
+					}
+					if json.Unmarshal([]byte(line), &entry) != nil || entry.CustomType != "envoy-message" {
+						continue
+					}
+					var rendered struct {
+						Envoy struct {
+							Message struct{ Type, From, Item string } `yaml:"message"`
+						} `yaml:"envoy"`
+					}
+					if yaml.Unmarshal([]byte(entry.Content), &rendered) != nil {
+						continue
+					}
+					if m := rendered.Envoy.Message; m.Type == "offer" && m.From == mtStruct && entry.Details.Topic == users && entry.Details.Subject == users {
+						noticed[m.Item]++
+					}
+				}
+			}
+		}
+	}
+	var raw struct {
+		OwnerNotices []ownerNoticeReport `json:"owner_notices"`
+	}
+	if data, err := os.ReadFile(filepath.Join(out, "report.json")); err != nil || json.Unmarshal(data, &raw) != nil {
+		t.Fatalf("report.json: %v", err)
+	}
+	if len(offers) == 0 || len(raw.OwnerNotices) != len(offers) {
+		t.Errorf("the run expected the offers %v and reports the owner notices %+v; want one notice of each offer", offers, raw.OwnerNotices)
+	}
+	steps := []string{"duplicates", "out of order", "kill", "restart"}
+	for _, offer := range offers {
+		if noticed[offer] == 0 {
+			t.Errorf("the source's session never recorded the target's own notice of %s on %s", offer, users)
+		}
+		if !slices.ContainsFunc(raw.OwnerNotices, func(n ownerNoticeReport) bool {
+			return n.Item == offer && n.Arrived && slices.Contains(steps, n.Step)
+		}) {
+			t.Errorf("the report shows no arrived notice of %s with its step: %+v", offer, raw.OwnerNotices)
+		}
 	}
 }
 

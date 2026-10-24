@@ -23,8 +23,9 @@ var ownerCommand = regexp.MustCompile("Your owner command is: `([^`]+)`")
 
 // Session is the scripted stand-in for an omp owner session: it follows owner.md step by step, with the owner
 // command the prompt names. It subscribes through the harness listener at ENVOY_URL, records the subscription,
-// works through its inbox, then records each delivery and works through its inbox again. It waits Delay before each
-// claim and each answer, so that a kill can land before the claim, after it, or after the answer.
+// works through its inbox, then records each of the driver's deliveries (never the other test owner's own notices)
+// and works through its inbox again after every delivery. It waits Delay before each claim and each answer, so that a
+// kill can land before the claim, after it, or after the answer.
 //
 // As omp does, it keeps a transcript of its session open while it runs, under Home's .omp/agent/sessions/ in a
 // directory for its working directory, and appends each Envoy delivery it takes there as pi-envoy's envoy-message
@@ -219,15 +220,19 @@ func (s Session) Run(ctx context.Context) error {
 		}
 		topic := envelope.Topic
 		var payload struct {
+			Type  string `json:"type"`
 			Topic string `json:"topic"`
 			Step  string `json:"step"`
 		}
 		if json.Unmarshal([]byte(envelope.Payload), &payload) == nil && payload.Topic != "" {
 			topic = payload.Topic
 		}
-		if s.SkipSaw != "" && payload.Step == s.SkipSaw {
+		switch {
+		case payload.Type != "message-test":
+			s.logf("took %s, the other owner's own notice: owner.md records only the driver's", envelope.EventID)
+		case s.SkipSaw != "" && payload.Step == s.SkipSaw:
 			s.logf("took %s without recording it", envelope.EventID)
-		} else {
+		default:
 			_, _ = s.owner(ctx, "message-test", "saw", envelope.EventID, topic)
 		}
 		s.inbox(ctx)

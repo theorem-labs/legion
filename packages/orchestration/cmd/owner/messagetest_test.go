@@ -69,9 +69,10 @@ func (f *commandFixture) enqueueCount(item string) int {
 }
 
 // A kill after the answer lands between the record commit and the completion: the driver's hold pauses the answer
-// there, with the record committed on the owner's branch and the follow-up queued, and the item still open. A killed
-// command (its context cancelled) leaves the item open; once the supervisor frees its lease, the relaunched owner's
-// answer completes it with the same record, once, and queues no second follow-up.
+// there, with the record committed on the owner's branch, the follow-up queued and its notice published, and the item
+// still open. A killed command (its context cancelled) leaves the item open; once the supervisor frees its lease, the
+// relaunched owner's answer completes it with the same record, once, queues no second follow-up, and publishes the
+// notice again under its one key.
 func TestMessageTestAnswerPausesAfterTheAnswerBeforeTheCompletion(t *testing.T) {
 	f := newCommandFixture(t)
 	edge := ownerpkg.EdgeID(caller, state)
@@ -91,6 +92,10 @@ func TestMessageTestAnswerPausesAfterTheAnswerBeforeTheCompletion(t *testing.T) 
 	}
 	if item := f.item(offer); item.State != "open" || item.Owner != caller {
 		t.Fatalf("at the hold the follow-up %s = %+v", offer, item)
+	}
+	// The notice of the offer goes out before the completion, as the step runner publishes before it completes.
+	if posts := f.notices(); len(posts) != 1 || decodePayload(t, posts[0]).Item != offer || decodePayload(t, posts[0]).Commit != record {
+		t.Fatalf("at the hold the answer published %+v, want the notice of %s with the record %s", posts, offer, record)
 	}
 	kill()
 	if code := <-exit; code == 0 {
@@ -115,6 +120,10 @@ func TestMessageTestAnswerPausesAfterTheAnswerBeforeTheCompletion(t *testing.T) 
 	if n := f.enqueueCount(offer); n != 1 {
 		t.Fatalf("%s was enqueued %d times", offer, n)
 	}
+	// The relaunched answer publishes the notice again under its one key, which a host drops as a repeat.
+	if posts := f.notices(); len(posts) != 2 || posts[0].IdempotencyKey != posts[1].IdempotencyKey || posts[1].Topic != posts[0].Topic {
+		t.Fatalf("after the relaunched answer the notices are %+v, want the offer's twice under one key", posts)
+	}
 }
 
 // A kill after the claim lands before the record: the hold pauses the answer with the item claimed by the owner
@@ -134,6 +143,9 @@ func TestMessageTestAnswerPausesAfterTheClaimBeforeTheRecord(t *testing.T) {
 	}
 	if n := f.commitCount(state, path); n != 0 {
 		t.Fatalf("at the hold %d answer commits exist, want none", n)
+	}
+	if posts := f.notices(); len(posts) != 0 {
+		t.Fatalf("at the hold after the claim the answer published %+v, want nothing before its record", posts)
 	}
 	kill()
 	<-exit
@@ -270,9 +282,6 @@ func TestMessageTestAnswerRecordsCompletesAndQueuesTheOfferOnce(t *testing.T) {
 	if record != (messagetest.Answer{Item: need, Type: "need", Subject: edge, Version: "r1", Revision: 1, Text: messagetest.AnswerText}) {
 		t.Fatalf("answer record = %+v", record)
 	}
-	if posts := f.notices(); len(posts) != 0 {
-		t.Fatalf("answer published %+v", posts)
-	}
 
 	f.as(caller).ok("message-test", "answer", offer)
 	if item := f.item(offer); item.State != "done" || item.Result != f.lastCommit(caller, messagetest.AnswerRecord("skeleton", caller, "offer", edge)) {
@@ -283,6 +292,39 @@ func TestMessageTestAnswerRecordsCompletesAndQueuesTheOfferOnce(t *testing.T) {
 	f.as(state).ok("message-test", "answer", start)
 	if item := f.item(start); item.State != "done" || item.Result != f.lastCommit(state, messagetest.AnswerRecord("skeleton", state, "start", state)) {
 		t.Fatalf("start = %+v, want done with its record", item)
+	}
+}
+
+// An answer to a need publishes the notice that `owner offer` publishes for a need it answers (offer.go): through the
+// routing table's offer row to the need's source, on the data structure's users topic, from the owner, naming the
+// offer it queues, with the record and its commit, under that offer's notice key. It is the notice one test owner's
+// session publishes to the other's, which the message test requires. A repeat of the answer of a done item publishes
+// nothing, and an answer to a start or an offer item queues nothing and publishes nothing.
+func TestMessageTestAnswerPublishesTheOfferNoticeToTheNeedsSource(t *testing.T) {
+	f := newCommandFixture(t)
+	edge := ownerpkg.EdgeID(caller, state)
+	need, offer := "need:"+edge+"@r1", "offer:"+edge+"@r1"
+	f.enqueue(need, state)
+	f.as(state).ok("message-test", "answer", need)
+	path := messagetest.AnswerRecord("skeleton", state, "need", edge)
+	commit := f.lastCommit(state, path)
+	posts := f.notices()
+	if len(posts) != 1 {
+		t.Fatalf("the answer of %s published %+v, want the notice of its offer once", need, posts)
+	}
+	payload := decodePayload(t, posts[0])
+	if posts[0].Topic != "notifications.example.node.struct:state.users" || posts[0].IdempotencyKey != ownerpkg.NoticeKey(offer) ||
+		payload.Type != "offer" || payload.From != state || payload.To != caller || payload.Item != offer || payload.Edge != edge ||
+		payload.Record != path || payload.Commit != commit {
+		t.Fatalf("the answer's notice = %+v %+v; want the offer row's notice of %s to %s", posts[0], payload, offer, caller)
+	}
+	f.as(state).ok("message-test", "answer", need)
+	f.as(caller).ok("message-test", "answer", offer)
+	start := "start:" + state + "@1"
+	f.enqueue(start, state)
+	f.as(state).ok("message-test", "answer", start)
+	if posts := f.notices(); len(posts) != 1 {
+		t.Fatalf("after a repeat and the answers of %s and %s, the notices are %+v, want the need's answer's only", offer, start, posts)
 	}
 }
 
@@ -371,6 +413,28 @@ func TestMessageTestUsage(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.root, "run")); err == nil {
 		t.Fatal("a refused message-test made its output directory")
+	}
+}
+
+// The run's tmux server lives under --out (TMUX_TMPDIR=<out>/tmux), and its socket path must fit a Unix socket's 107
+// bytes: an --out too long for it is a usage error, exit 2, before the run makes its directory or starts anything.
+func TestMessageTestRefusesAnOutWhoseTmuxSocketCannotFit(t *testing.T) {
+	f := newCommandFixture(t)
+	bin := filepath.Join(f.root, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "legion"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.env["PATH"] = bin
+	out := filepath.Join(f.root, strings.Repeat("o", 120), "run")
+	code, stderr := f.as(caller).fails("message-test", "--out", out)
+	if code != exitUsage || !strings.Contains(stderr, "tmux socket") {
+		t.Fatalf("owner message-test --out <%d bytes> exited %d, want 2 naming the tmux socket: %s", len(out), code, stderr)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("the refused run made its directory: %v", err)
 	}
 }
 

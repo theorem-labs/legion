@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -68,7 +69,7 @@ type driverFlags struct {
 }
 
 func parseDriverFlags(args []string) (driverFlags, error) {
-	flags := driverFlags{kills: 5}
+	flags := driverFlags{kills: messagetest.DefaultKills}
 	for len(args) > 0 {
 		if len(args) < 2 {
 			return driverFlags{}, usagef("%s needs a value; %s", args[0], messageTestUsage)
@@ -127,9 +128,7 @@ func (s *session) messageTestTopicsOf() ([]string, error) {
 		return nil, unable(err)
 	}
 	for _, topic := range extra[s.owner] {
-		if !containsString(topics, topic) {
-			topics = append(topics, topic)
-		}
+		topics = appendNew(topics, topic)
 	}
 	return topics, nil
 }
@@ -195,11 +194,13 @@ func (s *session) messageTestSaw(delivery, topic string) (any, error) {
 }
 
 // messageTestAnswer answers a start, need or offer item with an offer record of fixed text, as one step: the record
-// with the item's Owner-Item trailer, the follow-up offer of a need, and the completion. The record has a revision, as
-// a spec does: 1, and one more each time a newer version rewrites it. A need's follow-up is numbered as production's
-// offer numbers it, offer:<edge>@r<n> with n the revision of the record that answers the need. An item older than the
-// version the owner already answered, which the answer record holds, completes as superseded:<newer version> with no
-// record.
+// with the item's Owner-Item trailer, the follow-up offer of a need and its notice, and the completion. The record has
+// a revision, as a spec does: 1, and one more each time a newer version rewrites it. A need's follow-up is numbered as
+// production's offer numbers it, offer:<edge>@r<n> with n the revision of the record that answers the need, and its
+// notice is the one `owner offer` publishes for a need it answers (offer.go): through the routing table's offer row to
+// the need's source, from the owner, naming the offer, with the record and its commit. It is the notice one test
+// owner publishes to the other, which the message test requires. An item older than the version the owner already
+// answered, which the answer record holds, completes as superseded:<newer version> with no record.
 func (s *session) messageTestAnswer(item string, ref ownerpkg.ItemRef) (any, error) {
 	p, err := s.party()
 	if err != nil {
@@ -259,17 +260,35 @@ func (s *session) messageTestAnswer(item string, ref ownerpkg.ItemRef) (any, err
 	if err := s.holdAfterClaim(store, p, item, current); err != nil {
 		return nil, err
 	}
+	subject := "message-test: answer " + item
+	var notices []ownerpkg.Notice
+	if ref.Type == "need" {
+		// The notice names the record's commit, so the record is committed first, with the item's Owner-Item trailer, as
+		// offer commits its revision before its steps run; the step then finds it committed.
+		if _, err := p.tree.CommitFile(s.ctx, path, data, subject, map[string][]string{"Owner-Item": {item}}); err != nil {
+			return nil, err
+		}
+		commit, err := p.tree.LastCommitTouching(path)
+		if err != nil {
+			return nil, err
+		}
+		offer := followUps[0]
+		notices = ownerpkg.Notices(p.routing.Topics(ownerpkg.Route{Step: ownerpkg.RouteOffer, Source: offer.Owner, Target: p.ID, TargetKind: p.Kind}), ownerpkg.NoticeFields{
+			Type: "offer", Epoch: p.epoch, From: p.ID, To: offer.Owner, Edge: ref.Subject, Item: offer.Item, Record: path, Commit: commit,
+		})
+	}
 	// The driver's hold after the answer pauses the step in its completion, the step runner's last call
-	// (owner.Runner.Run, owner/step.go): the record is committed and the follow-up queued, and the item is open.
+	// (owner.Runner.Run, owner/step.go): the record is committed, the follow-up queued and its notice published, and the
+	// item is open.
 	p.runner.Ledger = completionHold{Ledger: p.runner.Ledger, await: func(ctx context.Context) error {
 		_, err := messagetest.AwaitRelease(ctx, s.deploy.StateDir, item, messagetest.MomentAfterAnswer)
 		return err
 	}}
-	outcome, err := s.runStep(p, ownerpkg.Step{Answers: item, Path: path, Data: data, Subject: "message-test: answer " + item, FollowUps: followUps})
+	outcome, err := s.runStep(p, ownerpkg.Step{Answers: item, Path: path, Data: data, Subject: subject, FollowUps: followUps, Notices: notices})
 	if err != nil {
 		return nil, err
 	}
-	result := stepResult{Item: item, Answered: []string{item}, AlreadyDone: outcome.AlreadyDone, Record: path, Commit: outcome.Commit}
+	result := stepResult{Item: item, Answered: []string{item}, AlreadyDone: outcome.AlreadyDone, Record: path, Commit: outcome.Commit, Undelivered: outcome.Undelivered}
 	for _, followUp := range followUps {
 		result.FollowUps = append(result.FollowUps, followUp.Item)
 	}
@@ -326,15 +345,7 @@ type messageTestResult struct {
 // It is the operator's program, not an owner's: it reads no launch variable, and its ledger is the deployment's
 // ledger_dsn_file alone, which it gives the supervisor, so the test owners get it as LEGION_LEDGER_DSN_FILE.
 func (s *session) messageTestRun(flags driverFlags) (any, error) {
-	deployPath := s.deployPath
-	if deployPath == "" {
-		home := strings.TrimSpace(s.getenv("HOME"))
-		if home == "" {
-			return nil, usagef("--deploy is not given and HOME is unset")
-		}
-		deployPath = filepath.Join(home, ".config", "owner", "deploy.yaml")
-	}
-	deploy, err := ownerpkg.LoadDeploy(deployPath)
+	deploy, err := s.loadDeploy()
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +356,13 @@ func (s *session) messageTestRun(flags driverFlags) (any, error) {
 			return nil, err
 		}
 		out = filepath.Join(cwd, out)
+	}
+	// The run's tmux socket lives under --out: an --out too long to hold it is the operator's to change, before
+	// anything starts.
+	if err := messagetest.CheckOut(out); errors.Is(err, messagetest.ErrTmuxSocketTooLong) {
+		return nil, usagef("--out %s: %v", out, err)
+	} else if err != nil {
+		return nil, err
 	}
 	owner, err := executablePath(os.Args[0], s.getenv("PATH"))
 	if err != nil {

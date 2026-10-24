@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func branchRef(owner string) string { return "refs/heads/owner/" + ownerpkg.Key(owner) }
+func branchRef(owner string) string { return "refs/heads/" + ownerpkg.Branch(owner) }
 
 func git(ctx context.Context, bare string, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, "git", append([]string{"--git-dir=" + bare}, args...)...)
@@ -39,15 +39,7 @@ func branchCommits(ctx context.Context, bare, owner string) ([]Commit, error) {
 		if !ok {
 			continue
 		}
-		commit := Commit{Owner: owner, SHA: sha, Trailers: map[string][]string{}}
-		for _, line := range strings.Split(strings.TrimSpace(trailers), "\n") {
-			key, value, found := strings.Cut(line, ":")
-			if found {
-				key = strings.TrimSpace(key)
-				commit.Trailers[key] = append(commit.Trailers[key], strings.TrimSpace(value))
-			}
-		}
-		commits = append(commits, commit)
+		commits = append(commits, Commit{Owner: owner, SHA: sha, Trailers: ownerpkg.ParseTrailers(trailers)})
 	}
 	return commits, nil
 }

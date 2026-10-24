@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -92,16 +93,6 @@ func ParseFactOwners(data []byte) (FactOwners, error) {
 	return owners, nil
 }
 
-// Has reports whether owner's graph topics include topic.
-func (t Topics) Has(owner, topic string) bool {
-	for _, candidate := range t.Owners[owner] {
-		if candidate == topic {
-			return true
-		}
-	}
-	return false
-}
-
 // Subscriptions is the owner's topics.json list plus concepts for the librarian, fact.<name>.needs for a fact
 // owner, fact.<name>.users for every fact whose users include the owner, and all, on which landings, the score and
 // protocol adoptions and reverts reach every owner (role owners are in no topics.json).
@@ -117,27 +108,17 @@ func Subscriptions(owner, role string, topics Topics, facts Facts, factOwners Fa
 	if name, ok := factOwners[owner]; ok {
 		values = appendNew(values, routing.fact(name, "needs"))
 	}
-	names := make([]string, 0, len(facts))
-	for name := range facts {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		for _, user := range facts[name].Users {
-			if user == owner {
-				values = appendNew(values, routing.fact(name, "users"))
-				break
-			}
+	for _, name := range slices.Sorted(maps.Keys(facts)) {
+		if slices.Contains(facts[name].Users, owner) {
+			values = appendNew(values, routing.fact(name, "users"))
 		}
 	}
 	return appendNew(values, routing.prefix+"all"), nil
 }
 
 func appendNew(values []string, value string) []string {
-	for _, existing := range values {
-		if existing == value {
-			return values
-		}
+	if slices.Contains(values, value) {
+		return values
 	}
 	return append(values, value)
 }

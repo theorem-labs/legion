@@ -43,7 +43,7 @@ func TestKillReadsTheItemBeforeTheSupervisorFreesTheDeadOwnersLease(t *testing.T
 	t.Cleanup(func() { _ = exec.Command("tmux", "-L", socket, "kill-server").Run() })
 	d := &driver{
 		opts: Options{Progress: io.Discard, Timeouts: Timeouts{DaemonStop: 10 * time.Second, Poll: 50 * time.Millisecond}},
-		run:  repo, source: fn, target: st, store: store, socket: socket, bare: filepath.Join(t.TempDir(), "no-repo.git"), report: &Report{},
+		run:  repo, source: fn, target: st, store: store, tmux: tmuxServer{socket: socket}, bare: filepath.Join(t.TempDir(), "no-repo.git"), report: &Report{},
 	}
 	for index, test := range []struct {
 		moment string
@@ -92,7 +92,7 @@ func ownerPane(t *testing.T, d *driver, socket string) pane {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		panes, err := ownerPanes(t.Context(), socket)
+		panes, err := d.tmux.ownerPanes(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}

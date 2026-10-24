@@ -3,9 +3,10 @@ package messagetest
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ type Report struct {
 	Panes        []PaneCheck   `json:"panes"`
 	Published    []Publication `json:"published"`
 	Deliveries   []Delivery    `json:"deliveries"`
+	OwnerNotices []OwnerNotice `json:"owner_notices"`
 	KillLog      []Kill        `json:"kills"`
 	Restart      *Restart      `json:"restart,omitempty"`
 	Expected     Expected      `json:"expected"`
@@ -50,8 +52,8 @@ type Report struct {
 
 // Teardown is what the run stopped and removed when it ended: every daemon process it started, every owner process
 // it saw in its panes, the ones still running after its tmux server stopped, which it signalled by PID, and any it
-// could not stop; its private bearer directory, and the daemon's secret files (each pane's boot token), which it
-// removed.
+// could not stop; its private bearer directory, the daemon's secret files (each pane's boot token), and the run's
+// tmux directory, which holds the tmux socket, which it removed.
 type Teardown struct {
 	DaemonPIDs    []int  `json:"daemon_pids"`
 	OwnerPIDs     []int  `json:"owner_pids"`
@@ -59,14 +61,19 @@ type Teardown struct {
 	Left          []int  `json:"left"`
 	TokenDir      string `json:"token_dir"`
 	DaemonSecrets string `json:"daemon_secrets"`
+	TmuxDir       string `json:"tmux_dir"`
 }
 
-// Daemon names the supervisor the run started, where its configuration, socket and log are, and the omp its panes
-// run, which the driver gives it as LEGION_OMP_PATH.
+// Daemon names the supervisor the run started, its project, where its configuration, tmux server and log are, and
+// the omp its panes run, which the driver gives it as LEGION_OMP_PATH. The tmux server is the socket Socket (-L) in
+// the run's own TMUX_TMPDIR, at SocketPath.
 type Daemon struct {
 	Executable string `json:"executable"`
 	Config     string `json:"config"`
+	Project    string `json:"project"`
 	Socket     string `json:"tmux_socket"`
+	TmuxTmpDir string `json:"tmux_tmpdir"`
+	SocketPath string `json:"tmux_socket_path"`
 	Log        string `json:"log"`
 	Port       int    `json:"port"`
 	Omp        string `json:"omp"`
@@ -122,6 +129,21 @@ type Delivery struct {
 	ArrivalSeconds float64 `json:"arrival_seconds,omitempty"`
 	Saw            bool    `json:"saw"`
 	SawSeconds     float64 `json:"saw_seconds,omitempty"`
+}
+
+// OwnerNotice is one notice an owner session published itself that the other owner's session had to receive (an
+// ExpectedOwnerNotice). Arrived, the verdict's evidence, says whether the receiver's transcript records it on its
+// topic; Arrivals counts those deliveries (an answer run again after a kill publishes it again under its one key,
+// which the session drops), and the first one's event id, dedupe key, line and time are shown.
+type OwnerNotice struct {
+	ExpectedOwnerNotice
+	Arrived    bool      `json:"arrived"`
+	Arrivals   int       `json:"arrivals"`
+	EventID    string    `json:"event_id,omitempty"`
+	DedupeKey  string    `json:"dedupe_key,omitempty"`
+	Transcript string    `json:"transcript,omitempty"`
+	Line       int       `json:"line,omitempty"`
+	At         time.Time `json:"at,omitzero"`
 }
 
 // Kill is one owner pane the driver killed: the moment the schedule set for it, the moment it landed at (the item's
@@ -201,7 +223,8 @@ func (r Report) markdown() string {
 		allowed = code(r.AllowedMissingKinds)
 	}
 	fmt.Fprintf(&b, "- Topic kinds the nodes lack, allowed by `--allow-missing-kinds`: %s\n", allowed)
-	fmt.Fprintf(&b, "- Daemon: `%s start --config %s` (port %d, tmux socket `%s`, log `%s`), panes running `%s`\n\n", r.Daemon.Executable, r.Daemon.Config, r.Daemon.Port, r.Daemon.Socket, r.Daemon.Log, r.Daemon.Omp)
+	fmt.Fprintf(&b, "- Daemon: `%s start --config %s` (project `%s`, port %d, tmux socket `%s` in TMUX_TMPDIR `%s`, at `%s`, log `%s`), panes running `%s`\n\n",
+		r.Daemon.Executable, r.Daemon.Config, r.Daemon.Project, r.Daemon.Port, r.Daemon.Socket, r.Daemon.TmuxTmpDir, r.Daemon.SocketPath, r.Daemon.Log, r.Daemon.Omp)
 	r.Revisions.markdown(&b)
 	b.WriteString("## Steps\n\n| Step | Seconds | Error |\n| --- | --- | --- |\n")
 	for _, step := range r.Steps {
@@ -209,13 +232,8 @@ func (r Report) markdown() string {
 	}
 	b.WriteString("\n## Owner panes\n\n| Owner | Pane | PID | Start (s) | Launch variables | Directory | Sessions | Subscribed (listener) | Subscribed record |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
 	for _, pane := range r.Panes {
-		names := make([]string, 0, len(pane.Env))
-		for name := range pane.Env {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		vars := make([]string, 0, len(names))
-		for _, name := range names {
+		vars := make([]string, 0, len(pane.Env))
+		for _, name := range slices.Sorted(maps.Keys(pane.Env)) {
 			vars = append(vars, fmt.Sprintf("`%s=%s`", name, pane.Env[name]))
 		}
 		fmt.Fprintf(&b, "| `%s` | %s | %d | %s | %s | `%s` | %s | %d topics | %d topics |\n", pane.Owner, pane.Pane, pane.PID, seconds(pane.StartSeconds),
@@ -236,6 +254,15 @@ func (r Report) markdown() string {
 			saw, sawAt = "yes", seconds(d.SawSeconds)
 		}
 		fmt.Fprintf(&b, "| `%s` | `%s` | `%s` | %t | %s | %s | %s | %s |\n", d.Owner, d.ID, d.Topic, d.Required, arrived, arrival, saw, sawAt)
+	}
+	b.WriteString("\n## Owner notices\n\nEach answer of a need publishes the offer's notice itself, through the routing table: the verdict reads the receiver's transcript for a delivery from that owner naming the offer, on the routing table's topic.\n\n" +
+		"| Step | Item | From | Receiver | Topic | Arrived | Deliveries | Event | Dedupe key | Session transcript |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+	for _, n := range r.OwnerNotices {
+		transcript := "no"
+		if n.Arrived {
+			transcript = fmt.Sprintf("`%s:%d`", filepath.Base(n.Transcript), n.Line)
+		}
+		fmt.Fprintf(&b, "| %s | `%s` | `%s` | `%s` | `%s` | %t | %d | `%s` | `%s` | %s |\n", n.Step, n.Item, n.From, n.Receiver, n.Topic, n.Arrived, n.Arrivals, n.EventID, n.DedupeKey, transcript)
 	}
 	b.WriteString("\n## Kills\n\nEach kill lands at the moment the schedule sets: the item's state is read at the kill, while the pane's processes are stopped. A kill after the claim or after the answer holds the owner's `message-test answer` at that moment (its PID is in Held) until the killed processes are gone.\n\n" +
 		"| # | Item | Scheduled | Landed at | Holder | Record | Done | Pane (PID) | Held | Relaunch (s) |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
@@ -259,8 +286,12 @@ func (r Report) markdown() string {
 			x.Item, x.OldDaemonPID, seconds(x.StopSeconds), x.OldPane.Pane, x.OldPane.PID, x.OldPane.Incarnation, x.NewDaemonPID, seconds(x.StartSeconds),
 			code(x.Launched), strings.Join(work, ", "), x.ClaimEvent, x.CompleteEvent, x.EventsFrom, seconds(x.ItemSeconds))
 	}
-	fmt.Fprintf(&b, "\n## Teardown\n\nDaemon processes %s; owner processes %s; signalled by PID %s; still running %s; bearer directory `%s` and the daemon's boot tokens `%s` removed.\n",
-		pids(r.Teardown.DaemonPIDs), pids(r.Teardown.OwnerPIDs), pids(r.Teardown.Stopped), pids(r.Teardown.Left), r.Teardown.TokenDir, r.Teardown.DaemonSecrets)
+	tmuxDir := "no tmux directory"
+	if r.Teardown.TmuxDir != "" {
+		tmuxDir = "the tmux directory `" + r.Teardown.TmuxDir + "`"
+	}
+	fmt.Fprintf(&b, "\n## Teardown\n\nDaemon processes %s; owner processes %s; signalled by PID %s; still running %s; bearer directory `%s` and the daemon's boot tokens `%s` removed; %s removed.\n",
+		pids(r.Teardown.DaemonPIDs), pids(r.Teardown.OwnerPIDs), pids(r.Teardown.Stopped), pids(r.Teardown.Left), r.Teardown.TokenDir, r.Teardown.DaemonSecrets, tmuxDir)
 	b.WriteString("\n## Failures\n\n")
 	if len(r.Failures) == 0 {
 		b.WriteString("None.\n")
@@ -317,12 +348,7 @@ func (r Revisions) markdown(b *strings.Builder) {
 	} {
 		fmt.Fprintf(b, "- `%s`: %s\n", tool.name, cell(tool.output))
 	}
-	names := make([]string, 0, len(r.Graph))
-	for name := range r.Graph {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(r.Graph)) {
 		fmt.Fprintf(b, "- Graph input `%s`: `%s`\n", name, r.Graph[name])
 	}
 	b.WriteString("\n")

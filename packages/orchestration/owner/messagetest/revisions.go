@@ -47,8 +47,8 @@ type Module struct {
 const versionTimeout = 10 * time.Second
 
 // collectRevisions reads the revisions of a run: the owner's build from this executable, `legion version`,
-// `omp --version` (omp "" when the supervisor's PATH has none), `tmux -V`, `git --version`, and the digest of each
-// graph input in graphDir. A tool that cannot answer is recorded as unavailable, with why.
+// `omp --version`, `tmux -V`, `git --version`, and the digest of each graph input in graphDir. A tool that cannot
+// answer is recorded as unavailable, with why.
 func collectRevisions(ctx context.Context, legion, omp, graphDir string) Revisions {
 	revisions := Revisions{
 		Legion: versionOutput(ctx, legion, "version"),
@@ -56,11 +56,7 @@ func collectRevisions(ctx context.Context, legion, omp, graphDir string) Revisio
 		Git:    versionOutput(ctx, "git", "--version"),
 		Graph:  map[string]string{},
 	}
-	if omp == "" {
-		revisions.Omp = "unavailable: omp is not on the supervisor's PATH"
-	} else {
-		revisions.Omp = versionOutput(ctx, omp, "--version")
-	}
+	revisions.Omp = versionOutput(ctx, omp, "--version")
 	if info, ok := debug.ReadBuildInfo(); ok {
 		revisions.Owner = Build{Path: info.Main.Path, Version: info.Main.Version, GoVersion: info.GoVersion}
 		for _, setting := range info.Settings {

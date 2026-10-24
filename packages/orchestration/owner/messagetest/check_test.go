@@ -25,6 +25,7 @@ var (
 	offrR2 = "offer:" + edge + "@r2"
 	offrR3 = "offer:" + edge + "@r3"
 	needs  = "notifications.example-message-test.node.struct:mountpoint.needs"
+	users  = "notifications.example-message-test.node.struct:mountpoint.users"
 )
 
 // recording builds the ledger rows and git logs a run leaves, one call per row or commit.
@@ -71,10 +72,18 @@ func (r *recording) arrive(owner, id, topic string) {
 		Transcript: "/sessions/" + owner + ".jsonl", Line: len(r.recorded.Arrivals) + 1})
 }
 
+// ownerNotice is the source owner's session recording the target owner's own notice of an offer: published by the
+// target's answer through the routing table's offer row, on the data structure's users topic.
+func (r *recording) ownerNotice(id, offer, topic string) {
+	r.recorded.Arrivals = append(r.recorded.Arrivals, Arrival{Owner: fn, ID: id, Type: "offer", From: st, Item: offer, Topic: topic, Subject: topic,
+		DedupeKey: "publish.k-" + offer, Transcript: "/sessions/" + fn + ".jsonl", Line: len(r.recorded.Arrivals) + 1})
+}
+
 // passingRun is the recorded state of a run where every step happened once: an arrival notice on all that both
 // owners' sessions recorded, the need r1 enqueued twice and its notice published twice under two keys (Envoy's
 // at-least-once delivery), both in the session and the need answered once, r3 answered and r2 superseded. The notice
-// of a killed owner's need is optional: the kill may end the session before the notice reaches it.
+// of a killed owner's need is optional: the kill may end the session before the notice reaches it. Each answer of a
+// need published its offer's notice itself, and the source's session recorded it.
 func passingRun() (Expected, *recording) {
 	expected := Expected{
 		Deliveries: []ExpectedDelivery{
@@ -83,6 +92,10 @@ func passingRun() (Expected, *recording) {
 			{Owner: st, Topic: needs, ID: "evt-dup-1", Required: true},
 			{Owner: st, Topic: needs, ID: "evt-dup-2", Required: true},
 			{Owner: st, Topic: needs, ID: "evt-kill"},
+		},
+		OwnerNotices: []ExpectedOwnerNotice{
+			{Step: "duplicates", Receiver: fn, From: st, Type: "offer", Item: offrR1, Topic: users},
+			{Step: "out of order", Receiver: fn, From: st, Type: "offer", Item: offrR3, Topic: users},
 		},
 		Outcomes: []Outcome{
 			{Item: "start:" + fn + "@1", Owner: fn},
@@ -104,12 +117,14 @@ func passingRun() (Expected, *recording) {
 	r.arrive(st, "evt-dup-1", needs)
 	r.enqueue(offrR1, fn)
 	r.answer(needR1, st)
+	r.ownerNotice("evt-offer-1", offrR1, users)
 	r.arrive(st, "evt-dup-2", needs)
 	r.answer(offrR1, fn)
 	r.enqueue(needR3, st)
 	r.enqueue(needR2, st)
 	r.enqueue(offrR3, fn)
 	r.answer(needR3, st)
+	r.ownerNotice("evt-offer-3", offrR3, users)
 	r.complete(needR2, st, "superseded:r3")
 	return expected, r
 }
@@ -186,6 +201,41 @@ func TestCheckAcceptsAnOptionalNoticeRecordedOnce(t *testing.T) {
 	}
 	r.arrive(st, "evt-kill", needs)
 	requireOnly(t, Check(expected, r.recorded), FailDuplicate, "evt-kill")
+}
+
+// The message test requires a notice that one owner session publishes itself to reach the other's: the source's
+// transcript must record the target's notice of each offer its answers queued. A run where one never arrived fails.
+func TestCheckFailsAnOwnersNoticeThatNeverReachedTheOtherOwner(t *testing.T) {
+	expected, r := passingRun()
+	r.recorded.Arrivals = without(r.recorded.Arrivals, "evt-offer-3")
+	requireOnly(t, Check(expected, r.recorded), FailMissed, offrR3)
+}
+
+// An owner's notice is told from the driver's by its payload's publisher and type and the item it names, and it counts
+// only on the topic the routing table gives it: a driver's notice naming the offer, one the source published itself,
+// and the target's notice delivered on another topic are none of them the target's notice of the offer.
+func TestCheckTellsAnOwnersNoticeByItsPublisherAndTopic(t *testing.T) {
+	for name, change := range map[string]func(*Arrival){
+		"the driver's notice":   func(a *Arrival) { a.Type, a.From = noticeType, "" },
+		"the source's own":      func(a *Arrival) { a.From = fn },
+		"an accept, not offer":  func(a *Arrival) { a.Type = "accept" },
+		"another offer's item":  func(a *Arrival) { a.Item = offrR2 },
+		"in the target session": func(a *Arrival) { a.Owner = st },
+	} {
+		expected, r := passingRun()
+		for index := range r.recorded.Arrivals {
+			if r.recorded.Arrivals[index].ID == "evt-offer-1" {
+				change(&r.recorded.Arrivals[index])
+			}
+		}
+		failures := Check(expected, r.recorded)
+		if !slices.ContainsFunc(failures, func(f Failure) bool { return f.Kind == FailMissed && strings.Contains(f.Subject, offrR1) }) {
+			t.Errorf("%s: failures = %+v, want %s missed", name, failures, offrR1)
+		}
+	}
+	expected, r := passingRun()
+	retopic(r.recorded.Arrivals, fn, "evt-offer-1", needs)
+	requireOnly(t, Check(expected, r.recorded), FailUnexpected, offrR1+" on "+needs)
 }
 
 // The verdict reads the sessions' transcripts, never the owner model's records: a delivery the model recorded and the
@@ -310,14 +360,7 @@ func without(arrivals []Arrival, delivery string) []Arrival {
 }
 
 func withoutEvent(events []ledger.Event, kind, subject string) []ledger.Event {
-	var kept []ledger.Event
-	for _, event := range events {
-		if event.Kind == kind && event.Subject == subject {
-			continue
-		}
-		kept = append(kept, event)
-	}
-	return kept
+	return slices.DeleteFunc(slices.Clone(events), func(event ledger.Event) bool { return event.Kind == kind && event.Subject == subject })
 }
 
 func retopic(arrivals []Arrival, owner, delivery, topic string) {

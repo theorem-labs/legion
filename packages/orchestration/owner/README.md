@@ -67,7 +67,7 @@ Steps:
 | `message-test topics` | A test owner's topics: `owner topics` plus the fact and concept topics the driver gives it in the test deployment's `<state_dir>/message-test/topics.json` (plan Task 1.8 step 4: the driver subscribes a test owner to topics no node owner holds); no other command reads that file |
 | `message-test subscribed` | Records the topics the test owner subscribed to, at `message-test/subscribed.yaml` |
 | `message-test saw <delivery id> <topic>` | Records one delivery once, at `message-test/saw/<hex16(id)>.yaml`, with `Owner-Delivery` and `Owner-Topic` trailers |
-| `message-test answer <item>` | Answers a `start:`, `need:` or `offer:` item with an offer record of fixed text as one step (record, the need's follow-up `offer:`, completion). The record has a revision, as a spec does: 1, and one more each time a newer version rewrites it; a need's follow-up is `offer:<edge>@r<n>`, n that revision, as production's `offer` numbers it. An item older than the version already answered completes as `superseded:<newer>` with no record |
+| `message-test answer <item>` | Answers a `start:`, `need:` or `offer:` item with an offer record of fixed text as one step (record, the need's follow-up `offer:` and its notice, completion). The record has a revision, as a spec does: 1, and one more each time a newer version rewrites it; a need's follow-up is `offer:<edge>@r<n>`, n that revision, as production's `offer` numbers it, and its notice is the one `owner offer` publishes for a need it answers: through the routing table's offer row to the need's source, from the owner, naming the offer, the record and its commit, under the offer's notice key, before the completion. An item older than the version already answered completes as `superseded:<newer>` with no record |
 | `librarian-intake --id <id> --proposer <owner id> --proposal <file> --ledger-dsn-file <path> --repository <name> [--git-dir <repo.git>] [--envoy-config <path>] [--topic-prefix <prefix>] [--deploy <path>]` | The concept gate's `librarian` command: queues the gate's near match or post-landing recheck for the librarian (below). It needs no `LEGION_OWNER` |
 
 Exit codes: 0 done, 1 refused, 2 usage (a missing launch variable included), 3 unable to check (an unreadable graph,
@@ -156,8 +156,13 @@ that the supervisor starts from their ledger queues, and that duplicate notices 
 owner sessions and a supervisor restart leave each step done once (plan Task 1.8). Package `messagetest` drives it:
 
 1. **Setup.** The run's name is `message-test-<UTC stamp>-<8 random hex digits>`, so that two runs started in the
-   same second share nothing: it names the ledger repository, the daemon's project and tmux socket, and the private
-   bearer directory. The run's topic prefix is `--prefix` (without it, the deployment graph's own prefix), then the
+   same second share nothing: it names the ledger repository and the private bearer directory, and the daemon's
+   project is `mt` and the same 8 hex digits. The daemon's tmux server lives in `DIR/tmux`: the driver gives the
+   daemon, and each tmux command of its own, `TMUX_TMPDIR=DIR/tmux` (the daemon keeps that variable for every tmux
+   command it runs), so its socket is `DIR/tmux/tmux-<uid>/legion-mt<8 hex digits>`. A Unix socket path holds at most
+   107 bytes (tmux refuses a longer one with "File name too long"), so `owner message-test` refuses a `DIR` too long
+   for it with exit 2 before anything starts, and the run's setup checks it again first. The run's topic prefix is
+   `--prefix` (without it, the deployment graph's own prefix), then the
    run's name and a dot, so that runs on one hub never see each other's notices: every topic the owners subscribe to
    and the driver publishes on is under it. A ledger repository of the run's name in the ledger of the operator
    deployment's `ledger_dsn_file` (the driver is the operator's program: it reads no launch variable, and the
@@ -184,8 +189,8 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    `callers`, `callees`, `users`, `neighbors`, `linked`, `all`) that no topic of the two nodes has fails the run in
    setup, before the daemon starts, unless `--allow-missing-kinds` names it; the report lists each allowed kind the
    nodes lack.
-3. **Wake.** `start:<node>@1` for each; both panes must start within 60 s on the tmux socket
-   `legion-<project token>`, each process with `LEGION_OWNER`, `LEGION_LEDGER_REPOSITORY` and
+3. **Wake.** `start:<node>@1` for each; both panes must start within 60 s on the daemon's tmux socket
+   `legion-mt<8 hex digits>` in `DIR/tmux`, each process with `LEGION_OWNER`, `LEGION_LEDGER_REPOSITORY` and
    `LEGION_LEDGER_DSN_FILE` (C8; a `_KEY` name is credential-shaped and the daemon strips it from panes) and working
    in `<state_dir>/owners/<claim token ending in the C9 encoding of the id>`. The driver finds each owner's omp
    session transcript among the files its pane's processes hold open, and publishes only once the listener's
@@ -198,7 +203,11 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    under two idempotency keys, as Envoy may deliver one message twice: both reach the session and the owner answers
    once. The need itself is enqueued twice; when the owner answers it between the two calls, the ledger refuses the
    second as an existing item, which is a duplicate too. The driver expects each answered need's offer by
-   production's numbering: the n-th need the target answers queues `offer:<edge>@r<n>`.
+   production's numbering: the n-th need the target answers queues `offer:<edge>@r<n>`. The target's answer publishes
+   that offer's notice itself, through the routing table's offer row (a data structure's `users` topic, a function's
+   `callers` topic): the run requires it in the source's session, told from the driver's notices by its payload's
+   `type` (`offer`), `from` (the target) and `item`, on the routing table's topic, and each step waits for it. The
+   report's "Owner notices" table lists each, with its step, event, dedupe key and transcript line.
    Every notice to a running, subscribed owner is a required delivery: arrival, duplicates, out of order, and a
    notice after the daemon restart to the pane the new daemon launched. A killed owner's need notice, and the
    restart's need notice (published while no pane of the target runs), are optional, because no session may be
@@ -227,13 +236,15 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    notices.
 6. **Check.** `messagetest.Check` reads the ledger's events, the owners' branches and the deliveries the owners'
    session transcripts record, and fails on a missed, duplicate or unexpected delivery (a notice of another run
-   included), an item completed twice or never, recorded twice or not at all, an out-of-order item answered as
+   included), an owner notice its receiver's session never recorded (missed) or recorded on another topic
+   (unexpected), an item completed twice or never, recorded twice or not at all, an out-of-order item answered as
    current, a follow-up enqueued twice, never or for another owner, and a record or completion of an item the run did
    not expect.
 7. **Teardown.** The run stops its daemon by its own PID, its panes by its own tmux socket, and then every owner
    process it saw in its panes that still runs, by its own PID (a PID counts only while its process names the run's
-   ledger repository). It then removes its bearer directory and the daemon's boot-token files, which the daemon writes
-   under its state directory in `DIR` (`DIR/daemon/state/secrets/`); the report lists those PIDs and paths. On SIGINT
+   ledger repository). It then removes its bearer directory, the daemon's boot-token files, which the daemon writes
+   under its state directory in `DIR` (`DIR/daemon/state/secrets/`), and, once its tmux server is stopped, `DIR/tmux`
+   with the socket (tmux never removes a socket file); the report lists those PIDs and paths. On SIGINT
    or SIGTERM the run ends its steps, collects and tears down on a context of its own, and writes a partial report
    marked `INTERRUPTED`; `owner message-test` then exits 1.
 

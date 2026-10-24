@@ -54,7 +54,7 @@ func TestReadArrivalsReadsTheDeliveriesAnOwnerTranscriptRecords(t *testing.T) {
 			Step: "arrival", Topic: callers, Subject: callers, DedupeKey: "publish.mt0a1b2c3d4e5f6a7b",
 			At: time.Date(2026, 10, 24, 4, 53, 43, 323e6, time.UTC), Transcript: path, Line: 4, Entry: "b3344aaf"},
 		{Owner: "struct:mountpoint", ID: "c3bb24243317a68bb9772a655b87c19f", Type: "message-test", Run: "message-test-20261024t045309z-0a1b2c3d",
-			Step: "out of order", Topic: needs, Subject: needs, DedupeKey: "publish.mt1b2c3d4e5f6a7b8c",
+			Step: "out of order", Item: "need:function:get_mountpoint@fs/namespace.c->struct:mountpoint@r2", Topic: needs, Subject: needs, DedupeKey: "publish.mt1b2c3d4e5f6a7b8c",
 			At: time.Date(2026, 10, 24, 5, 15, 55, 965e6, time.UTC), Transcript: path, Line: 6, Entry: "c03990ef"},
 	}
 	if !slices.EqualFunc(arrivals, want, func(a, b Arrival) bool { return a == b }) {
@@ -73,6 +73,30 @@ func TestReadArrivalsTakesTheTopicFromEnvoysRecordNotThePayload(t *testing.T) {
 	arrivals, err := readArrivals("struct:mountpoint", path)
 	if err != nil || len(arrivals) != 1 || arrivals[0].Topic != delivered || arrivals[0].Subject != delivered {
 		t.Fatalf("readArrivals = %+v, %v; want the topic and subject %s that Envoy delivered it on, not the payload's", arrivals, err, delivered)
+	}
+}
+
+// An owner's own notice, as pi-envoy renders and records one that the real hub delivered: the offer notice that the
+// data structure's owner publishes through the routing table when its answer to a need queues the offer for the need's
+// source.
+const ownerNoticeLine = `{"type":"custom_message","customType":"envoy-message","content":"envoy:\n  from: agent\n  at: \"2026-10-24T11:25:56Z\"\n  id: 5869e896ca12287cb279a8ff9e15731d\n  summary: \"offer function:get_mountpoint@fs/namespace.c -> struct:mountpoint r1 (epoch 0) at 33d50448e490\"\n  message:\n    commit: 33d50448e490b8733b73ad4ba62d734e231afc98\n    edge: \"function:get_mountpoint@fs/namespace.c->struct:mountpoint\"\n    epoch: 0\n    from: \"struct:mountpoint\"\n    item: \"offer:function:get_mountpoint@fs/namespace.c->struct:mountpoint@r1\"\n    models: null\n    record: skeleton/nodes/K135ea7ac23fb1090/message-test/answer-need-1.yaml\n    to: \"function:get_mountpoint@fs/namespace.c\"\n    type: offer\n    versions: null","display":true,"details":{"subject":"notifications.example-message-test.mt.node.struct:mountpoint.users","topic":"notifications.example-message-test.mt.node.struct:mountpoint.users","event_id":"5869e896ca12287cb279a8ff9e15731d","dedupe_key":"publish.c5da07acf27892109807e873c2abf1e3"},"attribution":"agent","id":"3537054f","parentId":"de0f4540","timestamp":"2026-10-24T11:25:56.667Z","runtime":{"version":"18.12.2"}}`
+
+// An owner's own notice is read as the driver's are: its event id, pi-envoy's record of the topic and subject it
+// arrived on and its dedupe key, and from the payload its type, its publisher (from) and the item it names. That is
+// how the driver tells it from its own notices, whose type is message-test.
+func TestReadArrivalsReadsAnOwnersOwnNotice(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.jsonl")
+	writeTranscript(t, path, headerLine, ownerNoticeLine, "")
+	arrivals, err := readArrivals("function:get_mountpoint@fs/namespace.c", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := "notifications.example-message-test.mt.node.struct:mountpoint.users"
+	want := Arrival{Owner: "function:get_mountpoint@fs/namespace.c", ID: "5869e896ca12287cb279a8ff9e15731d", Type: "offer", From: "struct:mountpoint",
+		Item: "offer:function:get_mountpoint@fs/namespace.c->struct:mountpoint@r1", Topic: users, Subject: users, DedupeKey: "publish.c5da07acf27892109807e873c2abf1e3",
+		At: time.Date(2026, 10, 24, 11, 25, 56, 667e6, time.UTC), Transcript: path, Line: 2, Entry: "3537054f"}
+	if len(arrivals) != 1 || arrivals[0] != want {
+		t.Fatalf("arrivals = %+v\nwant %+v", arrivals, want)
 	}
 }
 

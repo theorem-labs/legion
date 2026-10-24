@@ -29,15 +29,18 @@ const envoyMessage = "envoy-message"
 // noticeType is the payload type of every notice the driver publishes.
 const noticeType = "message-test"
 
-// Arrival is one Envoy delivery an owner session's transcript records: the event id, the payload's type, run and step,
-// pi-envoy's record of the delivery (the topic of its envelope, the subject the session took it on and its dedupe
-// key), when the session recorded it, where, and the transcript entry's own id.
+// Arrival is one Envoy delivery an owner session's transcript records: the event id, the payload's type, run, step,
+// publisher (from) and item, pi-envoy's record of the delivery (the topic of its envelope, the subject the session
+// took it on and its dedupe key), when the session recorded it, where, and the transcript entry's own id. A driver's
+// notice names its run and step; an owner's own notice names its publisher and, for a queued item, the item.
 type Arrival struct {
 	Owner      string    `json:"owner"`
 	ID         string    `json:"id"`
 	Type       string    `json:"type"`
 	Run        string    `json:"run"`
 	Step       string    `json:"step"`
+	From       string    `json:"from,omitempty"`
+	Item       string    `json:"item,omitempty"`
 	Topic      string    `json:"topic"`
 	Subject    string    `json:"subject"`
 	DedupeKey  string    `json:"dedupe_key"`
@@ -156,12 +159,15 @@ type renderedDelivery struct {
 	} `yaml:"envoy"`
 }
 
-// noticePayload is the payload of the driver's notices. Its topic is the driver's own word and decides nothing: a
-// delivery's topic is pi-envoy's record of it.
+// noticePayload is the part of a notice's payload the driver reads: the type, and the run and step of the driver's
+// own notices, or the publisher (from) and item of an owner's. A driver's notice's topic is the driver's own word and
+// decides nothing: a delivery's topic is pi-envoy's record of it.
 type noticePayload struct {
 	Type string `yaml:"type"`
 	Run  string `yaml:"run"`
 	Step string `yaml:"step"`
+	From string `yaml:"from"`
+	Item string `yaml:"item"`
 }
 
 // readArrivals reads every delivery a transcript records, in order. A line still being written (no newline yet) is
@@ -201,8 +207,8 @@ func readArrivals(owner, path string) ([]Arrival, error) {
 			}
 			continue
 		}
+		details := line.Details
 		if arrival.Type == noticeType {
-			details := line.Details
 			switch {
 			case details.Topic == "" || details.Subject == "":
 				return nil, fmt.Errorf("%s:%d: the delivery %s of a %s notice holds no record of its topic and subject (the custom message's details, which pi-envoy writes)",
@@ -210,8 +216,8 @@ func readArrivals(owner, path string) ([]Arrival, error) {
 			case details.EventID != "" && details.EventID != arrival.ID:
 				return nil, fmt.Errorf("%s:%d: the delivery renders the id %s, but pi-envoy recorded the event %s", path, number, arrival.ID, details.EventID)
 			}
-			arrival.Topic, arrival.Subject, arrival.DedupeKey = details.Topic, details.Subject, details.DedupeKey
 		}
+		arrival.Topic, arrival.Subject, arrival.DedupeKey = details.Topic, details.Subject, details.DedupeKey
 		arrival.Owner, arrival.At, arrival.Transcript, arrival.Line, arrival.Entry = owner, line.Timestamp, path, number, line.ID
 		arrivals = append(arrivals, arrival)
 	}
@@ -240,8 +246,8 @@ func messageText(raw json.RawMessage) (string, error) {
 	return strings.Join(out, "\n"), nil
 }
 
-// parseDelivery reads a rendered delivery: its event id, and the type, run, step and topic of a payload that is a
-// mapping. A payload of any other shape is no notice of the driver's, and leaves them empty.
+// parseDelivery reads a rendered delivery: its event id, and the type, run, step, publisher and item of a payload
+// that is a mapping. A payload of any other shape is no notice of the driver's or an owner's, and leaves them empty.
 func parseDelivery(content string) (Arrival, error) {
 	var rendered renderedDelivery
 	if err := yaml.Unmarshal([]byte(content), &rendered); err != nil {
@@ -256,7 +262,7 @@ func parseDelivery(content string) (Arrival, error) {
 		if err := rendered.Envoy.Message.Decode(&payload); err != nil {
 			return Arrival{}, err
 		}
-		arrival.Type, arrival.Run, arrival.Step = payload.Type, payload.Run, payload.Step
+		arrival.Type, arrival.Run, arrival.Step, arrival.From, arrival.Item = payload.Type, payload.Run, payload.Step, payload.From, payload.Item
 	}
 	return arrival, nil
 }

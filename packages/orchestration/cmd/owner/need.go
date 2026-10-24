@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"slices"
 
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 )
@@ -205,7 +206,7 @@ func (s *session) answeredReplies(p party, edge string, answers []string) ([]ans
 
 // appendNew appends value unless values holds it.
 func appendNew(values []string, value string) []string {
-	if containsString(values, value) {
+	if slices.Contains(values, value) {
 		return values
 	}
 	return append(values, value)

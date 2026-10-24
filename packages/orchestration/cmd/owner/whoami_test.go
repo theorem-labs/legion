@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"reflect"
+	"slices"
 	"testing"
 
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
@@ -35,7 +36,7 @@ func TestWhoamiAndTopicsDescribeEveryOwnerKind(t *testing.T) {
 		if err := json.Unmarshal([]byte(f.as(owner).ok("--json", "topics")), &topics); err != nil {
 			t.Fatal(err)
 		}
-		if topics.Owner != owner || !containsString(topics.Topics, wantTopic) {
+		if topics.Owner != owner || !slices.Contains(topics.Topics, wantTopic) {
 			t.Errorf("topics for %s = %+v, want %s", owner, topics, wantTopic)
 		}
 	}

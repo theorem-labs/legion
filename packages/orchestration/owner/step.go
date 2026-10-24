@@ -105,11 +105,10 @@ func (r Runner) Run(ctx context.Context, s Step) (Outcome, error) {
 		trailers["Owner-Item"] = []string{s.Answers}
 	}
 
-	commit, err := r.Tree.CommitFile(ctx, s.Path, s.Data, s.Subject, trailers)
-	if err != nil {
+	if _, err := r.Tree.CommitFile(ctx, s.Path, s.Data, s.Subject, trailers); err != nil {
 		return Outcome{}, fmt.Errorf("commit record %s: %w", s.Path, err)
 	}
-	commit, err = r.Tree.LastCommitTouching(s.Path)
+	commit, err := r.Tree.LastCommitTouching(s.Path)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("find the commit of record %s: %w", s.Path, err)
 	}
@@ -169,7 +168,7 @@ func (r Runner) checkAttributed(s Step, commit string) error {
 // the supervisor has not sent yet, so its generation is adopted; any other item is claimed, which refuses another
 // holder's live lease.
 func claimOrAdopt(ctx context.Context, l Ledger, repo, owner, id string, item ledger.Item) (int64, error) {
-	if item.Holder == owner && leaseLive(item) {
+	if item.Holder == owner && LeaseLive(item) {
 		return item.Generation, nil
 	}
 
@@ -186,13 +185,15 @@ func claimOrAdopt(ctx context.Context, l Ledger, repo, owner, id string, item le
 	if itemErr != nil {
 		return 0, fmt.Errorf("re-read answer item %q after held lease: %w", id, itemErr)
 	}
-	if item.Holder == owner && leaseLive(item) {
+	if item.Holder == owner && LeaseLive(item) {
 		return item.Generation, nil
 	}
 	return 0, fmt.Errorf("claim answer item %q: %w", id, err)
 }
 
-func leaseLive(item ledger.Item) bool {
+// LeaseLive reports whether item is held by a lease that has not expired: a holder, and no end time or one still to
+// come. The step runner adopts its owner's own live lease and refuses anyone else's.
+func LeaseLive(item ledger.Item) bool {
 	return item.Holder != "" && (item.ExpiresAt == nil || item.ExpiresAt.After(time.Now()))
 }
 

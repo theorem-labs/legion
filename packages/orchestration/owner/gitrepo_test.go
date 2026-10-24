@@ -65,6 +65,37 @@ func TestRepoWorktreeCreatesAndReusesInParallel(t *testing.T) {
 	}
 }
 
+// Each owner's first command makes its worktree of the one bare repository, and the owners' commands run at once. git
+// does not lock `git worktree add`: an add reads every other worktree's administrative files, which a concurrent add
+// is still writing, and fails with "failed to read worktrees/<name>/commondir" (seen once in 300 runs of the test
+// above under -race). So owners making their worktrees together must each get one.
+func TestRepoWorktreeCreatesManyWorktreesAtOnce(t *testing.T) {
+	for range 10 {
+		repo := newTestRepo(t)
+		start := make(chan struct{})
+		errs := make(chan error, 16)
+		var wait sync.WaitGroup
+		for index := range 16 {
+			wait.Add(1)
+			go func() {
+				defer wait.Done()
+				<-start
+				branch := fmt.Sprintf("owner/k%02d", index)
+				_, err := repo.Worktree(context.Background(), filepath.Join(t.TempDir(), strings.ReplaceAll(branch, "/", "-")), branch, "main")
+				errs <- err
+			}()
+		}
+		close(start)
+		wait.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
 func TestWorktreesCommitInParallel(t *testing.T) {
 	repo := newTestRepo(t)
 	one := testWorktree(t, repo, "owner/one")

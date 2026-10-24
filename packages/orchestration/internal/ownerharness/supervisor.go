@@ -116,7 +116,7 @@ func LoadConfig(path string, getenv func(string) string) (Config, error) {
 		config.PostgresDSN = strings.TrimSpace(getenv("LEGION_POSTGRES_DSN"))
 	}
 	switch {
-	case projectToken(config.Project) == "":
+	case messagetest.ProjectToken(config.Project) == "":
 		return Config{}, errors.New("project is required and must hold a letter or digit")
 	case config.StateDir == "":
 		return Config{}, errors.New("state_dir is required")
@@ -197,17 +197,6 @@ func ompPath(invocation string, getenv func(string) string) (string, error) {
 	return configured, nil
 }
 
-// projectToken is the daemon's spelling of the project: lowercase letters and digits.
-func projectToken(project string) string {
-	var out strings.Builder
-	for _, r := range strings.ToLower(project) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			out.WriteRune(r)
-		}
-	}
-	return out.String()
-}
-
 type supervisor struct {
 	config    Config
 	store     *ledger.Store
@@ -262,7 +251,7 @@ func Supervise(ctx context.Context, config Config, log io.Writer) error {
 	}()
 	s := &supervisor{
 		config: config, store: store, dsnFile: config.StandingOwners.LedgerDSNFile, socket: messagetest.DaemonSocket(config.Project),
-		token: projectToken(config.Project), panes: map[string]string{}, pending: map[string]bool{}, refused: map[string]int64{},
+		token: messagetest.ProjectToken(config.Project), panes: map[string]string{}, pending: map[string]bool{}, refused: map[string]int64{},
 		log: log, probeTick: 200 * time.Millisecond,
 	}
 	if err := os.MkdirAll(config.StateDir, 0o700); err != nil {
