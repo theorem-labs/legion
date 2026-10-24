@@ -86,8 +86,9 @@ func parseDriverFlags(args []string) (driverFlags, error) {
 			flags.nodes = nodes
 		case "--kills":
 			kills, err := strconv.Atoi(value)
-			if err != nil || kills < 0 {
-				return driverFlags{}, usagef("--kills takes a count, not %q", value)
+			if err != nil || kills < len(messagetest.Moments) {
+				return driverFlags{}, usagef("--kills takes a count of at least %d, one kill at each moment of a step (%s), not %q",
+					len(messagetest.Moments), strings.Join(messagetest.Moments, ", "), value)
 			}
 			flags.kills = kills
 		case "--out":

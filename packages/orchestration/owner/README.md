@@ -121,7 +121,8 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    Every notice to a running, subscribed owner is a required delivery: arrival, duplicates, out of order, the
    restart's need when the target's pane runs, and a notice after the daemon restart to the pane it left running.
    A killed owner's need notice is optional, because the kill can end the session before the notice reaches it.
-   `--kills` (default 5) panes are killed at a moment drawn from the owner's progress, and the daemon is restarted
+   `--kills` (default 5; at least 3, one at each moment, and fewer is a usage error, exit 2) panes are killed at a
+   moment drawn from the owner's progress, and the daemon is restarted
    once while an owner runs. Each step ends when the ledger shows its items' outcomes and the sessions' transcripts
    show its notices.
 6. **Check.** `messagetest.Check` reads the ledger's events, the owners' branches and the deliveries the owners'

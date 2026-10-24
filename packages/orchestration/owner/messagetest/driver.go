@@ -61,9 +61,11 @@ func DefaultTimeouts() Timeouts {
 	}
 }
 
-var moments = []string{MomentBeforeClaim, MomentAfterClaim, MomentAfterAnswer}
+// Moments are the three moments of an owner's step at which the run kills its pane, in the order of the step: before
+// the owner claims the item, after it claims it, and after it answers it. A run kills at least one pane at each.
+var Moments = []string{MomentBeforeClaim, MomentAfterClaim, MomentAfterAnswer}
 
-func momentRank(moment string) int { return slices.Index(moments, moment) }
+func momentRank(moment string) int { return slices.Index(Moments, moment) }
 
 type driver struct {
 	opts   Options
@@ -205,8 +207,8 @@ func (o Options) check() error {
 		return fmt.Errorf("prefix %q is not a prefix under notifications. that ends in a dot", o.Prefix)
 	case len(o.Nodes) != 0 && (len(o.Nodes) != 2 || o.Nodes[0] == o.Nodes[1]):
 		return fmt.Errorf("the message test takes two different nodes, not %v", o.Nodes)
-	case o.Kills < 0:
-		return fmt.Errorf("kills %d is negative", o.Kills)
+	case o.Kills < len(Moments):
+		return fmt.Errorf("kills %d: a run kills at least %d owner panes, one at each moment of a step (%s)", o.Kills, len(Moments), strings.Join(Moments, ", "))
 	case !filepath.IsAbs(o.Out) || !filepath.IsAbs(o.Owner) || !filepath.IsAbs(o.Legion) || !filepath.IsAbs(o.Deploy.LedgerDSNFile):
 		return fmt.Errorf("the output directory, the owner and legion executables and the deployment's ledger_dsn_file must be absolute paths")
 	case strings.ContainsAny(o.Out+o.Owner, " \t\n"):
@@ -1018,7 +1020,7 @@ func (d *driver) kill(index int) func(context.Context) error {
 	return func(ctx context.Context) error {
 		version := fmt.Sprintf("r%d", 4+index)
 		item := d.need(version)
-		drawn := moments[d.rng.IntN(len(moments))]
+		drawn := Moments[d.rng.IntN(len(Moments))]
 		if _, err := d.enqueueNeed(ctx, "kill", version, false); err != nil {
 			return err
 		}

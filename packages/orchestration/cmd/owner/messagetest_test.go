@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -225,6 +226,8 @@ func TestMessageTestUsage(t *testing.T) {
 		{"message-test", "--out"},
 		{"message-test", "--out", f.root + "/run", "--nodes", caller},
 		{"message-test", "--out", f.root + "/run", "--kills", "-1"},
+		{"message-test", "--out", f.root + "/run", "--kills", "0"},
+		{"message-test", "--out", f.root + "/run", "--kills", "2"},
 		{"message-test", "--out", f.root + "/run", "--frobnicate"},
 	} {
 		if code, stderr := f.as(caller).fails(args...); code != exitUsage {
@@ -233,5 +236,20 @@ func TestMessageTestUsage(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.root, "run")); err == nil {
 		t.Fatal("a refused message-test made its output directory")
+	}
+}
+
+// A full run kills one owner pane at each of the three moments of a step (before the claim, after the claim, after
+// the answer), so a count of kills below three, 0 included, is a usage error: such a run could not show every moment.
+func TestParseDriverFlagsRefusesFewerKillsThanMoments(t *testing.T) {
+	for _, kills := range []string{"0", "1", "2"} {
+		_, err := parseDriverFlags([]string{"--kills", kills, "--out", "/runs/one"})
+		var usage *usageError
+		if !errors.As(err, &usage) || !strings.Contains(err.Error(), "at least 3") {
+			t.Errorf("--kills %s: %v, want a usage error that asks for at least 3", kills, err)
+		}
+	}
+	if flags, err := parseDriverFlags([]string{"--kills", "3", "--out", "/runs/one"}); err != nil || flags.kills != 3 {
+		t.Fatalf("--kills 3 = %+v, %v", flags, err)
 	}
 }

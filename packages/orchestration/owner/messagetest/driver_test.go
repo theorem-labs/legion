@@ -131,25 +131,46 @@ func TestGraphWriteKeepsTheTwoNodesUnderThePrefix(t *testing.T) {
 	}
 }
 
-// runUntilSetupStops runs the message test on a graph of fn and st under prefix (empty: the graph's own). The
-// deployment names only its graph and a ledger DSN file that does not exist, so the run stops in setup once it has
-// written the test graph, the test copy and the driver's extra topics.
-func runUntilSetupStops(t *testing.T, prefix string) (Report, string) {
+// setupStopOptions are the options of a run of three kills on a graph of fn and st under prefix (empty: the graph's
+// own). The deployment names only its graph and a ledger DSN file that does not exist, so the run stops in setup once
+// it has written the test graph, the test copy and the driver's extra topics.
+func setupStopOptions(t *testing.T, prefix string) Options {
 	t.Helper()
 	fn, st := "function:c@x/y.c", "struct:t"
 	dir := writeGraphDir(t, map[string]string{fn: "function", st: "struct"},
 		map[string][]string{fn: everyKind("function:c%40x%2Fy%2Ec", st), st: {"all", "node.struct:t.needs"}}, [][2]string{{fn, st}})
-	out := filepath.Join(t.TempDir(), "run")
-	report, err := Run(t.Context(), Options{
-		Prefix: prefix, Nodes: []string{fn, st}, Out: out,
+	return Options{
+		Prefix: prefix, Nodes: []string{fn, st}, Kills: 3, Out: filepath.Join(t.TempDir(), "run"),
 		Deploy: ownerpkg.Deploy{GraphDir: dir, LedgerDSNFile: filepath.Join(t.TempDir(), "ledger-dsn")},
 		Owner:  "/opt/bin/owner", Legion: "/opt/bin/legion",
 		Getenv: func(string) string { return "" }, Progress: io.Discard, Timeouts: Timeouts{Poll: time.Millisecond},
-	})
+	}
+}
+
+// runUntilSetupStops runs the message test of setupStopOptions until its setup stops.
+func runUntilSetupStops(t *testing.T, prefix string) (Report, string) {
+	t.Helper()
+	opts := setupStopOptions(t, prefix)
+	report, err := Run(t.Context(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return report, out
+	return report, opts.Out
+}
+
+// A full run kills one owner pane at each of the three moments of a step, so Run refuses fewer kills than moments,
+// 0 included, before it makes its output directory.
+func TestRunRefusesFewerKillsThanMoments(t *testing.T) {
+	for _, kills := range []int{0, 2} {
+		opts := setupStopOptions(t, "")
+		opts.Kills = kills
+		if _, err := Run(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "at least 3") {
+			t.Errorf("Run with %d kills: %v, want a refusal that asks for at least 3", kills, err)
+		}
+		if _, err := os.Stat(opts.Out); !os.IsNotExist(err) {
+			t.Errorf("a refused run made its output directory %s: %v", opts.Out, err)
+		}
+	}
 }
 
 // assertRunPrefix checks that every topic of the run is under want: the report, the test graph's topics.json and every

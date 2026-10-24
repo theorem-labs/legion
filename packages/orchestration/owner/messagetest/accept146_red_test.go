@@ -20,7 +20,7 @@ import (
 func TestRunsStartedInTheSameSecondGetTheirOwnLedgerRepository(t *testing.T) {
 	run := func() Report {
 		report, err := Run(t.Context(), Options{
-			Nodes: []string{"function:c@x/y.c", "struct:t"}, Out: filepath.Join(t.TempDir(), "run"),
+			Nodes: []string{"function:c@x/y.c", "struct:t"}, Kills: 3, Out: filepath.Join(t.TempDir(), "run"),
 			Deploy: ownerpkg.Deploy{GraphDir: t.TempDir(), LedgerDSNFile: filepath.Join(t.TempDir(), "ledger-dsn")},
 			Owner:  "/opt/bin/owner", Legion: "/opt/bin/legion",
 			Getenv: func(string) string { return "" }, Progress: io.Discard, Timeouts: Timeouts{Poll: time.Millisecond},
