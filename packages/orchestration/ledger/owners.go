@@ -34,6 +34,37 @@ func (s *Store) OpenOwners(ctx context.Context, repo string) ([]string, error) {
 	return owners, err
 }
 
+// OpenItems lists owner's open items in repo, in enqueue order (created_at, then id), each as Item reads it: its
+// holder and generation, and its lease end only for a fixed-end lease. An owner with no open items has an empty list;
+// an empty owner is invalid input.
+func (s *Store) OpenItems(ctx context.Context, repo, owner string) ([]Item, error) {
+	if strings.TrimSpace(owner) == "" {
+		return nil, invalid("empty owner")
+	}
+	items := []Item{}
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT id, owner, state, coalesce(holder, ''), generation, lease_expires_at
+			FROM work_items WHERE repo = $1 AND owner = $2 AND state = 'open' ORDER BY created_at, id`, repo, owner)
+		if err != nil {
+			return err
+		}
+		read, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Item, error) {
+			var it Item
+			err := row.Scan(&it.ID, &it.Owner, &it.State, &it.Holder, &it.Generation, &it.ExpiresAt)
+			return it, err
+		})
+		if err != nil {
+			return err
+		}
+		items = append(items[:0], read...)
+		return nil
+	})
+	return items, err
+}
+
 // LatestEventID is the id of repo's newest event, or zero when it has none: the cursor a reader of
 // OwnerWakes starts from to see only what happens next.
 func (s *Store) LatestEventID(ctx context.Context, repo string) (int64, error) {
