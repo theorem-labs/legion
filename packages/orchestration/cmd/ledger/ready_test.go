@@ -102,6 +102,96 @@ func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
 	}
 }
 
+// TestReadyRecordsPrintEmptyCollectionsInBothForms catches a ready record whose absent lists and maps print as null,
+// and a record whose shape depends on the input form. A ready with only a head, through flags or a request file,
+// prints {} for changed_contracts and [] for reviews and approved_pinned in ready, ready-list and its migration.ready
+// event, and a landing with no review prints [] for reviews in its migration.landed event.
+func TestReadyRecordsPrintEmptyCollectionsInBothForms(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_ready_shapes")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	invoke := func(args ...string) string {
+		t.Helper()
+		var out, err bytes.Buffer
+		if code := run(context.Background(), args, getenv, &out, &err); code != 0 {
+			t.Fatalf("%v exited %d: %s", args, code, err.String())
+		}
+		return out.String()
+	}
+	empty := func(what, output string, fields map[string]json.RawMessage) {
+		t.Helper()
+		for field, want := range map[string]string{"changed_contracts": "{}", "reviews": "[]", "approved_pinned": "[]"} {
+			if got := string(fields[field]); got != want {
+				t.Fatalf("%s prints %s = %s, want %s: %s", what, field, got, want, output)
+			}
+		}
+	}
+	invoke("repo", "ensure", "r", "0")
+	invoke("open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
+	invoke("open", "r", "M-file", "bob", "base", "branch", "--write", "b.lean")
+	file := filepath.Join(t.TempDir(), "ready.json")
+	if err := os.WriteFile(file, []byte(`{"repo":"r","id":"M-file","generation":1,"head":"head-file"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"--json", "ready", "r", "M-flag", "1", "--head", "head-flag"},
+		{"--json", "ready", "--request-file", file},
+	} {
+		output := invoke(args...)
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(output), &fields); err != nil {
+			t.Fatal(err)
+		}
+		empty(strings.Join(args, " "), output, fields)
+	}
+	output := invoke("--json", "ready-list", "r")
+	var listed []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(output), &listed); err != nil || len(listed) != 2 {
+		t.Fatalf("ready-list: %v %s", err, output)
+	}
+	for _, fields := range listed {
+		empty("ready-list", output, fields)
+	}
+	for _, id := range []string{"M-flag", "M-file"} {
+		output := invoke("--json", "events", "r", "0", id)
+		var events []struct {
+			Kind string                     `json:"kind"`
+			Data map[string]json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(output), &events); err != nil {
+			t.Fatal(err)
+		}
+		ready := 0
+		for _, event := range events {
+			if event.Kind == "migration.ready" {
+				ready++
+				empty("migration.ready of "+id, output, event.Data)
+			}
+		}
+		if ready != 1 {
+			t.Fatalf("%d migration.ready events for %s: %s", ready, id, output)
+		}
+	}
+
+	invoke("land", "--repo", "r", "--migration", "M-flag", "--generation", "1", "--commit", "commit-1", "--path", "a.lean")
+	output = invoke("--json", "events", "r", "0", "M-flag")
+	var events []struct {
+		Kind string                     `json:"kind"`
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(output), &events); err != nil {
+		t.Fatal(err)
+	}
+	landed := events[len(events)-1]
+	if landed.Kind != "migration.landed" || string(landed.Data["reviews"]) != "[]" || string(landed.Data["contracts"]) != "[]" {
+		t.Fatalf("migration.landed event with no review: %s", output)
+	}
+}
+
 func TestReadyFlagsRejectNamesContainingDelimiters(t *testing.T) {
 	dsn := testpg.Database(t, "ledger_ready_delimiters")
 	getenv := func(key string) string {

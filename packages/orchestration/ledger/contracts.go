@@ -631,6 +631,10 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 		return Migration{}, err
 	}
 	names := sortedNames(req.ChangedContracts)
+	reviews := req.Reviews
+	if reviews == nil {
+		reviews = []Review{}
+	}
 	approved := make(map[string]struct{}, len(req.ApprovedPinned))
 	for _, name := range req.ApprovedPinned {
 		approved[name] = struct{}{}
@@ -736,7 +740,7 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 			"head":                req.Head,
 			"compatibility_proof": req.CompatibilityProof,
 			"reviewed_head":       req.ReviewedHead,
-			"reviews":             req.Reviews,
+			"reviews":             reviews,
 			"upstream":            req.Upstream,
 		}); err != nil {
 			return err

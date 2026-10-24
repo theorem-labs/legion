@@ -607,10 +607,20 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 }
 
 // Ready records the exact landing inputs an owner supplies for an open, current, un-escalated migration. A later
-// ready replaces the previous record and has the id of its own migration.ready event.
+// ready replaces the previous record and has the id of its own migration.ready event. An absent list or map is
+// recorded empty, so a record has one shape whether its request came from flags or from JSON.
 func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error) {
 	if err := checkReadyRequest(req); err != nil {
 		return ReadyRecord{}, err
+	}
+	if req.ChangedContracts == nil {
+		req.ChangedContracts = map[string]string{}
+	}
+	if req.Reviews == nil {
+		req.Reviews = []Review{}
+	}
+	if req.ApprovedPinned == nil {
+		req.ApprovedPinned = []string{}
 	}
 	changedContracts, err := json.Marshal(req.ChangedContracts)
 	if err != nil {
