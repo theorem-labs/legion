@@ -452,6 +452,7 @@ class _Extractor:
         self.nesting = 0  # analyses under way, one inside another: bounded by _EFFECT_DEPTH
         self.depth_cuts = 0  # calls not followed at the depth bound, and kept answers resting on one
         self.selections: dict[int, set[int] | None] = {}
+        self.static_locals: dict[int, ci.Cursor] = {}  # the static locals walked: their initializers are data
         self.typedefs: dict[str, str] | None = None  # the unit's typedef names, read on demand
 
     # Locations -----------------------------------------------------------------------------
@@ -971,14 +972,80 @@ class _Extractor:
     def branches_without_effect(self, statement: ci.Cursor, dead: frozenset[int] = frozenset()) -> bool:
         """An ``if`` whose branches have no effect and leave only by their end: only what its
         condition does is code (__device_attach's ``if (dev->parent) pm_runtime_get_sync(dev->parent)``
-        without CONFIG_PM). A store to a variable in ``dead``, which nothing reads, is no effect."""
+        without CONFIG_PM). A store to a variable in ``dead``, which nothing reads, is no effect, and
+        neither is code control does not reach (clk_core_is_enabled's goto under
+        ``!pm_runtime_active(dev)``, which gives true without CONFIG_PM)."""
         children = _children(statement)
         return (
             statement.kind == K.IF_STMT
             and len(children) >= 2
-            and not _jumps_out(statement, 0)
+            and not _jumps_out(statement, 0, self.live_children)
             and all(self.effect_free(branch, dead) for branch in children[1:])
         )
+
+    def live_children(self, node: ci.Cursor, children: list[ci.Cursor]) -> list[ci.Cursor]:
+        """The children of ``node`` control reaches, as the walk decides them: the branch a constant
+        condition selects, the left operand alone of ``&&`` or ``||`` where it decides, and a block's
+        statements up to one that exits. A part that holds a label stays, as a goto may enter it."""
+        kind = node.kind
+        if kind == K.COMPOUND_STMT:
+            for index, child in enumerate(children[:-1]):
+                if child.kind in (*_EXITS, K.COMPOUND_STMT, K.IF_STMT, K.DO_STMT) and self.evaluator.exits(child):
+                    rest = children[index + 1 :]
+                    return children if any(_holds_label(part) for part in rest) else children[: index + 1]
+            return children
+        if len(children) < 2 or _mentions(children[0], _IMAGE_DECIDES):
+            return children
+        if kind in (K.IF_STMT, K.CONDITIONAL_OPERATOR):
+            value = self.evaluator.evaluate(children[0], truth=True)
+            if value is None:
+                return children
+            selected = 1 if value else 2
+            kept = [child for index, child in enumerate(children) if index in (0, selected)]
+            return children if any(_holds_label(child) for child in children if child not in kept) else kept
+        if kind == K.BINARY_OPERATOR and libclang.binary_kind(node) in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
+            left = self.evaluator.evaluate(children[0], truth=True)
+            if left is not None and bool(left) == (libclang.binary_kind(node) == libclang.LOGICAL_OR):
+                return children[:1]
+        return children
+
+    def loop_without_effect(self, loop: ci.Cursor, function: ci.Cursor, dead: frozenset[int]) -> bool:
+        """A loop that has no effect: it may be assumed to end (not a constant controlling
+        expression), and it stores only to locals nothing outside it reads. flush_all_rcu_sheaves'
+        ``list_for_each_entry(s, &slab_caches, list) { if (!cache_has_sheaves(s)) continue; ... }``
+        with CONFIG_SLUB_TINY stores only its cursor; the compiler removes the whole loop."""
+        if loop.kind not in _LOOPS or self.loop_may_not_end(loop):
+            return False
+        stored: set[int] = set()
+        for node in _effect_nodes(loop, self.live_children):
+            target = _store_target(node)
+            variable = _stored_variable(target) if target is not None else None
+            if variable is not None and _is_local(variable):
+                stored.add(variable.hash)
+        declared = {node.hash for node in _effect_nodes(loop) if node.kind == K.VAR_DECL and _is_local(node)}
+        return self._effect_free(loop, stored | declared | dead, inlined=True) and not _referenced_outside(
+            function, loop, stored - declared
+        )
+
+    def outcome(self, statements: list[ci.Cursor], dead: frozenset[int], falls_off: bool) -> tuple[int | None] | None:
+        """What running ``statements`` gives, where they have no effect and end in a return: the
+        returned constant, or (None,) for ``return;`` or for falling off the end of a function that
+        returns nothing (``falls_off``). None where they do anything else."""
+        if statements and statements[-1].kind == K.RETURN_STMT:
+            body, last = statements[:-1], statements[-1]
+        elif falls_off:
+            body, last = statements, None
+        else:
+            return None
+        if any(_jumps_out(part, 0, self.live_children) or not self.effect_free(part, dead) for part in body):
+            return None
+        value = _children(last) if last is not None else []
+        if not value:
+            return (None,)
+        if not self.effect_free(value[0], dead):
+            return None
+        result = self.evaluator.evaluate(value[0])
+        return None if result is None else (result,)
 
     def analysis(self, definition: ci.Cursor) -> _FunctionWalk:
         """The walk of a function whose labels and dead stores are settled.
@@ -999,9 +1066,10 @@ class _Extractor:
         labels: frozenset[str] = frozenset()
         dead: frozenset[int] = frozenset()
         decided: frozenset[int] = frozenset()
+        overwritten: frozenset[int] = frozenset()
         settled = False
         for _ in range(_ANALYSIS_ROUNDS):
-            walk = _FunctionWalk(self, definition, labels, dead, decided)
+            walk = _FunctionWalk(self, definition, labels, dead, decided, overwritten)
             walk.walk(definition, None, 0, None)
             walk.finish()
             if not settled:
@@ -1011,10 +1079,12 @@ class _Extractor:
                     labels |= walk.goto_targets
                     continue
             never_read, image_read = walk.never_read(), walk.read_only_where_the_image_decides()
-            if never_read <= dead and image_read <= decided:
+            stored_again = walk.overwritten_stores()
+            if never_read <= dead and image_read <= decided and stored_again <= overwritten:
                 break
             dead |= never_read
             decided |= image_read - dead
+            overwritten |= stored_again
         self.analyzing.discard(name)
         # A walk that met the depth bound is kept for as deep a horizon as it saw, so a function's
         # own facts (asked at nesting 0) come from a walk that saw its callees whole.
@@ -1065,7 +1135,7 @@ class _Extractor:
         return result
 
     def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool) -> bool:
-        for node in _effect_nodes(root):
+        for node in _effect_nodes(root, self.live_children):
             kind = node.kind
             if kind == K.CALL_EXPR:
                 callee = node.referenced
@@ -1295,8 +1365,42 @@ _LOOP_EXITS = (K.BREAK_STMT, K.CONTINUE_STMT)
 _BRANCHES = (K.IF_STMT, K.CONDITIONAL_OPERATOR, K.SWITCH_STMT, K.WHILE_STMT, K.FOR_STMT, K.DO_STMT, K.GOTO_STMT)
 # CXBinaryOperatorKind Comma.
 _COMMA = 33
+# CXBinaryOperatorKind Assign: ``v = e``, which stores without reading v.
+_ASSIGN = 22
 # CXBinaryOperatorKind Mul and And: with an operand 0, the result is 0 whatever the other one is.
 _ZEROING = (3, 17)
+
+
+def _is_plain_assignment(node: ci.Cursor) -> bool:
+    return node.kind == K.BINARY_OPERATOR and libclang.binary_kind(node) == _ASSIGN
+
+
+def _is_static_local(variable: ci.Cursor) -> bool:
+    """A variable a function declares static: the compiler lays it out as data."""
+    parent = variable.semantic_parent
+    return variable.storage_class == ci.StorageClass.STATIC and parent is not None and parent.kind != K.TRANSLATION_UNIT
+
+
+def _holds_label(node: ci.Cursor) -> bool:
+    """A label or a case inside, where control may enter other than by the start."""
+    return any(part.kind in _ENTRIES for part in node.walk_preorder())
+
+
+def _function_body(definition: ci.Cursor) -> ci.Cursor | None:
+    return next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
+
+
+def _referenced_outside(root: ci.Cursor, inside: ci.Cursor, variables: set[int]) -> bool:
+    """A reference to one of ``variables`` in ``root`` that is not in its subtree ``inside``."""
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if node.hash == inside.hash:
+            continue
+        if node.kind == K.DECL_REF_EXPR and node.referenced is not None and node.referenced.hash in variables:
+            return True
+        pending.extend(_children(node))
+    return False
 
 
 def _mentions(cursor: ci.Cursor, names: frozenset[str]) -> bool:
@@ -1371,7 +1475,8 @@ def _exits_under_builtin(statement: ci.Cursor, evaluator: _Evaluator) -> bool:
     return len(parts) >= 2 and _mentions(parts[0], _IMAGE_DECIDES) and evaluator.exits(parts[1])
 
 
-# Builtins that only compute a value from their operands.
+# Builtins that only compute a value from their operands (the return and frame addresses from the
+# frame: kmalloc_nolock_noprof's _RET_IP_).
 _VALUE_BUILTINS = frozenset(
     {
         "__builtin_expect", "__builtin_expect_with_probability", "__builtin_constant_p",
@@ -1379,7 +1484,7 @@ _VALUE_BUILTINS = frozenset(
         "__builtin_clz", "__builtin_clzl", "__builtin_clzll", "__builtin_ctz", "__builtin_ctzl",
         "__builtin_ctzll", "__builtin_ffs", "__builtin_ffsl", "__builtin_ffsll", "__builtin_popcount",
         "__builtin_popcountl", "__builtin_popcountll", "__builtin_bswap16", "__builtin_bswap32",
-        "__builtin_bswap64",
+        "__builtin_bswap64", "__builtin_return_address", "__builtin_frame_address",
     }
 )  # fmt: skip
 # Walks of one function until its labels and dead stores settle, and analyses nested one inside
@@ -1447,14 +1552,23 @@ def _statement_position(parent: ci.Cursor, index: int) -> bool:
     return False
 
 
-def _jumps_out(node: ci.Cursor, enclosing: int) -> bool:
+# The parts of a node control reaches, as the evaluator decides them (_Extractor.live_children).
+_Live = Callable[[ci.Cursor, list[ci.Cursor]], list[ci.Cursor]]
+
+
+def _jumps_out(node: ci.Cursor, enclosing: int, live: _Live | None = None) -> bool:
     """Control may leave ``node`` other than by its end, or enter it other than by its start: a
-    return, a goto, a label, a case, or a break or continue that no loop or switch inside it takes."""
+    return, a goto, a label, a case, or a break or continue that no loop or switch inside it takes.
+    With ``live``, only the parts control reaches count (clk_core_is_enabled's goto under
+    ``!pm_runtime_active(dev)``, a stub that gives true)."""
     kind = node.kind
     if kind in _LEAVES or (kind in (K.BREAK_STMT, K.CONTINUE_STMT) and enclosing == 0):
         return True
     inner = enclosing + 1 if kind in _LOOP_OR_SWITCH else enclosing
-    return any(_jumps_out(child, inner) for child in _children(node))
+    children = _children(node)
+    if live is not None:
+        children = live(node, children)
+    return any(_jumps_out(child, inner, live) for child in children)
 
 
 def _stored_variable(target: ci.Cursor) -> ci.Cursor | None:
@@ -1487,10 +1601,11 @@ def _stored_variable(target: ci.Cursor) -> ci.Cursor | None:
             return None
 
 
-def _effect_nodes(root: ci.Cursor) -> Iterator[ci.Cursor]:
+def _effect_nodes(root: ci.Cursor, live: _Live | None = None) -> Iterator[ci.Cursor]:
     """The nodes of a function or an expression in preorder, without the operands that are never
     evaluated: sizeof and alignof operands, the operands of __builtin_constant_p, cast and
-    compound-literal types, and the types of declarations (typeof)."""
+    compound-literal types, and the types of declarations (typeof). With ``live``, without the
+    parts control does not reach either."""
     pending = [root]
     while pending:
         node = pending.pop()
@@ -1504,6 +1619,8 @@ def _effect_nodes(root: ci.Cursor) -> Iterator[ci.Cursor]:
             children = [child for child in children if initializer is not None and child == initializer]
         elif kind in (K.CSTYLE_CAST_EXPR, K.COMPOUND_LITERAL_EXPR):
             children = children[-1:]
+        elif live is not None:
+            children = live(node, children)
         pending.extend(reversed(children))
 
 
@@ -2237,6 +2354,7 @@ class _FunctionWalk:
         live_labels: frozenset[str] = frozenset(),
         dead_variables: frozenset[int] = frozenset(),
         decided_variables: frozenset[int] = frozenset(),
+        overwritten: frozenset[int] = frozenset(),
     ) -> None:
         self.x = extractor
         self.cursor = cursor
@@ -2260,6 +2378,14 @@ class _FunctionWalk:
         self.goto_targets: set[str] = set()
         self.reads: collections.Counter[int] = collections.Counter()
         self.stores: set[int] = set()  # the references that are the target of a store, not a read
+        # Per variable, the references counted as reads and the stores of a whole value as statements
+        # (an initial value, a plain assignment), and the variables whose address is taken. The stores
+        # every read sees stored again first (``overwritten_stores``) are not code in the next walk.
+        self.read_sites: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
+        self.store_sites: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
+        self.address_taken: set[int] = set()
+        self.overwritten = overwritten
+        self.same_outcomes: set[int] = set()  # the ifs whose two outcomes give the same, without effect
         # What compiled code does besides computing values: effects (a call of a function that has
         # one, an asm the compiler keeps, a volatile access, a store outside the function's locals, a
         # loop that may not end) and loops. A call of the function may go when it has neither.
@@ -2300,7 +2426,7 @@ class _FunctionWalk:
         self.events["field_accesses"] = [item for member, item in self.fields if member not in self.inner]
 
     def never_read(self) -> frozenset[int]:
-        """The parameters and scalar locals of the function that compiled code never reads: every
+        """The parameters and locals of the function that compiled code never reads: every
         read is in code no control reaches, in an unevaluated operand, in a discarded value, or an
         argument a callee ignores. A variable whose address is taken counts as read, and so does one
         with a cleanup attribute, which its cleanup receives. A parameter may have any type: one of
@@ -2322,7 +2448,9 @@ class _FunctionWalk:
         )
 
     def tracked_variables(self) -> list[ci.Cursor]:
-        """The parameters, and the scalar locals without a cleanup, that are not volatile."""
+        """The parameters, and the locals without a cleanup, that are not volatile. A struct or an
+        array local counts too: one nothing reads is not laid out (rcu_start_exp_gp_kworker's
+        ``struct sched_param param``, whose address only a call under IS_ENABLED takes)."""
         parameters = list(self.cursor.get_arguments() or [])
         locals_ = [
             node
@@ -2330,9 +2458,101 @@ class _FunctionWalk:
             if node.kind == K.VAR_DECL
             and _is_local(node)
             and not any(child.kind == K.UNEXPOSED_ATTR for child in node.get_children())
-            and node.type.get_canonical().kind not in (TK.RECORD, *_ARRAY_TYPES)
         ]
         return [variable for variable in [*parameters, *locals_] if not variable.type.is_volatile_qualified()]
+
+    def overwritten_stores(self) -> frozenset[int]:
+        """The stores of a whole value to a local (its initial value, or a plain assignment as a
+        statement) that no read sees: for every read the walk counted, a block around it without a
+        label or a case assigns the local again in an earlier statement, and the store is not between
+        that assignment and the read. Control enters such a block only at its start, so every path
+        from the store to the read passes the assignment. ipi_mux_send_mask's ``icpu =
+        this_cpu_ptr(ipi_mux_pcpu)`` is stored again at the top of the loop before any read, and
+        wait_task_inactive's ``rq = task_rq(p)``, read only by task_on_cpu, which ignores it, again by
+        ``rq = task_rq_lock(p, &rf)`` before every other read. A local whose address is taken may be
+        read through it, and a struct or an array may be stored in part: neither counts."""
+        found: set[int] = set()
+        for variable, stores in self.store_sites.items():
+            kills = [store for store in stores if store.kind == K.BINARY_OPERATOR]
+            reads = self.read_sites.get(variable)
+            if len(stores) < 2 or not kills or not reads or variable in self.address_taken:
+                continue
+            target = _strip_parens(_children(kills[0])[0]).referenced
+            if target is None or target.type.get_canonical().kind in (TK.RECORD, *_ARRAY_TYPES):
+                continue
+            self.local_uses()
+            for store in stores:
+                others = {kill.hash for kill in kills if kill.hash != store.hash}
+                if others and all(self.stored_again_before(read, store, others) for read in reads):
+                    found.add(store.hash)
+        return frozenset(found)
+
+    def stored_again_before(self, read: ci.Cursor, store: ci.Cursor, kills: set[int]) -> bool:
+        """A block around ``read`` without a label or a case has one of ``kills`` (assignments of the
+        variable as statements of that block) before the statement that holds the read, and
+        ``store`` is not in a statement from the one after that assignment through that one."""
+        positions = self.block_positions(store)
+        child, parent = read, self.parents.get(read.hash)
+        while parent is not None:
+            if parent.kind == K.COMPOUND_STMT and parent.hash not in self.label_holders:
+                statements = _children(parent)
+                at = next(index for index, statement in enumerate(statements) if statement.hash == child.hash)
+                earlier = [index for index in range(at) if statements[index].hash in kills]
+                if earlier:
+                    stored = positions.get(parent.hash)
+                    if stored is None or not earlier[-1] < stored <= at:
+                        return True
+            if parent.hash == self.cursor.hash:
+                return False
+            child, parent = parent, self.parents.get(parent.hash)
+        return False
+
+    def block_positions(self, node: ci.Cursor) -> dict[int, int]:
+        """For each block around ``node``, the index of its statement that holds ``node``."""
+        positions: dict[int, int] = {}
+        child, parent = node, self.parents.get(node.hash)
+        while parent is not None:
+            if parent.kind == K.COMPOUND_STMT:
+                statements = _children(parent)
+                positions[parent.hash] = next(
+                    index for index, statement in enumerate(statements) if statement.hash == child.hash
+                )
+            child, parent = parent, self.parents.get(parent.hash)
+        return positions
+
+    def statement_without_effect(self, statement: ci.Cursor, block: ci.Cursor, index: int) -> bool:
+        """A statement of a block, not an expression, that is not code beyond what its parts do
+        besides computing values: an if whose branches have no effect, a loop without effect, or an
+        if whose two outcomes agree."""
+        if self.x.branches_without_effect(statement, self.dead_variables):
+            return True
+        if statement.kind in _LOOPS:
+            return self.x.loop_without_effect(statement, self.cursor, self.dead_variables)
+        if self.same_outcome(statement, block, index):
+            self.same_outcomes.add(statement.hash)
+            return True
+        return False
+
+    def same_outcome(self, statement: ci.Cursor, block: ci.Cursor, index: int) -> bool:
+        """``if (c) return v;`` whose return and the rest of its block give the same, neither with an
+        effect, so ``c`` decides nothing: rcutree_online_cpu's ``if (rcu_scheduler_active ==
+        RCU_SCHEDULER_INACTIVE) return 0;`` before ``tick_dep_clear(TICK_DEP_BIT_RCU); return 0;``
+        (tick_dep_clear is empty without NO_HZ_FULL), and clk_pm_runtime_put's ``if
+        (!core->rpm_enabled) return;`` before ``pm_runtime_put_sync(core->dev);``, a stub."""
+        children = _children(statement)
+        if statement.kind != K.IF_STMT or len(children) != 2 or _mentions(children[0], _IMAGE_DECIDES):
+            return False
+        if self.x.evaluator.evaluate(children[0], truth=True) is not None:
+            return False
+        taken = _children(children[1]) if children[1].kind == K.COMPOUND_STMT else [children[1]]
+        if not taken or taken[-1].kind != K.RETURN_STMT:
+            return False
+        body = _function_body(self.cursor)
+        falls_off = body is not None and block.hash == body.hash and self.cursor.result_type.kind == TK.VOID
+        then = self.x.outcome(taken, self.dead_variables, falls_off=False)
+        return then is not None and then == self.x.outcome(
+            _children(block)[index + 1 :], self.dead_variables, falls_off
+        )
 
     # Guards ---------------------------------------------------------------------------------
 
@@ -2580,11 +2800,19 @@ class _FunctionWalk:
                 else:
                     self.walk(statement, children[0], statement_index, None, generic)
             return
-        if kind == K.IF_STMT and self.x.branches_without_effect(node, self.dead_variables):
-            # An if whose branches have no effect: only what its condition does is code.
+        if kind == K.IF_STMT and (
+            node.hash in self.same_outcomes or self.x.branches_without_effect(node, self.dead_variables)
+        ):
+            # An if whose branches have no effect, or whose two outcomes agree: only what its
+            # condition does is code.
             self.discard(children[0], node, 0, generic, reason)
             for child_index, child in enumerate(children[1:], 1):
                 self.walk(child, node, child_index, reason, generic)
+            return
+        if kind in _LOOPS and self.x.loop_without_effect(node, self.cursor, self.dead_variables):
+            # A loop without effect (flush_all_rcu_sheaves' list walk with CONFIG_SLUB_TINY): none
+            # of it is code.
+            self.walk(node, parent, index, reason, generic)
             return
         if kind == K.BINARY_OPERATOR and len(children) == 2:
             operator = libclang.binary_kind(node)
@@ -3714,7 +3942,10 @@ class _FunctionWalk:
                 self.field_address[members[0].hash] = (address, node.hash in self.addressed)
                 self.inner.update(member.hash for member in members[1:])
         elif kind == K.UNARY_OPERATOR and children and libclang.is_address_of(node):
-            self.addressed.add(_strip_parens(children[0]).hash)
+            operand = _strip_parens(children[0])
+            self.addressed.add(operand.hash)
+            if operand.kind == K.DECL_REF_EXPR and operand.referenced is not None:
+                self.address_taken.add(operand.referenced.hash)
         elif kind == K.UNEXPOSED_EXPR and len(children) == 1 and node.type.get_canonical().kind == TK.POINTER:
             operand = _strip_parens(children[0])
             if operand.type.get_canonical().kind in _ARRAY_TYPES:
@@ -3736,6 +3967,7 @@ class _FunctionWalk:
                     self.decided_reads[node.referenced.hash] += 1
                 else:
                     self.reads[node.referenced.hash] += 1
+                self.read_sites[node.referenced.hash].append(node)
         stored = _store_target(node)
         if stored is not None and _strip_parens(stored).kind == K.DECL_REF_EXPR:
             # v = e stores into v without reading it. v op= e and v++ read v only to store into it,
@@ -3744,19 +3976,22 @@ class _FunctionWalk:
             if value_unused or (kind == K.BINARY_OPERATOR and libclang.is_assignment(node)):
                 self.stores.add(_strip_parens(stored).hash)
             variable = _strip_parens(stored).referenced
+            statement = parent is not None and _statement_position(parent, index)
+            if reason is None and statement and variable is not None and _is_plain_assignment(node):
+                self.store_sites[variable.hash].append(node)
             if (
                 reason is None
                 and len(children) == 2
-                and parent is not None
-                and _statement_position(parent, index)
+                and statement
                 and variable is not None
-                and variable.hash in self.dead_variables | self.decided_variables
+                and (variable.hash in self.dead_variables | self.decided_variables or node.hash in self.overwritten)
             ):
-                # A store, as a statement, to a variable nothing reads (local_lock's __tl): only
+                # A store, as a statement, to a variable nothing reads (local_lock's __tl), or one
+                # every read sees stored again first (wait_task_inactive's rq = task_rq(p)): only
                 # what the stored value's computation does besides computing it is code. One read
                 # only where the image decides is stored only where the image has it.
                 self.walk(children[0], node, 0, reason, generic)
-                if variable.hash in self.dead_variables:
+                if variable.hash in self.dead_variables or node.hash in self.overwritten:
                     self.discard(children[1], node, 1, generic)
                 else:
                     self.conditional += 1
@@ -3803,11 +4038,25 @@ class _FunctionWalk:
             return
         if kind == K.VAR_DECL:
             initializer = libclang.var_initializer(node)
+            if initializer is not None and _is_static_local(node):
+                # string_get_size's static units_str = { units_10, units_2 }: the compiler lays the
+                # initial value out as data, an edge of the static local (_global_initializers), not
+                # code of the function.
+                self.x.static_locals[node.hash] = node
+                for child_index, child in enumerate(children):
+                    self.walk(child, node, child_index, reason or "static_initializer", generic)
+                return
             if reason is None:
                 self.cleanup(node, initializer)
+            if reason is None and initializer is not None:
+                self.store_sites[node.hash].append(node)
             # The initial value of a variable nothing reads is not computed (ns = current_user_ns()
-            # passed only to make_kgid, which ignores it).
-            dead_store = reason is None and initializer is not None and node.hash in self.dead_variables
+            # passed only to make_kgid, which ignores it), nor one every read sees stored again first.
+            dead_store = (
+                reason is None
+                and initializer is not None
+                and (node.hash in self.dead_variables or node.hash in self.overwritten)
+            )
             decided = reason is None and initializer is not None and node.hash in self.decided_variables
             for child_index, child in enumerate(children):
                 if initializer is not None and child == initializer:
@@ -3884,9 +4133,15 @@ class _FunctionWalk:
                     return
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
                 right = self.x.evaluator.evaluate(children[1], truth=True)
-                if right is not None and bool(right) == (operator == libclang.LOGICAL_OR):
+                if (
+                    right is not None
+                    and bool(right) == (operator == libclang.LOGICAL_OR)
+                    and self.x.effect_free(children[1], self.dead_variables)
+                ):
                     # a || 1 is 1 and a && 0 is 0: a's value is unused (can_demote's !pgdat ||
-                    # !numa_demotion_enabled without NUMA), so only a's effects are code.
+                    # !numa_demotion_enabled without NUMA), so only a's effects are code. Where the
+                    # right operand has an effect, a decides whether it happens (pagetable_pte_ctor's
+                    # mm != &init_mm && !ptlock_init(ptdesc)).
                     self.discard(children[0], node, 0, generic)
                     self.walk(children[1], node, 1, reason, generic)
                     return
@@ -3969,11 +4224,11 @@ class _FunctionWalk:
                     self.walk(child, node, child_index, "after_exit", generic)
                 elif (
                     child.kind.is_expression() and not (value_last and child_index == len(children) - 1)
-                ) or self.x.branches_without_effect(child, self.dead_variables):
+                ) or self.statement_without_effect(child, node, child_index):
                     # An expression statement (get_user_ns(ns);, a call of a void function that only
-                    # reads), or an if whose branches have no effect: its value is discarded, so only
-                    # its effects are code. The last statement of ({ ... }) is that expression's
-                    # value (per_cpu_ptr).
+                    # reads), or a statement without effect (statement_without_effect): its value is
+                    # discarded, so only its effects are code. The last statement of ({ ... }) is
+                    # that expression's value (per_cpu_ptr).
                     pushed = case_guard is not None and case_guard[0] is not None and not self.has_label(child)
                     if pushed:
                         assert case_guard is not None and case_guard[0] is not None
@@ -4184,11 +4439,13 @@ def _initializer_values(
 
 
 def _global_initializers(extractor: _Extractor, tu: ci.TranslationUnit) -> list[dict[str, Any]]:
-    """The addresses of globals a file-scope global's initializer stores (arch/riscv/kernel/vdso.c:
-    ``vdso_info.vdso_code_start = vdso_start``). Where the program never writes the holder after
-    boot, the compiler and the linker put those addresses into the functions that read it."""
+    """The addresses of globals a global's initializer stores (arch/riscv/kernel/vdso.c:
+    ``vdso_info.vdso_code_start = vdso_start``), for file-scope globals and for the static locals of
+    the functions walked (string_get_size's ``units_str = { units_10, units_2 }``). Where the program
+    never writes the holder after boot, the compiler and the linker put those addresses into the
+    functions that read it."""
     items = []
-    for cursor in tu.cursor.get_children():
+    for cursor in [*tu.cursor.get_children(), *extractor.static_locals.values()]:
         if cursor.kind != K.VAR_DECL or not cursor.is_definition() or not _is_global_var(cursor):
             continue
         initializer = libclang.var_initializer(cursor)

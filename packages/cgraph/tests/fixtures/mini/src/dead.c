@@ -570,3 +570,213 @@ void dd_if_mixed(struct box *b)
 	else
 		obj_free(b);
 }
+
+/* include/linux/mm.h pagetable_pte_ctor: mm != &init_mm && !ptlock_init(ptdesc). ptlock_init
+ * always gives true but initializes the lock: the left operand decides whether that runs. */
+static inline int dd_lock_init(struct box *b)
+{
+	b->size = 0;
+	return 1;
+}
+
+int dd_absorbed_effect(struct box *b, struct box *c)
+{
+	if (c->first && !dd_lock_init(b))
+		return 0;
+	return 1;
+}
+
+/* kmalloc_nolock_noprof without __CMPXCHG_DOUBLE: s = kmalloc_slab(size, NULL, alloc_gfp, _RET_IP_),
+ * whose value only a stub takes: _RET_IP_ only computes a value. */
+static inline struct item *dd_slab(struct box *b, unsigned long caller)
+{
+	return b->first;
+}
+
+static inline int dd_cache_debug(struct item *i)
+{
+	return 0;
+}
+
+struct item *dd_return_address(struct box *b)
+{
+	struct item *s = dd_slab(b, (unsigned long)__builtin_return_address(0));
+
+	if (!dd_cache_debug(s))
+		return NULL;
+	return s;
+}
+
+/* rcu_start_exp_gp_kworker without CONFIG_RCU_EXP_KTHREAD: struct sched_param param =
+ * { .sched_priority = kthread_prio }, whose address only a call under IS_ENABLED takes. */
+void dd_struct_unread(void)
+{
+	struct box param = { .size = dd_flag };
+
+	if (DD_DEBUG)
+		obj_free(&param);
+}
+
+/* string_get_size's static const char *const *const units_str[] = { units_10, units_2 }: the
+ * compiler lays the table out as data, so its initializer is not code of the function. (Inline and
+ * not called, so that the image's other functions and objects keep their places.) */
+static inline long *dd_unit(int base, int i)
+{
+	static long units_10[2];
+	static long units_2[2];
+	static long *units_str[] = { units_10, units_2 };
+
+	return &units_str[base][i];
+}
+
+/* flush_all_rcu_sheaves with CONFIG_SLUB_TINY: list_for_each_entry(s, &slab_caches, list) { if
+ * (!cache_has_sheaves(s)) continue; flush_rcu_sheaves_on_cache(s); }. The loop stores only its
+ * cursor, which nothing after it reads: it has no effect, and C11 lets the compiler assume it ends. */
+static inline int dd_has_sheaves(struct list_node *pos)
+{
+	return !DD_TINY && pos->next;
+}
+
+void dd_loop_without_effect(struct box *b)
+{
+	struct list_node *pos;
+
+	dd_for_each(pos, &b->hash) {
+		if (!dd_has_sheaves(pos))
+			continue;
+		obj_free(pos);
+	}
+	obj_free(b);
+}
+
+/* The same loop whose cursor is read after it: the loop computes that value. */
+struct list_node *dd_loop_cursor_read(struct box *b)
+{
+	struct list_node *pos;
+
+	dd_for_each(pos, &b->hash)
+		if (!dd_has_sheaves(pos))
+			continue;
+	return pos;
+}
+
+/* rcutree_online_cpu: if (rcu_scheduler_active == RCU_SCHEDULER_INACTIVE) return 0; then only
+ * tick_dep_clear(), empty without NO_HZ_FULL, and return 0: either way the function gives 0. */
+static inline void dd_tick_clear(struct box *b)
+{
+}
+
+int dd_same_outcome(struct box *b)
+{
+	if (b->size == 0)
+		return 0;
+	dd_tick_clear(b);
+	return 0;
+}
+
+/* clk_pm_runtime_put without CONFIG_PM: if (!core->rpm_enabled) return; pm_runtime_put_sync(core->dev); */
+void dd_same_outcome_void(struct box *b)
+{
+	if (!b->first)
+		return;
+	dd_tick_clear(b);
+}
+
+/* clk_pm_runtime_get without CONFIG_PM: if (!core->rpm_enabled) return 0; return
+ * pm_runtime_resume_and_get(core->dev);, a stub that gives 0. */
+static inline int dd_resume(struct box *b)
+{
+	return 0;
+}
+
+int dd_same_outcome_call(struct box *b)
+{
+	if (!b->first)
+		return 0;
+	return dd_resume(b);
+}
+
+/* vmstat_cpu_dead: node_cpus = cpumask_of_node(node); if (!cpumask_empty(node_cpus)) return 0;
+ * node_clear_state(node, N_CPU); return 0;: the local goes with the condition. */
+int dd_same_outcome_local(struct box *b)
+{
+	long n = b->size;
+
+	if (n)
+		return 0;
+	dd_tick_clear(b);
+	return 0;
+}
+
+/* Outcomes that differ keep the condition. */
+int dd_other_outcome(struct box *b)
+{
+	if (b->size == 0)
+		return 0;
+	dd_tick_clear(b);
+	return 1;
+}
+
+/* clk_core_is_enabled without CONFIG_PM: if (core->rpm_enabled) { pm_runtime_get_noresume(dev);
+ * if (!pm_runtime_active(dev)) { ret = false; goto done; } }, where pm_runtime_active gives true. */
+static inline int dd_active(struct box *b)
+{
+	return 1;
+}
+
+int dd_dead_jump(struct box *b, struct box *c)
+{
+	int ret;
+
+	if (b->first) {
+		dd_tick_clear(b);
+		if (!dd_active(b)) {
+			ret = 0;
+			goto done;
+		}
+	}
+	ret = ext_check(c);
+done:
+	return ret;
+}
+
+/* ipi_mux_send_mask: icpu = this_cpu_ptr(ipi_mux_pcpu) is overwritten at the top of the loop
+ * before any read, and nothing reads it after the loop. */
+void dd_overwritten(struct box *b, struct box *c)
+{
+	struct item *i = b->first;
+	struct list_node *pos;
+
+	dd_for_each(pos, &c->hash) {
+		i = c->first;
+		obj_free(i);
+	}
+}
+
+/* wait_task_inactive: rq = task_rq(p) is read only by task_on_cpu(rq, p), which ignores it, and
+ * rq = task_rq_lock(p, &rf) comes before every other read. */
+static inline void dd_check_item(struct item *i, struct box *c)
+{
+	obj_free(c);
+}
+
+void dd_redefined(struct box *b, struct box *c)
+{
+	struct item *i;
+
+	i = b->first;
+	dd_check_item(i, c);
+	i = c->first;
+	obj_free(i);
+}
+
+/* A store whose value a later read can still see keeps its read. */
+void dd_not_redefined(struct box *b, struct box *c)
+{
+	struct item *i;
+
+	i = b->first;
+	if (c->size)
+		i = c->first;
+	obj_free(i);
+}

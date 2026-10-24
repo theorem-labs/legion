@@ -33,14 +33,22 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   the cases a `switch` on a value clang folds does not reach (`switch (sizeof(x))`,
   `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or `||`, an operand of `&` or `*`
   whose other operand is 0 (`IS_DAX(inode)` without `CONFIG_FS_DAX`), the left operand of an `&&`
-  whose right one is 0 or of an `||` whose right one is 1 (`!pgdat || !numa_demotion_enabled`
-  without NUMA), discarded values (`(void)x`, `(x, 0)`, an expression statement such as
-  `get_user_ns(ns);`, also as an `if`'s branch or a loop's body, an `if` whose branches have no
-  effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)` without `CONFIG_PM`, stores to a
-  local or a parameter that compiled code never reads, such as `local_lock`'s `__tl`, and arguments
-  to a parameter the callee never reads in compiled code), of which only the parts
-  with an effect are code (`psi_sched_switch(..., !task_on_rq_queued(prev) || p->x)` keeps the
-  `READ_ONCE` and drops the read of `p->x`; the last statement of `({ ... })` is its value).
+  whose right one is 0 or of an `||` whose right one is 1, where the right one has no effect
+  (`!pgdat || !numa_demotion_enabled` without NUMA; in `mm != &init_mm && !ptlock_init(ptdesc)` the
+  left operand decides whether the lock is initialized), discarded values (`(void)x`, `(x, 0)`, an
+  expression statement such as `get_user_ns(ns);`, also as an `if`'s branch or a loop's body, an
+  `if` whose branches have no effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)`
+  without `CONFIG_PM`, an `if (c) return v;` whose return and the rest of its block give the same
+  without an effect (`rcutree_online_cpu`'s `return 0` before `tick_dep_clear(); return 0;`), a loop
+  that may be assumed to end and stores only to locals nothing after it reads
+  (`flush_all_rcu_sheaves`' list walk with `CONFIG_SLUB_TINY`), stores to a local or a parameter
+  that compiled code never reads, such as `local_lock`'s `__tl` or a struct whose address only dead
+  code takes, a store every read sees stored again first (`ipi_mux_send_mask`'s `icpu`, stored again
+  at the top of the loop), and arguments to a parameter the callee never reads in compiled code),
+  of which only the parts with an effect are code (`psi_sched_switch(..., !task_on_rq_queued(prev)
+  || p->x)` keeps the `READ_ONCE` and drops the read of `p->x`; the last statement of `({ ... })` is
+  its value). The initializer of a static local is data, an edge of that local in
+  `global_initializers` (`string_get_size`'s `units_str`), not code of the function.
   A parameter is ignored transitively (`from_kuid_munged` passes its namespace only to
   `from_kuid`, which ignores it), whatever its type (an array parameter is a pointer, a struct
   passed by value need not be copied), and so are the arguments past the named parameters of a
@@ -55,7 +63,9 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   (also by `__builtin_mul_overflow` and its kind), no loop that may not end (a constant controlling
   expression, read from the parts libclang gives, or from the header as written where it leaves
   some out; C11 lets the compiler assume any other loop ends), no cleanup with an effect, and
-  calls only to such functions. So the `WARN_ON_ONCE` under `IS_ENABLED(CONFIG_DEBUG_ATOMIC)` in
+  calls only to such functions and to builtins that only compute a value (`__builtin_return_address`
+  in `_RET_IP_`); the same holds for a statement or an expression, without the code no control
+  reaches in it. So the `WARN_ON_ONCE` under `IS_ENABLED(CONFIG_DEBUG_ATOMIC)` in
   `instrument_atomic_check_alignment` is no effect. Calls are followed 16 deep; a call past that, or
   back into a function whose analysis is under way, has an effect and reads its named arguments.
   Branches of `__builtin_constant_p` and `__builtin_object_size`, also as the left operand of `&&`

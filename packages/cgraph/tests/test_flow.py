@@ -1032,6 +1032,91 @@ def test_an_operand_the_other_operand_of_and_or_or_decides_is_not_read(
     assert ("box", "discarded") in unevaluated(dead_facts, function)
 
 
+def test_an_operand_that_decides_whether_the_other_one_runs_is_read(dead_facts: dict[str, Any]) -> None:
+    """pagetable_pte_ctor's mm != &init_mm && !ptlock_init(ptdesc): ptlock_init always gives true but
+    initializes the lock, so the left operand decides whether it runs (llvm-objdump: ld, beqz, sd)."""
+    events = fact_events(dead_facts, "dd_absorbed_effect")
+    assert [(item["field"], item["param"]) for item in events["field_accesses"]] == [("first", 1)]
+    assert ("box", "discarded") not in unevaluated(dead_facts, "dd_absorbed_effect")
+
+
+def fields_read(facts: dict[str, Any], function: str) -> set[tuple[str, int | None]]:
+    """(the field, the parameter it is reached from) of each field access of the function."""
+    return {(item["field"], item.get("param")) for item in fact_events(facts, function)["field_accesses"]}
+
+
+def test_the_return_address_only_computes_a_value(dead_facts: dict[str, Any]) -> None:
+    """kmalloc_nolock_noprof's s = kmalloc_slab(size, NULL, alloc_gfp, _RET_IP_), read only by a stub
+    (llvm-objdump: li a0, 0; ret)."""
+    assert fields_read(dead_facts, "dd_return_address") == set()
+    assert ("dd_slab", "discarded") in unevaluated(dead_facts, "dd_return_address")
+
+
+def test_a_struct_local_no_live_code_reads_is_not_computed(dead_facts: dict[str, Any]) -> None:
+    """rcu_start_exp_gp_kworker's param = { .sched_priority = kthread_prio }, used only under
+    IS_ENABLED(CONFIG_RCU_EXP_KTHREAD) (llvm-objdump: ret)."""
+    assert fact_events(dead_facts, "dd_struct_unread")["accesses"] == []
+    assert ("dd_flag", "discarded") in unevaluated(dead_facts, "dd_struct_unread")
+
+
+def test_a_static_local_initializer_is_data(dead_facts: dict[str, Any]) -> None:
+    """string_get_size's units_str = { units_10, units_2 }: the image's code addresses only units_str;
+    the table's addresses are a data edge of units_str."""
+    names = {item["unit"]["name"] for item in fact_events(dead_facts, "dd_unit")["accesses"]}
+    assert names == {"dd_unit.units_str"}
+    edges = {
+        (item["global"]["name"], item["offset"], item["target"]["name"])
+        for item in dead_facts["global_initializers"]
+        if item["global"]["name"] == "dd_unit.units_str"
+    }
+    assert edges == {("dd_unit.units_str", 0, "dd_unit.units_10"), ("dd_unit.units_str", 8, "dd_unit.units_2")}
+
+
+def test_a_loop_that_stores_only_its_own_cursor_is_not_compiled(dead_facts: dict[str, Any]) -> None:
+    """flush_all_rcu_sheaves' list_for_each_entry under CONFIG_SLUB_TINY (llvm-objdump: j obj_free)."""
+    events = fact_events(dead_facts, "dd_loop_without_effect")
+    assert (events["field_accesses"], [item["access"] for item in events["accesses"]]) == ([], ["free"])
+    assert [call["callee"] for call in events["calls"]] == ["obj_free"]
+    # A loop whose cursor is read after it computes that value.
+    assert fact_events(dead_facts, "dd_loop_cursor_read")["field_accesses"]
+
+
+@pytest.mark.parametrize(
+    "function", ["dd_same_outcome", "dd_same_outcome_void", "dd_same_outcome_call", "dd_same_outcome_local"]
+)
+def test_an_if_whose_two_outcomes_agree_is_not_code(dead_facts: dict[str, Any], function: str) -> None:
+    """rcutree_online_cpu, clk_pm_runtime_put, clk_pm_runtime_get and vmstat_cpu_dead: the return
+    after the condition and the code after the if give the same, without effect (llvm-objdump: li a0,
+    0; ret, or ret)."""
+    assert fields_read(dead_facts, function) == set()
+    assert ("box", "discarded") in unevaluated(dead_facts, function)
+
+
+def test_an_if_whose_outcomes_differ_keeps_its_condition(dead_facts: dict[str, Any]) -> None:
+    assert fields_read(dead_facts, "dd_other_outcome") == {("size", 0)}
+
+
+def test_a_branch_whose_only_jump_is_dead_has_no_effect(dead_facts: dict[str, Any]) -> None:
+    """clk_core_is_enabled's if (core->rpm_enabled) { ...; if (!pm_runtime_active(dev)) { ret = false;
+    goto done; } } without CONFIG_PM: pm_runtime_active gives true, so the goto is not code."""
+    assert fields_read(dead_facts, "dd_dead_jump") == set()
+
+
+@pytest.mark.parametrize(
+    ("function", "read"), [("dd_overwritten", {("first", 1), ("hash", 1)}), ("dd_redefined", {("first", 1)})]
+)
+def test_a_store_overwritten_before_any_read_is_not_computed(
+    dead_facts: dict[str, Any], function: str, read: set[tuple[str, int]]
+) -> None:
+    """ipi_mux_send_mask's icpu = this_cpu_ptr(ipi_mux_pcpu), stored again at the top of the loop, and
+    wait_task_inactive's rq = task_rq(p), read only by task_on_cpu, which ignores it."""
+    assert fields_read(dead_facts, function) == read
+
+
+def test_a_store_a_later_read_may_see_keeps_its_read(dead_facts: dict[str, Any]) -> None:
+    assert fields_read(dead_facts, "dd_not_redefined") == {("first", 0), ("first", 1), ("size", 1)}
+
+
 def test_a_call_whose_loops_may_be_assumed_to_end_goes_with_its_unused_value(dead_facts: dict[str, Any]) -> None:
     """fwnode_links_check_suppliers' list_for_each_entry, written out and by a macro."""
     events = fact_events(dead_facts, "dd_unused_loop_call")
