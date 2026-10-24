@@ -286,7 +286,9 @@ These rules follow what the machine code shows, each only where it shows it:
   and, where nothing else reads `v`, a value the callee only stores there, are `conditional`: where
   the image inlines the callee neither is computed, where it calls the callee both are, so the image
   decides at each site (`page_vma_mkclean_one`'s `mmu_notifier_range_init(&range, ...,
-  vma_address_end(pvmw))` without `MMU_NOTIFIER`).
+  vma_address_end(pvmw))` without `MMU_NOTIFIER`). A read of such a local that only gives the value
+  stored back into it is no read of it (`try_to_migrate_one`'s `range.end`), a store `v.m = e` into
+  a local is no read of `v`, and into a local nothing reads it is no code.
 - A member address the machine code never forms because container_of takes it back is no field
   access where the helper that does so is folded: an argument `&p->m` at a parameter whose every use
   is `container_of(·, T, m)` (directly, through a local it initializes, or through another helper's

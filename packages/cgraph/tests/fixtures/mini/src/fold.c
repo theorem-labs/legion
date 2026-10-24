@@ -503,6 +503,19 @@ void fd_mkclean_called(struct fd_pvmw *w)
 	obj_free((void *)w->address);
 }
 
+/* mm/rmap.c try_to_migrate_one: range.end = vma_address_end(&pvmw); mmu_notifier_range_init(&range,
+ * ..., address, range.end), whose only read of range gives the value it stores back into range
+ * (llvm-objdump: no load of nr). */
+void fd_migrate(struct fd_pvmw *w)
+{
+	struct fd_range range;
+
+	range.end = fd_address_end(w);
+	fd_range_init(&range, w->address, range.end);
+	fd_range_start(&range);
+	obj_free((void *)w->address);
+}
+
 /* A helper the image calls at one site and inlines at another, where the inlined call's value is
  * unused: only the volatile read and the call of ext_check are made there, not the call of box_size
  * the value needs. */

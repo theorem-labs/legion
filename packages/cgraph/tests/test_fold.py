@@ -201,7 +201,7 @@ def test_a_value_whose_only_effects_the_image_decides_is_left_to_the_image(
     assert "function:fd_cpu_dead" not in {entry["function"] for entry in offsets["misses"]}
 
 
-@pytest.mark.parametrize("function", ["fd_mkclean", "fd_mkclean_read", "fd_mkclean_called"])
+@pytest.mark.parametrize("function", ["fd_mkclean", "fd_mkclean_read", "fd_mkclean_called", "fd_migrate"])
 def test_a_value_stored_only_into_a_local_nothing_reads_is_left_to_the_image(
     fold_build: dict[str, Any], function: str
 ) -> None:
@@ -209,10 +209,12 @@ def test_a_value_stored_only_into_a_local_nothing_reads_is_left_to_the_image(
     fd_address_end gives it, and that helper's read of nr, are compiled only where the image calls the
     callee that stores it: they are left to the image, which here has no read of nr. fd_mkclean_called
     calls fd_range_fenced out of line, and jal fd_address_end before it: the image's call is the
-    argument's. fd_mkclean_read returns range.end, which needs nr: ld a1, 0x8(a0)."""
+    argument's. fd_mkclean_read returns range.end, which needs nr: ld a1, 0x8(a0). fd_migrate reads
+    range.end only to store it back into range (try_to_migrate_one), so nr is left to the image."""
     accesses = fold_build["graph"]["analysis"]["field_accesses"][f"function:{function}"]
     nr = {bool(item.get("conditional")) for item in accesses if item["field"] == "nr"}
-    assert nr == {"fd_mkclean": {True}, "fd_mkclean_read": {False}, "fd_mkclean_called": set()}[function]
+    expected = {"fd_mkclean": {True}, "fd_mkclean_read": {False}, "fd_mkclean_called": set(), "fd_migrate": {True}}
+    assert nr == expected[function]
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert f"function:{function}" not in {entry["function"] for entry in offsets["misses"]}
     edges = {

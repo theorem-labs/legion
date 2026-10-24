@@ -1747,6 +1747,26 @@ def _whole_local_address(expression: ci.Cursor) -> ci.Cursor | None:
     return variable if _is_local(variable) else None
 
 
+def _local_store_base(target: ci.Cursor) -> ci.Cursor | None:
+    """The reference to the local ``v`` a store into ``v.m`` or ``v[i]`` names (not through a
+    pointer, and not a parameter of array type, which is one), or None."""
+    node = _bare(target)
+    while node.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR) and _children(node):
+        base = _bare(_children(node)[0])
+        kind = base.type.get_canonical().kind
+        if (node.kind == K.MEMBER_REF_EXPR and kind == TK.POINTER) or (
+            node.kind == K.ARRAY_SUBSCRIPT_EXPR and kind not in _ARRAY_TYPES
+        ):
+            return None
+        node = base
+    variable = node.referenced if node.kind == K.DECL_REF_EXPR else None
+    if variable is None or not _is_local(variable):
+        return None
+    if variable.kind == K.PARM_DECL and variable.type.get_canonical().kind in _ARRAY_TYPES:
+        return None
+    return node
+
+
 def _inside(place: _Place, scope: _Place) -> bool:
     """``place`` lies in the text of ``scope``."""
     return place[0] == scope[0] and scope[1] <= place[1] and place[2] <= scope[2]
@@ -2866,6 +2886,8 @@ class _FunctionWalk:
         # branch), and those this walk meets there.
         self.uncompiled = uncompiled
         self.uncompiled_stores: set[int] = set()
+        # The locals whose reads, being walked, only give a value stored back into them.
+        self.self_stored: set[int] = set()
         self.subtractions = False  # a subtraction of two locals or parameters is code
         self.local_stores: dict[int, list[ci.Cursor]] | None = None
         self.same_outcomes: set[int] = set()  # the ifs whose two outcomes give the same, without effect
@@ -5041,7 +5063,7 @@ class _FunctionWalk:
                     if child.kind == K.LABEL_REF:
                         self.goto_guards[child.spelling].append(way)
             elif kind == K.DECL_REF_EXPR and _is_local(node.referenced) and node.hash not in self.stores:
-                if self.conditional:
+                if self.conditional or node.referenced.hash in self.self_stored:
                     self.decided_reads[node.referenced.hash] += 1
                 else:
                     self.reads[node.referenced.hash] += 1
@@ -5086,6 +5108,35 @@ class _FunctionWalk:
                 self.walk(children[0], node, 0, reason, generic)
                 self.walk_held(variable, children[1], node, 1, generic)
                 return
+        if stored is not None and _is_plain_assignment(node) and _strip_parens(stored).kind != K.DECL_REF_EXPR:
+            # v.m = e and v[i] = e of a local v store into v without reading it.
+            base = _local_store_base(stored)
+            if base is not None:
+                self.stores.add(base.hash)
+        if (
+            stored is not None
+            and reason is None
+            and _is_plain_assignment(node)
+            and len(children) == 2
+            and parent is not None
+            and _statement_position(parent, index)
+            and _strip_parens(stored).kind != K.DECL_REF_EXPR
+            and (whole := _stored_variable(stored)) is not None
+            and _is_local(whole)
+            and whole.hash in self.dead_variables | self.decided_variables
+        ):
+            # A store into a member of a local struct nothing reads, or reads only where the image
+            # decides (try_to_migrate_one's range.end = vma_address_end(&pvmw) without MMU_NOTIFIER).
+            self.walk(children[0], node, 0, reason, generic)
+            if whole.hash in self.dead_variables:
+                self.discard(children[1], node, 1, generic)
+            else:
+                self.conditional += 1
+                try:
+                    self.walk(children[1], node, 1, reason, generic)
+                finally:
+                    self.conditional -= 1
+            return
         if kind == K.CALL_EXPR:
             self.call(node, parent, reason, generic)
         elif kind in (K.DECL_REF_EXPR, K.MEMBER_REF_EXPR):
@@ -5449,6 +5500,16 @@ class _FunctionWalk:
                         self.walk(child, node, child_index, reason, generic)
                     finally:
                         self.conditional -= 1
+                elif position is not None and position in stored and all(at in targets for at in stored[position]):
+                    # A value the callee only stores into locals (try_to_migrate_one's
+                    # _mmu_notifier_range_init(&range, ..., range.end)): its reads of those locals only
+                    # give what goes back into them, so they keep no local read.
+                    own = {targets[at].hash for at in stored[position]} - self.self_stored
+                    self.self_stored |= own
+                    try:
+                        self.walk(child, node, child_index, reason, generic)
+                    finally:
+                        self.self_stored -= own
                 elif position is None or not (position in ignored or (variadic and position >= named)):
                     self.walk_read(node, child, child_index, position, reason, generic)
                 elif inline:
