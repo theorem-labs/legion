@@ -79,7 +79,7 @@ go run ./packages/orchestration/declindex/e2e/parity \
 
 ## Librarian recording
 
-Configure a gate's `librarian` command with `record-librarian`. The record path is supplied by `LIBRARIAN_RECORD`.
+Configure a gate's `librarian` command with `record-librarian`; the gate calls it with its own arguments, as below. The record path is supplied by `LIBRARIAN_RECORD`.
 
 ```sh
 LIBRARIAN_RECORD=/path/to/librarian-record \
@@ -89,7 +89,7 @@ packages/orchestration/declindex/e2e/record-librarian \
   --proposal /path/to/request
 ```
 
-It appends `<UTC>\t<id>\t<proposer>\t<SHA-256>` to the record, copies the proposal to `$LIBRARIAN_RECORD.d/<id>`, and then executes the optional command after `--`. Its exit status is that command's status.
+It appends `<UTC>\t<id>\t<proposer>\t<SHA-256>` to the record, copies the proposal to `$LIBRARIAN_RECORD.d/<id>`, and exits 0.
 
 To record in front of a real librarian, configure `librarian: [record-librarian, --, COMMAND, ARGS...]`. The gate appends `--id … --proposer … --proposal …` to that list, so `record-librarian` takes everything between the leading `--` and those six arguments as the command. It records the call, then runs `COMMAND ARGS... --id … --proposer … --proposal …`, and exits with its status.
 

@@ -178,7 +178,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	}
 	// The exporter ran without the write lock; only the write of what it read holds it.
 	if err := s.writeTx(ctx, log, func(tx *sql.Tx) error {
-		return s.writeCompiled(ctx, tx, todo, again, keys, consts, digest, commit)
+		return s.writeCompiled(ctx, tx, compiledRead{read: todo, rematched: again, oleanKeys: keys, consts: consts, digest: digest, commit: commit})
 	}); err != nil {
 		return 0, 0, err
 	}
@@ -209,17 +209,27 @@ func (s *Store) conceptBodies(ctx context.Context, concepts []ConceptForms) (str
 	return bodies.String(), nil
 }
 
-// writeCompiled replaces the compiled rows of the modules read (todo, and again, re-matched) with consts, records
-// the .olean key now of each module of todo (keys), and the digest and the commit that the compiled part is of.
-func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, todo, again []string, keys map[string]string, consts []Constant, digest, commit string) error {
-	for _, mod := range slices.Concat(todo, again) {
+// compiledRead is what a compiled step read, for writeCompiled.
+type compiledRead struct {
+	read      []string          // the modules read, whose .olean key is recorded
+	rematched []string          // the modules read again because a definition they use changed
+	oleanKeys map[string]string // the .olean key now of each module of read
+	consts    []Constant
+	digest    string // what the compiled part was read with
+	commit    string // the commit the compiled part is of
+}
+
+// writeCompiled replaces the compiled rows of the modules read (read, and rematched) with consts, records the .olean
+// key now of each module of read, and the digest and the commit that the compiled part is of.
+func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, w compiledRead) error {
+	for _, mod := range slices.Concat(w.read, w.rematched) {
 		if err := deleteCompiled(ctx, tx, mod); err != nil {
 			return err
 		}
 	}
 	cb := newBatch(tx, "INSERT OR REPLACE", "consts", 5)
 	ab, fb := newBatch(tx, "INSERT", "atoms", 3), newBatch(tx, "INSERT", "facts", 4)
-	for _, c := range consts {
+	for _, c := range w.consts {
 		if err := cb.add(ctx, c.Name, c.Module, c.Kind, c.Type, c.Hash); err != nil {
 			return err
 		}
@@ -239,15 +249,15 @@ func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, todo, again []str
 			return err
 		}
 	}
-	for _, mod := range todo {
-		if _, err := tx.ExecContext(ctx, `UPDATE modules SET olean_key = ? WHERE module = ?`, keys[mod], mod); err != nil {
+	for _, mod := range w.read {
+		if _, err := tx.ExecContext(ctx, `UPDATE modules SET olean_key = ? WHERE module = ?`, w.oleanKeys[mod], mod); err != nil {
 			return err
 		}
 	}
-	if err := s.setMeta(ctx, tx, "compiled", digest); err != nil {
+	if err := s.setMeta(ctx, tx, "compiled", w.digest); err != nil {
 		return err
 	}
-	return s.setMeta(ctx, tx, "compiled_commit", commit)
+	return s.setMeta(ctx, tx, "compiled_commit", w.commit)
 }
 
 // defHashes are the compiled hashes of the definitions of the modules, before they are read again.

@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-	printf '%s\n' 'usage: record-librarian --id ID --proposer OWNER --proposal FILE [-- COMMAND ...]' \
+	printf '%s\n' 'usage: record-librarian --id ID --proposer OWNER --proposal FILE' \
 		'   or: record-librarian -- COMMAND ... --id ID --proposer OWNER --proposal FILE' >&2
 	exit 2
 }
@@ -55,9 +55,7 @@ while [ "$#" -gt 0 ]; do
 		shift 2
 		;;
 	--)
-		[ "$wrapped" = 0 ] || usage
-		shift
-		break
+		usage
 		;;
 	*)
 		usage
@@ -105,6 +103,4 @@ cp "$proposal" "$record.d/$id"
 
 if [ "$wrapped" = 1 ]; then
 	"$@" --id "$id" --proposer "$proposer" --proposal "$proposal"
-elif [ "$#" -gt 0 ]; then
-	"$@"
 fi

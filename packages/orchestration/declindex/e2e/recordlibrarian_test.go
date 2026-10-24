@@ -45,32 +45,31 @@ func TestRecordLibrarianWrapsTheConfiguredCommandAsTheGateCallsIt(t *testing.T) 
 	}
 }
 
-// The README's form names the call first and the command after `--`; the command then runs with its own arguments
-// only, and its exit status is the helper's.
-func TestRecordLibrarianRunsTheCommandAfterItsOwnArguments(t *testing.T) {
+// A gate configured with `librarian: [record-librarian]` calls it with the gate's arguments alone: it records the call
+// and exits 0. A command after those arguments is not a call form; a command goes first, after `--`, as the gate
+// passes it.
+func TestRecordLibrarianRecordsTheGatesCallAlone(t *testing.T) {
 	dir := t.TempDir()
-	seen := filepath.Join(dir, "seen")
-	command := filepath.Join(dir, "intake")
-	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > '"+seen+"'\nexit 7\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	proposal := filepath.Join(dir, "proposal")
 	if err := os.WriteFile(proposal, []byte("envelope\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	record := filepath.Join(dir, "record.tsv")
-	cmd := exec.Command("./record-librarian", "--id", "near-0123456789abcdef", "--proposer", "function:open_file",
-		"--proposal", proposal, "--", command, "one", "two")
-	cmd.Env = append(os.Environ(), "LIBRARIAN_RECORD="+record)
-	out, err := cmd.CombinedOutput()
-	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.ExitCode() != 7 {
-		t.Fatalf("record-librarian: %v, want the command's exit 7\n%s", err, out)
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command("./record-librarian", args...)
+		cmd.Env = append(os.Environ(), "LIBRARIAN_RECORD="+record)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run("--id", "near-0123456789abcdef", "--proposer", "function:open_file", "--proposal", proposal); err != nil {
+		t.Fatalf("record-librarian: %v\n%s", err, out)
 	}
 	if line, err := os.ReadFile(record); err != nil || !strings.Contains(string(line), "\tnear-0123456789abcdef\tfunction:open_file\t") {
 		t.Fatalf("record %q, %v", line, err)
 	}
-	if got, err := os.ReadFile(seen); err != nil || string(got) != "one\ntwo\n" {
-		t.Fatalf("the command got %q (%v), want only its own arguments", got, err)
+	out, err := run("--id", "near-0123456789abcdef", "--proposer", "function:open_file", "--proposal", proposal, "--", "true")
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 {
+		t.Fatalf("a command after the gate's arguments: %v, want usage exit 2\n%s", err, out)
 	}
 }

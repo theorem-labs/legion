@@ -166,6 +166,12 @@ func gitTreeSources(ctx context.Context, gitDir, treeID, prefix string, pathspec
 	if err != nil {
 		return nil, fmt.Errorf("list LAND_TREE sources: %w", err)
 	}
+	return treeSources(raw, prefix)
+}
+
+// treeSources reads `git ls-tree -r -z` output: the blob id of each `.lean` file below prefix, keyed by its path
+// relative to prefix.
+func treeSources(raw []byte, prefix string) (map[string]string, error) {
 	out := map[string]string{}
 	for record, err := range nulRecords("git ls-tree", raw) {
 		if err != nil {
@@ -176,7 +182,10 @@ func gitTreeSources(ctx context.Context, gitDir, treeID, prefix string, pathspec
 			return nil, fmt.Errorf("git ls-tree record has no path")
 		}
 		parts := strings.Fields(fields)
-		if len(parts) != 3 || parts[1] != "blob" || !strings.HasSuffix(path, ".lean") {
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("git ls-tree record for %s has %d fields, not 3", path, len(parts))
+		}
+		if parts[1] != "blob" || !strings.HasSuffix(path, ".lean") {
 			continue
 		}
 		if rel, inTree := strings.CutPrefix(path, prefix); inTree {
