@@ -123,9 +123,18 @@ const ProposalModule = "DeclIndexProposal"
 // index declares its name. A source-bearing concept that the index does not yet declare is pending; only the gate
 // compiles it, in a sandbox, and then adds it to the forms module for that one decision.
 func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.FormsModule, error) {
-	fm := declindex.FormsModule{Imports: append([]string(nil), r.Imports...), Opens: append([]string(nil), r.Opens...)}
+	return forms(ctx, s, r, nil)
+}
+
+// forms is Forms without the modules of hidden: it imports none of them, and a concept that only they declare is
+// not declared.
+func forms(ctx context.Context, s *declindex.Store, r Registry, hidden map[string]bool) (declindex.FormsModule, error) {
+	fm := declindex.FormsModule{Opens: append([]string(nil), r.Opens...)}
 	seen := map[string]bool{}
-	for _, i := range fm.Imports {
+	for _, i := range r.Imports {
+		if !hidden[i] {
+			fm.Imports = append(fm.Imports, i)
+		}
 		seen[i] = true
 	}
 	for _, c := range r.Concepts {
@@ -135,7 +144,7 @@ func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.Forms
 		}
 		declared := false
 		for _, f := range found {
-			if f.Name != c.Name {
+			if f.Name != c.Name || hidden[f.Module] {
 				continue
 			}
 			declared = true
@@ -404,11 +413,19 @@ func admit(ctx context.Context, ex *declindex.Exporter, run, module, source stri
 	return dir, nil
 }
 
-// pendingForms compiles the sources of registry concepts that are not yet declared by the index. It runs only
-// from the gate's confined export path; refresh and FormsModule never receive those source bytes. A pending
-// concept whose source the text filter or Lean refuses is a defect of that concept, left out of the forms.
+// pendingForms gives the forms module of a decision on the proposal of the concept exclude, with the compiled
+// sources of the registry concepts that the index does not yet declare. It runs only from the gate's confined
+// export path; refresh and FormsModule never receive those source bytes. A pending concept whose source the text
+// filter or Lean refuses is a defect of that concept, left out of the forms. The proposal supplies exclude, also
+// when the index declares it, as it does in the recheck of an addition that landed with its declaration. Lean
+// refuses two definitions of one name, so the forms then import no module that declares exclude, and a concept
+// whose compiled constant is in such a module is pending.
 func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exporter, run, exclude string) (declindex.FormsModule, []Defect, error) {
-	fm, err := Forms(ctx, g.Index, reg)
+	hidden, err := declaringModules(ctx, g.Index, exclude)
+	if err != nil {
+		return declindex.FormsModule{}, nil, err
+	}
+	fm, err := forms(ctx, g.Index, reg, hidden)
 	if err != nil {
 		return fm, nil, err
 	}
@@ -425,7 +442,7 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		if err != nil && !errors.As(err, &nf) {
 			return fm, defects, err
 		}
-		if err == nil && compiled.Hash != "" {
+		if err == nil && compiled.Hash != "" && !hidden[compiled.Module] {
 			continue
 		}
 		if c.Source == "" {
@@ -455,6 +472,21 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
 	}
 	return fm, defects, nil
+}
+
+// declaringModules are the modules in which the index declares name.
+func declaringModules(ctx context.Context, s *declindex.Store, name string) (map[string]bool, error) {
+	found, err := s.Resolve(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	modules := map[string]bool{}
+	for _, f := range found {
+		if f.Name == name {
+			modules[f.Module] = true
+		}
+	}
+	return modules, nil
 }
 
 // export checks the proposal, compiles it against the build and reads it with the registry's forms, each step in

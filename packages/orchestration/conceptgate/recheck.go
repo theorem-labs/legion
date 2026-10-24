@@ -22,6 +22,7 @@ type RecheckReport struct {
 
 // Recheck recompiles each added concept's stored source in the sandbox, checks its recorded hash, and sends each
 // near pair to the librarian once. The caller supplies paths added by the landing diff and the loaded registry.
+// The stored source supplies its concept also when the landing added the concept's declaration (see pendingForms).
 // An added file that is not a loaded concept, a stored source that Lean refuses or does not compile, and a pending
 // concept left out of the forms are defects; an error means that the recheck could not run.
 func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (RecheckReport, error) {
