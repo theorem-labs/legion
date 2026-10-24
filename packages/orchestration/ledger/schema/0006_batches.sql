@@ -40,22 +40,22 @@ CREATE TABLE batch_members (
 CREATE UNIQUE INDEX batch_members_admitted ON batch_members (repo, migration) WHERE admitted;
 
 -- A batch's post-landing effects: each an intent until it is done, never back. A key is scoped to its batch. member is
--- empty for an effect of the whole batch. result holds the intent's inputs (its landing commit) and then the done
--- result; last_attempt is the newest failed attempt's result, and held stops the effect until an operator acts.
+-- empty for an effect of the whole batch, and kind is a follow-on's apply kind. result holds the intent's inputs (its
+-- landing commit, and for a follow-on the effect and output it follows) and then the done result; last_attempt is the
+-- newest failed attempt's result, and held stops the effect until an operator acts.
 CREATE TABLE batch_effects (
-    repo              text NOT NULL,
-    batch             text NOT NULL,
-    key               text NOT NULL,
-    member            text NOT NULL DEFAULT '',
-    op                text NOT NULL,
-    kind              text NOT NULL DEFAULT '',
-    definition_digest text NOT NULL DEFAULT '',
-    state             text NOT NULL DEFAULT 'intent' CHECK (state IN ('intent', 'done')),
-    held              boolean NOT NULL DEFAULT false,
-    attempts          integer NOT NULL DEFAULT 0,
-    last_attempt      jsonb,
-    result            jsonb NOT NULL DEFAULT '{}',
-    at                timestamptz NOT NULL DEFAULT clock_timestamp(),
+    repo         text NOT NULL,
+    batch        text NOT NULL,
+    key          text NOT NULL,
+    member       text NOT NULL DEFAULT '',
+    op           text NOT NULL,
+    kind         text NOT NULL DEFAULT '',
+    state        text NOT NULL DEFAULT 'intent' CHECK (state IN ('intent', 'done')),
+    held         boolean NOT NULL DEFAULT false,
+    attempts     integer NOT NULL DEFAULT 0,
+    last_attempt jsonb,
+    result       jsonb NOT NULL DEFAULT '{}',
+    at           timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (repo, batch, key),
     FOREIGN KEY (repo, batch) REFERENCES batches(repo, id)
 );

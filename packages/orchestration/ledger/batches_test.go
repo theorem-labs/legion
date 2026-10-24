@@ -61,9 +61,9 @@ func sameJSON(t *testing.T, a, b json.RawMessage) bool {
 	return reflect.DeepEqual(x, y)
 }
 
-// batchSQL runs statement on its own connection. The tests use it for the columns that only the calls of later tasks
-// write (AdmitBatch, LandBatch, DeclineBatch and the effect log), so that SaveBatch and ListActiveBatches can be
-// tested against them now.
+// batchSQL runs statement on its own connection. The tests use it for the columns and rows that only the calls of later
+// tasks write (AdmitBatch, LandBatch and DeclineBatch, among them the hook intents that LandBatch records), so that
+// SaveBatch, ListActiveBatches and the effect log can be tested against them now.
 func batchSQL(t *testing.T, dsn, statement string, args ...any) {
 	t.Helper()
 	ctx := context.Background()
@@ -457,8 +457,8 @@ func TestListActiveBatchesListsWhatARestartMustFinish(t *testing.T) {
 	if successor := must(s.LoadBatch(ctx, "r", "declined-empty-successor")).Successor; successor != "" {
 		t.Fatalf("a batch stored with an empty successor loads with successor %q", successor)
 	}
-	// No call writes an effect yet: LandBatch and ResolveBatch record a landed batch's effects. The test writes them
-	// directly to check the listing rule for a terminal batch with an effect still to do.
+	// LandBatch and ResolveBatch record a landed batch's hook intents, and they are built separately. The test writes
+	// the rows directly to check the listing rule for a terminal batch with an effect still to do.
 	batchSQL(t, dsn, `INSERT INTO batch_effects (repo, batch, key, op, state) VALUES
 		('r', 'landed-with-effects', 'hook/landed-with-effects/1/score', 'hook', 'intent'),
 		('r', 'landed-with-effects', 'hook/landed-with-effects/0/report', 'hook', 'intent'),

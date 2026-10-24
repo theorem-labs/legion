@@ -449,6 +449,10 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		value, err := s.ListActiveBatches(ctx, args[0])
 		return value, true, err
+	case "effects", "begin-withdraw", "effect-attempt", "effect-done", "effect-outputs", "effect-apply-contracts", "effect-skip",
+		"effect-release":
+		value, err := effectCommand(ctx, s, command, args)
+		return value, true, err
 	default:
 		return nil, false, usagef("unknown command %q", command)
 	}

@@ -59,23 +59,38 @@ func (s *Store) RegisterContract(ctx context.Context, repo, name, owner, hash st
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
+		var inserted bool
 		var err error
-		c, err = scanContract(tx.QueryRow(ctx, `INSERT INTO contracts (repo, name, owner, statement_hash, pinned)
-			VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING
-			RETURNING `+contractColumns, repo, name, owner, hash, pinned))
-		if errors.Is(err, pgx.ErrNoRows) {
-			return refuse(ReasonExists, "contract %s already exists", name)
-		}
-		if err != nil {
+		if c, inserted, err = insertContract(ctx, tx, repo, name, owner, hash, pinned); err != nil {
 			return err
 		}
-		return event(ctx, tx, repo, "contract.registered", name, owner, map[string]any{
-			"statement_hash": hash,
-			"version":        c.Version,
-			"pinned":         pinned,
-		})
+		if !inserted {
+			return refuse(ReasonExists, "contract %s already exists", name)
+		}
+		return contractRegistered(ctx, tx, repo, c, nil)
 	})
 	return c, err
+}
+
+// insertContract records a new contract at version one inside tx, which already holds the repository's row lock. It
+// appends no event. When the name is already registered, it writes nothing and returns false.
+func insertContract(ctx context.Context, tx pgx.Tx, repo, name, owner, hash string, pinned bool) (Contract, bool, error) {
+	c, err := scanContract(tx.QueryRow(ctx, `INSERT INTO contracts (repo, name, owner, statement_hash, pinned)
+		VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING
+		RETURNING `+contractColumns, repo, name, owner, hash, pinned))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Contract{}, false, nil
+	}
+	return c, err == nil, err
+}
+
+// contractRegistered appends contract.registered for c, whose data holds the registration and the fields of extra.
+func contractRegistered(ctx context.Context, tx pgx.Tx, repo string, c Contract, extra map[string]any) error {
+	data := map[string]any{"statement_hash": c.StatementHash, "version": c.Version, "pinned": c.Pinned}
+	for field, value := range extra {
+		data[field] = value
+	}
+	return event(ctx, tx, repo, "contract.registered", c.Name, c.Owner, data)
 }
 
 // Contract reads one contract's current owner, hash and version.

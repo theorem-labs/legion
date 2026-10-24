@@ -30,6 +30,8 @@ const (
 	ReasonUpstreamNotAllowed = "upstream_not_allowed" // only the configured upstream owner may record provenance
 	ReasonRefusalConflict    = "refusal_conflict"     // the owner's work revision already has a refusal with another reason
 	ReasonStaleBatch         = "stale_batch"          // the batch is at another record version than the caller read
+	ReasonEffectDone         = "effect_done"          // another executor already finished the effect
+	ReasonContractConflict   = "contract_conflict"    // another landing registered the contract with another owner or hash
 	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.
 	ReasonStatementUnreviewed = "statement_unreviewed"
 )

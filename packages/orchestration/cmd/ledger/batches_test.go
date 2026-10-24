@@ -169,8 +169,8 @@ func (cli batchCLI) events(subject string) []string {
 	return kinds
 }
 
-// sql runs statement on its own connection, for the columns that only later calls write (AdmitBatch, LandBatch,
-// DeclineBatch and the effect log).
+// sql runs statement on its own connection, for the columns and rows that only later calls write (AdmitBatch,
+// LandBatch and DeclineBatch, among them the hook intents that LandBatch records).
 func (cli batchCLI) sql(statement string, args ...any) {
 	cli.t.Helper()
 	ctx := context.Background()
