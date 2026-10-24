@@ -44,6 +44,76 @@ func TestSupervisedLeaseNeverExpires(t *testing.T) {
 	}
 }
 
+// HasOpenWork is true exactly while the owner has an open item: not before its first enqueue, not after its last
+// item is done, and not because another owner has work. An empty owner is invalid input.
+func TestHasOpenWorkFollowsTheOwnersOpenItems(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	const owner, other = "struct:mount", "struct:state"
+	hasWork := func(step string, want bool) {
+		t.Helper()
+		if got := must(s.HasOpenWork(ctx, "r", owner)); got != want {
+			t.Fatalf("%s: HasOpenWork = %t, want %t", step, got, want)
+		}
+	}
+	hasWork("before any enqueue", false)
+	if err := s.Enqueue(ctx, "r", "other-item", other); err != nil {
+		t.Fatal(err)
+	}
+	hasWork("after another owner's enqueue", false)
+	if err := s.Enqueue(ctx, "r", "item", owner); err != nil {
+		t.Fatal(err)
+	}
+	hasWork("after its enqueue", true)
+	lease := must(s.Claim(ctx, "r", "item", owner, 0))
+	hasWork("while its item is held", true)
+	if err := s.Complete(ctx, "r", "item", owner, lease.Generation, "proved"); err != nil {
+		t.Fatal(err)
+	}
+	hasWork("after its only item is done", false)
+	var invalid *ledger.InvalidError
+	if _, err := s.HasOpenWork(ctx, "r", " "); !errors.As(err, &invalid) {
+		t.Fatalf("blank owner: %v, want invalid input", err)
+	}
+}
+
+// EnsureRepoWithUpstreamOwner sets the landing-round limit and the upstream owner in one change, which one
+// repository.configured event records with both values; an empty owner clears it. EnsureRepo leaves the upstream
+// owner as it is, and a call that changes nothing appends no event.
+func TestEnsureRepoConfiguresTheUpstreamOwnerInOneChange(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	type configured struct {
+		MaxLandingRounds int    `json:"max_landing_rounds"`
+		UpstreamOwner    string `json:"upstream_owner"`
+	}
+	var seen []configured
+	step := func(name string, repository ledger.Repository, rounds int, owner string, events ...configured) {
+		t.Helper()
+		if repository.Name != "u" || repository.MaxLandingRounds != rounds || repository.UpstreamOwner != owner {
+			t.Fatalf("%s: repository %+v, want %d rounds and upstream owner %q", name, repository, rounds, owner)
+		}
+		seen = append(seen, events...)
+		var got []configured
+		for _, event := range must(s.Events(ctx, "u", 0, "u")) {
+			var data configured
+			if err := json.Unmarshal(event.Data, &data); err != nil || event.Kind != "repository.configured" {
+				t.Fatalf("%s: event %+v: %v", name, event, err)
+			}
+			got = append(got, data)
+		}
+		if !slices.Equal(got, seen) {
+			t.Fatalf("%s: repository.configured events %+v, want %+v", name, got, seen)
+		}
+	}
+	step("create with an upstream owner", must(s.EnsureRepoWithUpstreamOwner(ctx, "u", 2, "upstream")), 2, "upstream",
+		configured{2, "upstream"})
+	step("ensure keeps the upstream owner", must(s.EnsureRepo(ctx, "u", 2)), 2, "upstream")
+	step("the same upstream owner again", must(s.EnsureRepoWithUpstreamOwner(ctx, "u", 2, "upstream")), 2, "upstream")
+	step("a new limit keeps the upstream owner", must(s.EnsureRepo(ctx, "u", 3)), 3, "upstream", configured{3, "upstream"})
+	step("clear the upstream owner", must(s.EnsureRepoWithUpstreamOwner(ctx, "u", 3, "")), 3, "", configured{3, ""})
+}
+
 // ReleaseHolder frees, in one transaction, every lease of the stopped holder at its current
 // generation and no one else's; the holder's late result and renewal are refused, and the freed
 // item is claimed again at the next generation.

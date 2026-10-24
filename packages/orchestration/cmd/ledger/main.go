@@ -148,18 +148,18 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 	args = args[1:]
 	switch command {
 	case "repo":
-		if len(args) < 3 || args[0] != "ensure" || (len(args) != 3 && (len(args) != 5 || args[3] != "--upstream-owner")) {
+		withOwner := len(args) == 5 && args[3] == "--upstream-owner"
+		if len(args) < 3 || args[0] != "ensure" || (len(args) != 3 && !withOwner) {
 			return nil, false, usagef("repo ensure <repo> <max-rounds> [--upstream-owner <name>]")
 		}
 		limit, err := roundLimit(args[2])
 		if err != nil {
 			return nil, false, err
 		}
-		options := []ledger.EnsureRepoOption{}
-		if len(args) == 5 {
-			options = append(options, ledger.WithUpstreamOwner(args[4]))
+		if withOwner {
+			return mutation(s.EnsureRepoWithUpstreamOwner(ctx, args[1], limit, args[4]))
 		}
-		return mutation(s.EnsureRepo(ctx, args[1], limit, options...))
+		return mutation(s.EnsureRepo(ctx, args[1], limit))
 	case "enqueue":
 		if len(args) != 3 || args[0] == "" || args[1] == "" || args[2] == "" {
 			return nil, false, usagef("enqueue <repo> <item> <owner>")

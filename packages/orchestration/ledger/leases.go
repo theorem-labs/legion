@@ -9,54 +9,51 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// EnsureRepoOption configures optional repository records.
-type EnsureRepoOption func(*ensureRepoOptions)
-
-type ensureRepoOptions struct {
-	upstreamOwner *string
+// EnsureRepo creates the repository record, or updates its landing-round limit if it exists. It keeps the repository's
+// upstream owner.
+func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds int) (Repository, error) {
+	return s.ensureRepo(ctx, name, maxLandingRounds, nil)
 }
 
-// WithUpstreamOwner sets the migration owner allowed to attach upstream provenance. An empty owner clears it.
-func WithUpstreamOwner(owner string) EnsureRepoOption {
-	return func(options *ensureRepoOptions) {
-		options.upstreamOwner = &owner
-	}
+// EnsureRepoWithUpstreamOwner is EnsureRepo that also sets, in the same transaction, the one migration owner whose
+// landings may carry upstream provenance. An empty owner clears it.
+func (s *Store) EnsureRepoWithUpstreamOwner(ctx context.Context, name string, maxLandingRounds int, upstreamOwner string) (Repository, error) {
+	return s.ensureRepo(ctx, name, maxLandingRounds, &upstreamOwner)
 }
 
-// EnsureRepo creates the repository record, or updates its landing-round limit and selected configuration if it exists.
-func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds int, options ...EnsureRepoOption) (Repository, error) {
+// ensureRepo stores the repository with its limit and, unless upstreamOwner is nil, that upstream owner. A change, or a
+// new repository, appends one repository.configured event with both values.
+func (s *Store) ensureRepo(ctx context.Context, name string, maxLandingRounds int, upstreamOwner *string) (Repository, error) {
 	if name == "" {
 		return Repository{}, invalid("empty repository name")
 	}
 	if maxLandingRounds < 0 {
 		return Repository{}, invalid("max landing rounds %d is negative", maxLandingRounds)
 	}
-	config := ensureRepoOptions{}
-	for _, option := range options {
-		option(&config)
-	}
-	var configuredOwner any
-	if config.upstreamOwner != nil && *config.upstreamOwner != "" {
-		configuredOwner = *config.upstreamOwner
-	}
 	var r Repository
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		var previousRounds int
-		var previousOwner string
+		var previous Repository
 		err := tx.QueryRow(ctx, `SELECT max_landing_rounds, coalesce(upstream_owner, '') FROM repositories WHERE name = $1 FOR UPDATE`, name).
-			Scan(&previousRounds, &previousOwner)
+			Scan(&previous.MaxLandingRounds, &previous.UpstreamOwner)
 		exists := err == nil
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds, upstream_owner) VALUES ($1, $2, $3)
+		var owner string
+		if upstreamOwner != nil {
+			owner = *upstreamOwner
+		}
+		// Without an upstream owner, the conflict arm keeps the row's own value, which a concurrent first ensure of
+		// this repository may have set after the read above.
+		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds, upstream_owner) VALUES ($1, $2, nullif($3, ''))
 			ON CONFLICT (name) DO UPDATE SET max_landing_rounds = EXCLUDED.max_landing_rounds,
 				upstream_owner = CASE WHEN $4 THEN EXCLUDED.upstream_owner ELSE repositories.upstream_owner END
-			RETURNING name, max_landing_rounds, coalesce(upstream_owner, ''), created_at`, name, maxLandingRounds, configuredOwner, config.upstreamOwner != nil).
+			RETURNING name, max_landing_rounds, coalesce(upstream_owner, ''), created_at`,
+			name, maxLandingRounds, owner, upstreamOwner != nil).
 			Scan(&r.Name, &r.MaxLandingRounds, &r.UpstreamOwner, &r.CreatedAt); err != nil {
 			return err
 		}
-		if exists && previousRounds == maxLandingRounds && (config.upstreamOwner == nil || previousOwner == r.UpstreamOwner) {
+		if exists && previous.MaxLandingRounds == r.MaxLandingRounds && previous.UpstreamOwner == r.UpstreamOwner {
 			return nil
 		}
 		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{

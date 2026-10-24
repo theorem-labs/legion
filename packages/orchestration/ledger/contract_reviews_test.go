@@ -107,7 +107,7 @@ func TestPerContractReviews(t *testing.T) {
 func TestUpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
-	must(s.EnsureRepo(ctx, "r", 3, ledger.WithUpstreamOwner("upstream")))
+	must(s.EnsureRepoWithUpstreamOwner(ctx, "r", 3, "upstream"))
 
 	denied := must(open(t, s, "M-denied", "alice", []string{"a.lean"}, nil))
 	deniedRequest := ledger.LandRequest{
@@ -273,7 +273,7 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s := newStore(t)
 			if test.upstream != "" {
-				must(s.EnsureRepo(ctx, "r", 3, ledger.WithUpstreamOwner("upstream")))
+				must(s.EnsureRepoWithUpstreamOwner(ctx, "r", 3, "upstream"))
 			}
 			must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 			migration := must(open(t, s, test.migration, test.owner, []string{"a.lean"}, map[string]string{"C": "hash-1"}))
@@ -302,7 +302,7 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 func TestContractJSONReadsBack(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
-	must(s.EnsureRepo(ctx, "r", 3, ledger.WithUpstreamOwner("upstream")))
+	must(s.EnsureRepoWithUpstreamOwner(ctx, "r", 3, "upstream"))
 	review := func(name string) []ledger.Review {
 		return []ledger.Review{{Contract: name, Reviewer: "alice", Head: "head-" + name}}
 	}

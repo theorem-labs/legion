@@ -273,7 +273,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			name: "upstream provenance does not clear a statement",
 			kind: ledger.ReasonStatementUnreviewed,
 			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
-				if _, err := s.EnsureRepo(context.Background(), "r", 3, ledger.WithUpstreamOwner("alice")); err != nil {
+				if _, err := s.EnsureRepoWithUpstreamOwner(context.Background(), "r", 3, "alice"); err != nil {
 					t.Fatal(err)
 				}
 				parityRegister(t, s, "C", "hash-1", false)
@@ -287,7 +287,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			name: "pinned contract remains pinned under upstream provenance",
 			kind: ledger.ReasonPinned,
 			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
-				if _, err := s.EnsureRepo(context.Background(), "r", 3, ledger.WithUpstreamOwner("alice")); err != nil {
+				if _, err := s.EnsureRepoWithUpstreamOwner(context.Background(), "r", 3, "alice"); err != nil {
 					t.Fatal(err)
 				}
 				parityRegister(t, s, "C", "hash-1", true)
