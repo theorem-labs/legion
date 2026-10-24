@@ -55,3 +55,40 @@ def test_a_loop_that_may_leave_the_function_is_code(
     own = {item["field"] for item in fold_facts["functions"][function]["events"]["field_accesses"]}
     assert fields <= own
     assert fields <= folded_fields(fold_build, function)
+
+
+def call_of(facts: dict[str, Any], function: str, callee: str) -> dict[str, Any]:
+    (call,) = [call for call in facts["functions"][function]["events"]["calls"] if call["callee"] == callee]
+    return call
+
+
+@pytest.mark.parametrize(
+    ("function", "callee", "kept", "left_out"),
+    [
+        # llvm-objdump: ld zero, 0x0(a0); ret.
+        ("fd_unused_order", "fd_folio_order", {"flags"}, {"order"}),
+        # lw a0, 0x0(a0); li a1, 0x1; blt a1, a0, +4; ebreak; ret.
+        ("fd_unused_clock", "fd_rq_clock", {"flags"}, {"clock"}),
+        # lw a1, 0x0(a0); beqz a1, +4; ret; lw zero, 0x4(a0); ret.
+        ("fd_unused_entity", "fd_dl_rq_of_se", {"server", "cpu"}, {"rq", "rqs", "dl"}),
+    ],
+)
+def test_a_call_whose_value_is_unused_keeps_only_what_the_callee_s_effects_need(
+    fold_facts: dict[str, Any],
+    fold_build: dict[str, Any],
+    function: str,
+    callee: str,
+    kept: set[str],
+    left_out: set[str],
+) -> None:
+    assert call_of(fold_facts, function, callee).get("value_unused") is True
+    fields = folded_fields(fold_build, function)
+    assert kept <= fields and not fields & left_out
+
+
+def test_a_call_whose_value_is_used_keeps_the_reads_that_make_it(
+    fold_facts: dict[str, Any], fold_build: dict[str, Any]
+) -> None:
+    """llvm-objdump of fd_used_order: ld a1, 0x0(a0); andi; beqz; lbu a0, 0x8(a0)."""
+    assert "value_unused" not in call_of(fold_facts, "fd_used_order", "fd_folio_order")
+    assert folded_fields(fold_build, "fd_used_order") == {"flags", "order"}

@@ -55,3 +55,98 @@ int fd_check_all(struct fd_limits *l)
 out:
 	return -1;
 }
+
+/* mm/swap.c folios_put_refs without THP: folio_order(folio) <= 1 || !folio_test_large_rmappable(folio),
+ * where the right operand is 1. folio_order's volatile flags read stays; its read of the order,
+ * which only makes the unused value, does not. */
+struct fd_folio {
+	unsigned long flags;
+	unsigned long order;
+};
+
+static inline int fd_folio_head(const struct fd_folio *f)
+{
+	return *(const volatile unsigned long *)&f->flags & 1;
+}
+
+static inline unsigned long fd_folio_order(const struct fd_folio *f)
+{
+	if (!fd_folio_head(f))
+		return 0;
+	return f->order & 0xff;
+}
+
+void fd_unused_order(struct fd_folio *f)
+{
+	fd_folio_order(f);
+}
+
+/* Where the value is used, the read that makes it stays. */
+unsigned long fd_used_order(struct fd_folio *f)
+{
+	return fd_folio_order(f);
+}
+
+/* kernel/sched/core.c sched_tick without SCHED_HW_PRESSURE: update_hw_load_avg(rq_clock_task(rq),
+ * rq, hw_pressure), a stub that ignores its arguments. rq_clock_task's WARN_ON_ONCE test of
+ * rq->clock_update_flags stays; its read of rq->clock_task does not. */
+struct fd_rq {
+	int flags;
+	long clock;
+};
+
+static inline long fd_rq_clock(struct fd_rq *rq)
+{
+	if (rq->flags < 2)
+		__asm__ volatile("ebreak");
+	return rq->clock;
+}
+
+static inline void fd_hw_load(long now, struct fd_rq *rq)
+{
+}
+
+void fd_unused_clock(struct fd_rq *rq)
+{
+	fd_hw_load(fd_rq_clock(rq), rq);
+}
+
+/* kernel/sched/deadline.c enqueue_task_dl: update_stats_wait_start_dl(dl_rq_of_se(&p->dl), &p->dl),
+ * a stub without SCHEDSTATS. dl_rq_of_se returns &rq_of_dl_se(dl_se)->dl, whose rq = dl_se->rq only
+ * makes the value; dl_server(dl_se) decides whether task_cpu's READ_ONCE runs. */
+struct fd_dl_rq {
+	long n;
+};
+struct fd_runq {
+	long pad[2];
+	struct fd_dl_rq dl;
+};
+struct fd_dl_entity {
+	int server;
+	int cpu;
+	struct fd_runq *rq;
+	struct fd_runq *rqs[4];
+};
+
+static inline struct fd_runq *fd_rq_of_se(struct fd_dl_entity *se)
+{
+	struct fd_runq *rq = se->rq;
+
+	if (!se->server)
+		rq = se->rqs[*(volatile int *)&se->cpu & 3];
+	return rq;
+}
+
+static inline struct fd_dl_rq *fd_dl_rq_of_se(struct fd_dl_entity *se)
+{
+	return &fd_rq_of_se(se)->dl;
+}
+
+static inline void fd_wait_start(struct fd_dl_rq *dl_rq, struct fd_dl_entity *se)
+{
+}
+
+void fd_unused_entity(struct fd_dl_entity *se)
+{
+	fd_wait_start(fd_dl_rq_of_se(se), se);
+}

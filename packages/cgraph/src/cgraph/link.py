@@ -292,7 +292,7 @@ class Linker:
                             self.global_ids[unit["name"]].add(identity)
         self.symbol_cache: dict[tuple[str, str, int], list[Symbol]] = {}
         self.callee_cache: dict[tuple[str, str, int], set[str]] = {}
-        self.effective_cache: dict[tuple[str, str, tuple[str, str, int], bool], Effective] = {}
+        self.effective_cache: dict[tuple[str, str, tuple[str, str, int], bool, bool], Effective] = {}
         self.own_cache: dict[tuple[str, str, int], tuple[frozenset[str], frozenset[str]]] = {}
         # A header's static function is compiled into each unit that includes it, with that unit's
         # view of its callees. Its facts are those of the unit whose image copy the node is.
@@ -456,19 +456,29 @@ class Linker:
     # Folding -------------------------------------------------------------------------------
 
     def effective(
-        self, tu: str, name: str, caller: Definition, stack: tuple[str, ...] = (), pointers: bool = True
+        self,
+        tu: str,
+        name: str,
+        caller: Definition,
+        stack: tuple[str, ...] = (),
+        pointers: bool = True,
+        unused: bool = False,
     ) -> Effective:
         """The events of ``name`` (as unit ``tu`` defines it) inside the image code of ``caller``.
 
         A visible helper is folded where the caller's image code has no direct call to it: the
         compiler inlined it there. A helper the image calls stays a call. With ``pointers``, a
-        function whose address the C passes is folded too where the image shows it (below).
+        function whose address the C passes is folded too where the image shows it (below). With
+        ``unused``, at a call whose value nothing uses: the events of the function's walk with its
+        returns discarded (``value_unused``), where the facts give one.
         """
         caller_key = (caller.name, caller.file, caller.line)
-        key = (tu, name, caller_key, pointers)
+        key = (tu, name, caller_key, pointers, unused)
         if key in self.effective_cache:
             return self.effective_cache[key]
         function = self.tus[tu]["functions"][name]
+        if unused:
+            function = function.get("value_unused", function)
         events, table = function["events"], function.get("guards", [])
         result = Effective()
         for kind in _EVENT_LISTS:
@@ -485,7 +495,7 @@ class Linker:
             ):
                 helper = self.visible(tu, callee)
                 assert helper is not None
-                child = self.effective(tu, callee, caller, (*stack, name), pointers)
+                child = self.effective(tu, callee, caller, (*stack, name), pointers, bool(call.get("value_unused")))
                 bound = _bind(child, call["arguments"])
                 returned = self.tus[tu]["functions"][callee].get("returns_object")
                 if returned is not None and call.get("result_object") is not None:
@@ -614,6 +624,8 @@ class Linker:
         """The calls a folded helper makes through a parameter its caller passes a function in: that
         function's arguments in the caller's terms, kept per function in ``result.pointer_calls``."""
         record = self.tus[tu]["functions"][helper]
+        if call.get("value_unused"):
+            record = record.get("value_unused", record)
         through = _resolved(record["events"].get("parameter_calls", []), record.get("guards", []))
         for item in through:
             passed = call["arguments"][item["param"]] if item["param"] < len(call["arguments"]) else {}

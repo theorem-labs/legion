@@ -230,6 +230,10 @@ These rules follow what the machine code shows, each only where it shows it:
   fold, link puts the arguments in; a call or an access a guard decides against becomes `unevaluated`
   with reason `constant_argument` (an exclusion), other events are dropped, and the guards still open
   carry up to the next fold.
+- A call whose value nothing uses (a discarded value that has an effect, such as an argument the
+  callee ignores) is marked `value_unused`; the facts give the callee a second event set,
+  `value_unused`, from its walk with each return's value discarded, and link folds that set there:
+  `rq_clock_task`'s `WARN_ON_ONCE` test stays and its read of `rq->clock_task` goes.
 - A helper folded under a `__builtin_constant_p` choice marks all its events `conditional`, field
   accesses too: the machine code decides whether that branch was compiled, so a conditional field
   access with no match is excluded as `image_decided` (below).

@@ -447,6 +447,7 @@ class _Extractor:
         # calls compute only their result, and each _Generic's selection, read once per node.
         # Each kept answer goes with its horizon (see ``horizon``).
         self.analyses: dict[str, tuple[_FunctionWalk, int | None]] = {}
+        self.unused_analyses: dict[str, tuple[_FunctionWalk, int | None]] = {}  # returns discarded
         self.analyzing: set[str] = set()
         self.effect_free_cache: dict[str, tuple[bool, int | None]] = {}
         self.nesting = 0  # analyses under way, one inside another: bounded by _EFFECT_DEPTH
@@ -1049,7 +1050,7 @@ class _Extractor:
         result = self.evaluator.evaluate(value[0])
         return None if result is None else (result,)
 
-    def analysis(self, definition: ci.Cursor) -> _FunctionWalk:
+    def analysis(self, definition: ci.Cursor, returns_discarded: bool = False) -> _FunctionWalk:
         """The walk of a function whose labels and dead stores are settled.
 
         A label is code only when control falls into it or a goto that is code jumps to it
@@ -1058,9 +1059,11 @@ class _Extractor:
         a parameter nothing reads in compiled code (local_lock's ``__tl``) is not code either, and a
         store to one read only where the image decides (an argument a callee that is not inline
         ignores) is compiled only where the image has it; the walk is repeated until those
-        variables stop growing."""
+        variables stop growing. With ``returns_discarded``, the walk of a call whose value nothing
+        uses: each return's value is discarded, so a local that only makes it is not computed."""
         name = definition.spelling
-        cached = self.reuse(self.analyses, name)
+        analyses = self.unused_analyses if returns_discarded else self.analyses
+        cached = self.reuse(analyses, name)
         if cached is not None:
             return cached
         self.analyzing.add(name)
@@ -1071,7 +1074,7 @@ class _Extractor:
         overwritten: frozenset[int] = frozenset()
         settled = False
         for _ in range(_ANALYSIS_ROUNDS):
-            walk = _FunctionWalk(self, definition, labels, dead, decided, overwritten)
+            walk = _FunctionWalk(self, definition, labels, dead, decided, overwritten, returns_discarded)
             walk.walk(definition, None, 0, None)
             walk.finish()
             if not settled:
@@ -1090,7 +1093,7 @@ class _Extractor:
         self.analyzing.discard(name)
         # A walk that met the depth bound is kept for as deep a horizon as it saw, so a function's
         # own facts (asked at nesting 0) come from a walk that saw its callees whole.
-        self.analyses[name] = (walk, self.horizon(start))
+        analyses[name] = (walk, self.horizon(start))
         return walk
 
     def inline_function(self, name: str) -> bool:
@@ -2502,6 +2505,7 @@ class _FunctionWalk:
         dead_variables: frozenset[int] = frozenset(),
         decided_variables: frozenset[int] = frozenset(),
         overwritten: frozenset[int] = frozenset(),
+        returns_discarded: bool = False,
     ) -> None:
         self.x = extractor
         self.cursor = cursor
@@ -2541,6 +2545,10 @@ class _FunctionWalk:
         self.effects = 0
         self.compiled_loops = 0
         self.statement_values: set[int] = set()  # the expression statements outside blocks, discarded
+        # The walk of a call whose value nothing uses: each return's value is discarded. The calls
+        # this walk discards, which have an effect: such a call of a helper is folded the same way.
+        self.returns_discarded = returns_discarded
+        self.unused_calls: set[int] = set()
         # Field addresses: each member chain's topmost member gets the chain's address; the members
         # below it (and the ones a local's definition folds away) are addressed only through it.
         self.chained: set[int] = set()
@@ -3025,6 +3033,10 @@ class _FunctionWalk:
             or node.type.is_volatile_qualified()
             or _store_target(node) is not None
         ):
+            if kind == K.CALL_EXPR:
+                # A call with an effect whose value nothing uses: of a helper the image inlines, only
+                # what its effects need is code (``value_unused``).
+                self.unused_calls.add(node.hash)
             self.walk(node, parent, index, None, generic)
             return
         # An operator, a cast or a member access: its own value is unused, and its operands give only
@@ -3902,6 +3914,10 @@ class _FunctionWalk:
         if self.conditional:
             # Under a __builtin_constant_p choice: the image decides.
             event["conditional"] = True
+        if node.hash in self.unused_calls and node.type.get_canonical().kind != TK.VOID:
+            # Nothing uses the call's value: a folded helper keeps only what its effects need, the
+            # events of its walk with its returns discarded (the function's ``value_unused``).
+            event["value_unused"] = True
         self.events["calls"].append(event)
         membership = self.x.vocabulary.membership.get(callee)
         if membership is not None:
@@ -4206,6 +4222,12 @@ class _FunctionWalk:
             # __builtin_constant_p(x) and __builtin_object_size(p, type) never evaluate their operands.
             for child_index, child in enumerate(children):
                 self.walk(child, node, child_index, reason or "builtin", generic)
+            return
+        if kind == K.RETURN_STMT and children and reason is None and self.returns_discarded:
+            # The walk of a call whose value nothing uses: the returned value is discarded, so only
+            # what computing it does besides is code (rq_clock_task's rq->clock_task goes, its
+            # WARN_ON_ONCE stays).
+            self.discard(children[0], node, 0, generic)
             return
         if kind == K.STATIC_ASSERT:
             # container_of's type check, ((type *)0)->member: compiled only for its type.
@@ -4536,6 +4558,13 @@ class _FunctionWalk:
         return None
 
 
+def _unused_callees(walk: _FunctionWalk, definitions: dict[str, ci.Cursor]) -> list[str]:
+    """The functions of the unit a walk calls where nothing uses the call's value."""
+    return sorted(
+        {call["callee"] for call in walk.events["calls"] if call.get("value_unused") and call["callee"] in definitions}
+    )
+
+
 def _definitions(tu: ci.TranslationUnit) -> dict[str, ci.Cursor]:
     found: dict[str, ci.Cursor] = {}
     for cursor in tu.cursor.get_children():
@@ -4802,7 +4831,30 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
     pending = sorted(owned | _initializer_functions(tu, definitions))
     functions: dict[str, Any] = {}
     exclusions: list[dict[str, Any]] = []
-    while pending:
+    # The helpers a call whose value nothing uses calls, each given its walk with the returns
+    # discarded too (``value_unused``), once every function reached is walked.
+    unused: list[str] = []
+    unused_walked: set[str] = set()
+    while pending or unused:
+        if not pending:
+            name = unused.pop()
+            if name in unused_walked:
+                continue
+            unused_walked.add(name)
+            walk = extractor.analysis(definitions[name], returns_discarded=True)
+            for event in walk.events["calls"]:
+                event["visible"] = event["callee"] in definitions
+            function = functions[name]
+            if walk.events != function["events"] or walk.guard_table != function.get("guards", []):
+                function["value_unused"] = {
+                    "events": walk.events,
+                    **({"guards": walk.guard_table} if walk.guard_table else {}),
+                }
+            reached = {call["callee"] for call in walk.events["calls"]}
+            reached |= {pointer["target"] for pointer in walk.events["function_pointers"]}
+            pending.extend(sorted(callee for callee in reached if callee in definitions and callee not in functions))
+            unused.extend(_unused_callees(walk, definitions))
+            continue
         name = pending.pop()
         if name in functions:
             continue
@@ -4842,6 +4894,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             **({"guards": walk.guard_table} if walk.guard_table else {}),
         }
         pending.extend(sorted(callee for callee in reached if callee in definitions and callee not in functions))
+        unused.extend(_unused_callees(walk, definitions))
     records = {}
     pending_records = sorted(extractor.records)
     while pending_records:
