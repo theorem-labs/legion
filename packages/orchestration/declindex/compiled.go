@@ -426,21 +426,19 @@ func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, er
 	return c, err
 }
 
-// DeclarationConstants are the compiled constants of the declaration d, one that Resolve gave: d's own, and those
-// that Lean generated from it (a structure's constructor and fields), each with its facts. It is empty when the
-// index read d's module without its compiled part.
-func (s *Store) DeclarationConstants(ctx context.Context, d Found) ([]Constant, error) {
-	byName := map[string]*Constant{}
+// DeclarationParts are the names of the compiled constants of the declaration d, one that Resolve gave: d's own, and
+// those that Lean generated from it (a structure's constructor and fields). It is empty when the index read d's
+// module without its compiled part.
+func (s *Store) DeclarationParts(ctx context.Context, d Found) ([]string, error) {
 	var consts []declRef
-	rows, err := s.q.QueryContext(ctx, `SELECT name, kind, cstmt FROM consts WHERE module = ? AND
+	rows, err := s.q.QueryContext(ctx, `SELECT name FROM consts WHERE module = ? AND
 		(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, d.Module, d.Name, d.Name+".", d.Name+"/")
 	err = eachRow(rows, err, func(r *sql.Rows) error {
-		c := &Constant{Module: d.Module}
-		if err := r.Scan(&c.Name, &c.Kind, &c.Hash); err != nil {
+		c := declRef{module: d.Module}
+		if err := r.Scan(&c.name); err != nil {
 			return err
 		}
-		byName[c.Name] = c
-		consts = append(consts, declRef{d.Module, c.Name})
+		consts = append(consts, c)
 		return nil
 	})
 	if err != nil {
@@ -450,31 +448,10 @@ func (s *Store) DeclarationConstants(ctx context.Context, d Found) ([]Constant, 
 	if err != nil {
 		return nil, err
 	}
-	var out []Constant
+	var out []string
 	for _, c := range consts {
-		if o := owner[c]; o.Name != d.Name || o.Module != d.Module {
-			delete(byName, c.name)
-		}
-	}
-	rows, err = s.q.QueryContext(ctx, `SELECT name, concept, how FROM facts WHERE module = ? AND
-		(name = ? OR (name >= ? AND name < ?)) ORDER BY name, concept, how`, d.Module, d.Name, d.Name+".", d.Name+"/")
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var n string
-		var f Fact
-		if err := r.Scan(&n, &f.Concept, &f.How); err != nil {
-			return err
-		}
-		if c, ok := byName[n]; ok {
-			c.Facts = append(c.Facts, f)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	for _, c := range consts {
-		if k, ok := byName[c.name]; ok {
-			out = append(out, *k)
+		if o := owner[c]; o.Name == d.Name && o.Module == d.Module {
+			out = append(out, c.name)
 		}
 	}
 	return out, nil

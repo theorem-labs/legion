@@ -354,6 +354,58 @@ func TestLedgerRechecksAnAdditionLandedWithItsDeclaration(t *testing.T) {
 	})
 }
 
+// A landed addition is compared with every registered concept, landed or pending: two additions gated apart, of
+// which one states the other's fact, are one near pair whichever of them lands with its declaration.
+func TestLedgerRechecksALandedAdditionAgainstEveryConcept(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	const theorem = "theorem Fx.First (x : Nat) (_h : x < 3) : True := trivial\n"
+	const second = "def Fx.Second (n : Nat) : Prop := n < 3\n"
+	for _, c := range []struct {
+		name                  string
+		first                 string
+		landFirst, landSecond bool
+	}{
+		{"the addition landed, the concept whose fact it states pending", theorem, true, false},
+		{"the addition pending, the concept whose fact it states landed", theorem, false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			config, tree, lean := leanRegistryTree(t, "Both")
+			first := gateAddition(t, config, "first", "Fx.First", "Both.lean", c.first)
+			other := gateAddition(t, config, "second", "Fx.Second", "Both.lean", second)
+			landed := ""
+			for _, v := range []struct {
+				verdict conceptgate.Verdict
+				source  string
+				lands   bool
+			}{{first, c.first, c.landFirst}, {other, second, c.landSecond}} {
+				writeTestFile(t, filepath.Join(tree, filepath.FromSlash(v.verdict.Addition.Path)), v.verdict.Addition.Content)
+				if v.lands {
+					landed += v.source + "\n"
+				}
+			}
+			if landed != "" {
+				writeTestFile(t, filepath.Join(tree, "Both.lean"), landed)
+				if err := declindex.CompileModule(context.Background(), lean, nil, tree, "Both"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := checkRegistry(t, config, land(t, config, tree, "land Fx.First and Fx.Second"))
+			added := []string{first.Addition.Path, other.Addition.Path}
+			sort.Strings(added)
+			wantID := "recheck-" + first.CompiledHash + "-" + other.CompiledHash
+			if r.code != 1 || !slices.Equal(r.added, added) || len(r.defects) != 0 || r.unable != "" || len(r.ops) != 1 ||
+				r.ops[0]["id"] != wantID {
+				t.Fatalf("want exit 1 with %v added, no defect or cause, and the one near pair %s, got %+v", added, wantID, r)
+			}
+		})
+	}
+}
+
 // The recheck of an addition reads the concept's declaration in the module of its home file when the landed build
 // has one, and compiles the stored source only when it has none:
 //   - landed in an existing home file that the stored source imports, it is checked from the landed constant, which
