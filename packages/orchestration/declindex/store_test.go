@@ -635,6 +635,54 @@ func TestAReaderOfTheTreeAndARefreshExcludeEachOtherInAWritableDirectory(t *test
 	}
 }
 
+// A symlinked index file is one index whichever path names it: its lock files and its graph are beside the file it
+// resolves to. So a reader of the tree that opens the resolved path, as the gate does (Config.GateIndexPath), waits
+// for a refresh that opened the link, and reads the graph that refresh wrote.
+func TestASymlinkedIndexFileHasOneRefreshLockAndOneGraph(t *testing.T) {
+	ctx := context.Background()
+	target := filepath.Join(t.TempDir(), "index.sqlite")
+	created, err := Open(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "index.sqlite")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := Open(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	writer.afterRefreshLock = func(context.Context) error {
+		short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer cancel()
+		if reader, err := OpenReadOnly(short, target, IndexAndTree); !errors.Is(err, context.DeadlineExceeded) {
+			if reader != nil {
+				_ = reader.Close()
+			}
+			t.Errorf("a reader of the resolved index during a refresh through its link: %v; want it to wait", err)
+		}
+		return nil
+	}
+	_, err = writer.Refresh(ctx, goldenTree(t), RefreshOptions{Commit: "one"})
+	writer.afterRefreshLock = nil
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenReadOnly(ctx, target, IndexAndTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := reader.Answer(ctx, "Gold.Frame", AnswerOptions{}); err != nil {
+		t.Errorf("an answer of the resolved index after a refresh through its link: %v", err)
+	}
+}
+
 // Open rebuilds an index of another schema under the write lock, so that a rebuild never drops the tables under a
 // reader in a read-only directory. An index of this schema needs no write, so Open of it does not wait.
 func TestOpenRebuildsAnOlderSchemaOnlyUnderTheWriteLock(t *testing.T) {

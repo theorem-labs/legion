@@ -163,6 +163,15 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
+	// The file is created here, through a symlink when path is one, so that resolveIndex names the file itself.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	_ = f.Close()
+	if path, err = resolveIndex(path); err != nil {
+		return nil, err
+	}
 	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(" + busyTimeoutMS + ")" +
 		"&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-262144)"
 	db, err := sql.Open("sqlite", dsn)
@@ -176,6 +185,18 @@ func Open(path string) (*Store, error) {
 	}
 	s.reload()
 	return s, nil
+}
+
+// resolveIndex resolves the symlinks of the existing index file at path. An index's lock files and graph are named
+// from the path of the file itself, as SQLite names its -wal and -shm files, so that every path that names one index
+// (a symlink to it, or the resolved path that the gate opens, Config.GateIndexPath) takes the same locks and reads
+// the same graph.
+func resolveIndex(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve the index %s: %w", path, err)
+	}
+	return resolved, nil
 }
 
 // ReadScope is what a store opened read-only reads besides the index, and so which part of a running refresh a
@@ -216,6 +237,10 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 		return nil, err
 	} else if info.IsDir() {
 		return nil, fmt.Errorf("index %s is a directory", path)
+	}
+	path, err := resolveIndex(path)
+	if err != nil {
+		return nil, err
 	}
 	dsn := "file:" + path + "?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(" + busyTimeoutMS + ")"
 	var release func()
