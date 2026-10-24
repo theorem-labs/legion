@@ -95,7 +95,11 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
 - **Field offsets** come from every offset from a base the machine code forms, not only from the
   ones it dereferences: the displacement of a load or store, the immediate of an `addi`, the constant
   a register already carries (with the shift that forms the size of an array element), and the sum of
-  the two where a load or store splits one offset over both.
+  the two where a load or store splits one offset over both. The frame is kept apart: each load and
+  store through sp or s0 (`frame_accesses`, without the prologue's saves of callee-saved registers
+  and their restores), each frame address the code forms (`frame_addresses`), and each it passes in
+  an argument register to a direct call (`frame_arguments`), as offsets from the value sp had on
+  entry.
 - **The contract graph** (optional): the proof's own graph. Its function nodes are joined to the graph's
   functions by image address (below); it confirms callback tables a C initializer also names, and
   gives the interfaces the measures map onto groups.

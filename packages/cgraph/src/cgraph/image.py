@@ -62,6 +62,16 @@ _RELOADS = frozenset({"ld", "c.ld", "c.ldsp"})
 _MAPPING_SYMBOL = "$"
 # The most addresses a register may hold, one from each path into a block, before it is unknown.
 _MAX_CHOICES = 4
+# The bytes each load moves (and _STORE_WIDTHS each store), for the frame slots of local objects.
+_LOAD_WIDTHS = {
+    "lb": 1, "lbu": 1, "lh": 2, "lhu": 2, "lw": 4, "lwu": 4, "ld": 8, "c.lw": 4, "c.ld": 8, "c.lwsp": 4,
+    "c.ldsp": 8, "flw": 4, "fld": 8, "c.fld": 8, "c.fldsp": 8,
+}  # fmt: skip
+# The registers a function saves in its frame on entry and restores before it returns.
+_CALLEE_SAVED = frozenset({"ra", *(f"s{number}" for number in range(12))})
+_ARGUMENTS = frozenset(f"a{number}" for number in range(8))
+# The instructions at a function's entry that save its registers, before its frame pointer is set.
+_PROLOGUE_LIMIT = 32
 
 
 @dataclass
@@ -432,15 +442,24 @@ class FunctionFacts:
     memory_offsets: set[int] = field(default_factory=set)
     addi_constants: set[int] = field(default_factory=set)
     exclusions: list[dict[str, Any]] = field(default_factory=list)
+    # The frame: each load or store through sp or s0 as (offset from the frame's top, the value sp had
+    # on entry; bytes moved), without the saves and restores of callee-saved registers; the frame
+    # addresses the code forms (addi rd, sp|s0, k; mv rd, sp); and those it passes to a direct call
+    # (the call's address, the argument's position, the offset).
+    frame_accesses: set[tuple[int, int]] = field(default_factory=set)
+    frame_addresses: set[int] = field(default_factory=set)
+    frame_arguments: set[tuple[int, int, int]] = field(default_factory=set)
 
 
 _RECORD_FIELDS = ("calls", "globals", "function_addresses", "outside", "exclusions")
-_NUMBER_FIELDS = ("memory_offsets", "addi_constants")
+_NUMBER_FIELDS = ("memory_offsets", "addi_constants", "frame_addresses")
+# Sets of integer tuples, by their length.
+_TUPLE_FIELDS = {"frame_accesses": 2, "frame_arguments": 3}
 
 
 def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts | None:
     """The facts a cache entry holds, or None when it does not have their shape."""
-    if set(value) != {*_RECORD_FIELDS, *_NUMBER_FIELDS}:
+    if set(value) != {*_RECORD_FIELDS, *_NUMBER_FIELDS, *_TUPLE_FIELDS}:
         return None
     records = [value[name] for name in _RECORD_FIELDS]
     numbers = [value[name] for name in _NUMBER_FIELDS]
@@ -451,8 +470,17 @@ def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts | None:
         for items in numbers
     ):
         return None
+    tuples: dict[str, set[Any]] = {}
+    for name, length in _TUPLE_FIELDS.items():
+        items = value[name]
+        if not isinstance(items, list) or not all(
+            isinstance(item, list) and len(item) == length and all(isinstance(part, int) for part in item)
+            for item in items
+        ):
+            return None
+        tuples[name] = {tuple(item) for item in items}
     calls, globals_, function_addresses, outside, exclusions = records
-    memory_offsets, addi_constants = numbers
+    memory_offsets, addi_constants, frame_addresses = numbers
     return FunctionFacts(
         calls=calls,
         globals=globals_,
@@ -461,6 +489,9 @@ def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts | None:
         memory_offsets=set(memory_offsets),
         addi_constants=set(addi_constants),
         exclusions=exclusions,
+        frame_accesses=tuples["frame_accesses"],
+        frame_addresses=set(frame_addresses),
+        frame_arguments=tuples["frame_arguments"],
     )
 
 
@@ -473,6 +504,9 @@ def _facts_for_cache(facts: FunctionFacts) -> dict[str, Any]:
         "memory_offsets": sorted(facts.memory_offsets),
         "addi_constants": sorted(facts.addi_constants),
         "exclusions": facts.exclusions,
+        "frame_accesses": [list(item) for item in sorted(facts.frame_accesses)],
+        "frame_addresses": sorted(facts.frame_addresses),
+        "frame_arguments": [list(item) for item in sorted(facts.frame_arguments)],
     }
 
 
@@ -848,6 +882,7 @@ class Image:
                     partner = self._partner(compares, before, first)
             self._first_pass(name, instruction, state, first.get(index), facts)
             self._step(name, instruction, state, facts, escapes, partner)
+        facts.frame_accesses, facts.frame_addresses, facts.frame_arguments = _frame(self.decoder, instructions)
         return facts
 
     def _partner(
@@ -1443,6 +1478,81 @@ def _memory_references(instruction: Any, operands: list[Any]) -> list[tuple[int,
         if last.type == CS_OP_REG:
             references.append((last.reg, 0))
     return references
+
+
+def _frame(decoder: Any, instructions: list[Any]) -> tuple[set[tuple[int, int]], set[int], set[tuple[int, int, int]]]:
+    """The frame accesses, the frame addresses, and the frame addresses passed in argument registers
+    to direct calls (the call's address, the argument's position, the offset) of a function, as
+    offsets from the value sp had on entry. The prologue's ``addi sp, sp, -n`` and ``addi s0, sp, m``
+    give each frame register's offset; the saves of callee-saved registers through sp before the frame
+    pointer is set, and the restores at the same offsets, are the frame's own and no local object's.
+    An argument register holds a frame address from the ``addi``/``mv`` that forms it to the next
+    write of it, call, branch or jump (in address order: the setup of a call's arguments)."""
+    deltas: dict[str, int] = {}
+    accesses: set[tuple[int, int]] = set()
+    addresses: set[int] = set()
+    arguments: set[tuple[int, int, int]] = set()
+    held: dict[str, int] = {}  # argument registers holding a frame address
+    saved: set[int] = set()
+    for position, instruction in enumerate(instructions):
+        operands = list(instruction.operands)
+        mnemonic = instruction.mnemonic
+        registers = [decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG]
+        immediate = next((operand.imm for operand in operands if operand.type == CS_OP_IMM), None)
+        if mnemonic in _DIRECT_CALLS:
+            arguments.update(
+                (instruction.address, int(name[1:]), offset) for name, offset in held.items() if name in _ARGUMENTS
+            )
+        if mnemonic in _DIRECT_CALLS or mnemonic in _REGISTER_CALLS or mnemonic in _BRANCHES or mnemonic in _ENDS:
+            # A callee-saved register keeps &object across calls and branches; the others do not.
+            held = {name: offset for name, offset in held.items() if name in _CALLEE_SAVED}
+            continue
+        written = registers[0] if registers and mnemonic not in _STORE_WIDTHS else None
+        if written is not None:
+            held.pop(written, None)
+        if mnemonic.startswith(("addi", "c.addi")) and registers and immediate is not None:
+            target, source = registers[0], registers[-1]
+            if target == source == "sp" and "sp" not in deltas and immediate < 0:
+                deltas["sp"] = immediate
+            elif target == "s0" and source == "sp" and "s0" not in deltas and "sp" in deltas:
+                deltas["s0"] = deltas["sp"] + immediate
+            elif source in deltas and target not in _FRAME_REGISTERS:
+                addresses.add(deltas[source] + immediate)
+                if target != "zero":
+                    held[target] = deltas[source] + immediate
+            continue
+        if mnemonic in ("mv", "c.mv") and len(registers) == 2:
+            if registers[1] in deltas:
+                addresses.add(deltas[registers[1]])
+                if registers[0] not in _FRAME_REGISTERS:
+                    held[registers[0]] = deltas[registers[1]]
+            elif registers[1] in held:
+                held[registers[0]] = held[registers[1]]
+            continue
+        width = _STORE_WIDTHS.get(mnemonic) or _LOAD_WIDTHS.get(mnemonic)
+        if width is None:
+            continue
+        references = _memory_references(instruction, operands)
+        if mnemonic.endswith("sp") and len(operands) == 3 and operands[1].type == CS_OP_IMM:
+            # c.sdsp ra, 0x18(sp): capstone gives the stack pointer as a third register operand.
+            references.append((operands[2].reg, operands[1].imm))
+        for base, displacement in references:
+            name = decoder.reg_name(base)
+            if name not in deltas:
+                continue
+            offset = deltas[name] + displacement
+            value = registers[0] if registers else ""
+            if (
+                name == "sp"
+                and "s0" not in deltas
+                and position < _PROLOGUE_LIMIT
+                and mnemonic in _STORE_WIDTHS
+                and value in _CALLEE_SAVED
+            ):
+                saved.add(offset)
+            else:
+                accesses.add((offset, width))
+    return {item for item in accesses if item[0] not in saved}, addresses, arguments
 
 
 def _register_target(operands: list[Any], values: dict[int, int]) -> int | None:
