@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -53,9 +54,11 @@ func (f *commandFixture) intakeArgs(id, proposal string, configured ...string) [
 	return append(args, "--id", id, "--proposer", intakeProposer, "--proposal", proposal)
 }
 
-// intake runs owner with env alone: no LEGION_OWNER, as the gate runs it. cwd is the fixture root.
+// intake runs owner with env alone: no LEGION_OWNER, as the gate runs it. cwd is the fixture root. The user cache
+// directory (os.UserCacheDir, the journal without a deployment file) is the fixture's.
 func (f *commandFixture) intake(env map[string]string, args ...string) (intakeOutput, string, int) {
 	f.t.Helper()
+	f.t.Setenv("XDG_CACHE_HOME", filepath.Join(f.root, "cache"))
 	var stdout, stderr bytes.Buffer
 	code := run(f.ctx, args, func(key string) string { return env[key] }, f.root, &stdout, &stderr)
 	var out intakeOutput
@@ -70,6 +73,21 @@ func (f *commandFixture) intake(env map[string]string, args ...string) (intakeOu
 // gateEnv is the gate's environment on a host with a listener: HOME, and the listener of the fixture.
 func (f *commandFixture) gateEnv() map[string]string {
 	return map[string]string{"HOME": f.root, "ENVOY_URL": f.env["ENVOY_URL"], "ENVOY_TOKEN": f.env["ENVOY_TOKEN"]}
+}
+
+// A delivery that fails after a listener refused its notice prints the notice, so that a journal that could not keep
+// it does not lose it; the failure is exit 3, unable to check.
+func TestAFailedDeliveryPrintsItsUndeliveredNotices(t *testing.T) {
+	var stderr bytes.Buffer
+	notice := ownerpkg.Notice{Topic: conceptsTopic, Message: "concept m", Key: "c-0123456789abcdef", Payload: ownerpkg.Payload{"item": "i"}}
+	_, err := deliveryResult(&stderr, ownerpkg.IntakeOutcome{Item: "i", Undelivered: []ownerpkg.Notice{notice}},
+		errors.New("write notice journal: no space left on device"), "/state/undelivered.jsonl")
+	if err == nil || !strings.Contains(stderr.String(), "notice not delivered: "+conceptsTopic) || !strings.Contains(stderr.String(), "c-0123456789abcdef") {
+		t.Fatalf("error %v, stderr %q", err, stderr.String())
+	}
+	if code := writeError(io.Discard, false, err); code != exitUnable {
+		t.Fatalf("a failed journal write exits %d, want %d", code, exitUnable)
+	}
 }
 
 func (f *commandFixture) itemEvents(id string) []string {
@@ -93,6 +111,7 @@ func (f *commandFixture) noItem(id string) {
 	}
 }
 
+// journalLines are the notices a journal holds; a journal the command created and never wrote holds none.
 func journalLines(t *testing.T, path string) []string {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -102,10 +121,13 @@ func journalLines(t *testing.T, path string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(data) == 0 {
+		return nil
+	}
 	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 }
 
-func TestLibrarianIntakeQueuesANearMatchOnceAndPublishesItsVerdictOnce(t *testing.T) {
+func TestLibrarianIntakeQueuesANearMatchOnceAndPublishesItUnderOneKey(t *testing.T) {
 	f := newCommandFixture(t)
 	item := ownerpkg.ConceptItem(intakeProposer, intakeNearID)
 	args := f.intakeArgs(intakeNearID, f.envelope("near-envelope.txt"), "--topic-prefix", "notifications.example.")
@@ -136,7 +158,8 @@ func TestLibrarianIntakeQueuesANearMatchOnceAndPublishesItsVerdictOnce(t *testin
 		t.Fatalf("message = %q", notices[0].Message)
 	}
 
-	// The gate runs again on the same proposal: the same id, a success that adds nothing and publishes nothing.
+	// The gate runs again on the same proposal: the same id, a success that adds nothing. The item is still open, so
+	// the notice goes again under the same key (the first delivery may have lost it; the listener drops a copy).
 	again, stderr, code := f.intake(f.gateEnv(), args...)
 	if code != 0 || again.Added || again.Item != item {
 		t.Fatalf("second delivery exited %d with %+v: %s", code, again, stderr)
@@ -150,8 +173,15 @@ func TestLibrarianIntakeQueuesANearMatchOnceAndPublishesItsVerdictOnce(t *testin
 	if events := f.itemEvents(item); len(events) != 1 {
 		t.Fatalf("item events after repeats = %v", events)
 	}
-	if notices := f.notices(); len(notices) != 1 {
-		t.Fatalf("repeats published %d notices, want the first one only", len(notices))
+	repeats := f.notices()
+	if len(repeats) != 3 {
+		t.Fatalf("three deliveries of an open item published %d notices, want 3", len(repeats))
+	}
+	for _, notice := range repeats[1:] {
+		if notice.IdempotencyKey != notices[0].IdempotencyKey || notice.Topic != notices[0].Topic ||
+			notice.Message != notices[0].Message || notice.Payload != notices[0].Payload {
+			t.Fatalf("a repeat notice %+v differs from the first %+v", notice, notices[0])
+		}
 	}
 }
 
@@ -245,8 +275,11 @@ func TestLibrarianIntakeRecordsARecheckAndTheInboxListsItReady(t *testing.T) {
 	if got := f.git(f.root, "--git-dir="+f.bare, "show", "inbox/librarian:"+record) + "\n"; got != string(envelope.InboxRecord()) {
 		t.Fatalf("the second envelope rewrote the record:\n%s", got)
 	}
-	if len(f.itemEvents(item)) != 1 || len(f.notices()) != 1 {
-		t.Fatalf("second delivery: events %v, %d notices", f.itemEvents(item), len(f.notices()))
+	// The open item's notice goes again, under the first key and with the first record's commit.
+	repeats := f.notices()
+	if len(f.itemEvents(item)) != 1 || len(repeats) != 2 || repeats[1].IdempotencyKey != repeats[0].IdempotencyKey ||
+		repeats[1].Payload != repeats[0].Payload {
+		t.Fatalf("second delivery: events %v, notices %+v", f.itemEvents(item), repeats)
 	}
 }
 
@@ -288,6 +321,12 @@ func TestLibrarianInboxListsANearItemReadyOnceTheVerdictRecordIsOnTheProposersBr
 	commit := f.git(tree, "rev-parse", "HEAD")
 	if got := inbox(); len(got) != 1 || got[0].Commit != commit || !got[0].Ready {
 		t.Fatalf("inbox after the verdict record = %+v, want commit %s and ready", got, commit)
+	}
+	// A verdict record that the branch deleted again is no input: the item is not ready.
+	f.git(tree, "rm", "-q", verdict)
+	f.git(tree, "commit", "-q", "-m", "concept: remove the verdict")
+	if got := inbox(); len(got) != 1 || got[0].Commit != "" || got[0].Ready {
+		t.Fatalf("inbox after the verdict record was deleted = %+v, want no commit and not ready", got)
 	}
 }
 
@@ -368,6 +407,8 @@ func TestLibrarianIntakeRefusesAMalformedProposalAndQueuesNothing(t *testing.T) 
 func TestLibrarianIntakeUsageErrorsExitTwoAndQueueNothing(t *testing.T) {
 	f := newCommandFixture(t)
 	near, recheck := f.envelope("near-envelope.txt"), f.envelope("recheck-envelope.txt")
+	noConfig := filepath.Join(f.root, "no-config.git")
+	f.git(f.root, "init", "-q", "--bare", noConfig)
 	// Each case names what its error must name.
 	for name, c := range map[string]struct {
 		args []string
@@ -387,6 +428,14 @@ func TestLibrarianIntakeUsageErrorsExitTwoAndQueueNothing(t *testing.T) {
 			args[len(args)-3] = "Function:Alloc frame"
 			return args
 		}(), "--proposer"},
+		"a --git-dir that is not the deployment's bare_repo": {f.intakeArgs(intakeRecheckID, recheck, "--topic-prefix", "notifications.example.",
+			"--git-dir", noConfig, "--deploy", f.deploy), "--git-dir"},
+		"a --git-dir with no skeleton/owner.yaml": {f.intakeArgs(intakeNearID, near, "--git-dir", noConfig), "--topic-prefix"},
+		"a configuration of another repository": {func() []string {
+			args := f.intakeArgs(intakeNearID, near, "--git-dir", f.bare)
+			args[5] = "another-repository"
+			return args
+		}(), "--repository"},
 	} {
 		_, stderr, code := f.intake(f.gateEnv(), c.args...)
 		if code != 2 || !strings.Contains(stderr, c.says) || strings.Contains(stderr, "unknown command") {
@@ -397,6 +446,25 @@ func TestLibrarianIntakeUsageErrorsExitTwoAndQueueNothing(t *testing.T) {
 	f.noItem(ownerpkg.ConceptItem(intakeProposer, intakeRecheckID))
 	if notices := f.notices(); len(notices) != 0 {
 		t.Fatalf("usage errors published %d notices", len(notices))
+	}
+}
+
+// A recheck record of that id that another proposer's delivery wrote is no record of this item: the recheck id names
+// no proposer. The delivery is a protocol error, and it queues nothing.
+func TestLibrarianIntakeForARecheckRecordOfAnotherProposerExitsFour(t *testing.T) {
+	f := newCommandFixture(t)
+	if _, stderr, code := f.intake(f.gateEnv(), f.intakeArgs(intakeRecheckID, f.envelope("recheck-envelope.txt"), "--git-dir", f.bare)...); code != 0 {
+		t.Fatalf("first delivery exited %d: %s", code, stderr)
+	}
+	other := "function:other_frame@kernel/frame.c"
+	args := f.intakeArgs(intakeRecheckID, f.envelope("recheck-envelope.txt", "proposer: "+intakeProposer, "proposer: "+other), "--git-dir", f.bare)
+	args[len(args)-3] = other
+	if _, stderr, code := f.intake(f.gateEnv(), args...); code != 4 || !strings.Contains(stderr, intakeProposer) {
+		t.Fatalf("another proposer's recheck exited %d, want 4 naming the recorded proposer: %s", code, stderr)
+	}
+	f.noItem(ownerpkg.ConceptItem(other, intakeRecheckID))
+	if notices := f.notices(); len(notices) != 1 {
+		t.Fatalf("%d notices, want the first delivery's only", len(notices))
 	}
 }
 
@@ -449,7 +517,23 @@ func TestLibrarianIntakeThatCannotCheckExitsThree(t *testing.T) {
 	f := newCommandFixture(t)
 	badDeploy := filepath.Join(f.root, "bad-deploy.yaml")
 	f.writeFile(badDeploy, "bare_repo: [\n")
-	near := f.envelope("near-envelope.txt")
+	// A deployment whose state_dir is below a regular file: its journal cannot be written.
+	f.writeFile(filepath.Join(f.root, "a-file"), "not a directory\n")
+	unwritable := filepath.Join(f.root, "unwritable-deploy.yaml")
+	f.writeFile(unwritable, strings.ReplaceAll(string(f.read(f.deploy)), f.stateDir(), filepath.Join(f.root, "a-file", "state")))
+	// A librarian repository whose skeleton/owner.yaml does not load.
+	seed := filepath.Join(f.root, "bad-config-seed")
+	f.writeFile(filepath.Join(seed, ownerpkg.ConfigPath), "repo: [\n")
+	f.git(f.root, "init", "-q", "-b", "main", seed)
+	f.git(seed, "add", ".")
+	f.git(seed, "commit", "-q", "-m", "skeleton: a configuration that does not load")
+	badConfig := filepath.Join(f.root, "bad-config.git")
+	f.git(f.root, "clone", "-q", "--bare", seed, badConfig)
+	notARepository := filepath.Join(f.root, "not-a-repository")
+	if err := os.MkdirAll(notARepository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	near, recheck := f.envelope("near-envelope.txt"), f.envelope("recheck-envelope.txt")
 	for name, args := range map[string][]string{
 		"an unreadable DSN file": func() []string {
 			args := f.intakeArgs(intakeNearID, near, "--topic-prefix", "notifications.example.")
@@ -461,14 +545,32 @@ func TestLibrarianIntakeThatCannotCheckExitsThree(t *testing.T) {
 			args[5] = "no-such-repository"
 			return args
 		}(),
-		"a deployment file that does not load": f.intakeArgs(intakeNearID, near, "--topic-prefix", "notifications.example.", "--deploy", badDeploy),
+		"a recheck for no such repository": func() []string {
+			args := f.intakeArgs(intakeRecheckID, recheck, "--topic-prefix", "notifications.example.", "--git-dir", f.bare)
+			args[5] = "no-such-repository"
+			return args
+		}(),
+		"a deployment file that does not load":   f.intakeArgs(intakeNearID, near, "--topic-prefix", "notifications.example.", "--deploy", badDeploy),
+		"a journal that cannot be written":       f.intakeArgs(intakeNearID, near, "--topic-prefix", "notifications.example.", "--deploy", unwritable),
+		"a configuration that does not load":     f.intakeArgs(intakeNearID, near, "--git-dir", badConfig),
+		"a --git-dir that is no repository":      f.intakeArgs(intakeRecheckID, recheck, "--topic-prefix", "notifications.example.", "--git-dir", notARepository),
+		"a --git-dir that does not exist":        f.intakeArgs(intakeRecheckID, recheck, "--topic-prefix", "notifications.example.", "--git-dir", filepath.Join(f.root, "no-such.git")),
+		"a named deployment file that is absent": f.intakeArgs(intakeNearID, near, "--topic-prefix", "notifications.example.", "--deploy", filepath.Join(f.root, "no-such-deploy.yaml")),
+		"an --envoy-config that does not exist": f.intakeArgs(intakeNearID, near, "--topic-prefix", "notifications.example.", "--envoy-config",
+			filepath.Join(f.root, "no-such-envoy.json")),
+		"an --envoy-config that does not decode": f.intakeArgs(intakeNearID, near, "--topic-prefix", "notifications.example.", "--envoy-config",
+			badDeploy),
 	} {
 		if _, stderr, code := f.intake(f.gateEnv(), args...); code != 3 {
 			t.Errorf("%s: exited %d, want 3: %s", name, code, stderr)
 		}
 	}
 	f.noItem(ownerpkg.ConceptItem(intakeProposer, intakeNearID))
+	f.noItem(ownerpkg.ConceptItem(intakeProposer, intakeRecheckID))
 	if notices := f.notices(); len(notices) != 0 {
 		t.Fatalf("published %d notices", len(notices))
+	}
+	if refs := f.git(f.root, "--git-dir="+f.bare, "for-each-ref", "refs/heads/inbox/"); refs != "" {
+		t.Fatalf("a delivery that could not be checked wrote %s", refs)
 	}
 }

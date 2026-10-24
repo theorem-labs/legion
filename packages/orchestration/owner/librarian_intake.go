@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
@@ -25,16 +26,24 @@ const (
 	// which have no proposer copy. Only librarian-intake writes it.
 	LibrarianInboxBranch = "inbox/librarian"
 
-	// IntakeLedgerTimeout bounds the ledger's open, and then its read and enqueue, of one delivery. With the
-	// publisher's bounded retries (1 s, 4 s and 16 s apart, each request at most 10 s) the intake ends well inside the
-	// 120 s that the gate gives its librarian command (conceptgate/librarian.go:40).
+	// IntakeLedgerTimeout bounds each ledger call of one delivery: the open, the repository check, the item's read and
+	// its enqueue. The command's own deadline (110 s) bounds them together with the git write and the publisher's
+	// bounded retries, inside the 120 s that the gate gives its librarian command (conceptgate/librarian.go:41).
 	IntakeLedgerTimeout = 20 * time.Second
 	// inboxWriteAttempts bounds the retries of an inbox record that lost its branch to a concurrent writer.
 	inboxWriteAttempts = 10
+	// refLockWait bounds the wait for a ref lock that leaves the branch's tip where it was; refLockPoll is the pause
+	// between two tries.
+	refLockWait = 5 * time.Second
+	refLockPoll = 100 * time.Millisecond
 )
 
 // ErrMalformedEnvelope reports a proposal file that is not the concept gate's envelope of the delivery it names.
 var ErrMalformedEnvelope = errors.New("malformed librarian envelope")
+
+// ErrRecordProposer reports a recheck whose inbox record another proposer's delivery wrote: the recheck id names no
+// proposer, so that record is no record of this item.
+var ErrRecordProposer = errors.New("the inbox record of this recheck id names another proposer")
 
 // GateEnvelope is one review request of the concept gate, as its librarian command reads it from the --proposal file
 // (conceptgate.Envelope, conceptgate/librarian.go). Verdict and Proposal are the gate's JSON as it wrote them: the
@@ -191,12 +200,21 @@ func (e GateEnvelope) InboxRecord() []byte {
 
 // AddFileOnce commits path with data on branch of the bare repository with plumbing only, so no worktree is checked
 // out: it builds the tree in a private index from the branch's tip, commits it on that tip with the repository's
-// identity, and moves the branch only from that tip (update-ref <new> <old>), reading the tip again after a writer that
-// moved it first. A path the branch already holds is never rewritten: created is false, and commit is the newest
-// commit that touched it. Otherwise commit is the new commit.
+// identity, and moves the branch only from that tip (update-ref --no-deref <new> <old>), reading the tip again after a
+// writer that moved it first. A ref lock that leaves the tip where it was (another writer's, or one a killed git left)
+// is waited for up to refLockWait, and then named in the error. A symbolic ref at branch is refused, so no file lands
+// on the ref it points to. A path the branch already holds is never rewritten: created is false, and commit is the
+// newest commit that touched it. Otherwise commit is the new commit.
 func (r Repo) AddFileOnce(ctx context.Context, branch, path string, data []byte, subject string) (commit string, created bool, err error) {
 	ref := "refs/heads/" + branch
-	for range inboxWriteAttempts {
+	lockDeadline := time.Now().Add(refLockWait)
+	builtOn, built := "", ""
+	for races := 0; races < inboxWriteAttempts; {
+		if _, err := r.git(ctx, "symbolic-ref", "-q", ref); err == nil {
+			return "", false, fmt.Errorf("%s is a symbolic ref: it must be a branch of its own", ref)
+		} else if gitExitCode(err) != 1 {
+			return "", false, err
+		}
 		tip, err := r.revision(ctx, ref)
 		if err != nil {
 			return "", false, err
@@ -210,17 +228,45 @@ func (r Repo) AddFileOnce(ctx context.Context, branch, path string, data []byte,
 				return strings.TrimSpace(last), false, err
 			}
 		}
-		commit, err := r.commitOnTip(ctx, tip, path, data, subject)
+		if built == "" || builtOn != tip {
+			if built, err = r.commitOnTip(ctx, tip, path, data, subject); err != nil {
+				return "", false, err
+			}
+			builtOn = tip
+		}
+		_, moveErr := r.git(ctx, "update-ref", "--no-deref", "-m", subject, ref, built, tip)
+		if moveErr == nil {
+			return built, true, nil
+		}
+		now, err := r.revision(ctx, ref)
 		if err != nil {
 			return "", false, err
 		}
-		if _, err := r.git(ctx, "update-ref", "-m", subject, ref, commit, tip); err == nil {
-			return commit, true, nil
-		} else if now, readErr := r.revision(ctx, ref); readErr != nil || now == tip {
-			return "", false, fmt.Errorf("move %s from %q to %s: %w", ref, tip, commit, err)
+		if now != tip {
+			races++
+			continue
+		}
+		lock, err := r.gitPath(ctx, ref+".lock")
+		if err != nil {
+			return "", false, err
+		}
+		if _, statErr := os.Stat(lock); statErr != nil {
+			return "", false, fmt.Errorf("move %s from %q to %s: %w", ref, tip, built, moveErr)
+		}
+		if time.Now().After(lockDeadline) {
+			return "", false, fmt.Errorf("%s has stayed locked for %s: remove %s if no git process holds it: %w", ref, refLockWait, lock, moveErr)
+		}
+		if err := wait(ctx, refLockPoll); err != nil {
+			return "", false, err
 		}
 	}
 	return "", false, fmt.Errorf("%s moved under each of %d attempts to add %s", ref, inboxWriteAttempts, path)
+}
+
+// HasFile reports whether rev exists and holds path.
+func (r Repo) HasFile(ctx context.Context, rev, path string) (bool, error) {
+	object, err := r.revision(ctx, rev+":"+path)
+	return object != "", err
 }
 
 // revision is the object name of rev, or "" when rev does not exist.
@@ -230,6 +276,19 @@ func (r Repo) revision(ctx context.Context, rev string) (string, error) {
 		return "", nil
 	}
 	return strings.TrimSpace(out), err
+}
+
+// gitPath is the absolute path of name in the repository's git directory.
+func (r Repo) gitPath(ctx context.Context, name string) (string, error) {
+	out, err := r.git(ctx, "rev-parse", "--git-path", name)
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimSpace(out)
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(r.Path, path)
+	}
+	return path, nil
 }
 
 // commitOnTip writes a commit whose tree is tip's tree plus path with data, and whose parent is tip ("" for a root
@@ -265,37 +324,53 @@ func (r Repo) commitOnTip(ctx context.Context, tip, path string, data []byte, su
 }
 
 // LedgerUnreachable reports whether err is a failure to reach the ledger, which its caller retries: a network operation
-// that failed (a refused, reset or timed-out connection, or a host name that did not resolve), a deadline, or a
-// connection that closed before the server answered. An answer from the server (an authentication failure, a refusal,
-// no repository) is no such failure, and neither is a file's error: syscall.Errno satisfies net.Error, so the test is
-// for the net package's own error types.
+// that failed (a refused, reset or timed-out connection, or a host name that did not resolve), a deadline, a
+// connection that closed before the server answered, a connection exception (SQLSTATE class 08), or a server that is
+// shutting down, starting up or out of connections. Any other answer from the server (an authentication failure, a
+// refusal, no repository) is no such failure, and neither is a file's error: syscall.Errno satisfies net.Error, so the
+// test is for the net package's own error types.
 func LedgerUnreachable(err error) bool {
 	var operation *net.OpError
 	var lookup *net.DNSError
+	var server *pgconn.PgError
+	if errors.As(err, &server) {
+		switch {
+		case strings.HasPrefix(server.Code, "08"): // connection_exception
+			return true
+		case server.Code == "57P01", server.Code == "57P02", server.Code == "57P03", server.Code == "53300":
+			return true // admin_shutdown, crash_shutdown, cannot_connect_now, too_many_connections
+		}
+	}
 	return errors.As(err, &operation) || errors.As(err, &lookup) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
 }
 
-// IntakeLedger is the part of the ledger that librarian-intake reads and writes.
+// IntakeLedger is the part of the ledger that librarian-intake reads and writes. HasOpenWork is its check that the
+// ledger repository exists (NotFoundError), which Item does not make.
 type IntakeLedger interface {
+	HasOpenWork(ctx context.Context, repo, owner string) (bool, error)
 	Item(ctx context.Context, repo, id string) (ledger.Item, error)
 	Enqueue(ctx context.Context, repo, id, owner string) error
 }
 
 // LibrarianIntake queues the concept gate's deliveries for the librarian (plan Task 1.10). Envoy is nil when no listener
-// resolved; NoListener then says why, and every notice is undelivered.
+// resolved; NoListener then says why, and every notice is undelivered. LedgerTimeout bounds each ledger call
+// (IntakeLedgerTimeout when zero).
 type LibrarianIntake struct {
-	Ledger     IntakeLedger
-	Repo       string // the ledger repository
-	Inbox      *Repo  // the librarian's bare repository, which holds LibrarianInboxBranch; required for a recheck
-	Routing    Routing
-	Envoy      Publisher
-	NoListener error
-	Journal    string // absolute: the host's undelivered.jsonl
+	Ledger        IntakeLedger
+	LedgerTimeout time.Duration
+	Repo          string // the ledger repository
+	Inbox         *Repo  // the librarian's bare repository, which holds LibrarianInboxBranch; required for a recheck
+	Routing       Routing
+	Envoy         Publisher
+	NoListener    error
+	Journal       string // absolute: the host's undelivered.jsonl
 }
 
-// IntakeOutcome is what one delivery did. Added is false when the item was there already, open or done, for the
-// librarian: then nothing was written or published. Record and Commit name a recheck's inbox record.
+// IntakeOutcome is what one delivery did. Added is true when this delivery's Enqueue found no item; two deliveries of
+// one id that run at once can both see that, since Enqueue accepts an item already open for the same owner. Record and
+// Commit name a recheck's inbox record. Undelivered are the notices no listener took, also one that the journal then
+// could not keep.
 type IntakeOutcome struct {
 	Item, Kind     string
 	Added          bool
@@ -303,45 +378,60 @@ type IntakeOutcome struct {
 	Undelivered    []Notice
 }
 
-// Deliver queues envelope's item concept:<proposer>@<id> for the librarian once. It reads the item first: one that
-// exists for the librarian, open or done, is a success that adds nothing; one of another owner is ErrIDOwner. A recheck
-// writes its inbox record before the item, which keeps the first envelope of an id. It then enqueues the item and
-// publishes the verdict notice, which the host's journal keeps when no listener takes it.
+// Deliver queues envelope's item concept:<proposer>@<id> for the librarian once. It checks the ledger repository and
+// reads the item first. An item of another owner is ErrIDOwner, and a done item of the librarian is a success that
+// writes and publishes nothing. A missing item is queued; a recheck first writes its inbox record, which keeps the first
+// envelope of an id (a record of another proposer is ErrRecordProposer). The notice of a missing or still open item is
+// then published under its one key c-<hex16(item)>: a delivery whose item is open may follow one that queued it and
+// then lost its notice, and the listener drops a copy it has. The host's journal keeps a notice no listener takes.
+// Each ledger call has a deadline of its own.
 func (in LibrarianIntake) Deliver(ctx context.Context, envelope GateEnvelope) (IntakeOutcome, error) {
 	outcome := IntakeOutcome{Item: ConceptItem(envelope.Proposer, envelope.ID), Kind: envelope.Kind}
-	ledgerCtx, cancel := context.WithTimeout(ctx, IntakeLedgerTimeout)
-	defer cancel()
-	existing, err := in.Ledger.Item(ledgerCtx, in.Repo, outcome.Item)
+	if err := in.call(ctx, func(ctx context.Context) error {
+		_, err := in.Ledger.HasOpenWork(ctx, in.Repo, Librarian)
+		return err
+	}); err != nil {
+		return outcome, fmt.Errorf("check ledger repository %s: %w", in.Repo, err)
+	}
+	var existing ledger.Item
+	err := in.call(ctx, func(ctx context.Context) (err error) {
+		existing, err = in.Ledger.Item(ctx, in.Repo, outcome.Item)
+		return err
+	})
 	var notFound *ledger.NotFoundError
+	missing := errors.As(err, &notFound)
 	switch {
-	case err == nil:
-		return outcome, in.checkLibrarian(existing)
-	case !errors.As(err, &notFound):
+	case err != nil && !missing:
 		return outcome, fmt.Errorf("read item %s: %w", outcome.Item, err)
+	case err == nil && existing.Owner != Librarian:
+		return outcome, in.checkLibrarian(existing)
+	case err == nil && existing.State == "done":
+		return outcome, nil
 	}
 
 	if envelope.Kind == "recheck" {
-		if in.Inbox == nil {
-			return outcome, errors.New("a recheck delivery needs the librarian's repository")
-		}
-		outcome.Record = LibrarianInboxRecord(envelope.ID)
-		if outcome.Commit, _, err = in.Inbox.AddFileOnce(ctx, LibrarianInboxBranch, outcome.Record, envelope.InboxRecord(),
-			"inbox: "+outcome.Item); err != nil {
-			return outcome, fmt.Errorf("record %s on %s: %w", outcome.Record, LibrarianInboxBranch, err)
+		if err := in.record(ctx, envelope, &outcome); err != nil {
+			return outcome, err
 		}
 	}
 
-	if err := in.Ledger.Enqueue(ledgerCtx, in.Repo, outcome.Item, Librarian); err != nil {
-		var refusal *ledger.Refusal
-		if !errors.As(err, &refusal) || refusal.Reason != ledger.ReasonExists {
-			return outcome, fmt.Errorf("enqueue %s: %w", outcome.Item, err)
+	if missing {
+		if err := in.call(ctx, func(ctx context.Context) error { return in.Ledger.Enqueue(ctx, in.Repo, outcome.Item, Librarian) }); err != nil {
+			var refusal *ledger.Refusal
+			if !errors.As(err, &refusal) || refusal.Reason != ledger.ReasonExists {
+				return outcome, fmt.Errorf("enqueue %s: %w", outcome.Item, err)
+			}
+			if err := in.call(ctx, func(ctx context.Context) (err error) {
+				existing, err = in.Ledger.Item(ctx, in.Repo, outcome.Item)
+				return err
+			}); err != nil {
+				return outcome, fmt.Errorf("read existing item %s: %w", outcome.Item, err)
+			}
+			// Enqueue refuses an existing item of another owner, or a done one; an open one of the librarian it accepts.
+			return outcome, in.checkLibrarian(existing)
 		}
-		if existing, err = in.Ledger.Item(ledgerCtx, in.Repo, outcome.Item); err != nil {
-			return outcome, fmt.Errorf("read existing item %s: %w", outcome.Item, err)
-		}
-		return outcome, in.checkLibrarian(existing)
+		outcome.Added = true
 	}
-	outcome.Added = true
 
 	runner := Runner{Envoy: in.Envoy, Journal: in.Journal}
 	for _, notice := range Notices(in.Routing.Topics(Route{Step: RouteConcept}), NoticeFields{
@@ -354,12 +444,54 @@ func (in LibrarianIntake) Deliver(ctx context.Context, envelope GateEnvelope) (I
 		if publishErr == nil {
 			continue
 		}
+		outcome.Undelivered = append(outcome.Undelivered, notice)
 		if err := runner.journal(notice, publishErr); err != nil {
 			return outcome, err
 		}
-		outcome.Undelivered = append(outcome.Undelivered, notice)
 	}
 	return outcome, nil
+}
+
+// record keeps a recheck's envelope as inbox/<id>.json on LibrarianInboxBranch, or finds the record a first delivery
+// wrote. The recheck id names no proposer, so a record of another proposer is ErrRecordProposer.
+func (in LibrarianIntake) record(ctx context.Context, envelope GateEnvelope, outcome *IntakeOutcome) error {
+	if in.Inbox == nil {
+		return errors.New("a recheck delivery needs the librarian's repository")
+	}
+	outcome.Record = LibrarianInboxRecord(envelope.ID)
+	commit, created, err := in.Inbox.AddFileOnce(ctx, LibrarianInboxBranch, outcome.Record, envelope.InboxRecord(), "inbox: "+outcome.Item)
+	if err != nil {
+		return fmt.Errorf("record %s on %s: %w", outcome.Record, LibrarianInboxBranch, err)
+	}
+	outcome.Commit = commit
+	if created {
+		return nil
+	}
+	data, err := in.Inbox.Show(ctx, commit, outcome.Record)
+	if err != nil {
+		return fmt.Errorf("read %s at %s: %w", outcome.Record, commit, err)
+	}
+	var stored struct {
+		Proposer string `json:"proposer"`
+	}
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return fmt.Errorf("decode %s at %s: %w", outcome.Record, commit, err)
+	}
+	if stored.Proposer != envelope.Proposer {
+		return fmt.Errorf("%w: %s at %s is %s's, not %s's", ErrRecordProposer, outcome.Record, commit, stored.Proposer, envelope.Proposer)
+	}
+	return nil
+}
+
+// call runs one ledger call under a deadline of its own.
+func (in LibrarianIntake) call(ctx context.Context, fn func(context.Context) error) error {
+	timeout := in.LedgerTimeout
+	if timeout == 0 {
+		timeout = IntakeLedgerTimeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return fn(callCtx)
 }
 
 func (in LibrarianIntake) checkLibrarian(item ledger.Item) error {

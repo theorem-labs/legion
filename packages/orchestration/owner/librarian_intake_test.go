@@ -309,7 +309,17 @@ func TestLedgerUnreachableIsAConnectionFailureOrADeadline(t *testing.T) {
 	if refused == nil || !LedgerUnreachable(refused) {
 		t.Fatalf("a refused connection: %v, unreachable %t", refused, LedgerUnreachable(refused))
 	}
-	for _, err := range []error{fmt.Errorf("read: %w", context.DeadlineExceeded)} {
+	// A server that is shutting down, starting up or out of connections is one to try again too, and so is any
+	// connection exception (SQLSTATE class 08).
+	for _, err := range []error{
+		fmt.Errorf("read: %w", context.DeadlineExceeded),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "57P01", Message: "terminating connection due to administrator command"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "57P02", Message: "terminating connection because of crash of another server process"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "57P03", Message: "the database system is starting up"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "53300", Message: "sorry, too many clients already"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "08006", Message: "connection failure"}),
+		fmt.Errorf("connect: %w", &pgconn.PgError{Code: "08001", Message: "unable to establish connection"}),
+	} {
 		if !LedgerUnreachable(err) {
 			t.Errorf("LedgerUnreachable(%v) = false", err)
 		}
@@ -326,5 +336,203 @@ func TestLedgerUnreachableIsAConnectionFailureOrADeadline(t *testing.T) {
 		if LedgerUnreachable(err) {
 			t.Errorf("LedgerUnreachable(%v) = true", err)
 		}
+	}
+}
+
+// fakeIntakeLedger is a ledger of one repository, r, for Deliver's own order of steps. itemDelay slows each Item read;
+// a positive enqueueNeeds refuses an Enqueue whose context has less time left than that.
+type fakeIntakeLedger struct {
+	items        map[string]ledger.Item
+	itemDelay    time.Duration
+	enqueueNeeds time.Duration
+}
+
+func (l *fakeIntakeLedger) HasOpenWork(_ context.Context, repo, _ string) (bool, error) {
+	if repo != "r" {
+		return false, &ledger.NotFoundError{What: "repository", ID: repo}
+	}
+	return len(l.items) > 0, nil
+}
+
+func (l *fakeIntakeLedger) Item(_ context.Context, _, id string) (ledger.Item, error) {
+	time.Sleep(l.itemDelay)
+	if item, found := l.items[id]; found {
+		return item, nil
+	}
+	return ledger.Item{}, &ledger.NotFoundError{What: "item", ID: id}
+}
+
+func (l *fakeIntakeLedger) Enqueue(ctx context.Context, _, id, owner string) error {
+	if deadline, ok := ctx.Deadline(); l.enqueueNeeds > 0 && (!ok || time.Until(deadline) < l.enqueueNeeds) {
+		return fmt.Errorf("enqueue with %v left: %w", time.Until(deadline), context.DeadlineExceeded)
+	}
+	l.items[id] = ledger.Item{ID: id, Owner: owner, State: "open"}
+	return nil
+}
+
+func newTestIntake(t *testing.T, l *fakeIntakeLedger, inbox *Repo) LibrarianIntake {
+	t.Helper()
+	routing, err := NewRouting("notifications.example.", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return LibrarianIntake{Ledger: l, Repo: "r", Inbox: inbox, Routing: routing, NoListener: errors.New("no listener"),
+		Journal: filepath.Join(t.TempDir(), "undelivered.jsonl")}
+}
+
+func parseFixture(t *testing.T, name, id string) GateEnvelope {
+	t.Helper()
+	envelope, err := ParseGateEnvelope(readLibrarianFixture(t, name), id, fixtureProposer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return envelope
+}
+
+// A delivery whose item is still open for the librarian publishes its notice again, under the same key: the first
+// delivery may have queued the item and then lost its notice (a failed journal, a lost reply, a kill), and the
+// listener drops a copy it already has. A done item publishes nothing, and another owner's item is ErrIDOwner.
+func TestDeliverPublishesAgainOnlyForAnItemStillOpenForTheLibrarian(t *testing.T) {
+	envelope := parseFixture(t, "near-envelope.txt", fixtureNearID)
+	item := ConceptItem(fixtureProposer, fixtureNearID)
+	for name, c := range map[string]struct {
+		existing ledger.Item
+		notices  int
+		idOwner  bool
+	}{
+		"open for the librarian": {existing: ledger.Item{ID: item, Owner: Librarian, State: "open"}, notices: 1},
+		"done":                   {existing: ledger.Item{ID: item, Owner: Librarian, State: "done"}},
+		"another owner's":        {existing: ledger.Item{ID: item, Owner: "function:other", State: "open"}, idOwner: true},
+	} {
+		l := &fakeIntakeLedger{items: map[string]ledger.Item{item: c.existing}}
+		outcome, err := newTestIntake(t, l, nil).Deliver(context.Background(), envelope)
+		if c.idOwner != errors.Is(err, ErrIDOwner) || (!c.idOwner && err != nil) {
+			t.Errorf("%s: error %v", name, err)
+		}
+		if outcome.Added || len(outcome.Undelivered) != c.notices {
+			t.Errorf("%s: outcome %+v, want %d notices and nothing added", name, outcome, c.notices)
+		}
+		if c.notices > 0 && len(outcome.Undelivered) > 0 && outcome.Undelivered[0].Key != "c-"+Hex16(item) {
+			t.Errorf("%s: key %s, want the first delivery's c-%s", name, outcome.Undelivered[0].Key, Hex16(item))
+		}
+	}
+}
+
+// The recheck id names no proposer, so a record of that id that another proposer's delivery wrote is no record of this
+// item: the delivery is a protocol error, and it queues nothing.
+func TestDeliverRefusesARecheckWhoseRecordNamesAnotherProposer(t *testing.T) {
+	repo := newTestRepo(t)
+	l := &fakeIntakeLedger{items: map[string]ledger.Item{}}
+	if _, err := newTestIntake(t, l, &repo).Deliver(context.Background(), parseFixture(t, "recheck-envelope.txt", fixtureRecheckID)); err != nil {
+		t.Fatal(err)
+	}
+	other := "function:other_frame@kernel/frame.c"
+	text := strings.Replace(string(readLibrarianFixture(t, "recheck-envelope.txt")), "proposer: "+fixtureProposer, "proposer: "+other, 1)
+	envelope, err := ParseGateEnvelope([]byte(text), fixtureRecheckID, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newTestIntake(t, l, &repo).Deliver(context.Background(), envelope); !errors.Is(err, ErrRecordProposer) {
+		t.Fatalf("a recheck of another proposer: %v, want ErrRecordProposer", err)
+	}
+	if _, queued := l.items[ConceptItem(other, fixtureRecheckID)]; queued {
+		t.Fatal("the other proposer's item was queued")
+	}
+}
+
+// Each ledger call has its own deadline: time the delivery spends before it (a slow read, the record's git write)
+// does not shorten the enqueue's.
+func TestDeliverGivesEachLedgerCallItsOwnDeadline(t *testing.T) {
+	repo := newTestRepo(t)
+	l := &fakeIntakeLedger{items: map[string]ledger.Item{}, itemDelay: 300 * time.Millisecond, enqueueNeeds: 300 * time.Millisecond}
+	intake := newTestIntake(t, l, &repo)
+	intake.LedgerTimeout = 400 * time.Millisecond
+	if _, err := intake.Deliver(context.Background(), parseFixture(t, "recheck-envelope.txt", fixtureRecheckID)); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+}
+
+// A ref lock that another writer holds, or that a killed git left, does not move the tip: the write waits for it, and
+// names the lock when it stays.
+func TestAddFileOnceWaitsForAHeldRefLockAndNamesAStaleOne(t *testing.T) {
+	repo := newTestRepo(t)
+	lock := filepath.Join(repo.Path, "refs", "heads", "inbox", "librarian.lock")
+	if err := os.MkdirAll(filepath.Dir(lock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		os.Remove(lock)
+		close(released)
+	}()
+	if _, created, err := repo.AddFileOnce(context.Background(), "inbox/librarian", "inbox/a.json", []byte("a\n"), "inbox: a"); err != nil || !created {
+		t.Fatalf("a lock released after 400 ms: created %t, %v", created, err)
+	}
+	<-released
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := repo.AddFileOnce(context.Background(), "inbox/librarian", "inbox/b.json", []byte("b\n"), "inbox: b")
+	if err == nil || !strings.Contains(err.Error(), lock) {
+		t.Fatalf("a stale lock: %v, want an error naming %s", err, lock)
+	}
+}
+
+// The inbox branch is a branch: a symbolic ref there is refused, so no record lands on the ref it points to.
+func TestAddFileOnceRefusesASymbolicRef(t *testing.T) {
+	repo := newTestRepo(t)
+	main := gitOutput(t, repo.Path, nil, "rev-parse", "main")
+	gitOutput(t, repo.Path, nil, "symbolic-ref", "refs/heads/inbox/librarian", "refs/heads/main")
+	if _, _, err := repo.AddFileOnce(context.Background(), "inbox/librarian", "inbox/a.json", []byte("a\n"), "inbox: a"); err == nil {
+		t.Fatal("AddFileOnce wrote through a symbolic ref")
+	}
+	if got := gitOutput(t, repo.Path, nil, "rev-parse", "main"); got != main {
+		t.Fatalf("main moved from %s to %s", main, got)
+	}
+}
+
+// A notice the journal could not keep is still in the outcome, so that the command prints it: the item is queued, and
+// a later delivery of the open item publishes it again.
+func TestDeliverKeepsTheNoticeThatTheJournalCouldNotKeep(t *testing.T) {
+	envelope, err := ParseGateEnvelope(readLibrarianFixture(t, "near-envelope.txt"), fixtureNearID, fixtureProposer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routing, err := NewRouting("notifications.example.", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &fakeIntakeLedger{items: map[string]ledger.Item{}}
+	intake := LibrarianIntake{Ledger: l, Repo: "r", Routing: routing, NoListener: errors.New("no listener"), Journal: "relative/undelivered.jsonl"}
+	outcome, err := intake.Deliver(context.Background(), envelope)
+	if err == nil || !outcome.Added || len(outcome.Undelivered) != 1 || outcome.Undelivered[0].Topic != "notifications.example.concepts" {
+		t.Fatalf("Deliver with an unwritable journal = %+v, %v", outcome, err)
+	}
+}
+
+// A recheck checks its ledger repository before it writes its record, so a delivery to a repository that does not
+// exist leaves no record behind.
+func TestDeliverChecksTheRepositoryBeforeItRecordsARecheck(t *testing.T) {
+	envelope, err := ParseGateEnvelope(readLibrarianFixture(t, "recheck-envelope.txt"), fixtureRecheckID, fixtureProposer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routing, err := NewRouting("notifications.example.", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := newTestRepo(t)
+	intake := LibrarianIntake{Ledger: &fakeIntakeLedger{items: map[string]ledger.Item{}}, Repo: "no-such-repository", Inbox: &repo,
+		Routing: routing, NoListener: errors.New("no listener"), Journal: filepath.Join(t.TempDir(), "undelivered.jsonl")}
+	var notFound *ledger.NotFoundError
+	if _, err := intake.Deliver(context.Background(), envelope); !errors.As(err, &notFound) || notFound.What != "repository" {
+		t.Fatalf("Deliver to no repository: %v", err)
+	}
+	if refs := gitOutput(t, repo.Path, nil, "for-each-ref", "refs/heads/inbox/"); refs != "" {
+		t.Fatalf("Deliver wrote %s before it found no repository", refs)
 	}
 }

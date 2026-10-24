@@ -200,10 +200,16 @@ func (s *session) fillRecord(entry *ownerpkg.InboxItem) error {
 	case entry.Branch != "":
 		rev = "refs/heads/" + entry.Branch
 	}
+	// A concept item waits for its record: ready only while the branch holds it, and git log, which would also name
+	// the commit that deleted it, runs only then.
+	if entry.WaitsForRecord() {
+		_, found, err := s.blob(rev, entry.Record)
+		if err != nil || !found {
+			return err
+		}
+		entry.Ready = true
+	}
 	commit, err := s.lastCommit(rev, entry.Record)
 	entry.Commit = commit
-	if entry.WaitsForRecord() {
-		entry.Ready = commit != ""
-	}
 	return err
 }

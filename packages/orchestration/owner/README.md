@@ -74,11 +74,12 @@ rule, manifest, score, reviews or listener configuration input), 4 protocol erro
 
 ## The librarian's intake
 
-The concept gate (`declindex gate`, and `declindex ledger`'s recheck of a landing) delivers each near match to its
-configured `librarian` command, here `owner librarian-intake`, with `--id`, `--proposer` and `--proposal <file>`
-appended, no stdin and 120 s (`conceptgate/librarian.go`). The gate removes the file when the command exits, so the
-command reads it whole at once, and it never reads stdin. It acts for the gate: it needs no `LEGION_OWNER`, and it
-queues for `librarian`.
+The concept gate delivers each near match to its configured `librarian` command, here `owner librarian-intake`, with
+`--id`, `--proposer` and `--proposal <file>` appended, no stdin and 120 s (`conceptgate/librarian.go`): `declindex
+gate` does so itself, and so does `declindex ledger` with a DSN; with `--emit`, `declindex ledger` writes each recheck's
+id, proposer and envelope to its emit file, and the landing program delivers it the same way. The gate removes the file
+when the command exits, so the command reads it whole at once, and it never reads stdin. It acts for the gate: it needs
+no `LEGION_OWNER`, and it queues for `librarian`.
 
 - **The ids.** `--id` is `near-<hex16 of the proposal file's bytes>` (the gate) or `recheck-<key>-<key>` (the
   recheck), each key a compiled hash (32 lowercase hex digits) or `name.` and the lowercase hex of a concept name's
@@ -92,42 +93,59 @@ queues for `librarian`.
   second marker is refused; marker text inside the JSON line is data, since the gate's JSON escapes every newline.
   Anything else is exit 2, and nothing is queued or written.
 - **The item** is `concept:<proposer>@<id>` for `librarian` in `--repository` (its version is after the last `@`, so
-  a proposer may hold `@`). The command reads it first. A missing item is queued and its notice published. One that
-  exists for `librarian`, open or done (also the ledger's `ReasonExists` when another delivery queued it first), is a
-  success that adds and publishes nothing, whatever the envelope says now. One in another owner's queue is exit 4.
-- **A near delivery** records nothing: the proposer's own command keeps the proposal on its branch at
+  a proposer may hold `@`). The command checks that the ledger repository exists and reads the item first. An item
+  in another owner's queue is exit 4. A done item of `librarian` is a success that writes and publishes nothing,
+  whatever the envelope says now. A missing item is queued, and the notice of a missing or still open item is
+  published under its one key: a delivery that finds the item open may follow one that queued it and then lost its
+  notice (a journal that failed, a reply lost at the deadline, a kill), and the listener drops a copy it already has.
+  `added` is true when this delivery's enqueue made the item; two deliveries of one id at once can both report it,
+  since the ledger's `Enqueue` accepts an item already open for the same owner.
+- **A near delivery** records nothing. The proposal is on the proposer's branch at
   `skeleton/nodes/<Key>/concepts/<hex16>.json`, `<hex16>` the id after `near-`, and the gate's verdict beside it as
-  `<hex16>.verdict.json`.
+  `<hex16>.verdict.json`; the proposer's concept command writes both, and this branch has no such command yet, so until
+  then a near item is listed as not ready.
 - **A recheck delivery** has no proposer copy, so it needs `--git-dir`, the librarian's bare repository (exit 2
-  without it). Before it queues the item, the command writes `inbox/<id>.json` on `inbox/librarian` with plumbing
-  only, no worktree: a private index from the branch's tip, `commit-tree` on that tip with the repository's identity,
-  then `update-ref <new> <old>`, again from the new tip when another writer moved it first. The record is
-  `{"untrusted": true, "id", "proposer", "kind", "verdict", "proposal"}`, the verdict and the proposal as the gate
-  wrote them. A record of that id is never rewritten: the first envelope stays. Only this command writes the branch.
-- **The inbox.** `owner inbox` lists a `concept:` item as ready, with its record's path and commit, once a near item's
-  proposer branch `owner/<Key(proposer)>` holds `<records_root>/nodes/<Key>/concepts/<hex16>.verdict.json`, or a
-  recheck item's `inbox/librarian` holds `inbox/<id>.json`; until then it is listed as not ready.
-- **The notice.** A queued item's notice goes to `<topic prefix>concepts` (the routing table's concept row) with the
-  payload of the notices above (`type: concept`, `from` the proposer, `to: librarian`, the item, and for a recheck its
-  inbox record and commit) and the key `c-<hex16(item)>`. The topic prefix is `--topic-prefix`, else `topic_prefix`
-  of `skeleton/owner.yaml` at `main` of `--git-dir`; with neither, the command exits 2 before it queues anything.
-  The listener is `ResolveListener`'s, with `--envoy-config` as `ENVOY_CONFIG_FILE`.
+  without it, exit 3 when it is no bare repository, exit 2 when a deployment file names another `bare_repo`, which
+  `owner inbox` reads). Before it queues the item, the command writes `inbox/<id>.json` on `inbox/librarian` with
+  plumbing only, no worktree: a private index from the branch's tip, `commit-tree` on that tip with the repository's
+  identity, then `update-ref --no-deref <new> <old>`, again from the new tip when another writer moved it first. A ref
+  lock that leaves the tip where it was is waited for up to 5 s, then named in the error; a symbolic ref there is
+  refused. The record is `{"untrusted": true, "id", "proposer", "kind", "verdict", "proposal"}`, the verdict and the
+  proposal as the gate wrote them. A record of that id is never rewritten: the first envelope stays. The recheck id
+  names no proposer, so a record whose `proposer` is not `--proposer` is exit 4. Only this command writes the branch.
+- **The inbox.** `owner inbox` lists a `concept:` item as ready, with its record's path and commit, while a near
+  item's proposer branch `owner/<Key(proposer)>` holds `<records_root>/nodes/<Key>/concepts/<hex16>.verdict.json`, or a
+  recheck item's `inbox/librarian` holds `inbox/<id>.json`; otherwise (also after the branch deleted the record) it is
+  listed as not ready.
+- **The notice** goes to `<topic prefix>concepts` (the routing table's concept row) with the payload of the notices
+  above (`type: concept`, `from` the proposer, `to: librarian`, the item, and for a recheck its inbox record and
+  commit) and the key `c-<hex16(item)>`. The command reads no protocol manifest, so its `epoch` is 0, and it has no
+  versions or models to name. The topic prefix is `--topic-prefix`, else `topic_prefix` of `skeleton/owner.yaml` at
+  `main` of `--git-dir`, whose `repo` must be `--repository` (exit 2 otherwise); with neither, the command exits 2,
+  and a configuration that does not load is exit 3, before it queues anything. The listener is `ResolveListener`'s,
+  with `--envoy-config` as `ENVOY_CONFIG_FILE`; an `--envoy-config` that cannot be read or decoded is exit 3.
 - **The journal.** When no listener resolves, or the listener still refuses after the retries at 1 s, 4 s and 16 s,
   the command prints `notice not delivered: <topic> <notice>` on stderr, appends the notice to the host's journal and
   exits 0: the ledger item is the record. The journal is `<state_dir>/undelivered.jsonl` of the deployment file
   (`--deploy`, else `owner --deploy`, else `~/.config/owner/deploy.yaml`) when there is one, else
   `<user cache directory>/owner/undelivered/undelivered.jsonl` (Go's `os.UserCacheDir`: `$XDG_CACHE_HOME`, else
-  `~/.cache`). The command resolves it before it writes anything; a named deployment file that is missing, or one
-  that does not load, is exit 3.
+  `~/.cache`). The command resolves it and opens it for appending before it writes anything else; a named deployment
+  file that is missing, one that does not load, and a journal that cannot be opened are exit 3. A notice that the
+  journal then fails to keep is still printed, and the command exits 3.
 - **The ledger** is the DSN in `--ledger-dsn-file`, opened as every owner command opens it (`OpenLedgerFile`, which
   `ledger.Open` migrates to the schema it lacks).
-- **Time.** The ledger has 20 s to open and 20 s more to read and queue; a notice's four attempts take at most 61 s;
-  the whole command stops at 110 s, inside the gate's 120 s.
+- **Time.** Each ledger call (the open, the repository check, the item's read, the enqueue) has 20 s; a notice's four
+  attempts take at most 61 s; the whole command stops at 110 s, inside the gate's 120 s, and a delivery that its own
+  deadline ended is exit 75.
 
-Exit codes of `librarian-intake`: 0 delivered (queued now, or already there); 2 usage or a malformed envelope; 3
-unable to check (a DSN file that cannot be read, no such ledger repository, a query the server refuses, a deployment
-file that does not load); 4 protocol error (the item is another owner's); 75 when the ledger cannot be reached (a
-refused, broken or timed-out connection), so that the caller retries. The gate fails the delivery on any code but 0.
+Exit codes of `librarian-intake`: 0 delivered (queued now, already open, or done); 2 usage, a malformed envelope, or
+inputs that disagree (no topic prefix, a configuration of another repository, a `--git-dir` that is not the
+deployment's); 3 unable to check (a DSN file that cannot be read, no such ledger repository, a query the server
+refuses, a deployment file, configuration, `--envoy-config` or journal that cannot be read, a `--git-dir` that is no
+bare repository, a git write that fails); 4 protocol error (the item is another owner's, or a recheck record is
+another proposer's); 75 when the ledger cannot be reached (a refused, broken or timed-out connection, a connection
+exception, a server that is shutting down, starting up or out of connections) or the command's deadline ended it, so
+that the caller retries. The gate fails the delivery on any code but 0.
 
 ## The message test
 

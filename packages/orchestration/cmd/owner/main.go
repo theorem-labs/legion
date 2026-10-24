@@ -116,10 +116,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, cwd str
 			fmt.Fprintln(stderr, "notice not delivered:", topic)
 		}
 	case intakeResult:
-		for _, notice := range result.notices {
-			data, _ := json.Marshal(map[string]any{"message": notice.Message, "payload": notice.Payload, "key": notice.Key})
-			fmt.Fprintf(stderr, "notice not delivered: %s %s (journal %s)\n", notice.Topic, data, result.Journal)
-		}
+		printUndelivered(stderr, result.notices, result.Journal)
 	}
 	if jsonOutput {
 		if err := json.NewEncoder(stdout).Encode(value); err != nil {
