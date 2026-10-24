@@ -26,8 +26,10 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   read from the macro bodies that write them, a typedef name standing for its type, or, where a
   macro pastes them together, the one association with the selection's own type is the selected
   one; a call of the function a `_Generic` selects is a direct call), branches whose condition
-  folds to a constant (also through inline helpers that return one truth value and locals that
-  keep their initializer; a weak definition decides nothing, because another unit may replace it),
+  folds to a constant (also through inline helpers whose reachable returns give one value or one
+  truth value, a return after one the helper always takes being unreachable, and locals every store
+  of which, initializer and plain assignments, gives one value; a weak definition decides nothing,
+  because another unit may replace it),
   the cases a `switch` on a value clang folds does not reach (`switch (sizeof(x))`,
   `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or `||`, discarded values
   (`(void)x`, `(x, 0)`, an expression statement such as `get_user_ns(ns);`,

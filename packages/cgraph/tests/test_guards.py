@@ -345,3 +345,77 @@ def test_an_expression_libclang_does_not_expose_is_no_value(tmp_path: Path) -> N
     (call,) = [item for item in facts["functions"]["errname"]["events"]["calls"] if item["callee"] == "name_of"]
     assert "expr" not in call["arguments"][0]
     assert compiled(facts, "name_of", call["arguments"]) == {"late"}
+
+
+def test_a_helper_s_returns_after_one_it_always_takes_are_not_its_value(tmp_path: Path) -> None:
+    """kmem_cache_init → bootstrap_kmalloc_sheaves → bootstrap_cache_sheaves: with CONFIG_SLUB_TINY,
+    calculate_sheaf_capacity returns 0 before any other return, so `if (!capacity) return;` ends
+    bootstrap_cache_sheaves, and its barn_init (node_barn.nr_full) was never compiled."""
+    facts = facts_of(
+        tmp_path,
+        """
+        struct barn { int lock; int nr_full; };
+        static inline unsigned int capacity_of(struct dev *d)
+        {
+            if (1 || d->x)
+                return 0;
+            return d->x * 2;
+        }
+        static inline void setup(struct dev *d, struct barn *b)
+        {
+            unsigned int capacity;
+            capacity = capacity_of(d);
+            if (!capacity)
+                return;
+            note();
+            b->nr_full = 0;
+        }
+        """,
+    )
+    setup = facts["functions"]["setup"]["events"]
+    assert "note" not in {call["callee"] for call in setup["calls"]}
+    assert "note" in {item.get("call") for item in setup["unevaluated"]}
+    assert not [item for item in setup["field_accesses"] if item["field"] == "nr_full"]
+
+
+def test_a_local_every_store_gives_one_value_holds_it_and_one_with_two_values_does_not(tmp_path: Path) -> None:
+    facts = facts_of(
+        tmp_path,
+        """
+        static inline int one(void) { return 1; }
+        void same(void) { int v; v = 0; if (v) late(); kept(); }
+        void two(int k) { int v = 0; if (k) v = one(); if (v) late(); kept(); }
+        void once(void) { static int done; if (done) return; done = 1; late(); }
+        """,
+    )
+    assert "late" not in {call["callee"] for call in facts["functions"]["same"]["events"]["calls"]}
+    assert "late" in {call["callee"] for call in facts["functions"]["two"]["events"]["calls"]}
+    assert "late" in {call["callee"] for call in facts["functions"]["once"]["events"]["calls"]}
+
+
+def test_the_evaluator_compares_at_each_operand_s_width_and_signedness(tmp_path: Path) -> None:
+    """copy_thread: `ssp = 0; … ssp = shstk_alloc_thread_stack(p, args);` (a macro for 0), then
+    `if (IS_ERR_VALUE(ssp)) return …;`. (unsigned long)0 >= (unsigned long)-4095 is false."""
+    facts = facts_of(
+        tmp_path,
+        """
+        int copy(int fn)
+        {
+            unsigned long ssp = 0;
+            if (fn) {
+                late();
+            } else {
+                ssp = 0;
+                if ((unsigned long)(void *)(ssp) >= (unsigned long)-4095)
+                    return -1;
+                note();
+            }
+            kept();
+            if ((unsigned char)511 == 255)
+                other();
+            return 0;
+        }
+        """,
+    )
+    calls = {call["callee"] for call in facts["functions"]["copy"]["events"]["calls"]}
+    assert {"note", "kept", "other"} <= calls

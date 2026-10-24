@@ -1335,7 +1335,7 @@ class _Evaluator:
         self.locals: dict[int, int | None] = {}
         self.values: dict[tuple[int, bool], int | None] = {}
         self.deciding: dict[int, bool] = {}
-        self.written: dict[int, frozenset[int]] = {}
+        self.written: dict[int, tuple[dict[int, list[ci.Cursor]], frozenset[int]]] = {}
 
     def image_decides(self, cursor: ci.Cursor) -> bool:
         """``__builtin_constant_p`` or ``__builtin_object_size`` inside: the image decides. Once per cursor."""
@@ -1352,9 +1352,22 @@ class _Evaluator:
             # Guards and argument values evaluate each subexpression again: once per cursor.
             key = (cursor.hash, truth)
             if key not in self.values:
-                self.values[key] = self.evaluate_uncached(cursor, truth)
+                self.values[key] = self.typed_value(cursor, truth)
             return self.values[key]
-        return self.evaluate_uncached(cursor, truth, depth)
+        return self.typed_value(cursor, truth, depth)
+
+    def typed_value(self, cursor: ci.Cursor, truth: bool, depth: int = 0) -> int | None:
+        """The value as the expression's type holds it: an unsigned type has no negative value, and
+        each width wraps (libclang gives a constant as a signed long long)."""
+        value = self.evaluate_uncached(cursor, truth, depth)
+        typed = _integer_type(cursor.type) if value is not None and cursor.kind.is_expression() else None
+        if value is None or typed is None:
+            return value
+        if typed.get("b"):
+            return int(value != 0)
+        width = int(typed["w"])
+        value &= (1 << width) - 1
+        return value - (1 << width) if typed["s"] and value >= 1 << (width - 1) else value
 
     def evaluate_uncached(self, cursor: ci.Cursor, truth: bool, depth: int = 0) -> int | None:
         if self.image_decides(cursor):
@@ -1398,28 +1411,59 @@ class _Evaluator:
         return None
 
     def helper(self, name: str, depth: int) -> tuple[int | None, int | None]:
-        """What an inline helper always returns: the value, when every return gives the same one, and
-        the truth value, when every return agrees in truth."""
+        """What an inline helper always returns: the value, when every return control can reach gives
+        the same one, and the truth value, when every one agrees in truth. A return after one the
+        helper always takes (``if (IS_ENABLED(CONFIG_SLUB_TINY) || …) return 0;``) is not reached."""
         if name in self.helpers:
             return self.helpers[name]
         self.helpers[name] = (None, None)
         definition = self.definitions.get(name)
         if definition is None or depth > 3 or self.weak(definition):
             return (None, None)
+        body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
+        returns = self.live_returns(body) if body is not None else []
+        if not returns:
+            return (None, None)
         values: set[int | None] = set()
         truths: set[int | None] = set()
-        for node in definition.walk_preorder():
-            if node.kind == K.RETURN_STMT:
-                inner = _children(node)
-                if not inner:
-                    return (None, None)
-                values.add(self.evaluate(inner[0], depth + 1))
-                truth = self.evaluate(inner[0], depth + 1, truth=True)
-                truths.add(None if truth is None else int(bool(truth)))
+        for node in returns:
+            inner = _children(node)
+            if not inner:
+                return (None, None)
+            values.add(self.evaluate(inner[0], depth + 1))
+            truth = self.evaluate(inner[0], depth + 1, truth=True)
+            truths.add(None if truth is None else int(bool(truth)))
         exact = values.pop() if len(values) == 1 else None
         truth_value = truths.pop() if len(truths) == 1 else None
         self.helpers[name] = (exact, truth_value)
         return self.helpers[name]
+
+    def live_returns(self, statement: ci.Cursor) -> list[ci.Cursor]:
+        """The return statements control can reach in a statement: none in an if's branch a constant
+        condition rules out, or after a statement that exits (until a label or a case)."""
+        kind = statement.kind
+        if kind == K.RETURN_STMT:
+            return [statement]
+        inner = _children(statement)
+        if kind == K.COMPOUND_STMT:
+            found: list[ci.Cursor] = []
+            dead = False
+            for child in inner:
+                if child.kind in _ENTRIES:
+                    dead = False
+                if not dead:
+                    found += self.live_returns(child)
+                    dead = self.exits(child)
+            return found
+        if kind == K.IF_STMT and len(inner) >= 2:
+            value = self.evaluate(inner[0], truth=True)
+            if value is not None:
+                branch = inner[1] if value else (inner[2] if len(inner) > 2 else None)
+                return self.live_returns(branch) if branch is not None else []
+        if kind.is_statement():
+            return [node for child in inner for node in self.live_returns(child)]
+        # Inside an expression only a statement expression (``({ … })``) holds a return.
+        return [node for node in statement.walk_preorder() if node.kind == K.RETURN_STMT]
 
     def kept_initializer(self, variable: ci.Cursor) -> ci.Cursor | None:
         """A local's initializer when nothing writes the local or takes its address."""
@@ -1427,13 +1471,16 @@ class _Evaluator:
         function = variable.semantic_parent
         if initializer is None or function is None:
             return None
-        return None if variable.hash in self.written_in(function) else initializer
+        stores, other = self.stores_in(function)
+        return None if variable.hash in other or stores.get(variable.hash) else initializer
 
-    def written_in(self, function: ci.Cursor) -> frozenset[int]:
-        """The variables a function assigns, changes in place or takes the address of, by hash."""
+    def stores_in(self, function: ci.Cursor) -> tuple[dict[int, list[ci.Cursor]], frozenset[int]]:
+        """The values plain assignments store in each variable of a function, and the variables it
+        changes otherwise (``op=``, ``++``) or takes the address of, by hash."""
         key = function.hash
         if key not in self.written:
-            found: set[int] = set()
+            stores: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
+            other: set[int] = set()
             for node in function.walk_preorder():
                 if node.kind not in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR, K.UNARY_OPERATOR):
                     continue
@@ -1443,23 +1490,36 @@ class _Evaluator:
                     target = _children(target)[0]
                 if target is None or target.kind != K.DECL_REF_EXPR or target.referenced is None:
                     continue
-                if (
-                    node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR
-                    or (node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node))
-                    or (node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node)))
+                if node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node) and len(operands) == 2:
+                    stores[target.referenced.hash].append(operands[1])
+                elif node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR or (
+                    node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node))
                 ):
-                    found.add(target.referenced.hash)
-            self.written[key] = frozenset(found)
+                    other.add(target.referenced.hash)
+            self.written[key] = (dict(stores), frozenset(other))
         return self.written[key]
 
     def local(self, variable: ci.Cursor, depth: int) -> int | None:
-        """A local's value when its initializer evaluates and nothing writes it or takes its address."""
+        """A local's value when every value stored in it (its initializer and each plain assignment)
+        evaluates to one value, and nothing else writes it or takes its address. A read before every
+        store reads an indeterminate value, so the stores decide."""
         key = variable.hash
         if key in self.locals:
             return self.locals[key]
         self.locals[key] = None
-        initializer = self.kept_initializer(variable)
-        value = self.evaluate(initializer, depth + 1) if initializer is not None else None
+        function = variable.semantic_parent
+        if function is None:
+            return None
+        stores, other = self.stores_in(function)
+        if key in other:
+            return None
+        initializer = libclang.var_initializer(variable)
+        if stores.get(key) and variable.storage_class in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN):
+            # A static local keeps its value between calls: its first value is any earlier store.
+            return None
+        sources = ([initializer] if initializer is not None else []) + stores.get(key, [])
+        values = {self.evaluate(source, depth + 1) for source in sources}
+        value = values.pop() if len(values) == 1 else None
         self.locals[key] = value
         return value
 
