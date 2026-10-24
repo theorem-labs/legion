@@ -369,7 +369,8 @@ func TestSaveBatchCommandSurvivesAKillAfterTheCommit(t *testing.T) {
 }
 
 // batches <repo> --active lists, by creation, the active batches, a declined batch whose successor is missing and a
-// terminal batch with an effect still to do, with its pending effect keys.
+// terminal batch with an effect still to do, with its pending effect keys. A declined batch whose successor is stored
+// as the empty string names no successor, so it is not listed.
 func TestBatchesActiveCommand(t *testing.T) {
 	cli := newBatchCLI(t)
 	for _, id := range []string{"batch-b", "batch-a"} {
@@ -379,11 +380,13 @@ func TestBatchesActiveCommand(t *testing.T) {
 	for _, end := range []struct{ id, phase, admission, successor string }{
 		{"landed", "landed", "landed", ""},
 		{"declined", "declined", "declined", "successor"},
+		{"declined-empty-successor", "declined", "declined", ""},
 		{"effects", "landed", "landed", ""},
 	} {
 		cli.create(end.id, cliRecord(end.phase))
 		cli.setAdmission(end.id, end.admission, end.successor)
 	}
+	cli.sql(`UPDATE batches SET successor = '' WHERE repo = 'r' AND id = 'declined-empty-successor'`)
 	// LandBatch records a landed batch's effects in a later task; the test writes one directly.
 	cli.sql(`INSERT INTO batch_effects (repo, batch, key, op) VALUES ('r', 'effects', 'hook/effects/0/report', 'hook')`)
 	var batches []cliBatch

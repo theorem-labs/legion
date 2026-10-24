@@ -177,7 +177,8 @@ func (s *Store) LoadBatch(ctx context.Context, repo, id string) (Batch, error) {
 
 // ListActiveBatches lists, in creation order, every batch of the repository that a restarted landing program still has
 // work on: each batch in an active phase; each declined batch whose successor names no batch yet, so the program
-// creates it; and each terminal batch with an effect still to do, so the program finishes it.
+// creates it; and each terminal batch with an effect still to do, so the program finishes it. A successor stored as
+// NULL or as the empty string is none, as Batch.Successor reads it.
 func (s *Store) ListActiveBatches(ctx context.Context, repo string) ([]Batch, error) {
 	batches := []Batch{}
 	err := s.tx(ctx, func(tx pgx.Tx) error {
@@ -187,7 +188,7 @@ func (s *Store) ListActiveBatches(ctx context.Context, repo string) ([]Batch, er
 		rows, err := tx.Query(ctx, `SELECT `+batchColumns+` FROM batches
 			WHERE repo = $1 AND (
 				phase <> ALL($2)
-				OR (phase = $3 AND successor IS NOT NULL AND NOT EXISTS (
+				OR (phase = $3 AND coalesce(successor, '') <> '' AND NOT EXISTS (
 					SELECT 1 FROM batches successors WHERE successors.repo = batches.repo AND successors.id = batches.successor))
 				OR EXISTS (SELECT 1 FROM batch_effects e WHERE e.repo = batches.repo AND e.batch = batches.id AND e.state = 'intent'))
 			ORDER BY created_at, id`, repo, terminalPhases, PhaseDeclined)

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -154,24 +155,34 @@ func TestCreateBatchLandedUnrecordedEnqueuesItsEscalation(t *testing.T) {
 	assertBatchUnchanged(t, s, created, events)
 }
 
-// Concurrent creates of one id store one batch: every other create returns it, uncreated.
+// Concurrent creates of one id store one batch: every other create returns it, uncreated. The test holds an
+// uncommitted insert of the id until every create waits on it, so each of them inserts while the id is taken.
 func TestConcurrentCreatesStoreOneBatch(t *testing.T) {
 	ctx := context.Background()
-	s := newStore(t)
+	_, dsn := newStoreDSN(t)
 	const creators = 8
+	s := openStoreWithPool(t, dsn, creators)
+	conn := must(pgx.Connect(ctx, dsn))
+	defer conn.Close(ctx)
+	holder := must(conn.Begin(ctx))
+	must(holder.Exec(ctx, `INSERT INTO batches (repo, id, record, record_version, created_at, updated_at)
+		VALUES ('r', 'batch-1', '{"state": "frozen"}', 1, now(), now())`))
 	var wait sync.WaitGroup
 	created := make([]bool, creators)
 	errs := make([]error, creators)
-	start := make(chan struct{})
 	for i := range creators {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			<-start
 			_, created[i], errs[i] = s.CreateBatch(ctx, "r", "batch-1", batchRecord("frozen", "round", i))
 		}()
 	}
-	close(start)
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	waitForBlockedConnections(t, observer, creators)
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
 	wait.Wait()
 	if err := errors.Join(errs...); err != nil {
 		t.Fatal(err)
@@ -339,39 +350,65 @@ func TestSaveBatchComparesTheRecordVersion(t *testing.T) {
 }
 
 // Writers that save different records from the same version at once commit exactly one record; every other one is
-// refused with stale_batch.
+// refused with stale_batch. The test holds the batch's row lock until every writer waits on a lock, so each of them
+// reads the batch while the others do.
 func TestConcurrentSavesFromOneVersionCommitOnce(t *testing.T) {
 	ctx := context.Background()
-	s := newStore(t)
-	created := createBatch(t, s, "batch-1", batchRecord("frozen"))
+	_, dsn := newStoreDSN(t)
 	const writers = 12
+	s := openStoreWithPool(t, dsn, writers)
+	created := createBatch(t, s, "batch-1", batchRecord("frozen"))
+	conn := must(pgx.Connect(ctx, dsn))
+	defer conn.Close(ctx)
+	holder := must(conn.Begin(ctx))
+	must(holder.Exec(ctx, `SELECT 1 FROM batches WHERE repo = 'r' AND id = 'batch-1' FOR UPDATE`))
 	var wait sync.WaitGroup
 	results := make([]error, writers)
-	start := make(chan struct{})
 	for i := range writers {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			<-start
 			_, results[i] = s.SaveBatch(ctx, "r", "batch-1", batchRecord("checked", "round", i+1), created.RecordVersion)
 		}()
 	}
-	close(start)
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	waitForBlockedConnections(t, observer, writers)
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
 	wait.Wait()
-	winners := 0
-	for _, err := range results {
+	winners := []int{}
+	for i, err := range results {
 		if err == nil {
-			winners++
+			winners = append(winners, i)
 			continue
 		}
 		wantRefusal(t, err, ledger.ReasonStaleBatch)
 	}
-	if winners != 1 {
-		t.Fatalf("%d concurrent saves from one version committed, want 1", winners)
+	if len(winners) != 1 {
+		t.Fatalf("%d concurrent saves from one version committed, want 1", len(winners))
 	}
-	if got := must(s.LoadBatch(ctx, "r", "batch-1")).RecordVersion; got != 2 {
-		t.Fatalf("record version %d after the concurrent saves, want 2", got)
+	stored := must(s.LoadBatch(ctx, "r", "batch-1"))
+	if stored.RecordVersion != 2 || !sameJSON(t, stored.Record, batchRecord("checked", "round", winners[0]+1)) {
+		t.Fatalf("after the concurrent saves the batch is %+v, want the record of writer %d at version 2", stored, winners[0])
 	}
+	if got := eventKinds(t, s, "batch-1"); !slices.Equal(got, []string{"batch.created", "batch.saved"}) {
+		t.Fatalf("batch events = %q", got)
+	}
+}
+
+// openStoreWithPool opens another ledger on dsn whose pool holds up to size connections, so that size calls can each
+// wait on a lock at once, whatever the number of CPUs sets the default pool size to.
+func openStoreWithPool(t *testing.T, dsn string, size int) *ledger.Store {
+	t.Helper()
+	sized := must(url.Parse(dsn))
+	query := sized.Query()
+	query.Set("pool_max_conns", strconv.Itoa(size))
+	sized.RawQuery = query.Encode()
+	s := must(ledger.Open(context.Background(), sized.String()))
+	t.Cleanup(s.Close)
+	return s
 }
 
 func activeIDs(t *testing.T, s *ledger.Store) []string {
@@ -409,10 +446,16 @@ func TestListActiveBatchesListsWhatARestartMustFinish(t *testing.T) {
 		{"declined-missing-successor", "declined", "declined", "successor"},
 		{"declined-existing-successor", "declined", "declined", "batch-c"},
 		{"declined-no-successor", "declined", "declined", ""},
+		{"declined-empty-successor", "declined", "declined", ""},
 		{"landed-with-effects", "landed", "landed", ""},
 	} {
 		createBatch(t, s, end.id, batchRecord(end.phase))
 		setAdmission(t, dsn, end.id, end.admission, end.successor)
+	}
+	// setAdmission stores NULL for no successor. A successor stored as the empty string names no batch either.
+	batchSQL(t, dsn, `UPDATE batches SET successor = '' WHERE repo = 'r' AND id = 'declined-empty-successor'`)
+	if successor := must(s.LoadBatch(ctx, "r", "declined-empty-successor")).Successor; successor != "" {
+		t.Fatalf("a batch stored with an empty successor loads with successor %q", successor)
 	}
 	// No call writes an effect yet: LandBatch and ResolveBatch record a landed batch's effects (plan task L8c). The
 	// test writes them directly to check the listing rule for a terminal batch with an effect still to do.
@@ -666,11 +709,14 @@ func TestSaveBatchLandedUnrecordedKilledBeforeTheCommitLeavesNothing(t *testing.
 	watcher := must(pgx.Connect(ctx, dsn))
 	defer watcher.Close(ctx)
 	waitForBlockedConnections(t, watcher, 1)
+	// Only the batch's UPDATE takes RowExclusiveLock on batches. The row locks taken before it, on the repository and
+	// on the batch, already give the transaction an id, but take only RowShareLock on their tables.
 	var updated bool
 	if err := watcher.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
-		WHERE a.application_name = 'crash_child' AND l.locktype = 'transactionid' AND l.mode = 'ExclusiveLock' AND l.granted)`).
+		WHERE a.application_name = 'crash_child' AND l.locktype = 'relation' AND l.database = a.datid
+			AND l.relation = 'batches'::regclass AND l.mode = 'RowExclusiveLock' AND l.granted)`).
 		Scan(&updated); err != nil || !updated {
-		t.Fatalf("the child holds no transaction of its own while it waits (%v): it has not updated the batch", err)
+		t.Fatalf("the child holds no RowExclusiveLock on batches while it waits (%v): it has not updated the batch", err)
 	}
 	if err := child.Process.Kill(); err != nil {
 		t.Fatal(err)
