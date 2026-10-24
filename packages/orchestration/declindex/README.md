@@ -86,9 +86,9 @@ The landing program's container contract decides each container's mounts and net
 | `gate` | The index directory: its state and proposal work. |
 | `land-hash` | Nothing. It reads `LAND_GIT_DIR` and `LAND_BUILD_DIR`. |
 
-The configuration's absolute paths, such as the toolchain, `lean.cc`, `remote` and the owner map, must exist at the same paths inside the container. A container image with the pinned toolchain copies it from the worker-lean image pinned by digest, as `e2e/Dockerfile` does (`LEAN_IMAGE`; [e2e/README.md](e2e/README.md)).
+The configuration's absolute paths, such as the toolchain, `lean.cc`, `remote` and the owner map, must exist at the same paths inside the container. A container image with the pinned toolchain copies it from a worker image pinned by digest, as `e2e/Dockerfile` does (the required `LEAN_IMAGE` build argument; [e2e/README.md](e2e/README.md)).
 
-Deployment requirement: the identity that pulls the worker-lean image on the landing machine needs read access (`roles/artifactregistry.reader`) to the Artifact Registry repository that holds it. Without that access the pull fails with HTTP 403, as it does for the build machine's Compute Engine default service account at the time of writing. Grant the access, or copy the image by digest to a registry that identity can read, before the landing program builds these containers.
+Deployment requirement: the identity that pulls the worker image on the landing machine needs read access to the registry that holds it; without it the pull fails with HTTP 403. Grant that access, or copy the image by digest to a registry that identity can read, before the landing program builds these containers.
 
 ### `refresh`
 
@@ -148,18 +148,8 @@ The JSON output is:
 
 The final stderr line counts contracts, registrations, contract defects, gone, unowned, ambiguous, and registry additions, near pairs, and defects. `ledger` exits 0 only when both checks are clean; 1 for a contract hash defect, gone, unowned, ambiguous contract, registry defect, or added near pair; 3 when it cannot check; 75 for a ledger connection failure; and 2 for usage. If a recheck is unable but either check found a defect, it exits 1 and includes the inability in the report.
 
-## Baseline measurements and acceptance records
+## Baseline measurements
 
 The following baseline measurements describe the indexed project, not acceptance evidence for this change: 52,529 modules, 545,934 declarations, 9,686,627 uses, 4,389,369 edges, and 789,877 compiled constants. The initial refresh took 15 minutes 43 seconds; an unchanged update took 2.2 seconds; a one-module compiled update took 3.4 seconds. Process-inclusive query times were 0.014 seconds for `where`, 0.2 seconds median and 0.67 seconds worst for `users`, 0.34 seconds for `states`, 0.11 seconds for `same`, and about 5 seconds for `gate`.
 
-Do not treat the baseline numbers as acceptance results. The end-to-end drivers write each acceptance row's record, with run ID, command output, revision, binary hash, duration, and measured outcome, to a run directory named for the row and its UTC start (`infra145-e<row>-<yyyymmddThhmmZ>`) below the acceptance machine's run root. Records so far, all at revision `c98ee164`:
-
-| Acceptance row | Run | Outcome |
-| --- | --- | --- |
-| E1 parity | `infra145-e1-20261023T2222Z` | Pass: 55 of 55 declarations have the reference tool's direct users and every per-directory and file-kind count. Reach differs for 4: for 3, the extra directories are reached only through an `example`; the fourth has the same directory sets and 6 extra proofs, not yet traced. `users` took 0.195 seconds median and 0.571 seconds worst per name, process included. |
-| E2 recall and exact duplicates | `infra145-e2-20261023T2236Z` | Exact duplicates pass: 20 of 20 seeded copies are refused, each naming the copied declaration, with no librarian request; a copy with one constant changed is near. Recall did not run: `Forms` dropped the forms of a concept that no module declares. That is fixed in `ba8cb011`, and recall must run again. |
-| E3 gate and librarian route | none yet | |
-| E4 sandbox controls | `infra145-e4-20261023T2229Z` | Pass: 5 of 5 cases in containers. |
-| E5 `land-hash` | `infra145-e5-20261023T2244Z` | Pass: the base and candidate calls differ only in the changed contract's hash. A candidate without `LAND_BUILD_DIR`, and another tree with this build directory, both exit 3. Rewriting the built source after the build exited 0 until `ba8cb011`, which also refuses an `.ilean` that is not its trace's output. Both controls must run again. |
-
-The records, not this README, are the evidence for the baseline-scale claims and the acceptance outcomes.
+Acceptance records live with the acceptance runs, not in this repository.

@@ -1,28 +1,28 @@
 # Acceptance drivers
 
-These drivers keep the declaration-index acceptance checks reproducible. Run every sandbox probe in Docker. Do not run a sandbox probe on the devbox host or with `sudo`.
+These drivers keep the declaration-index acceptance checks reproducible. Run every sandbox probe in a disposable container, never on a shared host or with `sudo`. Acceptance records live with the acceptance runs, not in this repository.
 
 ## Build the image
 
-From the repository root, build the image with the root build context:
+From the repository root, build the image with the root build context. `LEAN_IMAGE` and `LEAN_TOOLCHAIN` have no default; the build stops with an error naming the one that is unset:
 
 ```sh
 docker buildx build --load --tag declindex-e2e:local \
+  --build-arg LEAN_IMAGE=<worker-image>@sha256:<digest> \
+  --build-arg LEAN_TOOLCHAIN=<toolchain-name> \
   --file packages/orchestration/declindex/e2e/Dockerfile .
 ```
 
-The image never builds Lean. It copies the prebuilt toolchain `/opt/lean/<LEAN_FORK_COMMIT>` from `LEAN_IMAGE`, which defaults to the worker image `us-west1-docker.pkg.dev/theorem-agent-infra/legion/worker-lean@sha256:3c923ef45665cfd719c52e4706e558016b0e253edfb241f83b2cb8f08762c2ab`, and the build fails unless `lean --githash` equals `LEAN_FORK_COMMIT`. Pulling that image needs read access to the `legion` Artifact Registry repository. Where only a local copy of a worker image exists, pass it with `--build-arg LEAN_IMAGE=<image>` and record the substitution with the run. `build-lean.sh` builds Lean from source for CI runners only.
+The image never builds Lean. It copies the prebuilt toolchain `/opt/lean/<LEAN_FORK_COMMIT>` from `LEAN_IMAGE`, a worker image pinned by digest, and the build fails unless `lean --githash` equals `LEAN_FORK_COMMIT`. `LEAN_TOOLCHAIN` is the toolchain name in the served tree's `lean-toolchain` file, so that elan in the image selects the copied toolchain for that tree. Record the `LEAN_IMAGE` digest with each run. `build-lean.sh` builds Lean from source for CI runners only.
 
-**Rules:**
-- **No Lean compile on the devbox.** The toolchain comes from the worker-lean image pinned by digest.
-- **Any image rebuild on the devbox must reuse the previous image's layers** (`docker buildx build --cache-from declindex-e2e:local ...`), or it does not happen on the devbox.
-
-The base is the digest-pinned `golang:1.27.1-trixie` image, because the prebuilt toolchain links the system `libgmp` and `libstdc++` of Debian trixie; the build checks that `libgmp10` is 6.3.0 or newer, which Lean requires. The image installs elan v4.2.4 after checking its SHA-256, links the toolchain as `theorem-labs/lean4:machcsl-v4.36-d71bb0c6d0` and makes it the default, and installs `declindex`, `ledger`, `python3` and `strace`.
+The base is the digest-pinned `golang:1.27.1-trixie` image, because the prebuilt toolchain links the system `libgmp` and `libstdc++` of Debian trixie; the build checks that `libgmp10` is 6.3.0 or newer, which Lean requires. The image installs elan v4.2.4 after checking its SHA-256, links the toolchain as `LEAN_TOOLCHAIN` and makes it the default, and installs `declindex`, `ledger`, `python3` and `strace`.
 
 The checksum's negative control (E8) is the same build with one digit of `ELAN_SHA256` changed; it must fail at `sha256sum --check`, before `elan-init` runs:
 
 ```sh
 docker buildx build --tag declindex-e2e:bad-elan \
+  --build-arg LEAN_IMAGE=<worker-image>@sha256:<digest> \
+  --build-arg LEAN_TOOLCHAIN=<toolchain-name> \
   --build-arg ELAN_SHA256=52b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63 \
   --file packages/orchestration/declindex/e2e/Dockerfile .
 ```

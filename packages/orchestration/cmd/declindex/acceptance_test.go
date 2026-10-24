@@ -11,12 +11,11 @@ import (
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
-// Accept145 (INFRA-145 acceptance, E3 outcome 4; contract 4, D-7, D-8): an addition is the repository file
-// registry/concepts/<compiled hash>.yaml, which its proposer writes in its own worktree and opens with
-// `ledger open --write <addition.path>` (declindex/README.md, "Concept registry"). The gate prints the absolute
-// path of that file inside the gate's tree instead, and the ledger refuses an absolute write path ("path ... is
-// absolute; give it relative to the repository root", ledger/paths.go); an absolute path also names the gate's
-// tree, not the proposer's worktree, so two exact duplicates proposed from different trees would not overlap.
+// An addition is the repository file registry/concepts/<compiled hash>.yaml, which its proposer writes in its own
+// worktree and opens with `ledger open --write <addition.path>` (declindex/README.md, "Concept registry"). The
+// ledger refuses an absolute write path ("path ... is absolute; give it relative to the repository root",
+// ledger/paths.go), and an absolute path would name the gate's tree, not the proposer's worktree, so two exact
+// duplicates proposed from different trees would not overlap. The gate prints the repository-relative path.
 func TestGateAdditionPathIsRepositoryRelative(t *testing.T) {
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
 		t.Skip("the successful gate path compiles untrusted source in Docker")
