@@ -2,6 +2,7 @@ package conceptgate
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -101,7 +102,7 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 					continue
 				}
 				seenPairs[pair] = true
-				id := "recheck-" + concept.CompiledHash + "-" + otherKey
+				id := recheckID(concept.CompiledHash, other)
 				match := Match{Concept: other.Name, How: fact.How, Declaration: constant.Name}
 				verdict := Verdict{Proposal: concept.Proposal, Name: concept.Name, Outcome: Near, Reason: "an added concept restates a registered concept's fact", Matches: []Match{match}, CompiledHash: actual, VerdictID: id}
 				report.Near = append(report.Near, RecheckNear{ID: id, Added: addedKey, Other: otherKey})
@@ -115,4 +116,16 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 		}
 	}
 	return report, nil
+}
+
+// recheckID is the librarian id of the near pair of an added concept, by its checked compiled hash, and other, by
+// its key in a form that the ledger accepts in an id (`recheck-[A-Za-z0-9._:@/-]+`): a compiled hash as it is, and
+// the name that keys a concept without one as `name.` and the hexadecimal of its UTF-8 bytes, since a Lean name
+// can hold any character. The prefix keeps a 16-byte name from making a compiled hash's id.
+func recheckID(added string, other Concept) string {
+	key := other.CompiledHash
+	if key == "" {
+		key = "name." + hex.EncodeToString([]byte(other.Name))
+	}
+	return "recheck-" + added + "-" + key
 }

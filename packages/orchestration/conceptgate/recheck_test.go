@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -142,6 +143,38 @@ func TestRecheckReportsAStoredSourceThatDoesNotCompileAsADefect(t *testing.T) {
 	report, err := Recheck(context.Background(), g, reg, []string{path})
 	if err != nil || len(report.Defects) != 1 || !strings.Contains(report.Defects[0].Message, "does not compile") || len(lib.got) != 0 {
 		t.Fatalf("uncompilable stored source: %+v, %v, librarian %+v", report, err, lib.got)
+	}
+}
+
+// The ledger accepts a recheck id only when it matches recheckIDRule. An id names the pair by the two concepts'
+// keys, and a librarian-written concept's key is its name, which may hold any character that Lean allows.
+var recheckIDRule = regexp.MustCompile(`^recheck-[A-Za-z0-9._:@/-]+$`)
+
+func TestRecheckIDsMatchTheLedgerRuleForAnyName(t *testing.T) {
+	const added = "00112233445566778899aabbccddeeff"
+	// "abcdefghijklmnop" is 16 bytes, so its hexadecimal form is that of a compiled hash: the last concept's.
+	others := []Concept{
+		{Name: "Foo'"}, {Name: "Foo''"}, {Name: "a b"}, {Name: "«a b»"}, {Name: "«Foo'».bar"}, {Name: "x₁"},
+		{Name: "Ünïcode.λ"}, {Name: "Nat.lt_irrefl"}, {Name: "a-b/c:d@e"}, {Name: "abcdefghijklmnop"},
+		{Name: "Hashed", CompiledHash: "ffeeddccbbaa99887766554433221100"},
+		{Name: "Other", CompiledHash: "6162636465666768696a6b6c6d6e6f70"},
+	}
+	seen := map[string]string{}
+	for _, other := range others {
+		id := recheckID(added, other)
+		if !recheckIDRule.MatchString(id) {
+			t.Errorf("%q: id %q does not match %s", other.Name, id, recheckIDRule)
+		}
+		if again := recheckID(added, other); again != id {
+			t.Errorf("%q: id %q, then %q", other.Name, id, again)
+		}
+		if previous, ok := seen[id]; ok {
+			t.Errorf("%q and %q share the id %q", previous, other.Name, id)
+		}
+		seen[id] = other.Name
+	}
+	if got, want := recheckID(added, others[10]), "recheck-"+added+"-"+others[10].CompiledHash; got != want {
+		t.Errorf("a hashed concept's id is %q, want %q", got, want)
 	}
 }
 
