@@ -108,15 +108,11 @@ func run(ctx context.Context, args []string, getenv func(string) string, cwd str
 	if err != nil {
 		return writeError(stderr, jsonOutput, err)
 	}
-	// A refused notice does not fail a step: the runner journaled it, and the command names it. librarian-intake
-	// prints each whole notice, with the journal that kept it.
-	switch result := value.(type) {
-	case stepResult:
+	// A refused notice does not fail a step: the runner journaled it, and the command names it.
+	if result, ok := value.(stepResult); ok {
 		for _, topic := range result.Undelivered {
 			fmt.Fprintln(stderr, "notice not delivered:", topic)
 		}
-	case intakeResult:
-		printUndelivered(stderr, result.notices, result.Journal)
 	}
 	if jsonOutput {
 		if err := json.NewEncoder(stdout).Encode(value); err != nil {

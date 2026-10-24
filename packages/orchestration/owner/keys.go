@@ -188,14 +188,11 @@ func validEdge(value string) bool {
 }
 
 // The concept gate's owner-id rule (conceptgate/gate.go:85-96): a node id of the supervisor's node kinds, whose name
-// has no white space and may hold @, or a role name.
-var (
-	nodeOwnerID = regexp.MustCompile(`^(function|struct|global|percpu|subsystem):\S+$`)
-	roleOwnerID = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
-)
+// has no white space and may hold @, or a role name (roleName).
+var nodeOwnerID = regexp.MustCompile(`^(function|struct|global|percpu|subsystem):\S+$`)
 
 // ValidOwnerID reports whether id passes the concept gate's owner-id rule, as a proposer must.
-func ValidOwnerID(id string) bool { return nodeOwnerID.MatchString(id) || roleOwnerID.MatchString(id) }
+func ValidOwnerID(id string) bool { return nodeOwnerID.MatchString(id) || roleName.MatchString(id) }
 
 // GateIDKind is the kind of a concept gate id: "near" for near-<hex16 of the proposal bytes> (conceptgate/gate.go:164-165),
 // "recheck" for recheck-<key>-<key> (conceptgate/recheck.go:121-131), each key a compiled hash (32 lowercase hex digits)

@@ -209,10 +209,7 @@ func TestParseGateEnvelopeRefusesMalformedText(t *testing.T) {
 // The record the intake keeps of a recheck is the envelope's JSON, marked untrusted, with the verdict and the proposal
 // as the gate wrote them.
 func TestInboxRecordIsTheUntrustedEnvelope(t *testing.T) {
-	envelope, err := ParseGateEnvelope(readLibrarianFixture(t, "recheck-envelope.txt"), fixtureRecheckID, fixtureProposer)
-	if err != nil {
-		t.Fatal(err)
-	}
+	envelope := parseFixture(t, "recheck-envelope.txt", fixtureRecheckID)
 	want := `{"untrusted":true,"id":"` + fixtureRecheckID + `","proposer":"` + fixtureProposer + `","kind":"recheck","verdict":` +
 		string(envelope.Verdict) + `,"proposal":` + string(envelope.Proposal) + "}\n"
 	if got := string(envelope.InboxRecord()); got != want {
@@ -498,17 +495,9 @@ func TestAddFileOnceRefusesASymbolicRef(t *testing.T) {
 // A notice the journal could not keep is still in the outcome, so that the command prints it: the item is queued, and
 // a later delivery of the open item publishes it again.
 func TestDeliverKeepsTheNoticeThatTheJournalCouldNotKeep(t *testing.T) {
-	envelope, err := ParseGateEnvelope(readLibrarianFixture(t, "near-envelope.txt"), fixtureNearID, fixtureProposer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	routing, err := NewRouting("notifications.example.", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := &fakeIntakeLedger{items: map[string]ledger.Item{}}
-	intake := LibrarianIntake{Ledger: l, Repo: "r", Routing: routing, NoListener: errors.New("no listener"), Journal: "relative/undelivered.jsonl"}
-	outcome, err := intake.Deliver(context.Background(), envelope)
+	intake := newTestIntake(t, &fakeIntakeLedger{items: map[string]ledger.Item{}}, nil)
+	intake.Journal = "relative/undelivered.jsonl"
+	outcome, err := intake.Deliver(context.Background(), parseFixture(t, "near-envelope.txt", fixtureNearID))
 	if err == nil || !outcome.Added || len(outcome.Undelivered) != 1 || outcome.Undelivered[0].Topic != "notifications.example.concepts" {
 		t.Fatalf("Deliver with an unwritable journal = %+v, %v", outcome, err)
 	}
@@ -517,17 +506,10 @@ func TestDeliverKeepsTheNoticeThatTheJournalCouldNotKeep(t *testing.T) {
 // A recheck checks its ledger repository before it writes its record, so a delivery to a repository that does not
 // exist leaves no record behind.
 func TestDeliverChecksTheRepositoryBeforeItRecordsARecheck(t *testing.T) {
-	envelope, err := ParseGateEnvelope(readLibrarianFixture(t, "recheck-envelope.txt"), fixtureRecheckID, fixtureProposer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	routing, err := NewRouting("notifications.example.", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	repo := newTestRepo(t)
-	intake := LibrarianIntake{Ledger: &fakeIntakeLedger{items: map[string]ledger.Item{}}, Repo: "no-such-repository", Inbox: &repo,
-		Routing: routing, NoListener: errors.New("no listener"), Journal: filepath.Join(t.TempDir(), "undelivered.jsonl")}
+	intake := newTestIntake(t, &fakeIntakeLedger{items: map[string]ledger.Item{}}, &repo)
+	intake.Repo = "no-such-repository"
+	envelope := parseFixture(t, "recheck-envelope.txt", fixtureRecheckID)
 	var notFound *ledger.NotFoundError
 	if _, err := intake.Deliver(context.Background(), envelope); !errors.As(err, &notFound) || notFound.What != "repository" {
 		t.Fatalf("Deliver to no repository: %v", err)

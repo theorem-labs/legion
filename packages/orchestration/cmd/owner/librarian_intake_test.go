@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sjawhar/legion/orchestration/ledger"
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 )
 
@@ -105,8 +104,7 @@ func (f *commandFixture) itemEvents(id string) []string {
 
 func (f *commandFixture) noItem(id string) {
 	f.t.Helper()
-	var notFound *ledger.NotFoundError
-	if _, err := f.store.Item(f.ctx, "r", id); !errors.As(err, &notFound) {
+	if _, err := f.store.Item(f.ctx, "r", id); !isNotFound(err) {
 		f.t.Fatalf("item %s exists (%v)", id, err)
 	}
 }
@@ -362,7 +360,6 @@ func TestLibrarianIntakeWithoutAListenerJournalsTheNotice(t *testing.T) {
 func TestLibrarianIntakeWithoutADeploymentJournalsInTheUserCache(t *testing.T) {
 	f := newCommandFixture(t)
 	cache := filepath.Join(f.root, "cache")
-	t.Setenv("XDG_CACHE_HOME", cache)
 	args := f.intakeArgs(intakeNearID, f.envelope("near-envelope.txt"), "--topic-prefix", "notifications.example.")
 	out, stderr, code := f.intake(map[string]string{"HOME": f.root}, args...)
 	journal := filepath.Join(cache, "owner", "undelivered", "undelivered.jsonl")

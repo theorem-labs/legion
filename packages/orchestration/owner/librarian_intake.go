@@ -220,10 +220,11 @@ func (r Repo) AddFileOnce(ctx context.Context, branch, path string, data []byte,
 			return "", false, err
 		}
 		if tip != "" {
-			if existing, err := r.revision(ctx, tip+":"+path); err != nil || existing != "" {
-				if err != nil {
-					return "", false, err
-				}
+			found, err := r.HasFile(ctx, tip, path)
+			if err != nil {
+				return "", false, err
+			}
+			if found {
 				last, err := r.git(ctx, "log", "-1", "--format=%H", tip, "--", path)
 				return strings.TrimSpace(last), false, err
 			}
@@ -400,11 +401,7 @@ func (in LibrarianIntake) Deliver(ctx context.Context, envelope GateEnvelope) (I
 	}); err != nil {
 		return outcome, fmt.Errorf("check ledger repository %s: %w", in.Repo, err)
 	}
-	var existing ledger.Item
-	err := in.call(ctx, func(ctx context.Context) (err error) {
-		existing, err = in.Ledger.Item(ctx, in.Repo, outcome.Item)
-		return err
-	})
+	existing, err := in.item(ctx, outcome.Item)
 	var notFound *ledger.NotFoundError
 	missing := errors.As(err, &notFound)
 	switch {
@@ -428,10 +425,7 @@ func (in LibrarianIntake) Deliver(ctx context.Context, envelope GateEnvelope) (I
 			if !errors.As(err, &refusal) || refusal.Reason != ledger.ReasonExists {
 				return outcome, fmt.Errorf("enqueue %s: %w", outcome.Item, err)
 			}
-			if err := in.call(ctx, func(ctx context.Context) (err error) {
-				existing, err = in.Ledger.Item(ctx, in.Repo, outcome.Item)
-				return err
-			}); err != nil {
+			if existing, err = in.item(ctx, outcome.Item); err != nil {
 				return outcome, fmt.Errorf("read existing item %s: %w", outcome.Item, err)
 			}
 			// Enqueue refuses an existing item of another owner, or a done one; an open one of the librarian it accepts.
@@ -499,6 +493,16 @@ func (in LibrarianIntake) call(ctx context.Context, fn func(context.Context) err
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return fn(callCtx)
+}
+
+// item reads item id under a deadline of its own.
+func (in LibrarianIntake) item(ctx context.Context, id string) (ledger.Item, error) {
+	var item ledger.Item
+	err := in.call(ctx, func(ctx context.Context) (err error) {
+		item, err = in.Ledger.Item(ctx, in.Repo, id)
+		return err
+	})
+	return item, err
 }
 
 func (in LibrarianIntake) checkLibrarian(item ledger.Item) error {

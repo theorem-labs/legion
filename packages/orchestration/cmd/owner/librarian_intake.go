@@ -25,7 +25,7 @@ type intakeFlags struct {
 	id, proposer, proposal, dsnFile, repository, gitDir, envoyConfig, topicPrefix, deploy string
 }
 
-// intakeResult is what one delivery did. notices are the undelivered notices, which run prints.
+// intakeResult is what one delivery did.
 type intakeResult struct {
 	Item        string   `json:"item"`
 	Kind        string   `json:"kind"`
@@ -34,7 +34,6 @@ type intakeResult struct {
 	Commit      string   `json:"commit,omitempty"`
 	Undelivered []string `json:"undelivered,omitempty"`
 	Journal     string   `json:"journal,omitempty"`
-	notices     []ownerpkg.Notice
 }
 
 // parseLibrarianIntake reads the configured command's options and the three the gate appends (--id, --proposer,
@@ -134,10 +133,7 @@ func (s *session) librarianIntake(flags intakeFlags) (any, error) {
 	defer cancelLedger()
 	store, err := ownerpkg.OpenLedgerFile(ledgerCtx, "--ledger-dsn-file", flags.dsnFile)
 	if err != nil {
-		if ownerpkg.LedgerUnreachable(err) {
-			return nil, &exitError{exitUnreachable, err}
-		}
-		return nil, &exitError{exitUnable, err}
+		return nil, intakeError(err)
 	}
 	s.store, intake.Ledger = store, store
 
@@ -149,15 +145,14 @@ func (s *session) librarianIntake(flags intakeFlags) (any, error) {
 	return deliveryResult(s.stderr, outcome, err, journal)
 }
 
-// deliveryResult is the command's result for outcome. A failed delivery prints its undelivered notices itself (run
-// prints them only on success), since the journal may have failed to keep them, and gets its exit code (intakeError).
+// deliveryResult is the command's result for outcome. It prints each undelivered notice whole, also for a failed
+// delivery, since the journal may have failed to keep it; a failed delivery gets its exit code (intakeError).
 func deliveryResult(stderr io.Writer, outcome ownerpkg.IntakeOutcome, err error, journal string) (any, error) {
+	printUndelivered(stderr, outcome.Undelivered, journal)
 	if err != nil {
-		printUndelivered(stderr, outcome.Undelivered, journal)
 		return nil, intakeError(err)
 	}
-	result := intakeResult{Item: outcome.Item, Kind: outcome.Kind, Added: outcome.Added, Record: outcome.Record, Commit: outcome.Commit,
-		notices: outcome.Undelivered}
+	result := intakeResult{Item: outcome.Item, Kind: outcome.Kind, Added: outcome.Added, Record: outcome.Record, Commit: outcome.Commit}
 	for _, notice := range outcome.Undelivered {
 		result.Undelivered = append(result.Undelivered, notice.Topic)
 	}
