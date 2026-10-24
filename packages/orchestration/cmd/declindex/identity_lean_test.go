@@ -177,6 +177,55 @@ func TestTwoModulesThatEachDeclareAnUnderscoreNameAreReadApart(t *testing.T) {
 	}
 }
 
+// `states` counts the declarations that state a concept's fact, each by its module and its name: A's `shared` and
+// B's are two, and a structure whose constructor and field state the fact is its one declaration. Its JSON gives the
+// module of each statement's declaration.
+func TestStatesCountsEachDeclarationByItsModuleAndName(t *testing.T) {
+	requireLake(t)
+	ctx := context.Background()
+	lean, err := declindex.FindLean(ctx, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "tree")
+	for _, m := range []struct{ name, source string }{
+		{"A", "theorem shared (n : Nat) : n = n := rfl\nstructure S where\n  x : Nat\n  h : x = x\n"},
+		{"B", "theorem shared (n : Nat) : n = n := rfl\n"},
+	} {
+		writeTestFile(t, filepath.Join(tree, m.name+".lean"), m.source)
+		if err := declindex.CompileModule(ctx, lean, nil, tree, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
+	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: A.lean\n"+
+		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
+	config := filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh with the compiled part: %+v", r)
+	}
+	if r := invoke(t, "--config", config, "states", "Reflexive"); r.code != 0 || !strings.HasPrefix(r.out, "Reflexive: 3 declarations\n") {
+		t.Errorf("states Reflexive: %+v; want 3 declarations: A's shared and S, and B's shared", r)
+	}
+	var states map[string][]struct {
+		Declaration string `json:"declaration"`
+		Module      string `json:"declaration_module"`
+	}
+	decode(t, invoke(t, "--config", config, "--json", "states", "Reflexive"), &states)
+	var got []string
+	for _, s := range states["Reflexive"] {
+		if d := s.Module + "." + s.Declaration; !slices.Contains(got, d) {
+			got = append(got, d)
+		}
+	}
+	slices.Sort(got)
+	if want := []string{"A.S", "A.shared", "B.shared"}; !slices.Equal(got, want) {
+		t.Errorf("states --json Reflexive: declarations %q of %+v, want %q", got, states, want)
+	}
+}
+
 // decode reads a command's JSON output into v, failing the test unless the command exited 0.
 func decode(t *testing.T, r result, v any) {
 	t.Helper()

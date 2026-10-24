@@ -569,13 +569,16 @@ func (s *Store) distinctOwners(ctx context.Context, query string, args ...any) (
 	return out, nil
 }
 
-// Stating is one statement that states a registered concept's fact.
+// Stating is one statement that states a registered concept's fact: the declaration that its constant belongs to,
+// by name and module, and the constant, by name and module (an equation lemma that Lean made in the module that
+// uses it is recorded there, and belongs to a declaration of that module's imports).
 type Stating struct {
-	Decl   string `json:"declaration"`
-	Const  string `json:"constant"`
-	Module string `json:"module"`
-	How    string `json:"how"`
-	At     string `json:"at,omitempty"`
+	Decl       string `json:"declaration"`
+	DeclModule string `json:"declaration_module"`
+	Const      string `json:"constant"`
+	Module     string `json:"module"`
+	How        string `json:"how"`
+	At         string `json:"at,omitempty"`
 }
 
 // States lists the statements that state a concept's fact, directly, through a definition, or by using it.
@@ -605,7 +608,7 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	out := make([]Stating, 0, len(rs))
 	for _, r := range rs {
 		f := owner[declRef{r.module, r.name}]
-		st := Stating{Decl: f.Name, Const: r.name, Module: r.module, How: r.how}
+		st := Stating{Decl: f.Name, DeclModule: f.Module, Const: r.name, Module: r.module, How: r.how}
 		if f.Path != "" {
 			st.At = f.At()
 		}

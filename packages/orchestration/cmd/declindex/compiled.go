@@ -63,9 +63,10 @@ func cmdStates(ctx context.Context, e *env, args []string) int {
 		return e.printJSONOr(out, rc)
 	}
 	for _, c := range concepts {
-		decls := map[string]bool{}
+		// A declaration is its module and its name, however many of its constants state the fact.
+		decls := map[[2]string]bool{}
 		for _, r := range out[c] {
-			decls[r.Decl] = true
+			decls[[2]string{r.DeclModule, r.Decl}] = true
 		}
 		fmt.Fprintf(e.stdout, "%s: %d declarations\n", c, len(decls))
 		for _, r := range out[c] {
