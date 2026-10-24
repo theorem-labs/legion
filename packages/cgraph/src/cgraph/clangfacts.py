@@ -1502,6 +1502,22 @@ def _type_selection(node: ci.Cursor) -> set[int] | None:
     return matches if len(matches) == 1 else None
 
 
+def _generic_callee(call: ci.Cursor) -> ci.Cursor | None:
+    """The function a call through ``_Generic(x, a: f, b: g)(…)`` calls, where the selection's type
+    names one association (``_type_selection``): seqlock.h's ``__seqprop(s, preemptible)(s)``."""
+    head = next(iter(call.get_children()), None)
+    selection = _strip(head) if head is not None and call.referenced is None else None
+    if selection is None or selection.kind != K.GENERIC_SELECTION_EXPR:
+        return None
+    chosen = _type_selection(selection)
+    if chosen is None:
+        return None
+    (index,) = chosen
+    named = _strip(_children(selection)[index])
+    function = named.referenced if named.kind == K.DECL_REF_EXPR else None
+    return function if function is not None and function.kind == K.FUNCTION_DECL else None
+
+
 # Builtins whose answer the compiler gives only while it optimizes: the image decides the branch.
 _IMAGE_DECIDES = frozenset({"__builtin_constant_p", "__builtin_object_size", "__builtin_dynamic_object_size"})
 _UNREACHABLE = frozenset({"__builtin_unreachable", "__builtin_trap"})
@@ -2100,6 +2116,10 @@ class _Evaluator:
             if cursor.referenced.kind == K.FUNCTION_DECL:
                 exact, truth_value = self.helper(cursor.referenced.spelling, depth)
                 return exact if exact is not None or not truth else truth_value
+        if kind == K.CALL_EXPR and (selected := _generic_callee(cursor)) is not None:
+            # seqprop_preemptible(s): _Generic(*(s), …)(s) calls the function its selection names.
+            exact, truth_value = self.helper(selected.spelling, depth)
+            return exact if exact is not None or not truth else truth_value
         return None
 
     def helper(self, name: str, depth: int) -> tuple[int | None, int | None]:
@@ -2287,6 +2307,9 @@ class _Evaluator:
             return None
         if kind == K.MEMBER_REF_EXPR and inner:
             return self.member(cursor, inner[0], resolve, depth, typed)
+        if kind == K.COMPOUND_LITERAL_EXPR and typed is None and _is_record(cursor.type):
+            # pte_clear's __pte(0), ((pte_t) { (0) }): a struct its initializer gives.
+            return self.literal_struct(cursor)
         if typed is None:
             return None
         if kind == K.UNARY_OPERATOR and inner and libclang.is_address_of(cursor):
@@ -2368,6 +2391,17 @@ class _Evaluator:
             return None
         held = resolve(referenced, cursor, depth + 1)
         return {"p": held["p"]} if held is not None and set(held) == {"p"} else None
+
+    def literal_struct(self, literal: ci.Cursor) -> dict[str, Any] | None:
+        """A compound literal of a struct type as the members its initializer list gives (as
+        ``struct_value``); None for another shape."""
+        initializer = next((child for child in _children(literal) if child.kind == K.INIT_LIST_EXPR), None)
+        members: dict[int, dict[str, Any] | None] = {}
+        if initializer is None or not self.record_values(initializer, literal.type.get_canonical(), 0, members):
+            return None
+        if len(members) > _STRUCT_MEMBERS:
+            return None
+        return {"struct": [[bits, members[bits]] for bits in sorted(members)]}
 
     def struct_value(self, variable: ci.Cursor) -> dict[str, Any] | None:
         """A const global struct's value (fs/pidfs.c's pidfs_ino_ht_params): the bits of each scalar

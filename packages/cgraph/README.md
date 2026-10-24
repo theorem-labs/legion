@@ -260,7 +260,11 @@ These rules follow what the machine code shows, each only where it shows it:
   `likely(params.obj_hashfn)` and `params.obj_cmpfn ?`. An argument without effect of a call through
   a member of a struct the function is passed by value is under a guard with `image` on whether the
   function the fold gives ignores it; where it does (simple_xattr_obj_hashfn's `len`), the image
-  decides whether the argument is computed. A call argument gives the value it passes (`expr`: a
+  decides whether the argument is computed. A compound literal of a struct type is a constant struct
+  as its initializer gives it (pte_clear's `__pte(0)`, so `pte_present` of it is 0), and a call through
+  a `_Generic` selection whose type names one association returns what that function returns
+  (seqlock.h's `seqprop_preemptible(s)` of a raw spinlock's seqcount is false). A call argument gives
+  the value it passes (`expr`: a
   constant, a choice, a named value, a struct, an object's address, or an expression on the caller's
   own parameters, at each type's width). At a fold, link puts the arguments in; a call or an access a
   guard decides against becomes `unevaluated` with reason `constant_argument` (an exclusion), or

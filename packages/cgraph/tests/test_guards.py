@@ -893,3 +893,56 @@ def test_a_const_struct_s_function_member_decides_its_tests_and_leaves_an_argume
     given = fold(facts, "find_given", "lookup")
     assert {call["callee"] for call in given.calls} == {"other_hash", "compare"}
     assert lengths(given) == ["None", "None"]
+
+
+SEQPROP = """
+    typedef struct { unsigned sequence; } seqcount_t;
+    typedef struct { seqcount_t seqcount; int *lock; } seqcount_raw_spinlock_t;
+    typedef struct { seqcount_t seqcount; int *lock; } seqcount_mutex_t;
+    static inline _Bool __seqprop_preemptible(const seqcount_t *s) { return 0; }
+    #define SEQ_LOCKNAME(lockname, preemptible) \\
+    static inline _Bool __seqprop_##lockname##_preemptible(const seqcount_##lockname##_t *s) { return preemptible; }
+    SEQ_LOCKNAME(raw_spinlock, 0)
+    SEQ_LOCKNAME(mutex, 1)
+    #define __seqprop_case(s, lockname, prop) seqcount_##lockname##_t: __seqprop_##lockname##_##prop
+    #define __seqprop(s, prop) _Generic(*(s), seqcount_t: __seqprop_##prop, \\
+        __seqprop_case((s), raw_spinlock, prop), __seqprop_case((s), mutex, prop))
+    #define seqprop_preemptible(s) __seqprop(s, preemptible)(s)
+    #define write_begin(s) do { if (seqprop_preemptible(s)) note(); } while (0)
+    void seq_raw(seqcount_raw_spinlock_t *s) { write_begin(s); kept(); }
+    void seq_plain(seqcount_t *s) { write_begin(s); kept(); }
+    void seq_mutex(seqcount_mutex_t *s) { write_begin(s); kept(); }
+"""
+
+
+def test_a_call_a_generic_selection_names_returns_what_the_selected_function_returns(tmp_path: Path) -> None:
+    """write_seqcount_begin(&tkd->seq) on a seqcount_raw_spinlock_t: seqprop_preemptible(s) is
+    _Generic(*(s), …)(s), which selects __seqprop_raw_spinlock_preemptible, `return false` (llvm-objdump
+    of seq_raw and seq_plain: tail kept)."""
+    facts = facts_of(tmp_path, SEQPROP)
+
+    def callees(function: str) -> set[str]:
+        return {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+
+    assert "note" not in callees("seq_raw") | callees("seq_plain")
+    assert "note" in callees("seq_mutex")
+
+
+COMPOUND_LITERAL = """
+    typedef struct { unsigned long pte; } pte_t;
+    #define __pte(x) ((pte_t) { (x) })
+    static inline int pte_present(pte_t pte) { return pte.pte & 1; }
+    static inline void set_pte_at(pte_t pteval) { if (pte_present(pteval)) warn(); kept(); }
+    static inline void pte_clear(void) { set_pte_at(__pte(0)); }
+    static inline void pte_mark(void) { set_pte_at(__pte(3)); }
+    static inline void pte_set(pte_t pte) { set_pte_at(pte); }
+"""
+
+
+def test_a_compound_literal_argument_is_a_constant_struct(tmp_path: Path) -> None:
+    """pte_clear: `__set_pte_at(mm, ptep, __pte(0))`, `__pte(x)` being `((pte_t) { (x) })`: pte_present of
+    it is 0, so flush_icache_pte is not called (llvm-objdump of __set_fixmap: sd zero, no call)."""
+    facts = facts_of(tmp_path, COMPOUND_LITERAL)
+    assert {call["callee"] for call in fold(facts, "pte_clear", "set_pte_at").calls} == {"pte_present", "kept"}
+    assert "warn" in {call["callee"] for call in fold(facts, "pte_mark", "set_pte_at").calls}
+    assert "warn" in {call["callee"] for call in fold(facts, "pte_set", "set_pte_at").calls}
