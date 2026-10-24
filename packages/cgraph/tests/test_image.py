@@ -889,6 +889,62 @@ def test_a_load_in_a_loop_reads_the_first_elements_field_on_some_path(image: Ima
     assert entries == [("box_table", 8)]
 
 
+def test_a_loop_register_biased_to_a_member_gives_the_member_s_field_on_the_first_pass(image: Image) -> None:
+    """``s1 = a0 + 0x40; loop: ld a1, 0x28(s1); s1 += 32; bne s1, a2, loop`` (rcu_exp_sel_wait_wake's
+    loop over rcu_node, poll_freewait's over its entries): the head loses s1's constant, but the first
+    pass reads the field at 64 + 40 from a0."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack(
+        "<5I", _addi(S1, A0, 0x40), _load(A1, S1, 0x28), _addi(S1, S1, 32), _branch(S1, A2, -8) | 1 << 12, RET
+    )
+    assert 104 in image.decode("synthetic", code, start).memory_offsets
+
+
+def test_an_access_inside_an_object_names_the_zero_size_symbols_at_its_start_apart(image: Image) -> None:
+    """``ld a1, 8(s1)`` with s1 = &box_table, where a zero-size table start (``__start_rtab``) sits at
+    box_table's address: the entry gives it as a start name for field offsets, never as an alias."""
+    start = image.object_symbols["box_table"][0].address
+    image.zero_size_at[start] = ["__start_rtab"]
+    try:
+        facts = _at(image, S1, start, _load(A1, S1, 8))
+    finally:
+        del image.zero_size_at[start]
+    entries = [(item["global"], item.get("start_names"), item.get("aliases")) for item in facts.globals]
+    assert ("box_table", ["__start_rtab"], None) in entries
+
+
+def _frame_prologue() -> list[int]:
+    """addi sp, sp, -64; sd s0, 48(sp); addi s0, sp, 64: s0 is the frame pointer, at sp on entry."""
+    return [_addi(SP, SP, -64), _store(S0, SP, 48), _addi(S0, SP, 64)]
+
+
+def _add(rd: int, rs1: int, rs2: int) -> int:
+    return rs2 << 20 | rs1 << 15 | rd << 7 | 0x33
+
+
+def test_frame_arithmetic_is_no_field_offset_where_s0_is_the_frame_pointer(image: Image) -> None:
+    """After the prologue, ld a0, -24(s0) and addi a1, s0, -40 address the frame: neither adds a field
+    offset. Without the prologue s0 is a value, and the same load reads its field at -24."""
+    start = image.functions["anchor_pair"][0].address
+    body = [_load(A0, S0, -24), _addi(A1, S0, -40), _load(A2, A1, 16), RET]
+    framed = image.decode("synthetic", struct.pack(f"<{len(body) + 3}I", *_frame_prologue(), *body), start)
+    assert not {-24, -40, -24 + 16, 48, 64, -64} & (framed.memory_offsets | framed.addi_constants)
+    assert (-24, 8) in framed.frame_accesses and -40 in framed.frame_addresses
+    plain = image.decode("synthetic", struct.pack("<2I", _load(A0, S0, -24), RET), start)
+    assert -24 in plain.memory_offsets
+
+
+def test_a_frame_address_in_another_register_reaches_the_frame(image: Image) -> None:
+    """addi s1, s0, -40 is &batch.items; ld a0, 8(s1) reads the frame at -32, and a2 + s1 is
+    batch.items[i], whose store is past a variable index from -40."""
+    start = image.functions["anchor_pair"][0].address
+    body = [_addi(S1, S0, -40), _load(A0, S1, 8), _add(A2, A2, S1), _store(A0, A2, 0), RET]
+    facts = image.decode("synthetic", struct.pack(f"<{len(body) + 3}I", *_frame_prologue(), *body), start)
+    assert (-32, 8) in facts.frame_accesses
+    assert facts.frame_indexed == {(-40, 8)}
+    assert not {8, -32} & facts.memory_offsets
+
+
 def test_a_store_over_part_of_a_frame_slot_ends_the_address_spilled_there(image: Image) -> None:
     """``sd s1, -24(s0)``, then ``sw zero, -20(s0)`` writes half of it: the reload is no address."""
     facts = _at(image, S1, image.object_symbols["pair_a"][0].address, _store(S1, S0, -24),

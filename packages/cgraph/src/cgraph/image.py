@@ -55,6 +55,7 @@ _ADDRESS_OPERATIONS = frozenset({"addi_address", "indexed_address"})
 _MERGED_GLOBALS = ".L_MergedGlobals"
 # The registers a frame slot is addressed through.
 _FRAME_REGISTERS = frozenset({"sp", "s0"})
+_SP = frozenset({"sp"})
 # Stores and loads of a whole register, which spill an address to a frame slot and reload it.
 _SPILLS = frozenset({"sd", "c.sd", "c.sdsp"})
 _RELOADS = frozenset({"ld", "c.ld", "c.ldsp"})
@@ -442,19 +443,21 @@ class FunctionFacts:
     memory_offsets: set[int] = field(default_factory=set)
     addi_constants: set[int] = field(default_factory=set)
     exclusions: list[dict[str, Any]] = field(default_factory=list)
-    # The frame: each load or store through sp or s0 as (offset from the frame's top, the value sp had
-    # on entry; bytes moved), without the saves and restores of callee-saved registers; the frame
-    # addresses the code forms (addi rd, sp|s0, k; mv rd, sp); and those it passes to a direct call
-    # (the call's address, the argument's position, the offset).
+    # The frame: each load or store through sp, s0 or a register holding a frame address, as (offset
+    # from the value sp had on entry; bytes moved), without the saves and restores of callee-saved
+    # registers; the frame addresses the code forms (addi rd, sp|s0, k; mv rd, sp); those it passes to
+    # a call (the call's address, the argument's position, the offset); and the loads and stores past a
+    # variable index added to a frame address (fbatch.folios[i]), at the address's offset.
     frame_accesses: set[tuple[int, int]] = field(default_factory=set)
     frame_addresses: set[int] = field(default_factory=set)
     frame_arguments: set[tuple[int, int, int]] = field(default_factory=set)
+    frame_indexed: set[tuple[int, int]] = field(default_factory=set)
 
 
 _RECORD_FIELDS = ("calls", "globals", "function_addresses", "outside", "exclusions")
 _NUMBER_FIELDS = ("memory_offsets", "addi_constants", "frame_addresses")
 # Sets of integer tuples, by their length.
-_TUPLE_FIELDS = {"frame_accesses": 2, "frame_arguments": 3}
+_TUPLE_FIELDS = {"frame_accesses": 2, "frame_arguments": 3, "frame_indexed": 2}
 
 
 def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts | None:
@@ -492,6 +495,7 @@ def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts | None:
         frame_accesses=tuples["frame_accesses"],
         frame_addresses=set(frame_addresses),
         frame_arguments=tuples["frame_arguments"],
+        frame_indexed=tuples["frame_indexed"],
     )
 
 
@@ -507,6 +511,7 @@ def _facts_for_cache(facts: FunctionFacts) -> dict[str, Any]:
         "frame_accesses": [list(item) for item in sorted(facts.frame_accesses)],
         "frame_addresses": sorted(facts.frame_addresses),
         "frame_arguments": [list(item) for item in sorted(facts.frame_arguments)],
+        "frame_indexed": [list(item) for item in sorted(facts.frame_indexed)],
     }
 
 
@@ -731,6 +736,9 @@ class Image:
             address: sorted(names, key=lambda name: (name.startswith("_"), name))
             for address, names in zero_size.items()
         }
+        # The registers holding a frame address before each instruction of the function being
+        # decoded (_decode sets them from _frame): what they add is the frame's, no field offset.
+        self.frame_rooted: dict[int, frozenset[str]] = {}
         # The C names of every symbol System.map lists, for telling a global the compiler removed.
         self.map_source_names = frozenset(source_name(name) for _, _, name in self.map)
 
@@ -872,6 +880,8 @@ class Image:
         before = dict(states)
         first = dict(self._block_states(instructions, successors, _retreating(successors)))
         returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
+        frame = _frame(self.decoder, instructions)
+        self.frame_rooted = frame.rooted
         for index, state in states:
             instruction = instructions[index]
             escapes, partner = None, None
@@ -882,7 +892,8 @@ class Image:
                     partner = self._partner(compares, before, first)
             self._first_pass(name, instruction, state, first.get(index), facts)
             self._step(name, instruction, state, facts, escapes, partner)
-        facts.frame_accesses, facts.frame_addresses, facts.frame_arguments = _frame(self.decoder, instructions)
+        facts.frame_accesses, facts.frame_addresses = frame.accesses, frame.addresses
+        facts.frame_arguments, facts.frame_indexed = frame.arguments, frame.indexed
         return facts
 
     def _partner(
@@ -920,6 +931,16 @@ class Image:
                 continue
             if base in state.choices or base in state.constants:
                 continue
+            rooted = self.frame_rooted.get(instruction.address, _SP)
+            if (
+                base not in state.relative
+                and base in first.relative
+                and first.address(base) is None
+                and self.decoder.reg_name(base) not in rooted
+            ):
+                # An unknown base the loop register was biased from (s1 = a0 + 0x40 before the loop):
+                # on the first pass the field is that far from it, as _step counts it outside loops.
+                facts.memory_offsets.add(first.relative[base] + displacement)
             entered = first.address(base)
             if entered is not None:
                 self._record_address(
@@ -1210,6 +1231,14 @@ class Image:
             # shares the address of the object after it; a loop's bound at the start of one object
             # may be the end of the object before it.
             entry["aliases"] = aliases
+        start_names = (
+            [marker for marker in self.zero_size_at.get(start, []) if marker != name] if start != address else []
+        )
+        if start_names:
+            # Zero-size symbols at the object's start (a linker table's __start_x): the C may name the
+            # table by one and reach a field from there. Only field offsets read these; as aliases
+            # they would match any access to the name at any offset inside the object.
+            entry["start_names"] = start_names
         facts.globals.append(entry)
 
     def _step(
@@ -1230,7 +1259,10 @@ class Image:
         mnemonic = instruction.mnemonic
         computed = _computed_value(instruction, operands, values, state.constants)
         if facts is not None:
-            if mnemonic in _ADDI and operands and operands[-1].type == CS_OP_IMM:
+            rooted = self.frame_rooted.get(instruction.address, _SP)
+            frame = {self.decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG} & rooted
+            if mnemonic in _ADDI and operands and operands[-1].type == CS_OP_IMM and not frame:
+                # Frame arithmetic (addi s0, sp, 16) is the frame's (frame_addresses), no field offset.
                 facts.addi_constants.add(operands[-1].imm)
                 source = operands[-2].reg if len(operands) == 3 and operands[-2].type == CS_OP_REG else operands[0].reg
                 if source in relative:
@@ -1240,7 +1272,9 @@ class Image:
                 # The thread pointer used as a value (passed, stored, offset): the current task itself.
                 facts.globals.append(self._thread_pointer(function, instruction.address, 0, "thread_pointer_value"))
             for base, displacement in _memory_references(instruction, operands):
-                facts.memory_offsets.add(displacement)
+                if self.decoder.reg_name(base) not in rooted:
+                    # A frame slot's displacement is the frame's (frame_accesses), no field offset.
+                    facts.memory_offsets.add(displacement)
                 if self.decoder.reg_name(base) == "tp":
                     if self.rules.thread_pointer:
                         facts.globals.append(
@@ -1262,7 +1296,8 @@ class Image:
                         "indexed_access",
                         facts,
                     )
-                    facts.memory_offsets.add(anchored[base] - origin + displacement)
+                    if self.decoder.reg_name(base) not in rooted:
+                        facts.memory_offsets.add(anchored[base] - origin + displacement)
                 elif base in state.choices:
                     # Every path into this load gives the base a known address, but not the same
                     # one: the function reads each of those objects on some path.
@@ -1274,7 +1309,7 @@ class Image:
                             "load_or_store_some_path",
                             facts,
                         )
-                elif base in relative:
+                elif base in relative and self.decoder.reg_name(base) not in rooted:
                     # A base register the code has already added a constant to: the field's offset
                     # from the object the register pointed at is the sum, which a load or store
                     # beyond the reach of a 12-bit displacement is always split into.
@@ -1344,9 +1379,10 @@ class Image:
                 )
         elif derived is not None:
             relative[derived[0]] = derived[1]
-            if facts is not None:
+            names = {self.decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG}
+            if facts is not None and not names & self.frame_rooted.get(instruction.address, _SP):
                 # The code formed "a base plus a constant": the offset of the field it addresses,
-                # which an index added after it would lose.
+                # which an index added after it would lose (not of the frame, which _frame keeps).
                 facts.memory_offsets.add(derived[1])
         self._frame_slot(instruction, operands, state)
 
@@ -1480,54 +1516,104 @@ def _memory_references(instruction: Any, operands: list[Any]) -> list[tuple[int,
     return references
 
 
-def _frame(decoder: Any, instructions: list[Any]) -> tuple[set[tuple[int, int]], set[int], set[tuple[int, int, int]]]:
-    """The frame accesses, the frame addresses, and the frame addresses passed in argument registers
-    to direct calls (the call's address, the argument's position, the offset) of a function, as
-    offsets from the value sp had on entry. The prologue's ``addi sp, sp, -n`` and ``addi s0, sp, m``
-    give each frame register's offset; the saves of callee-saved registers through sp before the frame
-    pointer is set, and the restores at the same offsets, are the frame's own and no local object's.
-    An argument register holds a frame address from the ``addi``/``mv`` that forms it to the next
-    write of it, call, branch or jump (in address order: the setup of a call's arguments)."""
+@dataclass
+class _Frame:
+    """A function's frame facts (``_frame``), and the registers holding a frame address before each
+    instruction (by its address): sp, s0 once the prologue sets it from sp, and the registers an
+    address of the frame was moved into."""
+
+    accesses: set[tuple[int, int]]
+    addresses: set[int]
+    arguments: set[tuple[int, int, int]]
+    indexed: set[tuple[int, int]]
+    rooted: dict[int, frozenset[str]]
+
+
+def _frame(decoder: Any, instructions: list[Any]) -> _Frame:
+    """The frame accesses, the frame addresses, the frame addresses passed in argument registers to
+    calls (the call's address, the argument's position, the offset), and the frame accesses past a
+    variable index of a function, as offsets from the value sp had on entry. The prologue's
+    ``addi sp, sp, -n`` and ``addi s0, sp, m`` give each frame register's offset; the saves of
+    callee-saved registers through sp before the frame pointer is set, and the restores at the same
+    offsets, are the frame's own and no local object's.
+
+    A register holds a frame address from the ``addi``/``mv`` that forms it (``addi s3, s0, -312``
+    for &fbatch.folios[0]; ``addi`` from such a register moves it) to its next write; ``add`` of one
+    and another register holds the address plus a variable index (fbatch.folios[i]). In address
+    order, a call or branch ends that for a caller-saved register (the setup of a call's arguments),
+    not for a callee-saved one, which keeps &object across the calls."""
     deltas: dict[str, int] = {}
     accesses: set[tuple[int, int]] = set()
     addresses: set[int] = set()
     arguments: set[tuple[int, int, int]] = set()
-    held: dict[str, int] = {}  # argument registers holding a frame address
+    indexed_accesses: set[tuple[int, int]] = set()
+    held: dict[str, int] = {}  # registers holding a frame address
+    indexed: dict[str, int] = {}  # registers holding a frame address plus a variable index
     saved: set[int] = set()
+    rooted: dict[int, frozenset[str]] = {}
     for position, instruction in enumerate(instructions):
+        rooted[instruction.address] = frozenset({"sp", *deltas, *held, *indexed})
         operands = list(instruction.operands)
         mnemonic = instruction.mnemonic
         registers = [decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG]
         immediate = next((operand.imm for operand in operands if operand.type == CS_OP_IMM), None)
-        if mnemonic in _DIRECT_CALLS:
+        calls = mnemonic in _DIRECT_CALLS or (mnemonic in _REGISTER_CALLS and _links(decoder, operands))
+        if calls:
             arguments.update(
                 (instruction.address, int(name[1:]), offset) for name, offset in held.items() if name in _ARGUMENTS
             )
-        if mnemonic in _DIRECT_CALLS or mnemonic in _REGISTER_CALLS or mnemonic in _BRANCHES or mnemonic in _ENDS:
+        if calls or mnemonic in _REGISTER_CALLS or mnemonic in _BRANCHES or mnemonic in _ENDS:
             # A callee-saved register keeps &object across calls and branches; the others do not.
             held = {name: offset for name, offset in held.items() if name in _CALLEE_SAVED}
+            indexed = {name: offset for name, offset in indexed.items() if name in _CALLEE_SAVED}
             continue
         written = registers[0] if registers and mnemonic not in _STORE_WIDTHS else None
+        sources = {name: (held.get(name), indexed.get(name)) for name in registers[1:]}
+        if written in ("c.add", "c.mv"):
+            sources[written] = (held.get(written), indexed.get(written))
         if written is not None:
             held.pop(written, None)
+            indexed.pop(written, None)
         if mnemonic.startswith(("addi", "c.addi")) and registers and immediate is not None:
             target, source = registers[0], registers[-1]
             if target == source == "sp" and "sp" not in deltas and immediate < 0:
                 deltas["sp"] = immediate
             elif target == "s0" and source == "sp" and "s0" not in deltas and "sp" in deltas:
                 deltas["s0"] = deltas["sp"] + immediate
-            elif source in deltas and target not in _FRAME_REGISTERS:
+            elif target in _FRAME_REGISTERS or target == "zero" or target == source:
+                pass
+            elif source in deltas:
                 addresses.add(deltas[source] + immediate)
-                if target != "zero":
-                    held[target] = deltas[source] + immediate
+                held[target] = deltas[source] + immediate
+            elif sources.get(source, (None, None))[0] is not None:
+                held[target] = sources[source][0] + immediate
+                addresses.add(held[target])
+            elif sources.get(source, (None, None))[1] is not None:
+                indexed[target] = sources[source][1] + immediate
             continue
         if mnemonic in ("mv", "c.mv") and len(registers) == 2:
-            if registers[1] in deltas:
-                addresses.add(deltas[registers[1]])
-                if registers[0] not in _FRAME_REGISTERS:
-                    held[registers[0]] = deltas[registers[1]]
-            elif registers[1] in held:
-                held[registers[0]] = held[registers[1]]
+            target, source = registers
+            if target in _FRAME_REGISTERS:
+                continue
+            if source in deltas:
+                addresses.add(deltas[source])
+                held[target] = deltas[source]
+            elif source in sources and sources[source][0] is not None:
+                held[target] = sources[source][0]  # type: ignore[assignment]
+            elif source in sources and sources[source][1] is not None:
+                indexed[target] = sources[source][1]  # type: ignore[assignment]
+            continue
+        if mnemonic in ("add", "c.add") and written is not None and written not in _FRAME_REGISTERS:
+            # rd = a frame address + a register: the address plus a variable index.
+            operands_read = registers[1:] if mnemonic == "add" else registers
+            bases = [sources.get(name, (None, None)) for name in operands_read if name not in _FRAME_REGISTERS]
+            known = [held_offset if held_offset is not None else index_offset for held_offset, index_offset in bases]
+            if (
+                len(operands_read) == 2
+                and not set(operands_read) & _FRAME_REGISTERS
+                and sum(value is not None for value in known) == 1
+            ):
+                indexed[written] = next(value for value in known if value is not None)
             continue
         width = _STORE_WIDTHS.get(mnemonic) or _LOAD_WIDTHS.get(mnemonic)
         if width is None:
@@ -1538,7 +1624,13 @@ def _frame(decoder: Any, instructions: list[Any]) -> tuple[set[tuple[int, int]],
             references.append((operands[2].reg, operands[1].imm))
         for base, displacement in references:
             name = decoder.reg_name(base)
+            # A load's destination may be its own base (ld a0, 0(a0)): the base is read before.
+            through, index_through = sources.get(name, (held.get(name), indexed.get(name)))
             if name not in deltas:
+                if through is not None:
+                    accesses.add((through + displacement, width))
+                elif index_through is not None:
+                    indexed_accesses.add((index_through + displacement, width))
                 continue
             offset = deltas[name] + displacement
             value = registers[0] if registers else ""
@@ -1552,7 +1644,7 @@ def _frame(decoder: Any, instructions: list[Any]) -> tuple[set[tuple[int, int]],
                 saved.add(offset)
             else:
                 accesses.add((offset, width))
-    return {item for item in accesses if item[0] not in saved}, addresses, arguments
+    return _Frame({item for item in accesses if item[0] not in saved}, addresses, arguments, indexed_accesses, rooted)
 
 
 def _register_target(operands: list[Any], values: dict[int, int]) -> int | None:
