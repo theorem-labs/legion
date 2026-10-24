@@ -208,7 +208,7 @@ func (e GateEnvelope) InboxRecord() []byte {
 func (r Repo) AddFileOnce(ctx context.Context, branch, path string, data []byte, subject string) (commit string, created bool, err error) {
 	ref := "refs/heads/" + branch
 	lockDeadline := time.Now().Add(refLockWait)
-	builtOn, built := "", ""
+	builtOn, built, lockGone := "", "", false
 	for races := 0; races < inboxWriteAttempts; {
 		if _, err := r.git(ctx, "symbolic-ref", "-q", ref); err == nil {
 			return "", false, fmt.Errorf("%s is a symbolic ref: it must be a branch of its own", ref)
@@ -251,8 +251,15 @@ func (r Repo) AddFileOnce(ctx context.Context, branch, path string, data []byte,
 			return "", false, err
 		}
 		if _, statErr := os.Stat(lock); statErr != nil {
-			return "", false, fmt.Errorf("move %s from %q to %s: %w", ref, tip, built, moveErr)
+			// No lock now. One that its holder released after the failed update is the common case, so try once
+			// more; a second failure with no lock has another cause (such as a branch inbox that blocks inbox/...).
+			if lockGone {
+				return "", false, fmt.Errorf("move %s from %q to %s: %w", ref, tip, built, moveErr)
+			}
+			lockGone = true
+			continue
 		}
+		lockGone = false
 		if time.Now().After(lockDeadline) {
 			return "", false, fmt.Errorf("%s has stayed locked for %s: remove %s if no git process holds it: %w", ref, refLockWait, lock, moveErr)
 		}
