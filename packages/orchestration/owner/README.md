@@ -210,10 +210,12 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    hold.json` of the test deployment): `message-test answer` then pauses with the item claimed and nothing recorded,
    or inside the step runner's completion, its last call (`owner.Runner.Run`, `Ledger.Complete` in `owner/step.go`),
    with the record committed and the follow-up queued and the item open. The paused command writes `held.json` with
-   its PID, the driver kills the pane and SIGKILLs every process under it that names the run, waits until they are
-   gone, and only then releases the hold. The item's state just after the kill (holder, record commit, done) is the
-   moment the kill landed at; the run fails (`kill`) on a kill that landed elsewhere than its schedule set, and on a
-   moment no kill landed at. The report lists each kill's scheduled and landed moment, the item's state and the held
+   its PID. At each kill the driver first stops (SIGSTOP) every process of the pane that names the run and reads the
+   item (holder, record commit, done) while they are stopped and still alive: the supervisor frees a dead owner's
+   leases as soon as it sees its pane gone, so a read after the kill could find no holder. It then kills the pane,
+   SIGKILLs those processes, waits until they are gone, and only then releases the hold. That read is the moment the
+   kill landed at; the run fails (`kill`) on a kill that landed elsewhere than its schedule set, and on a moment no
+   kill landed at. The report lists each kill's scheduled and landed moment, the item's state and the held
    command's PID.
    **Restart.** With the target's pane running, the daemon is stopped (SIGTERM; the panes keep running) and started
    again. The driver then kills the old daemon's pane of the target, and only then enqueues the restart's need, so
