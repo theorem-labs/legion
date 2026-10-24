@@ -77,7 +77,9 @@ decimal has no leading zero, so `@r01` is no item id.
 that the supervisor starts from their ledger queues, and that duplicate notices and items, items out of order, killed
 owner sessions and a supervisor restart leave each step done once (plan Task 1.8). Package `messagetest` drives it:
 
-1. **Setup.** A ledger repository `message-test-<UTC stamp>` in the ledger of the operator deployment's
+1. **Setup.** The run's name is `message-test-<UTC stamp>-<8 random hex digits>`, so that two runs started in the
+   same second share nothing: it names the ledger repository, the daemon's project and tmux socket, and the private
+   bearer directory. A ledger repository of that name in the ledger of the operator deployment's
    `ledger_dsn_file` (the driver is the operator's program: it reads no launch variable, and the supervisor gives the
    same file to the test owners as `LEGION_LEDGER_DSN_FILE`), a bare repository with the test's `skeleton/` files, a
    graph directory with the two nodes' `owners.json`, their `topics.json` moved under `--prefix` (without it, the

@@ -7,6 +7,8 @@ package messagetest
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -105,10 +107,13 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		return Report{}, err
 	}
 	now := time.Now().UTC()
+	run, err := runName(now)
+	if err != nil {
+		return Report{}, err
+	}
 	seed := now.UnixNano()
 	d := &driver{
-		opts: opts, rng: rand.New(rand.NewPCG(uint64(seed), uint64(seed)>>1)),
-		run: "message-test-" + strings.ToLower(now.Format("20060102T150405Z")), root: "skeleton",
+		opts: opts, rng: rand.New(rand.NewPCG(uint64(seed), uint64(seed)>>1)), run: run, root: "skeleton",
 		report: &Report{Prefix: opts.Prefix, Out: opts.Out, Seed: seed, StartedAt: now},
 	}
 	d.report.Run = d.run
@@ -150,6 +155,17 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	}
 	d.logf("report %s: passed %t, %d failures", filepath.Join(opts.Out, "report.md"), d.report.Passed, len(failures))
 	return *d.report, nil
+}
+
+// runName is a run's name: message-test-, its UTC stamp to the second and 8 random hex digits, so that two runs
+// started in the same second share no ledger repository, daemon project, tmux socket, bearer directory or topic. It
+// holds only lowercase letters, digits and hyphens, which each of those names takes as it is.
+func runName(at time.Time) (string, error) {
+	var suffix [4]byte
+	if _, err := cryptorand.Read(suffix[:]); err != nil {
+		return "", fmt.Errorf("draw the run's name: %w", err)
+	}
+	return "message-test-" + strings.ToLower(at.UTC().Format("20060102T150405Z")) + "-" + hex.EncodeToString(suffix[:]), nil
 }
 
 func (o Options) check() error {

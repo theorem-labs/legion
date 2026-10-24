@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -202,8 +203,30 @@ func TestDaemonConfigIsTheMinimalStandingOwnersFile(t *testing.T) {
 }
 
 func TestDaemonSocketIsTheProjectsTmuxServer(t *testing.T) {
-	if got := DaemonSocket("message-test-20261023t180000z"); got != "legion-messagetest20261023t180000z" {
+	if got := DaemonSocket("message-test-20261023t180000z-0a1b2c3d"); got != "legion-messagetest20261023t180000z0a1b2c3d" {
 		t.Fatalf("DaemonSocket = %q", got)
+	}
+}
+
+// A run's name is its UTC stamp and a random suffix, so runs started in the same second differ. It names the ledger
+// repository, the daemon's project, the tmux socket, the private bearer directory and a token of every topic, so it
+// holds only lowercase letters, digits and hyphens: one topic token, one path element, and a project token that
+// keeps the suffix.
+func TestRunNameIsItsStampAndARandomSuffix(t *testing.T) {
+	at := time.Date(2026, 10, 24, 5, 4, 20, 999, time.UTC)
+	names := map[string]bool{}
+	for range 100 {
+		name, err := runName(at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !regexp.MustCompile(`^message-test-20261024t050420z-[0-9a-f]{8}$`).MatchString(name) {
+			t.Fatalf("run name %q is not message-test-<stamp>-<8 hex digits>", name)
+		}
+		if names[DaemonSocket(name)] {
+			t.Fatalf("two runs of one second share the tmux socket %s", DaemonSocket(name))
+		}
+		names[DaemonSocket(name)] = true
 	}
 }
 
