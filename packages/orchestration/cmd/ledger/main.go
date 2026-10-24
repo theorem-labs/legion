@@ -417,6 +417,38 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		value, err := s.Events(ctx, args[0], after, subject)
 		return value, true, err
+	case "create-batch":
+		request, jsonInput, err := requestFile[createBatchRequest](args)
+		if !jsonInput {
+			return nil, true, usagef("create-batch --request-file <json>")
+		}
+		if err != nil {
+			return nil, true, err
+		}
+		batch, created, err := s.CreateBatch(ctx, request.Repo, request.ID, request.Record)
+		return createdBatch{Batch: batch, Created: created}, true, err
+	case "save-batch":
+		request, jsonInput, err := requestFile[saveBatchRequest](args)
+		if !jsonInput {
+			return nil, true, usagef("save-batch --request-file <json>")
+		}
+		if err != nil {
+			return nil, true, err
+		}
+		value, err := s.SaveBatch(ctx, request.Repo, request.ID, request.Record, request.ExpectedVersion)
+		return value, true, err
+	case "batch":
+		if len(args) != 2 {
+			return nil, true, usagef("batch <repo> <id>")
+		}
+		value, err := s.LoadBatch(ctx, args[0], args[1])
+		return value, true, err
+	case "batches":
+		if len(args) != 2 || args[1] != "--active" {
+			return nil, true, usagef("batches <repo> --active")
+		}
+		value, err := s.ListActiveBatches(ctx, args[0])
+		return value, true, err
 	default:
 		return nil, false, usagef("unknown command %q", command)
 	}
@@ -567,6 +599,27 @@ type agreementRequest struct {
 	ID      string           `json:"id"`
 	Parties []string         `json:"parties"`
 	Reads   map[string]int64 `json:"reads"`
+}
+
+// createBatchRequest is create-batch's --request-file. record is the landing program's batch record, stored as sent.
+type createBatchRequest struct {
+	Repo   string          `json:"repo"`
+	ID     string          `json:"id"`
+	Record json.RawMessage `json:"record"`
+}
+
+// saveBatchRequest is save-batch's --request-file: the new record and the record version the caller read.
+type saveBatchRequest struct {
+	Repo            string          `json:"repo"`
+	ID              string          `json:"id"`
+	Record          json.RawMessage `json:"record"`
+	ExpectedVersion int64           `json:"expected_version"`
+}
+
+// createdBatch is what create-batch prints: the stored batch, and whether this call created it.
+type createdBatch struct {
+	Batch   ledger.Batch `json:"batch"`
+	Created bool         `json:"created"`
 }
 
 func requestFile[T any](args []string) (T, bool, error) {
