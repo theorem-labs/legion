@@ -27,12 +27,14 @@ type pane struct {
 }
 
 // ownerPanes lists the panes on the tmux socket whose process tree holds LEGION_OWNER, by owner. A socket with no
-// server has none.
+// server has none, and so does a server with no session yet, which tmux answers with "no current target": the
+// supervisor's private server is up before its first owner's session exists.
 func ownerPanes(ctx context.Context, socket string) (map[string]pane, error) {
 	out, err := exec.CommandContext(ctx, "tmux", "-L", socket, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").CombinedOutput()
 	if err != nil {
 		text := string(out)
-		if strings.Contains(text, "no server running") || strings.Contains(text, "error connecting") || strings.Contains(text, "No such file") {
+		if strings.Contains(text, "no server running") || strings.Contains(text, "error connecting") || strings.Contains(text, "No such file") ||
+			strings.Contains(text, "no current target") {
 			return map[string]pane{}, nil
 		}
 		return nil, fmt.Errorf("tmux -L %s list-panes: %w: %s", socket, err, bytes.TrimSpace(out))
