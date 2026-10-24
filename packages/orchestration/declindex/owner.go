@@ -212,8 +212,9 @@ func (o *ownerResolver) closure(module string) (map[string]bool, error) {
 // modules that the registry's forms import): within a group, no name is declared by two of the modules that the
 // group's modules and base import, as Lean refuses such an environment. A module whose imports clash with base's
 // goes into a group of apart, to be read without base. A project that declares no name twice gives one group.
-// Names that Lean made (madeByLean) are left out: they are unique to their module, or no constant at all. clashing
-// are the names that more than one module declares.
+// Every declaration that a reference file records counts, also a name with a component that starts with `_`: a
+// user can write one (`_Value`), and the names that Lean makes there hold their module (`_private.M.0.x`,
+// `_aux_M_…`), so no two modules declare them. clashing are the names that more than one module declares.
 func exportGroups(ctx context.Context, q querier, modules, base []string) (groups, apart [][]string, clashing map[string]bool, err error) {
 	all, err := allDeclaring(ctx, q)
 	if err != nil {
@@ -223,7 +224,7 @@ func exportGroups(ctx context.Context, q querier, modules, base []string) (group
 	twice := map[string][]string{}
 	clashing = map[string]bool{}
 	for n, ms := range all {
-		if len(ms) > 1 && !madeByLean(n) {
+		if len(ms) > 1 {
 			clashing[n] = true
 			for _, m := range ms {
 				twice[m] = append(twice[m], n)

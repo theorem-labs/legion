@@ -144,6 +144,39 @@ func TestTheGateHashesAConstantWithItsModule(t *testing.T) {
 	}
 }
 
+// A name whose source writes it with a leading `_` is a declaration like any other: two modules that each declare
+// `_Value` are never imported together, and a refresh with the compiled part reads them in two exporter groups, as
+// it reads two modules that each declare `Value`.
+func TestTwoModulesThatEachDeclareAnUnderscoreNameAreReadApart(t *testing.T) {
+	requireLake(t)
+	ctx := context.Background()
+	lean, err := declindex.FindLean(ctx, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "tree")
+	for _, m := range []struct{ name, source string }{
+		{"A", "def _Value : Nat := 1\ndef Original : Nat := _Value\n"},
+		{"B", "def _Value : Nat := 2\n"},
+	} {
+		writeTestFile(t, filepath.Join(tree, m.name+".lean"), m.source)
+		if err := declindex.CompileModule(ctx, lean, nil, tree, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	config := filepath.Join(dir, "index.yaml")
+	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B]\nlean:\n  export: true\n  jobs: 1\n")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 || !strings.Contains(r.errOut, "2 of 2 module groups") {
+		t.Fatalf("refresh with the compiled part: want exit 0 after two exporter groups, got %+v", r)
+	}
+	var where []declindex.Found
+	decode(t, invoke(t, "--config", config, "--json", "where", "_Value"), &where)
+	if len(where) != 2 || where[0].Module != "A" || where[1].Module != "B" {
+		t.Fatalf("where _Value: %+v; want A's and B's declarations", where)
+	}
+}
+
 // decode reads a command's JSON output into v, failing the test unless the command exited 0.
 func decode(t *testing.T, r result, v any) {
 	t.Helper()
