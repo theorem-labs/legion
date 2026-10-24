@@ -92,15 +92,47 @@ func (s tmuxServer) command(ctx context.Context, args ...string) *exec.Cmd {
 	return command
 }
 
+// tmuxExiting is what tmux says when the server closes the client's connection unanswered. An exiting server does so
+// to each new connection until its last client has left (server_accept in tmux 3.4's server.c), and kill-server
+// returns before that: such a server has no pane, and it is stopped.
+const tmuxExiting = "server exited unexpectedly"
+
+// tmuxExitWait bounds how long a command asks an exiting server again, every tmuxExitPoll, until its socket refuses.
+const (
+	tmuxExitWait = time.Second
+	tmuxExitPoll = 20 * time.Millisecond
+)
+
+// combinedOutput runs `tmux -L <socket> args...` and returns its output. The answer of an exiting server (tmuxExiting)
+// is asked again until the socket refuses or a server answers, for up to tmuxExitWait; exiting reports that the last
+// answer was still that one. Any other error is returned as tmux gave it.
+func (s tmuxServer) combinedOutput(ctx context.Context, args ...string) (out []byte, exiting bool, err error) {
+	deadline := time.Now().Add(tmuxExitWait)
+	for {
+		out, err = s.command(ctx, args...).CombinedOutput()
+		if err == nil || !bytes.Contains(out, []byte(tmuxExiting)) {
+			return out, false, err
+		}
+		if !time.Now().Before(deadline) {
+			return out, true, err
+		}
+		select {
+		case <-ctx.Done():
+			return out, true, err
+		case <-time.After(tmuxExitPoll):
+		}
+	}
+}
+
 // ownerPanes lists the panes of the server whose process tree holds LEGION_OWNER, by owner. A socket with no server
-// has none, and so does a server with no session yet, which tmux answers with "no current target": the supervisor's
-// private server is up before its first owner's session exists.
+// has none, and so does an exiting server (combinedOutput), and a server with no session yet, which tmux answers with
+// "no current target": the supervisor's private server is up before its first owner's session exists.
 func (s tmuxServer) ownerPanes(ctx context.Context) (map[string]pane, error) {
-	out, err := s.command(ctx, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").CombinedOutput()
+	out, exiting, err := s.combinedOutput(ctx, "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}")
 	if err != nil {
 		text := string(out)
-		if strings.Contains(text, "no server running") || strings.Contains(text, "error connecting") || strings.Contains(text, "No such file") ||
-			strings.Contains(text, "no current target") {
+		if exiting || strings.Contains(text, "no server running") || strings.Contains(text, "error connecting") ||
+			strings.Contains(text, "No such file") || strings.Contains(text, "no current target") {
 			return map[string]pane{}, nil
 		}
 		return nil, fmt.Errorf("tmux -L %s list-panes: %w: %s", s.socket, err, bytes.TrimSpace(out))
@@ -186,10 +218,11 @@ func (s tmuxServer) killPane(ctx context.Context, id string) error {
 	return nil
 }
 
-// killServer stops every pane of the server; a socket with no server is already stopped.
+// killServer stops every pane of the server; a socket with no server, or an exiting server (combinedOutput), is already
+// stopped.
 func (s tmuxServer) killServer(ctx context.Context) error {
-	out, err := s.command(ctx, "kill-server").CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "no server running") && !strings.Contains(string(out), "error connecting") {
+	out, exiting, err := s.combinedOutput(ctx, "kill-server")
+	if err != nil && !exiting && !strings.Contains(string(out), "no server running") && !strings.Contains(string(out), "error connecting") {
 		return fmt.Errorf("tmux -L %s kill-server: %w: %s", s.socket, err, bytes.TrimSpace(out))
 	}
 	return nil
