@@ -129,16 +129,16 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 	args = args[1:]
 	switch command {
 	case "repo":
-		if len(args) < 3 || args[0] != "ensure" {
-			return nil, false, usagef(repoEnsureUsage)
+		if len(args) < 3 || args[0] != "ensure" || (len(args) != 3 && (len(args) != 5 || args[3] != "--upstream-owner")) {
+			return nil, false, usagef("repo ensure <repo> <max-rounds> [--upstream-owner <name>]")
 		}
 		limit, err := roundLimit(args[2])
 		if err != nil {
 			return nil, false, err
 		}
-		options, err := parseRepoFlags(args[3:])
-		if err != nil {
-			return nil, false, err
+		options := []ledger.EnsureRepoOption{}
+		if len(args) == 5 {
+			options = append(options, ledger.WithUpstreamOwner(args[4]))
 		}
 		return mutation(s.EnsureRepo(ctx, args[1], limit, options...))
 	case "enqueue":
@@ -693,42 +693,6 @@ func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
 		request.Changed = []string{}
 	}
 	return request, nil
-}
-
-const repoEnsureUsage = "repo ensure <repo> <max-rounds> [--upstream-owner <name>] [--escalation-owner <owner>]..."
-
-// parseRepoFlags reads repo ensure's configuration. --upstream-owner is given at most once; --escalation-owner may
-// repeat, its values replace the stored set, and one empty value alone clears it.
-func parseRepoFlags(args []string) ([]ledger.EnsureRepoOption, error) {
-	options := []ledger.EnsureRepoOption{}
-	sawUpstream := false
-	var escalationOwners []string
-	for len(args) > 0 {
-		if len(args) < 2 {
-			return nil, usagef(repoEnsureUsage)
-		}
-		flag, value := args[0], args[1]
-		args = args[2:]
-		switch flag {
-		case "--upstream-owner":
-			if sawUpstream {
-				return nil, usagef("repo ensure takes --upstream-owner at most once")
-			}
-			sawUpstream = true
-			options = append(options, ledger.WithUpstreamOwner(value))
-		case "--escalation-owner":
-			escalationOwners = append(escalationOwners, value)
-		default:
-			return nil, usagef(repoEnsureUsage)
-		}
-	}
-	switch {
-	case len(escalationOwners) == 1 && escalationOwners[0] == "":
-		options = append(options, ledger.WithEscalationOwners())
-	case escalationOwners != nil:
-		options = append(options, ledger.WithEscalationOwners(escalationOwners...))
-	}
-	return options, nil
 }
 
 func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
