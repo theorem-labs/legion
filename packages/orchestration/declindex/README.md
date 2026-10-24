@@ -146,7 +146,7 @@ On exit 0, each requested name produces one line in request order:
 name<TAB>hash<TAB>path
 ```
 
-The `hash` is the 16-hex text statement hash and `path` is the repository-relative declaration path. An absent declaration is `name<TAB>absent<TAB>-`; an ambiguous declaration is `name<TAB>ambiguous<TAB><sorted,comma-joined paths>`. Exit 3 writes no stdout when the request, Git tree, source snapshot, candidate build, trace, or parsed declaration is unusable, or when a path that an answer line prints contains a tab, carriage return, newline, or comma. Such a character in a source path that no answer prints does not affect the call. Exit 2 is a usage error.
+The `hash` is the 16-hex text statement hash and `path` is the repository-relative declaration path. The hash is the first 16 hex digits of the SHA-256 of the declaration's statement as written (a theorem's signature, a definition's whole text), with comments dropped and each run of white space between tokens collapsed to one space; a string or character literal keeps its own white space. An absent declaration is `name<TAB>absent<TAB>-`; an ambiguous declaration is `name<TAB>ambiguous<TAB><sorted,comma-joined paths>`. Exit 3 writes no stdout when the request, Git tree, source snapshot, candidate build, trace, or parsed declaration is unusable, or when a path that an answer line prints contains a tab, carriage return, newline, or comma. Such a character in a source path that no answer prints does not affect the call. Exit 2 is a usage error.
 
 ### `ledger`
 

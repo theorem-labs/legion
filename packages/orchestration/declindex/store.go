@@ -22,9 +22,10 @@ import (
 	_ "modernc.org/sqlite" // the database/sql driver "sqlite"
 )
 
-// SchemaVersion changes whenever what an index holds changes: a table, a column, or a meta key that a reader needs.
-// An index of another version is rebuilt from nothing (Open), and OpenReadOnly refuses it.
-const SchemaVersion = "4"
+// SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
+// how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
+// OpenReadOnly refuses it.
+const SchemaVersion = "5"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
