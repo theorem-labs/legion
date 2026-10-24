@@ -34,6 +34,38 @@ func landRequest(m ledger.Migration, commit string, paths []string, current, cha
 	return request
 }
 
+// TestCheckListsEveryViolationWhenAContractReadIsStale catches a stale contract read that hides the candidate's other
+// violations: check reports the stale read, the undeclared contract and the pinned contract together, and land refuses
+// with the first of them.
+func TestCheckListsEveryViolationWhenAContractReadIsStale(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	must(s.RegisterContract(ctx, "r", "Stale", "alice", "hash-1", false))
+	must(s.RegisterContract(ctx, "r", "Pinned", "alice", "hash-1", true))
+	must(s.RegisterContract(ctx, "r", "Undeclared", "alice", "hash-1", false))
+	reads := map[string]string{"Stale": "hash-1", "Pinned": "hash-1"}
+	m := must(open(t, s, "M-1", "alice", []string{"a.lean"}, reads))
+	writer := must(open(t, s, "M-writer", "alice", []string{"w.lean"}, map[string]string{"Stale": "hash-1"}))
+	must(s.Land(ctx, landRequest(writer, "writer", []string{"w.lean"}, map[string]string{"Stale": "hash-1"},
+		map[string]string{"Stale": "hash-2"}, nil)))
+
+	request := landRequest(m, "commit-1", []string{"a.lean"}, reads,
+		map[string]string{"Pinned": "hash-2", "Undeclared": "hash-2"}, nil)
+	res := must(s.Check(ctx, checkRequestFor(request)))
+	kinds := make([]string, 0, len(res.Violations))
+	for _, v := range res.Violations {
+		kinds = append(kinds, v.Kind)
+	}
+	want := []string{ledger.ReasonStaleRead, ledger.ReasonPinned, ledger.ReasonUndeclaredContract}
+	if res.Pass || !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("check violations %v, want %v: %+v", kinds, want, res)
+	}
+	refusal := wantRefusal(t, landError(s, request), ledger.ReasonStaleRead)
+	if refusal.Message != res.Violations[0].Message {
+		t.Fatalf("land refused with %q, check's first violation says %q", refusal.Message, res.Violations[0].Message)
+	}
+}
+
 func TestRegisterContractAndReadBack(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
