@@ -10,39 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Kinds of check violation. Any violation means the candidate must not land.
-const (
-	ViolationNotOpen            = "not_open"            // the migration has landed or been abandoned
-	ViolationStaleGeneration    = "stale_generation"    // the candidate comes from a generation that was taken over
-	ViolationEscalated          = "escalated"           // it used up its landing rounds; the steward decides first
-	ViolationInvalidCandidate   = "invalid_candidate"   // candidate metadata cannot describe a complete landing
-	ViolationUndeclaredWrite    = "undeclared_write"    // a changed path outside the declared writes
-	ViolationStaleRead          = "stale_read"          // a read's statement hash changed, or the statement is gone
-	ViolationUnverifiedRead     = "unverified_read"     // no current hash was supplied for a read, so it cannot be decided
-	ViolationOverlap            = "overlap"             // the declared writes overlap another open migration's
-	ViolationUndeclaredContract = "undeclared_contract" // a changed contract was not a declared read
-	ViolationPinned             = "pinned"              // a pinned contract change lacks a person's approval
-	// A changed registered contract has neither a compatibility proof nor an agent's review at the candidate's head.
-	ViolationStatementUnreviewed = "statement_unreviewed"
-	// A migration that is not owned by the configured upstream owner carries upstream provenance.
-	ViolationUpstreamNotAllowed = "upstream_not_allowed"
-)
-
-var violationKinds = [...]string{
-	ViolationNotOpen,
-	ViolationStaleGeneration,
-	ViolationEscalated,
-	ViolationInvalidCandidate,
-	ViolationUndeclaredWrite,
-	ViolationStaleRead,
-	ViolationUnverifiedRead,
-	ViolationOverlap,
-	ViolationUndeclaredContract,
-	ViolationPinned,
-	ViolationStatementUnreviewed,
-	ViolationUpstreamNotAllowed,
-}
-
 // Check outcomes classify a complete pass, a refusal, or a pre-build check with deferred reads.
 const (
 	CheckOutcomePass       = "pass"
@@ -75,7 +42,8 @@ type CheckRequest struct {
 	Upstream           string            `json:"upstream"`
 }
 
-// Violation is one reason a candidate must not land.
+// Violation is one reason a candidate must not land. Kind is the refusal reason (a Reason constant) that Land gives for
+// it.
 type Violation struct {
 	Kind     string `json:"kind"`
 	Path     string `json:"path,omitempty"`
@@ -210,38 +178,12 @@ func statementViolations(ctx context.Context, q querier, m Migration, req CheckR
 	if why == "" {
 		return nil, nil
 	}
-	return []Violation{{Kind: ViolationStatementUnreviewed, Name: missing[0], Message: why}}, nil
+	return []Violation{{Kind: ReasonStatementUnreviewed, Name: missing[0], Message: why}}, nil
 }
 
+// refusalForViolation is the refusal Land gives for a violation: a violation's kind is its refusal reason.
 func refusalForViolation(v Violation) error {
-	switch v.Kind {
-	case ViolationNotOpen:
-		return refuse(ReasonNotOpen, "%s", v.Message)
-	case ViolationStaleGeneration:
-		return refuse(ReasonStaleGeneration, "%s", v.Message)
-	case ViolationEscalated:
-		return refuse(ReasonEscalated, "%s", v.Message)
-	case ViolationInvalidCandidate:
-		return refuse(ReasonInvalidCandidate, "%s", v.Message)
-	case ViolationUndeclaredWrite:
-		return refuse(ReasonUndeclaredWrite, "%s", v.Message)
-	case ViolationStaleRead:
-		return refuse(ReasonStaleRead, "%s", v.Message)
-	case ViolationUnverifiedRead:
-		return refuse(ReasonUnverifiedRead, "%s", v.Message)
-	case ViolationOverlap:
-		return refuse(ReasonOverlap, "%s", v.Message)
-	case ViolationUndeclaredContract:
-		return refuse(ReasonUndeclaredContract, "%s", v.Message)
-	case ViolationPinned:
-		return refuse(ReasonPinned, "%s", v.Message)
-	case ViolationUpstreamNotAllowed:
-		return refuse(ReasonUpstreamNotAllowed, "%s", v.Message)
-	case ViolationStatementUnreviewed:
-		return refuse(ReasonStatementUnreviewed, "%s", v.Message)
-	default:
-		return fmt.Errorf("unmapped violation kind %q", v.Kind)
-	}
+	return &Refusal{Reason: v.Kind, Message: v.Message}
 }
 
 func contractReadsAtVersions(ctx context.Context, tx pgx.Tx, repo string, migration Migration) (map[string]Contract, error) {
@@ -288,7 +230,7 @@ func checkContractViolations(ctx context.Context, tx pgx.Tx, migration Migration
 		if err != nil {
 			var refusal *Refusal
 			if errors.As(err, &refusal) && refusal.Reason == ReasonStaleRead {
-				return []Violation{{Kind: ViolationStaleRead, Message: refusal.Message}}, nil
+				return []Violation{{Kind: ReasonStaleRead, Message: refusal.Message}}, nil
 			}
 			return nil, err
 		}
@@ -297,7 +239,7 @@ func checkContractViolations(ctx context.Context, tx pgx.Tx, migration Migration
 	for _, name := range sortedNames(req.ChangedContracts) {
 		recorded, declared := migration.ReadVersions[name]
 		if !declared {
-			violations = append(violations, Violation{Kind: ViolationUndeclaredContract, Name: name,
+			violations = append(violations, Violation{Kind: ReasonUndeclaredContract, Name: name,
 				Message: fmt.Sprintf("migration %s did not declare contract %s as a read", migration.ID, name)})
 			continue
 		}
@@ -314,20 +256,20 @@ func checkContractViolations(ctx context.Context, tx pgx.Tx, migration Migration
 			}
 		} else {
 			if recorded == nil {
-				violations = append(violations, Violation{Kind: ViolationStaleRead, Name: name,
+				violations = append(violations, Violation{Kind: ReasonStaleRead, Name: name,
 					Message: fmt.Sprintf("migration %s did not record a contract version for %s", migration.ID, name)})
 				continue
 			}
 			current = contracts[name]
 			if current.Name == "" {
-				violations = append(violations, Violation{Kind: ViolationStaleRead, Name: name,
+				violations = append(violations, Violation{Kind: ReasonStaleRead, Name: name,
 					Message: fmt.Sprintf("migration %s did not read current contract %s", migration.ID, name)})
 				continue
 			}
 		}
 		if current.Pinned {
 			if _, ok := approved[name]; !ok {
-				violations = append(violations, Violation{Kind: ViolationPinned, Name: name,
+				violations = append(violations, Violation{Kind: ReasonPinned, Name: name,
 					Message: fmt.Sprintf("contract %s is pinned; a person must approve its change", name)})
 			}
 		}
@@ -355,7 +297,7 @@ func candidatePrecondition(req CheckRequest) (Violation, bool) {
 	if message == "" {
 		return Violation{}, false
 	}
-	return Violation{Kind: ViolationInvalidCandidate, Message: message}, true
+	return Violation{Kind: ReasonInvalidCandidate, Message: message}, true
 }
 
 // cleanCheckRequest validates and normalizes candidate paths before they are compared to declared writes, and
@@ -382,15 +324,15 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 	var violations []Violation
 	add := func(v Violation) { violations = append(violations, v) }
 	if m.State != StateOpen {
-		add(Violation{Kind: ViolationNotOpen, Message: fmt.Sprintf("migration %s is %s", m.ID, m.State)})
+		add(Violation{Kind: ReasonNotOpen, Message: fmt.Sprintf("migration %s is %s", m.ID, m.State)})
 	}
 	if req.Generation != m.Generation {
-		add(Violation{Kind: ViolationStaleGeneration, Message: fmt.Sprintf(
+		add(Violation{Kind: ReasonStaleGeneration, Message: fmt.Sprintf(
 			"candidate is from generation %d; migration %s is at generation %d (owner %s)",
 			req.Generation, m.ID, m.Generation, m.Owner)})
 	}
 	if m.EscalatedAt != nil {
-		add(Violation{Kind: ViolationEscalated, Message: fmt.Sprintf(
+		add(Violation{Kind: ReasonEscalated, Message: fmt.Sprintf(
 			"migration %s was escalated to the steward: %s", m.ID, m.EscalationReason)})
 	}
 	ours, err := migrationWrites(ctx, q, req.Repo, req.ID)
@@ -405,7 +347,7 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 		if coveredBy(ours, path) {
 			continue
 		}
-		v := Violation{Kind: ViolationUndeclaredWrite, Path: path,
+		v := Violation{Kind: ReasonUndeclaredWrite, Path: path,
 			Message: fmt.Sprintf("%s is outside migration %s's declared writes", path, m.ID)}
 		if other := holderOf(sets, path); other != "" {
 			v.Other = other
@@ -420,13 +362,13 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 			current, ok := req.Current[name]
 			switch {
 			case !ok:
-				add(Violation{Kind: ViolationUnverifiedRead, Name: name, Recorded: recorded,
+				add(Violation{Kind: ReasonUnverifiedRead, Name: name, Recorded: recorded,
 					Message: fmt.Sprintf("no current hash for read %s, so it cannot be checked", name)})
 			case current == "":
-				add(Violation{Kind: ViolationStaleRead, Name: name, Recorded: recorded,
+				add(Violation{Kind: ReasonStaleRead, Name: name, Recorded: recorded,
 					Message: fmt.Sprintf("read %s no longer exists (recorded hash %s)", name, recorded)})
 			case current != recorded:
-				add(Violation{Kind: ViolationStaleRead, Name: name, Recorded: recorded, Current: current,
+				add(Violation{Kind: ReasonStaleRead, Name: name, Recorded: recorded, Current: current,
 					Message: fmt.Sprintf("read %s changed: recorded %s, now %s", name, recorded, current)})
 			}
 		}
@@ -439,7 +381,7 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 		sort.Strings(ids)
 		for _, id := range ids {
 			for _, clash := range clashes(ours, sets[id]) {
-				add(Violation{Kind: ViolationOverlap, Path: clash.Ours, Other: id,
+				add(Violation{Kind: ReasonOverlap, Path: clash.Ours, Other: id,
 					Message: fmt.Sprintf("declared %s overlaps open migration %s's %s", clash.Ours, id, clash.Theirs)})
 			}
 		}
@@ -453,12 +395,12 @@ func upstreamViolation(repository Repository, migration Migration, upstream stri
 	}
 	if repository.UpstreamOwner == "" {
 		return Violation{
-			Kind:    ViolationUpstreamNotAllowed,
+			Kind:    ReasonUpstreamNotAllowed,
 			Message: fmt.Sprintf("repository %s has no configured upstream owner", repository.Name),
 		}, true
 	}
 	return Violation{
-		Kind: ViolationUpstreamNotAllowed,
+		Kind: ReasonUpstreamNotAllowed,
 		Message: fmt.Sprintf("migration %s is owned by %s, not repository %s's upstream owner %s",
 			migration.ID, migration.Owner, repository.Name, repository.UpstreamOwner),
 	}, true

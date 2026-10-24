@@ -748,7 +748,7 @@ func TestCheckReportsAStatementChangeWithNeitherRecordBeforeLand(t *testing.T) {
 			continue
 		}
 		v := res.Violations[0]
-		if v.Kind != ledger.ViolationStatementUnreviewed || v.Name != "C" {
+		if v.Kind != ledger.ReasonStatementUnreviewed || v.Name != "C" {
 			t.Errorf("%s: violation %+v", unreviewed.name, v)
 		}
 		for _, want := range []string{"contract C", "compatibility proof", "review", unreviewed.names} {
@@ -764,7 +764,7 @@ func TestCheckReportsAStatementChangeWithNeitherRecordBeforeLand(t *testing.T) {
 		{"Spec.C_compat", ""},
 		{"", "head-1"},
 	} {
-		if res := check(changeC, "", noHead.proof, noHead.reviewed); !hasViolation(res, ledger.ViolationInvalidCandidate) {
+		if res := check(changeC, "", noHead.proof, noHead.reviewed); !hasViolation(res, ledger.ReasonInvalidCandidate) {
 			t.Errorf("missing head with proof %q and review %q: %+v", noHead.proof, noHead.reviewed, res)
 		}
 	}
@@ -784,7 +784,7 @@ func TestCheckReportsAStatementChangeWithNeitherRecordBeforeLand(t *testing.T) {
 	// Only a changed read that is a registered contract is a statement change; Land refuses the others for
 	// their own reasons.
 	for _, other := range []map[string]string{{"X.external": "x2"}, {"D": "hash-d2"}} {
-		if res := check(other, "head-1", "", ""); hasViolation(res, ledger.ViolationStatementUnreviewed) {
+		if res := check(other, "head-1", "", ""); hasViolation(res, ledger.ReasonStatementUnreviewed) {
 			t.Errorf("change %v is not a changed registered read: %+v", other, res)
 		}
 	}
