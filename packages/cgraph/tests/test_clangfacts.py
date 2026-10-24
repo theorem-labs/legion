@@ -224,7 +224,7 @@ def test_negative_access_field_size_keeps_its_layout_error() -> None:
     walk.x = Extractor()
     walk.events = {"accesses": [], "field_accesses": [], "unevaluated": []}
     walk.conditional = 0
-    walk.fields, walk.inner, walk.addressed = [], set(), set()
+    walk.fields, walk.inner, walk.addressed, walk.held_addresses = [], set(), set(), []
     # The member chain's address, as the walk records it at the chain's top.
     walk.field_address = {Where.hash: (clangfacts._Address(32, "pointer"), False)}
     walk.add_access(

@@ -3,6 +3,7 @@ and the values call arguments pass, as link reads them at a fold (link._bind).""
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 from typing import Any
 
@@ -733,3 +734,80 @@ def test_an_argument_that_names_a_global_gives_the_lines_it_spans(tmp_path: Path
         [first + 3, first + 3],
         [first + 4, first + 4],
     ]
+
+
+def fold(facts: dict[str, Any], *chain: str) -> link.Effective:
+    """The events of the last function of ``chain`` inside the first: each call along the chain folded
+    with the arguments it passes, as link folds inline helpers (link._bind)."""
+    record = facts["functions"][chain[-1]]
+    table = record.get("guards", [])
+    events = {kind: link._resolved(record["events"][kind], table) for kind in ("calls", *link._EVENT_LISTS)}
+    folded = link.Effective(**events)
+    for caller, callee in reversed(list(itertools.pairwise(chain))):
+        (call,) = [item for item in facts["functions"][caller]["events"]["calls"] if item["callee"] == callee]
+        folded = link._bind(folded, call["arguments"])
+    return folded
+
+
+BY_VALUE = """
+    struct params { unsigned short len; unsigned short offset; long (*fn)(long, unsigned int); };
+    struct table { long pad[2]; struct params p; };
+    static struct table tab;
+    static const struct params tab_params = { .len = 8, .offset = 4 };
+    long other_hash(long x);
+    static inline long hash(struct table *t, long x, const struct params params)
+    {
+        return __builtin_expect(!!(params.fn), 1) ? params.fn(x, params.len ?: t->p.len) : other_hash(x + params.offset);
+    }
+    static inline long mid(struct table *t, long x, const struct params params) { return hash(t, x, params); }
+    long add(long x) { return mid(&tab, x, tab_params); }
+    long add_given(struct table *t, long x, struct params given) { return mid(t, x, given); }
+"""
+
+
+def test_a_member_of_a_struct_passed_by_value_guards_and_a_const_global_struct_decides_it(tmp_path: Path) -> None:
+    """rht_head_hashfn: `likely(params.obj_hashfn) ? …params.obj_hashfn(ptr, params.key_len ?: ht->p.key_len,
+    …) : rht_key_hashfn(…, ptr + params.key_offset, params)`; pidfs_add_pid passes the static const
+    pidfs_ino_ht_params, whose obj_hashfn is NULL (llvm-objdump of add: addi a0, a0, 0x4; tail other_hash)."""
+    facts = facts_of(tmp_path, BY_VALUE)
+    added = fold(facts, "add", "mid", "hash")
+    assert "len" not in {item["field"] for item in added.field_accesses}
+    assert ({call["callee"] for call in added.calls}, added.indirect) == ({"other_hash"}, [])
+    given = fold(facts, "add_given", "mid", "hash")
+    assert ("len", 16) in {(item["field"], item["displacement"]) for item in given.field_accesses}
+    assert [item["field"] for item in given.indirect] == ["fn"]
+
+
+ADDRESS = """
+    struct vp { long a; long rm; long rm2; };
+    struct mg { int del; int nxt; long v; long w; };
+    static inline void prep(struct vp *p, struct mg *m)
+    {
+        long *r = &p->rm;
+        if (m && m->del) {
+            *r = m->v;
+            r = &p->rm2;
+        }
+        if (m && m->nxt)
+            *r = m->w;
+    }
+    static inline void either(struct vp *p, int k) { long *r = &p->rm; if (k == 1) *r = 1; if (k == 2) *r = 2; }
+    static inline void always(struct vp *p, struct mg *m) { long *r = &p->rm; if (m && m->del) *r = m->v; *r += 1; }
+"""
+
+
+def test_an_address_a_local_holds_is_formed_only_where_a_read_of_the_local_is_compiled(tmp_path: Path) -> None:
+    """init_multi_vma_prep: `remove = &vp->remove;`, read only under `vmg && vmg->__remove_middle` or
+    `vmg && vmg->__remove_next`; init_vma_prep passes vmg NULL, so vma_shrink forms no &vp->remove."""
+    facts = facts_of(tmp_path, ADDRESS)
+
+    def rm_guards(function: str) -> list[dict[str, Any]]:
+        record = facts["functions"][function]
+        (rm,) = [item for item in record["events"]["field_accesses"] if item["field"] == "rm"]
+        return [record["guards"][index] for index in rm.get("guards", [])]
+
+    assert link._decided(rm_guards("prep"), [unknown(), constant(0)]) is None
+    assert link._decided(rm_guards("prep"), [unknown(), unknown()]) is not None
+    assert link._decided(rm_guards("either"), [unknown(), constant(3)]) is None
+    assert link._decided(rm_guards("either"), [unknown(), constant(2)]) == []
+    assert link._decided(rm_guards("always"), [unknown(), constant(0)]) == []

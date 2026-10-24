@@ -215,9 +215,15 @@ These rules follow what the machine code shows, each only where it shows it:
   it may take agrees, and an `==` or `!=` between two reads of one value is decided whatever that
   value is: a pointer local set once (by its initializer or one assignment no loop or label repeats)
   whose value the facts cannot state is named `{"v": name}` (switch_hrtimer_base's new_cpu_base is
-  this_cpu_base whichever store set it). A call argument gives the value it passes (`expr`: a
-  constant, a choice, a named value, or an expression on the caller's own parameters, at each
-  type's width). At a
+  this_cpu_base whichever store set it). A member of a struct passed by value is the parameter's member
+  (rht_head_hashfn's `likely(params.obj_hashfn)`), and a const global struct passed by value gives
+  the members its initializer states, every other one 0 (fs/pidfs.c's `pidfs_ino_ht_params`, whose
+  `obj_hashfn` is NULL). A member's address that a local holds (`remove = &vp->remove`) is formed only
+  where a read of the local is compiled: its access is under the guards those reads share and, where
+  they differ, a guard that one read's guards all hold (init_vma_prep passes NULL to every
+  `vmg && …` before a read of `remove`). A call argument gives the value it passes (`expr`: a
+  constant, a choice, a named value, a struct, or an expression on the caller's own parameters, at
+  each type's width). At a
   fold, link puts the arguments in; a call or an access a guard decides against becomes `unevaluated`
   with reason `constant_argument` (an exclusion), other events are dropped, and the guards still open
   carry up to the next fold.

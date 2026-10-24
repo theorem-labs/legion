@@ -1708,6 +1708,16 @@ def _integer_type(typ: ci.Type) -> dict[str, Any] | None:
     return None
 
 
+def _is_record(typ: ci.Type) -> bool:
+    return bool(typ.get_canonical().kind == TK.RECORD)
+
+
+def _is_struct(expression: dict[str, Any]) -> bool:
+    """An expression of a struct value (expressions: a parameter passed by value, a member that is a
+    struct, a constant struct), which carries no integer type."""
+    return "struct" in expression or ("w" not in expression and ("p" in expression or expression.get("op") == "."))
+
+
 # CXBinaryOperatorKind AndAssign, XorAssign, OrAssign: a variable they change holds a few values.
 _COMBINING = {30: "&", 31: "^", 32: "|"}
 # A variable changed by more combining assignments than this holds too many values to state.
@@ -1718,6 +1728,8 @@ _TEMPLATE_NODES = 256
 # The nesting of an expression the facts state, at most: IS_ERR's
 # __builtin_expect(!!((unsigned long)(void *)(ptr) >= (unsigned long)-MAX_ERRNO), 0) is 12 deep.
 _EXPRESSION_DEPTH = 48
+# A constant struct with more scalar members than this is not stated (expressions: ``{"struct": …}``).
+_STRUCT_MEMBERS = 64
 # A template refuses a label or a jump: the returns then take another shape.
 _JUMPS = (K.LABEL_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT)
 # Statements that may leave a statement around them for code elsewhere in the function.
@@ -1797,6 +1809,7 @@ class _Evaluator:
         self.templates: dict[str, dict[str, Any] | None] = {}
         self.choices: dict[tuple[int, bool], int | None] = {}
         self.transferring: dict[int, bool] = {}
+        self.structs: dict[int, dict[str, Any] | None] = {}  # each const global struct's value, by its hash
         # Variables as the unit's own values: a local as the values stored in it, a parameter unknown.
         self.known = self.resolver({})
 
@@ -2035,9 +2048,10 @@ class _Evaluator:
     ) -> dict[str, Any] | None:
         """The expression as link evaluates it at a fold (expressions.values): a constant, an operation,
         each variable as ``resolve`` states the values it may hold (a parameter, or a choice among
-        values), and a helper's call as what it returns for the arguments (``template``); or None where
-        a value is unknown (a field read, a call that does not fold). Without ``fold`` the expression
-        itself is not first evaluated (``chosen`` states what evaluating it did not give)."""
+        values), a helper's call as what it returns for the arguments (``template``), and a member of a
+        struct passed by value or of a constant struct (``member``); or None where a value is unknown (a
+        field read through a pointer, a call that does not fold). Without ``fold`` the expression itself
+        is not first evaluated (``chosen`` states what evaluating it did not give)."""
         typed = _integer_type(cursor.type) if cursor.kind.is_expression() else None
         value = self.evaluate(cursor, truth=truth) if fold else None
         if value is not None:
@@ -2050,10 +2064,15 @@ class _Evaluator:
         if kind in (K.UNEXPOSED_EXPR, K.CSTYLE_CAST_EXPR) and inner:
             single = _operand(cursor)
             operand = self.expression(single, resolve, depth + 1, truth) if single is not None else None
+            if operand is not None and typed is None and _is_record(cursor.type) and _is_struct(operand):
+                # A struct passed on by value (rhashtable_insert_fast(…, pidfs_ino_ht_params)).
+                return operand
             if operand is None or typed is None:
                 return None
             same = all(operand.get(key) == typed.get(key) for key in ("w", "s", "b"))
             return operand if same else {"op": "cast", "a": [operand], **typed}
+        if kind == K.DECL_REF_EXPR and cursor.referenced is not None and typed is None:
+            return self.struct_reference(cursor, resolve, depth)
         if kind == K.DECL_REF_EXPR and cursor.referenced is not None and typed is not None:
             referenced = cursor.referenced
             parent = referenced.semantic_parent
@@ -2067,6 +2086,8 @@ class _Evaluator:
                     return {**held, **typed}
                 return {"op": "cast", "a": [held], **typed}
             return None
+        if kind == K.MEMBER_REF_EXPR and inner:
+            return self.member(cursor, inner[0], resolve, depth, typed)
         if typed is None:
             return None
         if kind == K.UNARY_OPERATOR and inner:
@@ -2099,6 +2120,95 @@ class _Evaluator:
                 return {"c": next(iter(found)), **typed}
             return returned if _size(returned) <= _TEMPLATE_NODES else None
         return None
+
+    def member(
+        self, cursor: ci.Cursor, base: ci.Cursor, resolve: _Resolve, depth: int, typed: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """``s.m`` of a struct the expressions state (a parameter passed by value, a constant struct, a
+        member that is a struct of one): rht_head_hashfn's ``params.obj_hashfn``, which a caller's
+        constant params decides. A bit-field, or a member reached through a pointer, is unknown."""
+        field = cursor.referenced
+        if field is None or field.kind != K.FIELD_DECL or field.is_bitfield():
+            return None
+        if typed is None and not _is_record(cursor.type):
+            return None
+        below = _unnamed_base(base)
+        record = below.type.get_canonical()
+        offset = record.get_offset(field.spelling) if record.kind == TK.RECORD else -1
+        struct = self.expression(below, resolve, depth + 1) if offset >= 0 else None
+        if struct is None or not _is_struct(struct):
+            return None
+        return {"op": ".", "a": [struct], "o": offset, **(typed or {})}
+
+    def struct_reference(self, cursor: ci.Cursor, resolve: _Resolve, depth: int) -> dict[str, Any] | None:
+        """A struct a reference names: a parameter passed by value, as itself, or a const global, as its
+        initializer gives it (``struct_value``)."""
+        referenced = cursor.referenced
+        if not _is_record(cursor.type):
+            return None
+        if _is_global_var(referenced):
+            return self.struct_value(referenced)
+        if referenced.kind != K.PARM_DECL:
+            return None
+        held = resolve(referenced, cursor, depth + 1)
+        return {"p": held["p"]} if held is not None and set(held) == {"p"} else None
+
+    def struct_value(self, variable: ci.Cursor) -> dict[str, Any] | None:
+        """A const global struct's value (fs/pidfs.c's pidfs_ino_ht_params): the bits of each scalar
+        member its initializer gives, with the value (None where it cannot be stated), as
+        ``{"struct": [[bits, value], ...]}``; a member the initializer does not give is 0. None where the
+        global may change, or its initializer gives a union, an array or a bit-field."""
+        key = variable.hash
+        if key not in self.structs:
+            definition = variable.get_definition() or variable
+            typ = definition.type
+            initializer = libclang.var_initializer(definition)
+            members: dict[int, dict[str, Any] | None] = {}
+            complete = (
+                typ.is_const_qualified()
+                and not typ.is_volatile_qualified()
+                and initializer is not None
+                and self.record_values(initializer, typ.get_canonical(), 0, members)
+                and len(members) <= _STRUCT_MEMBERS
+            )
+            self.structs[key] = {"struct": [[bits, members[bits]] for bits in sorted(members)]} if complete else None
+        return self.structs[key]
+
+    def record_values(
+        self, node: ci.Cursor, record: ci.Type, bits: int, members: dict[int, dict[str, Any] | None]
+    ) -> bool:
+        """The scalar members a struct's initializer list gives, by their bits from the global's start
+        (a later designator of a member replaces an earlier one); False for another shape."""
+        declaration = record.get_declaration()
+        if node.kind != K.INIT_LIST_EXPR or declaration is None or declaration.kind != K.STRUCT_DECL:
+            return False
+        fields = [field for field in record.get_fields() if field.spelling or not field.is_bitfield()]
+        position = 0
+        for child in _children(node):
+            designators, value = _designation(child)
+            if designators:
+                designator, *rest = designators
+                if rest or designator.kind != K.MEMBER_REF or designator.referenced not in fields:
+                    return False
+                position = fields.index(designator.referenced)
+            if position >= len(fields):
+                return False
+            field = fields[position]
+            position += 1
+            offset = field.get_field_offsetof()
+            typ = field.type.get_canonical()
+            if offset < 0 or field.is_bitfield():
+                return False
+            if typ.kind == TK.RECORD:
+                if not self.record_values(value, typ, bits + offset, members):
+                    return False
+                continue
+            typed = _integer_type(typ)
+            if typed is None:
+                return False
+            number = 0 if _is_null(value) else self.evaluate(value)
+            members[bits + offset] = {"c": number, **typed} if number is not None else None
+        return True
 
     def exits(self, statement: ci.Cursor, loop: bool = False) -> bool:
         """Control does not fall through: a return, goto, break or continue, a block that ends in
@@ -2330,6 +2440,22 @@ class _Evaluator:
         return held if _size(held) <= _TEMPLATE_NODES else None
 
 
+def _any_way(ways: list[list[dict[str, Any]]]) -> dict[str, Any]:
+    """The condition that holds where every guard of at least one of ``ways`` holds."""
+    typed = {"w": 32, "s": True}
+    terms = []
+    for way in ways:
+        factors = [guard["e"] if guard["v"] else {"op": "!", "a": [guard["e"]], **typed} for guard in way]
+        term = factors[0]
+        for factor in factors[1:]:
+            term = {"op": "&&", "a": [term, factor], **typed}
+        terms.append(term)
+    either = terms[0]
+    for term in terms[1:]:
+        either = {"op": "||", "a": [either, term], **typed}
+    return either
+
+
 class _Tagged(list[Any]):
     """An event list that puts the walk's current guards on each event appended (``pair``: the event
     is the second item of an appended tuple)."""
@@ -2384,6 +2510,8 @@ class _FunctionWalk:
         # (an initial value, a plain assignment), and the variables whose address is taken. The stores
         # every read sees stored again first (``overwritten_stores``) are not code in the next walk.
         self.read_sites: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
+        # Per variable, the guards each read in compiled code is under (None where the image decides).
+        self.read_guards: dict[int, list[tuple[int, ...] | None]] = collections.defaultdict(list)
         self.store_sites: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
         self.address_taken: set[int] = set()
         self.overwritten = overwritten
@@ -2401,6 +2529,9 @@ class _FunctionWalk:
         self.inner: set[int] = set()
         self.addressed: set[int] = set()
         self.fields: list[tuple[int, dict[str, Any]]] = _Tagged(self, pair=True)
+        # The member addresses a local holds (``remove = &vp->remove``): the local, the field access and
+        # the access event of the member, which ``finish`` puts under the guards of the local's reads.
+        self.held_addresses: list[tuple[ci.Cursor, list[dict[str, Any]]]] = []
         self.derived_cache: dict[tuple[int, tuple[int, ...], bool], _Address | None] = {}
         self.uses: dict[str, collections.Counter[int]] | None = None
         # Each local's and parameter's plain assignments: the value and where the assignment is.
@@ -2423,9 +2554,51 @@ class _FunctionWalk:
         self.labelled: dict[int, bool] = {}
 
     def finish(self) -> None:
-        """The field accesses the machine code addresses on their own."""
+        """The field accesses the machine code addresses on their own. A member address a local holds
+        is formed only where a read of the local is compiled: it is under the guards of those reads."""
+        for variable, items in self.held_addresses:
+            guards = self.read_guard(variable)
+            for item in items if guards else []:
+                kept = item.get("guards", [])
+                item["guards"] = [*kept, *(index for index in guards if index not in kept)]
         self.events = {kind: list(items) for kind, items in self.events.items()}
         self.events["field_accesses"] = [item for member, item in self.fields if member not in self.inner]
+
+    def read_guard(self, variable: ci.Cursor) -> list[int]:
+        """The guards under which some read of the variable in compiled code is: those every read is
+        under, and a guard that one of the reads' other guards all hold; none where a read is under no
+        guard or where the image decides, or the variable may be read another way (its address, a
+        cleanup)."""
+        found = self.read_guards.get(variable.hash, [])
+        reads = [read for read in found if read]
+        if (
+            not reads
+            or len(reads) != len(found)
+            or variable.hash in self.address_taken
+            or any(child.kind == K.UNEXPOSED_ATTR for child in variable.get_children())
+        ):
+            return []
+        shared = [index for index in reads[0] if all(index in read for read in reads)]
+        ways = {tuple(index for index in read if index not in shared) for read in reads}
+        if () in ways:
+            return shared
+        either = _any_way([[self.guard_table[index] for index in way] for way in sorted(ways)])
+        return [*shared, self.guard_id(either, True)]
+
+    def walk_held(self, variable: ci.Cursor, value: ci.Cursor, parent: ci.Cursor, index: int, generic: bool) -> None:
+        """Walk the value a local is given, as code. Where it is a member's address (``remove =
+        &vp->remove``, or an array member that decays to its address), the local holds that address."""
+        start = len(self.fields)
+        self.walk(value, parent, index, None, generic)
+        member = _strip(value)
+        if member.kind == K.UNARY_OPERATOR and libclang.is_address_of(member) and _children(member):
+            member = _strip(_children(member)[0])
+        if member.kind != K.MEMBER_REF_EXPR or variable.type.get_canonical().kind != TK.POINTER:
+            return
+        for where, access in self.fields[start:]:
+            if where == member.hash and access.get("address"):
+                events = [item for item in self.events["accesses"] if item["provenance"] is access["provenance"]]
+                self.held_addresses.append((variable, [access, *events]))
 
     def never_read(self) -> frozenset[int]:
         """The parameters and locals of the function that compiled code never reads: every
@@ -2715,19 +2888,7 @@ class _FunctionWalk:
             ways.append(fallthrough)
         if not ways or any(not way for way in ways):
             return None
-        typed = {"w": 32, "s": True}
-        terms = []
-        for way in ways:
-            assert way is not None
-            factors = [guard["e"] if guard["v"] else {"op": "!", "a": [guard["e"]], **typed} for guard in way]
-            term = factors[0]
-            for factor in factors[1:]:
-                term = {"op": "&&", "a": [term, factor], **typed}
-            terms.append(term)
-        either = terms[0]
-        for term in terms[1:]:
-            either = {"op": "||", "a": [either, term], **typed}
-        return either
+        return _any_way([way for way in ways if way is not None])
 
     def has_label(self, node: ci.Cursor) -> bool:
         """A label inside that control may enter from outside, past any condition around it: a goto
@@ -2752,13 +2913,17 @@ class _FunctionWalk:
             self.labelled[key] = found
         return self.labelled[key]
 
-    def push_guard(self, expression: dict[str, Any], value: bool) -> None:
+    def guard_id(self, expression: dict[str, Any], value: bool) -> int:
+        """The guard's index in the function's table, added once."""
         guard = {"e": expression, "v": value}
         key = jsonio.canonical(guard)
         if key not in self.guard_ids:
             self.guard_ids[key] = len(self.guard_table)
             self.guard_table.append(guard)
-        self.guard_stack.append(self.guard_ids[key])
+        return self.guard_ids[key]
+
+    def push_guard(self, expression: dict[str, Any], value: bool) -> None:
+        self.guard_stack.append(self.guard_id(expression, value))
 
     def walk_guarded(
         self,
@@ -3970,6 +4135,7 @@ class _FunctionWalk:
                 else:
                     self.reads[node.referenced.hash] += 1
                 self.read_sites[node.referenced.hash].append(node)
+                self.read_guards[node.referenced.hash].append(None if self.conditional else tuple(self.guard_stack))
         stored = _store_target(node)
         if stored is not None and _strip_parens(stored).kind == K.DECL_REF_EXPR:
             # v = e stores into v without reading it. v op= e and v++ read v only to store into it,
@@ -3979,8 +4145,10 @@ class _FunctionWalk:
                 self.stores.add(_strip_parens(stored).hash)
             variable = _strip_parens(stored).referenced
             statement = parent is not None and _statement_position(parent, index)
+            held = False
             if reason is None and statement and variable is not None and _is_plain_assignment(node):
                 self.store_sites[variable.hash].append(node)
+                held = len(children) == 2
             if (
                 reason is None
                 and len(children) == 2
@@ -3999,6 +4167,11 @@ class _FunctionWalk:
                     self.conditional += 1
                     self.walk(children[1], node, 1, reason, generic)
                     self.conditional -= 1
+                return
+            if held and variable is not None:
+                # p = &q->m: the address is the local's, formed where a read of it is compiled.
+                self.walk(children[0], node, 0, reason, generic)
+                self.walk_held(variable, children[1], node, 1, generic)
                 return
         if kind == K.CALL_EXPR:
             self.call(node, parent, reason, generic)
@@ -4069,6 +4242,8 @@ class _FunctionWalk:
                         self.conditional += 1
                         self.walk(child, node, child_index, reason, generic)
                         self.conditional -= 1
+                    elif reason is None:
+                        self.walk_held(node, child, node, child_index, generic)
                     else:
                         self.walk(child, node, child_index, reason, generic)
                 elif child.kind.is_expression():

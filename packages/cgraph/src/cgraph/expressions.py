@@ -3,9 +3,12 @@
 An expression is JSON: ``{"c": n}`` a constant, ``{"p": i}`` the function's parameter ``i``, ``{"v":
 name}`` the one value a variable holds that the facts cannot state, ``None`` a value the facts cannot
 name, or ``{"op": name, "a": [operands]}``: a C operator by its spelling (``"neg"`` and ``"~"`` and
-``"!"`` unary, ``"cast"`` a conversion), ``"in"`` (the operand is one of ``"set"``), or ``"?:"``, whose
-None condition makes it a choice between its two values. Each carries its C type: its width ``w`` in
-bits, its signedness ``s``, and ``b`` for _Bool.
+``"!"`` unary, ``"cast"`` a conversion), ``"in"`` (the operand is one of ``"set"``), ``"."`` (the
+member ``"o"`` bits into the struct its operand is), or ``"?:"``, whose None condition makes it a
+choice between its two values. Each carries its C type: its width ``w`` in bits, its signedness ``s``,
+and ``b`` for _Bool. A struct has no type keys: a parameter passed by value, a member that is itself a
+struct, or ``{"struct": [[bits, expression], ...]}``, a constant struct's scalar members (a member it
+does not list is 0).
 """
 
 from __future__ import annotations
@@ -51,16 +54,32 @@ def _bounded(found: set[int]) -> frozenset[int] | None:
     return frozenset(found) if len(found) <= _LIMIT else None
 
 
+def member(struct: Expression | None, bits: int) -> Expression | None:
+    """The member ``bits`` into a struct value: what a constant struct lists there (0 where it lists
+    nothing), also through the members that are structs themselves; None where the struct is unknown."""
+    if struct is None:
+        return None
+    if "struct" in struct:
+        listed: dict[int, Expression | None] = {offset: value for offset, value in struct["struct"]}
+        return listed.get(bits, {"c": 0})
+    if struct.get("op") == "." and "w" not in struct:
+        return member(struct["a"][0], struct["o"] + bits)
+    return None
+
+
 def values(expression: Expression | None) -> frozenset[int] | None:
     """Every value the expression may take, or None where one depends on something unknown (a
     parameter, a value the facts cannot name) or there are too many to keep. ``&&``, ``||`` and ``?:``
     take what the operand that decides them gives, as C evaluates them; ``x & 0`` and ``x * 0`` are 0
-    whatever ``x`` is."""
-    if expression is None or "p" in expression or "v" in expression:
+    whatever ``x`` is. A struct has no integer value."""
+    if expression is None or "p" in expression or "v" in expression or "struct" in expression:
         return None
     if "c" in expression:
         return frozenset({normalized(int(expression["c"]), expression)})
     operator, operands = expression["op"], expression["a"]
+    if operator == ".":
+        held = values(member(operands[0], expression["o"])) if "w" in expression else None
+        return None if held is None else _bounded({normalized(value, expression) for value in held})
     if operator in ("&&", "||"):
         decisive = int(operator == "||")
         sides = [values(operand) for operand in operands[:2]]
@@ -157,13 +176,14 @@ def stated(expression: Expression | None) -> bool:
 
 def substitute(expression: Expression | None, arguments: list[Expression | None]) -> Expression | None:
     """The expression in the caller's terms: each parameter becomes its argument, as the parameter's
-    type holds it, or unknown where no argument is stated."""
-    if expression is None or "c" in expression or "v" in expression:
+    type holds it (a struct as it is), or unknown where no argument is stated."""
+    if expression is None or "c" in expression or "v" in expression or "struct" in expression:
         return expression
     if "p" in expression:
         index = expression["p"]
         value = arguments[index] if index < len(arguments) else None
         if value is None:
             return None
-        return {"op": "cast", "a": [value], **{key: expression[key] for key in _TYPE_KEYS if key in expression}}
+        typed = {key: expression[key] for key in _TYPE_KEYS if key in expression}
+        return {"op": "cast", "a": [value], **typed} if typed else value
     return {**expression, "a": [substitute(operand, arguments) for operand in expression["a"]]}
