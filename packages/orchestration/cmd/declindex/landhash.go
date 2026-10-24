@@ -135,9 +135,17 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 type landDeclaration struct{ path, hash string }
 type landAnswer struct{ name, hash, path string }
 
+// answerLandHash gives name's answer line from the declarations found for it. A path the line prints must not
+// contain the line's separators: a tab, carriage return or newline, or the comma that joins an ambiguous answer's
+// paths. A path that no answer prints is not checked.
 func answerLandHash(name string, declarations []landDeclaration) (landAnswer, error) {
 	if len(declarations) == 0 {
 		return landAnswer{name: name, hash: "absent", path: "-"}, nil
+	}
+	for _, declaration := range declarations {
+		if strings.ContainsAny(declaration.path, "\t\r\n,") {
+			return landAnswer{}, fmt.Errorf("%s: source path %q cannot be printed safely", name, declaration.path)
+		}
 	}
 	if len(declarations) == 1 {
 		if declarations[0].hash == "" {
@@ -240,9 +248,6 @@ func gitTreeSources(ctx context.Context, gitDir, tree string, roots []string) (m
 		parts := strings.Fields(fields)
 		if len(parts) != 3 || parts[1] != "blob" || !strings.HasSuffix(path, ".lean") {
 			continue
-		}
-		if strings.ContainsAny(path, "\t\r\n,") {
-			return nil, fmt.Errorf("source path %q cannot be printed safely", path)
 		}
 		out[path] = parts[2]
 	}

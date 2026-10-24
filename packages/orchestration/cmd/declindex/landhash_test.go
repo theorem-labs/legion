@@ -418,6 +418,56 @@ func TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas(t *testing.T) {
 	}
 }
 
+// TestLandHashRefusesOnlyAPrintedPathThatCannotBePrinted catches a hasher that fails the whole call for any
+// LAND_TREE source path with a tab, carriage return, newline or comma, rather than only for a path that an answer
+// line would print.
+func TestLandHashRefusesOnlyAPrintedPathThatCannotBePrinted(t *testing.T) {
+	t.Run("unrelated paths", func(t *testing.T) {
+		config := fixture(t)
+		tree := filepath.Join(filepath.Dir(config), "tree")
+		for _, rel := range []string{"Sub/Comma,Name.lean", "Sub/Tab\tName.lean"} {
+			writeLandFile(t, filepath.Join(tree, filepath.FromSlash(rel)), []byte("-- not a requested module\n"))
+		}
+		git(t, tree, "init", "-q")
+		git(t, tree, "add", "-A")
+		git(t, tree, "commit", "-q", "-m", "base")
+		if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+			t.Fatalf("refresh: %+v", r)
+		}
+		for _, rel := range []string{"Sub/Line\nName.lean", "Sub/Return\rName.lean"} {
+			writeLandFile(t, filepath.Join(tree, filepath.FromSlash(rel)), []byte("-- not a requested module\n"))
+		}
+		git(t, tree, "add", "-A")
+		git(t, tree, "commit", "-q", "-m", "candidate")
+		treeID := git(t, tree, "rev-parse", "HEAD^{tree}")
+		r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "Gold.frame_lo", "Gold2.FrameAt"), t.TempDir()))
+		const want = "Gold.frame_lo\t9d9fba31f41fc258\tGolden.lean\nGold2.FrameAt\t7f52be71a38bde18\tSub/Wrap.lean\n"
+		if r.code != 0 || r.out != want {
+			t.Fatalf("unrelated unprintable paths = %+v, want %q", r, want)
+		}
+	})
+	t.Run("printed path", func(t *testing.T) {
+		config, tree, _ := landBase(t)
+		source, err := os.ReadFile(filepath.Join(tree, "Golden.lean"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ilean, err := os.ReadFile(filepath.Join(tree, "Golden.ilean"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		git(t, tree, "mv", "Golden.lean", "Sub/Gold,en.lean")
+		git(t, tree, "commit", "-q", "-m", "move declaration to a path with a comma")
+		build := t.TempDir()
+		writeLandBuild(t, build, "Sub/Gold,en", source, ilean, false, declindex.LakeTextHash(source))
+		treeID := git(t, tree, "rev-parse", "HEAD^{tree}")
+		r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "Gold.frame_lo"), build))
+		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "Sub/Gold,en.lean") {
+			t.Fatalf("printed path with a comma = %+v, want exit 3, no stdout, and stderr naming the path", r)
+		}
+	})
+}
+
 func TestLandHashRefusesAnIndexWithoutGitSources(t *testing.T) {
 	config := fixture(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
