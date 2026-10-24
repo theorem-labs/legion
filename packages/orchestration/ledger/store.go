@@ -193,7 +193,6 @@ func (s *Store) checkSchema(ctx context.Context) error {
 }
 
 // migrate applies schema/NNNN_*.sql files in order, each once, under an advisory lock so concurrent starts agree.
-
 func (s *Store) migrate(ctx context.Context) error {
 	files, err := schemaFiles()
 	if err != nil {

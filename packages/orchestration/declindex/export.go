@@ -52,8 +52,9 @@ func FindLean(ctx context.Context, dir, prefix string) (Lean, error) {
 }
 
 // env is the whole environment of a toolchain process: the toolchain first on a system PATH, its root
-// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, and HOME and TMPDIR at home. Nothing else of the caller's environment (credentials, tokens) reaches Lean, and a
-// module that a proposal compiles sees only its scratch directory as home.
+// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, and HOME and TMPDIR at home. Nothing else of
+// the caller's environment (credentials, tokens) reaches Lean, and a module that a proposal compiles sees only its
+// scratch directory as home.
 func (l Lean) env(searchPath []string, home string) []string {
 	env := []string{
 		"LEAN_SYSROOT=" + l.Prefix,
@@ -187,12 +188,12 @@ func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel s
 // when empty): this user's, mode 0700, and empty.
 func NewScratch(base string) (string, error) { return confine.NewScratch(base) }
 
-// confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path,
-// read and its scratch directory, writes only the scratch directory (which must be fresh, and into which the
-// inputs are copied), starts no other process and opens no socket. It fails when the sandbox is unavailable,
-// and then nothing runs.
-func (l Lean) confined(ctx context.Context, argv []string, scratch string, inputs []confine.Input, searchPath, read []string) (*confine.Cmd, error) {
-	reads := slices.Concat([]string{l.Prefix}, searchPath, read)
+// confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path
+// and its scratch directory, writes only the scratch directory (which must be fresh, and into which the inputs are
+// copied), starts no other process and opens no socket. It fails when the sandbox is unavailable, and then nothing
+// runs.
+func (l Lean) confined(ctx context.Context, argv []string, scratch string, inputs []confine.Input, searchPath []string) (*confine.Cmd, error) {
+	reads := slices.Concat([]string{l.Prefix}, searchPath)
 	return confine.Command(ctx, confine.Spec{Argv: argv, Env: l.env(searchPath, scratch), Scratch: scratch, Inputs: inputs, Read: reads})
 }
 
@@ -207,7 +208,7 @@ func CompileConfined(ctx context.Context, l Lean, searchPath []string, scratch, 
 	base := filepath.Join(scratch, filepath.FromSlash(rel))
 	argv := []string{l.bin("lean"), "-R", scratch, "-o", base + ".olean", "-i", base + ".ilean", base + ".lean"}
 	cmd, err := l.confined(ctx, argv, scratch, []confine.Input{{Name: rel + ".lean", Data: source}},
-		append([]string{scratch}, searchPath...), nil)
+		append([]string{scratch}, searchPath...))
 	if err != nil {
 		return err
 	}
@@ -232,7 +233,7 @@ func CheckSandbox(ctx context.Context, l Lean) error {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	cmd, err := l.confined(ctx, []string{l.bin("lean"), "--version"}, dir, nil, nil, nil)
+	cmd, err := l.confined(ctx, []string{l.bin("lean"), "--version"}, dir, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -250,7 +251,7 @@ var ErrRefusedSource = errors.New("the proposal is not declarations only")
 func (x *Exporter) CheckSource(ctx context.Context, source []byte, searchPath []string, scratch string) error {
 	file := filepath.Join(scratch, "Proposal.lean")
 	cmd, err := x.Lean.confined(ctx, []string{x.Bin, "--check", file}, scratch,
-		[]confine.Input{{Name: "Proposal.lean", Data: source}}, searchPath, nil)
+		[]confine.Input{{Name: "Proposal.lean", Data: source}}, searchPath)
 	if err != nil {
 		return err
 	}
@@ -281,7 +282,7 @@ type Manifest struct {
 	Forms    []ConstRef `json:"forms"`
 	Concepts []ConstRef `json:"concepts"`
 	Types    bool       `json:"types"`
-	// Budget bounds the expression nodes one constant's walk visits; zero is DefaultBudget.
+	// Budget is the node budget of one constant's walk (DefaultBudget).
 	Budget int `json:"budget"`
 }
 
@@ -300,9 +301,7 @@ func nonNil[T any](s []T) []T {
 func (m Manifest) complete() Manifest {
 	m.Modules, m.Imports, m.Roots = nonNil(m.Modules), nonNil(m.Imports), nonNil(m.Roots)
 	m.Forms, m.Concepts = nonNil(m.Forms), nonNil(m.Concepts)
-	if m.Budget == 0 {
-		m.Budget = DefaultBudget
-	}
+	m.Budget = DefaultBudget
 	return m
 }
 
@@ -319,7 +318,6 @@ type Constant struct {
 	Kind      string   `json:"k"`
 	Type      string   `json:"t"`
 	Hash      string   `json:"h"`
-	ValueHash string   `json:"vh"`
 	Atoms     []string `json:"a"`
 	Facts     []Fact   `json:"f"`
 	Truncated bool     `json:"tr"`
@@ -400,7 +398,7 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 	var cmd started
 	if x.Confined {
 		c, err := x.Lean.confined(ctx, []string{x.Bin, path}, tmp, []confine.Input{{Name: "manifest.json", Data: manifest}},
-			x.SearchPath, nil)
+			x.SearchPath)
 		if err != nil {
 			return nil, err
 		}
@@ -443,9 +441,6 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 	}
 	if parseErr != nil {
 		return nil, parseErr
-	}
-	if out == nil {
-		out = []Constant{}
 	}
 	return out, nil
 }

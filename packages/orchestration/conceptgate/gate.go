@@ -396,10 +396,6 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 	defect := func(c Concept, format string, args ...any) {
 		defects = append(defects, Defect{Path: conceptFile(c), Message: fmt.Sprintf("pending concept %s: ", c.Name) + fmt.Sprintf(format, args...)})
 	}
-	seenImports := map[string]bool{}
-	for _, i := range fm.Imports {
-		seenImports[i] = true
-	}
 	for _, c := range reg.Concepts {
 		if c.Name == exclude {
 			continue
@@ -447,8 +443,7 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 			continue
 		}
 		ex.SearchPath = append(ex.SearchPath, dir)
-		if !seenImports[module] {
-			seenImports[module] = true
+		if !slices.Contains(fm.Imports, module) {
 			fm.Imports = append(fm.Imports, module)
 		}
 		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})

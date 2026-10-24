@@ -156,8 +156,8 @@ type env struct {
 	store  *declindex.Store
 }
 
-func (e *env) open(needIndex bool) error {
-	return e.openWith(needIndex, declindex.Open)
+func (e *env) open() error {
+	return e.openWith(false, declindex.Open)
 }
 
 // openReadOnly opens the index without writing it or its directory, which the landing hooks mount read-only: one
@@ -187,21 +187,17 @@ func (e *env) close() {
 	}
 }
 
-var commands map[string]func(context.Context, *env, []string) int
-
-func init() {
-	commands = map[string]func(context.Context, *env, []string) int{
-		"refresh":   cmdRefresh,
-		"status":    cmdStatus,
-		"where":     cmdWhere,
-		"users":     cmdUsers,
-		"hash":      cmdHash,
-		"states":    cmdStates,
-		"same":      cmdSame,
-		"gate":      cmdGate,
-		"ledger":    cmdLedger,
-		"land-hash": cmdLandHash,
-	}
+var commands = map[string]func(context.Context, *env, []string) int{
+	"refresh":   cmdRefresh,
+	"status":    cmdStatus,
+	"where":     cmdWhere,
+	"users":     cmdUsers,
+	"hash":      cmdHash,
+	"states":    cmdStates,
+	"same":      cmdSame,
+	"gate":      cmdGate,
+	"ledger":    cmdLedger,
+	"land-hash": cmdLandHash,
 }
 
 func fail(w io.Writer, err error) int {
@@ -256,7 +252,7 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"refresh takes no arguments"})
 	}
-	if err := e.open(false); err != nil {
+	if err := e.open(); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -349,6 +345,21 @@ func (e *env) staleNote(ctx context.Context) (string, error) {
 	return c, nil
 }
 
+// openQuery opens the index read-only for a query and notes a stale commit (staleNote). It gives the index's commit
+// and -1, or the exit code of a failure that it has reported, having closed the index it opened.
+func (e *env) openQuery(ctx context.Context) (string, int) {
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
+		return "", fail(e.stderr, err)
+	}
+	commit, err := e.staleNote(ctx)
+	if err != nil {
+		code := fail(e.stderr, &unableError{err})
+		e.close()
+		return "", code
+	}
+	return commit, -1
+}
+
 func short(c string) string { return c[:min(9, len(c))] }
 
 func names(e *env, cmd string, args []string) ([]string, int) {
@@ -368,13 +379,10 @@ func cmdWhere(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
-		return fail(e.stderr, err)
+	if _, code = e.openQuery(ctx); code >= 0 {
+		return code
 	}
 	defer e.close()
-	if _, err := e.staleNote(ctx); err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
 	var all []declindex.Found
 	rc := 0
 	for _, q := range qs {
@@ -398,13 +406,10 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
-		return fail(e.stderr, err)
+	if _, code = e.openQuery(ctx); code >= 0 {
+		return code
 	}
 	defer e.close()
-	if _, err := e.staleNote(ctx); err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
 	rc := 0
 	type hashed struct {
 		Declaration string `json:"declaration"`
@@ -466,14 +471,11 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 	if code >= 0 {
 		return code
 	}
-	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
-		return fail(e.stderr, err)
+	commit, code := e.openQuery(ctx)
+	if code >= 0 {
+		return code
 	}
 	defer e.close()
-	commit, err := e.staleNote(ctx)
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
 	rc := 0
 	var answers []declindex.Answer
 	for _, q := range qs {

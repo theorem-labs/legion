@@ -172,14 +172,11 @@ type directoryKey struct {
 
 func directoryKeys(left, right map[string]map[string]int) []directoryKey {
 	set := map[directoryKey]struct{}{}
-	for directory, kinds := range left {
-		for kind := range kinds {
-			set[directoryKey{directory, kind}] = struct{}{}
-		}
-	}
-	for directory, kinds := range right {
-		for kind := range kinds {
-			set[directoryKey{directory, kind}] = struct{}{}
+	for _, side := range []map[string]map[string]int{left, right} {
+		for directory, kinds := range side {
+			for kind := range kinds {
+				set[directoryKey{directory, kind}] = struct{}{}
+			}
 		}
 	}
 	return slices.SortedFunc(maps.Keys(set), func(a, b directoryKey) int {

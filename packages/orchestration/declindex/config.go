@@ -137,10 +137,7 @@ func LoadConfig(path string) (Config, error) {
 		}
 		return filepath.Join(base, p)
 	}
-	libRel := y.Lib
-	if libRel == "" {
-		libRel = filepath.Join(".lake", "build", "lib", "lean")
-	}
+	libRel := cmp.Or(y.Lib, filepath.Join(".lake", "build", "lib", "lean"))
 	c := Config{
 		Tree:         rel(dir, y.Tree),
 		LibRel:       libRel,
@@ -177,21 +174,21 @@ func (c Config) GateRegistryDir() (string, error) {
 	return pathInside(c.Tree, c.Registry)
 }
 
-// GateStatePath resolves the configured index path through symlinks and requires it to remain outside the tree.
+// GateIndexPath resolves the configured index path through symlinks and requires it to remain outside the tree.
 // A gate opens this existing file read-only, so neither the index nor its scratch work can dirty the tree.
-func (c Config) GateStatePath() (string, error) {
+func (c Config) GateIndexPath() (string, error) {
 	tree, err := canonicalPath(c.Tree)
 	if err != nil {
 		return "", err
 	}
-	state, err := canonicalStatePath(c.DB)
+	index, err := canonicalIndexPath(c.DB)
 	if err != nil {
 		return "", err
 	}
-	if isInside(tree, state) {
-		return "", fmt.Errorf("the gate index state %s must be outside the tree %s", state, tree)
+	if isInside(tree, index) {
+		return "", fmt.Errorf("the gate index state %s must be outside the tree %s", index, tree)
 	}
-	return state, nil
+	return index, nil
 }
 
 func pathInside(tree, path string) (string, error) {
@@ -217,7 +214,7 @@ func canonicalPath(path string) (string, error) {
 	return filepath.EvalSymlinks(absolute)
 }
 
-func canonicalStatePath(path string) (string, error) {
+func canonicalIndexPath(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -260,7 +257,7 @@ func (c Config) TreeSpec() Tree {
 	for _, r := range c.Roots {
 		roots[r] = true
 	}
-	return Tree{Source: c.Tree, Lib: c.Lib, Roots: roots, FileKinds: c.FileKinds}
+	return Tree{Source: c.Tree, Lib: c.Lib, Roots: roots}
 }
 
 // Compiled gives the options of the compiled part for this configuration: the tree's toolchain, the exporter

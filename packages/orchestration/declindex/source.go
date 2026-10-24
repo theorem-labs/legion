@@ -151,6 +151,14 @@ func skipString(text string, i, n int) int {
 	return i + 1
 }
 
+// skipLineComment returns the offset of the newline that ends the `--` comment at i, or n when no newline follows.
+func skipLineComment(text string, i, n int) int {
+	if j := strings.IndexByte(text[i:], '\n'); j >= 0 {
+		return i + j
+	}
+	return n
+}
+
 // bodyStart is the offset of the first `:=`, line-initial `|` or `where` at bracket depth 0 in text[i:end],
 // skipping comments and strings: where a declaration's statement ends and its body begins.
 func bodyStart(text string, i, end int) (int, bool) {
@@ -159,12 +167,7 @@ func bodyStart(text string, i, end int) (int, bool) {
 		rest := text[i:]
 		switch {
 		case strings.HasPrefix(rest, "--"):
-			j := strings.IndexByte(rest, '\n')
-			if j < 0 {
-				i = n
-			} else {
-				i += j
-			}
+			i = skipLineComment(text, i, n)
 			continue
 		case strings.HasPrefix(rest, "/-"):
 			i = skipBlockComment(text, i, n)
@@ -221,12 +224,7 @@ func stripComments(s string) string {
 	for i := 0; i < n; {
 		switch {
 		case strings.HasPrefix(s[i:], "--"):
-			j := strings.IndexByte(s[i:], '\n')
-			if j < 0 {
-				i = n
-			} else {
-				i += j
-			}
+			i = skipLineComment(s, i, n)
 		case strings.HasPrefix(s[i:], "/-"):
 			i = skipBlockComment(s, i, n)
 		case s[i] == '"':

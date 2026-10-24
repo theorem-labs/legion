@@ -44,14 +44,14 @@ func snapshotRegistry(ctx context.Context, tree, commit, rel, base string) (_ st
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
-	extracted := extractRegistryArchive(out, root, rel)
-	if extracted == nil {
-		_, extracted = io.Copy(io.Discard, out)
+	archiveErr := extractRegistryArchive(out, root, rel)
+	if archiveErr == nil {
+		_, archiveErr = io.Copy(io.Discard, out)
 	}
-	if extracted != nil {
+	if archiveErr != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		return "", extracted
+		return "", archiveErr
 	}
 	if err := cmd.Wait(); err != nil {
 		return "", err

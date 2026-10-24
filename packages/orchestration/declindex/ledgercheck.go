@@ -273,21 +273,21 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 		if strings.Contains(c.Name, ":") {
 			continue
 		}
-		declarations := declarations[c.Name]
-		switch len(declarations) {
+		decls := declarations[c.Name]
+		switch len(decls) {
 		case 0:
 			r.Gone = append(r.Gone, c.Name)
 		case 1:
-			if c.StatementHash == declarations[0].hash {
+			if c.StatementHash == decls[0].hash {
 				r.Matching++
 				continue
 			}
-			at := sourcePath("", declarations[0].module)
+			at := sourcePath("", decls[0].module)
 			if found, ok := selected[c.Name]; ok {
 				at = found.At()
 			}
 			r.Defects = append(r.Defects, LedgerDefect{Contract: c.Name, At: at, LedgerHash: c.StatementHash,
-				Version: c.Version, IndexHash: declarations[0].hash})
+				Version: c.Version, IndexHash: decls[0].hash})
 		default:
 			r.Ambiguous = append(r.Ambiguous, c.Name)
 		}

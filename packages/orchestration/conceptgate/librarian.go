@@ -35,7 +35,6 @@ type Librarian interface {
 type CommandLibrarian struct {
 	Command []string
 	WorkDir string
-	Timeout time.Duration
 }
 
 const librarianTimeout = 120 * time.Second
@@ -104,11 +103,7 @@ func (c CommandLibrarian) Review(ctx context.Context, r ReviewRequest) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	timeout := c.Timeout
-	if timeout == 0 {
-		timeout = librarianTimeout
-	}
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	runCtx, cancel := context.WithTimeout(ctx, librarianTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, c.Command[0], append(c.Command[1:], "--id", r.ID, "--proposer", r.Proposer, "--proposal", filepath.Clean(path))...)
 	cmd.Stdin = strings.NewReader("")

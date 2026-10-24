@@ -39,7 +39,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	defer e.close()
 	answers, err := e.store.LandHash(ctx, declindex.LandHashRequest{
 		GitDir:   gitDir,
-		Tree:     tree,
+		TreeID:   tree,
 		Names:    names,
 		BuildDir: strings.TrimSpace(e.getenv("LAND_BUILD_DIR")),
 		LibRel:   e.cfg.LibRel,

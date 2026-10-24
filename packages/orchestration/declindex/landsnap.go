@@ -6,8 +6,8 @@ import (
 )
 
 // LandSnapshot is the index state land-hash needs to answer one candidate tree. Its maps are read in one SQLite
-// transaction (the store's snapshot, or one of their own), so a concurrent refresh cannot combine one commit's
-// sources with another commit's declarations.
+// transaction (the store's snapshot, or one that LandSnapshot begins), so a concurrent refresh cannot combine one
+// commit's sources with another commit's declarations.
 type LandSnapshot struct {
 	HasSources bool
 	// Prefix is the indexed tree's path below the root of its repository, with a trailing slash, empty at that
@@ -19,9 +19,8 @@ type LandSnapshot struct {
 	Declarations map[string][]LandDeclaration
 }
 
-// LandDeclaration is one exact requested declaration from the snapshot.
+// LandDeclaration is one exact requested declaration from the snapshot, under its name in Declarations.
 type LandDeclaration struct {
-	Name     string
 	Module   string
 	Path     string
 	StmtHash string
@@ -71,7 +70,7 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 			return err
 		}
 		snapshot.Declarations[f.Name] = append(snapshot.Declarations[f.Name],
-			LandDeclaration{Name: f.Name, Module: f.Module, Path: f.Path, StmtHash: f.StmtHash})
+			LandDeclaration{Module: f.Module, Path: f.Path, StmtHash: f.StmtHash})
 		return nil
 	})
 	if err != nil {

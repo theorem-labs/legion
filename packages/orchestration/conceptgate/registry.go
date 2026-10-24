@@ -72,11 +72,12 @@ func (d Defect) Error() string {
 	return d.Path + ": " + d.Message
 }
 
-// sentenceBreak finds the end of a sentence before the end of the text: a full stop, question or exclamation
-// mark followed by a space and a capital letter.
 var (
+	// sentenceBreak finds the end of a sentence before the end of the text: a full stop, question or exclamation
+	// mark followed by a space and a capital letter.
 	sentenceBreak = regexp.MustCompile(`[.!?]\s+\p{Lu}`)
-	statementHash = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	// compiledHash is the form of a concept's compiled hash (Concept.CompiledHash): 32 lowercase hexadecimal digits.
+	compiledHash = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
 
 func (c Concept) check() error {
@@ -89,7 +90,7 @@ func (c Concept) check() error {
 		return fmt.Errorf("concept %s has no meaning", c.Name)
 	case strings.Contains(c.Meaning, "\n") || sentenceBreak.MatchString(c.Meaning):
 		return fmt.Errorf("concept %s: its meaning is one sentence", c.Name)
-	case c.CompiledHash != "" && !statementHash.MatchString(c.CompiledHash):
+	case c.CompiledHash != "" && !compiledHash.MatchString(c.CompiledHash):
 		return fmt.Errorf("concept %s: compiled hash is not 32 lowercase hexadecimal characters", c.Name)
 	}
 	return nil

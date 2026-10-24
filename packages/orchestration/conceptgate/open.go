@@ -114,12 +114,12 @@ func OpenGate(ctx context.Context, cfg declindex.Config, opts Options) (_ *Gate,
 	if err := available(); err != nil {
 		return nil, fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)
 	}
-	state, err := cfg.GateStatePath()
+	indexPath, err := cfg.GateIndexPath()
 	if err != nil {
 		return nil, err
 	}
 	// The gate also reads the tree: its HEAD, its registry's commit and its build.
-	index, err := declindex.OpenReadOnly(ctx, state, declindex.IndexAndTree)
+	index, err := declindex.OpenReadOnly(ctx, indexPath, declindex.IndexAndTree)
 	if err != nil {
 		return nil, err
 	}

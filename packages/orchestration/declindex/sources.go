@@ -34,7 +34,7 @@ func readSources(tree Tree) (blobs map[string]string, prefix string, err error) 
 	if err != nil {
 		return nil, "", err
 	}
-	paths := SourcePathspecs(tree.Roots)
+	paths := sourcePathspecs(tree.Roots)
 	args := append([]string{"-C", tree.Source, "ls-files", "-s", "-z", "--full-name", "--"}, paths...)
 	tracked, err := exec.Command("git", args...).Output()
 	if err != nil {
@@ -54,10 +54,6 @@ func readSources(tree Tree) (blobs map[string]string, prefix string, err error) 
 	if err != nil {
 		return nil, "", err
 	}
-	if len(changed) == 0 {
-		return sources, prefix, nil
-	}
-
 	toHash := make([]string, 0, len(changed))
 	for _, p := range changed {
 		ok, err := fileExists(filepath.Join(tree.Source, filepath.FromSlash(p)))
@@ -95,10 +91,10 @@ func readSources(tree Tree) (blobs map[string]string, prefix string, err error) 
 	return sources, prefix, nil
 }
 
-// SourcePathspecs are the Git pathspecs, relative to the tree, of the Lean sources below roots: each root's
+// sourcePathspecs are the Git pathspecs, relative to the tree, of the Lean sources below roots: each root's
 // directory and its own file. An empty root names no source and is dropped. Refresh records the sources these
 // select, and land-hash lists the same ones in LAND_TREE.
-func SourcePathspecs(roots Roots) []string {
+func sourcePathspecs(roots Roots) []string {
 	out := make([]string, 0, len(roots)*2)
 	for _, root := range slices.Sorted(maps.Keys(roots)) {
 		if root != "" {

@@ -109,19 +109,20 @@ type Answer struct {
 type AnswerOptions struct {
 	Why   bool
 	Lines bool
-	// FileKinds group users' files (see Tree.FileKinds).
+	// FileKinds are the file-name prefixes that group a user's file in an answer (for example the kinds of file a
+	// project's layout names); a file with none of them is "other".
 	FileKinds []string
 }
 
 type useRow struct {
-	target, module string
-	line, col      int
-	parent, class  string
+	module        string
+	line, col     int
+	parent, class string
 }
 
-func (s *Store) declared(ctx context.Context, q querier, names []string) (map[string]bool, error) {
+func (s *Store) declared(ctx context.Context, names []string) (map[string]bool, error) {
 	out := map[string]bool{}
-	err := eachRowIn(ctx, q, `SELECT name FROM decls WHERE name IN`, names, func(r *sql.Rows) error {
+	err := eachRowIn(ctx, s.q, `SELECT name FROM decls WHERE name IN`, names, func(r *sql.Rows) error {
 		var n string
 		if err := r.Scan(&n); err != nil {
 			return err
@@ -152,7 +153,7 @@ func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	declared, err := s.declared(ctx, s.q, cands)
+	declared, err := s.declared(ctx, cands)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +165,7 @@ func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 	}
 	var out []useRow
 	err = eachRowIn(ctx, s.q, `SELECT module, line, col, parent, cls FROM uses WHERE target IN`, keys, func(r *sql.Rows) error {
-		u := useRow{target: name}
+		var u useRow
 		if err := r.Scan(&u.module, &u.line, &u.col, &u.parent, &u.class); err != nil {
 			return err
 		}
@@ -316,20 +317,26 @@ func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Re
 		return Reach{}, err
 	}
 	changed, reprove, via := g.walk(root)
-	cdirs, rdirs := map[string][]string{}, map[string][]string{}
-	for d := range changed {
-		p, err := ps.of(ctx, d.module)
-		if err != nil {
-			return Reach{}, err
+	// byDir groups the names of reached declarations by the directory of their module's source.
+	byDir := func(set map[reachedDecl]bool) (map[string][]string, error) {
+		out := map[string][]string{}
+		for d := range set {
+			p, err := ps.of(ctx, d.module)
+			if err != nil {
+				return nil, err
+			}
+			dir := dirOf(p)
+			out[dir] = append(out[dir], d.name)
 		}
-		cdirs[dirOf(p)] = append(cdirs[dirOf(p)], d.name)
+		return out, nil
 	}
-	for d := range reprove {
-		p, err := ps.of(ctx, d.module)
-		if err != nil {
-			return Reach{}, err
-		}
-		rdirs[dirOf(p)] = append(rdirs[dirOf(p)], d.name)
+	cdirs, err := byDir(changed)
+	if err != nil {
+		return Reach{}, err
+	}
+	rdirs, err := byDir(reprove)
+	if err != nil {
+		return Reach{}, err
 	}
 	all := map[string]bool{}
 	for d := range cdirs {

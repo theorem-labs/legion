@@ -28,9 +28,6 @@ type Tree struct {
 	Lib string
 	// Roots are the project's module roots; only uses of their declarations are kept.
 	Roots Roots
-	// FileKinds are the file-name prefixes that group a user's file in an answer (for example the kinds of file
-	// a project's layout names); a file with none of them is "other".
-	FileKinds []string
 }
 
 // RefreshOptions control one refresh.
@@ -38,7 +35,8 @@ type RefreshOptions struct {
 	// Commit is the source commit the build is of; it is recorded as the index's commit, and a change of commit as
 	// a landing (see Store.Landing).
 	Commit string
-	// CheckLandedCoverage makes RefreshAt compare Commit with the persisted index before it runs a landed sync.
+	// CheckLandedCoverage makes RefreshAt refuse a tree with tracked changes and then compare Commit with the
+	// persisted index, before it runs a landed sync.
 	CheckLandedCoverage bool
 	// Jobs bounds the parallel readers; zero is min(48, CPUs).
 	Jobs int
@@ -203,11 +201,11 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 	return s.RefreshAt(ctx, tree, opt, nil)
 }
 
-// RefreshAt holds the refresh lock across sync and the refresh: a post-landing fetch, checkout and build cannot
+// RefreshAt holds the refresh lock across syncTree and the refresh: a post-landing fetch, checkout and build cannot
 // race a second index refresh, and a reader of the tree in a read-only directory observes only the result after
 // both complete. The refresh takes the write lock only while it writes the index (Store.write), so a reader of the
-// index alone reads the index of the refresh before while sync runs.
-func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sync func(context.Context) error) (RefreshStats, error) {
+// index alone reads the index of the refresh before while syncTree runs.
+func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, syncTree func(context.Context) error) (RefreshStats, error) {
 	if s.beforeRefreshLock != nil {
 		s.beforeRefreshLock()
 	}
@@ -216,7 +214,7 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 		return RefreshStats{}, err
 	}
 	defer unlock()
-	if sync != nil && opt.CheckLandedCoverage {
+	if syncTree != nil && opt.CheckLandedCoverage {
 		// The one check that the tree is clean, before a landed sync (Sync) checks out another commit there.
 		if err := requireCleanTree(ctx, tree.Source); err != nil {
 			return RefreshStats{}, err
@@ -230,8 +228,8 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 			return RefreshStats{}, ErrAlreadyPast
 		}
 	}
-	if sync != nil {
-		if err := sync(ctx); err != nil {
+	if syncTree != nil {
+		if err := syncTree(ctx); err != nil {
 			return RefreshStats{}, err
 		}
 	}
@@ -428,9 +426,9 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	return st, nil
 }
 
-func relsOf(fs []moduleFile) []string {
-	out := make([]string, len(fs))
-	for i, f := range fs {
+func relsOf(files []moduleFile) []string {
+	out := make([]string, len(files))
+	for i, f := range files {
 		out[i] = f.rel
 	}
 	return out

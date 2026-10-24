@@ -1,10 +1,12 @@
 // Package confine runs one program in an operating-system sandbox that an unprivileged process can build, with
 // no setuid helper and no user namespace: Landlock confines its files, and a seccomp filter its system calls.
 //
-//   - Files: it reads only beneath Spec.Read and its scratch directory, writes (creates, removes, truncates) only
-//     in its scratch directory, and links or renames nothing across directories (Landlock REFER is never
-//     granted). The scratch directory must be fresh: this user's, mode 0700 and empty; the inputs are copied
-//     into it, never linked.
+//   - Files: it reads only beneath Spec.Read, its scratch directory and the system files that a dynamically linked
+//     program needs to start (the shared libraries, the loader's cache and /dev/urandom); reads and writes
+//     /dev/null; executes only the program and its ELF interpreter; writes (creates, removes, truncates) only in
+//     its scratch directory; and links or renames nothing across directories (Landlock REFER is never granted).
+//     The scratch directory must be fresh: this user's, mode 0700 and empty; the inputs are copied into it, never
+//     linked.
 //   - Processes: the program is the only process. Its one exec is the start of the program itself; every later
 //     execve and execveat fails, and so does every clone that is not a thread (fork, vfork, clone3, posix_spawn).
 //   - Network and the rest: every socket(2) fails, and so do io_uring, ptrace, process_vm_readv/writev, the

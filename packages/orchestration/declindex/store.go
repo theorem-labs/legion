@@ -23,8 +23,7 @@ import (
 )
 
 // SchemaVersion changes whenever what an index holds changes: a table, a column, or a meta key that a reader needs.
-// An index of another version is rebuilt from nothing (Open), and OpenReadOnly refuses it. Version 4 added the
-// landings table and the compiled_commit and source_prefix keys.
+// An index of another version is rebuilt from nothing (Open), and OpenReadOnly refuses it.
 const SchemaVersion = "4"
 
 const schema = `
@@ -111,6 +110,9 @@ const (
 	writeLockSuffix   = ".write.lock"
 )
 
+// busyTimeoutMS is how long, in milliseconds, a statement waits for a lock that another connection holds.
+const busyTimeoutMS = "120000"
+
 // Store is an open index: the SQLite file at path, and the declaration graph beside it at path + ".graph".
 type Store struct {
 	db *sql.DB
@@ -138,8 +140,8 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(120000)&_pragma=synchronous(NORMAL)" +
-		"&_pragma=temp_store(MEMORY)&_pragma=cache_size(-262144)"
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(" + busyTimeoutMS + ")" +
+		"&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-262144)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -191,7 +193,7 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 	} else if info.IsDir() {
 		return nil, fmt.Errorf("index %s is a directory", path)
 	}
-	dsn := "file:" + path + "?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(120000)"
+	dsn := "file:" + path + "?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(" + busyTimeoutMS + ")"
 	var release func()
 	if unix.Access(filepath.Dir(path), unix.W_OK) != nil {
 		locks := []string{path + writeLockSuffix}
@@ -419,7 +421,7 @@ func (s *Store) checkpoint(ctx context.Context, log io.Writer) error {
 	if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout = 0`); err != nil {
 		return err
 	}
-	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA busy_timeout = 120000`) }()
+	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA busy_timeout = `+busyTimeoutMS) }()
 	noted := false
 	for wait := time.Millisecond; ; wait = min(2*wait, 250*time.Millisecond) {
 		var busy, frames, moved int

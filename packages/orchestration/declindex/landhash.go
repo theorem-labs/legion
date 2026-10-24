@@ -13,13 +13,13 @@ import (
 )
 
 // LandHashRequest is one request of the landing program's hasher (`declindex land-hash`): the statement hashes of
-// Names as the Git tree Tree has them.
+// Names as the Git tree TreeID has them.
 type LandHashRequest struct {
-	// GitDir is a Git directory that can read Tree and its blobs (LAND_GIT_DIR).
+	// GitDir is a Git directory that can read TreeID and its blobs (LAND_GIT_DIR).
 	GitDir string
-	// Tree is the 40-hex id of the repository's root tree to answer (LAND_TREE), also when the indexed tree is a
+	// TreeID is the 40-hex id of the repository's root tree to answer (LAND_TREE), also when the indexed tree is a
 	// directory below that root.
-	Tree string
+	TreeID string
 	// Names are distinct, non-empty full declaration names.
 	Names []string
 	// BuildDir is the candidate build root (LAND_BUILD_DIR), the candidate's copy of the indexed tree. Only a
@@ -31,7 +31,7 @@ type LandHashRequest struct {
 }
 
 // LandHashAnswer is the answer for one name: its statement hash and repository-relative source path; "absent" and
-// "-" when Tree has no such declaration; "ambiguous" and the sorted, comma-joined paths when it has several.
+// "-" when TreeID has no such declaration; "ambiguous" and the sorted, comma-joined paths when it has several.
 type LandHashAnswer struct {
 	Name, Hash, Path string
 }
@@ -50,7 +50,7 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 		return nil, fmt.Errorf("the index has no git source blobs")
 	}
 	prefix := snapshot.Prefix
-	candidate, err := gitTreeSources(ctx, r.GitDir, r.Tree, prefix, SourcePathspecs(r.Roots))
+	candidate, err := gitTreeSources(ctx, r.GitDir, r.TreeID, prefix, sourcePathspecs(r.Roots))
 	if err != nil {
 		return nil, err
 	}
@@ -158,13 +158,13 @@ func answerLandHash(name string, declarations []landDeclaration) (LandHashAnswer
 	return LandHashAnswer{Name: name, Hash: "ambiguous", Path: strings.Join(paths, ",")}, nil
 }
 
-// gitTreeSources lists the Lean source blobs of tree that pathspecs select below prefix, the indexed tree's
-// directory in the repository. It keys each blob by its path without prefix, as the index keys sources.
-func gitTreeSources(ctx context.Context, gitDir, tree, prefix string, pathspecs []string) (map[string]string, error) {
-	if err := exec.CommandContext(ctx, "git", "--git-dir="+gitDir, "cat-file", "-e", tree+"^{tree}").Run(); err != nil {
+// gitTreeSources lists the Lean source blobs of the tree treeID that pathspecs select below prefix, the indexed
+// tree's directory in the repository. It keys each blob by its path without prefix, as the index keys sources.
+func gitTreeSources(ctx context.Context, gitDir, treeID, prefix string, pathspecs []string) (map[string]string, error) {
+	if err := exec.CommandContext(ctx, "git", "--git-dir="+gitDir, "cat-file", "-e", treeID+"^{tree}").Run(); err != nil {
 		return nil, fmt.Errorf("LAND_GIT_DIR cannot read LAND_TREE: %w", err)
 	}
-	args := []string{"--git-dir=" + gitDir, "ls-tree", "-r", "-z", "--full-tree", tree, "--"}
+	args := []string{"--git-dir=" + gitDir, "ls-tree", "-r", "-z", "--full-tree", treeID, "--"}
 	for _, pathspec := range pathspecs {
 		args = append(args, prefix+pathspec)
 	}
