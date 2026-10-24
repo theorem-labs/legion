@@ -57,7 +57,7 @@ func TestExpiredLeaseIsRegrantedAndOldHolderIsRefusedByGeneration(t *testing.T) 
 	ctx := context.Background()
 	observer := must(pgx.Connect(ctx, dsn))
 	defer observer.Close(ctx)
-	old := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
+	old := must(s.Claim(ctx, "r", "item", "alice", heldLease))
 	_, err := s.Claim(ctx, "r", "item", "bob", time.Minute)
 	wantRefusal(t, err, ledger.ReasonLeaseHeld)
 	waitForDatabaseExpiry(t, observer, old.ExpiresAt)
@@ -97,7 +97,7 @@ func TestRenewMovesAndPersistsExpiryByRequestedLength(t *testing.T) {
 	ctx := context.Background()
 	observer := must(pgx.Connect(ctx, dsn))
 	defer observer.Close(ctx)
-	l := must(s.Claim(ctx, "r", "item", "alice", 2*time.Second))
+	l := must(s.Claim(ctx, "r", "item", "alice", heldLease))
 	ttl := 10 * time.Second
 	r := must(s.Renew(ctx, "r", "item", "alice", l.Generation, ttl))
 	if r.Generation != l.Generation {
@@ -297,7 +297,7 @@ func TestExpireLocksThenRechecksLeaseLiveness(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s, dsn := newStoreDSN(t)
 			ctx := context.Background()
-			lease := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
+			lease := must(s.Claim(ctx, "r", "item", "alice", heldLease))
 			locker := must(pgx.Connect(ctx, dsn))
 			defer locker.Close(ctx)
 			observer := must(pgx.Connect(ctx, dsn))
@@ -370,7 +370,7 @@ func TestLeaseLivenessIsEvaluatedAfterTheItemRowLock(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s, dsn := newStoreDSN(t)
 			ctx := context.Background()
-			lease := must(s.Claim(ctx, "r", "item", "alice", 100*time.Millisecond))
+			lease := must(s.Claim(ctx, "r", "item", "alice", heldLease))
 			locker := must(pgx.Connect(ctx, dsn))
 			defer locker.Close(ctx)
 			observer := must(pgx.Connect(ctx, dsn))
@@ -400,6 +400,11 @@ func TestLeaseLivenessIsEvaluatedAfterTheItemRowLock(t *testing.T) {
 		})
 	}
 }
+
+// heldLease is the length of a lease that a test needs live for several steps (another claim, a blocked operation)
+// before it waits for the lease's end with waitForDatabaseExpiry. Seconds of slack keep a heavily loaded machine from
+// ending the lease before those steps run.
+const heldLease = 2 * time.Second
 
 // waitForDatabaseExpiry waits until the database clock passes a fixed lease end; a lease with no end fails the test.
 func waitForDatabaseExpiry(t *testing.T, conn *pgx.Conn, expiresAt *time.Time) {
