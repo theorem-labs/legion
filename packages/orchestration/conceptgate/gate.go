@@ -207,6 +207,16 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	if c, ok := reg.Find(p.Concept.Name); ok {
 		return decided(NameTaken, c.Name, c.Home, "a concept of this name is registered")
 	}
+	// A refused concept file still holds its name: the name its YAML gives, or its key when it is a name.
+	for _, refused := range reg.Refused {
+		if refused.Name == p.Concept.Name || refused.Key() == p.Concept.Name {
+			at, err := g.additionPath(refused.Key())
+			if err != nil {
+				return v, err
+			}
+			return decided(NameTaken, p.Concept.Name, at, "the concept file "+at+" holds this name, but the loader refused it: "+refused.Defect.Message)
+		}
+	}
 	found, err := g.Index.Resolve(ctx, p.Concept.Name)
 	if err != nil {
 		return v, err
@@ -254,6 +264,17 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	}
 	if len(same) > 0 {
 		return decided(Refused, same[0].Name, same[0].At(), "the compiled statement equals an existing declaration's")
+	}
+	// A refused concept file that holds this statement, as its key or as the compiled hash it records, is a concept
+	// that the gate cannot read: an addition would replace that file or restate it.
+	for _, refused := range reg.Refused {
+		if refused.Key() == decl.Hash || refused.CompiledHash == decl.Hash {
+			at, err := g.additionPath(refused.Key())
+			if err != nil {
+				return v, err
+			}
+			return v, fmt.Errorf("the concept file %s holds the proposal's compiled statement %s, but the loader refused it (%s): repair or remove that file, then propose again", at, decl.Hash, refused.Defect.Message)
+		}
 	}
 	for _, c := range consts {
 		for _, f := range c.Facts {

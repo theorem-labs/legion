@@ -140,3 +140,39 @@ func TestLoadReportsARefusedConceptFileAsADefect(t *testing.T) {
 		})
 	}
 }
+
+// A refused file still holds its path, and whatever name and compiled hash its YAML gives, so Load keeps them for
+// the gate.
+func TestLoadKeepsWhatARefusedConceptFileHolds(t *testing.T) {
+	const hash = "00112233445566778899aabbccddeeff"
+	r, defects, err := Load(writeRegistry(t, t.TempDir(), map[string]string{
+		"Fx.Two.yaml":   "name: Fx.Two\nhome: Two.lean\nmeaning: Register x2 is aligned. It stays so.\n",
+		hash + ".yaml":  "name: Fx.Keyed\nhome: Keyed.lean\nmeaning: A fact with an unknown key.\ncompiled_hash: " + hash + "\ncolour: red\n",
+		"Fx.Mess.yaml":  "name: [Fx.Mess\n",
+		"Fx.Frame.yaml": "name: Fx.Frame\nhome: Fixture.lean\nmeaning: A window of n bytes below an aligned word.\n",
+	}))
+	if err != nil || len(defects) != 3 || len(r.Concepts) != 1 {
+		t.Fatalf("load: concepts %+v, defects %v, %v", r.Concepts, defects, err)
+	}
+	got := map[string]RefusedFile{}
+	for _, refused := range r.Refused {
+		got[refused.Path] = refused
+	}
+	for path, want := range map[string]RefusedFile{
+		"concepts/Fx.Two.yaml":       {Name: "Fx.Two"},
+		"concepts/" + hash + ".yaml": {Name: "Fx.Keyed", CompiledHash: hash},
+		"concepts/Fx.Mess.yaml":      {},
+	} {
+		refused, ok := got[path]
+		if !ok {
+			t.Errorf("no refused file %s in %+v", path, r.Refused)
+			continue
+		}
+		if refused.Name != want.Name || refused.CompiledHash != want.CompiledHash || refused.Defect.Path != path || refused.Defect.Message == "" {
+			t.Errorf("refused file %s: %+v, want name %q and hash %q with its defect", path, refused, want.Name, want.CompiledHash)
+		}
+	}
+	if key := got["concepts/"+hash+".yaml"].Key(); key != hash {
+		t.Errorf("key %q, want %q", key, hash)
+	}
+}

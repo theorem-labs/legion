@@ -322,3 +322,60 @@ func TestAnAdditionPathNeedsTheGatesAdditionRoot(t *testing.T) {
 		t.Errorf("an AdditionRoot outside the repository gave the addition path %q", path)
 	}
 }
+
+// A concept file that the loader refused still holds its name and its path in the registry. A proposal with its
+// name, by the file's key or by the name its YAML gives, is name-taken and names the file. A proposal whose compiled
+// statement is the file's key (its addition would replace the file) or the compiled hash that the file records is
+// unable to be decided until the file is repaired. In each case the refused file is a defect of the verdict, and
+// the librarian gets nothing.
+func TestGateKeepsARefusedConceptFilesNameAndPath(t *testing.T) {
+	g, lib := gateForTest(t)
+	ctx := context.Background()
+	options := DecideOptions{Proposer: "role"}
+	fresh := proposal("p7", "Fresh", "def Fresh (x : Nat) : Prop := x < 3 ∧ x ≠ 1")
+	control, err := g.Decide(ctx, fresh, options)
+	if err != nil || control.Outcome != Added || control.Addition == nil || len(control.Defects) != 0 {
+		t.Fatalf("control: %+v, %v", control, err)
+	}
+	hash := control.CompiledHash
+	hasDefect := func(v Verdict, path string) bool {
+		for _, d := range v.Defects {
+			if d.Path == path {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range []struct {
+		file, body string
+		unable     bool
+	}{
+		{"Fresh.yaml", "name: [Fresh\n", false},
+		{"Elsewhere.yaml", "name: Fresh\nhome: Fresh.lean\nmeaning: A concept. It has two sentences.\n", false},
+		{hash + ".yaml", "name: [broken\n", true},
+		{"Misnamed.yaml", "name: Old.Fresh\nhome: Old.lean\nmeaning: An older copy.\ncompiled_hash: " + hash + "\ncolour: red\n", true},
+	} {
+		path := filepath.Join(g.Registry, "concepts", c.file)
+		if err := os.WriteFile(path, []byte(c.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		at := "registry/concepts/" + c.file
+		v, err := g.Decide(ctx, fresh, options)
+		switch {
+		case c.unable && (err == nil || !strings.Contains(err.Error(), at)):
+			t.Errorf("%s: %+v, %v; want unable, naming %s", c.file, v, err, at)
+		case !c.unable && (err != nil || v.Outcome != NameTaken || v.Existing != "Fresh" || v.ExistingAt != at || !strings.Contains(v.Reason, "refused")):
+			t.Errorf("%s: %+v, %v; want name-taken at %s", c.file, v, err, at)
+		case v.Addition != nil:
+			t.Errorf("%s: an addition %+v", c.file, v.Addition)
+		case !hasDefect(v, "concepts/"+c.file):
+			t.Errorf("%s: defects %+v, want the refused file", c.file, v.Defects)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(lib.got) != 0 {
+		t.Fatalf("the librarian got %+v", lib.got)
+	}
+}

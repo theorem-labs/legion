@@ -40,6 +40,23 @@ type Registry struct {
 	Opens   []string `yaml:"opens,omitempty"`
 
 	Concepts []Concept `yaml:"-" json:"-"`
+	// Refused are the concept files that Load refused and left out of Concepts.
+	Refused []RefusedFile `yaml:"-" json:"-"`
+}
+
+// RefusedFile is a concept file that Load refused: its registry-relative path, the defect that says why, and the
+// name and compiled hash that its YAML gives, when it decodes that far. The file still holds its name and its path
+// in the registry, so the gate adds no concept that would take either (Gate.Decide).
+type RefusedFile struct {
+	Path         string
+	Name         string
+	CompiledHash string
+	Defect       Defect
+}
+
+// Key is the refused file's name without its concepts/ prefix or .yaml suffix.
+func (r RefusedFile) Key() string {
+	return strings.TrimSuffix(strings.TrimPrefix(r.Path, "concepts/"), ".yaml")
 }
 
 // Defect is a registry inconsistency that does not prevent the gate or refresh from using the registry.
@@ -174,7 +191,15 @@ func Load(dir string) (Registry, []Defect, error) {
 		}
 		c, err := decodeConcept(raw)
 		if err != nil {
-			defects = append(defects, Defect{Path: relative, Message: err.Error()})
+			defect := Defect{Path: relative, Message: err.Error()}
+			defects = append(defects, defect)
+			// Whatever name and hash the file gives, read without its checks; YAML that does not decode gives none.
+			var held struct {
+				Name         string `yaml:"name"`
+				CompiledHash string `yaml:"compiled_hash"`
+			}
+			_ = yaml.Unmarshal(raw, &held)
+			r.Refused = append(r.Refused, RefusedFile{Path: relative, Name: held.Name, CompiledHash: held.CompiledHash, Defect: defect})
 			continue
 		}
 		expected := filepath.ToSlash(filepath.Join("concepts", Key(c)+".yaml"))
