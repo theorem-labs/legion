@@ -201,8 +201,8 @@ func parseLandNames(raw []byte) ([]string, error) {
 	}
 	seen := make(map[string]bool, len(names))
 	for _, name := range names {
-		if strings.TrimSpace(name) == "" || !strings.Contains(name, ".") {
-			return nil, fmt.Errorf("%q is not a non-empty fully qualified name", name)
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("%q is not a non-empty name", name)
 		}
 		if seen[name] {
 			return nil, fmt.Errorf("%s is requested twice", name)

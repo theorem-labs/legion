@@ -368,6 +368,17 @@ func TestLandHashNamesFileAndInputValidation(t *testing.T) {
 	}
 }
 
+// TestLandHashAnswersADotlessName catches a request check that refuses a name without a dot, although the full
+// name of a top-level declaration has none.
+func TestLandHashAnswersADotlessName(t *testing.T) {
+	config, tree, treeID := landBase(t)
+	r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "frame_lo", "Gold.frame_lo"), ""))
+	const want = "frame_lo\tabsent\t-\nGold.frame_lo\t9d9fba31f41fc258\tGolden.lean\n"
+	if r.code != 0 || r.out != want {
+		t.Fatalf("dotless name = %+v, want %q", r, want)
+	}
+}
+
 func TestLandHashRefusesAnIndexWithoutGitSources(t *testing.T) {
 	config := fixture(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {

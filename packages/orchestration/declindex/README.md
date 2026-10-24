@@ -123,7 +123,7 @@ The command takes no positional arguments. Its environment is:
 
 - `LAND_TREE`: the 40-hex Git object whose tree is being answered.
 - `LAND_GIT_DIR`: a Git directory that can read `LAND_TREE` and its blobs.
-- `LAND_NAMES` or `LAND_NAMES_FILE`: a JSON array of distinct, non-empty, fully qualified names. The file form is required for large requests. If both are set, their arrays must be equal.
+- `LAND_NAMES` or `LAND_NAMES_FILE`: a JSON array of distinct, non-empty, fully qualified names. A top-level declaration's full name has no dot, so a name need not contain one. The file form is required for large requests. If both are set, their arrays must be equal.
 - `LAND_BUILD_DIR`: the candidate build root when a requested declaration is in a changed source file.
 
 On exit 0, each requested name produces one line in request order:
