@@ -362,3 +362,23 @@ long fct_helper_switch(struct fct_outer *a, int k)
 	}
 	return 0;
 }
+
+/* An asm with volatile, or without an output, stays where nothing reads what it gives, and so does
+ * its input (llvm-objdump: the addresses of fct_offsets_asm[1] and [2] are formed, [3]'s is not). */
+long fct_offsets_asm[4];
+
+static inline void fct_acquire(long *l)
+{
+	(void)l;
+}
+
+void fct_asm_kept(void)
+{
+	long *one;
+	long *two;
+
+	one = ({ unsigned long __p; __asm__ volatile("" : "=r"(__p) : "0"(&fct_offsets_asm[1])); (long *)__p; });
+	two = ({ __asm__("" : : "r"(&fct_offsets_asm[2])); &fct_offsets_asm[3]; });
+	fct_acquire(one);
+	fct_acquire(two);
+}

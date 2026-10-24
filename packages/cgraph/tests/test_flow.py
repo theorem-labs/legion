@@ -619,3 +619,59 @@ def test_a_field_read_under_a_builtin_choice_is_marked_conditional(dead_facts: d
 def test_the_dead_part_has_no_access_only_the_c_has(dead_build: dict[str, Any]) -> None:
     assert dead_build["result"].passes, dead_build["result"].hard_checks
     assert dead_build["checks"]["access_layer"]["pairs"]["only_c"] == []
+
+
+def test_an_asm_with_an_output_and_without_volatile_goes_with_its_unread_output(dead_facts: dict[str, Any]) -> None:
+    """RELOC_HIDE under this_cpu_ptr: llvm-objdump shows dd_asm_store as a bare ret."""
+    events = fact_events(dead_facts, "dd_asm_store")
+    assert (events["calls"], events["accesses"]) == ([], [])
+    assert ("dd_offsets", "discarded") in unevaluated(dead_facts, "dd_asm_store")
+
+
+def test_a_volatile_asm_or_one_without_an_output_stays(fct_facts: dict[str, Any]) -> None:
+    """Each asm keeps its input; the value of the second statement expression is discarded."""
+    accesses = fact_events(fct_facts, "fct_asm_kept")["accesses"]
+    assert [(item["unit"]["name"], item["provenance"][0]["line"]) for item in accesses] == [
+        ("fct_offsets_asm", 380),
+        ("fct_offsets_asm", 381),
+    ]
+    assert ("fct_offsets_asm", "discarded") in {
+        ((item.get("unit") or {}).get("name"), item["reason"])
+        for item in fact_events(fct_facts, "fct_asm_kept")["unevaluated"]
+    }
+
+
+def test_a_store_through_an_array_parameter_is_an_effect(dead_facts: dict[str, Any]) -> None:
+    """fast_mix(unsigned long s[4], ...): s is a pointer, so the call is code."""
+    assert callees(dead_facts, "dd_array_parameter") == {"dd_mix"}
+    assert ("dd_mix", "discarded") not in unevaluated(dead_facts, "dd_array_parameter")
+
+
+def test_a_parameter_of_array_or_struct_type_the_callee_never_reads_is_ignored(dead_facts: dict[str, Any]) -> None:
+    """free_cpumask_var(vec->mask) and is_mergeable_vm_userfaultfd_ctx(vma, vmg->uffd_ctx)."""
+    events = fact_events(dead_facts, "dd_typed_parameters")
+    assert (events["accesses"], events["field_accesses"]) == ([], [])
+    assert {("dd_holder", "ignored_argument")} <= unevaluated(dead_facts, "dd_typed_parameters")
+
+
+def test_of_a_discarded_value_only_what_has_an_effect_is_computed(dead_facts: dict[str, Any]) -> None:
+    """psi_sched_switch(..., !task_on_rq_queued(prev) || prev->se.sched_delayed): the volatile read
+    stays (llvm-objdump: ld zero, 0x38(a0)), the read of the right operand of || does not."""
+    # dd_switch is inline and has no call in the image: link folds it.
+    assert callees(dead_facts, "dd_partial") == {"dd_switch", "dd_queued"}
+    assert fact_events(dead_facts, "dd_partial")["field_accesses"] == []
+    # An argument to a parameter the inline callee ignores: its leftover is an ignored argument.
+    assert ("box", "ignored_argument") in unevaluated(dead_facts, "dd_partial")
+    # The volatile read is the called helper's.
+    assert {item["field"] for item in fact_events(dead_facts, "dd_queued")["field_accesses"]} == {"size"}
+
+
+def test_an_argument_with_a_call_to_a_static_callee_that_ignores_it_is_left_to_the_image(
+    dead_facts: dict[str, Any],
+) -> None:
+    """mm_init(mm, current, current_user_ns()): dd_init is static, not inline, and ignores ns. The call
+    is marked, and link folds the helper's address of dd_init_ns under the mark."""
+    events = fact_events(dead_facts, "dd_static_callee")
+    (call,) = [call for call in events["calls"] if call["callee"] == "dd_current_ns"]
+    assert call.get("conditional") is True
+    assert callees(dead_facts, "dd_static_callee") == {"dd_init", "dd_current_ns"}

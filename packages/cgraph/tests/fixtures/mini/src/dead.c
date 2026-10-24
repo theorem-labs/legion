@@ -243,3 +243,84 @@ long dd_builtin_field(struct box *b, long n)
 		return b->size;
 	return n;
 }
+
+/* include/linux/compiler.h RELOC_HIDE, under this_cpu_ptr(): asm without volatile and with an
+ * output computes only that output, so the compiler removes it when nothing reads the output
+ * (local_lock's __tl). src/facts.c fct_asm_kept has the asm that stays. */
+#define dd_reloc_hide(ptr) ({ unsigned long __ptr; __asm__("" : "=r"(__ptr) : "0"(ptr)); (long *)__ptr; })
+
+void dd_asm_store(int cpu)
+{
+	long *tl;
+
+	tl = dd_reloc_hide(&dd_offsets[cpu]);
+	dd_acquire(tl);
+}
+
+/* drivers/char/random.c fast_mix(unsigned long s[4], ...): a parameter of array type is a pointer,
+ * so a store through s[i] is an effect, and the call stays. */
+static void dd_mix(long s[2], long v)
+{
+	s[0] += v;
+	s[1] ^= s[0];
+}
+
+void dd_array_parameter(long v)
+{
+	dd_mix(dd_offsets, v);
+}
+
+/* kernel/sched/cpupri.c: free_cpumask_var(vec->mask), where the stub's parameter has array type
+ * (cpumask_var_t without CPUMASK_OFFSTACK); mm/vma.c: is_mergeable_vm_userfaultfd_ctx(vma,
+ * vmg->uffd_ctx), a struct the stub takes by value. Neither argument is computed. */
+typedef long dd_mask_t[2];
+struct dd_holder {
+	dd_mask_t mask;
+	struct dd_ns ctx;
+};
+
+static inline void dd_free_mask(dd_mask_t mask)
+{
+}
+
+static inline int dd_mergeable(struct dd_ns ctx)
+{
+	return 1;
+}
+
+int dd_typed_parameters(struct dd_holder *h)
+{
+	dd_free_mask(h->mask);
+	return dd_mergeable(h->ctx);
+}
+
+/* kernel/sched/core.c __schedule: psi_sched_switch(prev, next, !task_on_rq_queued(prev) ||
+ * prev->se.sched_delayed). task_on_rq_queued reads with READ_ONCE, which the compiler keeps, but the
+ * value of || is unused, so prev->se.sched_delayed is never read. */
+static inline void dd_switch(struct box *b, int sleep)
+{
+	(void)sleep;
+}
+
+static inline int dd_queued(struct box *b)
+{
+	return *(volatile long *)&b->size == 1;
+}
+
+void dd_partial(struct box *b)
+{
+	dd_switch(b, !dd_queued(b) || b->first);
+}
+
+/* kernel/fork.c mm_alloc: mm_init(mm, current, current_user_ns()), where mm_init is static and not
+ * inline and never reads its namespace: the image decides, also for an argument that calls. */
+static long dd_init(struct box *b, struct dd_ns *ns)
+{
+	b->size = 1;
+	return b->size;
+}
+
+long dd_static_callee(struct box *b)
+{
+	return dd_init(b, dd_current_ns());
+}

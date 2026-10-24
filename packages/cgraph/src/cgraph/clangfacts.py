@@ -814,10 +814,11 @@ class _Extractor:
 
     def effect_free(self, expression: ci.Cursor) -> bool:
         """Computing ``expression`` changes nothing but its value, so the compiler removes it when
-        the value is not used: no asm, no volatile access, no store except to a variable the
-        expression declares, no loop that may not end, and calls only to the builtins that compute a
-        value and to functions of the unit that are themselves effect-free."""
-        own = {node.hash for node in expression.walk_preorder() if node.kind == K.VAR_DECL and _is_local(node)}
+        the value is not used: no asm that is volatile or has no output, no volatile access, no store
+        except to a variable the expression declares, no loop that may not end, and calls only to
+        the builtins that compute a value and to functions of the unit that are themselves
+        effect-free. Operands that are never evaluated (sizeof, typeof) do not count."""
+        own = {node.hash for node in _effect_nodes(expression) if node.kind == K.VAR_DECL and _is_local(node)}
         return self._effect_free(expression, own, inlined=True, depth=0)
 
     def function_effect_free(self, name: str, depth: int) -> bool:
@@ -831,14 +832,14 @@ class _Extractor:
             return False
         # A function that calls itself again may not return: it is not effect-free.
         self.effect_free_cache[name] = False
-        own = {node.hash for node in definition.walk_preorder() if _is_local(node)}
+        own = {node.hash for node in _effect_nodes(definition) if _is_local(node)}
         inlined = _is_inline(definition) or definition.linkage == ci.LinkageKind.INTERNAL
         result = self._effect_free(definition, own, inlined, depth)
         self.effect_free_cache[name] = result
         return result
 
     def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool, depth: int) -> bool:
-        for node in root.walk_preorder():
+        for node in _effect_nodes(root):
             kind = node.kind
             if kind == K.CALL_EXPR:
                 callee = node.referenced
@@ -847,7 +848,7 @@ class _Extractor:
                 if callee.spelling not in _VALUE_BUILTINS and not self.function_effect_free(callee.spelling, depth + 1):
                     return False
             elif (
-                kind == K.ASM_STMT
+                (kind == K.ASM_STMT and not self.asm_removable(node))
                 or (kind in _LOOPS and (not inlined or self.loop_may_not_end(node)))
                 or (kind.is_expression() and node.type.is_volatile_qualified())
             ):
@@ -859,6 +860,17 @@ class _Extractor:
                     if variable is None or variable.hash not in own:
                         return False
         return True
+
+    def asm_removable(self, node: ci.Cursor) -> bool:
+        """An asm statement that is not volatile, has no goto labels and has an output operand: it
+        only computes its outputs, so the compiler removes it when nothing reads them (GCC manual,
+        Extended Asm, Volatile). RELOC_HIDE under this_cpu_ptr is such an asm. The statement is read
+        as written and from the macros it expands; where those hold several asm statements, every
+        one must be removable."""
+        found = [
+            removable for _, body in self.expansion_bodies(node, node, limit=64) for removable in _asm_statements(body)
+        ]
+        return bool(found) and all(found)
 
     def loop_may_not_end(self, loop: ci.Cursor) -> bool:
         """A loop whose controlling expression is absent or a constant other than 0. Any other loop
@@ -1128,21 +1140,89 @@ def _is_local(variable: ci.Cursor | None) -> bool:
 
 def _stored_variable(target: ci.Cursor) -> ci.Cursor | None:
     """The variable an assignment stores into: ``v``, ``v.m`` or ``v[i]`` of a variable ``v`` (not
-    through a pointer), or None."""
+    through a pointer), or None. A parameter of array type is a pointer (fast_mix's
+    ``unsigned long s[4]``), so ``s[i]`` stores through it."""
     node = _strip_parens(target)
+    selected = False
     while True:
         children = _children(node)
         if node.kind == K.DECL_REF_EXPR:
-            return node.referenced
+            variable = node.referenced
+            if (
+                selected
+                and variable is not None
+                and variable.kind == K.PARM_DECL
+                and variable.type.get_canonical().kind in _ARRAY_TYPES
+            ):
+                return None
+            return variable
         if node.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR) and children:
             base = children[0]
             if base.type.get_canonical().kind == TK.POINTER:
                 return None
+            selected = True
             node = _strip_parens(base)
         elif node.kind == K.UNEXPOSED_EXPR and len(children) == 1:
             node = children[0]
         else:
             return None
+
+
+def _effect_nodes(root: ci.Cursor) -> Iterator[ci.Cursor]:
+    """The nodes of a function or an expression in preorder, without the operands that are never
+    evaluated: sizeof and alignof operands, the operands of __builtin_constant_p, cast and
+    compound-literal types, and the types of declarations (typeof)."""
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        yield node
+        children = _children(node)
+        kind = node.kind
+        if kind == K.CXX_UNARY_EXPR or (kind == K.CALL_EXPR and node.spelling in _IMAGE_DECIDES):
+            continue
+        if kind == K.VAR_DECL:
+            initializer = libclang.var_initializer(node)
+            children = [child for child in children if initializer is not None and child == initializer]
+        elif kind in (K.CSTYLE_CAST_EXPR, K.COMPOUND_LITERAL_EXPR):
+            children = children[-1:]
+        pending.extend(reversed(children))
+
+
+_ASM_KEYWORDS = frozenset({"asm", "__asm", "__asm__"})
+_ASM_QUALIFIERS = frozenset({"volatile", "__volatile__", "__volatile", "goto", "inline", "__inline__", "__inline"})
+_ASM_KEEPS = frozenset({"volatile", "__volatile__", "__volatile", "goto"})
+
+
+def _asm_statements(tokens: list[str]) -> Iterator[bool]:
+    """For each asm statement in a token list, whether it only computes its outputs: no volatile or
+    goto qualifier, and a non-empty output list (the operands between the first and the second
+    ``:`` at the top level of its parentheses)."""
+    for start, token in enumerate(tokens):
+        if token not in _ASM_KEYWORDS:
+            continue
+        index, kept = start + 1, False
+        while index < len(tokens) and tokens[index] in _ASM_QUALIFIERS:
+            kept = kept or tokens[index] in _ASM_KEEPS
+            index += 1
+        if index >= len(tokens) or tokens[index] != "(":
+            yield False
+            continue
+        depth, colons, outputs = 0, 0, 0
+        for spelling in tokens[index:]:
+            if spelling in ("(", "[", "{"):
+                depth += 1
+            elif spelling in (")", "]", "}"):
+                depth -= 1
+                if depth == 0:
+                    break
+            elif depth == 1 and spelling in (":", "::"):
+                colons += len(spelling)
+                if colons >= 2:
+                    break
+                continue
+            if colons == 1 and depth >= 1:
+                outputs += 1
+        yield not kept and colons >= 1 and outputs > 0
 
 
 def _store_target(node: ci.Cursor) -> ci.Cursor | None:
@@ -1155,10 +1235,6 @@ def _store_target(node: ci.Cursor) -> ci.Cursor | None:
     if node.kind == K.UNARY_OPERATOR and libclang.is_increment(node):
         return children[0]
     return None
-
-
-def _has_call(expression: ci.Cursor) -> bool:
-    return any(node.kind == K.CALL_EXPR for node in expression.walk_preorder())
 
 
 _INTEGER_TYPES = {
@@ -1483,21 +1559,22 @@ class _FunctionWalk:
         """The parameters and scalar locals of the function that compiled code never reads: every
         read is in code no control reaches, in an unevaluated operand, in a discarded value, or an
         argument a callee ignores. A variable whose address is taken counts as read, and so does one
-        with a cleanup attribute, which its cleanup receives."""
-        candidates = [*(self.cursor.get_arguments() or [])]
-        candidates += [
+        with a cleanup attribute, which its cleanup receives. A parameter may have any type: one of
+        array type is a pointer (free_cpumask_var's cpumask_var_t), and a struct passed by value
+        that is never read is not copied (is_mergeable_vm_userfaultfd_ctx)."""
+        parameters = list(self.cursor.get_arguments() or [])
+        locals_ = [
             node
             for node in self.cursor.walk_preorder()
             if node.kind == K.VAR_DECL
             and _is_local(node)
             and not any(child.kind == K.UNEXPOSED_ATTR for child in node.get_children())
+            and node.type.get_canonical().kind not in (TK.RECORD, *_ARRAY_TYPES)
         ]
         return frozenset(
             variable.hash
-            for variable in candidates
-            if self.reads[variable.hash] == 0
-            and variable.type.get_canonical().kind not in (TK.RECORD, *_ARRAY_TYPES)
-            and not variable.type.is_volatile_qualified()
+            for variable in [*parameters, *locals_]
+            if self.reads[variable.hash] == 0 and not variable.type.is_volatile_qualified()
         )
 
     # Guards ---------------------------------------------------------------------------------
@@ -1568,6 +1645,57 @@ class _FunctionWalk:
         finally:
             if pushed:
                 self.guard_stack.pop()
+
+    def discard(
+        self, node: ci.Cursor, parent: ci.Cursor | None, index: int, generic: bool, reason: str = "discarded"
+    ) -> None:
+        """Walk an expression whose value nothing uses. Without effects it is not computed at all;
+        otherwise only its effects are, with what they need: a call with an effect, a volatile
+        access or a store is walked as code, and the operators around them only pass values on
+        (psi_sched_switch(..., !task_on_rq_queued(prev) || prev->se.sched_delayed): the READ_ONCE
+        in task_on_rq_queued stays, and the read of the right operand of || goes). In ({ ... }) the
+        statements before the value are code and the value is discarded."""
+        if self.x.effect_free(node):
+            self.walk(node, parent, index, reason, generic)
+            return
+        kind = node.kind
+        children = _children(node)
+        if kind == K.StmtExpr and children and children[0].kind == K.COMPOUND_STMT:
+            statements = _children(children[0])
+            for statement_index, statement in enumerate(statements):
+                if statement_index == len(statements) - 1 and statement.kind.is_expression():
+                    self.discard(statement, children[0], statement_index, generic, reason)
+                else:
+                    self.walk(statement, children[0], statement_index, None, generic)
+            return
+        if kind == K.BINARY_OPERATOR and len(children) == 2:
+            operator = libclang.binary_kind(node)
+            if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR, _COMMA) and self.x.effect_free(children[1]):
+                # The right operand only gives the unused value.
+                self.discard(children[0], node, 0, generic, reason)
+                self.walk(children[1], node, 1, reason, generic)
+                return
+            if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
+                # The left operand decides whether the right one's effects happen.
+                self.walk(node, parent, index, None, generic)
+                return
+        if (
+            kind in (K.CALL_EXPR, K.CONDITIONAL_OPERATOR, K.GENERIC_SELECTION_EXPR)
+            or not kind.is_expression()
+            or node.type.is_volatile_qualified()
+            or _store_target(node) is not None
+        ):
+            self.walk(node, parent, index, None, generic)
+            return
+        # An operator, a cast or a member access: its own value is unused, and its operands give only
+        # that value, so each is discarded in turn.
+        if kind in (K.DECL_REF_EXPR, K.MEMBER_REF_EXPR):
+            self.reference(node, parent, index, reason, generic)
+        for child_index, child in enumerate(children):
+            if kind in (K.CSTYLE_CAST_EXPR, K.COMPOUND_LITERAL_EXPR) and child_index < len(children) - 1:
+                self.walk(child, node, child_index, "type", generic)
+            else:
+                self.discard(child, node, child_index, generic, reason)
 
     def exit_guard(self, statement: ci.Cursor) -> tuple[dict[str, Any], bool] | None:
         """The guard on the statements after ``if (c) return;`` (or a branch that exits otherwise):
@@ -2197,11 +2325,11 @@ class _FunctionWalk:
                 and parent.kind in _STATEMENT_PARENTS
                 and variable is not None
                 and variable.hash in self.dead_variables
-                and self.x.effect_free(children[1])
             ):
-                # A store, as a statement, to a variable nothing reads (local_lock's __tl).
+                # A store, as a statement, to a variable nothing reads (local_lock's __tl): only
+                # what the stored value's computation does besides computing it is code.
                 self.walk(children[0], node, 0, reason, generic)
-                self.walk(children[1], node, 1, "discarded", generic)
+                self.discard(children[1], node, 1, generic)
                 return
         if kind == K.CALL_EXPR:
             self.call(node, parent, reason, generic)
@@ -2217,16 +2345,10 @@ class _FunctionWalk:
             for child_index, child in enumerate(children):
                 self.walk(child, node, child_index, reason or "type", generic)
             return
-        if (
-            kind == K.CSTYLE_CAST_EXPR
-            and children
-            and reason is None
-            and node.type.get_canonical().kind == TK.VOID
-            and self.x.effect_free(children[-1])
-        ):
-            # (void)x of a value without effects (lockdep_assert_held(__rq_lockp(rq)) without
-            # lockdep): never computed.
-            self.walk(children[-1], node, len(children) - 1, "discarded", generic)
+        if kind == K.CSTYLE_CAST_EXPR and children and reason is None and node.type.get_canonical().kind == TK.VOID:
+            # (void)x (lockdep_assert_held(__rq_lockp(rq)) without lockdep): only what computing x
+            # does besides computing it is code.
+            self.discard(children[-1], node, len(children) - 1, generic)
             return
         if kind == K.CXX_UNARY_EXPR:
             tokens = self.x.written_tokens(node, self.cursor)
@@ -2253,15 +2375,13 @@ class _FunctionWalk:
                 self.cleanup(node, initializer)
             # The initial value of a variable nothing reads is not computed (ns = current_user_ns()
             # passed only to make_kgid, which ignores it).
-            dead_store = (
-                reason is None
-                and initializer is not None
-                and node.hash in self.dead_variables
-                and self.x.effect_free(initializer)
-            )
+            dead_store = reason is None and initializer is not None and node.hash in self.dead_variables
             for child_index, child in enumerate(children):
                 if initializer is not None and child == initializer:
-                    self.walk(child, node, child_index, "discarded" if dead_store else reason, generic)
+                    if dead_store:
+                        self.discard(child, node, child_index, generic)
+                    else:
+                        self.walk(child, node, child_index, reason, generic)
                 elif child.kind.is_expression():
                     self.walk(child, node, child_index, reason or "type", generic)
             return
@@ -2318,9 +2438,9 @@ class _FunctionWalk:
                     within = (guard, operator == libclang.LOGICAL_AND) if guard is not None else None
                     self.walk_guarded(within, children[1], node, 1, reason, generic)
                 return
-            if operator == _COMMA and self.x.effect_free(children[0]):
-                # cpu_to_node(cpu) without NUMA: ((void)(cpu), 0).
-                self.walk(children[0], node, 0, "discarded", generic)
+            if operator == _COMMA:
+                # cpu_to_node(cpu) without NUMA: ((void)(cpu), 0). The left value is discarded.
+                self.discard(children[0], node, 0, generic)
                 self.walk(children[1], node, 1, reason, generic)
                 return
         if kind == K.SWITCH_STMT and len(children) == 2 and reason is None:
@@ -2368,15 +2488,19 @@ class _FunctionWalk:
                 case_guard = self.case_guards.get(child.hash)
                 if dead:
                     self.walk(child, node, child_index, "after_exit", generic)
-                elif (
-                    child.kind.is_expression()
-                    and not (value_last and child_index == len(children) - 1)
-                    and self.x.effect_free(child)
-                ):
-                    # An expression statement without effects (get_user_ns(ns);, a call of a void
-                    # function that only reads): its value is discarded. The last statement of
-                    # ({ ... }) is that expression's value (per_cpu_ptr).
-                    self.walk(child, node, child_index, "discarded", generic)
+                elif child.kind.is_expression() and not (value_last and child_index == len(children) - 1):
+                    # An expression statement (get_user_ns(ns);, a call of a void function that only
+                    # reads): its value is discarded, so only its effects are code. The last statement
+                    # of ({ ... }) is that expression's value (per_cpu_ptr).
+                    pushed = case_guard is not None and case_guard[0] is not None and not self.has_label(child)
+                    if pushed:
+                        assert case_guard is not None and case_guard[0] is not None
+                        self.push_guard(case_guard[0], case_guard[1])
+                    try:
+                        self.discard(child, node, child_index, generic)
+                    finally:
+                        if pushed:
+                            self.guard_stack.pop()
                 elif case_guard is not None:
                     self.walk_guarded(case_guard, child, node, child_index, None, generic)
                 else:
@@ -2401,14 +2525,16 @@ class _FunctionWalk:
             offset = len(children) - len(arguments)
             for child_index, child in enumerate(children):
                 position = child_index - offset if child_index >= offset else None
-                if position is None or position not in ignored or not self.x.effect_free(child):
+                if position is None or position not in ignored:
                     self.walk(child, node, child_index, reason, generic)
                 elif inline:
-                    # A value only a parameter the inline callee never reads receives: not computed.
-                    self.walk(child, node, child_index, "ignored_argument", generic)
-                elif reason is None and not _has_call(child):
-                    # A callee that is not inline drops the value where the compiler inlines it
-                    # (device_remove_file(dev, &dev_attr_dev)): the image decides.
+                    # A value only a parameter the inline callee never reads receives: only its
+                    # effects are computed.
+                    self.discard(child, node, child_index, generic, "ignored_argument")
+                elif reason is None and self.x.effect_free(child):
+                    # A callee that is not inline drops the value where the compiler inlines it, or
+                    # removes the parameter when it is static (device_remove_file(dev,
+                    # &dev_attr_dev), mm_init(mm, current, current_user_ns())): the image decides.
                     self.conditional += 1
                     self.walk(child, node, child_index, reason, generic)
                     self.conditional -= 1

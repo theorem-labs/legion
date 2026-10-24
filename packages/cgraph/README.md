@@ -29,20 +29,24 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   helpers that return one truth value and locals that keep their initializer; a weak definition
   decides nothing, because another unit may replace it), the cases a `switch` on a value clang folds
   does not reach (`switch (sizeof(x))`, `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or
-  `||`, values without effects that are discarded (`(void)x`, `(x, 0)`, an expression statement,
-  also one that calls a function of the unit with no effect, such as `get_user_ns(ns);`; the last
-  statement of `({ ... })` is its value), stores to a local or a parameter that compiled code never
-  reads (`local_lock`'s `__tl`), arguments to a parameter the callee never reads in compiled code
-  (transitively: `from_kuid_munged` passes its namespace only to `from_kuid`, which ignores it; for
-  a callee that is not inline the image decides), the operands of `__builtin_constant_p`, symbols
-  named only in `typeof`, and statements after a `return`, a `goto`, a noreturn builtin or
-  function, or a `do { ... } while (0)` that ends in one (`BUG()`); a label is code only when
-  control falls into it or a goto in code targets it. A function has no effect when it has no asm,
-  no volatile access, no store except to its own locals, no loop that may not end (a constant
-  controlling expression; C11 lets the compiler assume any other loop ends), and calls only such
-  functions. Branches of `__builtin_constant_p` and `__builtin_object_size`, also as the left
-  operand of `&&` or `||`, are left to the machine code: their calls, global accesses and field
-  accesses (marked `conditional`) stay only where the image has them.
+  `||`, discarded values (`(void)x`, `(x, 0)`, an expression statement such as `get_user_ns(ns);`,
+  stores to a local or a parameter that compiled code never reads, such as `local_lock`'s `__tl`,
+  and arguments to a parameter the callee never reads in compiled code), of which only the parts
+  with an effect are code (`psi_sched_switch(..., !task_on_rq_queued(prev) || p->x)` keeps the
+  `READ_ONCE` and drops the read of `p->x`; the last statement of `({ ... })` is its value).
+  A parameter is ignored transitively (`from_kuid_munged` passes its namespace only to
+  `from_kuid`, which ignores it), whatever its type (an array parameter is a pointer, a struct
+  passed by value need not be copied); for a callee that is not inline the image decides. Also left
+  out: the operands of `__builtin_constant_p`, symbols named only in `typeof`, and statements after
+  a `return`, a `goto`, a noreturn builtin or function, or a `do { ... } while (0)` that ends in one
+  (`BUG()`); a label is code only when control falls into it or a goto in code targets it. A
+  function has no effect when it has no asm other than one without `volatile` that has an output
+  (`RELOC_HIDE` under `this_cpu_ptr`), no volatile access, no store except to its own locals, no
+  loop that may not end (a constant controlling expression; C11 lets the compiler assume any other
+  loop ends), and calls only such functions. Branches of `__builtin_constant_p` and
+  `__builtin_object_size`, also as the left operand of `&&` or `||`, are left to the machine code:
+  their calls, global accesses and field accesses (marked `conditional`) stay only where the image
+  has them.
 - **Implied calls**: a local of a cleanup class (`c.cleanup.class_type`) calls its destructor with
   the constructor's arguments; a local with any other cleanup attribute calls the function it names
   (`c.cleanup.attribute_macros` maps macros such as `__free(x)` to that function, and a macro that is
