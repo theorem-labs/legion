@@ -196,7 +196,7 @@ func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 		{"empty reason", []string{"refuse-owner", "r", owner, canonical, ""}, "empty reason"},
 		{"zero revision", []string{"refuse-owner", "r", owner, "0", "no template"}, "revision 0"},
 		{"negative revision", []string{"refuse-owner", "r", owner, "-1", "no template"}, "revision -1"},
-		{"not a number", []string{"refuse-owner", "r", owner, canonical + "x", "no template"}, "revision"},
+		{"not a number", []string{"refuse-owner", "r", owner, canonical + "x", "no template"}, `invalid integer "` + canonical + `x"`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			code, stdout, stderr := cli.call(test.args...)

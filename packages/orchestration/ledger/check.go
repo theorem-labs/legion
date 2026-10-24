@@ -203,7 +203,7 @@ type verdict struct {
 // Check and Land both call it, so one candidate gets the same violations, in the same order, from both. lock is the row
 // lock it takes on each contract the migration read: shareLock for a check, updateLock for a landing. DeferReads skips
 // only the comparison of the caller's read hashes and the landed commit; every rule that needs only the ledger runs.
-func evaluate(ctx context.Context, tx pgx.Tx, m Migration, req CheckRequest, lock string) (verdict, error) {
+func evaluate(ctx context.Context, tx pgx.Tx, m Migration, req CheckRequest, lock rowLock) (verdict, error) {
 	var v verdict
 	if precondition, ok := candidatePrecondition(req); ok {
 		v.violations = append(v.violations, precondition)
@@ -264,7 +264,7 @@ func evaluate(ctx context.Context, tx pgx.Tx, m Migration, req CheckRequest, loc
 // hash the migration recorded. It needs no build, so it runs for a deferred check too. It returns the contracts it
 // read under lock, and one stale_read violation for each read that moved, vanished, or was declared without a
 // version although the contract is registered.
-func readFence(ctx context.Context, tx pgx.Tx, repo string, m Migration, lock string) (map[string]Contract, []Violation, error) {
+func readFence(ctx context.Context, tx pgx.Tx, repo string, m Migration, lock rowLock) (map[string]Contract, []Violation, error) {
 	contracts := map[string]Contract{}
 	var stale []Violation
 	for _, name := range sortedNames(m.ReadVersions) {
@@ -374,8 +374,7 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 			req.Generation, m.ID, m.Generation, m.Owner)})
 	}
 	if m.EscalatedAt != nil {
-		add(Violation{Kind: ReasonEscalated, Message: fmt.Sprintf(
-			"migration %s was escalated to the steward: %s", m.ID, m.EscalationReason)})
+		add(Violation{Kind: ReasonEscalated, Message: escalatedMessage(m)})
 	}
 	ours, err := migrationWrites(ctx, q, req.Repo, req.Migration)
 	if err != nil {
@@ -479,9 +478,6 @@ func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error
 			"violations": kinds,
 		})
 	})
-	if res.Violations == nil {
-		res.Violations = []Violation{}
-	}
 	return res, err
 }
 

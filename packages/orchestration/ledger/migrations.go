@@ -50,13 +50,6 @@ type Migration struct {
 	ReadVersions     map[string]*int64 `json:"read_versions,omitempty"`
 }
 
-// Review records a reviewer’s approval of one contract at a specific head.
-type Review struct {
-	Contract string `json:"contract"`
-	Reviewer string `json:"reviewer"`
-	Head     string `json:"head"`
-}
-
 // RoundRequest records a failed landing round: the ready record whose candidate failed, and the round's idempotency
 // key.
 type RoundRequest struct {
@@ -311,6 +304,11 @@ func lockOpenAt(ctx context.Context, tx pgx.Tx, repo, id string, gen int64) (Mig
 		return m, err
 	}
 	return m, requireOpenAt(m, gen)
+}
+
+// escalatedMessage says why an escalated migration waits: check's violation and ready's refusal give the same text.
+func escalatedMessage(m Migration) string {
+	return fmt.Sprintf("migration %s was escalated to the steward: %s", m.ID, m.EscalationReason)
 }
 
 // requireOpenAt refuses migration m unless it is open at generation gen.

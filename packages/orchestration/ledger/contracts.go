@@ -33,15 +33,18 @@ func scanContract(row contractRow) (Contract, error) {
 	return c, err
 }
 
-// Row locks a read of a contract may take: none, a share lock for a check, or an update lock for a write.
+// rowLock is the row lock a read of a contract takes: none, a share lock for a check, or an update lock for a write.
+// It is a SQL clause, and only these three values exist.
+type rowLock string
+
 const (
-	noLock     = ""
-	shareLock  = " FOR SHARE"
-	updateLock = " FOR UPDATE"
+	noLock     rowLock = ""
+	shareLock  rowLock = " FOR SHARE"
+	updateLock rowLock = " FOR UPDATE"
 )
 
-func loadContract(ctx context.Context, q querier, repo, name, lock string) (Contract, error) {
-	query := `SELECT ` + contractColumns + ` FROM contracts WHERE repo = $1 AND name = $2` + lock
+func loadContract(ctx context.Context, q querier, repo, name string, lock rowLock) (Contract, error) {
+	query := `SELECT ` + contractColumns + ` FROM contracts WHERE repo = $1 AND name = $2` + string(lock)
 	c, err := scanContract(q.QueryRow(ctx, query, repo, name))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, &NotFoundError{What: "contract", ID: name}
@@ -306,10 +309,7 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 		return Migration{}, err
 	}
 	req = candidate.LandRequest
-	reviews := req.Reviews
-	if reviews == nil {
-		reviews = []Review{}
-	}
+	reviews := req.withEmptyLists().Reviews
 	var landed Migration
 	err = s.tx(ctx, func(tx pgx.Tx) error {
 		if _, err := lockRepo(ctx, tx, req.Repo, true); err != nil {

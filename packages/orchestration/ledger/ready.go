@@ -101,7 +101,7 @@ func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error
 			return err
 		}
 		if migration.EscalatedAt != nil {
-			return refuse(ReasonEscalated, "migration %s was escalated to the steward: %s", req.ID, migration.EscalationReason)
+			return refuse(ReasonEscalated, "%s", escalatedMessage(migration))
 		}
 		event, err := eventRecord(ctx, tx, req.Repo, "migration.ready", req.ID, migration.Owner, readyEventData{
 			Generation: req.Generation, Key: req.Key, StatementRecords: ready.StatementRecords,

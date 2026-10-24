@@ -171,9 +171,9 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if len(args) != 4 {
 			return nil, false, usagef("refuse-owner <repo> <owner> <revision> <reason>")
 		}
-		revision, err := strconv.ParseInt(args[2], 10, 64)
+		revision, err := integer(args[2])
 		if err != nil {
-			return nil, false, usagef("invalid revision %q: want an integer", args[2])
+			return nil, false, err
 		}
 		return mutation(s.RecordOwnerRefused(ctx, args[0], args[1], revision, args[3]))
 	case "claim":

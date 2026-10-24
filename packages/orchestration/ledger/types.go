@@ -38,6 +38,13 @@ type PathClash struct {
 	Theirs string `json:"theirs"`
 }
 
+// Review records a reviewer’s approval of one contract at a specific head.
+type Review struct {
+	Contract string `json:"contract"`
+	Reviewer string `json:"reviewer"`
+	Head     string `json:"head"`
+}
+
 // LastChange is the record that allowed a contract's most recent statement advance: the compatibility proof or the
 // owner's review that cleared it, with the upstream commit beside it when the landing carried one.
 type LastChange struct {
