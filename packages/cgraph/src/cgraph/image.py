@@ -12,10 +12,12 @@ from __future__ import annotations
 import bisect
 import re
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 from typing import Any, TypeVar
 
 from capstone import CS_ARCH_RISCV, CS_MODE_RISCV64, CS_MODE_RISCVC, CS_OP_IMM, CS_OP_MEM, CS_OP_REG, Cs
+from capstone.riscv_const import RISCV_REG_ZERO
 from elftools.common.exceptions import ELFError
 from elftools.elf.constants import SH_FLAGS
 from elftools.elf.elffile import ELFFile
@@ -85,9 +87,10 @@ class _State:
     per-CPU offset or an index added to the address of an object), with the address each was formed
     from (``origin``); the frame slots holding what a register spilled there held, an address, a
     base plus a constant or an anchored address (``slots``, keyed by the frame register and its
-    displacement: ``(kind, value, origin)``); and registers every path into a block gives a known
+    displacement: ``(kind, value, origin)``); registers every path into a block gives a known
     address (``choices``) or a known number (``numbers``), but not the same one: the value on each
-    path."""
+    path, or one of a few the code chose (a truth value, the bits of a mask); and registers holding
+    one of several known addresses plus an unknown index (``spread``)."""
 
     values: dict[int, int] = field(default_factory=dict)
     relative: dict[int, int] = field(default_factory=dict)
@@ -97,6 +100,7 @@ class _State:
     slots: dict[tuple[int, int], tuple[str, int, int]] = field(default_factory=dict)
     choices: dict[int, frozenset[int]] = field(default_factory=dict)
     numbers: dict[int, frozenset[int]] = field(default_factory=dict)
+    spread: dict[int, frozenset[int]] = field(default_factory=dict)
 
     def copy(self) -> _State:
         return _State(
@@ -108,7 +112,18 @@ class _State:
             dict(self.slots),
             dict(self.choices),
             dict(self.numbers),
+            dict(self.spread),
         )
+
+    def forget(self, register: int) -> None:
+        """The register no longer holds what the state knew of it (an instruction or a call wrote it)."""
+        self.values.pop(register, None)
+        self.relative.pop(register, None)
+        self.anchored.pop(register, None)
+        self.choices.pop(register, None)
+        self.numbers.pop(register, None)
+        self.spread.pop(register, None)
+        self.constants.discard(register)
 
     def meet(self, other: _State) -> _State:
         def same(mine: dict[Any, _V], theirs: dict[Any, _V]) -> dict[Any, _V]:
@@ -141,6 +156,7 @@ class _State:
             same(self.slots, other.slots),
             per_path(self.possible, other.possible, candidates),
             per_path(self.possible_numbers, other.possible_numbers, candidates),
+            same(self.spread, other.spread),
         )
 
     def address(self, register: int) -> int | None:
@@ -196,12 +212,13 @@ def _two_registers(operands: list[Any]) -> bool:
 
 def _holds(state: _State | None, register: int) -> bool:
     """Whether a state still knows what a register holds: an address, an address plus an index,
-    one of several addresses, or an unknown base plus a constant."""
+    one of several addresses (plus an index or not), or an unknown base plus a constant."""
     return state is not None and (
         state.address(register) is not None
         or register in state.anchored
         or register in state.relative
         or register in state.choices
+        or register in state.spread
     )
 
 
@@ -248,10 +265,21 @@ def _reads(instruction: Any, operands: list[Any]) -> tuple[set[int], set[int]]:
     return bases, values - bases
 
 
+def _loads_immediate(instruction: Any, operands: list[Any]) -> bool:
+    """``addi rd, zero, imm``, the 4-byte ``li``: the number itself, as ``c.li`` gives it."""
+    return (
+        instruction.mnemonic in ("addi", "addiw")
+        and len(operands) == 3
+        and operands[1].type == CS_OP_REG
+        and operands[1].reg == RISCV_REG_ZERO
+        and operands[2].type == CS_OP_IMM
+    )
+
+
 def _is_number(instruction: Any, operands: list[Any], state: _State) -> bool:
     """Whether the value an instruction computes is a number (rooted in ``lui``/``li``), not an address."""
     mnemonic = instruction.mnemonic
-    if mnemonic in _NUMBERS:
+    if mnemonic in _NUMBERS or _loads_immediate(instruction, operands):
         return True
     sources = [operand.reg for operand in operands[1:] if operand.type == CS_OP_REG]
     if mnemonic in _READS_DESTINATION and operands and operands[0].type == CS_OP_REG:
@@ -329,6 +357,103 @@ def _chosen_value(instruction: Any, operands: list[Any], state: _State) -> tuple
     if source not in state.choices:
         return None
     return operands[0].reg, frozenset((address + immediate) & _MASK for address in state.choices[source])
+
+
+# Comparisons whose result is a truth value, 0 or 1.
+_TRUTH_VALUES = frozenset({"snez", "seqz", "sltz", "sgtz", "slt", "sltu", "slti", "sltiu"})
+
+
+def _added(instruction: Any, operands: list[Any]) -> tuple[int, int, int] | None:
+    """The destination and the two registers of ``add rd, rs1, rs2`` (or ``c.add rd, rs2``)."""
+    if instruction.mnemonic not in ("add", "c.add") or any(operand.type != CS_OP_REG for operand in operands):
+        return None
+    registers = [operand.reg for operand in operands]
+    if len(registers) == 3:
+        return registers[0], registers[1], registers[2]
+    if len(registers) == 2:
+        return registers[0], registers[0], registers[1]
+    return None
+
+
+def _unknown(state: _State, register: int) -> bool:
+    """Whether the state knows no value of a register, other than a constant added to it."""
+    return not (
+        register in state.values
+        or register in state.anchored
+        or register in state.choices
+        or register in state.numbers
+        or register in state.spread
+    )
+
+
+def _number_choices(instruction: Any, operands: list[Any], state: _State) -> tuple[int, frozenset[int]] | None:
+    """A register that becomes one of a few numbers: a comparison's truth value (``snez``, ``slt``:
+    0 or 1), what ``andi`` keeps of a mask's bits (each combination of them), or such numbers
+    shifted left (``slli``); at most _MAX_CHOICES of them."""
+    mnemonic = instruction.mnemonic
+    kinds = [operand.type for operand in operands]
+    if not kinds or kinds[0] != CS_OP_REG:
+        return None
+    if mnemonic in _TRUTH_VALUES:
+        found = frozenset({0, 1})
+    elif mnemonic in ("andi", "c.andi") and len(kinds) in (2, 3) and kinds[-1] == CS_OP_IMM:
+        source, mask = operands[-2].reg, operands[-1].imm
+        if source in state.numbers:
+            found = frozenset(number & mask for number in state.numbers[source])
+        elif source in state.values or mask < 0 or bin(mask).count("1") > 2:
+            return None
+        else:
+            bits = [1 << bit for bit in range(mask.bit_length()) if mask >> bit & 1]
+            found = frozenset(sum(chosen) for count in range(len(bits) + 1) for chosen in combinations(bits, count))
+    elif mnemonic in ("slli", "slliw", "c.slli") and len(kinds) in (2, 3) and kinds[-1] == CS_OP_IMM:
+        source, amount = operands[-2].reg, operands[-1].imm
+        if source not in state.numbers or not 0 <= amount < 64:
+            return None
+        found = frozenset((number << amount) & _MASK for number in state.numbers[source])
+    else:
+        return None
+    return (operands[0].reg, found) if 1 < len(found) <= _MAX_CHOICES else None
+
+
+def _number_offsets(instruction: Any, operands: list[Any], state: _State) -> frozenset[int] | None:
+    """The offsets an ``add`` of a register holding one of a few numbers (``numbers``) to an unknown
+    base forms: each number, plus the constant the base already carries."""
+    added = _added(instruction, operands)
+    if added is None:
+        return None
+    _, left, right = added
+    for number, base in ((left, right), (right, left)):
+        if number in state.numbers and _unknown(state, base):
+            carried = state.relative.get(base, 0)
+            offsets = frozenset(value + carried for value in state.numbers[number] if abs(value) < _OFFSET_LIMIT)
+            return offsets or None
+    return None
+
+
+def _spread_value(instruction: Any, operands: list[Any], state: _State) -> tuple[int, frozenset[int]] | None:
+    """A register that becomes one of several known addresses plus an unknown index: ``add`` of an
+    unknown value to a register holding several addresses (``choices``) or such a sum already, or
+    ``addi``/``mv`` of such a sum."""
+    added = _added(instruction, operands)
+    if added is not None:
+        destination, left, right = added
+        for chosen, index in ((left, right), (right, left)):
+            addresses = state.choices.get(chosen, state.spread.get(chosen))
+            if addresses is not None and _unknown(state, index):
+                return destination, addresses
+        return None
+    kinds = [operand.type for operand in operands]
+    if instruction.mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG]:
+        source, immediate = operands[1].reg, 0
+    elif instruction.mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM]:
+        source, immediate = operands[1].reg, operands[2].imm
+    elif instruction.mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM]:
+        source, immediate = operands[0].reg, operands[1].imm
+    else:
+        return None
+    if source not in state.spread:
+        return None
+    return operands[0].reg, frozenset((address + immediate) & _MASK for address in state.spread[source])
 
 
 @dataclass(frozen=True)
@@ -455,6 +580,9 @@ def _relative_value(
         return operands[0].reg, operands[2].imm
     if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in relative:
         return operands[0].reg, relative[operands[0].reg] + operands[1].imm
+    if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg not in values:
+        # c.addi a0, -16 is addi a0, a0, -16 in two bytes: a base plus a constant as the 4-byte form.
+        return (operands[0].reg, operands[1].imm) if operands[1].imm else None
     if mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in relative:
         return operands[0].reg, relative[operands[1].reg]
     return None
@@ -822,6 +950,9 @@ class Image:
         # The registers holding a frame address before each instruction of the function being
         # decoded (_decode sets them from _frame): what they add is the frame's, no field offset.
         self.frame_rooted: dict[int, frozenset[str]] = {}
+        # Whether that function forms the address of anything in its frame, which a callee may then
+        # write: a number it spills does not stay in its slot (_spilled).
+        self.frame_formed = False
         # The C names of every symbol System.map lists, for telling a global the compiler removed.
         self.map_source_names = frozenset(source_name(name) for _, _, name in self.map)
 
@@ -992,12 +1123,12 @@ class Image:
         facts = FunctionFacts()
         successors = _flow(self.decoder, instructions, self.never_returns, self._halts, patches)
         roots = _roots(patches)
+        frame = _frame(self.decoder, instructions, successors, patches)
+        self.frame_rooted, self.frame_formed = frame.rooted, bool(frame.addresses)
         states = self._block_states(instructions, successors, roots=roots)
         before = dict(states)
         first = dict(self._block_states(instructions, successors, _retreating(successors), roots))
         returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
-        frame = _frame(self.decoder, instructions, successors, patches)
-        self.frame_rooted = frame.rooted
         for index, state in states:
             instruction = instructions[index]
             escapes, partner = None, None
@@ -1027,11 +1158,14 @@ class Image:
 
     def _forms_address(self, instruction: Any, state: _State) -> bool:
         """Whether the instruction forms an address the escape walk judges: an ``addi``, or an index
-        added to a known address."""
+        or one of a few numbers added to a known address, or an index added to one of several."""
         if instruction.mnemonic in _ADDI:
             return True
+        operands = list(instruction.operands)
         return instruction.mnemonic in ("add", "c.add") and (
-            _anchored_value(instruction, list(instruction.operands), state, self.section_of) is not None
+            _anchored_value(instruction, operands, state, self.section_of) is not None
+            or _chosen_value(instruction, operands, state) is not None
+            or _spread_value(instruction, operands, state) is not None
         )
 
     def _first_pass(
@@ -1045,7 +1179,7 @@ class Image:
         for base, displacement in _memory_references(instruction, list(instruction.operands)):
             if self.decoder.reg_name(base) == "tp" or state.address(base) is not None or base in state.anchored:
                 continue
-            if base in state.choices or base in state.constants:
+            if base in state.choices or base in state.constants or base in state.spread:
                 continue
             rooted = self.frame_rooted.get(instruction.address, _SP)
             if (
@@ -1428,6 +1562,17 @@ class Image:
                             "load_or_store_some_path",
                             facts,
                         )
+                elif base in state.spread:
+                    # One of several known addresses plus an index (lazy_work ? this_cpu_ptr(&lazy_list)
+                    # : this_cpu_ptr(&raised_list)): each object, as an anchor names its own.
+                    for address in sorted(state.spread[base]):
+                        self._record_address(
+                            function,
+                            self._in_origin((address + displacement) & _MASK, address),
+                            instruction.address,
+                            "indexed_access",
+                            facts,
+                        )
                 elif base in relative and self.decoder.reg_name(base) not in rooted:
                     # A base register the code has already added a constant to: the field's offset
                     # from the object the register pointed at is the sum, which a load or store
@@ -1449,26 +1594,44 @@ class Image:
                     self._call(function, instruction.address, target, tail, facts)
         if mnemonic in {"jal", "c.jal"} or (mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, operands)):
             # A call may change every caller-saved register.
-            for register in (*values, *relative, *anchored, *state.choices, *state.numbers):
+            for register in (*values, *relative, *anchored, *state.choices, *state.numbers, *state.spread):
                 name = self.decoder.reg_name(register)
                 if name == "ra" or name.startswith(("a", "t")):
-                    values.pop(register, None)
-                    relative.pop(register, None)
-                    anchored.pop(register, None)
-                    state.choices.pop(register, None)
-                    state.numbers.pop(register, None)
-                    state.constants.discard(register)
+                    state.forget(register)
         derived = _relative_value(instruction, operands, values, relative)
         indexed = _anchored_value(instruction, operands, state, self.section_of)
         chosen = _chosen_value(instruction, operands, state)
+        spread = _spread_value(instruction, operands, state)
+        numbered = _number_choices(instruction, operands, state)
+        offsets = _number_offsets(instruction, operands, state)
         number = computed is not None and _is_number(instruction, operands, state)
         for register in _written_registers(instruction, operands):
-            values.pop(register, None)
-            relative.pop(register, None)
-            anchored.pop(register, None)
-            state.choices.pop(register, None)
-            state.numbers.pop(register, None)
-            state.constants.discard(register)
+            state.forget(register)
+        if numbered is not None and computed is None:
+            state.numbers[numbered[0]] = numbered[1]
+        if spread is not None:
+            state.spread[spread[0]] = spread[1]
+        names = {self.decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG}
+        framed = bool(names & self.frame_rooted.get(instruction.address, _SP))
+        if facts is not None and offsets is not None and not framed:
+            # One of a few numbers added to a base (cond ? &p->a : &p->b as p + (cond ? 24 : 240)):
+            # each is the offset of a field the code addresses.
+            facts.memory_offsets.update(offsets)
+        if facts is not None and not framed and _loads_immediate(instruction, operands) and operands[2].imm:
+            # A 4-byte li may be a field offset the code adds later; the field check reads it as one,
+            # as it did when this form was taken for an unknown base plus a constant.
+            facts.memory_offsets.add(operands[2].imm)
+        if facts is not None and escapes and computed is None:
+            # An address that is one of several (each path's, or chosen by a number), used other than
+            # as a load or store base: each object it may be, as one address names its own.
+            for address in sorted(chosen[1] if chosen is not None else ()):
+                self._record_address(
+                    function, address, instruction.address, "addi_address", facts, escapes == "compared", partner
+                )
+            for address in sorted(spread[1] if spread is not None else ()):
+                self._record_address(
+                    function, address, instruction.address, "indexed_address", facts, escapes == "compared", partner
+                )
         if chosen is not None:
             state.choices[chosen[0]] = chosen[1]
         if computed is not None:
@@ -1498,17 +1661,17 @@ class Image:
                 )
         elif derived is not None:
             relative[derived[0]] = derived[1]
-            names = {self.decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG}
-            if facts is not None and not names & self.frame_rooted.get(instruction.address, _SP):
+            if facts is not None and not framed:
                 # The code formed "a base plus a constant": the offset of the field it addresses,
                 # which an index added after it would lose (not of the frame, which _frame keeps).
                 facts.memory_offsets.add(derived[1])
         self._frame_slot(instruction, operands, state)
 
     def _frame_slot(self, instruction: Any, operands: list[Any], state: _State) -> None:
-        """A register holding an address, a base plus a constant (``relative``) or an anchored
-        address, spilled to a frame slot and reloaded from it (a value kept across calls in a long
-        function: shrink_node's pgdat + 3752, sched_balance_softirq's this_rq() + 2047). Without
+        """A register holding an address, a number (``lui``/``li``), a base plus a constant
+        (``relative``) or an anchored address, spilled to a frame slot and reloaded from it (a value
+        kept across calls in a long function: shrink_node's pgdat + 3752, sched_balance_softirq's
+        this_rq() + 2047, __purge_vmap_area_lazy's 6208 for &vn->lazy.lock). Without
         this the value is lost at the reload, although every path gives the slot the same one. A
         store over any byte of a slot ends what it held, and so does any store through the other
         frame register (whose distance to this one the code does not show) or a move of the frame
@@ -1538,9 +1701,12 @@ class Image:
                 state.slots[(base, displacement)] = held
         elif (base, displacement) in state.slots:
             kind, value, origin = state.slots[(base, displacement)]
-            if kind == "address":
+            if kind in ("address", "number"):
                 state.values[register] = value
-                state.constants.discard(register)
+                if kind == "number":
+                    state.constants.add(register)
+                else:
+                    state.constants.discard(register)
             elif kind == "relative":
                 state.relative[register] = value
             else:
@@ -1549,10 +1715,13 @@ class Image:
 
     def _spilled(self, register: int, state: _State) -> tuple[str, int, int] | None:
         """What a frame slot keeps of a register spilled to it: its address, its constant from an
-        unknown base, or its anchored address and origin; nothing for a number or an unknown value."""
+        unknown base, its anchored address and origin, or its number where the function hands out no
+        frame address (``frame_formed``); nothing for an unknown value."""
         address = state.address(register)
         if address is not None:
             return ("address", address, address)
+        if register in state.values and not self.frame_formed:
+            return ("number", state.values[register], 0)
         if register in state.anchored:
             return ("anchored", state.anchored[register], state.origin.get(register, state.anchored[register]))
         if register in state.relative and register not in state.values:
@@ -1884,6 +2053,8 @@ def _computed(
         if upper & 0x80000:
             upper -= 0x100000
         return operands[0].reg, upper << 12
+    if _loads_immediate(instruction, operands):
+        return operands[0].reg, operands[2].imm
     if mnemonic in {"addi", "addiw"} and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in values:
         return operands[0].reg, values[operands[1].reg] + operands[2].imm
     if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in values:

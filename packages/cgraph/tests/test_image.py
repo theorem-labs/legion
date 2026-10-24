@@ -1215,3 +1215,82 @@ def test_an_indexed_address_spilled_to_the_frame_keeps_its_object_and_offset(ima
     )  # fmt: skip
     assert ("box_table", "indexed_access") in _operations(facts)
     assert 240 in facts.memory_offsets
+
+
+A4 = 14
+
+
+def test_an_address_plus_a_truth_value_times_eight_names_both_objects(image: Image) -> None:
+    """``a2 = &pair_a; a1 = (a1 != 0) << 3; a1 += a2``, stored, as register_cpu's ``hotpluggable ?
+    hotplugable_cpu_attr_groups : common_cpu_attr_groups``: the address is pair_a or pair_b."""
+    snez = (A1 << 20) | (ZERO << 15) | (3 << 12) | (A1 << 7) | 0x33  # sltu a1, zero, a1
+    facts = _at(image, A2, image.object_symbols["pair_a"][0].address, snez, _i(0x13, A1, 1, A1, 3),
+                _add(A1, A1, A2), _store(A1, A0, 0))  # fmt: skip
+    assert _operations(facts) == {("pair_a", "addi_address"), ("pair_b", "addi_address")}
+
+
+def test_a_masked_bit_added_to_a_base_is_a_field_offset(image: Image) -> None:
+    """``s3 = (a2 & 0x40) + a1``, as statmount_mnt_idmap's ``uid_map ? &idmap->uid_map :
+    &idmap->gid_map``: the field is at 0 or at 64 from a1."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack("<4I", _i(0x13, S3, 7, A2, 0x40), _add(S3, S3, A1), _i(0x03, A1, 6, S3, 0x3C), RET)
+    assert {0, 64} <= image.decode("synthetic", code, start).memory_offsets
+
+
+def test_a_four_byte_li_is_a_number_and_stays_among_the_displacements(image: Image) -> None:
+    """``addi a2, zero, 24`` is the number 24, as ``c.li`` is, and the field check still reads it as
+    a displacement the function may add later, as it read it before it was a number."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack("<3I", _addi(A2, ZERO, 24), _addi(A3, A2, 8), RET)
+    facts = image.decode("synthetic", code, start)
+    assert 24 in facts.memory_offsets
+    assert 32 not in facts.memory_offsets
+
+
+def test_a_number_each_path_gives_added_to_a_base_is_each_field_offset(image: Image) -> None:
+    """``a2 = 240`` (``addi a2, zero, 240``) on one path, ``c.li a2, 24`` on the other, then
+    ``ld a0, 0(a1 + a2)``, as irq_affinity_notify's pending mask or ``irq_common_data.affinity``."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack(
+        "<IIIHIII", _branch(A3, ZERO, 12), _addi(A2, ZERO, 240), _jump(6), 0x4661,
+        _add(A2, A2, A1), _load(A0, A2, 0), RET,
+    )  # fmt: skip
+    assert {24, 240} <= image.decode("synthetic", code, start).memory_offsets
+
+
+def test_an_address_chosen_by_a_masked_bit_plus_an_index_names_both_objects(image: Image) -> None:
+    """``a3 = ((a1 & 4) << 1) + &pair_a; a2 += a3; ld a5, 0(a2)``, as __irq_work_queue_local's
+    ``lazy_work ? this_cpu_ptr(&lazy_list) : this_cpu_ptr(&raised_list)`` (a2 the CPU's offset)."""
+    facts = _at(image, A4, image.object_symbols["pair_a"][0].address, _i(0x13, A1, 7, A1, 4),
+                _i(0x13, A3, 1, A1, 1), _add(A3, A3, A4), _add(A2, A2, A3), _load(A5, A2, 0))  # fmt: skip
+    assert {("pair_a", "indexed_access"), ("pair_b", "indexed_access")} <= _operations(facts)
+
+
+def test_a_compressed_addi_of_an_unknown_base_is_a_base_plus_a_constant(image: Image) -> None:
+    """``c.addi a0, -16; lw a2, 24(a0)``, as __next_zones_zonelist's ``z - 1`` before its loop: the
+    field is 8 bytes from a0, as with the 4-byte ``addi``."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack("<HII", 0x1541, _i(0x03, A2, 2, A0, 24), RET)  # c.addi a0, -16
+    assert 8 in image.decode("synthetic", code, start).memory_offsets
+
+
+def _spilled_number(image: Image, *between: int) -> FunctionFacts:
+    """After the prologue, ``a0 = 0x2000 - 0x7c0; sd a0, -128(s0)``, a0 reused, ``between``, then
+    ``ld s5, -128(s0); s5 += s8; ld a1, 0(s5)``."""
+    body = [
+        _u(0x37, A1, 2), _addi(A0, A1, -0x7C0), _store(A0, S0, -128), _addi(A0, ZERO, 0), *between,
+        _load(21, S0, -128), _add(21, 21, 24), _load(A1, 21, 0), RET,
+    ]  # fmt: skip
+    return _framed(image, body)
+
+
+def test_a_number_spilled_to_the_frame_keeps_its_value(image: Image) -> None:
+    """As __purge_vmap_area_lazy's ``&vn->lazy.lock``, 6208 bytes into vmap_node, kept across a
+    loop: the reload gives the number back, and the field is 6208 bytes from s8."""
+    assert 6208 in _spilled_number(image).memory_offsets
+
+
+def test_a_number_spilled_where_the_function_forms_a_frame_address_is_not_kept(image: Image) -> None:
+    """``addi a2, s0, -40`` hands out a local's address, through which a callee may write the frame:
+    a number there may change, so the reload gives no number."""
+    assert 6208 not in _spilled_number(image, _addi(A2, S0, -40), _jal(RA, 0x100)).memory_offsets

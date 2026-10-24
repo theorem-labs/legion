@@ -96,9 +96,14 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   unknown base plus a constant, or a known address plus an index survives a spill to a frame slot
   and the reload from it, until a store over any byte of the slot, a store through the other frame
   register, or a move of the frame register; a field reached from the reloaded register keeps its
-  whole offset (`pgdat + 3752 + 352`). Where every path into a load gives its base a known address
-  but not the same one, the function reads each of those objects on some path
+  whole offset (`pgdat + 3752 + 352`). So does a number (`lui`/`li`), in a function that forms no
+  frame address a callee could write through. Where every path into a load gives its base a known
+  address but not the same one, the function reads each of those objects on some path
   (`load_or_store_some_path`); where any path leaves the base unknown, no object is claimed. A
+  number the code chooses among a few (a comparison's truth value, the bits an `andi` keeps, either
+  shifted left; a constant each path gives differently) added to a known address names each object
+  it may reach, and added to an unknown base is each field offset (`cond ? &p->a : &p->b` compiled
+  as `p + (cond ? 24 : 240)`); with an index added as well, each object names its own access. A
   loop's first pass is a path too: a load or store whose base the loop changes reads the
   address the loop enters with. An address formed with an `addi`, or an index added to a known
   address, is an access of its own only where the code uses it other than as the base of its loads
