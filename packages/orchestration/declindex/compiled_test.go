@@ -49,7 +49,7 @@ func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	if st.Exported != 1 {
 		t.Fatalf("exported %d modules, want 1", st.Exported)
 	}
-	c, err := s.Constant(ctx, "Fx.SpAligned")
+	c, err := s.Constant(ctx, "Fx.SpAligned", "Fixture")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,11 +82,15 @@ func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	if !reflect.DeepEqual(spBox, []string{"Fx.SpBox", "Fx.SpBox.al", "Fx.SpBox.mk"}) {
 		t.Errorf("a constructor's fact is not its structure's: %v", spBox)
 	}
-	same, err := s.SameAtoms(ctx, "Fx.inline")
+	same, err := s.SameAtoms(ctx, declaration(t, s, "Fx.inline"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(same, "Fx.swapped") || contains(same, "Fx.other_reg") {
+	var sameNames []string
+	for _, f := range same {
+		sameNames = append(sameNames, f.Name)
+	}
+	if !contains(sameNames, "Fx.swapped") || contains(sameNames, "Fx.other_reg") {
 		t.Errorf("same atoms as Fx.inline: %v", same)
 	}
 	again, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
@@ -168,7 +172,7 @@ func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := s.Constant(ctx, "user_frame"); err != nil || len(c.Facts) != 1 || c.Facts[0].How != "via:Fx.Frame" {
+	if c, err := s.Constant(ctx, "user_frame", "User"); err != nil || len(c.Facts) != 1 || c.Facts[0].How != "via:Fx.Frame" {
 		t.Fatalf("before the change: %+v %v", c, err)
 	}
 	src, _ := os.ReadFile(filepath.Join(tree.Source, "Fixture.lean"))
@@ -190,7 +194,7 @@ func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 	if st.Exported != 1 || st.Rematched != 1 {
 		t.Fatalf("exported %d and re-matched %d modules, want 1 and 1", st.Exported, st.Rematched)
 	}
-	if c, err := s.Constant(ctx, "user_frame"); err != nil || len(c.Facts) != 0 {
+	if c, err := s.Constant(ctx, "user_frame", "User"); err != nil || len(c.Facts) != 0 {
 		t.Fatalf("after the change the user still states the fact: %+v %v", c, err)
 	}
 }
@@ -223,7 +227,7 @@ func TestRefreshRematchesEverythingWhenAFormlessConceptsBodyChanges(t *testing.T
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := s.Constant(ctx, "restate"); err != nil || len(c.Facts) != 1 || c.Facts[0].Concept != "Fx.Frame" {
+	if c, err := s.Constant(ctx, "restate", "Restate"); err != nil || len(c.Facts) != 1 || c.Facts[0].Concept != "Fx.Frame" {
 		t.Fatalf("before the change: %+v %v", c, err)
 	}
 	src, _ := os.ReadFile(filepath.Join(tree.Source, "Fixture.lean"))
@@ -238,7 +242,7 @@ func TestRefreshRematchesEverythingWhenAFormlessConceptsBodyChanges(t *testing.T
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: compiledWith(co)}); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := s.Constant(ctx, "restate"); err != nil || len(c.Facts) != 0 {
+	if c, err := s.Constant(ctx, "restate", "Restate"); err != nil || len(c.Facts) != 0 {
 		t.Fatalf("after the concept's body changed, the old restatement still matches: %+v %v", c, err)
 	}
 }

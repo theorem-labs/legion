@@ -344,26 +344,41 @@ var ErrExporter = errors.New("exporter failed")
 
 // Run exports the manifest's modules, in parallel processes of at most ModulesPerProcess modules each.
 func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
-	if len(m.Modules) == 0 {
+	return x.RunEach(ctx, []Manifest{m})
+}
+
+// RunEach exports the modules of each manifest, in parallel processes of at most ModulesPerProcess modules each; a
+// process reads the modules of one manifest, which one Lean environment can import together.
+func (x *Exporter) RunEach(ctx context.Context, ms []Manifest) ([]Constant, error) {
+	total := 0
+	for _, m := range ms {
+		total += len(m.Modules)
+	}
+	if total == 0 {
 		return nil, nil
 	}
 	per := x.ModulesPerProcess
 	if per <= 0 {
-		per = (len(m.Modules) + max(1, x.Jobs) - 1) / max(1, x.Jobs)
+		per = (total + max(1, x.Jobs) - 1) / max(1, x.Jobs)
 	}
-	chunks := slices.Collect(slices.Chunk(m.Modules, per))
-	results := make([][]Constant, len(chunks))
-	errs := make([]error, len(chunks))
+	var runs []Manifest
+	for _, m := range ms {
+		for chunk := range slices.Chunk(m.Modules, per) {
+			mm := m
+			mm.Modules = chunk
+			runs = append(runs, mm)
+		}
+	}
+	results := make([][]Constant, len(runs))
+	errs := make([]error, len(runs))
 	var mu sync.Mutex
 	done := 0
-	parallel(len(chunks), max(1, x.Jobs), func(i int) {
-		mm := m
-		mm.Modules = chunks[i]
-		results[i], errs[i] = x.runOne(ctx, mm)
+	parallel(len(runs), max(1, x.Jobs), func(i int) {
+		results[i], errs[i] = x.runOne(ctx, runs[i])
 		mu.Lock()
 		done++
-		if errs[i] == nil && (done%10 == 0 || done == len(chunks)) {
-			logf(x.Log, "exporter: %d of %d module groups done", done, len(chunks))
+		if errs[i] == nil && (done%10 == 0 || done == len(runs)) {
+			logf(x.Log, "exporter: %d of %d module groups done", done, len(runs))
 		}
 		mu.Unlock()
 	})

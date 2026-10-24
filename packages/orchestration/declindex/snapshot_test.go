@@ -59,13 +59,13 @@ func viewOf(t *testing.T, s *Store) indexView {
 		t.Fatal(err)
 	}
 	v.frameAt = len(found) == 1
-	_, err = s.Constant(ctx, "Gold2.FrameAt")
+	_, err = s.Constant(ctx, "Gold2.FrameAt", "Sub.Wrap")
 	var nf *NotFoundError
 	if err != nil && !errors.As(err, &nf) {
 		t.Fatal(err)
 	}
 	v.constant = err == nil
-	answer, err := s.Answer(ctx, "Gold.Frame", AnswerOptions{})
+	answer, err := answerFor(t, s, "Gold.Frame", AnswerOptions{})
 	if err != nil {
 		t.Fatalf("answer about Gold.Frame: %v", err)
 	}

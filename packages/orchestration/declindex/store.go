@@ -25,7 +25,7 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
-const SchemaVersion = "5"
+const SchemaVersion = "6"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS modules (
     olean_key TEXT NOT NULL DEFAULT ''
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS modules_module ON modules (module);
+-- The modules that each module the index read imports directly, from its reference file.
+CREATE TABLE IF NOT EXISTS imports (module TEXT NOT NULL, imported TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS imports_module ON imports (module);
+-- A declaration is its module and its name: two modules that are never imported together can declare one name.
 CREATE TABLE IF NOT EXISTS decls (
     name      TEXT NOT NULL,
     short     TEXT NOT NULL,
@@ -53,35 +57,40 @@ CREATE TABLE IF NOT EXISTS decls (
 CREATE INDEX IF NOT EXISTS decls_name ON decls (name);
 CREATE INDEX IF NOT EXISTS decls_short ON decls (short);
 CREATE INDEX IF NOT EXISTS decls_module ON decls (module);
+-- One use of a constant: target and tmodule are its name and the module that Lean recorded for it; module, line,
+-- col and parent are where the use is.
 CREATE TABLE IF NOT EXISTS uses (
-    target TEXT NOT NULL,
-    module TEXT NOT NULL,
-    line   INTEGER NOT NULL,
-    col    INTEGER NOT NULL,
-    parent TEXT NOT NULL,
-    cls    TEXT NOT NULL
+    target  TEXT NOT NULL,
+    tmodule TEXT NOT NULL,
+    module  TEXT NOT NULL,
+    line    INTEGER NOT NULL,
+    col     INTEGER NOT NULL,
+    parent  TEXT NOT NULL,
+    cls     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS uses_target ON uses (target);
 CREATE INDEX IF NOT EXISTS uses_module ON uses (module);
--- Declaration-level edges, used -> user: target is the name the use records (a declaration, or a part Lean
--- generated from one, such as a field). The graph counts a generated part as its declaration. stmt is 1 when some
--- use is in the user's statement; kind is the user's kind.
+-- Declaration-level edges, used -> user: target and tmodule are the constant the use records (a declaration, or a
+-- part Lean generated from one, such as a field), dst and module the user. The graph counts a generated part as its
+-- declaration. stmt is 1 when some use is in the user's statement; kind is the user's kind.
 CREATE TABLE IF NOT EXISTS edges (
-    target TEXT NOT NULL,
-    dst    TEXT NOT NULL,
-    module TEXT NOT NULL,
-    stmt   INTEGER NOT NULL,
-    kind   TEXT NOT NULL
+    target  TEXT NOT NULL,
+    tmodule TEXT NOT NULL,
+    dst     TEXT NOT NULL,
+    module  TEXT NOT NULL,
+    stmt    INTEGER NOT NULL,
+    kind    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS edges_module ON edges (module);
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated
 -- type as printed, and its compiled statement hash.
 CREATE TABLE IF NOT EXISTS consts (
-    name   TEXT PRIMARY KEY,
+    name   TEXT NOT NULL,
     module TEXT NOT NULL,
     kind   TEXT NOT NULL,
     type   TEXT NOT NULL,
-    cstmt  TEXT NOT NULL
+    cstmt  TEXT NOT NULL,
+    PRIMARY KEY (name, module)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS consts_module ON consts (module);
 CREATE INDEX IF NOT EXISTS consts_cstmt ON consts (cstmt);
@@ -100,7 +109,7 @@ CREATE INDEX IF NOT EXISTS facts_module ON facts (module);
 CREATE TABLE IF NOT EXISTS landings (landed TEXT PRIMARY KEY, previous TEXT NOT NULL) WITHOUT ROWID;
 `
 
-var tables = []string{"meta", "sources", "modules", "decls", "uses", "edges", "consts", "atoms", "facts", "landings"}
+var tables = []string{"meta", "sources", "modules", "imports", "decls", "uses", "edges", "consts", "atoms", "facts", "landings"}
 
 // The index's two lock files, beside it. A refresh holds the refresh lock exclusive across its sync (fetch,
 // checkout and build) and its reads of the tree, so that two refreshes never interleave. Every write of the index

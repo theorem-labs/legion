@@ -486,7 +486,7 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 			fmt.Fprintf(e.stdout, "%s: %d declarations share this name; each is answered separately\n", q, len(found))
 		}
 		for _, f := range found {
-			a, err := e.store.Answer(ctx, f.Name, opt)
+			a, err := e.store.Answer(ctx, f, opt)
 			if err != nil {
 				return fail(e.stderr, &unableError{err})
 			}

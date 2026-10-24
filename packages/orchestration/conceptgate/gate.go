@@ -118,10 +118,10 @@ type Gate struct {
 // ProposalModule is the module name a proposal is compiled as.
 const ProposalModule = "DeclIndexProposal"
 
-// Forms gives the registry's forms module, importing the module of each registered concept that the index has.
-// A concept with forms and no stored source states its fact through those forms, so it is kept whether or not the
-// index declares its name. A source-bearing concept that the index does not yet declare is pending; only the gate
-// compiles it, in a sandbox, and then adds it to the forms module for that one decision.
+// Forms gives the registry's forms module, importing the module of each registered concept that the index declares
+// in the concept's home file. A concept with forms and no stored source states its fact through those forms, so it
+// is kept whether or not the index declares it. A source-bearing concept that the index does not yet declare is
+// pending; only the gate compiles it, in a sandbox, and then adds it to the forms module for that one decision.
 func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.FormsModule, error) {
 	return forms(ctx, s, r, nil)
 }
@@ -138,13 +138,17 @@ func forms(ctx context.Context, s *declindex.Store, r Registry, hidden map[strin
 		seen[i] = true
 	}
 	for _, c := range r.Concepts {
+		home, err := s.ModuleAt(ctx, c.Home)
+		if err != nil {
+			return fm, err
+		}
 		found, err := s.Resolve(ctx, c.Name)
 		if err != nil {
 			return fm, err
 		}
 		declared := false
 		for _, f := range found {
-			if f.Name != c.Name || hidden[f.Module] {
+			if f.Name != c.Name || f.Module != home || hidden[f.Module] {
 				continue
 			}
 			declared = true
@@ -158,6 +162,19 @@ func forms(ctx context.Context, s *declindex.Store, r Registry, hidden map[strin
 		}
 	}
 	return fm, nil
+}
+
+// conceptConstant is the compiled constant of the registered concept c: its name in the module of its home file.
+// Another module can declare the same name; it is not c's.
+func conceptConstant(ctx context.Context, s *declindex.Store, c Concept) (declindex.Compiled, error) {
+	module, err := s.ModuleAt(ctx, c.Home)
+	if err != nil {
+		return declindex.Compiled{}, err
+	}
+	if module == "" {
+		return declindex.Compiled{}, &declindex.NotFoundError{Name: c.Name}
+	}
+	return s.Constant(ctx, c.Name, module)
 }
 
 // Decide compares a proposal with the registry and the index. An added verdict carries a canonical file; the
@@ -254,7 +271,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	v.CompiledHash = decl.Hash
 	var unknown []string
 	for _, c := range reg.Concepts {
-		rc, err := g.Index.Constant(ctx, c.Name)
+		rc, err := conceptConstant(ctx, g.Index, c)
 		var nf *declindex.NotFoundError
 		switch {
 		case errors.As(err, &nf):
@@ -437,7 +454,7 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		if c.Name == exclude {
 			continue
 		}
-		compiled, err := g.Index.Constant(ctx, c.Name)
+		compiled, err := conceptConstant(ctx, g.Index, c)
 		var nf *declindex.NotFoundError
 		if err != nil && !errors.As(err, &nf) {
 			return fm, defects, err

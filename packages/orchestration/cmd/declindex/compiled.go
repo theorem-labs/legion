@@ -1,10 +1,10 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -75,6 +75,15 @@ func cmdStates(ctx context.Context, e *env, args []string) int {
 	return rc
 }
 
+// sameAnswer is `same`'s answer about one declaration: the declarations whose statements share a relation atom with
+// its statement.
+type sameAnswer struct {
+	Declaration string            `json:"declaration"`
+	Module      string            `json:"module"`
+	At          string            `json:"at"`
+	Same        []declindex.Found `json:"same"`
+}
+
 func cmdSame(ctx context.Context, e *env, args []string) int {
 	qs, code := names(e, "same", args)
 	if code != 0 {
@@ -88,7 +97,7 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 	if _, err := e.store.CompiledCommit(ctx, false); err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	out := map[string][]string{}
+	out := []sameAnswer{}
 	rc := 0
 	for _, q := range qs {
 		found, code := e.resolve(ctx, q, &rc)
@@ -96,21 +105,33 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 			return code
 		}
 		for _, f := range found {
-			same, err := e.store.SameAtoms(ctx, f.Name)
+			same, err := e.store.SameAtoms(ctx, f)
 			if err != nil {
 				return fail(e.stderr, &unableError{err})
 			}
-			out[f.Name] = same
+			if same == nil {
+				same = []declindex.Found{}
+			}
+			out = append(out, sameAnswer{Declaration: f.Name, Module: f.Module, At: f.At(), Same: same})
 		}
 	}
+	// In name order, each declaration once, also when two NAMEs resolve to it.
+	order := func(a, b sameAnswer) int {
+		return cmp.Or(strings.Compare(a.Declaration, b.Declaration), strings.Compare(a.Module, b.Module))
+	}
+	slices.SortFunc(out, order)
+	out = slices.CompactFunc(out, func(a, b sameAnswer) bool { return order(a, b) == 0 })
 	if e.g.json {
 		return e.printJSONOr(out, rc)
 	}
-	for _, name := range slices.Sorted(maps.Keys(out)) {
-		same := out[name]
-		fmt.Fprintf(e.stdout, "%s: %d declarations share a relation atom\n", name, len(same))
-		for _, s := range same {
-			fmt.Fprintln(e.stdout, "  "+s)
+	for _, a := range out {
+		fmt.Fprintf(e.stdout, "%s  %s: %d declarations share a relation atom\n", a.Declaration, a.At, len(a.Same))
+		for _, s := range a.Same {
+			at := s.At()
+			if s.Path == "" {
+				at = s.Module
+			}
+			fmt.Fprintf(e.stdout, "  %s\t%s\n", s.Name, at)
 		}
 	}
 	return rc
