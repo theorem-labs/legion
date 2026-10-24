@@ -153,6 +153,14 @@ def _children(cursor: ci.Cursor) -> list[ci.Cursor]:
     return list(cursor.get_children())
 
 
+def _operand(cursor: ci.Cursor) -> ci.Cursor | None:
+    """The one expression a parenthesis, a cast or an implicit conversion wraps, or None for a
+    construct libclang does not expose and gives several expressions (``__builtin_choose_expr``,
+    whose last child is an alternative it may not select)."""
+    operands = [child for child in _children(cursor) if child.kind.is_expression()]
+    return operands[0] if len(operands) == 1 else None
+
+
 def _is_unnamed_member(field: ci.Cursor) -> bool:
     """An anonymous struct or union member: libclang spells it ``(anonymous ...)`` or not at all."""
     return not field.spelling or "(anonymous" in field.spelling or "(unnamed" in field.spelling
@@ -1356,7 +1364,8 @@ class _Evaluator:
             return value
         kind, inner = cursor.kind, _children(cursor)
         if kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR, K.CSTYLE_CAST_EXPR) and inner:
-            return self.evaluate(inner[-1], depth, truth)
+            operand = _operand(cursor)
+            return None if operand is None else self.evaluate(operand, depth, truth)
         if kind == K.UNARY_OPERATOR and inner and libclang.unary_kind(cursor) == libclang.LOGICAL_NOT:
             value = self.evaluate(inner[0], depth, truth=True)
             return None if value is None else int(not value)
@@ -1470,7 +1479,8 @@ class _Evaluator:
         if kind == K.PAREN_EXPR and inner:
             return self.expression(inner[-1], resolve, depth + 1, truth)
         if kind in (K.UNEXPOSED_EXPR, K.CSTYLE_CAST_EXPR) and inner:
-            operand = self.expression(inner[-1], resolve, depth + 1, truth)
+            single = _operand(cursor)
+            operand = self.expression(single, resolve, depth + 1, truth) if single is not None else None
             if operand is None or typed is None:
                 return None
             same = all(operand.get(key) == typed.get(key) for key in ("w", "s", "b"))

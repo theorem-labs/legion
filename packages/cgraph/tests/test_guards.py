@@ -326,3 +326,22 @@ def test_a_label_a_later_goto_reaches_gets_no_guard(tmp_path: Path) -> None:
     )
     null = {"unit": None, "param": None, "expr": {"c": 0, "w": 64, "s": False}}
     assert compiled(facts, "retry", [null]) == set()
+
+
+def test_an_expression_libclang_does_not_expose_is_no_value(tmp_path: Path) -> None:
+    """errname: __errname(abs(err)), where abs is __builtin_choose_expr(…, ({ … }), …((void)0)).
+    Its last child is the unselected (void)0, not the argument's value."""
+    facts = facts_of(
+        tmp_path,
+        """
+        const char *lookup(unsigned int err);
+        static inline const char *name_of(unsigned int err) { if (err >= 512) late(); return 0; }
+        const char *errname(int err)
+        {
+            return name_of(__builtin_choose_expr(1, ({ int x = err; x < 0 ? -x : x; }), ((void)0)));
+        }
+        """,
+    )
+    (call,) = [item for item in facts["functions"]["errname"]["events"]["calls"] if item["callee"] == "name_of"]
+    assert "expr" not in call["arguments"][0]
+    assert compiled(facts, "name_of", call["arguments"]) == {"late"}
