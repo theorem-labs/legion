@@ -46,37 +46,63 @@ _DISPLACEMENT_REACH = 2048
 # a0 and a1.
 _DEFAULT_ARGUMENTS = 8
 _DEFAULT_RESULTS = 2
+# The operations that form an address without reading it; a load or store through it names the
+# object at the address it reads.
+_ADDRESS_OPERATIONS = frozenset({"addi_address", "indexed_address"})
+# LLVM's name for a block of globals it merged into one object.
+_MERGED_GLOBALS = ".L_MergedGlobals"
+# The registers a frame slot is addressed through.
+_FRAME_REGISTERS = frozenset({"sp", "s0"})
+# Stores and loads of a whole register, which spill an address to a frame slot and reload it.
+_SPILLS = frozenset({"sd", "c.sd", "c.sdsp"})
+_RELOADS = frozenset({"ld", "c.ld", "c.ldsp"})
+# The symbols that mark a change from code to data, which name no object of their own.
+_MAPPING_SYMBOL = "$"
 
 
 @dataclass
 class _State:
     """Registers that hold a known value (``constants`` are those formed with ``lui``/``li``, which
     are numbers, not addresses); registers that hold an unknown base plus a known constant
-    (``relative``); and registers that hold a known address plus an unknown offset (``anchored``: a
-    per-CPU offset or an index added to the address of an object)."""
+    (``relative``); registers that hold a known address plus an unknown offset (``anchored``: a
+    per-CPU offset or an index added to the address of an object), with the address each was formed
+    from (``origin``); and the frame slots holding an address the code spilled (``slots``, keyed by
+    the frame register and its displacement)."""
 
     values: dict[int, int] = field(default_factory=dict)
     relative: dict[int, int] = field(default_factory=dict)
     anchored: dict[int, int] = field(default_factory=dict)
     constants: set[int] = field(default_factory=set)
+    origin: dict[int, int] = field(default_factory=dict)
+    slots: dict[tuple[int, int], int] = field(default_factory=dict)
 
     def copy(self) -> _State:
-        return _State(dict(self.values), dict(self.relative), dict(self.anchored), set(self.constants))
+        return _State(
+            dict(self.values),
+            dict(self.relative),
+            dict(self.anchored),
+            set(self.constants),
+            dict(self.origin),
+            dict(self.slots),
+        )
 
     def meet(self, other: _State) -> _State:
-        def same(mine: dict[int, int], theirs: dict[int, int]) -> dict[int, int]:
-            return {register: value for register, value in mine.items() if theirs.get(register) == value}
+        def same(mine: dict[Any, int], theirs: dict[Any, int]) -> dict[Any, int]:
+            return {key: value for key, value in mine.items() if theirs.get(key) == value}
 
         values = {
             register: value
             for register, value in same(self.values, other.values).items()
             if (register in self.constants) == (register in other.constants)
         }
+        anchored = same(self.anchored, other.anchored)
         return _State(
             values,
             same(self.relative, other.relative),
-            same(self.anchored, other.anchored),
+            anchored,
             {register for register in values if register in self.constants},
+            {register: value for register, value in same(self.origin, other.origin).items() if register in anchored},
+            same(self.slots, other.slots),
         )
 
     def address(self, register: int) -> int | None:
@@ -132,10 +158,11 @@ def _anchored_value(
     operands: list[Any],
     state: _State,
     section_of: Any,
-) -> tuple[int, int] | None:
+) -> tuple[int, int, int] | None:
     """A register that becomes a known address plus an unknown offset: ``add rd, address, offset``,
-    ``add rd, anchored, offset``, or ``addi``/``mv`` of such a register."""
-    values, anchored = state.values, state.anchored
+    ``add rd, anchored, offset``, or ``addi``/``mv`` of such a register. The result is the register,
+    the address it holds, and the address it was formed from (the anchor's origin)."""
+    values, anchored, origin = state.values, state.anchored, state.origin
     mnemonic = instruction.mnemonic
     kinds = [operand.type for operand in operands]
     if mnemonic in ("add", "c.add") and kinds and all(kind == CS_OP_REG for kind in kinds):
@@ -144,16 +171,23 @@ def _anchored_value(
         for address, offset in ((left, right), (right, left)):
             known = state.address(address)
             if known is not None and offset not in values and section_of(known) is not None:
-                return registers[0], known
+                return registers[0], known, known
             if address in anchored and offset not in values:
-                return registers[0], anchored[address]
+                return registers[0], anchored[address], origin.get(address, anchored[address])
         return None
-    if mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in anchored:
-        return operands[0].reg, (anchored[operands[1].reg] + operands[2].imm) & _MASK
-    if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in anchored:
-        return operands[0].reg, (anchored[operands[0].reg] + operands[1].imm) & _MASK
+    for source, value in (
+        (operands[1].reg if kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] else None, 2),
+        (operands[0].reg if kinds == [CS_OP_REG, CS_OP_IMM] else None, 1),
+    ):
+        if source is None or source not in anchored:
+            continue
+        if mnemonic in ("addi", "addiw") and value == 2:
+            return operands[0].reg, (anchored[source] + operands[2].imm) & _MASK, origin.get(source, anchored[source])
+        if mnemonic in ("c.addi", "c.addiw") and value == 1:
+            return operands[0].reg, (anchored[source] + operands[1].imm) & _MASK, origin.get(source, anchored[source])
     if mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in anchored:
-        return operands[0].reg, anchored[operands[1].reg]
+        source = operands[1].reg
+        return operands[0].reg, anchored[source], origin.get(source, anchored[source])
     return None
 
 
@@ -203,12 +237,13 @@ def _relative_value(
     if mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in relative:
         return operands[0].reg, relative[operands[1].reg] + operands[2].imm
     if (
-        mnemonic == "addi"
+        mnemonic in ("addi", "addiw")
         and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM]
         and operands[1].reg not in values
-        and abs(operands[2].imm) >= _SPLIT_OFFSET
+        and operands[2].imm
     ):
-        # addi s3, s2, 2047 before ld 481(s3): a field beyond the 12-bit displacement, split in two.
+        # addi s3, s2, 2047 before ld 481(s3): a field beyond the 12-bit displacement of one load,
+        # split in two. A smaller constant is split the same way when the base is reused.
         return operands[0].reg, operands[2].imm
     if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in relative:
         return operands[0].reg, relative[operands[0].reg] + operands[1].imm
@@ -311,6 +346,13 @@ def read_system_map(path: Path) -> list[tuple[int, str, str]]:
     return sorted(entries)
 
 
+def code_symbol(kind: str, size: int, *, executable: bool) -> bool:
+    """Whether a symbol is a routine the C can call or take the address of. An assembly routine
+    (handle_exception, ret_from_fork_kernel_asm) carries a size but no function type, and a
+    zero-size marker often sits at its first instruction."""
+    return executable and bool(size) and kind in ("STT_FUNC", "STT_NOTYPE")
+
+
 def resolve_sized(symbols: list[tuple[int, int, str, str]], address: int) -> tuple[str, int, str] | None:
     """The symbol whose declared size covers ``address``: its name, its start and its section.
 
@@ -372,6 +414,16 @@ class Image:
         function_ranges: list[tuple[int, int, str, str]] = []
         self.object_symbols: dict[str, list[Symbol]] = {}
         markers: list[tuple[int, str]] = []
+        routines: list[tuple[int, str]] = []
+        # LLVM merges several globals of one unit into a .L_MergedGlobals block and addresses the
+        # block once, so the block's start is also its first member's address. The block is a
+        # compiler artifact, which System.map leaves out: it is read from the symbol table alone.
+        self.merged_blocks: dict[int, int] = {}
+        # The symbols System.map leaves out, by address: a jump table or a constant pool
+        # (.LJTI..., .Lswitch.table...). An address they start at belongs to them, not to the
+        # object that ends there. Mapping symbols ($d, $x) mark a data or code change, not an
+        # object, so they name nothing.
+        self.hidden_starts: set[int] = set()
         symtab = self.elf.get_section_by_name(".symtab")
         current_file = ""
         for symbol in symtab.iter_symbols() if isinstance(symtab, SymbolTableSection) else []:
@@ -380,7 +432,13 @@ class Image:
                 current_file = symbol.name
                 continue
             address = int(symbol["st_value"])
-            if (address, symbol.name) not in named or not isinstance(symbol["st_shndx"], int):
+            if symbol.name.startswith(_MERGED_GLOBALS) and int(symbol["st_size"]):
+                self.merged_blocks[address] = int(symbol["st_size"])
+            if (address, symbol.name) not in named:
+                if symbol.name and not symbol.name.startswith(_MAPPING_SYMBOL):
+                    self.hidden_starts.add(address)
+                continue
+            if not isinstance(symbol["st_shndx"], int):
                 continue
             section = self.elf.get_section(symbol["st_shndx"])
             if section is None:
@@ -389,10 +447,16 @@ class Image:
             entry = Symbol(
                 address, int(symbol["st_size"]), symbol.name, section.name, local, current_file if local else ""
             )
+            executable = bool(int(section["sh_flags"]) & SH_FLAGS.SHF_EXECINSTR)
             if kind == "STT_FUNC":
                 self.functions.setdefault(symbol.name, []).append(entry)
                 function_ranges.append((entry.address, entry.size, entry.name, entry.section))
-            elif kind in ("STT_OBJECT", "STT_NOTYPE") and not (int(section["sh_flags"]) & SH_FLAGS.SHF_EXECINSTR):
+            elif code_symbol(kind, entry.size, executable=executable):
+                # An assembly routine: code the C calls and takes the address of, with no function
+                # type of its own.
+                function_ranges.append((entry.address, entry.size, entry.name, entry.section))
+                routines.append((entry.address, entry.name))
+            elif kind in ("STT_OBJECT", "STT_NOTYPE") and not executable:
                 objects.append((entry.address, entry.size, entry.name, entry.section))
                 self.object_symbols.setdefault(symbol.name, []).append(entry)
             elif kind == "STT_NOTYPE" and not entry.size:
@@ -400,15 +464,25 @@ class Image:
                 markers.append((entry.address, entry.name))
         for symbols in self.functions.values():
             symbols.sort(key=lambda item: item.address)
-        # A call target is named by the function symbol that starts there; System.map's zero-size
-        # markers at the same address (__sched_text_start, __lock_text_start) name it only where no
-        # function symbol does.
+        # A call target is named by the code symbol that starts there; System.map's zero-size
+        # markers at the same address (__sched_text_start, __entry_text_end) name it only where no
+        # function or assembly routine does.
+        for address, name in sorted(routines):
+            self.text_at[address] = name
         for name, copies in sorted(self.functions.items()):
             for copy in copies:
                 self.text_at[copy.address] = name
         self.objects = sorted(set(objects))
         self.function_ranges = sorted(set(function_ranges))
         self.sized_object_names = sorted({name for _, size, name, _ in self.objects if size})
+        # The sized objects that end exactly at an address. The C forms such an address as the end
+        # of that object (a loop bound, &array[count]); the image cannot tell it from the address
+        # of whatever follows, so both name it.
+        ends: dict[int, set[tuple[str, str, int]]] = {}
+        for start, size, name, section_name in self.objects:
+            if size:
+                ends.setdefault(start + size, set()).add((source_name(name), section_name, start))
+        self.object_ends = {address: sorted(names) for address, names in ends.items()}
         # Names an address has without storage of their own: zero-size symbols (jiffies, which the
         # linker script makes an alias of jiffies_64; an empty lock_class_key; a section marker).
         zero_size: dict[int, set[str]] = {}
@@ -665,15 +739,35 @@ class Image:
     def _record_address(
         self, function: str, address: int, instruction: int, operation: str, facts: FunctionFacts
     ) -> None:
+        provenance = [{"source": "image", "address": _hex(instruction)}]
         section = self.section_of(address)
-        if section is None:
-            return
-        resolved = resolve_sized(self.objects, address)
         zero_size = list(self.zero_size_at.get(address, []))
-        target = resolve_sized(self.function_ranges, address) if resolved is None else None
+        ended = self.object_ends.get(address, [])
+        if operation in _ADDRESS_OPERATIONS and address in self.merged_blocks:
+            # The start of a merged-globals block is its first member's address, but forming it
+            # accesses no member: each is reached by a displacement from it, recorded where it is.
+            facts.exclusions.append(
+                {
+                    "kind": "image_access",
+                    "reason": "merged_globals_block_base",
+                    "function": function,
+                    "target": _hex(address),
+                    "detail": f"the base of a merged-globals block of {self.merged_blocks[address]} bytes",
+                    "provenance": provenance,
+                }
+            )
+            return
+        resolved = resolve_sized(self.objects, address) if section is not None else None
+        target = resolve_sized(self.function_ranges, address) if resolved is None and section else None
         if resolved is None and target is None and zero_size:
-            # Only zero-size names at the address: an empty object, or a marker the code compares.
-            resolved = (zero_size[0], address, section[2])
+            # Only zero-size names at the address: an empty object, a marker the code compares, or
+            # a section's end (_etext, _edata, _end), which belongs to no section at all.
+            resolved = (zero_size[0], address, section[2] if section else "")
+        if resolved is None and target is None and ended and address not in self.hidden_starts:
+            # One past the end of an object, and nothing the image names starts there: the C's end
+            # pointer, which is the only name the address can have.
+            name, section_name, start = ended[0]
+            resolved = (name, start, section_name)
         if resolved is None:
             if target is not None:
                 name, start, section_name = target
@@ -686,25 +780,23 @@ class Image:
                         "offset": address - start,
                         "section": section_name,
                         "operation": operation,
-                        "provenance": [{"source": "image", "address": _hex(instruction)}],
+                        "provenance": provenance,
                     }
                 )
-                if zero_size and address == start:
-                    # A code marker (_sinittext, _stext) at a function's start: the C may name either.
-                    resolved = (zero_size[0], address, section[2])
-                else:
-                    return
-            else:
+                # A code marker at a function's start (__entry_text_end, _sinittext) names the
+                # function's first instruction, which the entry above already records.
+                return
+            if section is not None:
                 facts.outside.append(
                     {
                         "function": function,
                         "address": _hex(address),
                         "section": section[2],
                         "operation": operation,
-                        "provenance": [{"source": "image", "address": _hex(instruction)}],
+                        "provenance": provenance,
                     }
                 )
-                return
+            return
         symbol, start, section_name = resolved
         name = source_name(symbol)
         entry = {
@@ -716,12 +808,13 @@ class Image:
             "section": section_name,
             "target_class": self.symbol_class(name, section_name),
             "operation": operation,
-            "provenance": [{"source": "image", "address": _hex(instruction)}],
+            "provenance": provenance,
         }
-        aliases = [alias for alias in zero_size if alias != name]
+        aliases = sorted({alias for alias in zero_size if alias != name} | {end for end, _, _ in ended if end != name})
         if aliases:
             # The address cannot tell these names apart: jiffies is jiffies_64; a zero-size key
-            # shares the address of the object after it.
+            # shares the address of the object after it; the end of one object is the start of the
+            # next, and the C may have formed either.
             entry["aliases"] = aliases
         facts.globals.append(entry)
 
@@ -734,7 +827,7 @@ class Image:
         values, relative, anchored = state.values, state.relative, state.anchored
         operands = list(instruction.operands)
         mnemonic = instruction.mnemonic
-        computed = _computed_value(instruction, operands, values)
+        computed = _computed_value(instruction, operands, values, state.constants)
         if facts is not None:
             if mnemonic in _ADDI and operands and operands[-1].type == CS_OP_IMM:
                 facts.addi_constants.add(operands[-1].imm)
@@ -758,13 +851,16 @@ class Image:
                     )
                 elif base in anchored:
                     # A known address plus a per-CPU offset or an index the code computed: the
-                    # object at the known address and the displacement.
+                    # object at the known address and the displacement, and the field offset from
+                    # the address the anchor was formed from.
                     self._record_address(
                         function, (anchored[base] + displacement) & _MASK, instruction.address, "indexed_access", facts
                     )
-                elif base in relative and abs(relative[base] + displacement) >= _DISPLACEMENT_REACH:
-                    # A base register plus a constant beyond the 12-bit displacement of a load or
-                    # store, formed with lui+add or a split addi.
+                    facts.memory_offsets.add(anchored[base] - state.origin.get(base, anchored[base]) + displacement)
+                elif base in relative:
+                    # A base register the code has already added a constant to: the field's offset
+                    # from the object the register pointed at is the sum, which a load or store
+                    # beyond the reach of a 12-bit displacement is always split into.
                     facts.memory_offsets.add(relative[base] + displacement)
             if mnemonic in _DIRECT_CALLS and operands and operands[-1].type == CS_OP_IMM:
                 self._call(
@@ -807,11 +903,42 @@ class Image:
                 self._record_address(function, value, instruction.address, "addi_address", facts)
         elif indexed is not None:
             anchored[indexed[0]] = indexed[1]
-            if facts is not None and mnemonic in _ADDI and escapes:
-                # A per-CPU or indexed address plus a field offset that escapes: the object it names.
+            state.origin[indexed[0]] = indexed[2]
+            if facts is not None and escapes and (mnemonic in _ADDI or mnemonic in ("add", "c.add")):
+                # An index added to a known address, or a per-CPU or indexed address plus a field
+                # offset: the object the sum names, whatever the index is.
                 self._record_address(function, indexed[1], instruction.address, "indexed_address", facts)
         elif derived is not None:
             relative[derived[0]] = derived[1]
+            if facts is not None:
+                # The code formed "a base plus a constant": the offset of the field it addresses,
+                # which an index added after it would lose.
+                facts.memory_offsets.add(derived[1])
+        self._frame_slot(instruction, operands, state)
+
+    def _frame_slot(self, instruction: Any, operands: list[Any], state: _State) -> None:
+        """A register holding an address, spilled to a frame slot and reloaded from it. Without
+        this the address is lost at the first join after the reload, although every path gives the
+        slot the same value."""
+        mnemonic = instruction.mnemonic
+        if mnemonic not in _SPILLS and mnemonic not in _RELOADS:
+            return
+        references = _memory_references(instruction, operands)
+        if not references or not operands or operands[0].type != CS_OP_REG:
+            return
+        base, displacement = references[0]
+        if self.decoder.reg_name(base) not in _FRAME_REGISTERS:
+            return
+        register = operands[0].reg
+        if mnemonic in _SPILLS:
+            address = state.address(register)
+            if address is None:
+                state.slots.pop((base, displacement), None)
+            else:
+                state.slots[(base, displacement)] = address
+        elif (base, displacement) in state.slots:
+            state.values[register] = state.slots[(base, displacement)]
+            state.constants.discard(register)
 
     def _thread_pointer(self, function: str, instruction: int, offset: int, operation: str) -> dict[str, Any]:
         return {
@@ -908,13 +1035,17 @@ def _register_target(operands: list[Any], values: dict[int, int]) -> int | None:
     return (values[base] + offset) & _MASK if base in values else None
 
 
-def _computed_value(instruction: Any, operands: list[Any], values: dict[int, int]) -> tuple[int, int] | None:
+def _computed_value(
+    instruction: Any, operands: list[Any], values: dict[int, int], constants: set[int]
+) -> tuple[int, int] | None:
     """Evaluate the address-preserving forms RISC-V code generation uses, modulo 2**64."""
-    computed = _computed(instruction, operands, values)
+    computed = _computed(instruction, operands, values, constants)
     return None if computed is None else (computed[0], computed[1] & _MASK)
 
 
-def _computed(instruction: Any, operands: list[Any], values: dict[int, int]) -> tuple[int, int] | None:
+def _computed(
+    instruction: Any, operands: list[Any], values: dict[int, int], constants: set[int]
+) -> tuple[int, int] | None:
     mnemonic = instruction.mnemonic
     kinds = [operand.type for operand in operands]
     if mnemonic == "auipc" and kinds == [CS_OP_REG, CS_OP_IMM]:
@@ -951,4 +1082,16 @@ def _computed(instruction: Any, operands: list[Any], values: dict[int, int]) -> 
         and operands[1].reg in values
     ):
         return operands[0].reg, values[operands[0].reg] + values[operands[1].reg]
+    if mnemonic in ("slli", "slliw", "c.slli"):
+        # The size of an array element, formed as a small number shifted left. Only a number is
+        # shifted: an address shifted left is no address.
+        source, amount = (
+            (operands[1].reg, operands[2].imm)
+            if kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM]
+            else (operands[0].reg, operands[1].imm)
+            if kinds == [CS_OP_REG, CS_OP_IMM]
+            else (None, 0)
+        )
+        if source in constants and source in values and 0 <= amount < 64:
+            return operands[0].reg, values[source] << amount
     return None

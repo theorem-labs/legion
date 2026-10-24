@@ -32,12 +32,26 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   the constructor's arguments; a local with any other cleanup attribute calls the function it names
   (`c.cleanup.attribute_macros` maps macros such as `__free(x)` to that function).
 - **The image** (ELF and `System.map`), decoded with capstone. Calls come from `jal`/`j` and from
-  `auipc`+`jalr`, named by the ELF function symbol at the target (`image.call_aliases` maps a library
-  call the compiler substitutes, such as `bcmp`, to the one C names). Data addresses come from
+  `auipc`+`jalr`, named by the code symbol at the target (`image.call_aliases` maps a library
+  call the compiler substitutes, such as `bcmp`, to the one C names). An assembly routine, which the
+  symbol table gives a size but no function type, is code like any other, so it takes its address
+  from the zero-size marker that often sits at its first instruction. Data addresses come from
   `auipc` arithmetic, shared anchors and compressed loads included, and count only inside the
-  declared size of an object symbol that `System.map` names. Thread-pointer accesses are per-CPU
-  state. Globals the machine code addresses but the C does not name become nodes with image-only
-  access edges.
+  declared size of an object symbol that `System.map` names. An address a register holds survives a
+  spill to a frame slot and the reload from it. Thread-pointer accesses are per-CPU state. Globals
+  the machine code addresses but the C does not name become nodes with image-only access edges.
+- **What the image cannot tell apart is named by every name it has.** An address one past the end of
+  an object is that object's end pointer and, where another object starts there, that object too;
+  both names are kept, and a C access to either matches. Where the symbol table has a symbol of its
+  own at the address that `System.map` leaves out (a jump table, a constant pool), the address is
+  that symbol's and the object's end pointer is not claimed. The start of a block of globals LLVM
+  merged (`.L_MergedGlobals`) is also its first member's address: forming it accesses no member, so
+  it is recorded in `exclusions.json` (`image_access` / `merged_globals_block_base`) and each member
+  is named where a displacement from the block reaches it.
+- **Field offsets** come from every offset from a base the machine code forms, not only from the
+  ones it dereferences: the displacement of a load or store, the immediate of an `addi`, the constant
+  a register already carries (with the shift that forms the size of an array element), and the sum of
+  the two where a load or store splits one offset over both.
 - **The contract graph** (optional): the proof's own graph. Its function nodes are joined to the graph's
   functions by image address (below); it confirms callback tables a C initializer also names, and
   gives the interfaces the measures map onto groups.

@@ -10,7 +10,7 @@ from conftest import FIXTURE
 
 from cgraph import config, imagecache
 from cgraph.errors import InputError
-from cgraph.image import FunctionFacts, Image, read_system_map, resolve_sized, source_name
+from cgraph.image import FunctionFacts, Image, code_symbol, read_system_map, resolve_sized, source_name
 from cgraph.imagecache import ImageCache
 
 
@@ -365,7 +365,8 @@ def test_a_zero_size_name_at_an_objects_address_is_an_alias(image: Image) -> Non
     high, low = _split(image.object_symbols["pair_a"][0].address - start)
     code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _load(A1, A5, 0), 0x00008067)
     (entry,) = [item for item in image.decode("synthetic", code, start).globals if item["global"] == "pair_a"]
-    assert entry["aliases"] == ["pair_alias"]
+    # pair_a starts where flow_header_ops ends, so an end pointer to it has the very same address.
+    assert entry["aliases"] == ["flow_header_ops", "pair_alias"]
 
 
 def test_a_displacement_split_into_addi_2047_and_a_load(image: Image) -> None:
@@ -470,3 +471,174 @@ def test_an_address_plus_a_field_offset_that_escapes_names_the_object_there(imag
     high, low = _split(image.object_symbols["pair_a"][0].address - start)
     code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _addi(A0, A5, 8), RET)
     assert _operations(image.decode("synthetic", code, start)) == {("pair_b", "addi_address")}
+
+
+S0, S3 = 8, 19
+
+
+def _address_in(image: Image, start: int, register: int, address: int) -> tuple[int, int]:
+    """``auipc``/``addi`` of ``register`` at ``start``, so that it holds ``address``."""
+    return _split(address - start)
+
+
+def test_an_address_one_past_an_object_also_names_that_object(image: Image) -> None:
+    """``&pair_a + 8`` is pair_b's address: the two cannot be told apart, so both name it."""
+    start = image.functions["anchor_pair"][0].address
+    pair_a = image.object_symbols["pair_a"][0]
+    high, low = _split(pair_a.address + pair_a.size - start)
+    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
+    (entry,) = image.decode("synthetic", code, start).globals
+    assert (entry["global"], entry["offset"], entry["aliases"]) == ("pair_b", 0, ["pair_a"])
+
+
+def test_an_address_one_past_the_last_object_names_that_object(image: Image) -> None:
+    """``&heap[sizeof heap]``, the end pointer of a loop: no object starts there, and the address
+    lies outside every section, but it still names heap."""
+    start = image.functions["anchor_pair"][0].address
+    heap = image.object_symbols["heap"][0]
+    assert image.section_of(heap.address + heap.size) is None
+    high, low = _split(heap.address + heap.size - start)
+    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
+    (entry,) = image.decode("synthetic", code, start).globals
+    assert (entry["global"], entry["offset"]) == ("heap", heap.size)
+
+
+def test_an_object_the_image_hides_keeps_the_end_address_for_itself(image: Image) -> None:
+    """A jump table or a constant pool (.LJTI..., .Lswitch.table...) often starts where an object
+    ends, and System.map leaves it out. The address is the table's, so the object does not take it."""
+    start = image.functions["anchor_pair"][0].address
+    heap = image.object_symbols["heap"][0]
+    high, low = _split(heap.address + heap.size - start)
+    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
+    image.hidden_starts.add(heap.address + heap.size)
+    try:
+        assert image.decode("synthetic", code, start).globals == []
+    finally:
+        image.hidden_starts.discard(heap.address + heap.size)
+
+
+def test_a_zero_size_symbol_outside_every_section_is_recorded(image: Image) -> None:
+    """_etext, _edata and _end sit at a section's end, which belongs to no section. The C compares
+    an address with them, so the image must name them."""
+    start = image.functions["anchor_pair"][0].address
+    marker = image.object_symbols["heap"][0].address + image.object_symbols["heap"][0].size + 0x100
+    assert image.section_of(marker) is None
+    high, low = _split(marker - start)
+    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
+    image.zero_size_at[marker] = ["_etext"]
+    try:
+        (entry,) = image.decode("synthetic", code, start).globals
+    finally:
+        del image.zero_size_at[marker]
+    assert (entry["global"], entry["offset"], entry["section"]) == ("_etext", 0, "")
+
+
+def test_the_base_of_a_merged_globals_block_is_not_an_access_to_its_first_member(image: Image) -> None:
+    """LLVM merges several globals into one .L_MergedGlobals block and addresses the block once.
+    That address is the first member's, but the instruction accesses no member: each member is
+    reached by a displacement from it, which is recorded where it happens."""
+    start = image.functions["anchor_pair"][0].address
+    block = image.object_symbols["box_count"][0].address
+    assert image.merged_blocks.get(block)
+    high, low = _split(block - start)
+    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
+    facts = image.decode("synthetic", code, start)
+    assert facts.globals == []
+    assert [(item["kind"], item["reason"], int(item["target"], 16)) for item in facts.exclusions] == [
+        ("image_access", "merged_globals_block_base", block)
+    ]
+
+
+def test_a_displacement_from_a_merged_globals_base_still_names_its_member(image: Image) -> None:
+    start = image.functions["anchor_pair"][0].address
+    block = image.object_symbols["box_count"][0].address
+    table = image.object_symbols["table_lock"][0]
+    high, low = _split(block - start)
+    code = struct.pack("<4I", _u(0x17, A0, high), _addi(A0, A0, low), _load(A1, A0, table.address - block), RET)
+    assert ("table_lock", "load_or_store") in _operations(image.decode("synthetic", code, start))
+
+
+def test_a_code_marker_at_a_function_start_is_the_function_not_a_global(image: Image) -> None:
+    """__entry_text_end sits at handle_exception's first instruction. Where the C takes the
+    function's address, naming the marker as well invents an access to it."""
+    start = image.functions["anchor_pair"][0].address
+    callee = image.functions["box_weight"][0].address
+    high, low = _split(callee - start)
+    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
+    image.zero_size_at[callee] = ["__entry_text_end"]
+    try:
+        facts = image.decode("synthetic", code, start)
+    finally:
+        del image.zero_size_at[callee]
+    assert [item["target"] for item in facts.function_addresses] == ["box_weight"]
+    assert facts.globals == []
+
+
+def test_an_address_spilled_to_the_frame_and_reloaded_keeps_its_object(image: Image) -> None:
+    """``sd s1, -24(s0)`` then ``ld s1, -24(s0)`` on both paths into a block: every path gives the
+    register the same address, so the load after the join addresses pair_b."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack(
+        "<8I", _u(0x17, S1, high), _addi(S1, S1, low), _store(S1, S0, -24), _branch(A0, ZERO, 12),
+        _addi(S1, ZERO, 0), _load(S1, S0, -24), _load(A1, S1, 8), RET,
+    )  # fmt: skip
+    assert ("pair_b", "load_or_store") in _operations(image.decode("synthetic", code, start))
+
+
+def test_an_index_added_to_a_known_address_records_the_object(image: Image) -> None:
+    """``a5 = &pair_a; a5 += a0``: the sum is an address inside pair_a, whatever the index is. The
+    load that follows may be on a path where the state no longer holds it."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _add(A5, A5, A0), RET)
+    assert ("pair_a", "indexed_address") in _operations(image.decode("synthetic", code, start))
+
+
+def test_a_field_offset_from_an_indexed_base_is_a_memory_offset(image: Image) -> None:
+    """``a5 = &box_table + index; a5 += 2047; ld a1, 481(a5)``: the field at 2528 bytes from the
+    object, split over the register and the load."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["box_table"][0].address - start)
+    code = struct.pack(
+        "<6I", _u(0x17, A5, high), _addi(A5, A5, low), _add(A5, A5, A0), _addi(A5, A5, 2047),
+        _load(A1, A5, 481), RET,
+    )  # fmt: skip
+    assert 2528 in image.decode("synthetic", code, start).memory_offsets
+
+
+def test_a_small_offset_split_over_a_register_and_a_load_is_a_memory_offset(image: Image) -> None:
+    """``addi a5, a0, 100; ld a1, 8(a5)``: the field at 108 bytes from whatever a0 points at."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack("<3I", _addi(A5, A0, 100), _load(A1, A5, 8), RET)
+    assert 108 in image.decode("synthetic", code, start).memory_offsets
+
+
+def test_an_assembly_routine_with_a_size_is_code() -> None:
+    """The kernel's handle_exception and ret_from_fork_kernel_asm are assembly: the symbol table
+    gives them a size but no function type, and a zero-size marker sits at the first instruction of
+    each. Without this they are neither a function nor an object, and the marker takes the address."""
+    assert code_symbol("STT_FUNC", 26, executable=True)
+    assert code_symbol("STT_NOTYPE", 26, executable=True)
+    assert not code_symbol("STT_NOTYPE", 0, executable=True)
+    assert not code_symbol("STT_NOTYPE", 26, executable=False)
+    assert not code_symbol("STT_OBJECT", 26, executable=False)
+
+
+def test_an_offset_the_code_forms_is_recorded_where_it_is_formed(image: Image) -> None:
+    """``lui a3, 1; addi a3, a3, 0x48; add a0, a0, a3`` is the address of the field at 4168 bytes.
+    An index added after it loses the offset, so recording it only at the load would lose it."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack(
+        "<6I", _u(0x37, A3, 1), _addi(A3, A3, 0x48), _add(A0, A0, A3), _add(A0, A0, T0),
+        _load(A1, A0, 0), RET,
+    )  # fmt: skip
+    assert 4168 in image.decode("synthetic", code, start).memory_offsets
+
+
+def test_a_constant_a_shift_forms_is_an_offset(image: Image) -> None:
+    """``c.li a2, 3; c.slli a2, 11; add a0, a0, a2``: the element at 6144 bytes. The compiler forms
+    the size of an array element this way, and the field's offset is lost without the shift."""
+    start = image.functions["anchor_pair"][0].address
+    code = struct.pack("<HHIII", 0x460D, 0x062E, _add(A0, A0, A2), _load(A1, A0, 0), RET)
+    assert 6144 in image.decode("synthetic", code, start).memory_offsets
