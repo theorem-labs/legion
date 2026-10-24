@@ -5425,7 +5425,9 @@ class _FunctionWalk:
                 for position, argument in enumerate(arguments)
                 if position in written and (local := _whole_local_address(argument)) is not None
             }
-            dead_targets = {position for position, local in targets.items() if local.hash in self.dead_variables}
+            # Locals nothing reads, or only where the image decides (a stored-only argument below).
+            unread_locals = self.dead_variables | self.decided_variables
+            dead_targets = {position for position, local in targets.items() if local.hash in unread_locals}
             direct = node.referenced is not None and node.referenced.kind == K.FUNCTION_DECL
             for child_index, child in enumerate(children):
                 position = child_index - offset if child_index >= offset else None
@@ -5435,13 +5437,18 @@ class _FunctionWalk:
                     # fdt_translate_address's bus->count_cells with bus = &of_busses[0]: the compiler
                     # calls the function the const table names and reads no table.
                     self.walk(child, node, child_index, "constant_data", generic)
-                elif position is not None and position in targets:
+                elif position is not None and (
+                    position in targets or (position in stored and stored[position] <= dead_targets)
+                ):
                     # &local where the inline callee only stores through the parameter
-                    # (_mmu_notifier_range_init(&range, ...)): the local is not read there.
-                    self.walk(child, node, child_index, "stored_only", generic)
-                elif position is not None and position in stored and stored[position] <= dead_targets:
-                    # A value the inline callee only stores into a local nothing reads.
-                    self.discard(child, node, child_index, generic, "ignored_argument")
+                    # (_mmu_notifier_range_init(&range, ...)), and a value it only stores into a local
+                    # nothing else reads: where the image inlines the callee neither is computed, where
+                    # it calls the callee both are. The image decides, at each site.
+                    self.conditional += 1
+                    try:
+                        self.walk(child, node, child_index, reason, generic)
+                    finally:
+                        self.conditional -= 1
                 elif position is None or not (position in ignored or (variadic and position >= named)):
                     self.walk_read(node, child, child_index, position, reason, generic)
                 elif inline:

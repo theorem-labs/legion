@@ -201,17 +201,47 @@ def test_a_value_whose_only_effects_the_image_decides_is_left_to_the_image(
     assert "function:fd_cpu_dead" not in {entry["function"] for entry in offsets["misses"]}
 
 
-@pytest.mark.parametrize("function", ["fd_mkclean", "fd_mkclean_read"])
-def test_a_value_stored_only_into_a_local_nothing_reads_is_not_computed(
+@pytest.mark.parametrize("function", ["fd_mkclean", "fd_mkclean_read", "fd_mkclean_called"])
+def test_a_value_stored_only_into_a_local_nothing_reads_is_left_to_the_image(
     fold_build: dict[str, Any], function: str
 ) -> None:
     """fd_mkclean: ld a0, 0x0(a0); tail obj_free (llvm-objdump): range is never read, so the value
-    fd_address_end gives it, and that helper's read of nr, are not code. fd_mkclean_read returns
-    range.end, which needs nr: ld a1, 0x8(a0). The stores into range are the local object's either way,
-    which the frame check holds."""
-    fields = folded_fields(fold_build, function)
-    assert ("nr" in fields) == (function == "fd_mkclean_read")
-    assert "address" in fields
+    fd_address_end gives it, and that helper's read of nr, are compiled only where the image calls the
+    callee that stores it: they are left to the image, which here has no read of nr. fd_mkclean_called
+    calls fd_range_fenced out of line, and jal fd_address_end before it: the image's call is the
+    argument's. fd_mkclean_read returns range.end, which needs nr: ld a1, 0x8(a0)."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"][f"function:{function}"]
+    nr = {bool(item.get("conditional")) for item in accesses if item["field"] == "nr"}
+    assert nr == {"fd_mkclean": {True}, "fd_mkclean_read": {False}, "fd_mkclean_called": set()}[function]
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert f"function:{function}" not in {entry["function"] for entry in offsets["misses"]}
+    edges = {
+        (edge["kind"], edge["target"])
+        for edge in fold_build["graph"]["edges"]
+        if edge["source"] == f"function:{function}"
+    }
+    assert (("call", "function:fd_address_end@src/fold.c") in edges) == (function == "fd_mkclean_called")
+    # The image's call of fd_address_end is the C's: no call only the image makes.
+    pairs = fold_build["checks"]["call_layer"]["pairs"]
+    assert f"function:{function}" not in {pair["source"] for pair in pairs["only_image"] + pairs["only_c"]}
+
+
+def test_an_unused_value_at_a_site_inlined_beside_a_call_keeps_only_what_the_image_shows(
+    fold_facts: dict[str, Any], fold_build: dict[str, Any]
+) -> None:
+    """fd_partial calls fd_part (jal fd_part) and inlines it for the statement whose value is unused:
+    the volatile read and jal ext_check, not box_size. The image calls the helper, so link keeps the
+    call and takes from the helper's events only the calls the image makes that the caller's C does
+    not; box_size is no call of fd_partial."""
+    calls = [call for call in fold_facts["functions"]["fd_partial"]["events"]["calls"] if call["callee"] == "fd_part"]
+    assert sorted(bool(call.get("value_unused")) for call in calls) == [False, True]
+    edges = {
+        (edge["kind"], edge["target"])
+        for edge in fold_build["graph"]["edges"]
+        if edge["source"] == "function:fd_partial"
+    }
+    assert {("call", "function:fd_part@src/fold.c"), ("call", "function:ext_check")} <= edges
+    assert not any("box_size" in target for _, target in edges)
 
 
 def test_a_store_no_pass_of_a_loop_that_runs_once_reads_is_not_computed(fold_build: dict[str, Any]) -> None:

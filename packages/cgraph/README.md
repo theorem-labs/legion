@@ -282,9 +282,10 @@ These rules follow what the machine code shows, each only where it shows it:
   A discarded value whose only effects are where the image makes a choice (`cpumask_empty`'s
   `find_first_bit`, after `bitmap_empty`'s `__builtin_constant_p` test returns, in `vmstat_cpu_dead`)
   is `conditional`: the image decides whether it is compiled.
-  `&v` of a local passed to a parameter an inline callee only stores through (`range->end = end`)
-  is no read of `v`; where nothing else reads `v`, a value the callee only stores there is an
-  argument it ignores (`page_vma_mkclean_one`'s `mmu_notifier_range_init(&range, ...,
+  `&v` of a local passed to a parameter an inline callee only stores through (`range->end = end`),
+  and, where nothing else reads `v`, a value the callee only stores there, are `conditional`: where
+  the image inlines the callee neither is computed, where it calls the callee both are, so the image
+  decides at each site (`page_vma_mkclean_one`'s `mmu_notifier_range_init(&range, ...,
   vma_address_end(pvmw))` without `MMU_NOTIFIER`).
 - A member address the machine code never forms because container_of takes it back is no field
   access where the helper that does so is folded: an argument `&p->m` at a parameter whose every use

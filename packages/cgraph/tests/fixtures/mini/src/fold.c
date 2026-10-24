@@ -486,6 +486,39 @@ unsigned long fd_mkclean_read(struct fd_pvmw *w)
 	return range.end;
 }
 
+/* A range set by a helper that also has an effect, called out of line: the argument is computed
+ * there (llvm-objdump: the load of nr before jal fd_range_fenced). */
+static inline void fd_range_fenced(struct fd_range *r, unsigned long start, unsigned long end)
+{
+	__asm__ volatile("" ::: "memory");
+	r->start = start;
+	r->end = end;
+}
+
+void fd_mkclean_called(struct fd_pvmw *w)
+{
+	struct fd_range range;
+
+	[[clang::noinline]] fd_range_fenced(&range, w->address, fd_address_end(w));
+	obj_free((void *)w->address);
+}
+
+/* A helper the image calls at one site and inlines at another, where the inlined call's value is
+ * unused: only the volatile read and the call of ext_check are made there, not the call of box_size
+ * the value needs. */
+static inline long fd_part(struct box *b)
+{
+	if (*(volatile long *)&b->size)
+		ext_check(b);
+	return box_size(b);
+}
+
+long fd_partial(struct box *b)
+{
+	fd_part(b);
+	[[clang::noinline]] return fd_part(b);
+}
+
 /* kernel/sched/fair.c enqueue_task_fair without group scheduling: for_each_sched_entity(se) is for
  * (; se; se = NULL), which runs at most once. slice = cfs_rq_min_slice(cfs_rq) at the end of the
  * first loop reaches the second only through the first one's break, before it; at the end of the
