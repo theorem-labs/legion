@@ -111,6 +111,8 @@ The landing program calls `declindex land-hash` twice for every registered contr
 1. At the base tree, with the index at that tree. Unchanged declarations are answered from the index; no candidate build directory is needed.
 2. At the built candidate tree. For each source blob that differs from the indexed `sources` blob, `LAND_BUILD_DIR` must hold a fresh Lake `.ilean` and trace for that tree. The candidate answer gives the changed contract's candidate hash and path; unchanged declarations keep the indexed answer.
 
+A declaration is answered from the index only when `LAND_TREE` has its source file with the same blob as the indexed `sources` row. A module that the index read without a `sources` row, such as an ignored source file, is not answered from the index.
+
 A changed module's build output is fresh only when all of these hold:
 
 - `LAND_BUILD_DIR` holds that module's source with exactly the candidate blob's bytes.

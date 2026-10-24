@@ -379,6 +379,45 @@ func TestLandHashAnswersADotlessName(t *testing.T) {
 	}
 }
 
+// TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas catches a hasher that answers a declaration from the
+// index when neither the index's sources nor LAND_TREE have its source file: two missing blobs compare equal.
+func TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas(t *testing.T) {
+	config := fixture(t)
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	writeLandFile(t, filepath.Join(tree, ".gitignore"), []byte("/Golden.lean\n"))
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "base without Golden.lean")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+	cfg, err := declindex.LoadConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := declindex.Open(cfg.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.LandSnapshot(context.Background(), []string{"Gold.frame_lo"})
+	store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, indexed := snapshot.Modules["Golden"]; !indexed || len(snapshot.Declarations["Gold.frame_lo"]) != 1 {
+		t.Fatalf("test setup: the index did not read Golden: %+v", snapshot)
+	}
+	if blob, ok := snapshot.Sources["Golden.lean"]; ok {
+		t.Fatalf("test setup: the index's sources have the ignored Golden.lean as %s", blob)
+	}
+	treeID := git(t, tree, "rev-parse", "HEAD^{tree}")
+	r := invokeLandHash(t, config, landValues(tree, treeID, namesJSON(t, "Gold.frame_lo", "Gold2.FrameAt"), ""))
+	const want = "Gold.frame_lo\tabsent\t-\nGold2.FrameAt\t7f52be71a38bde18\tSub/Wrap.lean\n"
+	if r.code != 0 || r.out != want {
+		t.Fatalf("source missing from the index and LAND_TREE = %+v, want %q", r, want)
+	}
+}
+
 func TestLandHashRefusesAnIndexWithoutGitSources(t *testing.T) {
 	config := fixture(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {

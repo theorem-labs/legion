@@ -16,8 +16,8 @@ import (
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
-// cmdLandHash answers a landing's declaration reads at one Git tree. Modules whose source blob is the same as the
-// index read come from the index; changed modules come only from verified candidate build output.
+// cmdLandHash answers a landing's declaration reads at one Git tree. A module whose source LAND_TREE has with the
+// blob the index recorded comes from the index; changed modules come only from verified candidate build output.
 func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"land-hash takes no arguments; it reads LAND_TREE, LAND_GIT_DIR, and LAND_NAMES"})
@@ -113,7 +113,10 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 			if _, indexed := snapshot.Modules[rel]; !indexed {
 				continue
 			}
-			if candidate[declaration.Path] == snapshot.Sources[declaration.Path] {
+			// The index answers only for a source LAND_TREE has with the blob the index read; a source missing
+			// from both must not count as unchanged.
+			indexedBlob, indexed := snapshot.Sources[declaration.Path]
+			if blob, inTree := candidate[declaration.Path]; indexed && inTree && blob == indexedBlob {
 				declarations = append(declarations, landDeclaration{path: declaration.Path, hash: declaration.StmtHash})
 			}
 		}
