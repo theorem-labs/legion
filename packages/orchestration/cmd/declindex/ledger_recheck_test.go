@@ -353,3 +353,78 @@ func TestLedgerRechecksAnAdditionLandedWithItsDeclaration(t *testing.T) {
 		}
 	})
 }
+
+// The recheck of an addition reads the concept's declaration in the module of its home file when the landed build
+// has one, and compiles the stored source only when it has none:
+//   - landed in an existing home file that the stored source imports, it is checked from the landed constant, which
+//     the stored source could no longer compile beside;
+//   - landed with another statement than the one the gate added, it is a defect of the concept;
+//   - not landed, the stored source is compiled, and the forms import no module whose imports declare the concept,
+//     here a registry import that imports a file that declares it outside its home.
+func TestLedgerRechecksAnAdditionFromItsLandedDeclaration(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	ctx := context.Background()
+	compile := func(t *testing.T, lean declindex.Lean, tree string, modules ...string) {
+		t.Helper()
+		for _, m := range modules {
+			if err := declindex.CompileModule(ctx, lean, nil, tree, m); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Run("landed in a home file that the stored source imports", func(t *testing.T) {
+		const lib = "import Fixture\n\ndef Fx.helper (n : Nat) : Nat := n + 1\n"
+		config, tree, lean := leanRegistryTree(t, "Lib")
+		writeTestFile(t, filepath.Join(tree, "Lib.lean"), lib)
+		compile(t, lean, tree, "Lib")
+		land(t, config, tree, "add Lib")
+		source := "import Lib\n\ndef Fx.Lib (n : Nat) : Prop := Fx.helper n < 5\n"
+		addition := *gateAddition(t, config, "lib", "Fx.Lib", "Lib.lean", source).Addition
+		writeTestFile(t, filepath.Join(tree, filepath.FromSlash(addition.Path)), addition.Content)
+		writeTestFile(t, filepath.Join(tree, "Lib.lean"), lib+"\ndef Fx.Lib (n : Nat) : Prop := Fx.helper n < 5\n")
+		compile(t, lean, tree, "Lib")
+		r := checkRegistry(t, config, land(t, config, tree, "land Fx.Lib in Lib.lean"))
+		if r.code != 0 || !slices.Equal(r.added, []string{addition.Path}) || len(r.defects) != 0 || r.unable != "" {
+			t.Fatalf("want exit 0 with %s added and no defect or cause, got %+v", addition.Path, r)
+		}
+	})
+	t.Run("landed with another statement", func(t *testing.T) {
+		config, tree, lean := leanRegistryTree(t, "Fresh")
+		source := "import Fixture\n\ndef Fx.Fresh (n : Nat) : Prop := n < 3\n"
+		addition := *gateAddition(t, config, "fresh", "Fx.Fresh", "Fresh.lean", source).Addition
+		writeTestFile(t, filepath.Join(tree, filepath.FromSlash(addition.Path)), addition.Content)
+		writeTestFile(t, filepath.Join(tree, "Fresh.lean"), strings.Replace(source, "n < 3", "n < 4", 1))
+		compile(t, lean, tree, "Fresh")
+		r := checkRegistry(t, config, land(t, config, tree, "land Fx.Fresh with another statement"))
+		if r.code != 1 || len(r.defects) != 1 || !strings.Contains(r.defects[0], "the landed declaration is not the one the gate added") ||
+			r.unable != "" {
+			t.Fatalf("want exit 1 with the defect that the landed declaration is not the added one, got %+v", r)
+		}
+	})
+	t.Run("not landed in its home file", func(t *testing.T) {
+		config, tree, lean := leanRegistryTree(t, "Other", "Wrapper")
+		writeTestFile(t, filepath.Join(tree, "Wrapper.lean"), "import Fixture\n")
+		writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\nimports: [Wrapper]\n")
+		// A concept with a written form, so that the forms module is built and imports Wrapper.
+		writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Fx.SpAligned.yaml"), "name: Fx.SpAligned\n"+
+			"home: Fixture.lean\nmeaning: Register x2 of a register file is 8-aligned.\nforms:\n"+
+			"  - \"fun (R : BitVec 5 → BitVec 64) => R 2#5 &&& 7#64 = 0#64\"\n")
+		compile(t, lean, tree, "Wrapper")
+		land(t, config, tree, "import Wrapper in the forms")
+		source := "import Fixture\n\ndef Fx.Fresh (n : Nat) : Prop := n < 3\n"
+		addition := *gateAddition(t, config, "fresh", "Fx.Fresh", "Fresh.lean", source).Addition
+		writeTestFile(t, filepath.Join(tree, filepath.FromSlash(addition.Path)), addition.Content)
+		writeTestFile(t, filepath.Join(tree, "Other.lean"), source)
+		writeTestFile(t, filepath.Join(tree, "Wrapper.lean"), "import Other\n")
+		compile(t, lean, tree, "Other", "Wrapper")
+		r := checkRegistry(t, config, land(t, config, tree, "land Fx.Fresh outside its home file"))
+		if r.code != 0 || !slices.Equal(r.added, []string{addition.Path}) || len(r.defects) != 0 || r.unable != "" {
+			t.Fatalf("want exit 0 with %s added and no defect or cause, got %+v", addition.Path, r)
+		}
+	})
+}

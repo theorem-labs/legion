@@ -99,6 +99,37 @@ func (g importGraph) closure(module string) map[string]bool {
 	return seen
 }
 
+// Importers are modules and every module the index read that imports one of them, directly or not: the modules
+// whose Lean environment holds a declaration of modules.
+func (s *Store) Importers(ctx context.Context, modules []string) (map[string]bool, error) {
+	g, err := loadImports(ctx, s.q)
+	if err != nil {
+		return nil, err
+	}
+	importedBy := map[string][]string{}
+	for m, is := range g {
+		for _, i := range is {
+			importedBy[i] = append(importedBy[i], m)
+		}
+	}
+	seen := map[string]bool{}
+	todo := slices.Clone(modules)
+	for _, m := range modules {
+		seen[m] = true
+	}
+	for len(todo) > 0 {
+		m := todo[len(todo)-1]
+		todo = todo[:len(todo)-1]
+		for _, by := range importedBy[m] {
+			if !seen[by] {
+				seen[by] = true
+				todo = append(todo, by)
+			}
+		}
+	}
+	return seen, nil
+}
+
 // ownerResolver gives the declaration that a recorded constant belongs to (owner), from the declarations of the
 // names it was made with and, when a name is declared by several modules, the index's imports.
 type ownerResolver struct {

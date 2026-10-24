@@ -426,6 +426,60 @@ func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, er
 	return c, err
 }
 
+// DeclarationConstants are the compiled constants of the declaration d, one that Resolve gave: d's own, and those
+// that Lean generated from it (a structure's constructor and fields), each with its facts. It is empty when the
+// index read d's module without its compiled part.
+func (s *Store) DeclarationConstants(ctx context.Context, d Found) ([]Constant, error) {
+	byName := map[string]*Constant{}
+	var consts []declRef
+	rows, err := s.q.QueryContext(ctx, `SELECT name, kind, cstmt FROM consts WHERE module = ? AND
+		(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, d.Module, d.Name, d.Name+".", d.Name+"/")
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		c := &Constant{Module: d.Module}
+		if err := r.Scan(&c.Name, &c.Kind, &c.Hash); err != nil {
+			return err
+		}
+		byName[c.Name] = c
+		consts = append(consts, declRef{d.Module, c.Name})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	owner, err := s.owners(ctx, consts)
+	if err != nil {
+		return nil, err
+	}
+	var out []Constant
+	for _, c := range consts {
+		if o := owner[c]; o.Name != d.Name || o.Module != d.Module {
+			delete(byName, c.name)
+		}
+	}
+	rows, err = s.q.QueryContext(ctx, `SELECT name, concept, how FROM facts WHERE module = ? AND
+		(name = ? OR (name >= ? AND name < ?)) ORDER BY name, concept, how`, d.Module, d.Name, d.Name+".", d.Name+"/")
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var n string
+		var f Fact
+		if err := r.Scan(&n, &f.Concept, &f.How); err != nil {
+			return err
+		}
+		if c, ok := byName[n]; ok {
+			c.Facts = append(c.Facts, f)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range consts {
+		if k, ok := byName[c.name]; ok {
+			out = append(out, *k)
+		}
+	}
+	return out, nil
+}
+
 // dottedPrefixes yields name, then each shorter prefix that ends before one of its dots, while the prefix is not
 // empty: A.B.c, A.B, A.
 func dottedPrefixes(name string) iter.Seq[string] {
