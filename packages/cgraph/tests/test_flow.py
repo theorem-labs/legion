@@ -978,3 +978,44 @@ def test_the_shift_of_a_call_s_arguments_is_the_one_every_object_argument_agrees
     assert frames.evidence("ms", "f", analysis, image) == {-128}
     image = {"frame_arguments": {"f": [["q", 2, -128]]}}
     assert frames.evidence("ms", "f", analysis, image) == {-128}
+
+
+def test_arguments_past_the_named_parameters_of_a_callee_that_never_reads_them_are_not_computed(
+    dead_facts: dict[str, Any],
+) -> None:
+    """cpu_capacity_show's sysfs_emit(buf, "%lu\\n", topology_get_cpu_scale(...)) without CONFIG_SYSFS."""
+    events = fact_events(dead_facts, "dd_variadic")
+    assert (events["accesses"], events["field_accesses"]) == ([], [])
+    assert ("box", "ignored_argument") in unevaluated(dead_facts, "dd_variadic")
+    # A callee that reads its arguments with va_arg keeps them.
+    assert {item["field"] for item in fact_events(dead_facts, "dd_variadic_used")["field_accesses"]} == {"size"}
+
+
+def test_an_if_whose_branches_have_no_effect_is_not_code(dead_facts: dict[str, Any]) -> None:
+    """__device_attach's if (dev->parent) pm_runtime_get_sync(dev->parent) without CONFIG_PM."""
+    events = fact_events(dead_facts, "dd_if_without_effect")
+    assert (events["calls"], events["accesses"], events["field_accesses"]) == ([], [], [])
+    assert ("box", "discarded") in unevaluated(dead_facts, "dd_if_without_effect")
+    # A branch with an effect keeps the condition.
+    assert {item["field"] for item in fact_events(dead_facts, "dd_if_with_effect")["field_accesses"]} == {"first"}
+    assert callees(dead_facts, "dd_if_with_effect") == {"obj_free"}
+
+
+def test_a_value_masked_with_zero_is_never_read(dead_facts: dict[str, Any]) -> None:
+    """IS_DAX(inode) without CONFIG_FS_DAX: inode->i_flags & 0 (llvm-objdump: li a0, 0; ret)."""
+    events = fact_events(dead_facts, "dd_masked")
+    assert (events["accesses"], events["field_accesses"]) == ([], [])
+    assert ("box", "discarded") in unevaluated(dead_facts, "dd_masked")
+
+
+@pytest.mark.parametrize("function", ["dd_dead_effect", "dd_overflow"])
+def test_a_helper_whose_effects_are_not_compiled_has_none(dead_facts: dict[str, Any], function: str) -> None:
+    """An asm under IS_ENABLED of an unset option, and __builtin_mul_overflow into the helper's local,
+    are no effects (llvm-objdump: both callers are a bare ret)."""
+    events = fact_events(dead_facts, function)
+    assert (events["calls"], events["field_accesses"]) == ([], [])
+    assert {item.get("call") for item in events["unevaluated"] if item["reason"] == "discarded"} != set()
+
+
+def test_a_helper_with_a_live_asm_volatile_is_kept(dead_facts: dict[str, Any]) -> None:
+    assert callees(dead_facts, "dd_live_effect") == {"dd_read_fenced"}

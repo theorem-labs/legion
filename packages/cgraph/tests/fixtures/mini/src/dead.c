@@ -389,3 +389,105 @@ int dd_digits(struct dd_holder *h)
 		width++;
 	return width;
 }
+
+/* include/linux/sysfs.h without CONFIG_SYSFS: static inline int sysfs_emit(char *buf, const char *fmt,
+ * ...) { return 0; }. Arguments past the named parameters of a function that never reads them are
+ * not computed (drivers/base/topology.c cpu_capacity_show). One that reads them with va_arg keeps
+ * them. (No string literal: one in .rodata would move the fixture's text.) */
+static inline int dd_emit(char *buf, const char *fmt, ...)
+{
+	return 0;
+}
+
+int dd_variadic(char *buf, struct box *b)
+{
+	return dd_emit(buf, buf, b->size);
+}
+
+static inline long dd_emit_used(const char *fmt, ...)
+{
+	__builtin_va_list ap;
+	long v;
+
+	__builtin_va_start(ap, fmt);
+	v = __builtin_va_arg(ap, long);
+	__builtin_va_end(ap);
+	return v;
+}
+
+long dd_variadic_used(char *buf, struct box *b)
+{
+	return dd_emit_used(buf, b->size);
+}
+
+/* drivers/base/dd.c __device_attach: if (dev->parent) pm_runtime_get_sync(dev->parent), where
+ * pm_runtime_get_sync without CONFIG_PM has no effect. The whole statement is not code. */
+static inline int dd_pm_get(struct box *b)
+{
+	return 1;
+}
+
+void dd_if_without_effect(struct box *b)
+{
+	if (b->first)
+		dd_pm_get(b);
+}
+
+void dd_if_with_effect(struct box *b)
+{
+	if (b->first)
+		obj_free(b);
+}
+
+/* include/linux/fs.h IS_DAX(inode): ((inode)->i_flags & S_DAX), with S_DAX 0 without CONFIG_FS_DAX.
+ * Anything and 0 is 0: the flags are never read. */
+#define DD_S_DAX 0
+
+int dd_masked(struct box *b)
+{
+	return (b->size & DD_S_DAX) != 0;
+}
+
+/* include/linux/instrumented.h: the WARN_ON_ONCE under IS_ENABLED(CONFIG_DEBUG_ATOMIC) is not
+ * compiled, so a helper whose only other work is a read has no effect, and a call of it whose value
+ * is unused is not code (fsnotify_open, kswapd_age_node). A helper with a live asm volatile stays. */
+#define DD_DEBUG 0
+
+static inline long dd_read_checked(struct box *b)
+{
+	if (DD_DEBUG)
+		__asm__ volatile("ebreak");
+	return b->size;
+}
+
+void dd_dead_effect(struct box *b)
+{
+	dd_read_checked(b);
+}
+
+static inline long dd_read_fenced(struct box *b)
+{
+	__asm__ volatile("" ::: "memory");
+	return b->size;
+}
+
+void dd_live_effect(struct box *b)
+{
+	dd_read_fenced(b);
+}
+
+/* mm/slub.c calculate_sheaf_capacity -> size_mul: __builtin_mul_overflow stores only into the
+ * caller's local, so the helper has no effect (bootstrap_kmalloc_sheaves). */
+static inline long dd_mul(long a, long b)
+{
+	long r;
+
+	if (__builtin_mul_overflow(a, b, &r))
+		return -1;
+	return r;
+}
+
+void dd_overflow(struct box *b)
+{
+	dd_mul(b->size, 2);
+}

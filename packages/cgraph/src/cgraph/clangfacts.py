@@ -445,6 +445,7 @@ class _Extractor:
         self.analyses: dict[str, _FunctionWalk] = {}
         self.analyzing: set[str] = set()
         self.effect_free_cache: dict[str, bool] = {}
+        self.nesting = 0  # analyses under way, one inside another: bounded by _EFFECT_DEPTH
         self.selections: dict[int, set[int] | None] = {}
         self.typedefs: dict[str, str] | None = None  # the unit's typedef names, read on demand
 
@@ -901,14 +902,44 @@ class _Extractor:
         if name in self.ignored_cache:
             return self.ignored_cache[name]
         definition = self.evaluator.definitions.get(name)
-        if definition is None or self.is_weak(definition) or name in self.analyzing:
+        if definition is None or self.is_weak(definition) or name in self.analyzing or self.nesting >= _EFFECT_DEPTH:
             return frozenset()
-        walk = self.analysis(definition)
+        self.nesting += 1
+        try:
+            walk = self.analysis(definition)
+        finally:
+            self.nesting -= 1
         never_read = walk.never_read()
         parameters = list(definition.get_arguments() or [])
         result = frozenset(position for position, parameter in enumerate(parameters) if parameter.hash in never_read)
         self.ignored_cache[name] = result
         return result
+
+    def ignores_variadic(self, callee: ci.Cursor | None) -> bool:
+        """A variadic function of the unit that never reads its arguments past the named ones: no
+        va_start in its body (include/linux/sysfs.h without CONFIG_SYSFS: ``static inline int
+        sysfs_emit(char *buf, const char *fmt, ...) { return 0; }``). A weak definition may be
+        replaced, so it reads them."""
+        if callee is None or callee.kind != K.FUNCTION_DECL:
+            return False
+        definition = self.evaluator.definitions.get(callee.spelling)
+        if definition is None or self.is_weak(definition):
+            return False
+        if definition.type.kind != TK.FUNCTIONPROTO or not definition.type.is_function_variadic():
+            return False
+        return not any(node.kind == K.CALL_EXPR and node.spelling in _VA_START for node in definition.walk_preorder())
+
+    def branches_without_effect(self, statement: ci.Cursor) -> bool:
+        """An ``if`` whose branches have no effect and leave only by their end: only what its
+        condition does is code (__device_attach's ``if (dev->parent) pm_runtime_get_sync(dev->parent)``
+        without CONFIG_PM)."""
+        children = _children(statement)
+        return (
+            statement.kind == K.IF_STMT
+            and len(children) >= 2
+            and not _jumps_out(statement, 0)
+            and all(self.effect_free(branch) for branch in children[1:])
+        )
 
     def analysis(self, definition: ci.Cursor) -> _FunctionWalk:
         """The walk of a function whose labels and dead stores are settled.
@@ -960,33 +991,47 @@ class _Extractor:
         the builtins that compute a value and to functions of the unit that are themselves
         effect-free. Operands that are never evaluated (sizeof, typeof) do not count."""
         own = {node.hash for node in _effect_nodes(expression) if node.kind == K.VAR_DECL and _is_local(node)}
-        return self._effect_free(expression, own, inlined=True, depth=0)
+        return self._effect_free(expression, own, inlined=True)
 
-    def function_effect_free(self, name: str, depth: int) -> bool:
-        """A call of the function changes nothing but its result. A function that is not inline and
-        not static may not be inlined, and the compiler knows such a call returns only when the
-        function has no loop."""
-        if name in self.effect_free_cache:
-            return self.effect_free_cache[name]
+    def function_effect_free(self, name: str) -> bool:
+        """A call of the function changes nothing but its result: its compiled code, as its settled
+        walk tells (dead branches, code after an exit and unselected associations left out, such as
+        the WARN_ON_ONCE under IS_ENABLED(CONFIG_DEBUG_ATOMIC) in instrument_atomic_check_alignment),
+        has no effect. A function that is not inline and not static may not be inlined, and the
+        compiler knows such a call returns only when the function has no loop. A function that
+        calls itself again may not return, and a chain of calls deeper than _EFFECT_DEPTH is not
+        followed: both count as an effect."""
+        cached = self.effect_free_cache.get(name)
+        if cached is not None:
+            return cached
         definition = self.evaluator.definitions.get(name)
-        if definition is None or depth > _EFFECT_DEPTH or self.is_weak(definition):
+        if definition is None or self.is_weak(definition):
+            self.effect_free_cache[name] = False
             return False
-        # A function that calls itself again may not return: it is not effect-free.
-        self.effect_free_cache[name] = False
-        own = {node.hash for node in _effect_nodes(definition) if _is_local(node)}
+        if name in self.analyzing or self.nesting >= _EFFECT_DEPTH:
+            return False
+        self.nesting += 1
+        try:
+            walk = self.analysis(definition)
+        finally:
+            self.nesting -= 1
         inlined = _is_inline(definition) or definition.linkage == ci.LinkageKind.INTERNAL
-        result = self._effect_free(definition, own, inlined, depth)
+        result = walk.effects == 0 and (inlined or walk.compiled_loops == 0)
         self.effect_free_cache[name] = result
         return result
 
-    def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool, depth: int) -> bool:
+    def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool) -> bool:
         for node in _effect_nodes(root):
             kind = node.kind
             if kind == K.CALL_EXPR:
                 callee = node.referenced
                 if callee is None or callee.kind != K.FUNCTION_DECL:
                     return False
-                if callee.spelling not in _VALUE_BUILTINS and not self.function_effect_free(callee.spelling, depth + 1):
+                if _is_overflow_builtin(callee.spelling):
+                    arguments = list(node.get_arguments() or [])
+                    if len(arguments) != 3 or not _address_of_local(arguments[2], own):
+                        return False
+                elif callee.spelling not in _VALUE_BUILTINS and not self.function_effect_free(callee.spelling):
                     return False
             elif (
                 (kind == K.ASM_STMT and not self.asm_removable(node))
@@ -1198,6 +1243,8 @@ _LOOP_EXITS = (K.BREAK_STMT, K.CONTINUE_STMT)
 _BRANCHES = (K.IF_STMT, K.CONDITIONAL_OPERATOR, K.SWITCH_STMT, K.WHILE_STMT, K.FOR_STMT, K.DO_STMT, K.GOTO_STMT)
 # CXBinaryOperatorKind Comma.
 _COMMA = 33
+# CXBinaryOperatorKind Mul and And: with an operand 0, the result is 0 whatever the other one is.
+_ZEROING = (3, 17)
 
 
 def _mentions(cursor: ci.Cursor, names: frozenset[str]) -> bool:
@@ -1283,11 +1330,12 @@ _VALUE_BUILTINS = frozenset(
         "__builtin_bswap64",
     }
 )  # fmt: skip
-_LOOPS = (K.WHILE_STMT, K.FOR_STMT, K.DO_STMT)
 # Walks of one function until its labels and dead stores settle, and calls followed into callees
 # to tell whether they have an effect.
 _ANALYSIS_ROUNDS = 8
 _EFFECT_DEPTH = 8
+# What va_start expands to: a function that calls neither never reads its variable arguments.
+_VA_START = frozenset({"__builtin_va_start", "__builtin_c23_va_start", "__builtin_stdarg_start"})
 # The statements whose children are statements: an expression there is an expression statement.
 _STATEMENT_PARENTS = (K.COMPOUND_STMT, K.LABEL_STMT, K.CASE_STMT, K.DEFAULT_STMT)
 
@@ -1303,6 +1351,40 @@ def _is_local(variable: ci.Cursor | None) -> bool:
         and not _is_global_var(variable)
         and variable.storage_class not in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN)
     )
+
+
+_OVERFLOW_BUILTIN = re.compile(r"__builtin_[su]?(add|sub|mul)(l|ll)?_overflow")
+
+
+def _is_overflow_builtin(name: str) -> bool:
+    """``__builtin_mul_overflow(a, b, &r)`` and its typed forms: a value, and a store into ``*r``."""
+    return _OVERFLOW_BUILTIN.fullmatch(name) is not None
+
+
+def _address_of_local(expression: ci.Cursor, own: set[int] | None) -> bool:
+    """``&v`` (or ``&v.m``, ``&v[i]``) of a local: of one in ``own``, or, without ``own``, of any
+    variable the function itself owns (a parameter, or a local that is not static)."""
+    node = _strip(expression)
+    if node.kind != K.UNARY_OPERATOR or not libclang.is_address_of(node) or not _children(node):
+        return False
+    variable = _stored_variable(_children(node)[0])
+    if variable is None:
+        return False
+    return variable.hash in own if own is not None else _is_local(variable)
+
+
+_LOOP_OR_SWITCH = (K.WHILE_STMT, K.FOR_STMT, K.DO_STMT, K.SWITCH_STMT)
+_LEAVES = (K.RETURN_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT, K.LABEL_STMT, K.CASE_STMT, K.DEFAULT_STMT)
+
+
+def _jumps_out(node: ci.Cursor, enclosing: int) -> bool:
+    """Control may leave ``node`` other than by its end, or enter it other than by its start: a
+    return, a goto, a label, a case, or a break or continue that no loop or switch inside it takes."""
+    kind = node.kind
+    if kind in _LEAVES or (kind in (K.BREAK_STMT, K.CONTINUE_STMT) and enclosing == 0):
+        return True
+    inner = enclosing + 1 if kind in _LOOP_OR_SWITCH else enclosing
+    return any(_jumps_out(child, inner) for child in _children(node))
 
 
 def _stored_variable(target: ci.Cursor) -> ci.Cursor | None:
@@ -1818,6 +1900,11 @@ class _FunctionWalk:
         self.goto_targets: set[str] = set()
         self.reads: collections.Counter[int] = collections.Counter()
         self.stores: set[int] = set()  # the references that are the target of a store, not a read
+        # What compiled code does besides computing values: effects (a call of a function that has
+        # one, an asm the compiler keeps, a volatile access, a store outside the function's locals, a
+        # loop that may not end) and loops. A call of the function may go when it has neither.
+        self.effects = 0
+        self.compiled_loops = 0
         # Field addresses: each member chain's topmost member gets the chain's address; the members
         # below it (and the ones a local's definition folds away) are addressed only through it.
         self.chained: set[int] = set()
@@ -2080,6 +2167,12 @@ class _FunctionWalk:
                     self.discard(statement, children[0], statement_index, generic, reason)
                 else:
                     self.walk(statement, children[0], statement_index, None, generic)
+            return
+        if kind == K.IF_STMT and self.x.branches_without_effect(node):
+            # An if whose branches have no effect: only what its condition does is code.
+            self.discard(children[0], node, 0, generic, reason)
+            for child_index, child in enumerate(children[1:], 1):
+                self.walk(child, node, child_index, reason, generic)
             return
         if kind == K.BINARY_OPERATOR and len(children) == 2:
             operator = libclang.binary_kind(node)
@@ -3125,6 +3218,37 @@ class _FunctionWalk:
                 "provenance": [self.x.location(node)],
             }
         )
+        if not self.x.function_effect_free(destructor):
+            self.effects += 1
+
+    def count_effect(self, node: ci.Cursor, kind: ci.CursorKind) -> None:
+        """Count what a node of compiled code does besides computing a value."""
+        if kind == K.CALL_EXPR:
+            callee = node.referenced
+            if callee is None or callee.kind != K.FUNCTION_DECL:
+                self.effects += 1
+            elif _is_overflow_builtin(callee.spelling):
+                # __builtin_mul_overflow(a, b, &r): a store into the third argument.
+                arguments = list(node.get_arguments() or [])
+                if len(arguments) != 3 or not _address_of_local(arguments[2], None):
+                    self.effects += 1
+            elif callee.spelling not in _VALUE_BUILTINS and not self.x.function_effect_free(callee.spelling):
+                self.effects += 1
+        elif kind == K.ASM_STMT:
+            if not self.x.asm_removable(node):
+                self.effects += 1
+        elif kind in _LOOPS:
+            self.compiled_loops += 1
+            if self.x.loop_may_not_end(node):
+                self.effects += 1
+        elif kind.is_expression() and node.type.is_volatile_qualified():
+            self.effects += 1
+        else:
+            target = _store_target(node)
+            if target is not None:
+                variable = _stored_variable(target)
+                if variable is None or not _is_local(variable):
+                    self.effects += 1
 
     def walk(
         self, node: ci.Cursor, parent: ci.Cursor | None, index: int, reason: str | None, generic: bool = False
@@ -3147,6 +3271,7 @@ class _FunctionWalk:
                 # An array member that decays to its address.
                 self.addressed.add(operand.hash)
         if reason is None:
+            self.count_effect(node, kind)
             if kind in (K.GOTO_STMT, K.ADDR_LABEL_EXPR):
                 # A goto in code, or a label whose address is taken (&&label): the label is code.
                 self.goto_targets.update(child.spelling for child in children if child.kind == K.LABEL_REF)
@@ -3283,6 +3408,14 @@ class _FunctionWalk:
                     return
         if kind == K.BINARY_OPERATOR and len(children) == 2 and reason is None:
             operator = libclang.binary_kind(node)
+            if operator in _ZEROING:
+                zero = next((i for i in (1, 0) if libclang.constant_int(children[i]) == 0), None)
+                if zero is not None:
+                    # IS_DAX(inode) without CONFIG_FS_DAX: inode->i_flags & 0. Anything and 0, or
+                    # times 0, is 0: the other operand's value is not used.
+                    self.walk(children[zero], node, zero, reason, generic)
+                    self.discard(children[1 - zero], node, 1 - zero, generic)
+                    return
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
                 self.walk(children[0], node, 0, reason, generic)
                 if _mentions(children[0], _IMAGE_DECIDES):
@@ -3361,10 +3494,13 @@ class _FunctionWalk:
                 case_guard = self.case_guards.get(child.hash)
                 if dead:
                     self.walk(child, node, child_index, "after_exit", generic)
-                elif child.kind.is_expression() and not (value_last and child_index == len(children) - 1):
+                elif (
+                    child.kind.is_expression() and not (value_last and child_index == len(children) - 1)
+                ) or self.x.branches_without_effect(child):
                     # An expression statement (get_user_ns(ns);, a call of a void function that only
-                    # reads): its value is discarded, so only its effects are code. The last statement
-                    # of ({ ... }) is that expression's value (per_cpu_ptr).
+                    # reads), or an if whose branches have no effect: its value is discarded, so only
+                    # its effects are code. The last statement of ({ ... }) is that expression's
+                    # value (per_cpu_ptr).
                     pushed = case_guard is not None and case_guard[0] is not None and not self.has_label(child)
                     if pushed:
                         assert case_guard is not None and case_guard[0] is not None
@@ -3393,12 +3529,16 @@ class _FunctionWalk:
             ignored = self.x.ignored_parameters(node.referenced)
             inline = node.referenced is not None and self.x.inline_function(node.referenced.spelling)
             arguments = list(node.get_arguments() or [])
+            # Arguments past the named parameters of a variadic callee that never reads them
+            # (sysfs_emit without CONFIG_SYSFS) are ignored too.
+            named = len(list(node.referenced.get_arguments() or [])) if node.referenced is not None else 0
+            variadic = self.x.ignores_variadic(node.referenced)
             # The children are the callee, then the arguments in order: libclang's cursors for one
             # argument from get_arguments and from the children do not compare equal.
             offset = len(children) - len(arguments)
             for child_index, child in enumerate(children):
                 position = child_index - offset if child_index >= offset else None
-                if position is None or position not in ignored:
+                if position is None or not (position in ignored or (variadic and position >= named)):
                     self.walk(child, node, child_index, reason, generic)
                 elif inline:
                     # A value only a parameter the inline callee never reads receives: only its
