@@ -113,6 +113,8 @@ The landing program calls `declindex land-hash` twice for every registered contr
 
 A declaration is answered from the index only when `LAND_TREE` has its source file with the same blob as the indexed `sources` row. A module that the index read without a `sources` row, such as an ignored source file, is not answered from the index.
 
+The configured tree can be a directory below its repository's root. The index keys `sources` and declaration paths relative to the tree. `land-hash` finds the tree's directory in the repository with `git rev-parse --show-prefix` in the configured tree, so that tree must be inside its Git work tree where `land-hash` runs. It lists the sources of `LAND_TREE` below that directory, compares them with the index by their tree-relative paths, and prints each `path` with the directory in front. For a tree at the repository's root the directory is empty.
+
 A changed module's build output is fresh only when all of these hold:
 
 - `LAND_BUILD_DIR` holds that module's source with exactly the candidate blob's bytes.
@@ -123,10 +125,10 @@ So for a fetch trace, nothing in the build directory ties the outputs to the can
 
 The command takes no positional arguments. Its environment is:
 
-- `LAND_TREE`: the 40-hex Git object whose tree is being answered.
+- `LAND_TREE`: the 40-hex Git object whose tree is being answered. Its tree is the repository's root tree, also when the configured tree is a directory below it.
 - `LAND_GIT_DIR`: a Git directory that can read `LAND_TREE` and its blobs.
 - `LAND_NAMES` or `LAND_NAMES_FILE`: a JSON array of distinct, non-empty, fully qualified names. A top-level declaration's full name has no dot, so a name need not contain one. The file form is required for large requests. If both are set, their arrays must be equal.
-- `LAND_BUILD_DIR`: the candidate build root when a requested declaration is in a changed source file.
+- `LAND_BUILD_DIR`: the candidate build root when a requested declaration is in a changed source file. It is the candidate's copy of the configured tree, so its sources are at their tree-relative paths.
 
 On exit 0, each requested name produces one line in request order:
 

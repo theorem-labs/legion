@@ -70,6 +70,62 @@ func TestReadSourcesSkipsANonGitTree(t *testing.T) {
 	}
 }
 
+// TestRefreshKeysSourcesRelativeToASubdirectoryTree catches a refresh of a tree below its repository's root that
+// keys a changed or untracked source by the repository-relative path git status prints: the index then keeps the
+// committed blob of a modified file and loses an untracked one.
+func TestRefreshKeysSourcesRelativeToASubdirectoryTree(t *testing.T) {
+	tree := goldenTree(t)
+	repo := t.TempDir()
+	proj := filepath.Join(repo, "proj")
+	if err := os.Rename(tree.Source, proj); err != nil {
+		t.Fatal(err)
+	}
+	tree.Source, tree.Lib = proj, proj
+	gitIn(t, repo, "init", "-q")
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "base")
+	golden, err := os.ReadFile(filepath.Join(proj, "Golden.lean"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSource(t, proj, "Golden.lean", string(golden)+"\n-- changed after the commit\n")
+	writeSource(t, proj, "Sub/Untracked.lean", "def untracked := 3\n")
+
+	s := openStore(t)
+	ctx := context.Background()
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "base"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var path, blob string
+		if err := rows.Scan(&path, &blob); err != nil {
+			t.Fatal(err)
+		}
+		got[path] = blob
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{}
+	for _, rel := range []string{"Golden.lean", "Sub/Wrap.lean", "Sub/Untracked.lean"} {
+		want[rel] = gitIn(t, proj, "hash-object", "--", rel)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("sources = %v, want %v", got, want)
+	}
+	for rel, blob := range want {
+		if got[rel] != blob {
+			t.Errorf("source %s = %q, want %q", rel, got[rel], blob)
+		}
+	}
+}
+
 // TestRefreshStoresSourcesAndTheReplacedCommit catches a refresh that cannot later compare the candidate's
 // blobs with the exact source bytes it indexed, or that loses the commit the refresh replaced.
 func TestRefreshStoresSourcesAndTheReplacedCommit(t *testing.T) {

@@ -504,6 +504,45 @@ func TestLandHashListsTheSourcesRefreshRecorded(t *testing.T) {
 	}
 }
 
+// TestLandHashAnswersATreeBelowTheRepositoryRoot catches a hasher that lists the configured roots at the root of
+// LAND_TREE when the configured tree is a directory below its repository's root, or that prints a tree-relative
+// path where the contract gives the repository-relative one.
+func TestLandHashAnswersATreeBelowTheRepositoryRoot(t *testing.T) {
+	config := fixture(t)
+	dir := filepath.Dir(config)
+	repo := filepath.Join(dir, "repo")
+	proj := filepath.Join(repo, "proj")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "tree"), proj); err != nil {
+		t.Fatal(err)
+	}
+	rewriteConfig(t, config, "tree: tree\n", "tree: repo/proj\n")
+	git(t, repo, "init", "-q")
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-q", "-m", "base")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("refresh: %+v", r)
+	}
+
+	base := invokeLandHash(t, config, landValues(repo, git(t, repo, "rev-parse", "HEAD^{tree}"),
+		namesJSON(t, "Gold.frame_lo", "Gold2.FrameAt"), ""))
+	const wantBase = "Gold.frame_lo\t9d9fba31f41fc258\tproj/Golden.lean\nGold2.FrameAt\t7f52be71a38bde18\tproj/Sub/Wrap.lean\n"
+	if base.code != 0 || base.out != wantBase {
+		t.Fatalf("base land-hash of a subdirectory tree = %+v, want %q", base, wantBase)
+	}
+
+	source, ilean, candidate := changeGolden(t, proj)
+	build := t.TempDir()
+	writeLandBuild(t, build, "Golden", source, ilean, false, declindex.LakeTextHash(source))
+	changed := invokeLandHash(t, config, landValues(repo, candidate, namesJSON(t, "Gold.frame_lo"), build))
+	const wantChanged = "Gold.frame_lo\tdd801c6f96a0e63c\tproj/Golden.lean\n"
+	if changed.code != 0 || changed.out != wantChanged {
+		t.Fatalf("candidate land-hash of a subdirectory tree = %+v, want %q", changed, wantChanged)
+	}
+}
+
 func TestLandHashRefusesAnIndexWithoutGitSources(t *testing.T) {
 	config := fixture(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {

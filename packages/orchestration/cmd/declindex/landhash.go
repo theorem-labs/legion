@@ -18,6 +18,8 @@ import (
 
 // cmdLandHash answers a landing's declaration reads at one Git tree. A module whose source LAND_TREE has with the
 // blob the index recorded comes from the index; changed modules come only from verified candidate build output.
+// The index keys sources and declarations relative to the configured tree; LAND_TREE is the repository's, so a
+// tree below the repository's root is listed below its SourcePrefix, and answers print paths with that prefix.
 func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"land-hash takes no arguments; it reads LAND_TREE, LAND_GIT_DIR, and LAND_NAMES"})
@@ -46,7 +48,11 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &unableError{fmt.Errorf("the index has no git source blobs")})
 	}
 	roots := e.cfg.TreeSpec().Roots
-	candidate, err := gitTreeSources(ctx, gitDir, tree, declindex.SourcePathspecs(roots))
+	prefix, err := declindex.SourcePrefix(e.cfg.Tree)
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	candidate, err := gitTreeSources(ctx, gitDir, tree, prefix, declindex.SourcePathspecs(roots))
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
@@ -71,7 +77,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 			rel := strings.TrimSuffix(path, ".lean")
 			blob, err := gitBlob(ctx, gitDir, candidate[path])
 			if err != nil {
-				return fail(e.stderr, &unableError{fmt.Errorf("read %s from LAND_TREE: %w", path, err)})
+				return fail(e.stderr, &unableError{fmt.Errorf("read %s from LAND_TREE: %w", prefix+path, err)})
 			}
 			freshness, err := declindex.Fresh(buildDir, e.cfg.LibRel, rel, blob)
 			if err != nil {
@@ -96,7 +102,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 			}
 			for _, declaration := range module.Decls {
 				changedDecls[declaration.Name] = append(changedDecls[declaration.Name], landDeclaration{
-					path: path, hash: declaration.StmtHash,
+					path: prefix + path, hash: declaration.StmtHash,
 				})
 			}
 		}
@@ -114,7 +120,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 			// from both must not count as unchanged.
 			indexedBlob, indexed := snapshot.Sources[declaration.Path]
 			if blob, inTree := candidate[declaration.Path]; indexed && inTree && blob == indexedBlob {
-				declarations = append(declarations, landDeclaration{path: declaration.Path, hash: declaration.StmtHash})
+				declarations = append(declarations, landDeclaration{path: prefix + declaration.Path, hash: declaration.StmtHash})
 			}
 		}
 		answer, err := answerLandHash(name, declarations)
@@ -129,6 +135,7 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	return 0
 }
 
+// landDeclaration is one declaration an answer can print: path is repository-relative.
 type landDeclaration struct{ path, hash string }
 type landAnswer struct{ name, hash, path string }
 
@@ -220,13 +227,16 @@ func parseLandNames(raw []byte) ([]string, error) {
 	return names, nil
 }
 
-// gitTreeSources lists the Lean source blobs of LAND_TREE that pathspecs select, keyed by path.
-func gitTreeSources(ctx context.Context, gitDir, tree string, pathspecs []string) (map[string]string, error) {
+// gitTreeSources lists the Lean source blobs of LAND_TREE that pathspecs select below prefix, the configured tree's
+// directory in the repository. It keys each blob by its path without prefix, as the index keys sources.
+func gitTreeSources(ctx context.Context, gitDir, tree, prefix string, pathspecs []string) (map[string]string, error) {
 	if err := exec.CommandContext(ctx, "git", "--git-dir="+gitDir, "cat-file", "-e", tree+"^{tree}").Run(); err != nil {
 		return nil, fmt.Errorf("LAND_GIT_DIR cannot read LAND_TREE: %w", err)
 	}
 	args := []string{"--git-dir=" + gitDir, "ls-tree", "-r", "-z", "--full-tree", tree, "--"}
-	args = append(args, pathspecs...)
+	for _, pathspec := range pathspecs {
+		args = append(args, prefix+pathspec)
+	}
 	raw, err := exec.CommandContext(ctx, "git", args...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("list LAND_TREE sources: %w", err)
@@ -247,7 +257,9 @@ func gitTreeSources(ctx context.Context, gitDir, tree string, pathspecs []string
 		if len(parts) != 3 || parts[1] != "blob" || !strings.HasSuffix(path, ".lean") {
 			continue
 		}
-		out[path] = parts[2]
+		if rel, inTree := strings.CutPrefix(path, prefix); inTree {
+			out[rel] = parts[2]
+		}
 	}
 	return out, nil
 }

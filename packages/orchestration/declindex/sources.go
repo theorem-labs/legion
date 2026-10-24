@@ -12,9 +12,11 @@ import (
 	"strings"
 )
 
-// readSources records the blob of every Lean source below the configured roots as it exists in tree.Source. Git's
-// index names unchanged tracked files; hash-object gives the bytes refresh actually reads for modified and
-// untracked files. A source directory that is not a Git work tree has no source-blob snapshot.
+// readSources records the blob of every Lean source below the configured roots as it exists in tree.Source, keyed
+// by its path relative to tree.Source. Git's index names unchanged tracked files; hash-object gives the bytes
+// refresh actually reads for modified and untracked files. Git lists both by paths from the work tree's root, so a
+// tree below that root strips its SourcePrefix. A source directory that is not a Git work tree has no source-blob
+// snapshot.
 func readSources(tree Tree) (map[string]string, error) {
 	check := exec.Command("git", "-C", tree.Source, "rev-parse", "--is-inside-work-tree")
 	out, err := check.Output()
@@ -28,13 +30,17 @@ func readSources(tree Tree) (map[string]string, error) {
 		return nil, nil
 	}
 
+	top, prefix, err := workTreeLocation(tree.Source)
+	if err != nil {
+		return nil, err
+	}
 	paths := SourcePathspecs(tree.Roots)
-	args := append([]string{"-C", tree.Source, "ls-files", "-s", "-z", "--"}, paths...)
+	args := append([]string{"-C", tree.Source, "ls-files", "-s", "-z", "--full-name", "--"}, paths...)
 	tracked, err := exec.Command("git", args...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("list tracked sources: %w", err)
 	}
-	sources, err := parseTrackedSources(tracked)
+	sources, err := parseTrackedSources(tracked, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +50,7 @@ func readSources(tree Tree) (map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list changed sources: %w", err)
 	}
-	changed, err := changedSourcePaths(status)
+	changed, err := changedSourcePaths(status, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -67,8 +73,14 @@ func readSources(tree Tree) (map[string]string, error) {
 		return sources, nil
 	}
 	sort.Strings(toHash)
-	cmd := exec.Command("git", "-C", tree.Source, "hash-object", "--stdin-paths")
-	cmd.Stdin = strings.NewReader(strings.Join(toHash, "\n") + "\n")
+	// hash-object resolves --stdin-paths from the work tree's root, not from a subdirectory given with -C, so it
+	// runs at that root with the repository-relative paths.
+	cmd := exec.Command("git", "-C", top, "hash-object", "--stdin-paths")
+	var stdin strings.Builder
+	for _, p := range toHash {
+		stdin.WriteString(prefix + p + "\n")
+	}
+	cmd.Stdin = strings.NewReader(stdin.String())
 	hashes, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("hash changed sources: %w", err)
@@ -101,7 +113,30 @@ func SourcePathspecs(roots Roots) []string {
 	return out
 }
 
-func parseTrackedSources(raw []byte) (map[string]string, error) {
+// SourcePrefix is dir's path below the root of its Git work tree, with a trailing slash, and empty at that root.
+// Git lists a repository's files by paths from its root; the index keys sources and declarations relative to the
+// tree, which is this prefix shorter.
+func SourcePrefix(dir string) (string, error) {
+	_, prefix, err := workTreeLocation(dir)
+	return prefix, err
+}
+
+// workTreeLocation gives the root of dir's Git work tree and dir's SourcePrefix below it.
+func workTreeLocation(dir string) (top, prefix string, err error) {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel", "--show-prefix").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("find %s in its Git work tree: %w", dir, err)
+	}
+	top, prefix, ok := strings.Cut(strings.TrimSuffix(string(out), "\n"), "\n")
+	if !ok || top == "" || (prefix != "" && !strings.HasSuffix(prefix, "/")) {
+		return "", "", fmt.Errorf("find %s in its Git work tree: git rev-parse gave %q", dir, out)
+	}
+	return top, prefix, nil
+}
+
+// parseTrackedSources reads `git ls-files -s -z --full-name` output. It keys each stage-0 Lean source by its path
+// without prefix and skips a path outside the tree.
+func parseTrackedSources(raw []byte, prefix string) (map[string]string, error) {
 	out := map[string]string{}
 	for len(raw) > 0 {
 		end := bytes.IndexByte(raw, 0)
@@ -121,12 +156,16 @@ func parseTrackedSources(raw []byte) (map[string]string, error) {
 		if parts[2] != "0" || !strings.HasSuffix(path, ".lean") {
 			continue
 		}
-		out[path] = parts[1]
+		if rel, inTree := strings.CutPrefix(path, prefix); inTree {
+			out[rel] = parts[1]
+		}
 	}
 	return out, nil
 }
 
-func changedSourcePaths(raw []byte) ([]string, error) {
+// changedSourcePaths reads `git status --porcelain -z` output, whose paths are from the repository's root. It gives
+// each changed Lean source's path without prefix and skips a path outside the tree.
+func changedSourcePaths(raw []byte, prefix string) ([]string, error) {
 	set := map[string]bool{}
 	for len(raw) > 0 {
 		end := bytes.IndexByte(raw, 0)
@@ -138,8 +177,8 @@ func changedSourcePaths(raw []byte) ([]string, error) {
 		if len(record) < 4 || record[2] != ' ' {
 			return nil, fmt.Errorf("git status record %q is malformed", record)
 		}
-		if strings.HasSuffix(record[3:], ".lean") {
-			set[record[3:]] = true
+		if rel, inTree := strings.CutPrefix(record[3:], prefix); inTree && strings.HasSuffix(rel, ".lean") {
+			set[rel] = true
 		}
 		if record[0] == 'R' || record[0] == 'C' || record[1] == 'R' || record[1] == 'C' {
 			end := bytes.IndexByte(raw, 0)
