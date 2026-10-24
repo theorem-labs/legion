@@ -42,7 +42,9 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   address but not the same one, the function reads each of those objects on some path
   (`load_or_store_some_path`); where any path leaves the base unknown, no object is claimed. A call
   to a function whose code has no return and no jump out of itself (`rest_init`, `panic`) does not
-  continue, so code the compiler places after it is reached only by its other paths.
+  continue, so code the compiler places after it is reached only by its other paths. Nor does an
+  `ebreak` that `[image.trap_table]` lists without the resume flag (a BUG); a WARN's resumes, as does
+  any trap the table does not list.
   Thread-pointer accesses are per-CPU state. Globals the machine code addresses but the C does not
   name become nodes with image-only access edges.
 - **What the image cannot tell apart is named by every name it has.** An address one past the end of
@@ -51,8 +53,9 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   own at the address that `System.map` leaves out (a jump table, a constant pool), the address is
   that symbol's and the object's end pointer is not claimed. The start of a block of globals LLVM
   merged (`.L_MergedGlobals`) is also its first member's address: forming it accesses no member, so
-  it is recorded in `exclusions.json` (`image_access` / `merged_globals_block_base`) and each member
-  is named where a displacement from the block reaches it.
+  it is recorded in `exclusions.json` (`image_access` / `merged_globals_block_base`, its `detail`
+  holding the block's size and the names its start has) and each member is named where a
+  displacement from the block reaches it.
 - **Field offsets** come from every offset from a base the machine code forms, not only from the
   ones it dereferences: the displacement of a load or store, the immediate of an `addi`, the constant
   a register already carries (with the shift that forms the size of an array element), and the sum of
@@ -210,6 +213,16 @@ percpu_sections = []
 call_aliases = { bcmp = "memcmp" }   # an image callee that stands for the C function named
 [image.symbol_classes]               # data symbols that are not state
 compiler_symbol = "^__key$"
+[image.trap_table]                   # optional: which ebreak traps resume (the kernel's __bug_table)
+section = "__bug_table"              # one entry per trap; a missing section stops the run (exit 3)
+entry_size = 8
+address_offset = 0                  # the trap's address: absolute, or with relative = true a signed
+address_size = 4                    #   offset from the address field itself
+relative = true
+flags_offset = 4
+flags_size = 2
+resume_flags = 1                    # a trap whose flags share a bit resumes (WARN); one listed
+                                     #   without it stops there (BUG), and the flow ends after it
 
 [contract_graph]
 function_prefix = "Prog/"            # a function node <prefix><dir>/<file>/<Fn> is <dir>/<file>.c

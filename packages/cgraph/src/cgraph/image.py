@@ -21,7 +21,7 @@ from elftools.elf.constants import SH_FLAGS
 from elftools.elf.elffile import ELFFile
 from elftools.elf.sections import SymbolTableSection
 
-from .config import ImageRules
+from .config import ImageRules, TrapTable
 from .errors import InputError
 from .imagecache import ImageCache
 
@@ -34,8 +34,10 @@ _BRANCHES = {
     "beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez", "blez", "bgez", "bltz", "bgtz", "bgt", "ble",
     "bgtu", "bleu", "c.beqz", "c.bnez",
 }  # fmt: skip
-# Instructions after which control does not continue. ebreak is not one: a WARN resumes after it.
+# Instructions after which control does not continue. A trap is not one: a WARN resumes after it.
 _ENDS = {"ret", "jr", "c.jr", "unimp", "c.unimp", "mret", "sret"}
+# Traps, which end the flow where the image's trap table says they do not resume.
+_TRAPS = {"ebreak", "c.ebreak"}
 # Constants beyond this many bytes are addresses or masks, not field offsets.
 _OFFSET_LIMIT = 1 << 24
 # An addi this large on a base the code does not know is the first half of a split displacement.
@@ -263,9 +265,10 @@ def _chosen_value(instruction: Any, operands: list[Any], state: _State) -> tuple
     return operands[0].reg, frozenset((address + immediate) & _MASK for address in state.choices[source])
 
 
-def _flow(decoder: Any, instructions: list[Any], never_returns: Any = None) -> list[list[int]]:
+def _flow(decoder: Any, instructions: list[Any], never_returns: Any = None, halts: Any = None) -> list[list[int]]:
     """The successors of each instruction: the next one, a branch target, none after a return, an
-    indirect jump, a jump to an address outside the function, or a call to a function that never
+    indirect jump, a jump to an address outside the function, a trap that does not resume
+    (``halts(address)``; a BUG, where a WARN's trap resumes), or a call to a function that never
     returns (``never_returns(address)``; panic, rest_init), after which the compiler places code
     that only other paths reach."""
     index_of = {instruction.address: index for index, instruction in enumerate(instructions)}
@@ -281,7 +284,11 @@ def _flow(decoder: Any, instructions: list[Any], never_returns: Any = None) -> l
             successors.append(following + ([target] if target is not None else []))
         elif mnemonic in {"j", "c.j"}:
             successors.append([target] if target is not None else [])
-        elif mnemonic in _ENDS or (mnemonic in {"jalr", "c.jalr"} and not _links(decoder, operands)):
+        elif (
+            mnemonic in _ENDS
+            or (mnemonic in {"jalr", "c.jalr"} and not _links(decoder, operands))
+            or (mnemonic in _TRAPS and halts is not None and halts(instruction.address))
+        ):
             successors.append([])
         elif never_returns is not None and (callee := _callee(decoder, instructions, index)) is not None:
             successors.append([] if never_returns(callee) else following)
@@ -448,6 +455,26 @@ def read_system_map(path: Path) -> list[tuple[int, str, str]]:
     return sorted(entries)
 
 
+def read_trap_table(data: bytes, section_address: int, table: TrapTable) -> dict[int, bool]:
+    """Each trap the table at ``section_address`` lists, and whether it resumes. A trap listed twice
+    resumes when either entry says so."""
+    if len(data) % table.entry_size:
+        raise InputError(
+            f"trap table {table.section} holds {len(data)} bytes, not a whole number of {table.entry_size}-byte entries"
+        )
+    traps: dict[int, bool] = {}
+    for start in range(0, len(data), table.entry_size):
+        address_field = start + table.address_offset
+        value = int.from_bytes(
+            data[address_field : address_field + table.address_size], "little", signed=table.relative
+        )
+        address = (section_address + address_field + value) & _MASK if table.relative else value
+        flags_field = start + table.flags_offset
+        flags = int.from_bytes(data[flags_field : flags_field + table.flags_size], "little")
+        traps[address] = traps.get(address, False) or bool(flags & table.resume_flags)
+    return traps
+
+
 def code_symbol(kind: str, size: int, *, executable: bool) -> bool:
     """Whether a symbol is a routine the C can call or take the address of. An assembly routine
     (handle_exception, ret_from_fork_kernel_asm) carries a size but no function type, and a
@@ -499,7 +526,25 @@ class Image:
         self.results: dict[str, int] = {}
         # Whether the function at an address cannot return, decided once per callee.
         self.no_return: dict[int, bool] = {}
+        # Each trap the image's trap table lists, and whether it resumes ([image] trap_table).
+        self.traps: dict[int, bool] = {} if rules.trap_table is None else self._read_traps(image, rules.trap_table)
         self.image_cache = ImageCache(cache_directory, image, system_map, rules, Path(__file__))
+
+    def _read_traps(self, image: Path, table: TrapTable) -> dict[int, bool]:
+        section = self.elf.get_section_by_name(table.section)
+        if section is None:
+            self.handle.close()
+            raise InputError(f"image {image} has no section {table.section}, which [image] trap_table names")
+        try:
+            data = section.data()
+        except (OSError, ELFError) as error:
+            self.handle.close()
+            raise InputError(f"cannot read section {table.section} of {image}: {error}") from error
+        return read_trap_table(data, int(section["sh_addr"]), table)
+
+    def _halts(self, address: int) -> bool:
+        """Whether the trap at ``address`` stops: the trap table lists it, without the resume flag."""
+        return self.traps.get(address) is False
 
     def _load_elf(self, image: Path, named: set[tuple[int, str]]) -> None:
         self.handle = image.open("rb")
@@ -728,7 +773,7 @@ class Image:
 
     def _decode(self, name: str, instructions: list[Any]) -> FunctionFacts:
         facts = FunctionFacts()
-        successors = _flow(self.decoder, instructions, self.never_returns)
+        successors = _flow(self.decoder, instructions, self.never_returns, self._halts)
         states = self._block_states(instructions, successors)
         before = dict(states)
         returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
@@ -890,13 +935,20 @@ class Image:
         if operation in _ADDRESS_OPERATIONS and address in self.merged_blocks:
             # The start of a merged-globals block is its first member's address, but forming it
             # accesses no member: each is reached by a displacement from it, recorded where it is.
+            # The names the start has go with it, for a C access that takes the first member's
+            # address (an empty lock_class_key passed by address).
+            starting = bisect.bisect_left(self.objects, (address,))
+            names = set(zero_size)
+            while starting < len(self.objects) and self.objects[starting][0] == address:
+                names.add(source_name(self.objects[starting][2]))
+                starting += 1
             facts.exclusions.append(
                 {
                     "kind": "image_access",
                     "reason": "merged_globals_block_base",
                     "function": function,
                     "target": _hex(address),
-                    "detail": f"the base of a merged-globals block of {self.merged_blocks[address]} bytes",
+                    "detail": {"block_bytes": self.merged_blocks[address], "names": sorted(names)},
                     "provenance": provenance,
                 }
             )

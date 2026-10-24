@@ -87,12 +87,31 @@ class Vocabulary:
 
 
 @dataclass(frozen=True)
+class TrapTable:
+    """Where the image lists its trap instructions, and which of them resume: one entry per trap,
+    ``entry_size`` bytes each, little-endian, holding the trap's address and a word of flags. The
+    address is absolute, or with ``relative`` a signed offset from the address field itself. A trap
+    whose flags share a bit with ``resume_flags`` resumes after it; any other the table lists stops
+    there. The kernel's ``__bug_table`` lists each BUG and WARN, and BUGFLAG_WARNING marks a WARN."""
+
+    section: str
+    entry_size: int
+    address_offset: int
+    address_size: int
+    relative: bool
+    flags_offset: int
+    flags_size: int
+    resume_flags: int
+
+
+@dataclass(frozen=True)
 class ImageRules:
     thread_pointer: str | None = None
     percpu_sections: tuple[str, ...] = ()
     symbol_classes: dict[str, re.Pattern[str]] = field(default_factory=dict)
     # Image callee -> the C function it stands for.
     call_aliases: dict[str, str] = field(default_factory=dict)
+    trap_table: TrapTable | None = None
 
     def symbol_class(self, name: str, section: str = "") -> str:
         """``per_cpu``, ``compiler_symbol``, ``constant_data`` or ``state`` for a data symbol."""
@@ -171,7 +190,7 @@ def _expect(table: dict[str, Any], key: str, kind: type | tuple[type, ...], wher
 
 
 def _kind_name(kind: type | tuple[type, ...]) -> str:
-    names = {str: "a string", list: "a list", dict: "a table", int: "an integer"}
+    names = {str: "a string", list: "a list", dict: "a table", int: "an integer", bool: "a boolean"}
     if isinstance(kind, tuple):
         return " or ".join(names.get(item, item.__name__) for item in kind)
     return names.get(kind, kind.__name__)
@@ -198,6 +217,50 @@ def _unknown(table: dict[str, Any], allowed: set[str], where: str) -> None:
     extra = sorted(set(table) - allowed)
     if extra:
         raise ConfigError(f"{where} has unknown key {extra[0]}")
+
+
+def _trap_table(table: dict[str, Any]) -> TrapTable:
+    where = "image.trap_table"
+    _unknown(
+        table,
+        {"section", "entry_size", "address_offset", "address_size", "relative", "flags_offset", "flags_size"}
+        | {"resume_flags"},
+        where,
+    )
+
+    def number(key: str) -> int:
+        value = _expect(table, key, int, where, required=True)
+        if isinstance(value, bool) or value < 0:
+            raise ConfigError(f"{where}.{key} must be an integer")
+        return int(value)
+
+    section = _expect(table, "section", str, where, required=True)
+    if not section:
+        raise ConfigError(f"{where}.section must name a section")
+    relative = _expect(table, "relative", bool, where, required=True)
+    trap = TrapTable(
+        section=section,
+        entry_size=number("entry_size"),
+        address_offset=number("address_offset"),
+        address_size=number("address_size"),
+        relative=relative,
+        flags_offset=number("flags_offset"),
+        flags_size=number("flags_size"),
+        resume_flags=number("resume_flags"),
+    )
+    if trap.address_size not in (4, 8):
+        raise ConfigError(f"{where}.address_size must be 4 or 8")
+    if trap.flags_size not in (1, 2, 4, 8):
+        raise ConfigError(f"{where}.flags_size must be 1, 2, 4 or 8")
+    if not trap.resume_flags:
+        raise ConfigError(f"{where}.resume_flags must be a nonzero bit mask")
+    for name, offset, size in (
+        ("address", trap.address_offset, trap.address_size),
+        ("flags", trap.flags_offset, trap.flags_size),
+    ):
+        if offset + size > trap.entry_size:
+            raise ConfigError(f"{where}'s {name} field ends at byte {offset + size}, past entry_size {trap.entry_size}")
+    return trap
 
 
 def load(path: Path, root: Path | None = None) -> Config:
@@ -350,7 +413,11 @@ def load(path: Path, root: Path | None = None) -> Config:
         raise ConfigError("c.base_type_min_containers must be at least 2")
 
     image_table = _expect(data, "image", dict, "configuration") or {}
-    _unknown(image_table, {"arch", "thread_pointer", "percpu_sections", "symbol_classes", "call_aliases"}, "image")
+    _unknown(
+        image_table,
+        {"arch", "thread_pointer", "percpu_sections", "symbol_classes", "call_aliases", "trap_table"},
+        "image",
+    )
     aliases = _expect(image_table, "call_aliases", dict, "image") or {}
     if not all(isinstance(value, str) for value in aliases.values()):
         raise ConfigError("image.call_aliases must map names to names")
@@ -367,11 +434,13 @@ def load(path: Path, root: Path | None = None) -> Config:
                 symbol_classes[kind] = re.compile(pattern)
             except re.error as error:
                 raise ConfigError(f"image.symbol_classes.{kind} is not a valid regular expression: {error}") from error
+    trap_table = _expect(image_table, "trap_table", dict, "image")
     image_rules = ImageRules(
         thread_pointer=_expect(image_table, "thread_pointer", str, "image"),
         percpu_sections=tuple(_strings(image_table, "percpu_sections", "image")),
         symbol_classes=symbol_classes,
         call_aliases=dict(aliases),
+        trap_table=None if trap_table is None else _trap_table(trap_table),
     )
 
     contract_table = _expect(data, "contract_graph", dict, "configuration") or {}

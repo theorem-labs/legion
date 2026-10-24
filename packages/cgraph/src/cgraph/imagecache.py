@@ -16,6 +16,7 @@ read or does not have its shape is an input error: the run stops and names the c
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -48,6 +49,7 @@ def _rules(rules: ImageRules) -> dict[str, Any]:
         "percpu_sections": list(rules.percpu_sections),
         "symbol_classes": {name: pattern.pattern for name, pattern in sorted(rules.symbol_classes.items())},
         "call_aliases": dict(sorted(rules.call_aliases.items())),
+        "trap_table": None if rules.trap_table is None else dataclasses.asdict(rules.trap_table),
     }
 
 

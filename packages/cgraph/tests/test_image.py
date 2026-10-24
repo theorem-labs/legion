@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import struct
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 from conftest import FIXTURE
 
 from cgraph import config, imagecache
+from cgraph import image as image_module
 from cgraph.errors import InputError
 from cgraph.image import FunctionFacts, Image, code_symbol, read_system_map, resolve_sized, source_name
 from cgraph.imagecache import ImageCache
@@ -159,13 +161,14 @@ def test_image_cache_key_covers_each_decoder_input(tmp_path: Path, monkeypatch: 
         key(results=2),
         key(arities={"callee": 2}),
         key(arities={"other": 1}),
+        key(rules=dataclasses.replace(loaded.image, trap_table=_bug_table())),
     }
     monkeypatch.setattr(imagecache.capstone, "__version__", "changed")
     keys.add(key())
     monkeypatch.undo()
     monkeypatch.setattr(imagecache.elftools, "__version__", "changed")
     keys.add(key())
-    assert len(keys) == 13
+    assert len(keys) == 14
 
 
 def test_disabled_image_cache_does_not_read_inputs(tmp_path: Path) -> None:
@@ -548,6 +551,8 @@ def test_the_base_of_a_merged_globals_block_is_not_an_access_to_its_first_member
     assert [(item["kind"], item["reason"], int(item["target"], 16)) for item in facts.exclusions] == [
         ("image_access", "merged_globals_block_base", block)
     ]
+    # The names the block's start has, which a C access to the first member uses.
+    assert facts.exclusions[0]["detail"] == {"block_bytes": image.merged_blocks[block], "names": ["box_count"]}
 
 
 def test_a_displacement_from_a_merged_globals_base_still_names_its_member(image: Image) -> None:
@@ -721,4 +726,84 @@ def test_a_constant_each_path_gives_selects_one_object_per_path(image: Image) ->
         _add(A5, S1, A2), _load(A1, A5, 0), RET,
     )  # fmt: skip
     facts = image.decode("synthetic", code, start)
+    assert {("pair_a", "load_or_store_some_path"), ("pair_b", "load_or_store_some_path")} <= _operations(facts)
+
+
+EBREAK = 0x00100073
+
+
+def _bug_table() -> config.TrapTable:
+    """The kernel's __bug_table with relative pointers: the trap as an offset from the entry, then a
+    u16 of flags, whose bit 0 (BUGFLAG_WARNING) means the trap resumes."""
+    return config.TrapTable(
+        section="__bug_table",
+        entry_size=8,
+        address_offset=0,
+        address_size=4,
+        relative=True,
+        flags_offset=4,
+        flags_size=2,
+        resume_flags=1,
+    )
+
+
+def _bug_entries(section: int, entries: list[tuple[int, int]]) -> bytes:
+    return b"".join(
+        struct.pack("<iHxx", trap - (section + 8 * index), flags) for index, (trap, flags) in enumerate(entries)
+    )
+
+
+def test_a_trap_table_tells_each_trap_whether_it_resumes() -> None:
+    section = 0xFFFFFFFF80900000
+    bug, warn = 0xFFFFFFFF80212946, 0xFFFFFFFF80900010  # one before the table, one after it
+    data = _bug_entries(section, [(bug, 0), (warn, 0x909)])
+    assert image_module.read_trap_table(data, section, _bug_table()) == {bug: False, warn: True}
+
+
+def test_an_absolute_trap_table_is_read() -> None:
+    table = dataclasses.replace(_bug_table(), entry_size=16, address_size=8, relative=False, flags_offset=8)
+    data = struct.pack("<QH6x", 0x1000, 0) + struct.pack("<QH6x", 0x2000, 1)
+    assert image_module.read_trap_table(data, 0x5000, table) == {0x1000: False, 0x2000: True}
+
+
+def test_a_trap_table_of_partial_entries_is_an_input_error() -> None:
+    with pytest.raises(InputError, match=r"__bug_table holds 12 bytes, not a whole number of 8-byte entries"):
+        image_module.read_trap_table(bytes(12), 0x5000, _bug_table())
+
+
+def test_a_trap_table_the_image_lacks_is_an_input_error() -> None:
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    rules = dataclasses.replace(loaded.image, trap_table=_bug_table())
+    with pytest.raises(InputError, match=r"has no section __bug_table, which \[image\] trap_table names"):
+        Image(loaded.inputs.image, loaded.inputs.system_map, rules)
+
+
+def _after_a_trap(image: Image, flags: int) -> FunctionFacts:
+    """``s1 = &pair_a``; on the fall-through path an ``ebreak`` the trap table lists with ``flags``,
+    then ``s1 = &pair_b``; both paths meet at ``ld a1, 0(s1)``."""
+    start = image.functions["anchor_pair"][0].address
+    section = start + 0x1000
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    high_b, low_b = _split(image.object_symbols["pair_b"][0].address - (start + 16))
+    code = struct.pack(
+        "<8I", _u(0x17, S1, high), _addi(S1, S1, low), _branch(A0, ZERO, 16), EBREAK,
+        _u(0x17, S1, high_b), _addi(S1, S1, low_b), _load(A1, S1, 0), RET,
+    )  # fmt: skip
+    image.traps = image_module.read_trap_table(_bug_entries(section, [(start + 12, flags)]), section, _bug_table())
+    try:
+        return image.decode("synthetic", code, start)
+    finally:
+        image.traps = {}
+
+
+def test_code_after_a_trap_that_does_not_resume_is_not_reached_from_it(image: Image) -> None:
+    """A BUG: its entry lacks the resume flag, so the load reads pair_a on the only path to it."""
+    facts = _after_a_trap(image, flags=0)
+    assert ("pair_a", "load_or_store") in _operations(facts)
+    assert "pair_b" not in {name for name, _ in _operations(facts)}
+
+
+def test_code_after_a_trap_that_resumes_is_reached_from_it(image: Image) -> None:
+    """A WARN (flags 0x909, the resume bit set) continues, so the load reads pair_a or pair_b."""
+    facts = _after_a_trap(image, flags=0x909)
     assert {("pair_a", "load_or_store_some_path"), ("pair_b", "load_or_store_some_path")} <= _operations(facts)

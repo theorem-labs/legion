@@ -140,6 +140,56 @@ def test_legacy_alloc_rule_is_refused(tmp_path: Path) -> None:
         config.load(write(tmp_path, MINIMAL + '[c.calls]\nalloc = "alloc"\n'))
 
 
+TRAP_TABLE = """[image.trap_table]
+section = "__bug_table"
+entry_size = 8
+address_offset = 0
+address_size = 4
+relative = true
+flags_offset = 4
+flags_size = 2
+resume_flags = 1
+"""
+
+
+def test_trap_table_is_read(tmp_path: Path) -> None:
+    loaded = config.load(write(tmp_path, MINIMAL + TRAP_TABLE))
+    assert loaded.image.trap_table == config.TrapTable(
+        section="__bug_table",
+        entry_size=8,
+        address_offset=0,
+        address_size=4,
+        relative=True,
+        flags_offset=4,
+        flags_size=2,
+        resume_flags=1,
+    )
+    assert config.load(write(tmp_path, MINIMAL)).image.trap_table is None
+
+
+@pytest.mark.parametrize(
+    ("change", "replacement", "message"),
+    [
+        ("flags_size = 2\n", "", r"image\.trap_table\.flags_size is required"),
+        (
+            "flags_offset = 4\n",
+            "flags_offset = 7\n",
+            r"image\.trap_table's flags field ends at byte 9, past entry_size 8",
+        ),
+        ("address_size = 4\n", "address_size = 3\n", r"image\.trap_table\.address_size must be 4 or 8"),
+        ("flags_size = 2\n", "flags_size = 3\n", r"image\.trap_table\.flags_size must be 1, 2, 4 or 8"),
+        ("resume_flags = 1\n", "resume_flags = 0\n", r"image\.trap_table\.resume_flags must be a nonzero bit mask"),
+        ("entry_size = 8\n", "entry_size = true\n", r"image\.trap_table\.entry_size must be an integer"),
+        ("relative = true\n", 'relative = "yes"\n', r"image\.trap_table\.relative must be a boolean"),
+        ('section = "__bug_table"\n', 'section = ""\n', r"image\.trap_table\.section must name a section"),
+        ("resume_flags = 1\n", 'resume_flags = 1\ncolour = "blue"\n', r"image\.trap_table has unknown key colour"),
+    ],
+)
+def test_trap_table_is_checked(tmp_path: Path, change: str, replacement: str, message: str) -> None:
+    with pytest.raises(config.ConfigError, match=message):
+        config.load(write(tmp_path, MINIMAL + TRAP_TABLE.replace(change, replacement)))
+
+
 def test_new_shadowing_header_reparses_all_units_that_include_it(copy: Path, tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     before, incremental_out, full_out = tmp_path / "before", tmp_path / "incremental", tmp_path / "full"
