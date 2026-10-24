@@ -301,7 +301,8 @@ type NotFoundError struct{ Name string }
 
 func (e *NotFoundError) Error() string { return "no declaration " + e.Name + " in the index" }
 
-const propagates = `(e.stmt = 1 OR e.kind IN ('def', 'abbrev', 'instance', 'structure', 'class', 'inductive', 'opaque'))`
+// propagates says whether an edge passes a change on: a use in a statement, or any use by a definition (defKinds).
+var propagates = `(e.stmt = 1 OR e.kind IN ('` + strings.Join(defKinds, `', '`) + `'))`
 
 // reach computes the statements a change to root's statement changes, and the proofs at their edge, on the
 // declaration graph that the last refresh wrote. A declaration is its name and the module of its use: Lean names

@@ -3,6 +3,7 @@ package declindex
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -16,10 +17,9 @@ const (
 	closeBrackets = ")]}⟩⦄"
 )
 
-// defKinds are the declaration kinds whose whole text is their meaning; a theorem's meaning is its signature.
-var defKinds = map[string]bool{
-	"def": true, "abbrev": true, "instance": true, "structure": true, "class": true, "inductive": true, "opaque": true,
-}
+// defKinds are the declaration kinds whose whole text is their meaning; a theorem's meaning is its signature. A
+// definition of one of these kinds passes a change to every statement that applies it (propagates).
+var defKinds = []string{"def", "abbrev", "instance", "structure", "class", "inductive", "opaque"}
 
 // keywords are the commands whose last occurrence before a declaration's name gives its kind.
 var keywords = []string{"theorem", "lemma", "def", "abbrev", "instance", "structure", "class", "inductive", "opaque",
@@ -274,7 +274,7 @@ func wordBoundaryAfterDot(text string, i, end int) bool {
 // for a theorem-like declaration, its whole text for a definition-like one (whose body is its meaning).
 func StatementText(text string, start, end, sigFrom int, kind string) string {
 	b := end
-	if !defKinds[kind] {
+	if !slices.Contains(defKinds, kind) {
 		if s, ok := bodyStart(text, sigFrom, next(text, end)); ok {
 			b = s
 		}
