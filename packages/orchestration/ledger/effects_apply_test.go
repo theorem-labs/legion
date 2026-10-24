@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/url"
 	"reflect"
 	"slices"
@@ -209,10 +208,13 @@ func databaseDeadlocks(t *testing.T, observer *pgx.Conn) int64 {
 	return deadlocks
 }
 
-// Two applies whose hooks register the same two names in opposite orders run at once, and both finish with no
-// deadlock: each name is registered by one of them and left unchanged by the other. The test holds uncommitted
-// registrations of both names until both applies wait, so both reach their first registration together.
-func TestConcurrentAppliesOfTheSameNamesDoNotDeadlock(t *testing.T) {
+// concurrentApplies runs, at once, the contracts applies of two hooks of batch-1 whose outputs are ops[0] and ops[1].
+// A holder first inserts, uncommitted, the rows of statement hold that both applies write, and keeps them until both
+// applies wait on them, so both reach their first such write together; then it rolls them back. It returns the
+// follow-ons that the effect.applied events name, sorted, each apply's result, and the number of deadlocks that
+// Postgres detected in the database.
+func concurrentApplies(t *testing.T, ops [2][]byte, hold string) (followOns []string, results []json.RawMessage, deadlocks int64) {
+	t.Helper()
 	ctx := context.Background()
 	// Every session of the database ends before the test reads its deadlock count, so the first store closes now.
 	first, dsn := newStoreDSN(t)
@@ -222,24 +224,24 @@ func TestConcurrentAppliesOfTheSameNamesDoNotDeadlock(t *testing.T) {
 	query.Set("pool_max_conns", "2")
 	applierDSN.RawQuery = query.Encode()
 	s := must(ledger.Open(ctx, applierDSN.String()))
-	for i, order := range [][]string{{"X", "Y"}, {"Y", "X"}} {
-		id := fmt.Sprintf("batch-%d", i+1)
-		landedBatch(t, s, dsn, id, "hook")
-		must(s.BatchEffectDone(ctx, "r", id, "hook", ledger.DoneRequest{
+	hooks, applies := []string{"hook/0", "hook/1"}, []string{"apply/0", "apply/1"}
+	landedBatch(t, s, dsn, "batch-1", hooks...)
+	for i, hook := range hooks {
+		must(s.BatchEffectDone(ctx, "r", "batch-1", hook, ledger.DoneRequest{
 			Result:  jsonValue(map[string]any{"outcome": "exit", "exit": 0}),
-			Then:    []ledger.FollowOn{{Key: "apply", Op: "apply", Kind: "contracts", Input: "ops.jsonl"}},
-			Outputs: []ledger.OutputFile{{Name: "ops.jsonl", Bytes: opsLines(registerOp(order[0], "owner:alice", "h"), registerOp(order[1], "owner:alice", "h"))}},
+			Then:    []ledger.FollowOn{{Key: applies[i], Op: "apply", Kind: "contracts", Input: "ops.jsonl"}},
+			Outputs: []ledger.OutputFile{{Name: "ops.jsonl", Bytes: ops[i]}},
 		}))
 	}
 	observer := must(pgx.Connect(ctx, dsn))
 	defer observer.Close(ctx)
 	holderConn := must(pgx.Connect(ctx, dsn))
 	holder := must(holderConn.Begin(ctx))
-	must(holder.Exec(ctx, `INSERT INTO contracts (repo, name, owner, statement_hash) VALUES ('r', 'X', 'holder', 'h'), ('r', 'Y', 'holder', 'h')`))
+	must(holder.Exec(ctx, hold))
 	errs := make(chan error, 2)
-	for _, id := range []string{"batch-1", "batch-2"} {
+	for _, apply := range applies {
 		go func() {
-			_, err := s.BatchEffectApplyContracts(ctx, "r", id, "apply")
+			_, err := s.BatchEffectApplyContracts(ctx, "r", "batch-1", apply)
 			errs <- err
 		}()
 	}
@@ -253,24 +255,61 @@ func TestConcurrentAppliesOfTheSameNamesDoNotDeadlock(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	results := []json.RawMessage{effectOf(t, s, "batch-1", "apply").Result, effectOf(t, s, "batch-2", "apply").Result}
-	s.Close()
-	if deadlocks := databaseDeadlocks(t, observer); deadlocks != 0 {
-		t.Fatalf("the two applies deadlocked %d times", deadlocks)
+	for _, apply := range applies {
+		results = append(results, effectOf(t, s, "batch-1", apply).Result)
 	}
-	var registered, unchanged []string
-	for _, result := range results {
-		var r struct{ Applied, Unchanged []string }
-		if err := json.Unmarshal(result, &r); err != nil {
+	for _, e := range eventsOf(t, s, "batch-1", "effect.applied") {
+		var data struct {
+			FollowOns []string `json:"follow_ons"`
+		}
+		if err := json.Unmarshal(e.Data, &data); err != nil {
 			t.Fatal(err)
 		}
-		registered, unchanged = append(registered, r.Applied...), append(unchanged, r.Unchanged...)
+		followOns = append(followOns, data.FollowOns...)
 	}
-	slices.Sort(registered)
-	slices.Sort(unchanged)
-	if !reflect.DeepEqual(registered, []string{"X", "Y"}) || !reflect.DeepEqual(unchanged, []string{"X", "Y"}) {
-		t.Fatalf("the applies registered %q and left %q unchanged; want each name registered once and unchanged once", registered, unchanged)
-	}
+	slices.Sort(followOns)
+	s.Close()
+	return followOns, results, databaseDeadlocks(t, observer)
+}
+
+// Two applies of one batch whose hooks name the same rows in opposite orders run at once, and both finish with no
+// deadlock. With the registrations X, Y and Y, X, each name is registered by one apply and left unchanged by the
+// other. With the librarian lines x, y and y, x, each librarian intent is created by one apply.
+func TestConcurrentAppliesOfTheSameNamesDoNotDeadlock(t *testing.T) {
+	t.Run("registrations", func(t *testing.T) {
+		_, results, deadlocks := concurrentApplies(t,
+			[2][]byte{opsLines(registerOp("X", "owner:alice", "h"), registerOp("Y", "owner:alice", "h")),
+				opsLines(registerOp("Y", "owner:alice", "h"), registerOp("X", "owner:alice", "h"))},
+			`INSERT INTO contracts (repo, name, owner, statement_hash) VALUES ('r', 'X', 'holder', 'h'), ('r', 'Y', 'holder', 'h')`)
+		if deadlocks != 0 {
+			t.Fatalf("the two applies deadlocked %d times", deadlocks)
+		}
+		var registered, unchanged []string
+		for _, result := range results {
+			var r struct{ Applied, Unchanged []string }
+			if err := json.Unmarshal(result, &r); err != nil {
+				t.Fatal(err)
+			}
+			registered, unchanged = append(registered, r.Applied...), append(unchanged, r.Unchanged...)
+		}
+		slices.Sort(registered)
+		slices.Sort(unchanged)
+		if !reflect.DeepEqual(registered, []string{"X", "Y"}) || !reflect.DeepEqual(unchanged, []string{"X", "Y"}) {
+			t.Fatalf("the applies registered %q and left %q unchanged; want each name registered once and unchanged once", registered, unchanged)
+		}
+	})
+	t.Run("librarian intents", func(t *testing.T) {
+		followOns, _, deadlocks := concurrentApplies(t,
+			[2][]byte{opsLines(librarianOp("x"), librarianOp("y")), opsLines(librarianOp("y"), librarianOp("x"))},
+			`INSERT INTO batch_effects (repo, batch, key, op) VALUES ('r', 'batch-1', 'librarian/batch-1/x', 'hold'),
+				('r', 'batch-1', 'librarian/batch-1/y', 'hold')`)
+		if deadlocks != 0 {
+			t.Fatalf("the two applies deadlocked %d times", deadlocks)
+		}
+		if want := []string{"librarian/batch-1/x", "librarian/batch-1/y"}; !slices.Equal(followOns, want) {
+			t.Fatalf("the applies created the librarian intents %q; want each of %q created once", followOns, want)
+		}
+	})
 }
 
 // An apply and a RegisterContract of one of the apply's names, at once, do not deadlock. Every event takes the

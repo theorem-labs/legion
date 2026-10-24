@@ -63,9 +63,6 @@ func effectCommand(ctx context.Context, s *ledger.Store, command string, args []
 		if err != nil {
 			return nil, err
 		}
-		if threshold < 0 {
-			return nil, usagef("--escalate-after %d must not be negative", threshold)
-		}
 		result, err := readJSONFile[json.RawMessage](flags["--result-file"][0])
 		if err != nil {
 			return nil, err

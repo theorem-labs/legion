@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"reflect"
 	"slices"
 	"sync"
@@ -618,6 +619,65 @@ func TestConcurrentDonesCompleteAnEffectOnce(t *testing.T) {
 	}
 	if got := len(eventsOf(t, s, "batch-1", "effect.done")); got != 1 {
 		t.Fatalf("%d effect.done events, want 1", got)
+	}
+}
+
+// Two dones of one batch whose follow-ons share keys in opposite orders (x, y and y, x) run at once, and both finish
+// with no deadlock: each follow-on is created once. A holder keeps uncommitted rows with both keys until both dones
+// wait on them, so both reach their first follow-on together; then it rolls them back.
+func TestConcurrentDonesWithFollowOnsInOppositeOrdersDoNotDeadlock(t *testing.T) {
+	ctx := context.Background()
+	// Every session of the database ends before the test reads its deadlock count, so the first store closes now.
+	first, dsn := newStoreDSN(t)
+	first.Close()
+	sized := must(url.Parse(dsn))
+	query := sized.Query()
+	query.Set("pool_max_conns", "2")
+	sized.RawQuery = query.Encode()
+	s := must(ledger.Open(ctx, sized.String()))
+	landedBatch(t, s, dsn, "batch-1", "hook/0", "hook/1")
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	holderConn := must(pgx.Connect(ctx, dsn))
+	holder := must(holderConn.Begin(ctx))
+	must(holder.Exec(ctx, `INSERT INTO batch_effects (repo, batch, key, op) VALUES ('r', 'batch-1', 'x', 'hold'), ('r', 'batch-1', 'y', 'hold')`))
+	errs := make(chan error, 2)
+	for hook, order := range map[string][]string{"hook/0": {"x", "y"}, "hook/1": {"y", "x"}} {
+		go func() {
+			_, err := s.BatchEffectDone(ctx, "r", "batch-1", hook, ledger.DoneRequest{
+				Result: jsonValue(map[string]any{"outcome": "exit", "exit": 0}),
+				Then:   []ledger.FollowOn{{Key: order[0], Op: "publish"}, {Key: order[1], Op: "publish"}},
+			})
+			errs <- err
+		}()
+	}
+	waitForBlockedConnections(t, observer, 2)
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	must(0, holderConn.Close(ctx))
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	created := []string{}
+	for _, e := range eventsOf(t, s, "batch-1", "effect.done") {
+		var data struct {
+			FollowOns []string `json:"follow_ons"`
+		}
+		if err := json.Unmarshal(e.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		created = append(created, data.FollowOns...)
+	}
+	slices.Sort(created)
+	s.Close()
+	if deadlocks := databaseDeadlocks(t, observer); deadlocks != 0 {
+		t.Fatalf("the two dones deadlocked %d times", deadlocks)
+	}
+	if !slices.Equal(created, []string{"x", "y"}) {
+		t.Fatalf("the dones created the follow-ons %q; want each of x and y created once", created)
 	}
 }
 

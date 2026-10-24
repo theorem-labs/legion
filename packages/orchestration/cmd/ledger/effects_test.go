@@ -653,7 +653,6 @@ func TestEffectCommandsRefuseMalformedInput(t *testing.T) {
 		{"effects with too few arguments", []string{"effects", "r"}, "effects <repo> <batch>"},
 		{"begin-withdraw with too many arguments", []string{"begin-withdraw", "r", "batch-1", "x"}, "begin-withdraw <repo> <batch>"},
 		{"effect-attempt without --escalate-after", []string{"effect-attempt", "r", "batch-1", cliHookKey, "--result-file", result, "--escalate-to", "o"}, "effect-attempt <repo>"},
-		{"effect-attempt with a negative threshold", []string{"effect-attempt", "r", "batch-1", cliHookKey, "--result-file", result, "--escalate-to", "o", "--escalate-after", "-1"}, "escalate-after"},
 		{"effect-attempt with an unknown flag", []string{"effect-attempt", "r", "batch-1", cliHookKey, "--result-file", result, "--escalate-to", "o", "--escalate-after", "1", "--x", "y"}, "unknown"},
 		{"effect-done without --result-file", []string{"effect-done", "r", "batch-1", cliHookKey}, "effect-done <repo>"},
 		{"effect-done with a result that is not JSON", []string{"effect-done", "r", "batch-1", cliHookKey, "--result-file", cli.file("bad.json", []byte("{"))}, "invalid JSON"},

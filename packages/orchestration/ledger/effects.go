@@ -256,7 +256,8 @@ type completion struct {
 // escalation; the caller appends the event. A done effect with an equal result is a retry whose response was lost:
 // it returns the stored effect, replayed, and writes nothing. A done effect with another result is refused with
 // effect_done. The effect's row is written before its outputs, and its outputs before its follow-ons and escalation,
-// all in tx.
+// all in tx. Follow-ons are created in key order, which every done shares, so two dones of one batch whose follow-ons
+// share keys cannot deadlock.
 func completeEffect(ctx context.Context, tx pgx.Tx, repo, batch, key string, req DoneRequest) (completion, error) {
 	stored, err := lockEffect(ctx, tx, repo, batch, key)
 	if err != nil {
@@ -292,7 +293,8 @@ func completeEffect(ctx context.Context, tx pgx.Tx, repo, batch, key string, req
 		done.outputs = append(done.outputs, digest)
 	}
 	slices.SortFunc(done.outputs, func(a, b OutputDigest) int { return strings.Compare(a.Name, b.Name) })
-	for _, follow := range req.Then {
+	then := slices.SortedStableFunc(slices.Values(req.Then), func(a, b FollowOn) int { return strings.Compare(a.Key, b.Key) })
+	for _, follow := range then {
 		created, err := createEffect(ctx, tx, repo, batch, follow.Key, follow.Op, follow.Kind,
 			`jsonb_build_object('commit', $6::jsonb -> 'commit', 'hook', $7::text, 'input', $8::text)`,
 			string(stored.Result), key, follow.Input)
@@ -477,11 +479,11 @@ func librarianID(line json.RawMessage) string {
 //   - a librarian line creates the intent librarian/<batch>/<id> (op librarian), whose result holds the line, the
 //     landing commit and the apply's hook.
 //
-// Registrations run in name order, which every apply shares, and every row write comes before the first event: an
-// event holds the repository's event lock until its transaction commits, so a call that waits on a row never holds it.
-// So no two applies, and no apply and RegisterContract, deadlock. A line that is neither operation, or a registration
-// that RegisterContract's argument rules refuse, is invalid; an apply whose named output does not exist is not found;
-// a done apply is refused with effect_done. None of these changes anything.
+// Registrations run in name order and librarian intents in id order, which every apply shares, and every row write
+// comes before the first event: an event holds the repository's event lock until its transaction commits, so a call
+// that waits on a row never holds it. So no two applies, and no apply and RegisterContract, deadlock. A line that is
+// neither operation, or a registration that RegisterContract's argument rules refuse, is invalid; an apply whose named
+// output does not exist is not found; a done apply is refused with effect_done. None of these changes anything.
 func (s *Store) BatchEffectApplyContracts(ctx context.Context, repo, batch, key string) (Effect, error) {
 	var effect Effect
 	err := s.tx(ctx, func(tx pgx.Tx) error {
@@ -530,6 +532,9 @@ func (s *Store) BatchEffectApplyContracts(ctx context.Context, repo, batch, key 
 			}
 			unchanged = append(unchanged, want.Name)
 		}
+		slices.SortStableFunc(librarians, func(a, b numbered[json.RawMessage]) int {
+			return strings.Compare(librarianID(a.value), librarianID(b.value))
+		})
 		followOns := []string{}
 		for _, librarian := range librarians {
 			intent := "librarian/" + batch + "/" + librarianID(librarian.value)
