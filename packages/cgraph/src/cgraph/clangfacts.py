@@ -12,7 +12,9 @@ fields), and the lines where a membership macro appears.
 What the compiler does not evaluate is not an access: the operand of ``sizeof`` and ``_Alignof``,
 the controlling expression and the unselected associations of ``_Generic``, the type expressions
 of a declaration or a cast (``typeof``), and the branch of an ``if`` or ``?:`` whose condition clang
-folds to a constant. Those references are kept as ``unevaluated`` with the reason.
+folds to a constant. Those references are kept as ``unevaluated`` with the reason. Where a branch
+depends on the function's parameters, its events give ``guards``: indexes into the function's table
+of conditions on those parameters, which a caller's constant arguments decide at a fold (link._bind).
 """
 
 from __future__ import annotations
@@ -495,6 +497,10 @@ class _Extractor:
             if node.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR) and children:
                 if children[0].type.get_canonical().kind == TK.POINTER:
                     base = _strip(children[0])
+                    if node.kind == K.ARRAY_SUBSCRIPT_EXPR and base.type.get_canonical().kind in _ARRAY_TYPES:
+                        # g[i]: the array decays to a pointer to its own storage.
+                        node = base
+                        continue
                     if not (node.kind == K.MEMBER_REF_EXPR and base.kind == K.UNARY_OPERATOR
                             and libclang.is_address_of(base) and _children(base)):  # fmt: skip
                         return None
@@ -1155,9 +1161,49 @@ def _has_call(expression: ci.Cursor) -> bool:
     return any(node.kind == K.CALL_EXPR for node in expression.walk_preorder())
 
 
+_INTEGER_TYPES = {
+    TK.CHAR_U: False, TK.UCHAR: False, TK.CHAR16: False, TK.CHAR32: False, TK.USHORT: False,
+    TK.UINT: False, TK.ULONG: False, TK.ULONGLONG: False, TK.UINT128: False, TK.CHAR_S: True,
+    TK.SCHAR: True, TK.WCHAR: True, TK.SHORT: True, TK.INT: True, TK.LONG: True, TK.LONGLONG: True,
+    TK.INT128: True,
+}  # fmt: skip
+# CXBinaryOperatorKind values the guard expressions express, and CXUnaryOperatorKind ones.
+_BINARY_NAMES = {
+    3: "*", 4: "/", 5: "%", 6: "+", 7: "-", 8: "<<", 9: ">>", 11: "<", 12: ">", 13: "<=", 14: ">=",
+    15: "==", 16: "!=", 17: "&", 18: "^", 19: "|", 20: "&&", 21: "||",
+}  # fmt: skip
+_UNARY_NAMES = {8: "neg", 9: "~", 10: "!"}
+
+
+def _integer_type(typ: ci.Type) -> dict[str, Any] | None:
+    """An integer or pointer type as guard expressions state it: its width in bits ``w``, whether it is
+    signed ``s``, and ``b`` for _Bool (any non-zero value converts to 1)."""
+    canonical = typ.get_canonical()
+    kind = canonical.kind
+    if kind == TK.ENUM:
+        declaration = canonical.get_declaration()
+        canonical = declaration.enum_type.get_canonical() if declaration is not None else canonical
+        kind = canonical.kind
+    size = canonical.get_size()
+    if kind == TK.BOOL:
+        return {"w": 8, "s": False, "b": True}
+    if kind == TK.POINTER:
+        return {"w": size * 8, "s": False} if size > 0 else None
+    if kind in _INTEGER_TYPES and size > 0:
+        return {"w": size * 8, "s": _INTEGER_TYPES[kind]}
+    return None
+
+
+def _mentions_parameter(expression: dict[str, Any] | None) -> bool:
+    if expression is None:
+        return False
+    return "p" in expression or any(_mentions_parameter(operand) for operand in expression.get("a", []))
+
+
 class _Evaluator:
     """What the compiler folds that clang's evaluator alone does not: inline helpers that return one
-    truth value, locals that keep their initializer, ``x & 0`` and ``x * 0``, ``__builtin_expect``."""
+    value (or one truth value, where only the truth is tested), locals that keep their initializer,
+    ``x & 0`` and ``x * 0``, ``__builtin_expect``."""
 
     _OPERATIONS: ClassVar[dict[int, Any]] = {
         3: lambda a, b: a * b, 6: lambda a, b: a + b, 7: lambda a, b: a - b,
@@ -1171,10 +1217,13 @@ class _Evaluator:
         self.definitions = definitions
         # A weak definition's answer is not the program's: another unit may replace it.
         self.weak = weak
-        self.helpers: dict[str, int | None] = {}
+        self.helpers: dict[str, tuple[int | None, int | None]] = {}
         self.locals: dict[int, int | None] = {}
 
-    def evaluate(self, cursor: ci.Cursor, depth: int = 0) -> int | None:
+    def evaluate(self, cursor: ci.Cursor, depth: int = 0, truth: bool = False) -> int | None:
+        """The value clang or this evaluator folds the expression to. Where ``truth``, only the truth
+        of the value is tested (a condition, an operand of ``!``, ``&&`` or ``||``), and an inline
+        helper whose returns differ but agree in truth gives that truth value."""
         if _mentions(cursor, _IMAGE_DECIDES):
             return None
         value = libclang.constant_int(cursor)
@@ -1182,18 +1231,19 @@ class _Evaluator:
             return value
         kind, inner = cursor.kind, _children(cursor)
         if kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR, K.CSTYLE_CAST_EXPR) and inner:
-            return self.evaluate(inner[-1], depth)
+            return self.evaluate(inner[-1], depth, truth)
         if kind == K.UNARY_OPERATOR and inner and libclang.unary_kind(cursor) == libclang.LOGICAL_NOT:
-            value = self.evaluate(inner[0], depth)
+            value = self.evaluate(inner[0], depth, truth=True)
             return None if value is None else int(not value)
         if kind == K.BINARY_OPERATOR and len(inner) == 2:
             operator = libclang.binary_kind(cursor)
-            left = self.evaluate(inner[0], depth)
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
+                left = self.evaluate(inner[0], depth, truth=True)
                 if left is not None and bool(left) == (operator == libclang.LOGICAL_OR):
                     return int(bool(left))
-                right = self.evaluate(inner[1], depth)
+                right = self.evaluate(inner[1], depth, truth=True)
                 return None if left is None or right is None else int(bool(right))
+            left = self.evaluate(inner[0], depth)
             right = self.evaluate(inner[1], depth)
             if operator in (3, 17) and (left == 0 or right == 0):
                 return 0
@@ -1207,41 +1257,43 @@ class _Evaluator:
         if kind == K.CALL_EXPR and cursor.referenced is not None:
             if cursor.referenced.spelling == "__builtin_expect":
                 arguments = list(cursor.get_arguments() or [])
-                return self.evaluate(arguments[0], depth) if arguments else None
+                return self.evaluate(arguments[0], depth, truth) if arguments else None
             if cursor.referenced.kind == K.FUNCTION_DECL:
-                return self.helper(cursor.referenced.spelling, depth)
+                exact, truth_value = self.helper(cursor.referenced.spelling, depth)
+                return exact if exact is not None or not truth else truth_value
         return None
 
-    def helper(self, name: str, depth: int) -> int | None:
-        """The truth value an inline helper always returns, when every return gives the same one."""
+    def helper(self, name: str, depth: int) -> tuple[int | None, int | None]:
+        """What an inline helper always returns: the value, when every return gives the same one, and
+        the truth value, when every return agrees in truth."""
         if name in self.helpers:
             return self.helpers[name]
-        self.helpers[name] = None
+        self.helpers[name] = (None, None)
         definition = self.definitions.get(name)
         if definition is None or depth > 3 or self.weak(definition):
-            return None
-        values = set()
+            return (None, None)
+        values: set[int | None] = set()
+        truths: set[int | None] = set()
         for node in definition.walk_preorder():
             if node.kind == K.RETURN_STMT:
                 inner = _children(node)
-                value = self.evaluate(inner[0], depth + 1) if inner else None
-                if value is None:
-                    return None
-                values.add(bool(value))
-        result = int(values.pop()) if len(values) == 1 else None
-        self.helpers[name] = result
-        return result
+                if not inner:
+                    return (None, None)
+                values.add(self.evaluate(inner[0], depth + 1))
+                truth = self.evaluate(inner[0], depth + 1, truth=True)
+                truths.add(None if truth is None else int(bool(truth)))
+        exact = values.pop() if len(values) == 1 else None
+        truth_value = truths.pop() if len(truths) == 1 else None
+        self.helpers[name] = (exact, truth_value)
+        return self.helpers[name]
 
-    def local(self, variable: ci.Cursor, depth: int) -> int | None:
-        """A local's value when its initializer evaluates and nothing writes it or takes its address."""
-        key = variable.hash
-        if key in self.locals:
-            return self.locals[key]
-        self.locals[key] = None
+    def kept_initializer(self, variable: ci.Cursor) -> ci.Cursor | None:
+        """A local's initializer when nothing writes the local or takes its address."""
         initializer = libclang.var_initializer(variable)
         function = variable.semantic_parent
         if initializer is None or function is None:
             return None
+        key = variable.hash
         for node in function.walk_preorder():
             if node.kind not in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR, K.UNARY_OPERATOR):
                 continue
@@ -1259,9 +1311,73 @@ class _Evaluator:
                 or (node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node)))
             ):
                 return None
-        value = self.evaluate(initializer, depth + 1)
+        return initializer
+
+    def local(self, variable: ci.Cursor, depth: int) -> int | None:
+        """A local's value when its initializer evaluates and nothing writes it or takes its address."""
+        key = variable.hash
+        if key in self.locals:
+            return self.locals[key]
+        self.locals[key] = None
+        initializer = self.kept_initializer(variable)
+        value = self.evaluate(initializer, depth + 1) if initializer is not None else None
         self.locals[key] = value
         return value
+
+    def expression(
+        self, cursor: ci.Cursor, parameters: dict[int, int], depth: int = 0, truth: bool = False
+    ) -> dict[str, Any] | None:
+        """The expression as link evaluates it at a fold (link._evaluate): a constant, a parameter of
+        ``parameters`` (by cursor hash; those the function never writes), an operation on those, or
+        None where a value is unknown (a field read, a call that does not fold)."""
+        typed = _integer_type(cursor.type) if cursor.kind.is_expression() else None
+        value = self.evaluate(cursor, truth=truth)
+        if value is not None:
+            return {"c": value, **(typed or {})}
+        if depth > 12 or _mentions(cursor, _IMAGE_DECIDES):
+            return None
+        kind, inner = cursor.kind, _children(cursor)
+        if kind == K.PAREN_EXPR and inner:
+            return self.expression(inner[-1], parameters, depth + 1, truth)
+        if kind in (K.UNEXPOSED_EXPR, K.CSTYLE_CAST_EXPR) and inner:
+            operand = self.expression(inner[-1], parameters, depth + 1, truth)
+            if operand is None or typed is None:
+                return None
+            same = all(operand.get(key) == typed.get(key) for key in ("w", "s", "b"))
+            return operand if same else {"op": "cast", "a": [operand], **typed}
+        if kind == K.DECL_REF_EXPR and cursor.referenced is not None and typed is not None:
+            referenced = cursor.referenced
+            if referenced.kind == K.PARM_DECL:
+                index = parameters.get(referenced.hash)
+                return {"p": index, **typed} if index is not None else None
+            parent = referenced.semantic_parent
+            if referenced.kind == K.VAR_DECL and parent is not None and parent.kind == K.FUNCTION_DECL:
+                initializer = self.kept_initializer(referenced)
+                operand = self.expression(initializer, parameters, depth + 1) if initializer is not None else None
+                return None if operand is None else {"op": "cast", "a": [operand], **typed}
+            return None
+        if typed is None:
+            return None
+        if kind == K.UNARY_OPERATOR and inner:
+            name = _UNARY_NAMES.get(libclang.unary_kind(cursor))
+            operand = self.expression(inner[0], parameters, depth + 1, truth=name == "!")
+            return None if name is None or operand is None else {"op": name, "a": [operand], **typed}
+        if kind == K.BINARY_OPERATOR and len(inner) == 2:
+            name = _BINARY_NAMES.get(libclang.binary_kind(cursor))
+            if name is None:
+                return None
+            logical = name in ("&&", "||")
+            operands = [self.expression(part, parameters, depth + 1, truth=logical) for part in inner]
+            return None if operands == [None, None] else {"op": name, "a": operands, **typed}
+        if kind == K.CONDITIONAL_OPERATOR and len(inner) == 3:
+            operands = [
+                self.expression(part, parameters, depth + 1, truth=index == 0) for index, part in enumerate(inner)
+            ]
+            return None if operands == [None, None, None] else {"op": "?:", "a": operands, **typed}
+        if kind == K.CALL_EXPR and cursor.referenced is not None and cursor.referenced.spelling == "__builtin_expect":
+            arguments = list(cursor.get_arguments() or [])
+            return self.expression(arguments[0], parameters, depth + 1, truth) if arguments else None
+        return None
 
     def exits(self, statement: ci.Cursor, loop: bool = False) -> bool:
         """Control does not fall through: a return, goto, break or continue, a block that ends in
@@ -1276,14 +1392,14 @@ class _Evaluator:
             # A block, or a labeled statement (``case 4: ... break;``), exits when its last part does.
             return bool(inner) and self.exits(inner[-1], loop)
         if kind == K.IF_STMT and len(inner) >= 2:
-            value = self.evaluate(inner[0])
+            value = self.evaluate(inner[0], truth=True)
             if value is not None:
                 branch = inner[1] if value else (inner[2] if len(inner) > 2 else None)
                 return branch is not None and self.exits(branch, loop)
             return False
         if kind == K.DO_STMT and len(inner) == 2:
             # BUG(): do { __BUG_FLAGS(0); unreachable(); } while (0).
-            return self.evaluate(inner[1]) == 0 and self.exits(inner[0], loop=True)
+            return self.evaluate(inner[1], truth=True) == 0 and self.exits(inner[0], loop=True)
         if kind in _BRANCHES:
             return False
         found = False
@@ -1293,6 +1409,22 @@ class _Evaluator:
             if node.kind == K.CALL_EXPR and (node.spelling in _UNREACHABLE or _is_noreturn(node.referenced)):
                 found = True
         return found
+
+
+class _Tagged(list[Any]):
+    """An event list that puts the walk's current guards on each event appended (``pair``: the event
+    is the second item of an appended tuple)."""
+
+    def __init__(self, walk: _FunctionWalk, pair: bool = False) -> None:
+        super().__init__()
+        self.walk = walk
+        self.pair = pair
+
+    def append(self, item: Any) -> None:
+        if self.walk.guard_stack:
+            event = item[1] if self.pair else item
+            event["guards"] = list(self.walk.guard_stack)
+        super().append(item)
 
 
 class _FunctionWalk:
@@ -1309,14 +1441,11 @@ class _FunctionWalk:
         self.cursor = cursor
         self.parameters = {parameter.hash: index for index, parameter in enumerate(cursor.get_arguments() or [])}
         self.events: dict[str, list[Any]] = {
-            "calls": [],
-            "accesses": [],
-            "unevaluated": [],
-            "list_calls": [],
-            "indirect": [],
-            "function_pointers": [],
-            "field_accesses": [],
-        }
+            kind: _Tagged(self)
+            for kind in (
+                "calls", "accesses", "unevaluated", "list_calls", "indirect", "function_pointers", "field_accesses",
+            )
+        }  # fmt: skip
         self.conditional = 0  # depth of __builtin_constant_p branches being walked
         self.callees: set[int] = set()  # the hashes of the references that name a direct call's callee
         # Liveness: the labels a goto that is code targets reach code, and a store to a variable
@@ -1333,13 +1462,21 @@ class _FunctionWalk:
         self.field_address: dict[int, tuple[_Address, bool]] = {}
         self.inner: set[int] = set()
         self.addressed: set[int] = set()
-        self.fields: list[tuple[int, dict[str, Any]]] = []
+        self.fields: list[tuple[int, dict[str, Any]]] = _Tagged(self, pair=True)
         self.derived_cache: dict[int, _Address | None] = {}
         self.uses: dict[str, collections.Counter[int]] | None = None
         self.definitions: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
+        # Guards: the conditions on the parameters under which the code being walked is compiled.
+        self.guard_table: list[dict[str, Any]] = []
+        self.guard_ids: dict[str, int] = {}
+        self.guard_stack: list[int] = []
+        self.case_guards: dict[int, tuple[dict[str, Any], bool]] = {}
+        self.unwritten: dict[int, int] | None = None
+        self.labelled: dict[int, bool] = {}
 
     def finish(self) -> None:
         """The field accesses the machine code addresses on their own."""
+        self.events = {kind: list(items) for kind, items in self.events.items()}
         self.events["field_accesses"] = [item for member, item in self.fields if member not in self.inner]
 
     def never_read(self) -> frozenset[int]:
@@ -1362,6 +1499,115 @@ class _FunctionWalk:
             and variable.type.get_canonical().kind not in (TK.RECORD, *_ARRAY_TYPES)
             and not variable.type.is_volatile_qualified()
         )
+
+    # Guards ---------------------------------------------------------------------------------
+
+    def guard_parameters(self) -> dict[int, int]:
+        """The parameters the function never writes, by cursor hash: a guard or an argument value may
+        name them, since they hold the caller's argument throughout."""
+        if self.unwritten is None:
+            self.unwritten = {
+                parameter.hash: index
+                for index, parameter in enumerate(self.cursor.get_arguments() or [])
+                if not self.written(parameter)
+            }
+        return self.unwritten
+
+    def guard_expression(self, condition: ci.Cursor, truth: bool = True) -> dict[str, Any] | None:
+        """The condition as an expression on the parameters, when it names one."""
+        expression = self.x.evaluator.expression(condition, self.guard_parameters(), truth=truth)
+        return expression if _mentions_parameter(expression) else None
+
+    def has_label(self, node: ci.Cursor) -> bool:
+        """A label inside that control may enter from outside, past any condition around it: a goto
+        label, or a case of an enclosing switch (one no switch inside the node owns)."""
+        key = node.hash
+        if key not in self.labelled:
+            found = False
+            # The node's own case labels are those the guard describes.
+            root = node
+            while root.kind in (K.CASE_STMT, K.DEFAULT_STMT) and _children(root):
+                root = _children(root)[-1]
+            stack = [root]
+            while stack and not found:
+                current = stack.pop()
+                if current.kind in _ENTRIES:
+                    found = True
+                elif current.kind != K.SWITCH_STMT:
+                    stack.extend(_children(current))
+                else:
+                    # A nested switch's cases are entered only from it; a goto label inside it is not.
+                    found = any(child.kind == K.LABEL_STMT for child in current.walk_preorder())
+            self.labelled[key] = found
+        return self.labelled[key]
+
+    def push_guard(self, expression: dict[str, Any], value: bool) -> None:
+        guard = {"e": expression, "v": value}
+        key = jsonio.canonical(guard)
+        if key not in self.guard_ids:
+            self.guard_ids[key] = len(self.guard_table)
+            self.guard_table.append(guard)
+        self.guard_stack.append(self.guard_ids[key])
+
+    def walk_guarded(
+        self,
+        guard: tuple[dict[str, Any] | None, bool] | None,
+        node: ci.Cursor,
+        parent: ci.Cursor | None,
+        index: int,
+        reason: str | None,
+        generic: bool,
+    ) -> None:
+        """Walk a branch under a guard, unless a label inside lets a goto enter it without one."""
+        pushed = guard is not None and guard[0] is not None and not self.has_label(node)
+        if pushed:
+            assert guard is not None and guard[0] is not None
+            self.push_guard(guard[0], guard[1])
+        try:
+            self.walk(node, parent, index, reason, generic)
+        finally:
+            if pushed:
+                self.guard_stack.pop()
+
+    def exit_guard(self, statement: ci.Cursor) -> tuple[dict[str, Any], bool] | None:
+        """The guard on the statements after ``if (c) return;`` (or a branch that exits otherwise):
+        they are compiled only where the exiting branch is not taken."""
+        if statement.kind != K.IF_STMT:
+            return None
+        parts = _children(statement)
+        if len(parts) < 2 or _mentions(parts[0], _IMAGE_DECIDES):
+            return None
+        if self.x.evaluator.evaluate(parts[0], truth=True) is not None:
+            return None
+        evaluator = self.x.evaluator
+        then_exits = evaluator.exits(parts[1])
+        else_exits = len(parts) > 2 and evaluator.exits(parts[2])
+        if then_exits == else_exits:
+            return None
+        expression = self.guard_expression(parts[0])
+        return None if expression is None else (expression, not then_exits)
+
+    def switch_guards(self, selector: ci.Cursor, body: ci.Cursor) -> None:
+        """The guard of each statement of a switch body on the selector: the cases control reaches it
+        from, falling through, up to a statement that exits."""
+        expression = self.guard_expression(selector, truth=False)
+        if expression is None or body.kind != K.COMPOUND_STMT or not _switch_labels_top_level(body):
+            return
+        statements = _children(body)
+        labels = [_case_values(statement) for statement in statements]
+        every = sorted({value for values in labels if values is not None for value in values if value is not None})
+        reaching: set[int] = set()
+        default = False
+        for statement, values in zip(statements, labels, strict=True):
+            if values is not None:
+                reaching |= {value for value in values if value is not None}
+                default = default or None in values
+            if reaching or default:
+                selected = sorted(set(every) - reaching) if default else sorted(reaching)
+                condition = {"op": "in", "a": [expression], "set": selected, "w": 32, "s": True}
+                self.case_guards[statement.hash] = (condition, not default)
+            if self.x.evaluator.exits(statement):
+                reaching, default = set(), False
 
     # Addresses ------------------------------------------------------------------------------
 
@@ -1528,7 +1774,7 @@ class _FunctionWalk:
         address of a member reached from a pointer (wb_exit(&bdi->wb)), what that address adds to
         the pointer, so a folded callee's field offsets can be rebased onto the caller's."""
         item: dict[str, Any] = {
-            "unit": self.held_global(expression) or self.x.unit_from_ref(expression),
+            "unit": self.held_global(expression) or self.x.unit_from_ref(expression) or self.global_storage(expression),
             "param": self.parameter_root(expression),
         }
         if expression.type.get_canonical().kind == TK.POINTER:
@@ -1539,6 +1785,11 @@ class _FunctionWalk:
                 # pointer loaded through a parameter (path->dentry) is a new base and gives none.
                 item["displacement"] = address.bits // 8
                 item["param"] = address.param
+        # The value the argument passes, where it is a constant or depends on the caller's parameters:
+        # the guards of a folded callee are decided by it (link._bind).
+        value = self.x.evaluator.expression(expression, self.guard_parameters())
+        if value is not None and ("c" in value or _mentions_parameter(value)):
+            item["expr"] = value
         return item
 
     def held_global(self, expression: ci.Cursor) -> Unit | None:
@@ -1555,21 +1806,39 @@ class _FunctionWalk:
         initializer = libclang.var_initializer(variable)
         if initializer is not None:
             definitions.append(initializer)
-        if not definitions or not all(self.global_address(definition) for definition in definitions):
+        units = [self.global_storage(definition) for definition in definitions]
+        if not units or any(unit is None for unit in units):
             return None
-        units = {jsonio.canonical(unit): unit for unit in map(self.x.unit_from_ref, definitions)}
-        return next(iter(units.values())) if len(units) == 1 else None
+        distinct = {jsonio.canonical(unit): unit for unit in units}
+        return next(iter(distinct.values())) if len(distinct) == 1 else None
 
-    def global_address(self, expression: ci.Cursor) -> bool:
-        """``&`` of a global's storage (``&g``, ``&g.a``, ``&g[i]``), or a global array's decay."""
+    def global_storage(self, expression: ci.Cursor, depth: int = 0) -> Unit | None:
+        """The global whose storage an address is in: ``&g``, ``&g.a``, ``&g[i]``, a global array's
+        decay, or a call of an inline helper every return of which gives one such global
+        (NODE_DATA(nid) without NUMA returns &contig_page_data)."""
         node = _strip(expression)
         if node.kind == K.UNARY_OPERATOR and libclang.is_address_of(node) and _children(node):
-            return self.x.global_from_ref(_children(node)[0]) is not None
-        return (
-            node.kind == K.DECL_REF_EXPR
-            and _is_global_var(node.referenced)
-            and node.type.get_canonical().kind in _ARRAY_TYPES
-        )
+            return self.x.unit_from_ref(node) if self.x.global_from_ref(_children(node)[0]) is not None else None
+        if node.kind == K.DECL_REF_EXPR:
+            if _is_global_var(node.referenced) and node.type.get_canonical().kind in _ARRAY_TYPES:
+                return self.x.unit_from_ref(node)
+            return None
+        referenced = node.referenced if node.kind == K.CALL_EXPR else None
+        if referenced is None or referenced.kind != K.FUNCTION_DECL or depth > 3:
+            return None
+        definition = self.x.evaluator.definitions.get(referenced.spelling)
+        if definition is None or self.x.evaluator.weak(definition):
+            return None
+        returned = [
+            _children(statement)[0]
+            for statement in definition.walk_preorder()
+            if statement.kind == K.RETURN_STMT and _children(statement)
+        ]
+        units = [self.global_storage(value, depth + 1) for value in returned]
+        if not units or any(unit is None for unit in units):
+            return None
+        distinct = {jsonio.canonical(unit): unit for unit in units}
+        return next(iter(distinct.values())) if len(distinct) == 1 else None
 
     def parameter_root(self, expression: ci.Cursor) -> int | None:
         for child in expression.walk_preorder():
@@ -1646,6 +1915,12 @@ class _FunctionWalk:
             if addressed:
                 # &p->m, or an array member decaying to its address: no load or store.
                 access["address"] = True
+                canonical = field.type.get_canonical() if field is not None else None
+                if canonical is not None and canonical.kind in _ARRAY_TYPES:
+                    # What the code reads through the decayed address is the first element's bytes.
+                    element = canonical.get_array_element_type().get_size()
+                    if element > 0:
+                        access["element_size"] = element
             if self.conditional:
                 # Under a __builtin_constant_p choice, or an argument a callee the image may inline
                 # ignores: compiled only where the image has it.
@@ -2007,13 +2282,22 @@ class _FunctionWalk:
                     self.walk(child, node, child_index, reason, generic)
                 self.conditional -= 1
                 return
-            value = self.x.evaluator.evaluate(condition)
+            value = self.x.evaluator.evaluate(condition, truth=True)
             if value is not None:
                 live = 1 if value else 2
                 self.walk(condition, node, 0, reason, generic)
                 for child_index, child in enumerate(children[1:], 1):
                     self.walk(child, node, child_index, None if child_index == live else "dead_branch", generic)
                 return
+            if kind == K.IF_STMT or len(children) == 3:
+                guard = self.guard_expression(condition)
+                if guard is not None:
+                    # The branches are compiled where the caller's arguments let the condition be
+                    # true, or false: each is under that guard.
+                    self.walk(condition, node, 0, reason, generic)
+                    for child_index, child in enumerate(children[1:3], 1):
+                        self.walk_guarded((guard, child_index == 1), child, node, child_index, reason, generic)
+                    return
         if kind == K.BINARY_OPERATOR and len(children) == 2 and reason is None:
             operator = libclang.binary_kind(node)
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
@@ -2024,9 +2308,15 @@ class _FunctionWalk:
                     self.walk(children[1], node, 1, reason, generic)
                     self.conditional -= 1
                     return
-                left = self.x.evaluator.evaluate(children[0])
+                left = self.x.evaluator.evaluate(children[0], truth=True)
                 decided = left is not None and (bool(left) == (operator == libclang.LOGICAL_OR))
-                self.walk(children[1], node, 1, "dead_branch" if decided else reason, generic)
+                if decided:
+                    self.walk(children[1], node, 1, "dead_branch", generic)
+                else:
+                    # The right operand is evaluated only where the left one does not decide.
+                    guard = self.guard_expression(children[0])
+                    within = (guard, operator == libclang.LOGICAL_AND) if guard is not None else None
+                    self.walk_guarded(within, children[1], node, 1, reason, generic)
                 return
             if operator == _COMMA and self.x.effect_free(children[0]):
                 # cpu_to_node(cpu) without NUMA: ((void)(cpu), 0).
@@ -2054,12 +2344,16 @@ class _FunctionWalk:
                     if live and self.x.evaluator.exits(statement):
                         live = False
                 return
+            if value is None and not _mentions(children[0], _IMAGE_DECIDES):
+                # A selector on the parameters: each statement of the body is under the cases that reach it.
+                self.switch_guards(children[0], body)
         if kind == K.COMPOUND_STMT and reason is None:
             # Statements after a return, a goto, a break, a continue or a noreturn call are reached
             # only through a label or a case. After an `if (__builtin_constant_p(...)) return ...;`
             # the machine code decides whether the rest was compiled.
             dead = False
             builtin_exits = 0
+            exit_guards = 0  # guards on the rest of the block, from `if (C) return;` before it
             value_last = parent is not None and parent.kind == K.StmtExpr
             for child_index, child in enumerate(children):
                 if child.kind == K.LABEL_STMT:
@@ -2067,6 +2361,11 @@ class _FunctionWalk:
                     dead = dead and child.spelling not in self.live_labels
                 elif child.kind in _ENTRIES:
                     dead = False
+                if exit_guards and (child.kind in _ENTRIES or self.has_label(child)):
+                    # Control enters here through a label, past the conditions before it.
+                    del self.guard_stack[len(self.guard_stack) - exit_guards :]
+                    exit_guards = 0
+                case_guard = self.case_guards.get(child.hash)
                 if dead:
                     self.walk(child, node, child_index, "after_exit", generic)
                 elif (
@@ -2078,6 +2377,8 @@ class _FunctionWalk:
                     # function that only reads): its value is discarded. The last statement of
                     # ({ ... }) is that expression's value (per_cpu_ptr).
                     self.walk(child, node, child_index, "discarded", generic)
+                elif case_guard is not None:
+                    self.walk_guarded(case_guard, child, node, child_index, None, generic)
                 else:
                     self.walk(child, node, child_index, None, generic)
                 if not dead and self.x.evaluator.exits(child):
@@ -2085,6 +2386,10 @@ class _FunctionWalk:
                 elif not dead and _exits_under_builtin(child, self.x.evaluator):
                     self.conditional += 1
                     builtin_exits += 1
+                elif not dead and (after := self.exit_guard(child)) is not None:
+                    self.push_guard(*after)
+                    exit_guards += 1
+            del self.guard_stack[len(self.guard_stack) - exit_guards :]
             self.conditional -= builtin_exits
             return
         if kind == K.CALL_EXPR and children and reason in (None, "discarded"):
@@ -2419,6 +2724,8 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
             "owned": name in owned,
             "returns": walk.returns(),
             "events": walk.events,
+            # The conditions on the parameters that events' ``guards`` index (link._bind decides them).
+            **({"guards": walk.guard_table} if walk.guard_table else {}),
         }
         pending.extend(sorted(callee for callee in reached if callee in definitions and callee not in functions))
     records = {}
