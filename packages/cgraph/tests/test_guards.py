@@ -1026,7 +1026,8 @@ WARN_ONCE = """
             table[i] = late_index(i);
         kept();
     }
-    int note_index(int i); int late_index(int i);
+    void next_range(int *i); void range_body(int i);
+    void each_range(void) { int i; for (i = -1, next_range(&i); i >= 0; next_range(&i)) range_body(i); }
 """
 
 
@@ -1043,6 +1044,8 @@ def test_a_warn_once_whose_condition_is_constant_false_and_a_loop_never_entered_
     assert callees("lock_idx") == {"kept"}
     assert "__warn_printk" in callees("lock_live")
     assert callees("size_table") == {"late_index", "kept"}
+    # memmap_init's for_each_mem_pfn_range: the init's call sets i after `i = -1`.
+    assert "range_body" in callees("each_range")
 
 
 MEMBER_CALL = """
@@ -1120,3 +1123,32 @@ def test_a_const_table_s_known_data_is_read_only_where_the_image_has_it(tmp_path
     )
     (access,) = [item for item in passed["functions"]["t2"]["events"]["accesses"] if item["unit"]["name"] == "busses"]
     assert access.get("conditional") is True
+
+
+def test_a_label_a_live_goto_targets_is_code_under_a_label_no_live_goto_targets(tmp_path: Path) -> None:
+    """vms_gather_munmap_vmas: `userfaultfd_error: munmap_gather_failed: …: reattach_vmas(mas_detach);`,
+    where userfaultfd_unmap_prep's stub makes `goto userfaultfd_error` dead but `goto
+    munmap_gather_failed` is live (llvm-objdump: jal reattach_vmas)."""
+    facts = facts_of(
+        tmp_path,
+        """
+        static inline int stub0(void) { return 0; }
+        int nested(int k, int e)
+        {
+            int error = 0;
+            if (stub0())
+                goto outer;
+            if (k) {
+                error = e;
+                goto inner;
+            }
+            note();
+            return 0;
+        outer:
+        inner:
+            err();
+            return error;
+        }
+        """,
+    )
+    assert "err" in {call["callee"] for call in facts["functions"]["nested"]["events"]["calls"]}

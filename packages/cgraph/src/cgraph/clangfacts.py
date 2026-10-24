@@ -1564,6 +1564,17 @@ def _is_static_local(variable: ci.Cursor) -> bool:
     return variable.storage_class == ci.StorageClass.STATIC and parent is not None and parent.kind != K.TRANSLATION_UNIT
 
 
+def _label_chain(label: ci.Cursor) -> list[str]:
+    """The names of a label and of the labels its statement starts with (``a: b: c: stmt``)."""
+    names = []
+    node: ci.Cursor | None = label
+    while node is not None and node.kind == K.LABEL_STMT:
+        names.append(node.spelling)
+        children = _children(node)
+        node = children[-1] if children else None
+    return names
+
+
 def _holds_label(node: ci.Cursor) -> bool:
     """A label or a case inside, where control may enter other than by the start."""
     return any(part.kind in _ENTRIES for part in node.walk_preorder())
@@ -3330,7 +3341,7 @@ class _FunctionWalk:
                 value = libclang.var_initializer(variable) if variable.kind == K.VAR_DECL else None
                 if value is not None:
                     firsts[variable.hash] = value
-        pending = [node]
+        pending = [] if node.kind == K.DECL_STMT else [node]
         while pending:
             part = _bare(pending.pop())
             operands = _children(part)
@@ -3340,6 +3351,12 @@ class _FunctionWalk:
                 target = _strip_parens(operands[0])
                 if target.kind == K.DECL_REF_EXPR and target.referenced is not None:
                     firsts[target.referenced.hash] = operands[1]
+            else:
+                # for_each_mem_pfn_range's `i = -1, __next_mem_pfn_range(&i, …)`: the init does more.
+                return False
+        if any(child.kind == K.CALL_EXPR for child in condition.walk_preorder()):
+            # A call in the condition may set the variable through its address.
+            return False
         if not firsts:
             return False
 
@@ -5297,8 +5314,9 @@ class _FunctionWalk:
                 # The ways control falls in here: under this block's guards, or none after an exit.
                 fallthrough = None if dead else [self.guard_table[i] for i in self.guard_stack]
                 if child.kind == K.LABEL_STMT:
-                    # A label is code when control falls into it or a goto in code targets it.
-                    dead = dead and child.spelling not in self.live_labels
+                    # A label is code when control falls into it or a goto in code targets it, or one
+                    # of the labels it heads (``a: b: stmt``, vms_gather_munmap_vmas' error labels).
+                    dead = dead and not any(name in self.live_labels for name in _label_chain(child))
                 elif child.kind in _ENTRIES:
                     dead = False
                 if exit_guards and (child.kind in _ENTRIES or self.has_label(child)):
