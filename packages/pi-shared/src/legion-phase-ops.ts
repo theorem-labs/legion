@@ -1,4 +1,9 @@
-import { isLegionRole, type LegionClaimRole, type LegionRole, zodSchemaApi } from "@legion/contracts";
+import {
+  isLegionRole,
+  type LegionClaimRole,
+  type LegionRole,
+  zodSchemaApi,
+} from "@legion/contracts";
 import {
   LEGION_PHASE_BACKWARD_TARGETS,
   type LegionIssue,
