@@ -1564,16 +1564,25 @@ def _frame_deltas(decoder: Any, instructions: list[Any]) -> tuple[dict[str, tupl
     return deltas, saved
 
 
-def _frame_step(decoder: Any, instruction: Any, state: _Rooted, deltas: dict[str, int]) -> _Rooted:
+def _frame_call(decoder: Any, instruction: Any, following: list[int]) -> bool:
+    """A call, or a tail call (a ``j`` out of the function); a ``j`` within it is a jump."""
+    mnemonic = instruction.mnemonic
+    if mnemonic in ("j", "c.j"):
+        return not following
+    return mnemonic in _DIRECT_CALLS or (mnemonic in _REGISTER_CALLS and _links(decoder, list(instruction.operands)))
+
+
+def _frame_step(decoder: Any, instruction: Any, state: _Rooted, deltas: dict[str, int], call: bool) -> _Rooted:
     """The registers holding a frame address after an instruction, from those before it."""
     operands = list(instruction.operands)
     mnemonic = instruction.mnemonic
     registers = [decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG]
     immediate = next((operand.imm for operand in operands if operand.type == CS_OP_IMM), None)
-    if mnemonic in _DIRECT_CALLS or (mnemonic in _REGISTER_CALLS and _links(decoder, operands)) or mnemonic in _ENDS:
+    if call or mnemonic in _ENDS:
         # A callee-saved register keeps &object across a call; the others do not.
         return {name: value for name, value in state.items() if name in _CALLEE_SAVED}
-    written = registers[0] if registers and mnemonic not in _STORE_WIDTHS and mnemonic not in _BRANCHES else None
+    jumps = mnemonic in _BRANCHES or mnemonic in ("j", "c.j")
+    written = registers[0] if registers and mnemonic not in _STORE_WIDTHS and not jumps else None
     if written is None or written in _FRAME_REGISTERS or written == "zero":
         return state
 
@@ -1636,7 +1645,8 @@ def _frame(decoder: Any, instructions: list[Any], successors: list[list[int]]) -
     while pending:
         index = pending.pop()
         deltas = {name: offset for name, (offset, start) in prologue.items() if start <= index}
-        after = _frame_step(decoder, instructions[index], entry[index], deltas)
+        call = _frame_call(decoder, instructions[index], successors[index])
+        after = _frame_step(decoder, instructions[index], entry[index], deltas, call)
         for following in successors[index]:
             known = entry.get(following)
             merged = after if known is None else _frame_join([known, after])
@@ -1658,7 +1668,7 @@ def _frame(decoder: Any, instructions: list[Any], successors: list[list[int]]) -
         read = {decoder.reg_name(register) for register in bases | values}
         # The registers holding a frame address that the instruction reads (not one it only writes).
         rooted[instruction.address] = frozenset({"sp", *deltas, *state} & (read | {"sp"}))
-        if mnemonic in _DIRECT_CALLS or (mnemonic in _REGISTER_CALLS and _links(decoder, operands)):
+        if _frame_call(decoder, instruction, successors[index]):
             arguments.update(
                 (instruction.address, int(name[1:]), offset)
                 for name, (kind, offsets) in state.items()
@@ -1666,7 +1676,7 @@ def _frame(decoder: Any, instructions: list[Any], successors: list[list[int]]) -
                 for offset in offsets
             )
             continue
-        after = _frame_step(decoder, instruction, state, deltas)
+        after = _frame_step(decoder, instruction, state, deltas, False)
         written = registers[0] if registers and mnemonic not in _STORE_WIDTHS else None
         if (
             written is not None

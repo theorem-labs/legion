@@ -979,6 +979,14 @@ def test_a_register_holding_either_of_two_frame_addresses_reaches_both(image: Im
     assert 0x30 in facts.addi_constants
 
 
+def test_a_jump_within_the_function_keeps_the_frame_address_it_passes_on(image: Image) -> None:
+    """force_sigsegv: both paths set a0 = &info and one jumps to the shared jal force_sig_info_to_task:
+    a j inside the function is no call, so a0 still holds -40 at the jal."""
+    body = [_branch(A1, ZERO, 12), _addi(A0, S0, -40), _jump(8), _addi(A0, S0, -40), _jal(RA, 0x100), RET]
+    facts = _framed(image, body)
+    assert {(position, offset) for _, position, offset in facts.frame_arguments} == {(0, -40)}
+
+
 def test_a_store_over_part_of_a_frame_slot_ends_the_address_spilled_there(image: Image) -> None:
     """``sd s1, -24(s0)``, then ``sw zero, -20(s0)`` writes half of it: the reload is no address."""
     facts = _at(image, S1, image.object_symbols["pair_a"][0].address, _store(S1, S0, -24),
