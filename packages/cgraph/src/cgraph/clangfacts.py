@@ -25,7 +25,7 @@ import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar
 
 import clang.cindex as ci
 from clang.cindex import CursorKind as K
@@ -38,6 +38,8 @@ from .errors import ExtractionError
 FORMAT = "cgraph/tu-facts/v1"
 Facts = dict[str, Any]
 Unit = dict[str, Any]
+# A kept answer of the extractor's analyses (``_Extractor.reuse``).
+_T = TypeVar("_T")
 
 _RECORD_KINDS = (K.STRUCT_DECL, K.UNION_DECL)
 _TABLE_ENTRY = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)")
@@ -436,18 +438,19 @@ class _Extractor:
              if cursor.kind == K.FUNCTION_DECL and cursor.is_definition() and cursor.spelling},
             self.is_weak,
         )  # fmt: skip
-        self.ignored_cache: dict[str, frozenset[int]] = {}
+        self.ignored_cache: dict[str, tuple[frozenset[int], int | None]] = {}
         self.returned: dict[str, _Address | None] = {}
         self.null_helpers: set[str] = set()  # the helpers whose every return is a null pointer
         self.nullable_helpers: set[str] = set()  # the helpers that return a null pointer or an address
         self.texts: dict[Path, bytes] = {}
         # Each function's settled walk, the functions whose walk is under way, the functions whose
         # calls compute only their result, and each _Generic's selection, read once per node.
-        self.analyses: dict[str, _FunctionWalk] = {}
+        # Each kept answer goes with its horizon (see ``horizon``).
+        self.analyses: dict[str, tuple[_FunctionWalk, int | None]] = {}
         self.analyzing: set[str] = set()
-        self.effect_free_cache: dict[str, bool] = {}
+        self.effect_free_cache: dict[str, tuple[bool, int | None]] = {}
         self.nesting = 0  # analyses under way, one inside another: bounded by _EFFECT_DEPTH
-        self.truncations = 0  # answers cut short by a recursion or the depth bound
+        self.depth_cuts = 0  # calls not followed at the depth bound, and kept answers resting on one
         self.selections: dict[int, set[int] | None] = {}
         self.typedefs: dict[str, str] | None = None  # the unit's typedef names, read on demand
 
@@ -897,21 +900,18 @@ class _Extractor:
         """The parameters a function of the unit never reads in code that is compiled, by position:
         not at all, only in code no control reaches, only in unevaluated operands, only in discarded
         values, or only as arguments its own callees ignore (from_kuid_munged passes its namespace
-        only to from_kuid, which never reads it). A weak definition may be replaced, so it has none."""
+        only to from_kuid, which never reads it). A weak definition may be replaced, and a recursion
+        or a chain past _EFFECT_DEPTH is not followed: none of these ignores a parameter."""
         if callee is None or callee.kind != K.FUNCTION_DECL:
             return frozenset()
         name = callee.spelling
-        if name in self.ignored_cache:
-            return self.ignored_cache[name]
+        cached = self.reuse(self.ignored_cache, name)
+        if cached is not None:
+            return cached
         definition = self.evaluator.definitions.get(name)
-        if definition is None or self.is_weak(definition):
+        if definition is None or self.is_weak(definition) or not self.may_follow(name):
             return frozenset()
-        if name in self.analyzing or self.nesting >= _EFFECT_DEPTH:
-            # A recursion, or a chain past the depth bound: no parameter counts as ignored, and the
-            # answer is not kept.
-            self.truncations += 1
-            return frozenset()
-        truncations = self.truncations
+        start = (self.nesting, self.depth_cuts)
         self.nesting += 1
         try:
             walk = self.analysis(definition)
@@ -920,9 +920,39 @@ class _Extractor:
         never_read = walk.never_read()
         parameters = list(definition.get_arguments() or [])
         result = frozenset(position for position, parameter in enumerate(parameters) if parameter.hash in never_read)
-        if self.truncations == truncations:
-            self.ignored_cache[name] = result
+        self.ignored_cache[name] = (result, self.horizon(start))
         return result
+
+    def may_follow(self, name: str) -> bool:
+        """A call may be followed into its callee: not a recursion, and not past _EFFECT_DEPTH. A cut
+        at the depth bound is counted, so the answers above it are kept only for as deep a horizon."""
+        if name in self.analyzing:
+            return False
+        if self.nesting >= _EFFECT_DEPTH:
+            self.depth_cuts += 1
+            return False
+        return True
+
+    def horizon(self, start: tuple[int, int]) -> int | None:
+        """None when no cut at the depth bound happened since ``start``; otherwise the nesting at
+        which the answer was computed: it holds wherever the analysis is asked at least that deep."""
+        nesting, cuts = start
+        return None if self.depth_cuts == cuts else nesting
+
+    def reuse(self, cache: dict[str, tuple[_T, int | None]], name: str) -> _T | None:
+        """A kept answer that holds at the current nesting. One computed under a cut is computed
+        again when asked less deep, so each function is analyzed at most _EFFECT_DEPTH + 1 times;
+        reusing it counts as the cut it rests on, so the answer that reuses it is bounded too."""
+        entry = cache.get(name)
+        if entry is None:
+            return None
+        value, horizon = entry
+        if horizon is None:
+            return value
+        if self.nesting < horizon:
+            return None
+        self.depth_cuts += 1
+        return value
 
     def ignores_variadic(self, callee: ci.Cursor | None) -> bool:
         """A variadic function of the unit that never reads its arguments past the named ones: no
@@ -961,11 +991,11 @@ class _Extractor:
         ignores) is compiled only where the image has it; the walk is repeated until those
         variables stop growing."""
         name = definition.spelling
-        cached = self.analyses.get(name)
+        cached = self.reuse(self.analyses, name)
         if cached is not None:
             return cached
         self.analyzing.add(name)
-        truncations = self.truncations
+        start = (self.nesting, self.depth_cuts)
         labels: frozenset[str] = frozenset()
         dead: frozenset[int] = frozenset()
         decided: frozenset[int] = frozenset()
@@ -986,10 +1016,9 @@ class _Extractor:
             dead |= never_read
             decided |= image_read - dead
         self.analyzing.discard(name)
-        if self.truncations == truncations:
-            # A walk that met a recursion or the depth bound depends on where it was asked for: it
-            # is not kept, so each function's facts come from a walk with the full horizon.
-            self.analyses[name] = walk
+        # A walk that met the depth bound is kept for as deep a horizon as it saw, so a function's
+        # own facts (asked at nesting 0) come from a walk that saw its callees whole.
+        self.analyses[name] = (walk, self.horizon(start))
         return walk
 
     def inline_function(self, name: str) -> bool:
@@ -1014,18 +1043,17 @@ class _Extractor:
         has no effect. A function that is not inline and not static may not be inlined, and the
         compiler knows such a call returns only when the function has no loop. A function that
         calls itself again may not return, and a chain of calls deeper than _EFFECT_DEPTH is not
-        followed: both count as an effect, and the answer is not kept."""
-        cached = self.effect_free_cache.get(name)
+        followed: both count as an effect."""
+        cached = self.reuse(self.effect_free_cache, name)
         if cached is not None:
             return cached
         definition = self.evaluator.definitions.get(name)
         if definition is None or self.is_weak(definition):
-            self.effect_free_cache[name] = False
+            self.effect_free_cache[name] = (False, None)
             return False
-        if name in self.analyzing or self.nesting >= _EFFECT_DEPTH:
-            self.truncations += 1
+        if not self.may_follow(name):
             return False
-        truncations = self.truncations
+        start = (self.nesting, self.depth_cuts)
         self.nesting += 1
         try:
             walk = self.analysis(definition)
@@ -1033,8 +1061,7 @@ class _Extractor:
             self.nesting -= 1
         inlined = _is_inline(definition) or definition.linkage == ci.LinkageKind.INTERNAL
         result = walk.effects == 0 and (inlined or walk.compiled_loops == 0)
-        if self.truncations == truncations:
-            self.effect_free_cache[name] = result
+        self.effect_free_cache[name] = (result, self.horizon(start))
         return result
 
     def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool) -> bool:

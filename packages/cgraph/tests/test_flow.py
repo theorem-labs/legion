@@ -6,6 +6,7 @@ import collections
 from pathlib import Path
 from typing import Any
 
+import clang.cindex as ci
 import pytest
 from conftest import FIXTURE, add_contract_functions, build, read, text_address
 
@@ -1054,3 +1055,44 @@ def test_an_expression_statement_that_is_a_branch_is_discarded(dead_facts: dict[
     assert {item["field"] for item in events["field_accesses"]} == {"first"}
     assert callees(dead_facts, "dd_if_mixed") == {"obj_free"}
     assert ("dd_read_checked", "discarded") in unevaluated(dead_facts, "dd_if_mixed")
+
+
+def test_an_answer_cut_at_the_depth_bound_is_kept_for_as_deep_a_horizon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """folio_put -> put_page_testzero -> ... -> arch_atomic_fetch_sub: a chain deeper than the bound.
+    An answer computed where the bound cut the chain below is kept and reused wherever it is asked at
+    least as deep, so a link asked twice per walk above it is not analyzed again and again (mm/vmscan.c
+    did not finish in 590 s, after 392135 walks, when such answers were dropped; 11 s, 707 walks, when
+    kept)."""
+    monkeypatch.setattr(clangfacts, "_EFFECT_DEPTH", 3)
+    lines = ["static inline long dd_link3(long n) { return n; }"]
+    for index in (2, 1, 0):
+        lines.append(f"static inline long dd_link{index}(long n) {{ return dd_link{index + 1}(n) + 1; }}")
+    (tmp_path / "chain.c").write_text("\n".join(lines) + "\n")
+    loaded = config.load(FIXTURE / "cgraph.toml")
+    arguments = ["--target=riscv64-unknown-elf", "-std=gnu11", "-ffreestanding", "-nostdinc"]
+    tu = ci.Index.create().parse(str(tmp_path / "chain.c"), args=arguments)
+    extractor = clangfacts._Extractor(tu, "chain.c", tmp_path, loaded.vocabulary)
+    extractor.function_effect_free("dd_link0")
+    # Asked at nesting 0, dd_link0 saw dd_link1 at 1 and dd_link2 at 2, which could not follow
+    # dd_link3 past the bound of 3.
+    assert extractor.effect_free_cache["dd_link0"] == (False, 0)
+    assert extractor.effect_free_cache["dd_link1"] == (False, 1)
+    assert extractor.effect_free_cache["dd_link2"] == (False, 2)
+    extractor.nesting = 1
+    assert extractor.reuse(extractor.effect_free_cache, "dd_link1") is False
+    # Asked less deep than its horizon, the answer is computed again with more of the chain in view.
+    extractor.nesting = 0
+    assert extractor.reuse(extractor.effect_free_cache, "dd_link1") is None
+    assert extractor.function_effect_free("dd_link1") is True
+    assert extractor.effect_free_cache["dd_link1"] == (True, None)
+    # An answer that reuses one kept for a horizon is kept for no wider horizon itself.
+    extractor = clangfacts._Extractor(tu, "chain.c", tmp_path, loaded.vocabulary)
+    extractor.nesting = 2
+    extractor.function_effect_free("dd_link2")
+    extractor.nesting = 1
+    extractor.function_effect_free("dd_link1")
+    assert extractor.effect_free_cache["dd_link1"] == (False, 1)
+    extractor.nesting = 0
+    assert extractor.function_effect_free("dd_link1") is True

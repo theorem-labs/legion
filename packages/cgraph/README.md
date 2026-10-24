@@ -56,10 +56,11 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   expression, read from the parts libclang gives, or from the header as written where it leaves
   some out; C11 lets the compiler assume any other loop ends), no cleanup with an effect, and
   calls only to such functions. So the `WARN_ON_ONCE` under `IS_ENABLED(CONFIG_DEBUG_ATOMIC)` in
-  `instrument_atomic_check_alignment` is no effect. Branches of `__builtin_constant_p` and
-  `__builtin_object_size`, also as the left operand of `&&` or `||`, are left to the machine code:
-  their calls, global accesses and field accesses (marked `conditional`) stay only where the image
-  has them.
+  `instrument_atomic_check_alignment` is no effect. Calls are followed 16 deep; a call past that, or
+  back into a function whose analysis is under way, has an effect and reads its named arguments.
+  Branches of `__builtin_constant_p` and `__builtin_object_size`, also as the left operand of `&&`
+  or `||`, are left to the machine code: their calls, global accesses and field accesses (marked
+  `conditional`) stay only where the image has them.
 - **Implied calls**: a local of a cleanup class (`c.cleanup.class_type`) calls its destructor, with
   the local's address where the class is a struct (a lock guard's also standing for the lock its
   constructor took) and with the constructor's arguments otherwise; a local with any other
