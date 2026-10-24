@@ -150,7 +150,10 @@ These rules follow what the machine code shows, each only where it shows it:
 - A static function's parameter that every call site of its unit gives one global (directly, or
   through a static caller's parameter, which the facts may also type as its struct), in a function
   whose address the unit does not take, is that global where the machine code addresses it (or an
-  address its initializer stores): `analysis.specialized_parameters`.
+  address its initializer stores): `analysis.specialized_parameters`. A caller whose machine code
+  forms no address of that global passes none: its accesses of the global within the argument (the
+  facts give a global argument's `lines`) are the callee's, excluded from the caller as
+  `argument_specialized_into_callee` (do_copy's `xwrite(..., &wfile_pos)`).
 - A folded helper's field access through its parameter is rebased to the caller only where the
   argument's `displacement` is given (0 for the caller's pointer itself, the member's offset for
   `wb_exit(&bdi->wb)`, the address of the caller's local or global object): the displacement is added,

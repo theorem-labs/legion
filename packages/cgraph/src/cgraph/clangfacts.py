@@ -3175,11 +3175,15 @@ class _FunctionWalk:
         address the facts can follow (wb_exit(&bdi->wb), prepare_alloc_pages(..., &ac, ...),
         clk_core_free_parent_map(container_of(ref, ...))), what that address adds to its base and
         what the base is, so a folded callee's field offsets can be rebased onto the caller's. A
-        function the argument names (kref_put's release_bdi) is ``function``."""
+        function the argument names (kref_put's release_bdi) is ``function``; for a global, the
+        ``lines`` the argument spans, where its own accesses of the global are (link moves them into a
+        callee the compiler specialized to that global)."""
         item: dict[str, Any] = {
             "unit": self.held_global(expression) or self.x.unit_from_ref(expression) or self.global_storage(expression),
             "param": self.parameter_root(expression),
         }
+        if item["unit"] is not None and item["unit"]["kind"] == "global":
+            item["lines"] = [expression.extent.start.line, expression.extent.end.line]
         named = _strip(expression)
         if named.kind == K.UNARY_OPERATOR and libclang.is_address_of(named) and _children(named):
             named = _strip(_children(named)[0])

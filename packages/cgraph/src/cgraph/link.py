@@ -1251,12 +1251,23 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
         addressed = image_globals[identity]
         # Every call site gives the parameter one global, and the image addresses it, or an address
         # its initializer stores: the compiler specialized the function to that global.
-        bound_parameters = {
-            index: value
-            for index, value in specialized.get(identity, {}).items()
-            if value["name"] in addressed
-            or any(item["target"]["name"] in addressed for item in linker.initializer_values(value, None))
-        }
+        bound_parameters = _bound_parameters(linker, specialized.get(identity, {}), addressed)
+        # This code's arguments that such a callee takes in its own code (do_copy's xwrite(..., &wfile_pos)):
+        # where this code's image forms no address of the global, its accesses of it within the
+        # argument are the callee's.
+        moved: dict[tuple[str, int, tuple[str, ...], str], tuple[str, int]] = {}
+        for call in result.calls:
+            callee = linker.resolve(call["tu"], call["callee"])
+            values = _bound_parameters(linker, specialized.get(callee, {}), image_globals.get(callee, set()))
+            for position, argument in enumerate(call["arguments"]):
+                unit, value, lines = argument.get("unit"), values.get(position), argument.get("lines")
+                if unit is None or value is None or lines is None or unit["kind"] != "global":
+                    continue
+                if unit["name"] != value["name"] or unit["name"] in addressed:
+                    continue
+                for site in call["provenance"]:
+                    for line in range(lines[0], lines[1] + 1):
+                        moved[(site["file"], line, tuple(site.get("via", [])), unit["name"])] = (callee, position)
         here = [{"source": "c", "file": definition.file, "line": definition.line}]
         # An access through such a parameter is the global's. The C records none for a dereference
         # of a scalar (``*pos``) or a field through the pointer (``tk->f`` is struct state): the
@@ -1291,6 +1302,21 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                     identity,
                     None,
                     {"field": access.get("field"), "parameter": access.get("param")},
+                    access["provenance"],
+                )
+                continue
+            moves = {
+                moved.get((site.get("file", ""), site.get("line", 0), tuple(site.get("via", [])), unit["name"]))
+                for site in access["provenance"]
+            }
+            if unit["kind"] == "global" and access.get("parameter") is None and None not in moves:
+                callee, position = min(move for move in moves if move is not None)
+                exclude(
+                    "access",
+                    "argument_specialized_into_callee",
+                    identity,
+                    linker.unit_id(unit),
+                    {"callee": callee, "parameter": position},
                     access["provenance"],
                 )
                 continue
@@ -1795,6 +1821,17 @@ def _field_access(item: dict[str, Any]) -> dict[str, Any]:
         if item.get(key) is not None:
             access[key] = item[key]
     return access
+
+
+def _bound_parameters(linker: Linker, specialized: dict[int, Unit], addressed: set[str]) -> dict[int, Unit]:
+    """A function's parameters every call site gives one global, where its image addresses that
+    global or an address its initializer stores: the compiler specialized the function to it."""
+    return {
+        index: value
+        for index, value in specialized.items()
+        if value["name"] in addressed
+        or any(item["target"]["name"] in addressed for item in linker.initializer_values(value, None))
+    }
 
 
 def _specialized_parameters(linker: Linker, functions: dict[str, Definition]) -> dict[str, dict[int, Unit]]:

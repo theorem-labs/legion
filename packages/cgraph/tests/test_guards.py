@@ -706,3 +706,30 @@ def test_an_operand_a_parameter_may_zero_is_read_only_where_it_does_not(tmp_path
     assert link._decided(guards, [unknown(), constant(0)]) is None
     assert link._decided(guards, [unknown(), constant(2)]) == []
     assert compiled(facts, "get", [unknown(), constant(0)]) == {"count"}
+
+
+def test_an_argument_that_names_a_global_gives_the_lines_it_spans(tmp_path: Path) -> None:
+    """vmap_init_free_space: insert_vmap_area_augment(free, 0,\\n &free_vmap_area_root,\\n
+    &free_vmap_area_list): the accesses of each argument are on its own lines."""
+    facts = facts_of(
+        tmp_path,
+        """
+        struct root { long node; };
+        static struct root tree;
+        static long counter;
+        void insert(long v, struct root *r, long *c);
+        void init(long v)
+        {
+            insert(v,
+                   &tree,
+                   &counter);
+        }
+        """,
+    )
+    (call,) = facts["functions"]["init"]["events"]["calls"]
+    first = facts["functions"]["init"]["line"]
+    assert [argument.get("lines") for argument in call["arguments"]] == [
+        None,
+        [first + 3, first + 3],
+        [first + 4, first + 4],
+    ]

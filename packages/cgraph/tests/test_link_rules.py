@@ -424,6 +424,36 @@ def test_a_specialized_parameter_with_no_recorded_access_is_a_read_of_its_global
     assert checks.accesses(graph)["only_image"] == 0
 
 
+def _caller_side(caller_globals: tuple[str, ...], access_line: int) -> dict[str, Any]:
+    """xwrite(wfile, victim, n, &wfile_pos) from do_copy, every call site passing &wfile_pos: the
+    compiler moved the address into xwrite, so do_copy forms none. a reads tk_data at access_line."""
+    argument = {**address_of("tk_data"), "lines": [2, 3]}
+    tus = {
+        "a.c": unit(
+            function("advance", static=True, accesses=(read_parameter(0),)),
+            function("a", calls=(call("advance", argument, line=2),), accesses=(read("tk_data", line=access_line),)),
+        )
+    }
+    copies = {"advance": [(0x100, True, "a.c")], "a": [(0x200, False, "")]}
+    facts = {0x100: FunctionFacts(globals=image_globals("tk_data")),
+             0x200: FunctionFacts(calls=image_calls("advance"), globals=image_globals(*caller_globals))}  # fmt: skip
+    return build(tus, StubImage(copies, facts))
+
+
+def test_the_caller_s_argument_to_a_specialized_parameter_is_no_access_of_the_caller() -> None:
+    graph = _caller_side((), 3)
+    assert _reads(graph, "function:a") == set()
+    assert _reads(graph, "function:advance@a.c") == {"global:tk_data"}
+    (item,) = [item for item in exclusion_items(graph) if item["reason"] == "argument_specialized_into_callee"]
+    assert (item["function"], item["target"], item["detail"]) == (
+        "function:a", "global:tk_data", {"callee": "function:advance@a.c", "parameter": 0},
+    )  # fmt: skip
+    assert checks.accesses(graph)["only_c"] == 0
+    # The caller's image forms the address itself, or the access is outside the argument: it stays.
+    assert _reads(_caller_side(("tk_data",), 3), "function:a") == {"global:tk_data"}
+    assert _reads(_caller_side((), 4), "function:a") == {"global:tk_data"}
+
+
 def _initializer(holder: str, target: str, field: str | None) -> dict[str, Any]:
     return {"global": global_unit(holder), "field": field, "offset": 0, "target": global_unit(target),
             "target_offset": 0, "provenance": where("a.c", 76)}  # fmt: skip
