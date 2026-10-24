@@ -1,0 +1,50 @@
+{
+  "meta": { "commit": "fixture" },
+  "nodes": [
+    {
+      "id": "Prog/src/store/BoxNew",
+      "kind": "fn",
+      "syms": ["box_new"],
+      "addr": "0x111b4",
+      "in_image": true
+    },
+    {
+      "id": "Prog/src/store/BoxGet",
+      "kind": "fn",
+      "syms": ["box_get"],
+      "addr": "0x111a0",
+      "in_image": true
+    },
+    {
+      "id": "Prog/src/store/RunGet",
+      "kind": "fn",
+      "syms": ["run_get"],
+      "addr": "0x1127e",
+      "in_image": true
+    },
+    {
+      "id": "Prog/src/bags/BagAdd",
+      "kind": "fn",
+      "syms": ["bag_add"],
+      "addr": "0x1130e",
+      "in_image": true
+    },
+    { "id": "if:BOX_IF", "kind": "iface", "file": "Lean/Box.lean:1" },
+    { "id": "if:COUNT_IF", "kind": "iface", "file": "Lean/Box.lean:5" }
+  ],
+  "edges": [
+    {
+      "kind": "table",
+      "src": "Prog/src/store/RunGet",
+      "dst": "Prog/src/store/BoxGet",
+      "evidence": ["table:box_ops"]
+    },
+    {
+      "kind": "binds",
+      "src": "Prog/src/store/BoxNew",
+      "dst": "if:BOX_IF",
+      "evidence": ["Spec.lean:1"]
+    },
+    { "kind": "binds", "src": "Prog/src/bags/BagAdd", "dst": "if:COUNT_IF", "evidence": [] }
+  ]
+}

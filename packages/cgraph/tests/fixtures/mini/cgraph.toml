@@ -1,0 +1,70 @@
+# The fixture program's configuration: the same keys a real program's configuration has.
+[inputs]
+c_tree = "."
+image = "image/mini.elf"
+system_map = "image/System.map"
+contract_graph = "contracts.json"
+contract_source = "lean"
+
+[parts.store]
+files = ["src/store.c"]
+
+[parts.both]
+files = ["src/bags.c", "src/store.c"]
+
+[parts.flow]
+files = ["src/flow.c"]
+
+[parts.facts]
+files = ["src/facts.c"]
+
+[parts.dead]
+files = ["src/dead.c"]
+
+[c]
+flags = ["-nostdinc", "-I{c_tree}/include/override", "-I{c_tree}/include", "--target=riscv64-unknown-elf",
+         "-march=rv64imac", "-mabi=lp64", "-std=gnu2x", "-ffreestanding", "-fms-extensions", "-DMODULE={stem}"]
+kit_types = ["list_node"]
+value_types = []
+lock_types = ["spin", "rwsem", "seqlk"]
+lock_type_words = []
+percpu_globals = ["current_box"]
+percpu_structs = ["percpu_box"]
+membership_witness_macros = ["for_each_box"]
+base_type_min_containers = 2
+
+[c.calls]
+unlock = "unlock|^up_"
+lock = "^(?!.*unlock)(?:.*lock|down_)"
+allocate = "alloc"
+free = "free"
+
+[c.membership]
+list = ["list_insert"]
+hash = ["hash_insert"]
+
+[c.cleanup]
+class_type = "^class_(.+)_t$"
+destructor = "class_{name}_destructor"
+attribute_macros = { "__free" = "__free_{arg}", "__cleanup" = "{arg}" }
+
+[checks]
+min_call_agreement = 0.95
+# Two C accesses the compiler leaves out (a NULL test of &all_bags; a table address indexed in a
+# register), of eleven: 9/11.
+min_access_agreement = 0.8
+min_field_offsets = 0.9
+
+[image]
+arch = "riscv64"
+thread_pointer = "current_box"
+percpu_sections = [".data..percpu"]
+
+[image.symbol_classes]
+compiler_symbol = "^__key$"
+
+[contract_graph]
+function_prefix = "Prog/"
+
+[topics]
+prefix = "notifications.example."

@@ -1,0 +1,49 @@
+[project]
+name = "cgraph"
+version = "0.1.0"
+description = "The graph of calls, accesses and structure links of a C program and its RISC-V image, with owners and topics."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "capstone==5.0.9",
+    "libclang==18.1.1",
+    "pyelftools==0.33",
+]
+
+[project.scripts]
+cgraph = "cgraph.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy==1.18.2",
+    "pytest==8.4.2",
+    "ruff==0.14.1",
+]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cgraph"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+# The formatter keeps code within the line length; long message strings stay whole.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["clang.*", "capstone.*", "elftools.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
