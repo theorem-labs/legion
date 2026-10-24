@@ -332,6 +332,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	c.Proposal = p.ID
 	c.Proposer = options.Proposer
 	c.CompiledHash = decl.Hash
+	c.Declarations = slices.Sorted(maps.Keys(own))
 	c.Source = p.Source
 	// accepted_by and accepted_near record the librarian's decision: never the proposal's own.
 	c.AcceptedBy, c.AcceptedNear = options.AcceptedBy, nil
@@ -529,14 +530,16 @@ func landedDeclaration(ctx context.Context, s *declindex.Store, c Concept) (decl
 }
 
 // landedConstants reads the module of d, the landed declaration of an added concept, as export reads a proposal:
-// with the registry's forms and the compiled sources of its pending concepts. It gives the constants of d, its own
-// and those that Lean generated from it, and the defects of the pending concepts it left out of the forms.
-func (g *Gate) landedConstants(ctx context.Context, reg Registry, d declindex.Found) ([]declindex.Constant, []Defect, error) {
-	parts, err := g.Index.DeclarationParts(ctx, d)
+// with the registry's forms and the compiled sources of its pending concepts. It gives the constants of d and of the
+// other declarations of its proposal (declared, the concept's Declarations) in that module, each declaration's own
+// and those that Lean generated from it, and the defects of the pending concepts it left out of the forms. Another
+// declaration of the module, though it lies in the namespace of one of them, is not the proposal's.
+func (g *Gate) landedConstants(ctx context.Context, reg Registry, d declindex.Found, declared []string) ([]declindex.Constant, []Defect, error) {
+	parts, err := g.Index.DeclarationParts(ctx, d.Module, append([]string{d.Name}, declared...))
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(parts) == 0 {
+	if !slices.Contains(parts, d.Name) {
 		return nil, nil, fmt.Errorf("the index declares %s in %s but holds no compiled constant of it: refresh the index with lean.export on", d.Name, d.At())
 	}
 	consts, defects, err := g.read(ctx, reg, nil, d.Module)

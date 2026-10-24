@@ -354,8 +354,10 @@ func TestLedgerRechecksAnAdditionLandedWithItsDeclaration(t *testing.T) {
 	})
 }
 
-// A landed addition is compared with every registered concept, landed or pending: two additions gated apart, of
-// which one states the other's fact, are one near pair whichever of them lands with its declaration.
+// A landed addition is compared with every registered concept, landed or pending, through every declaration of its
+// proposal: two additions gated apart, of which one states the other's fact, are one near pair whichever of them
+// lands with its declaration, also when the first states that fact through a helper that its proposal declares,
+// before and after that proposal lands.
 func TestLedgerRechecksALandedAdditionAgainstEveryConcept(t *testing.T) {
 	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
 		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
@@ -364,6 +366,7 @@ func TestLedgerRechecksALandedAdditionAgainstEveryConcept(t *testing.T) {
 		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
 	}
 	const theorem = "theorem Fx.First (x : Nat) (_h : x < 3) : True := trivial\n"
+	const helper = "def Fx.Helper (n : Nat) : Prop := n < 3\n\ndef Fx.First (n : Nat) : Prop := Fx.Helper n\n"
 	const second = "def Fx.Second (n : Nat) : Prop := n < 3\n"
 	for _, c := range []struct {
 		name                  string
@@ -372,6 +375,8 @@ func TestLedgerRechecksALandedAdditionAgainstEveryConcept(t *testing.T) {
 	}{
 		{"the addition landed, the concept whose fact it states pending", theorem, true, false},
 		{"the addition pending, the concept whose fact it states landed", theorem, false, true},
+		{"a helper's proposal landed with the concept whose fact it states", helper, true, true},
+		{"a helper's proposal and the concept whose fact it states pending", helper, false, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			config, tree, lean := leanRegistryTree(t, "Both")

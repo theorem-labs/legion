@@ -426,23 +426,32 @@ func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, er
 	return c, err
 }
 
-// DeclarationParts are the names of the compiled constants of the declaration d, one that Resolve gave: d's own, and
-// those that Lean generated from it (a structure's constructor and fields). It is empty when the index read d's
-// module without its compiled part.
-func (s *Store) DeclarationParts(ctx context.Context, d Found) ([]string, error) {
+// DeclarationParts are the names of the compiled constants of module that belong to one of the declarations of
+// names in module: each declaration's own, and those that Lean generated from it (a structure's constructor and
+// fields), not another declaration in its namespace. It is empty when the index read module without its compiled
+// part.
+func (s *Store) DeclarationParts(ctx context.Context, module string, names []string) ([]string, error) {
+	decls := map[declRef]bool{}
+	seen := map[string]bool{}
 	var consts []declRef
-	rows, err := s.q.QueryContext(ctx, `SELECT name FROM consts WHERE module = ? AND
-		(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, d.Module, d.Name, d.Name+".", d.Name+"/")
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		c := declRef{module: d.Module}
-		if err := r.Scan(&c.name); err != nil {
-			return err
+	for _, n := range names {
+		decls[declRef{module, n}] = true
+		rows, err := s.q.QueryContext(ctx, `SELECT name FROM consts WHERE module = ? AND
+			(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, module, n, n+".", n+"/")
+		err = eachRow(rows, err, func(r *sql.Rows) error {
+			c := declRef{module: module}
+			if err := r.Scan(&c.name); err != nil {
+				return err
+			}
+			if !seen[c.name] {
+				seen[c.name] = true
+				consts = append(consts, c)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		consts = append(consts, c)
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	owner, err := s.owners(ctx, consts)
 	if err != nil {
@@ -450,7 +459,7 @@ func (s *Store) DeclarationParts(ctx context.Context, d Found) ([]string, error)
 	}
 	var out []string
 	for _, c := range consts {
-		if o := owner[c]; o.Name == d.Name && o.Module == d.Module {
+		if o := owner[c]; decls[declRef{o.Module, o.Name}] {
 			out = append(out, c.name)
 		}
 	}
