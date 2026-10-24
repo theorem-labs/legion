@@ -476,10 +476,11 @@ func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declinde
 		return nil, nil, err
 	}
 	defer os.RemoveAll(run)
+	// The confined exporter also has the forms module compiled in the sandbox (declindex.Exporter.Confined).
 	ex := *g.Compiled.Exporter
 	ex.ScratchDir, ex.Confined = run, true
 	co := *g.Compiled
-	co.Exporter, co.Confined = &ex, true
+	co.Exporter = &ex
 	forms, defects, err := g.pendingForms(ctx, reg, &ex, run, p.Concept.Name)
 	if err != nil {
 		return nil, defects, err

@@ -19,13 +19,13 @@ import (
 // CompiledOptions turn on the compiled part of a refresh: types, compiled statement hashes, atoms and the
 // registry's facts, read by the exporter from the .olean files.
 type CompiledOptions struct {
+	// Exporter reads the modules. When it is Confined (the gate's setting, for proposals), the forms module is
+	// compiled in the sandbox too, in a fresh scratch directory below its ScratchDir.
 	Exporter *Exporter
 	// Forms are the registry's concepts and forms.
 	Forms FormsModule
-	// Dir holds the compiled forms module.
+	// Dir holds the compiled forms module of an exporter that is not confined.
 	Dir string
-	// Confined compiles the forms and runs the exporter in the sandbox: the gate's setting, for proposals.
-	Confined bool
 }
 
 // compiledDigest names what the compiled part was read with: the exporter and the forms. When it changes, every
@@ -43,7 +43,6 @@ func compiledDigest(co *CompiledOptions, m Manifest, formsSource string) (string
 func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter, Manifest, string, error) {
 	src, forms := co.Forms.Source()
 	x := *co.Exporter
-	x.Confined = x.Confined || co.Confined
 	m := Manifest{Forms: forms, Types: true}
 	for r := range roots {
 		m.Roots = append(m.Roots, r)
@@ -57,7 +56,7 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 			return nil, m, "", err
 		}
 		dir := co.Dir
-		if co.Confined {
+		if x.Confined {
 			// A fresh scratch below the caller's scratch directory, which the caller removes.
 			if x.ScratchDir == "" {
 				return nil, m, "", errors.New("a confined export needs the exporter's ScratchDir")

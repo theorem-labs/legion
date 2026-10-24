@@ -345,7 +345,8 @@ type Exporter struct {
 	// ModulesPerProcess bounds one process's target modules; zero is all of a shard.
 	ModulesPerProcess int
 	Log               io.Writer
-	// Confined runs the exporter in the sandbox, for modules that untrusted source wrote.
+	// Confined runs the exporter in the sandbox, for modules that untrusted source wrote; CompiledOptions then
+	// compiles the forms module in the sandbox too. It is the one switch of a confined export.
 	Confined bool
 	// ScratchDir holds each run's fresh scratch directory; empty is the system's temporary directory.
 	ScratchDir string
