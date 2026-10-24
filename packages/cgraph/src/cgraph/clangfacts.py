@@ -349,6 +349,7 @@ class _Extractor:
         self.analyzing: set[str] = set()
         self.effect_free_cache: dict[str, bool] = {}
         self.selections: dict[int, set[int] | None] = {}
+        self.typedefs: dict[str, str] | None = None  # the unit's typedef names, read on demand
 
     # Locations -----------------------------------------------------------------------------
 
@@ -746,12 +747,28 @@ class _Extractor:
         if len(tables) != 1:
             return None
         names = list(next(iter(tables)))
-        matches = {index for index, name in enumerate(names, 1) if name in candidates}
+        # An association may name a typedef (local_lock_t *), and the control's type may be spelled
+        # with typeof (this_cpu_ptr): compare canonical types too.
+        matches = {index for index, name in enumerate(names, 1) if {name, self.canonical_name(name)} & candidates}
         if len(matches) == 1:
             return matches
         if not matches and "default" in names:
             return {names.index("default") + 1}
         return None
+
+    def canonical_name(self, name: str) -> str:
+        """The canonical spelling of a type name as an association writes it: a typedef of the unit
+        (``local_lock_t *``) is replaced by the type it names (``struct local_lock *``)."""
+        stars = len(name) - len(name.rstrip("*"))
+        base = name[: len(name) - stars].strip()
+        if self.typedefs is None:
+            self.typedefs = {
+                cursor.spelling: cursor.underlying_typedef_type.get_canonical().spelling
+                for cursor in self.tu.cursor.get_children()
+                if cursor.kind == K.TYPEDEF_DECL and cursor.spelling
+            }
+        canonical = self.typedefs.get(base)
+        return _normal_type(canonical + "*" * stars) if canonical is not None else name
 
     def ignored_parameters(self, callee: ci.Cursor | None) -> frozenset[int]:
         """The parameters a function of the unit never reads in code that is compiled, by position:
@@ -779,8 +796,10 @@ class _Extractor:
         A label is code only when control falls into it or a goto that is code jumps to it
         (__slab_free's ``slab_empty:`` is reached only by a goto behind an exit), so the walk is
         repeated until the labels that live gotos target stop growing. Then a store to a local or
-        a parameter nothing reads in compiled code (local_lock's ``__tl``) is not code either, and
-        the walk is repeated until those variables stop growing."""
+        a parameter nothing reads in compiled code (local_lock's ``__tl``) is not code either, and a
+        store to one read only where the image decides (an argument a callee that is not inline
+        ignores) is compiled only where the image has it; the walk is repeated until those
+        variables stop growing."""
         name = definition.spelling
         cached = self.analyses.get(name)
         if cached is not None:
@@ -788,9 +807,10 @@ class _Extractor:
         self.analyzing.add(name)
         labels: frozenset[str] = frozenset()
         dead: frozenset[int] = frozenset()
+        decided: frozenset[int] = frozenset()
         settled = False
         for _ in range(_ANALYSIS_ROUNDS):
-            walk = _FunctionWalk(self, definition, labels, dead)
+            walk = _FunctionWalk(self, definition, labels, dead, decided)
             walk.walk(definition, None, 0, None)
             walk.finish()
             if not settled:
@@ -799,10 +819,11 @@ class _Extractor:
                 else:
                     labels |= walk.goto_targets
                     continue
-            never_read = walk.never_read()
-            if never_read <= dead:
+            never_read, image_read = walk.never_read(), walk.read_only_where_the_image_decides()
+            if never_read <= dead and image_read <= decided:
                 break
             dead |= never_read
+            decided |= image_read - dead
         self.analyzing.discard(name)
         self.analyses[name] = walk
         return walk
@@ -941,6 +962,10 @@ _NAMING_KINDS = (K.DECL_REF_EXPR, K.MEMBER_REF_EXPR, K.CALL_EXPR)
 _C_WORDS = frozenset({
     "struct", "union", "enum", "const", "volatile", "unsigned", "signed", "char", "short", "int", "long", "void",
     "float", "double", "_Bool", "bool", "sizeof", "typeof", "__typeof__", "default", "NULL",
+    # Statement keywords, which a statement expression in an association may hold (WRITE_ONCE's do
+    # ... while (0) written out).
+    "do", "while", "for", "if", "else", "switch", "case", "break", "continue", "return", "goto",
+    "static", "register", "auto", "extern", "inline", "__inline__", "asm", "__asm__", "__volatile__",
 })  # fmt: skip
 
 
@@ -1541,6 +1566,7 @@ class _FunctionWalk:
         cursor: ci.Cursor,
         live_labels: frozenset[str] = frozenset(),
         dead_variables: frozenset[int] = frozenset(),
+        decided_variables: frozenset[int] = frozenset(),
     ) -> None:
         self.x = extractor
         self.cursor = cursor
@@ -1558,6 +1584,8 @@ class _FunctionWalk:
         # labels the gotos in code target, for the next walk (``_Extractor.analysis``).
         self.live_labels = live_labels
         self.dead_variables = dead_variables
+        self.decided_variables = decided_variables
+        self.decided_reads: collections.Counter[int] = collections.Counter()  # reads the image decides
         self.goto_targets: set[str] = set()
         self.reads: collections.Counter[int] = collections.Counter()
         self.stores: set[int] = set()  # the references that are the target of a store, not a read
@@ -1596,6 +1624,23 @@ class _FunctionWalk:
         with a cleanup attribute, which its cleanup receives. A parameter may have any type: one of
         array type is a pointer (free_cpumask_var's cpumask_var_t), and a struct passed by value
         that is never read is not copied (is_mergeable_vm_userfaultfd_ctx)."""
+        return frozenset(
+            variable.hash
+            for variable in self.tracked_variables()
+            if self.reads[variable.hash] == 0 and self.decided_reads[variable.hash] == 0
+        )
+
+    def read_only_where_the_image_decides(self) -> frozenset[int]:
+        """The variables whose every read in compiled code is where the image decides: under a
+        __builtin_constant_p choice, or an argument a callee that is not inline ignores."""
+        return frozenset(
+            variable.hash
+            for variable in self.tracked_variables()
+            if self.reads[variable.hash] == 0 and self.decided_reads[variable.hash] > 0
+        )
+
+    def tracked_variables(self) -> list[ci.Cursor]:
+        """The parameters, and the scalar locals without a cleanup, that are not volatile."""
         parameters = list(self.cursor.get_arguments() or [])
         locals_ = [
             node
@@ -1605,11 +1650,7 @@ class _FunctionWalk:
             and not any(child.kind == K.UNEXPOSED_ATTR for child in node.get_children())
             and node.type.get_canonical().kind not in (TK.RECORD, *_ARRAY_TYPES)
         ]
-        return frozenset(
-            variable.hash
-            for variable in [*parameters, *locals_]
-            if self.reads[variable.hash] == 0 and not variable.type.is_volatile_qualified()
-        )
+        return [variable for variable in [*parameters, *locals_] if not variable.type.is_volatile_qualified()]
 
     # Guards ---------------------------------------------------------------------------------
 
@@ -2456,7 +2497,10 @@ class _FunctionWalk:
                     if child.kind == K.LABEL_REF:
                         self.goto_guards[child.spelling].append(way)
             elif kind == K.DECL_REF_EXPR and _is_local(node.referenced) and node.hash not in self.stores:
-                self.reads[node.referenced.hash] += 1
+                if self.conditional:
+                    self.decided_reads[node.referenced.hash] += 1
+                else:
+                    self.reads[node.referenced.hash] += 1
         stored = _store_target(node)
         if stored is not None and _strip_parens(stored).kind == K.DECL_REF_EXPR:
             # v = e, v op= e and v++ store into v; they read v's value only to store into it.
@@ -2468,12 +2512,18 @@ class _FunctionWalk:
                 and parent is not None
                 and parent.kind in _STATEMENT_PARENTS
                 and variable is not None
-                and variable.hash in self.dead_variables
+                and variable.hash in self.dead_variables | self.decided_variables
             ):
                 # A store, as a statement, to a variable nothing reads (local_lock's __tl): only
-                # what the stored value's computation does besides computing it is code.
+                # what the stored value's computation does besides computing it is code. One read
+                # only where the image decides is stored only where the image has it.
                 self.walk(children[0], node, 0, reason, generic)
-                self.discard(children[1], node, 1, generic)
+                if variable.hash in self.dead_variables:
+                    self.discard(children[1], node, 1, generic)
+                else:
+                    self.conditional += 1
+                    self.walk(children[1], node, 1, reason, generic)
+                    self.conditional -= 1
                 return
         if kind == K.CALL_EXPR:
             self.call(node, parent, reason, generic)
@@ -2520,10 +2570,16 @@ class _FunctionWalk:
             # The initial value of a variable nothing reads is not computed (ns = current_user_ns()
             # passed only to make_kgid, which ignores it).
             dead_store = reason is None and initializer is not None and node.hash in self.dead_variables
+            decided = reason is None and initializer is not None and node.hash in self.decided_variables
             for child_index, child in enumerate(children):
                 if initializer is not None and child == initializer:
                     if dead_store:
                         self.discard(child, node, child_index, generic)
+                    elif decided:
+                        # free_area_init_core's nid, read only by zone_init_internals, which ignores it.
+                        self.conditional += 1
+                        self.walk(child, node, child_index, reason, generic)
+                        self.conditional -= 1
                     else:
                         self.walk(child, node, child_index, reason, generic)
                 elif child.kind.is_expression():

@@ -23,20 +23,22 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   member that decays) is marked `address`.
 - **What the compiler removes is left out**, and kept with a reason: `sizeof`/`_Alignof` operands,
   `typeof` and cast types, const scalars, the unselected associations of `_Generic` (their types are
-  read from the macro bodies that write them, or, where a macro pastes them together, the one
-  association with the selection's own type is the selected one; a call of the function a `_Generic`
-  selects is a direct call), branches whose condition folds to a constant (also through inline
-  helpers that return one truth value and locals that keep their initializer; a weak definition
-  decides nothing, because another unit may replace it), the cases a `switch` on a value clang folds
-  does not reach (`switch (sizeof(x))`, `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or
-  `||`, discarded values (`(void)x`, `(x, 0)`, an expression statement such as `get_user_ns(ns);`,
+  read from the macro bodies that write them, a typedef name standing for its type, or, where a
+  macro pastes them together, the one association with the selection's own type is the selected
+  one; a call of the function a `_Generic` selects is a direct call), branches whose condition
+  folds to a constant (also through inline helpers that return one truth value and locals that
+  keep their initializer; a weak definition decides nothing, because another unit may replace it),
+  the cases a `switch` on a value clang folds does not reach (`switch (sizeof(x))`,
+  `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or `||`, discarded values
+  (`(void)x`, `(x, 0)`, an expression statement such as `get_user_ns(ns);`,
   stores to a local or a parameter that compiled code never reads, such as `local_lock`'s `__tl`,
   and arguments to a parameter the callee never reads in compiled code), of which only the parts
   with an effect are code (`psi_sched_switch(..., !task_on_rq_queued(prev) || p->x)` keeps the
   `READ_ONCE` and drops the read of `p->x`; the last statement of `({ ... })` is its value).
   A parameter is ignored transitively (`from_kuid_munged` passes its namespace only to
   `from_kuid`, which ignores it), whatever its type (an array parameter is a pointer, a struct
-  passed by value need not be copied); for a callee that is not inline the image decides. Also left
+  passed by value need not be copied); for a callee that is not inline the image decides, and so it
+  does for the value of a local only such an argument reads (`free_area_init_core`'s `nid`). Also left
   out: the operands of `__builtin_constant_p`, symbols named only in `typeof`, and statements after
   a `return`, a `goto`, a noreturn builtin or function, or a `do { ... } while (0)` that ends in one
   (`BUG()`); a label is code only when control falls into it or a goto in code targets it. A

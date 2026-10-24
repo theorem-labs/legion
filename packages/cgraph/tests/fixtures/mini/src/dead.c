@@ -324,3 +324,54 @@ long dd_static_callee(struct box *b)
 {
 	return dd_init(b, dd_current_ns());
 }
+
+/* include/linux/local_lock_internal.h __local_lock_acquire: _Generic((lock), local_trylock_t *: ...,
+ * local_lock_t *: (void)0), where the control is this_cpu_ptr()'s typeof expression and the
+ * associations name typedefs. The selected association is local_lock_t's, so __tl is never read. */
+typedef struct dd_lock {
+	int held;
+} dd_lock_t;
+typedef struct dd_trylock {
+	int acquired;
+} dd_trylock_t;
+dd_lock_t dd_lock_one;
+
+static inline void dd_lock_acquire(dd_lock_t *l)
+{
+	(void)l;
+}
+
+/* this_cpu_ptr(ptr): RELOC_HIDE((typeof(*(ptr)) *)(unsigned long)(ptr), offset), whose value has type
+ * typeof(ptr): clang spells the type of the _Generic's control with typeof. */
+#define dd_hide(ptr) ({ unsigned long __ptr = (unsigned long)(ptr); (typeof(ptr))__ptr; })
+#define dd_this_ptr(ptr) dd_hide((typeof(*(ptr)) *)((unsigned long)(ptr)))
+
+#define dd_local_lock(lock)                                                         \
+	do {                                                                        \
+		dd_trylock_t *__tl;                                                 \
+		dd_lock_t *__l;                                                     \
+		__l = (dd_lock_t *)(lock);                                          \
+		__tl = (dd_trylock_t *)__l;                                         \
+		_Generic((lock), dd_trylock_t *: ({ do { __tl->acquired = 1; } while (0); }), dd_lock_t *: (void)0); \
+		dd_lock_acquire(__l);                                               \
+	} while (0)
+
+void dd_generic_lock(void)
+{
+	dd_local_lock(dd_this_ptr(&dd_lock_one));
+}
+
+/* mm/mm_init.c free_area_init_core: int nid = pgdat->node_id, then zone_init_internals(zone, j, nid, ...),
+ * a static callee that never reads nid without NUMA. The local is read only by an argument the image
+ * decides, so its initial value is the image's to decide too. */
+static void dd_init_nid(struct box *b, long nid)
+{
+	b->size = 1;
+}
+
+void dd_conditional_local(struct box *b, struct dd_holder *h)
+{
+	long nid = h->ctx.id;
+
+	dd_init_nid(b, nid);
+}

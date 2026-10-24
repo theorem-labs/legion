@@ -675,3 +675,25 @@ def test_an_argument_with_a_call_to_a_static_callee_that_ignores_it_is_left_to_t
     (call,) = [call for call in events["calls"] if call["callee"] == "dd_current_ns"]
     assert call.get("conditional") is True
     assert callees(dead_facts, "dd_static_callee") == {"dd_init", "dd_current_ns"}
+
+
+def test_a_generic_on_typedef_names_with_a_typeof_control_is_selected(dead_facts: dict[str, Any]) -> None:
+    """local_lock(&radix_tree_preloads.lock): the local_lock_t association is selected, so the
+    trylock store and __tl are not code (llvm-objdump: dd_generic_lock is a bare ret)."""
+    events = fact_events(dead_facts, "dd_generic_lock")
+    assert (events["accesses"], events["field_accesses"]) == ([], [])
+    assert ("dd_trylock", "generic_unselected") in unevaluated(dead_facts, "dd_generic_lock")
+
+
+def test_a_local_read_only_where_the_image_decides_has_an_initial_value_the_image_decides(
+    dead_facts: dict[str, Any],
+) -> None:
+    """free_area_init_core's nid = pgdat->node_id, read only by zone_init_internals, which ignores it."""
+    (field,) = fact_events(dead_facts, "dd_conditional_local")["field_accesses"]
+    # h->ctx.id: one access, of the top member, at ctx + id.
+    assert (field["struct"], field["field"], field["displacement"], field.get("conditional")) == (
+        "dd_ns",
+        "id",
+        16,
+        True,
+    )
