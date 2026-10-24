@@ -614,6 +614,27 @@ def test_the_offsets_of_each_struct_inside_a_global_the_function_names_come_from
     }
 
 
+def test_a_global_the_image_decides_still_gives_the_places_of_its_structs() -> None:
+    """anon_vma_interval_tree_insert: rb_insert_augmented(…, &augment), augment a const table whose read
+    is left to the image (``conditional``): the image forms no address of it, yet the function's
+    rb_augment_callbacks field is in it (the classifier's const_table_call_folded)."""
+    records = {"inner@a.c:16": _record("inner", ("x", 0, 8, None))}
+    access = {"unit": {**global_unit("G"), "record": "inner"}, "access": "read", "field": None, "provenance": where(),
+              "conditional": True}  # fmt: skip
+    f = function("f", accesses=(access,))
+    f["events"]["field_accesses"] = [
+        {"struct": "inner", "field": "x", "offset": 0, "displacement": 0, "base": "global", "size": 8,
+         "bitfield": False, "provenance": where()}
+    ]  # fmt: skip
+    image = StubImage({"f": [(0x100, False, "")]}, {})
+    image.object_symbols = {"G": [Symbol(0x9000, 16, "G", ".rodata", False, "")]}
+    graph = build({"a.c": {**unit(f), "records": records}}, image)
+    assert graph["analysis"]["global_struct_offsets"] == {
+        "function:f": [{"global": "G", "struct": "inner", "offsets": [0]}]
+    }
+    assert edges(graph, "access", "function:f") == []
+
+
 def _global_graph(item: dict[str, Any], places: list[int], image_offsets: list[int]) -> dict[str, Any]:
     graph = _structure_graph(item, ["tk_data"], {})
     graph["analysis"]["image"]["globals"] = [

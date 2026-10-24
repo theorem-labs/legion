@@ -1401,6 +1401,9 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                 continue
             unit_id = linker.unit_id(unit)
             if access.get("conditional") and unit["kind"] == "global" and unit["name"] not in addressed:
+                if unit.get("record"):
+                    # The C names the global: its structs' places hold for the function's fields.
+                    named_records[identity][unit["name"]] = unit["record"]
                 exclude("access", "image_decided", identity, unit_id, {"event": "access"}, access["provenance"])
                 continue
             if access.get("generic") and (unit["kind"] != "global" or unit["name"] not in addressed):
