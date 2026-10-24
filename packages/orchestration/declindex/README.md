@@ -108,6 +108,8 @@ declindex refresh --config <cfg> && declindex ledger --config <cfg>
 
 The landing program sets `LAND_COMMIT` and `LAND_PART`; `declindex` reads `LAND_COMMIT` and does not read `LAND_PART`. With a 40-hex lowercase `LAND_COMMIT`, `refresh` runs under the index's refresh lock, and takes the write lock only to write the index ([Landing containers](#landing-containers)). It refuses tracked tree changes, recognizes an index that already covers the commit, fetches a missing commit from configured `remote`, checks out the commit, runs configured `build` within `build_timeout` (six hours by default), records `sources`, reads the reference files, and records the landing (the commit and the one it replaced). With `lean.export` it then reads the compiled part under the same refresh lock. An index covers the commit only when it read that commit or a descendant completely: without unreadable modules, with its declaration graph, and with the compiled part when `lean.export` is on. So a retry after a failed build, reference read or compiled step runs again. A refresh queued behind another's lock ends when it gets SIGTERM, SIGINT or SIGHUP.
 
+The fetch writes the remote's branches only under `refs/declindex/remote/<pid>-<random>/`, a namespace of that run, and deletes those refs when the sync ends; the checkout is by hash. So refreshes in several worktrees of one repository, which share its refs, never move each other's refs.
+
 `refresh` exits 0 after reading the build, 3 when it cannot safely read it, 75 for a failed fetch, build timeout, or signalled build, and 2 for usage. A configured build that exits nonzero exits 3. A registry defect is a note, not a failure.
 
 ### `land-hash`
