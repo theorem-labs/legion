@@ -44,7 +44,7 @@ An owner runs:
 declindex --config <cfg> gate --proposer <owner-id> [--accepted-by <owner-id>] PROPOSAL.json
 ```
 
-`PROPOSAL.json` has `id`, `concept` (`name`, `home`, `meaning`, and optional `extends`), and `source`, a Lean module that declares the concept. It carries no forms, and any `accepted_by` or `accepted_near` it carries is ignored. Before deciding, the gate requires the sandbox, an index at the tree's HEAD whose compiled part is of that commit, and a registry directory without local changes once it has taken its snapshot of the registry at that commit. Failure of any of those checks is exit 3 with a cause on stderr and no librarian request. The verdict's `defects` list the registry defects that the decision left out; the gate also prints them as notes.
+`PROPOSAL.json` has `id`, `concept` (`name`, `home`, `meaning`, and optional `extends`), and `source`, a Lean module that declares the concept. It carries no forms, and any `accepted_by` or `accepted_near` it carries is ignored. Before deciding, the gate requires the sandbox, an index at the tree's HEAD whose compiled part is of that commit, and a registry directory without local changes once it has taken its snapshot of the registry at that commit. Failure of any of those checks is exit 3 with a cause on stderr and no librarian request. The verdict's `defects` list the registry's defects: every loader defect, and each pending concept that the decision left out of the forms because its stored source no longer compiles. The gate also prints them as notes.
 
 | Exit | Verdict | Owner action |
 | --- | --- | --- |

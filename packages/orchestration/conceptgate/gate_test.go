@@ -113,7 +113,7 @@ func gateWith(t *testing.T, compiled bool) (*Gate, *recordingLibrarian) {
 		t.Fatal(err)
 	}
 	lib := &recordingLibrarian{}
-	return &Gate{Index: s, Tree: spec, Registry: registry, Compiled: co, Librarian: lib, WorkDir: t.TempDir()}, lib
+	return &Gate{Index: s, Tree: spec, Registry: registry, AdditionRoot: "registry", Compiled: co, Librarian: lib, WorkDir: t.TempDir()}, lib
 }
 
 func runGit(t *testing.T, dir string, args ...string) {
@@ -302,5 +302,23 @@ func TestGateDropsAProposalsOwnAcceptedNear(t *testing.T) {
 	}
 	if strings.Contains(v.Addition.Content, "accepted_near") {
 		t.Fatalf("the addition keeps the proposal's accepted_near:\n%s", v.Addition.Content)
+	}
+}
+
+// OpenGate always sets AdditionRoot, the registry's path in the repository. A gate without one gives no addition
+// path: it does not derive one from Registry, which OpenGate reads from a snapshot outside the repository.
+func TestAnAdditionPathNeedsTheGatesAdditionRoot(t *testing.T) {
+	tree := t.TempDir()
+	g := &Gate{Tree: declindex.Tree{Source: tree}, Registry: filepath.Join(tree, "registry")}
+	if path, err := g.additionPath("k"); err == nil {
+		t.Errorf("a gate without AdditionRoot gave the addition path %q", path)
+	}
+	g.AdditionRoot = "proj/registry"
+	if path, err := g.additionPath("k"); err != nil || path != "proj/registry/concepts/k.yaml" {
+		t.Errorf("addition path %q, %v; want proj/registry/concepts/k.yaml", path, err)
+	}
+	g.AdditionRoot = "../registry"
+	if path, err := g.additionPath("k"); err == nil {
+		t.Errorf("an AdditionRoot outside the repository gave the addition path %q", path)
 	}
 }

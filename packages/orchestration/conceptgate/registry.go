@@ -120,9 +120,10 @@ func decodeConcept(raw []byte) (Concept, error) {
 }
 
 // Load reads a format-2 registry directory. Defects describe the concept files that the loader refuses (YAML that
-// does not decode, an unknown key, a concept that fails its checks), which it leaves out, and duplicate concepts,
-// invalid file keys and unknown extensions; they do not stop callers from checking the valid entries. Only a
-// registry.yaml that is missing, malformed or of another format, or a file that cannot be read, is an error.
+// does not decode, an unknown key, a concept that fails its checks), which it leaves out, and duplicate names and
+// compiled hashes, wrongly keyed files and extends of concepts that are not registered; they do not stop callers
+// from checking the valid entries. Only a registry.yaml that is missing, malformed or of another format, or a file
+// that cannot be read, is an error.
 func Load(dir string) (Registry, []Defect, error) {
 	info, err := os.Stat(dir)
 	if err != nil {

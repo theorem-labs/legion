@@ -68,8 +68,10 @@ type Verdict struct {
 	CompiledHash string    `json:"compiled_hash,omitempty"`
 	VerdictID    string    `json:"verdict_id"`
 	Addition     *Addition `json:"addition,omitempty"`
-	// Defects are the registry defects that the decision left out: refused concept files, and pending concepts
-	// whose stored source no longer compiles.
+	// Defects are the registry's defects at this decision: every defect that Load reports (a concept file that it
+	// refused and left out, a duplicate name or compiled hash, a wrongly keyed file, an extends of a concept that is
+	// not registered), and each pending concept whose stored source no longer compiles, which the decision leaves
+	// out of the forms.
 	Defects []Defect `json:"defects,omitempty"`
 }
 
@@ -99,7 +101,7 @@ type Gate struct {
 	Tree     declindex.Tree
 	Registry string
 	// AdditionRoot is the registry directory relative to the repository root, slash-separated, as additions name
-	// it; empty is Registry relative to Tree.Source. OpenGate sets it because it reads Registry from a snapshot.
+	// it. OpenGate sets it from the tree's path in its repository, since it reads Registry from a snapshot.
 	AdditionRoot string
 	// Compiled reads the proposal; its Forms are replaced by the registry's at each decision.
 	Compiled  *declindex.CompiledOptions
@@ -149,8 +151,7 @@ func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.Forms
 }
 
 // Decide compares a proposal with the registry and the index. An added verdict carries a canonical file; the
-// gate never writes to the registry. The verdict's defects are the registry's: files the loader refused, and
-// pending concepts whose stored source no longer compiles, which the decision leaves out.
+// gate never writes to the registry. The verdict's defects are the registry's (Verdict.Defects).
 func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (Verdict, error) {
 	bytes := options.ProposalBytes
 	if bytes == nil {
@@ -371,18 +372,10 @@ func sortMatches(ms []Match) {
 // additionPath is the repository-relative, slash-separated path of the addition file with key: the path that its
 // owner writes in its own worktree and opens with `ledger open --write`.
 func (g *Gate) additionPath(key string) (string, error) {
-	root := g.AdditionRoot
-	if root == "" {
-		rel, err := filepath.Rel(g.Tree.Source, g.Registry)
-		if err != nil {
-			return "", err
-		}
-		root = filepath.ToSlash(rel)
+	if !filepath.IsLocal(filepath.FromSlash(g.AdditionRoot)) {
+		return "", fmt.Errorf("the registry's path in the repository, %q, is not a path inside it", g.AdditionRoot)
 	}
-	if !filepath.IsLocal(filepath.FromSlash(root)) {
-		return "", fmt.Errorf("the registry %s is not inside the repository", root)
-	}
-	return path.Join(root, "concepts", key+".yaml"), nil
+	return path.Join(g.AdditionRoot, "concepts", key+".yaml"), nil
 }
 
 // conceptFile is the registry-relative path of a concept's file, as Load names it in a defect.
