@@ -274,6 +274,33 @@ void fct_pass_arrow_of_address(void)
 	fct_takes_inner(&(&fct_global)->in);
 }
 
+/* __do_adjtimex(tkd) -> __timekeeping_advance(tkd): the parameter itself, or a local equal to it, is
+ * the callee's pointer. fsnotify_path(path) -> fsnotify_parent(path->dentry): a pointer loaded
+ * through it is not. */
+void fct_takes_node(struct list_node *n);
+
+void fct_pass_parameter(struct list_node *n)
+{
+	struct list_node *same = n;
+
+	fct_takes_node(n);
+	fct_takes_node(same);
+	fct_takes_node(n->next);
+}
+
+/* A parameter the function writes (o = o->next in a walk) is not the pointer it was given. */
+long fct_reassigned_parameter(struct fct_outer *o)
+{
+	long sum = 0;
+
+	while (o) {
+		sum += o->x;
+		fct_takes_inner(&o->in);
+		o = (struct fct_outer *)o->link.next;
+	}
+	return sum;
+}
+
 /* per_cpu_ptr(): ({ __verify_pcpu_ptr(ptr); SHIFT_PERCPU_PTR(ptr, per_cpu_offset(cpu)); }). The last
  * statement is the value, and fct_offsets[cpu] is read. */
 long fct_offsets[4];

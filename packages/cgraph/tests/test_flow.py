@@ -342,7 +342,11 @@ def test_every_non_container_field_offset_of_the_unit_matches_the_image(fct_buil
         for name, fields in FIELD_DISPLACEMENTS.items()
         if any(f[3] == "container_of" for f in fields)
     }
-    assert {miss for miss in misses if miss[0] not in container} == set()
+    # &o->x is o itself (llvm-objdump: mv s0, a0; jal obj_free): no instruction carries offset 0, so the
+    # image cannot show this field; the facts mark it `address` and the checks' rule decides it. Before
+    # 6bb98770's image change it matched `sd s0, 0x0(sp)`, a stack store, by coincidence.
+    no_instruction = {("function:fct_member_address", "fct_outer", "x")}
+    assert {miss for miss in misses if miss[0] not in container} <= no_instruction
     assert offsets["matched"] >= 8
 
 
@@ -436,8 +440,24 @@ def call_argument(facts: dict[str, Any], function: str, callee: str) -> dict[str
 def test_a_member_address_argument_gives_its_displacement_from_the_parameter(fct_facts: dict[str, Any]) -> None:
     argument = call_argument(fct_facts, "fct_pass_member", "fct_takes_inner")
     assert (argument["param"], argument["displacement"]) == (0, 8)
-    # A plain pointer argument adds nothing and gives no displacement.
+    # The address of a global's storage is no offset from a parameter.
     assert "displacement" not in call_argument(fct_facts, "fct_pass_held_global", "fct_takes_inner")
+
+
+def test_a_parameter_passed_on_has_displacement_zero_and_a_loaded_pointer_none(fct_facts: dict[str, Any]) -> None:
+    """Link rebases a folded callee only through an argument with a displacement: the parameter itself
+    and a local equal to it are the callee's pointer; n->next is a value loaded through it."""
+    arguments = [call["arguments"][0] for call in fact_events(fct_facts, "fct_pass_parameter")["calls"]]
+    assert [(item.get("param"), item.get("displacement")) for item in arguments[:2]] == [(0, 0), (0, 0)]
+    assert "displacement" not in arguments[2]
+
+
+def test_a_parameter_the_function_writes_is_no_longer_its_parameter(fct_facts: dict[str, Any]) -> None:
+    events = fact_events(fct_facts, "fct_reassigned_parameter")
+    found = {(item["field"], item.get("param")) for item in events["field_accesses"]}
+    assert found == {("x", None), ("in", None), ("link", None)}
+    argument = call_argument(fct_facts, "fct_reassigned_parameter", "fct_takes_inner")
+    assert (argument["param"], argument["displacement"]) == (None, 8)
 
 
 @pytest.mark.parametrize("function", ["fct_pass_held_global", "fct_pass_arrow_of_address"])

@@ -1194,6 +1194,9 @@ class _FunctionWalk:
             referenced = node.referenced
             array = referenced.type.get_canonical().kind in _ARRAY_TYPES
             if referenced.kind == K.PARM_DECL:
+                if self.written(referenced):
+                    # A parameter the function writes (o = o->next in a walk) holds another pointer.
+                    return _Address(bits, "pointer")
                 return _Address(bits, "pointer", self.parameters.get(referenced.hash))
             if _is_global_var(referenced):
                 return _Address(bits, "global" if array else "pointer")
@@ -1248,7 +1251,7 @@ class _FunctionWalk:
         return address
 
     def local_uses(self) -> dict[str, collections.Counter[int]]:
-        """Per local, by its cursor's hash: references, plain assignments to it, writes the
+        """Per local or parameter, by its cursor's hash: references, plain assignments to it, writes the
         derivation cannot follow (``+=``, ``++``, ``&local``), and uses as a member access's base."""
         if self.uses is not None:
             return self.uses
@@ -1260,7 +1263,7 @@ class _FunctionWalk:
             node = _strip(node) if node is not None else None
             if node is None or node.kind != K.DECL_REF_EXPR or node.referenced is None:
                 return None
-            return node.referenced.hash if node.referenced.kind == K.VAR_DECL else None
+            return node.referenced.hash if node.referenced.kind in (K.VAR_DECL, K.PARM_DECL) else None
 
         for node in self.cursor.walk_preorder():
             kind = node.kind
@@ -1283,6 +1286,11 @@ class _FunctionWalk:
         self.uses = uses
         return uses
 
+    def written(self, variable: ci.Cursor) -> bool:
+        """The function assigns the variable, changes it in place or takes its address."""
+        uses = self.local_uses()
+        return bool(uses["assigned"][variable.hash] or uses["written"][variable.hash])
+
     def argument(self, expression: ci.Cursor) -> dict[str, Any]:
         """What a call argument names: its state unit, the parameter it derives from, and, for the
         address of a member reached from a pointer (wb_exit(&bdi->wb)), what that address adds to
@@ -1294,7 +1302,9 @@ class _FunctionWalk:
         if expression.type.get_canonical().kind == TK.POINTER:
             members: list[ci.Cursor] = []
             address = self.pointer(expression, 0, members, 0)
-            if members and address.base in ("pointer", "container_of"):
+            if address.base in ("pointer", "container_of") and (members or address.param is not None or address.bits):
+                # The parameter itself or a local equal to it gives 0; a member address its offset. A
+                # pointer loaded through a parameter (path->dentry) is a new base and gives none.
                 item["displacement"] = address.bits // 8
                 item["param"] = address.param
         return item
