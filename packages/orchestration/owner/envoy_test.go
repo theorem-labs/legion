@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,42 @@ func TestHTTPPublisherSendsListenerEnvelope(t *testing.T) {
 
 	if err := NewHTTPPublisher(server.URL, "envoy-bearer").Publish(context.Background(), "notifications.example.node.function:ns_match.needs", "need changed", map[string]string{"item": "need:abc"}, "need:abc"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The listener closes a keep-alive connection that idles for its IdleTimeout (60 s). A publish that reuses such a
+// connection as the listener closes it reads EOF, though the listener answered nothing. The notice carries its
+// idempotency key, which the listener dedupes on, so the publish is sent again on a new connection.
+func TestHTTPPublisherSendsAgainWhenTheListenerClosesAReusedConnection(t *testing.T) {
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			IdempotencyKey string `json:"idempotency_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, body.IdempotencyKey)
+		if len(keys) == 2 {
+			connection, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			connection.Close()
+			return
+		}
+		_, _ = w.Write([]byte(`{"event_id":"evt-` + body.IdempotencyKey + `"}`))
+	}))
+	defer server.Close()
+
+	publisher := NewHTTPPublisher(server.URL, "")
+	for _, key := range []string{"first", "second"} {
+		if err := publisher.Publish(context.Background(), "notifications.example.all", "notice", map[string]string{}, key); err != nil {
+			t.Fatalf("publish %s: %v", key, err)
+		}
+	}
+	if want := []string{"first", "second", "second"}; !slices.Equal(keys, want) {
+		t.Fatalf("the listener received keys %v, want %v", keys, want)
 	}
 }
 

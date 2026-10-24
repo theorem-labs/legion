@@ -93,6 +93,10 @@ func (p *HTTPPublisher) post(ctx context.Context, topic, message string, payload
 		return nil, fmt.Errorf("create Envoy publish request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
+	// The key makes the POST replayable to Go's transport, which then sends it again on a new connection when the
+	// listener closed the reused one (its idle timeout) before answering. The listener dedupes on the body's key, so
+	// a second send delivers nothing twice.
+	request.Header.Set("Idempotency-Key", key)
 	if p.token != "" {
 		request.Header.Set("Authorization", "Bearer "+p.token)
 	}
