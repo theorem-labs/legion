@@ -6,9 +6,6 @@ ALTER TABLE migrations
     ADD COLUMN ready_records jsonb;
 CREATE INDEX migrations_ready_event ON migrations (repo, ready_event) WHERE ready_event IS NOT NULL;
 
--- The one migration owner whose landings may carry an upstream commit as their provenance.
-ALTER TABLE repositories ADD COLUMN upstream_owner text;
-
 -- The record that advanced each contract's statement: its compatibility proof or its owner's review, with the
 -- upstream commit beside it for an upstream landing.
 ALTER TABLE contracts ADD COLUMN last_change jsonb;

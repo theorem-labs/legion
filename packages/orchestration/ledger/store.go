@@ -112,14 +112,14 @@ func (s *Store) tx(ctx context.Context, fn func(pgx.Tx) error) error {
 // lockRepo takes the repository's row lock, which serialises every change to its migrations' locks, and returns
 // the repository. A missing repository is NotFoundError.
 func lockRepo(ctx context.Context, tx pgx.Tx, name string, forUpdate bool) (Repository, error) {
-	q := `SELECT name, max_landing_rounds, coalesce(upstream_owner, ''), created_at FROM repositories WHERE name = $1`
+	q := `SELECT name, max_landing_rounds, created_at FROM repositories WHERE name = $1`
 	if forUpdate {
 		q += ` FOR UPDATE`
 	} else {
 		q += ` FOR SHARE`
 	}
 	var c Repository
-	err := tx.QueryRow(ctx, q, name).Scan(&c.Name, &c.MaxLandingRounds, &c.UpstreamOwner, &c.CreatedAt)
+	err := tx.QueryRow(ctx, q, name).Scan(&c.Name, &c.MaxLandingRounds, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, &NotFoundError{What: "repository", ID: name}
 	}

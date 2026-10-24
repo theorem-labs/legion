@@ -77,21 +77,19 @@ func TestHasOpenWorkFollowsTheOwnersOpenItems(t *testing.T) {
 	}
 }
 
-// EnsureRepoWithUpstreamOwner sets the landing-round limit and the upstream owner in one change, which one
-// repository.configured event records with both values; an empty owner clears it. EnsureRepo leaves the upstream
-// owner as it is, and a call that changes nothing appends no event.
-func TestEnsureRepoConfiguresTheUpstreamOwnerInOneChange(t *testing.T) {
+// EnsureRepo creates a repository with its landing-round limit and updates the limit. A new repository or a new limit
+// appends one repository.configured event with the limit; a call that changes nothing appends none.
+func TestEnsureRepoRecordsEachLimitChangeOnce(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	type configured struct {
-		MaxLandingRounds int    `json:"max_landing_rounds"`
-		UpstreamOwner    string `json:"upstream_owner"`
+		MaxLandingRounds int `json:"max_landing_rounds"`
 	}
 	var seen []configured
-	step := func(name string, repository ledger.Repository, rounds int, owner string, events ...configured) {
+	step := func(name string, repository ledger.Repository, rounds int, events ...configured) {
 		t.Helper()
-		if repository.Name != "u" || repository.MaxLandingRounds != rounds || repository.UpstreamOwner != owner {
-			t.Fatalf("%s: repository %+v, want %d rounds and upstream owner %q", name, repository, rounds, owner)
+		if repository.Name != "u" || repository.MaxLandingRounds != rounds {
+			t.Fatalf("%s: repository %+v, want %d rounds", name, repository, rounds)
 		}
 		seen = append(seen, events...)
 		var got []configured
@@ -106,12 +104,9 @@ func TestEnsureRepoConfiguresTheUpstreamOwnerInOneChange(t *testing.T) {
 			t.Fatalf("%s: repository.configured events %+v, want %+v", name, got, seen)
 		}
 	}
-	step("create with an upstream owner", must(s.EnsureRepoWithUpstreamOwner(ctx, "u", 2, "upstream")), 2, "upstream",
-		configured{2, "upstream"})
-	step("ensure keeps the upstream owner", must(s.EnsureRepo(ctx, "u", 2)), 2, "upstream")
-	step("the same upstream owner again", must(s.EnsureRepoWithUpstreamOwner(ctx, "u", 2, "upstream")), 2, "upstream")
-	step("a new limit keeps the upstream owner", must(s.EnsureRepo(ctx, "u", 3)), 3, "upstream", configured{3, "upstream"})
-	step("clear the upstream owner", must(s.EnsureRepoWithUpstreamOwner(ctx, "u", 3, "")), 3, "", configured{3, ""})
+	step("create", must(s.EnsureRepo(ctx, "u", 2)), 2, configured{2})
+	step("the same limit again", must(s.EnsureRepo(ctx, "u", 2)), 2)
+	step("a new limit", must(s.EnsureRepo(ctx, "u", 3)), 3, configured{3})
 }
 
 // ReleaseHolder frees, in one transaction, every lease of the stopped holder at its current

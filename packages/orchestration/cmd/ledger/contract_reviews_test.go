@@ -12,43 +12,34 @@ import (
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
-func TestRepoEnsureConfiguresAndClearsUpstreamOwner(t *testing.T) {
+// repo ensure takes a repository and a landing-round limit only: an upstream owner is not a repository setting.
+func TestRepoEnsureTakesNoUpstreamOwner(t *testing.T) {
 	call := ledgerCommand(t)
-	mustExit(t, call, 0, "repo", "ensure", "r", "1", "--upstream-owner", "upstream")
-	if got := statusUpstreamOwner(t, call); got != "upstream" {
-		t.Fatalf("upstream owner %q, want upstream", got)
+	if code, _, stderr := call("repo", "ensure", "r", "1", "--upstream-owner", "upstream"); code != 2 {
+		t.Fatalf("repo ensure --upstream-owner: code=%d stderr=%q, want a usage error", code, stderr)
 	}
-	mustExit(t, call, 0, "repo", "ensure", "r", "2")
-	if got := statusUpstreamOwner(t, call); got != "upstream" {
-		t.Fatalf("upstream owner changed without its flag: %q", got)
-	}
-	mustExit(t, call, 0, "repo", "ensure", "r", "2", "--upstream-owner", "")
-	if got := statusUpstreamOwner(t, call); got != "" {
-		t.Fatalf("upstream owner %q after clearing", got)
-	}
+	mustExit(t, call, 0, "repo", "ensure", "r", "1")
 }
 
-func TestReadyRejectsNonUpstreamOwnersInBothCLIForms(t *testing.T) {
+// ready, through flags and through a request file, takes an upstream commit from a migration of any owner.
+func TestReadyTakesUpstreamProvenanceFromAnyOwnerInBothCLIForms(t *testing.T) {
 	call := ledgerCommand(t)
-	mustExit(t, call, 0, "repo", "ensure", "r", "0", "--upstream-owner", "upstream")
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
 	mustExit(t, call, 0, "open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
-	assertUpstreamNotAllowed(t, call, []string{"--json", "ready", "r", "M-flag", "1", "--head", "head", "--upstream", "upstream-commit"})
+	mustExit(t, call, 0, "--json", "ready", "r", "M-flag", "1", "--head", "head", "--upstream", "upstream-commit")
 
-	mustExit(t, call, 0, "open", "r", "M-file", "alice", "base", "branch", "--write", "b.lean")
+	mustExit(t, call, 0, "open", "r", "M-file", "bob", "base", "branch", "--write", "b.lean")
 	file := filepath.Join(t.TempDir(), "ready.json")
 	request := `{"repo":"r","id":"M-file","generation":1,"head":"head","upstream":"upstream-commit"}`
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	assertUpstreamNotAllowed(t, call, []string{"--json", "ready", "--request-file", file})
-
-	mustExit(t, call, 0, "open", "r", "M-allowed", "upstream", "base", "branch", "--write", "c.lean")
-	mustExit(t, call, 0, "ready", "r", "M-allowed", "1", "--head", "head", "--upstream", "upstream-commit")
+	mustExit(t, call, 0, "--json", "ready", "--request-file", file)
 }
 
 func TestContractListShowsProofReviewAndUpstreamRecords(t *testing.T) {
 	call := ledgerCommand(t)
-	mustExit(t, call, 0, "repo", "ensure", "r", "0", "--upstream-owner", "upstream")
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
 
 	mustExit(t, call, 0, "contract", "register", "r", "Proof", "alice", "hash-1", "false")
 	mustExit(t, call, 0, "open", "r", "M-proof", "alice", "base", "branch", "--write", "a.lean", "--read", "Proof=hash-1")
@@ -176,36 +167,5 @@ func mustExit(t *testing.T, call ledgerCall, want int, args ...string) {
 	t.Helper()
 	if code, _, stderr := call(args...); code != want {
 		t.Fatalf("%v: code=%d stderr=%q, want %d", args, code, stderr, want)
-	}
-}
-
-func statusUpstreamOwner(t *testing.T, call ledgerCall) string {
-	t.Helper()
-	code, stdout, stderr := call("--json", "status", "r")
-	if code != 0 {
-		t.Fatalf("status: code=%d stderr=%q", code, stderr)
-	}
-	var status struct {
-		Repository struct {
-			UpstreamOwner string `json:"upstream_owner"`
-		} `json:"repository"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &status); err != nil {
-		t.Fatal(err)
-	}
-	return status.Repository.UpstreamOwner
-}
-
-func assertUpstreamNotAllowed(t *testing.T, call ledgerCall, args []string) {
-	t.Helper()
-	code, stdout, stderr := call(args...)
-	if code != 1 {
-		t.Fatalf("%v: code=%d stdout=%q stderr=%q, want 1", args, code, stdout, stderr)
-	}
-	var refusal struct {
-		Reason string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &refusal); err != nil || refusal.Reason != "upstream_not_allowed" {
-		t.Fatalf("%v: refusal=%+v stdout=%q err=%v", args, refusal, stdout, err)
 	}
 }

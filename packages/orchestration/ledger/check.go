@@ -203,7 +203,7 @@ type verdict struct {
 // Check and Land both call it, so one candidate gets the same violations, in the same order, from both. lock is the row
 // lock it takes on each contract the migration read: shareLock for a check, updateLock for a landing. DeferReads skips
 // only the comparison of the caller's read hashes and the landed commit; every rule that needs only the ledger runs.
-func evaluate(ctx context.Context, tx pgx.Tx, repository Repository, m Migration, req CheckRequest, lock string) (verdict, error) {
+func evaluate(ctx context.Context, tx pgx.Tx, m Migration, req CheckRequest, lock string) (verdict, error) {
 	var v verdict
 	if precondition, ok := candidatePrecondition(req); ok {
 		v.violations = append(v.violations, precondition)
@@ -256,9 +256,6 @@ func evaluate(ctx context.Context, tx pgx.Tx, repository Repository, m Migration
 	if len(missing) > 0 {
 		v.violations = append(v.violations, Violation{Kind: ReasonStatementUnreviewed, Name: missing[0],
 			Message: unreviewedMessage(v.changed, missing, req.StatementRecords)})
-	}
-	if upstream, blocked := upstreamViolation(repository, m, req.Upstream); blocked {
-		v.violations = append(v.violations, upstream)
 	}
 	return v, nil
 }
@@ -433,23 +430,6 @@ func checkViolations(ctx context.Context, q querier, m Migration, req CheckReque
 	return violations, nil
 }
 
-func upstreamViolation(repository Repository, migration Migration, upstream string) (Violation, bool) {
-	if upstream == "" || repository.UpstreamOwner == migration.Owner {
-		return Violation{}, false
-	}
-	if repository.UpstreamOwner == "" {
-		return Violation{
-			Kind:    ReasonUpstreamNotAllowed,
-			Message: fmt.Sprintf("repository %s has no configured upstream owner", repository.Name),
-		}, true
-	}
-	return Violation{
-		Kind: ReasonUpstreamNotAllowed,
-		Message: fmt.Sprintf("migration %s is owned by %s, not repository %s's upstream owner %s",
-			migration.ID, migration.Owner, repository.Name, repository.UpstreamOwner),
-	}, true
-}
-
 // Check decides whether a candidate change may land for a migration, by the rules Land applies. It writes nothing but
 // the event that records its decision. A refusal of the request itself (an unknown migration, a malformed candidate)
 // is an error; every reason the candidate must not land is a violation in the result.
@@ -462,15 +442,14 @@ func (s *Store) Check(ctx context.Context, req CheckRequest) (CheckResult, error
 	err = s.tx(ctx, func(tx pgx.Tx) error {
 		// A retried attempt starts from an empty result, so the result holds only what the committed attempt found.
 		res = CheckResult{Migration: cleaned.Migration, Generation: cleaned.Generation, Deferred: []string{}, Violations: []Violation{}}
-		repository, err := lockRepo(ctx, tx, cleaned.Repo, false)
-		if err != nil {
+		if _, err := lockRepo(ctx, tx, cleaned.Repo, false); err != nil {
 			return err
 		}
 		migration, err := loadMigration(ctx, tx, cleaned.Repo, cleaned.Migration, true)
 		if err != nil {
 			return err
 		}
-		v, err := evaluate(ctx, tx, repository, migration, cleaned, shareLock)
+		v, err := evaluate(ctx, tx, migration, cleaned, shareLock)
 		if err != nil {
 			return err
 		}

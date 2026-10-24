@@ -295,8 +295,8 @@ func (s *Store) StaleAgreements(ctx context.Context, repo string) ([]Agreement, 
 // names the contract, whose Reviewer is the contract's owner in the ledger and whose Head is the request's Head; or a
 // ReviewedHead equal to Head, which clears them only when every changed contract has one owner, and then counts as that
 // owner's review. A candidate with no changed contracts changes proofs only and needs none of these records. Upstream
-// is accepted only when the migration's owner is the repository's upstream owner. It is provenance only: it clears
-// neither the statement rule nor a pinned contract. The ledger trusts its caller for these records, as it does for
+// names the upstream commit a landing carries, from a migration of any owner. It is provenance only: it clears neither
+// the statement rule nor a pinned contract. The ledger trusts its caller for these records, as it does for
 // ApprovedPinned: it does not build the proof declaration or confirm that the review happened. It stores the record
 // that cleared each advanced contract, with the upstream commit beside it, as that contract's last_change, and keeps
 // the request's records in the migration.landed event.
@@ -312,15 +312,14 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 	}
 	var landed Migration
 	err = s.tx(ctx, func(tx pgx.Tx) error {
-		repository, err := lockRepo(ctx, tx, req.Repo, true)
-		if err != nil {
+		if _, err := lockRepo(ctx, tx, req.Repo, true); err != nil {
 			return err
 		}
 		migration, err := loadMigration(ctx, tx, req.Repo, req.Migration, true)
 		if err != nil {
 			return err
 		}
-		v, err := evaluate(ctx, tx, repository, migration, candidate, updateLock)
+		v, err := evaluate(ctx, tx, migration, candidate, updateLock)
 		if err != nil {
 			return err
 		}

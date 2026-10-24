@@ -185,8 +185,8 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			},
 		},
 		{
-			name: "upstream is not allowed for another migration owner",
-			kind: ledger.ReasonUpstreamNotAllowed,
+			name: "upstream provenance is accepted from any migration owner",
+			kind: "",
 			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
 				candidate.Upstream = "upstream-commit"
@@ -255,9 +255,6 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			name: "upstream provenance does not clear a statement",
 			kind: ledger.ReasonStatementUnreviewed,
 			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
-				if _, err := s.EnsureRepoWithUpstreamOwner(context.Background(), "r", 3, "alice"); err != nil {
-					t.Fatal(err)
-				}
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
 				candidate.ChangedContracts, candidate.Head, candidate.Upstream = map[string]string{"C": "hash-2"}, "head-1", "upstream-commit"
@@ -268,9 +265,6 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			name: "pinned contract remains pinned under upstream provenance",
 			kind: ledger.ReasonPinned,
 			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
-				if _, err := s.EnsureRepoWithUpstreamOwner(context.Background(), "r", 3, "alice"); err != nil {
-					t.Fatal(err)
-				}
 				parityRegister(t, s, "C", "hash-1", true)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
 				candidate.ChangedContracts, candidate.Head, candidate.Upstream = map[string]string{"C": "hash-2"}, "head-1", "upstream-commit"

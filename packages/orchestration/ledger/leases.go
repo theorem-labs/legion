@@ -9,21 +9,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// EnsureRepo creates the repository record, or updates its landing-round limit if it exists. It keeps the repository's
-// upstream owner.
+// EnsureRepo creates the repository record, or updates its landing-round limit if it exists.
 func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds int) (Repository, error) {
-	return s.ensureRepo(ctx, name, maxLandingRounds, nil)
-}
-
-// EnsureRepoWithUpstreamOwner is EnsureRepo that also sets, in the same transaction, the one migration owner whose
-// landings may carry upstream provenance. An empty owner clears it.
-func (s *Store) EnsureRepoWithUpstreamOwner(ctx context.Context, name string, maxLandingRounds int, upstreamOwner string) (Repository, error) {
-	return s.ensureRepo(ctx, name, maxLandingRounds, &upstreamOwner)
-}
-
-// ensureRepo stores the repository with its limit and, unless upstreamOwner is nil, that upstream owner. A change, or a
-// new repository, appends one repository.configured event with both values.
-func (s *Store) ensureRepo(ctx context.Context, name string, maxLandingRounds int, upstreamOwner *string) (Repository, error) {
 	if name == "" {
 		return Repository{}, invalid("empty repository name")
 	}
@@ -32,34 +19,18 @@ func (s *Store) ensureRepo(ctx context.Context, name string, maxLandingRounds in
 	}
 	var r Repository
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		var previous Repository
-		err := tx.QueryRow(ctx, `SELECT max_landing_rounds, coalesce(upstream_owner, '') FROM repositories WHERE name = $1 FOR UPDATE`, name).
-			Scan(&previous.MaxLandingRounds, &previous.UpstreamOwner)
-		exists := err == nil
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		var prev *int
+		_ = tx.QueryRow(ctx, `SELECT max_landing_rounds FROM repositories WHERE name = $1 FOR UPDATE`, name).Scan(&prev)
+		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds) VALUES ($1, $2)
+			ON CONFLICT (name) DO UPDATE SET max_landing_rounds = EXCLUDED.max_landing_rounds
+			RETURNING name, max_landing_rounds, created_at`, name, maxLandingRounds).
+			Scan(&r.Name, &r.MaxLandingRounds, &r.CreatedAt); err != nil {
 			return err
 		}
-		var owner string
-		if upstreamOwner != nil {
-			owner = *upstreamOwner
-		}
-		// Without an upstream owner, the conflict arm keeps the row's own value, which a concurrent first ensure of
-		// this repository may have set after the read above.
-		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds, upstream_owner) VALUES ($1, $2, nullif($3, ''))
-			ON CONFLICT (name) DO UPDATE SET max_landing_rounds = EXCLUDED.max_landing_rounds,
-				upstream_owner = CASE WHEN $4 THEN EXCLUDED.upstream_owner ELSE repositories.upstream_owner END
-			RETURNING name, max_landing_rounds, coalesce(upstream_owner, ''), created_at`,
-			name, maxLandingRounds, owner, upstreamOwner != nil).
-			Scan(&r.Name, &r.MaxLandingRounds, &r.UpstreamOwner, &r.CreatedAt); err != nil {
-			return err
-		}
-		if exists && previous.MaxLandingRounds == r.MaxLandingRounds && previous.UpstreamOwner == r.UpstreamOwner {
+		if prev != nil && *prev == maxLandingRounds {
 			return nil
 		}
-		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{
-			"max_landing_rounds": maxLandingRounds,
-			"upstream_owner":     r.UpstreamOwner,
-		})
+		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{"max_landing_rounds": maxLandingRounds})
 	})
 	return r, err
 }

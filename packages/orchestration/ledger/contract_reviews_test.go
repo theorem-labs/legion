@@ -93,26 +93,26 @@ func TestPerContractReviews(t *testing.T) {
 	}
 }
 
-func TestUpstreamProvenanceStillNeedsAuthorizationAndApproval(t *testing.T) {
+// TestUpstreamProvenanceNeitherClearsNorBlocks catches upstream provenance that acts as an authorization: a migration
+// of any owner may carry an upstream commit through ready, check and land, and the commit still clears neither the
+// statement rule nor a pinned contract.
+func TestUpstreamProvenanceNeitherClearsNorBlocks(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
-	must(s.EnsureRepoWithUpstreamOwner(ctx, "r", 3, "upstream"))
 
-	denied := must(open(t, s, "M-denied", "alice", []string{"a.lean"}, nil))
-	deniedRequest := ledger.LandRequest{Repo: "r", Migration: denied.ID, Generation: denied.Generation, Commit: "commit-denied", ChangedPaths: []string{"a.lean"}, Current: map[string]string{}, StatementRecords: ledger.StatementRecords{Upstream: "upstream-commit"}}
-	_, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: denied.ID, Generation: denied.Generation, StatementRecords: ledger.StatementRecords{Head: "head-denied", Upstream: "upstream-commit"}})
-	wantRefusal(t, err, ledger.ReasonUpstreamNotAllowed)
-	deniedCheck := must(s.Check(ctx, checkRequestFor(deniedRequest)))
-	if deniedCheck.Pass || len(deniedCheck.Violations) != 1 || deniedCheck.Violations[0].Kind != ledger.ReasonUpstreamNotAllowed {
-		t.Fatalf("denied upstream check: %+v", deniedCheck)
+	provenance := must(open(t, s, "M-provenance", "alice", []string{"a.lean"}, nil))
+	provenanceRequest := ledger.LandRequest{Repo: "r", Migration: provenance.ID, Generation: provenance.Generation, Commit: "commit-provenance", ChangedPaths: []string{"a.lean"}, Current: map[string]string{}, StatementRecords: ledger.StatementRecords{Upstream: "upstream-commit"}}
+	must(s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: provenance.ID, Generation: provenance.Generation, StatementRecords: ledger.StatementRecords{Head: "head-provenance", Upstream: "upstream-commit"}}))
+	if check := must(s.Check(ctx, checkRequestFor(provenanceRequest))); !check.Pass {
+		t.Fatalf("upstream provenance check: %+v", check)
 	}
-	wantRefusal(t, landError(s, deniedRequest), ledger.ReasonUpstreamNotAllowed)
+	must(s.Land(ctx, provenanceRequest))
 
 	must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
-	unreviewed := must(open(t, s, "M-unreviewed", "upstream", []string{"b.lean"}, map[string]string{"C": "hash-1"}))
+	unreviewed := must(open(t, s, "M-unreviewed", "bob", []string{"b.lean"}, map[string]string{"C": "hash-1"}))
 	unreviewedRequest := ledger.LandRequest{Repo: "r", Migration: unreviewed.ID, Generation: unreviewed.Generation, Commit: "commit-unreviewed", ChangedPaths: []string{"b.lean"}, Current: map[string]string{"C": "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-2"}, Head: "head-unreviewed", Upstream: "upstream-commit"}}
 	if _, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: unreviewed.ID, Generation: unreviewed.Generation, StatementRecords: ledger.StatementRecords{Head: "head-unreviewed", ChangedContracts: map[string]string{"C": "hash-2"}, Upstream: "upstream-commit"}}); err != nil {
-		t.Fatalf("ready accepts upstream owner provenance: %v", err)
+		t.Fatalf("ready of an unreviewed statement change with upstream provenance: %v", err)
 	}
 	unreviewedCheck := must(s.Check(ctx, checkRequestFor(unreviewedRequest)))
 	if unreviewedCheck.Pass || len(unreviewedCheck.Violations) != 1 || unreviewedCheck.Violations[0].Kind != ledger.ReasonStatementUnreviewed {
@@ -245,9 +245,6 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := newStore(t)
-			if test.upstream != "" {
-				must(s.EnsureRepoWithUpstreamOwner(ctx, "r", 3, "upstream"))
-			}
 			must(s.RegisterContract(ctx, "r", "C", "alice", "hash-1", false))
 			migration := must(open(t, s, test.migration, test.owner, []string{"a.lean"}, map[string]string{"C": "hash-1"}))
 			request := ledger.LandRequest{Repo: "r", Migration: migration.ID, Generation: migration.Generation, Commit: "commit-1", ChangedPaths: []string{"a.lean"}, Current: map[string]string{"C": "hash-1"}, StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{"C": "hash-2"}, Head: "head-1", CompatibilityProof: test.proof, Reviews: test.reviews, ReviewedHead: test.reviewed, Upstream: test.upstream}}
@@ -271,7 +268,6 @@ func TestContractsRecordTheChangeThatAdvancedThem(t *testing.T) {
 func TestContractJSONReadsBack(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
-	must(s.EnsureRepoWithUpstreamOwner(ctx, "r", 3, "upstream"))
 	review := func(name string) []ledger.Review {
 		return []ledger.Review{{Contract: name, Reviewer: "alice", Head: "head-" + name}}
 	}

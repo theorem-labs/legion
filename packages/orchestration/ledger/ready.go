@@ -9,9 +9,8 @@ import (
 
 // ReadyRequest stores the exact statement records an owner offers for a migration's landing.
 //
-// Ready refuses an upstream record unless the migration's owner is the repository's upstream owner. It checks the other
-// records' shape, by the rules check and land apply, and stores them as given: Land applies the review and pinned rules
-// when the migration lands.
+// Ready checks the records' shape, by the rules check and land apply, and stores them as given: Land applies the
+// review and pinned rules when the migration lands.
 type ReadyRequest struct {
 	Repo       string `json:"repo"`
 	ID         string `json:"id"`
@@ -58,8 +57,7 @@ func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error
 	}
 	ready := ReadyRecord{ID: req.ID, Generation: req.Generation, StatementRecords: req.withEmptyLists()}
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		repository, err := lockRepo(ctx, tx, req.Repo, true)
-		if err != nil {
+		if _, err := lockRepo(ctx, tx, req.Repo, true); err != nil {
 			return err
 		}
 		migration, err := lockOpenAt(ctx, tx, req.Repo, req.ID, req.Generation)
@@ -68,9 +66,6 @@ func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error
 		}
 		if migration.EscalatedAt != nil {
 			return refuse(ReasonEscalated, "migration %s was escalated to the steward: %s", req.ID, migration.EscalationReason)
-		}
-		if upstream, blocked := upstreamViolation(repository, migration, req.Upstream); blocked {
-			return refusalForViolation(upstream)
 		}
 		event, err := eventRecord(ctx, tx, req.Repo, "migration.ready", req.ID, migration.Owner, readyEventData{
 			Generation: req.Generation, StatementRecords: ready.StatementRecords,

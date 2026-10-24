@@ -8,7 +8,6 @@ type Repository struct {
 	// MaxLandingRounds is how many failed landing rounds a migration may use before it goes to the steward.
 	// Zero turns escalation off.
 	MaxLandingRounds int       `json:"max_landing_rounds"`
-	UpstreamOwner    string    `json:"upstream_owner,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 
