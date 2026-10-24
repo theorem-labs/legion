@@ -14541,6 +14541,8 @@ var DISPATCH_KEY_PATTERN = /^([A-Z][A-Z0-9]*)-([0-9]+)$/;
 function isLegionRole(role) {
   return LEGION_ROLES.some((candidate) => candidate === role);
 }
+var OWNER_NODE_KINDS = ["function", "struct", "global", "percpu", "subsystem"];
+var NODE_OWNER_KEY = new RegExp(`^(?:${OWNER_NODE_KINDS.join("|")}):\\S+$`);
 // ../contracts/src/repo.ts
 function canonicalRepo(owner, repo) {
   return `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase().replace(/\.git$/, "")}`;

@@ -37191,6 +37191,8 @@ var DISPATCH_KEY_PATTERN = /^([A-Z][A-Z0-9]*)-([0-9]+)$/;
 function isLegionRole(role) {
   return LEGION_ROLES.some((candidate) => candidate === role);
 }
+var OWNER_NODE_KINDS = ["function", "struct", "global", "percpu", "subsystem"];
+var NODE_OWNER_KEY = new RegExp(`^(?:${OWNER_NODE_KINDS.join("|")}):\\S+$`);
 // ../contracts/src/repo.ts
 function canonicalRepo(owner, repo) {
   return `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase().replace(/\.git$/, "")}`;
@@ -44330,10 +44332,22 @@ var LegionOperatorClaimResponse = exports_external.strictObject({
   pending: legionDeliveryView.optional(),
   suspendedBy: exports_external.enum(["unknown", "operator", "daemon", "exit"]).optional(),
   suspensionHeld: exports_external.literal(true).optional(),
-  pluginContract: exports_external.number().int().nonnegative()
+  pluginContract: exports_external.number().int().nonnegative(),
+  ownerKey: nonEmptyString.optional()
 });
 var LegionOperatorClaimsResponse = exports_external.strictObject({
   claims: exports_external.array(LegionOperatorClaimResponse)
+});
+var LegionOwnerRefusal = exports_external.strictObject({
+  repository: nonEmptyString,
+  owner: nonEmptyString,
+  revision: exports_external.number().int().positive(),
+  reason: nonEmptyString,
+  refusedAt: exports_external.string().datetime({ offset: true }),
+  recorded: exports_external.boolean()
+});
+var LegionOwnerRefusalsResponse = exports_external.strictObject({
+  refused: exports_external.array(LegionOwnerRefusal)
 });
 var LegionGrantResponse = exports_external.strictObject({
   grantId: nonEmptyString,
