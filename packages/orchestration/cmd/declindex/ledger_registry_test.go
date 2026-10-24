@@ -134,7 +134,9 @@ func checkRegistry(t *testing.T, config, landed string) registryCheck {
 func conceptPath(key string) string { return "registry/concepts/" + key + ".yaml" }
 
 // A landing whose registry recheck cannot run at all exits 75, so the landing program runs that landing's check
-// again; the check of that landing compares the same two commits even after later landings moved the index.
+// again; the check of that landing compares the same two commits even after later landings moved the index. The
+// later landing's own check, and a check without LAND_COMMIT (the index's commit, that later landing), do not include
+// it. A LAND_COMMIT that the tree does not hold cannot be compared with the index's commit: exit 3.
 func TestARegistryRecheckThatCannotRunIsRetriedForItsLanding(t *testing.T) {
 	config, tree := registryFixture(t, unavailableLean, nil)
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", conceptKeyB+".yaml"), registryConcept("P.New", conceptKeyB, "p2", "n < 4"))
@@ -150,6 +152,36 @@ func TestARegistryRecheckThatCannotRunIsRetriedForItsLanding(t *testing.T) {
 	}
 	if r := checkRegistry(t, config, third); r.code != 0 || r.added == nil || len(r.added) != 0 {
 		t.Fatalf("the check of the unrelated landing: want exit 0 and no addition, got %+v", r)
+	}
+	if r := checkRegistry(t, config, ""); r.code != 0 || r.added == nil || len(r.added) != 0 {
+		t.Errorf("the check without LAND_COMMIT, of the index's commit (the unrelated landing): want exit 0 and no addition, got %+v", r)
+	}
+	if r := checkRegistry(t, config, strings.Repeat("0", 40)); r.code != 3 || !strings.Contains(r.stderr, "compare commits") {
+		t.Errorf("the check of a LAND_COMMIT that the tree does not hold: want exit 3, unable to compare commits, got %+v", r)
+	}
+}
+
+// A refused concept file is the defect of that file alone: a good concept file that the same landing adds is still
+// listed and rechecked, the ledger reports only the refused file, and its exit is the defect's or the recheck's,
+// never "unable to check the contracts" (3). The index and its queries go on.
+func TestARefusedConceptFileIsTheDefectOfThatFileAlone(t *testing.T) {
+	config, tree := registryFixture(t, unavailableLean, nil)
+	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "P.Bad.yaml"), "name: P.Bad\nhome: Golden.lean\nmeaning: Register x2 is aligned. It stays so.\n")
+	writeTestFile(t, filepath.Join(tree, "registry", "concepts", conceptKeyB+".yaml"), registryConcept("P.New", conceptKeyB, "p2", "n < 4"))
+	landed := land(t, config, tree, "a good and a refused concept file")
+	r := checkRegistry(t, config, landed)
+	if want := []string{conceptPath("P.Bad"), conceptPath(conceptKeyB)}; !slices.Equal(r.added, want) {
+		t.Errorf("added %v, want both files of the landing %v", r.added, want)
+	}
+	if len(r.defects) != 1 || !strings.Contains(r.defects[0], "concepts/P.Bad.yaml") {
+		t.Errorf("defects %v, want the refused file P.Bad.yaml alone", r.defects)
+	}
+	// The good concept's recheck cannot run here (no toolchain), and a recheck that cannot run outranks a defect.
+	if r.code != 75 || r.unable == "" {
+		t.Errorf("want exit 75 with a cause (the good concept's recheck cannot run), got %+v", r)
+	}
+	if s := invoke(t, "--config", config, "--json", "status"); s.code != 0 {
+		t.Errorf("status after the refused file: %+v", s)
 	}
 }
 
