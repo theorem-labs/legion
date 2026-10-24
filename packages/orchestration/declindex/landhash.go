@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -76,7 +75,8 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 			if err != nil {
 				return nil, fmt.Errorf("read %s from LAND_TREE: %w", prefix+path, err)
 			}
-			freshness, err := Fresh(r.BuildDir, r.LibRel, rel, blob)
+			// The .ilean that ParseModule reads is the one whose hash fresh checked against the build trace.
+			freshness, ilean, err := fresh(r.BuildDir, r.LibRel, rel, blob)
 			if err != nil {
 				return nil, fmt.Errorf("check %s: %w", rel, err)
 			}
@@ -85,10 +85,6 @@ func (s *Store) LandHash(ctx context.Context, r LandHashRequest) ([]LandHashAnsw
 				continue
 			case FreshnessStale:
 				return nil, fmt.Errorf("%s: %s", rel, freshness.Reason)
-			}
-			ilean, err := os.ReadFile(filepath.Join(r.BuildDir, filepath.FromSlash(r.LibRel), filepath.FromSlash(rel)+".ilean"))
-			if err != nil {
-				return nil, fmt.Errorf("read candidate %s.ilean: %w", rel, err)
 			}
 			module, err := ParseModule(rel, ilean, blob, r.Roots)
 			if err != nil {

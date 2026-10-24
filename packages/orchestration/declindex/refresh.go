@@ -289,11 +289,29 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		if _, err := tx.ExecContext(ctx, `DELETE FROM sources`); err != nil {
-			return err
+		// The sources table becomes sourceBlobs: the rows of gone sources are deleted, and only new or changed rows
+		// written. The refresh lock, held since storedSourceBlobs was read, keeps another refresh from changing the
+		// table meanwhile, as it does for the modules in old.
+		if len(sourceBlobs) == 0 {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM sources`); err != nil {
+				return err
+			}
+		} else {
+			for path := range storedSourceBlobs {
+				if _, kept := sourceBlobs[path]; kept {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE path = ?`, path); err != nil {
+					return err
+				}
+			}
 		}
 		sources := newBatch(tx, "sources", 2)
+		sources.verb = "INSERT OR REPLACE"
 		for _, path := range slices.Sorted(maps.Keys(sourceBlobs)) {
+			if blob, stored := storedSourceBlobs[path]; stored && blob == sourceBlobs[path] {
+				continue
+			}
 			if err := sources.add(ctx, path, sourceBlobs[path]); err != nil {
 				return err
 			}
@@ -301,17 +319,8 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		if err := sources.flush(ctx); err != nil {
 			return err
 		}
-		for _, rel := range slices.Concat(gone, relsOf(changed)) {
-			if o, ok := old[rel]; ok {
-				for _, t := range []string{"decls", "uses", "edges"} {
-					if _, err := tx.ExecContext(ctx, "DELETE FROM "+t+" WHERE module = ?", o.module); err != nil {
-						return err
-					}
-				}
-			}
-			if _, err := tx.ExecContext(ctx, `DELETE FROM modules WHERE rel = ?`, rel); err != nil {
-				return err
-			}
+		if err := deleteModules(ctx, tx, slices.Concat(gone, relsOf(changed)), old); err != nil {
+			return err
 		}
 		for _, rel := range gone {
 			if err := deleteCompiled(ctx, tx, old[rel].module); err != nil {
@@ -320,6 +329,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		}
 		decls := newBatch(tx, "decls", 6)
 		uses := newBatch(tx, "uses", 6)
+		modules := newBatch(tx, "modules", 4)
 		for i, md := range results {
 			if errs[i] != nil {
 				st.Unreadable++
@@ -339,11 +349,13 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 				}
 			}
 			// The olean key says which compiled module the index's types and facts were read from; re-reading the
-			// reference file does not change it.
-			if _, err := tx.ExecContext(ctx, `INSERT INTO modules (rel, module, ilean_key, olean_key) VALUES (?, ?, ?, ?)`,
-				md.Rel, md.Module, changed[i].ileanKey, old[md.Rel].oleanKey); err != nil {
+			// reference file does not change it. Each re-read module's old row was deleted above.
+			if err := modules.add(ctx, md.Rel, md.Module, changed[i].ileanKey, old[md.Rel].oleanKey); err != nil {
 				return err
 			}
+		}
+		if err := modules.flush(ctx); err != nil {
+			return err
 		}
 		if err := decls.flush(ctx); err != nil {
 			return err
@@ -424,6 +436,42 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	logf(opt.Log, "index: %d re-read, %d removed, %d unreadable, %d declarations newer than their build, %d compiled modules read, %d re-matched, %s",
 		st.Reread, st.Removed, st.Unreadable, st.Stale, st.Exported, st.Rematched, st.Elapsed.Round(time.Millisecond))
 	return st, nil
+}
+
+// deleteModules deletes the reference rows of the modules at rels: the declarations, uses and edges of each one's
+// old module name, and its modules row. A refresh that re-reads every module runs these statements once for each,
+// so each is prepared once.
+func deleteModules(ctx context.Context, tx *sql.Tx, rels []string, old map[string]stored) error {
+	if len(rels) == 0 {
+		return nil
+	}
+	var byModule []*sql.Stmt
+	for _, t := range []string{"decls", "uses", "edges"} {
+		stmt, err := tx.PrepareContext(ctx, "DELETE FROM "+t+" WHERE module = ?")
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		byModule = append(byModule, stmt)
+	}
+	byRel, err := tx.PrepareContext(ctx, `DELETE FROM modules WHERE rel = ?`)
+	if err != nil {
+		return err
+	}
+	defer byRel.Close()
+	for _, rel := range rels {
+		if o, ok := old[rel]; ok {
+			for _, stmt := range byModule {
+				if _, err := stmt.ExecContext(ctx, o.module); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := byRel.ExecContext(ctx, rel); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func relsOf(files []moduleFile) []string {

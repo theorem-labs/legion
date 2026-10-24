@@ -118,88 +118,94 @@ type lakeTraceMetadata struct {
 // source must be blob, and the .ilean must be the output its trace records. A build trace also binds that source
 // by its hash; a fetch trace (an artifact-cache hit) binds the outputs only, and the source by age.
 func Fresh(root, libRel, rel string, blob []byte) (Freshness, error) {
+	freshness, _, err := fresh(root, libRel, rel, blob)
+	return freshness, err
+}
+
+// fresh is Fresh, and for a fresh module also the .ilean bytes whose hash it checked.
+func fresh(root, libRel, rel string, blob []byte) (Freshness, []byte, error) {
 	base := filepath.Join(root, filepath.FromSlash(libRel), filepath.FromSlash(rel))
 	ilean, err := fileExists(base + ".ilean")
 	if err != nil {
-		return Freshness{}, err
+		return Freshness{}, nil, err
 	}
 	olean, err := fileExists(base + ".olean")
 	if err != nil {
-		return Freshness{}, err
+		return Freshness{}, nil, err
 	}
 	trace, err := fileExists(base + ".trace")
 	if err != nil {
-		return Freshness{}, err
+		return Freshness{}, nil, err
 	}
 	if !ilean && !olean && !trace {
-		return Freshness{State: FreshnessNotBuilt}, nil
+		return Freshness{State: FreshnessNotBuilt}, nil, nil
 	}
 	if !ilean {
-		return staleFreshness("missing " + rel + ".ilean"), nil
+		return staleFreshness("missing " + rel + ".ilean"), nil, nil
 	}
 	if !trace {
-		return staleFreshness("missing " + rel + ".trace"), nil
+		return staleFreshness("missing " + rel + ".trace"), nil, nil
 	}
 	raw, err := os.ReadFile(base + ".trace")
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return staleFreshness("missing " + rel + ".trace"), nil
+			return staleFreshness("missing " + rel + ".trace"), nil, nil
 		}
-		return Freshness{}, err
+		return Freshness{}, nil, err
 	}
 	var metadata lakeTraceMetadata
 	if err := json.Unmarshal(raw, &metadata); err != nil {
-		return staleFreshness("invalid " + rel + ".trace"), nil
+		return staleFreshness("invalid " + rel + ".trace"), nil, nil
 	}
 	if metadata.SchemaVersion != lakeTraceSchemaVersion {
-		return staleFreshness("unknown Lake trace schema " + metadata.SchemaVersion), nil
+		return staleFreshness("unknown Lake trace schema " + metadata.SchemaVersion), nil, nil
 	}
 	if metadata.Synthetic == nil {
-		return staleFreshness("missing synthetic flag"), nil
+		return staleFreshness("missing synthetic flag"), nil, nil
 	}
 	sourcePath := filepath.Join(root, filepath.FromSlash(rel)+".lean")
 	source, err := os.ReadFile(sourcePath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return staleFreshness("missing built source " + rel + ".lean"), nil
+			return staleFreshness("missing built source " + rel + ".lean"), nil, nil
 		}
-		return Freshness{}, err
+		return Freshness{}, nil, err
 	}
 	if !bytes.Equal(source, blob) {
-		return staleFreshness("built source " + rel + ".lean differs from the candidate blob"), nil
+		return staleFreshness("built source " + rel + ".lean differs from the candidate blob"), nil, nil
 	}
 	if metadata.Outputs == nil || metadata.Outputs.ILean == "" {
-		return staleFreshness("build trace records no .ilean output for " + rel), nil
+		return staleFreshness("build trace records no .ilean output for " + rel), nil, nil
 	}
 	ileanData, err := os.ReadFile(base + ".ilean")
 	if err != nil {
-		return Freshness{}, err
+		return Freshness{}, nil, err
 	}
 	if metadata.Outputs.ILean != LakeTextHash(ileanData)+".ilean" {
-		return staleFreshness(rel + ".ilean is not the output its build trace records"), nil
+		return staleFreshness(rel + ".ilean is not the output its build trace records"), nil, nil
 	}
 	if *metadata.Synthetic {
 		traceInfo, err := os.Stat(base + ".trace")
 		if err != nil {
-			return Freshness{}, err
+			return Freshness{}, nil, err
 		}
 		sourceInfo, err := os.Stat(sourcePath)
 		if err != nil {
-			return Freshness{}, err
+			return Freshness{}, nil, err
 		}
 		if traceInfo.ModTime().Before(sourceInfo.ModTime()) {
-			return staleFreshness("fetch trace is older than its source"), nil
+			return staleFreshness("fetch trace is older than its source"), nil, nil
 		}
-		return Freshness{State: FreshnessFresh}, nil
+		return Freshness{State: FreshnessFresh}, ileanData, nil
 	}
 	hash, ok := sourceTraceHash(metadata.Inputs, sourcePath, rel+".lean")
 	if !ok {
-		return staleFreshness("build trace has no source hash for " + rel + ".lean"), nil
+		return staleFreshness("build trace has no source hash for " + rel + ".lean"), nil, nil
 	}
 	if want := LakeTextHash(blob); hash != want {
-		return staleFreshness("build trace source hash differs from the candidate blob"), nil
+		return staleFreshness("build trace source hash differs from the candidate blob"), nil, nil
 	}
-	return Freshness{State: FreshnessFresh}, nil
+	return Freshness{State: FreshnessFresh}, ileanData, nil
 }
 
 func staleFreshness(reason string) Freshness {

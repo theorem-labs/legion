@@ -130,6 +130,10 @@ type Store struct {
 	g         *graph
 	graphErr  error
 
+	// snapshotPaths is the module-path map of a store opened read-only, read once (modulePaths).
+	pathsMu       sync.Mutex
+	snapshotPaths map[string]string
+
 	// beforeRefreshLock is a test hook. It runs immediately before RefreshAt attempts the refresh lock.
 	beforeRefreshLock func()
 }

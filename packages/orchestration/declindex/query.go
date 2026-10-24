@@ -1,6 +1,7 @@
 package declindex
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"database/sql"
@@ -179,7 +180,7 @@ func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 }
 
 // paths maps modules to their source paths. A wide declaration's answer touches tens of thousands of modules, so
-// the map is read in one query, once per answer.
+// the map is read in one query (modulePaths), the first time an answer needs it.
 type paths struct {
 	s     *Store
 	cache map[string]string
@@ -187,16 +188,7 @@ type paths struct {
 
 func (p *paths) of(ctx context.Context, module string) (string, error) {
 	if p.cache == nil {
-		cache := map[string]string{}
-		rows, err := p.s.q.QueryContext(ctx, `SELECT module, rel FROM modules`)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			var m, rel string
-			if err := r.Scan(&m, &rel); err != nil {
-				return err
-			}
-			cache[m] = sourcePath(rel, m)
-			return nil
-		})
+		cache, err := p.s.modulePaths(ctx)
 		if err != nil {
 			return "", err
 		}
@@ -206,6 +198,36 @@ func (p *paths) of(ctx context.Context, module string) (string, error) {
 		return v, nil
 	}
 	return sourcePath("", module), nil
+}
+
+// modulePaths maps every module the index read to its source path. A store opened read-only reads one snapshot for
+// its whole life, so it reads the map once and its answers share it; a writable store reads it for each answer,
+// because a refresh changes it. A failed read is not kept.
+func (s *Store) modulePaths(ctx context.Context) (map[string]string, error) {
+	if s.snapshot != nil {
+		s.pathsMu.Lock()
+		defer s.pathsMu.Unlock()
+		if s.snapshotPaths != nil {
+			return s.snapshotPaths, nil
+		}
+	}
+	out := map[string]string{}
+	rows, err := s.q.QueryContext(ctx, `SELECT module, rel FROM modules`)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var m, rel string
+		if err := r.Scan(&m, &rel); err != nil {
+			return err
+		}
+		out[m] = sourcePath(rel, m)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if s.snapshot != nil {
+		s.snapshotPaths = out
+	}
+	return out, nil
 }
 
 func fileKind(p string, kinds []string) string {
@@ -385,7 +407,13 @@ func (s *Store) graph() (*graph, error) {
 		case s.graphFile == nil:
 			s.graphErr = fmt.Errorf("%s.graph: %w", s.path, fs.ErrNotExist)
 		default:
-			data, s.graphErr = io.ReadAll(io.NewSectionReader(s.graphFile, 0, math.MaxInt64))
+			// Sized as os.ReadFile sizes its buffer; without the size the read still runs to the end of the file.
+			var buf bytes.Buffer
+			if info, err := s.graphFile.Stat(); err == nil {
+				buf.Grow(int(info.Size()) + bytes.MinRead)
+			}
+			_, s.graphErr = buf.ReadFrom(io.NewSectionReader(s.graphFile, 0, math.MaxInt64))
+			data = buf.Bytes()
 		}
 		if s.graphErr == nil {
 			s.g, s.graphErr = parseGraph(s.path+".graph", data)

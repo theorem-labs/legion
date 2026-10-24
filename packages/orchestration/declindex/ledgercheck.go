@@ -124,7 +124,8 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 		}
 		globs = append(globs, re)
 	}
-	name := regexp.MustCompile(".*")
+	// No name rule selects every name.
+	var name *regexp.Regexp
 	if rule.Name != "" {
 		var err error
 		if name, err = regexp.Compile(rule.Name); err != nil {
@@ -140,7 +141,7 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 		if err != nil {
 			return err
 		}
-		if !name.MatchString(short) {
+		if name != nil && !name.MatchString(short) {
 			return nil
 		}
 		for _, g := range globs {
