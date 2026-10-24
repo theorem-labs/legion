@@ -598,6 +598,53 @@ def test_a_pointer_loaded_through_the_parameter_is_not_rebased_onto_it() -> None
     assert (same["displacement"], same["param"]) == (0, 3)
 
 
+def test_a_folded_callee_s_field_takes_the_base_its_caller_passed() -> None:
+    """prepare_alloc_pages(..., &ac, ...): ac->migratetype is the caller's local object, which the
+    inlined code keeps on the stack or in registers. clk_core_free_parent_map(container_of(ref, ...)):
+    core->num_parents is 80 - 244 from the kref the caller was given, which the image addresses."""
+    access = {"struct": "o", "field": "m", "offset": 80, "displacement": 80, "base": "pointer",
+              "size": 1, "bitfield": False, "param": 0, "provenance": where()}  # fmt: skip
+    child = link.Effective(field_accesses=[access])
+    local = {"unit": None, "param": None, "displacement": 0, "base": "local"}
+    (on_stack,) = link._bind(child, [local]).field_accesses
+    assert (on_stack["base"], on_stack["displacement"], on_stack["param"]) == ("local", 80, None)
+    container = {"unit": None, "param": 0, "displacement": -244, "base": "container_of"}
+    (rebased,) = link._bind(child, [container]).field_accesses
+    assert (rebased["base"], rebased["displacement"], rebased["param"]) == ("container_of", -164, 0)
+    graph = _structure_graph({**_field(80), "base": "container_of", "displacement": -164}, [], {})
+    graph["analysis"]["image"]["memory_offsets"] = {"function:f": [-164, 8]}
+    assert checks.structure(graph)["field_offsets"]["by_method"] == {"memory_displacement": 1}
+    # A container_of the callee makes from its parameter, rebased onto the member the caller passes.
+    inner = {**access, "base": "container_of", "displacement": -64}
+    (cancelled,) = link._bind(
+        link.Effective(field_accesses=[inner]), [{**parameter(1), "displacement": 64}]
+    ).field_accesses
+    assert (cancelled["displacement"], cancelled["param"]) == (0, 1)
+    # A nested call's argument through the parameter keeps the caller's base.
+    call = {"callee": "g", "arguments": [{"unit": None, "param": 0, "displacement": 8, "base": "pointer"}],
+            "provenance": where()}  # fmt: skip
+    (nested,) = link._bind(link.Effective(calls=[call]), [local]).calls
+    assert nested["arguments"] == [{"unit": None, "param": None, "displacement": 8, "base": "local"}]
+
+
+def test_a_constant_argument_fixes_the_parameter_index_of_a_folded_address() -> None:
+    """__sb_end_write(sb, SB_FREEZE_WRITE): sb->s_writers.rw_sem + level - 1 is 560 + 96 * (level - 1)
+    from sb; the facts give 464 and a step of 96 per level, which the caller's constant 1 fixes."""
+    access = {"struct": "s", "field": "writer", "offset": 56, "displacement": 520, "base": "container_of",
+              "size": 8, "bitfield": False, "param": 0, "index": [{"param": 1, "scale": 96}],
+              "provenance": where()}  # fmt: skip
+    sb = {"unit": None, "param": 0, "displacement": 0, "base": "pointer"}
+    one = {"unit": None, "param": None, "expr": {"c": 1, "w": 32, "s": True}}
+    (fixed,) = link._bind(link.Effective(field_accesses=[access]), [sb, one]).field_accesses
+    assert (fixed["displacement"], fixed["param"], fixed.get("index")) == (616, 0, None)
+    level = {"unit": None, "param": 2, "expr": {"p": 2, "w": 32, "s": True}}
+    (carried,) = link._bind(link.Effective(field_accesses=[access]), [sb, level]).field_accesses
+    assert (carried["displacement"], carried["index"]) == (520, [{"param": 2, "scale": 96}])
+    unknown = {"unit": None, "param": None}
+    (variable,) = link._bind(link.Effective(field_accesses=[access]), [sb, unknown]).field_accesses
+    assert (variable["displacement"], variable.get("index")) == (520, None)
+
+
 def test_a_chain_field_matches_inside_a_global_by_its_own_offset_in_its_struct() -> None:
     """pgdat->__lruvec.lru_lock: the displacement (4048) is from pglist_data, the field's offset (16)
     is in lruvec, which sits at 4032 in contig_page_data."""

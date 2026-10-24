@@ -226,7 +226,7 @@ def test_an_array_member_whose_address_is_taken_gives_its_element_size(tmp_path:
         """
         struct item { long fd; long offset; long done; int status; int pad; };
         struct range { long a; long b; int count; int pad; struct item info[]; };
-        void walk(struct range *same) { struct item *info = same->info; info->offset = 1; }
+        void walk(struct range *same) { struct item *info = same->info; for (; info->fd; info++) info->offset = 1; }
         """,
     )
     fields = facts["functions"]["walk"]["events"]["field_accesses"]

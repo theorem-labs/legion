@@ -382,3 +382,167 @@ void fct_asm_kept(void)
 	fct_acquire(one);
 	fct_acquire(two);
 }
+
+/* prepare_alloc_pages(..., &ac, ...): the inlined helper fills the caller's local object, which the
+ * machine code keeps in registers. */
+static inline void fct_fill(struct fct_inner *in, int v)
+{
+	in->a = v;
+	in->b = v + 1;
+}
+
+int fct_local_object(int v)
+{
+	struct fct_inner local;
+
+	fct_fill(&local, v);
+	return local.a * local.b;
+}
+
+/* __clk_release: clk_core_free_parent_map(container_of(ref, struct clk_core, ref)) reads the field
+ * at its offset less the member's, from the pointer the caller was given. */
+static inline long fct_x_of(struct fct_outer *o)
+{
+	return o->x;
+}
+
+long fct_container_argument(struct list_node *n)
+{
+	return fct_x_of(container_of(n, struct fct_outer, link));
+}
+
+/* __ipi_send_single: data = irq_desc_get_irq_data(desc) is read before data is set again. */
+struct fct_inner *fct_other(int k);
+
+int fct_reassigned_local(struct fct_outer *o, int k)
+{
+	struct fct_inner *d = &o->in;
+	int sum = d->a;
+
+	if (k)
+		d = fct_other(k);
+	return sum + d->b;
+}
+
+/* for_each_sched_entity(se) without group scheduling: for (; se; se = NULL). A null pointer is
+ * never dereferenced, so se is still &p->se where it is. */
+int fct_null_walk(struct fct_outer *o)
+{
+	struct fct_inner *in = &o->in;
+	int sum = 0;
+
+	for (; in; in = NULL)
+		sum += in->b;
+	return sum;
+}
+
+/* A parameter read before the function sets it is still the parameter there. */
+int fct_parameter_before_write(struct fct_outer *o)
+{
+	int a = o->in.a;
+
+	o = &fct_global;
+	return a + o->in.b;
+}
+
+/* __sb_end_write: percpu_up_read(sb->s_writers.rw_sem + level - 1). The array decays to its address;
+ * a constant step folds into the displacement, a variable one is added in a register. */
+void fct_pass_step(struct fct_outer *o, int k)
+{
+	fct_takes_inner(o->slots + 1);
+	fct_takes_inner(o->slots + k - 1);
+}
+
+/* kernel/time/timekeeping.c: tk_core is timekeeper_data[0], so &tk_core.shadow_timekeeper is the
+ * storage of an element of a global array. */
+struct fct_outer fct_globals[2];
+
+void fct_pass_array_element(void)
+{
+	fct_takes_inner(&fct_globals[1].in);
+}
+
+/* mm/mm_init.c: NODE_DATA(nid) returns &contig_page_data without NUMA, and pgdat = NODE_DATA(nid)
+ * holds that global. */
+static inline struct fct_outer *fct_node(int nid)
+{
+	(void)nid;
+	return &fct_global;
+}
+
+void fct_pass_helper_global(int nid)
+{
+	struct fct_outer *pgdat = fct_node(nid);
+
+	obj_free(pgdat);
+}
+
+/* to_software_node(fwnode): is_software_node(fwnode) ? container_of(fwnode, ...) : NULL. */
+static inline struct fct_outer *fct_maybe(struct list_node *n)
+{
+	return n->next ? container_of(n, struct fct_outer, link) : NULL;
+}
+
+long fct_conditional_container(struct list_node *n)
+{
+	struct fct_outer *o = fct_maybe(n);
+
+	return o ? o->x : 0;
+}
+
+/* for_each_sched_entity with group_cfs_rq(), which returns NULL without group scheduling. */
+static inline struct fct_inner *fct_none(struct fct_outer *o)
+{
+	(void)o;
+	return NULL;
+}
+
+int fct_null_helper(struct fct_outer *o)
+{
+	struct fct_inner *in = &o->in;
+	int sum = 0;
+
+	for (; in; in = fct_none(o))
+		sum += in->b;
+	return sum;
+}
+
+/* container_of_const(): _Generic on the pointer's constness picks one container_of. */
+#define fct_const_of(n) _Generic((n), \
+	const struct list_node *: ((const struct fct_outer *)container_of(n, struct fct_outer, link)), \
+	struct list_node *: container_of(n, struct fct_outer, link))
+
+long fct_generic_container(struct list_node *n)
+{
+	return fct_const_of(n)->x;
+}
+
+/* INTERVAL_TREE_DEFINE's subtree search: the parameter is set to rb_entry(...) as it walks, and the
+ * machine code may keep the member's address instead of the container. */
+long fct_walk_entries(struct fct_outer *o, int k)
+{
+	long sum = 0;
+
+	while (k--) {
+		sum += o->x;
+		o = container_of(o->link.next, struct fct_outer, link);
+	}
+	return sum;
+}
+
+/* spin_lock_irqsave(&rsp->rss_lock, flags) is raw_spin_lock_irqsave(spinlock_check(lock), flags):
+ * the lock is named through an inline helper that returns its address. */
+struct fct_locked {
+	long pad;
+	struct spin lock;
+};
+
+static inline struct spin *fct_check(struct spin *s)
+{
+	return s;
+}
+
+void fct_lock_checked(struct fct_locked *l)
+{
+	spin_lock(fct_check(&l->lock));
+}

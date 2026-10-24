@@ -27,6 +27,7 @@ void box_release(void *b) { (void)b; }
 void fct_die(void) { for (;;) ; }
 void fct_takes_inner(void *in) { (void)in; }
 void fct_takes_node(void *n) { (void)n; }
+void *fct_other(int k) { (void)k; return heap; }
 void _start(void) { for (;;) ; }
 EOF
 "$CLANG" "${FLAGS[@]}" -c "$work/stubs.c" -o "$work/stubs.o"

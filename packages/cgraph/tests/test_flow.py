@@ -317,6 +317,18 @@ FIELD_DISPLACEMENTS = {
     "fct_container_loop": {("fct_outer", "x", -160, "container_of"), ("fct_outer", "link", 0, "container_of")},
     # auipc; lw 0x21c: g = &fct_global.in is the global's address plus in + b.
     "fct_global_field": {("fct_inner", "b", 20, "global")},
+    # lw s0, 0x10(a0) before the if; after it, lw a0, 0xc(a0) from whichever pointer d holds.
+    "fct_reassigned_local": {("fct_inner", "a", 16, "pointer"), ("fct_inner", "b", 12, "pointer")},
+    # lw a0, 0x14(a0): the loop's in = NULL is never dereferenced.
+    "fct_null_walk": {("fct_inner", "b", 20, "pointer")},
+    # lw a0, 0x10(a0) through the parameter; then o is fct_global, whose in.b the image reads.
+    "fct_parameter_before_write": {("fct_inner", "a", 16, "pointer"), ("fct_inner", "b", 20, "global")},
+    # The arm that is not NULL, through an inline helper: x from the link member.
+    "fct_conditional_container": {("fct_outer", "x", -160, "container_of")},
+    # A helper that returns NULL sets in to no pointer the loop dereferences.
+    "fct_null_helper": {("fct_inner", "b", 20, "pointer")},
+    # The _Generic association the pointer's type selects.
+    "fct_generic_container": {("fct_outer", "x", -160, "container_of")},
 }
 
 
@@ -333,6 +345,13 @@ def test_a_field_access_names_the_parameter_its_base_pointer_is(fct_facts: dict[
         assert {item.get("param") for item in fact_events(fct_facts, function)["field_accesses"]} == {0}
     # A global's field has no parameter.
     assert {item.get("param") for item in fact_events(fct_facts, "fct_global_field")["field_accesses"]} == {None}
+    # A parameter is its own value until the function sets it; a null pointer is never dereferenced.
+    found = {
+        (item["field"], item.get("param"))
+        for item in fact_events(fct_facts, "fct_parameter_before_write")["field_accesses"]
+    }
+    assert found == {("a", 0), ("b", None)}
+    assert {item.get("param") for item in fact_events(fct_facts, "fct_null_walk")["field_accesses"]} == {0}
 
 
 def test_every_non_container_field_offset_of_the_unit_matches_the_image(fct_build: dict[str, Any]) -> None:
@@ -442,9 +461,10 @@ def call_argument(facts: dict[str, Any], function: str, callee: str) -> dict[str
 
 def test_a_member_address_argument_gives_its_displacement_from_the_parameter(fct_facts: dict[str, Any]) -> None:
     argument = call_argument(fct_facts, "fct_pass_member", "fct_takes_inner")
-    assert (argument["param"], argument["displacement"]) == (0, 8)
-    # The address of a global's storage is no offset from a parameter.
-    assert "displacement" not in call_argument(fct_facts, "fct_pass_held_global", "fct_takes_inner")
+    assert (argument["param"], argument["displacement"], argument["base"]) == (0, 8, "pointer")
+    # The address of a global's storage is no offset from a parameter: it is that far into the global.
+    held = call_argument(fct_facts, "fct_pass_held_global", "fct_takes_inner")
+    assert (held["param"], held["displacement"], held["base"]) == (None, 8, "global")
 
 
 def test_a_parameter_passed_on_has_displacement_zero_and_a_loaded_pointer_none(fct_facts: dict[str, Any]) -> None:
@@ -705,3 +725,64 @@ def test_a_compound_assignment_whose_value_is_used_reads_its_variable(dead_facts
     (field,) = events["field_accesses"]
     assert (field["field"], field["displacement"], field.get("conditional")) == ("id", 16, None)
     assert not [item for item in events["unevaluated"] if item["reason"] == "discarded"]
+
+
+def test_an_argument_names_the_base_its_address_has(fct_facts: dict[str, Any]) -> None:
+    """&local is the caller's own object; container_of(n, ...) is that far below the parameter."""
+    (call,) = [call for call in fact_events(fct_facts, "fct_local_object")["calls"] if call["callee"] == "fct_fill"]
+    local = call["arguments"][0]
+    assert (local["base"], local["displacement"], local["param"]) == ("local", 0, None)
+    container = call_argument(fct_facts, "fct_container_argument", "fct_x_of")
+    assert (container["base"], container["displacement"], container["param"]) == ("container_of", -160, 0)
+
+
+def test_pointer_arithmetic_on_a_member_array_keeps_its_base(fct_facts: dict[str, Any]) -> None:
+    """o->slots + 1 is addi a0, a0, 0x70; o->slots + k - 1 is addi a0, s0, 0x50 after s0 = o + 16 * k."""
+    calls = [call for call in fact_events(fct_facts, "fct_pass_step")["calls"] if call["callee"] == "fct_takes_inner"]
+    constant, variable = (call["arguments"][0] for call in calls)
+    assert (constant["param"], constant["displacement"], constant.get("element")) == (0, 112, None)
+    assert (variable["param"], variable["displacement"], variable["element"]) == (0, 80, -16)
+    # k is parameter 1: a caller that passes a constant adds 16 bytes per step.
+    assert variable["index"] == [{"param": 1, "scale": 16}] and "index" not in constant
+
+
+def test_a_global_is_named_through_an_array_element_and_a_helper_that_returns_it(fct_facts: dict[str, Any]) -> None:
+    element = call_argument(fct_facts, "fct_pass_array_element", "fct_takes_inner")
+    assert (element["unit"]["kind"], element["unit"]["name"], element["unit"]["field"]) == (
+        "global",
+        "fct_globals",
+        "in",
+    )
+    assert (element["base"], element["displacement"]) == ("global", 184)
+    held = call_argument(fct_facts, "fct_pass_helper_global", "obj_free")["unit"]
+    assert (held["kind"], held["name"], held["field"]) == ("global", "fct_global", None)
+
+
+def test_a_folded_helper_s_fields_take_the_base_the_caller_passed(fct_build: dict[str, Any]) -> None:
+    """fct_fill(&local, v) is registers (addi a1, a0, 0x1; mulw): its fields are the caller's local
+    object. fct_x_of(container_of(n, ...)) is ld a0, -0xa0(a0)."""
+    accesses = fct_build["graph"]["analysis"]["field_accesses"]
+    assert {(item["field"], item["base"]) for item in accesses["function:fct_local_object"]} == {
+        ("a", "local"),
+        ("b", "local"),
+    }
+    (container,) = accesses["function:fct_container_argument"]
+    assert (container["field"], container["base"], container["displacement"]) == ("x", "container_of", -160)
+    offsets = fct_build["checks"]["structure_layer"]["field_offsets"]
+    assert not [item for item in offsets["misses"] if item["function"] == "function:fct_container_argument"]
+
+
+def test_a_walked_parameter_keeps_its_base_and_the_member_address_it_steps_by(fct_facts: dict[str, Any]) -> None:
+    """o = container_of(o->link.next, ...) in the walk: o->x is the parameter's x the first time, and
+    the machine code may keep &o->link, 160 above it, as it steps."""
+    (x,) = [item for item in fact_events(fct_facts, "fct_walk_entries")["field_accesses"] if item["field"] == "x"]
+    assert (x["displacement"], x["param"], x["inner_displacement"]) == (0, 0, -160)
+
+
+def test_a_lock_named_through_an_inline_helper_has_the_member_s_displacement(fct_facts: dict[str, Any]) -> None:
+    """spin_lock(fct_check(&l->lock)) locks l + 8, as the image's addi a0, a0, 0x8."""
+    found = {
+        (item["field"], item["displacement"], item["base"])
+        for item in fact_events(fct_facts, "fct_lock_checked")["field_accesses"]
+    }
+    assert found == {("lock", 8, "pointer")}

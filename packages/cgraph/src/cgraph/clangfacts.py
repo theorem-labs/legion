@@ -213,17 +213,66 @@ _OBJECT_BASES = ("global", "local", "other", "unknown")
 @dataclass(frozen=True)
 class _Address:
     """Where an address points: ``bits`` from the value the base names, what that base is, the
-    function's parameter it is when it is one, and, past a variable index, the bits from the start
-    of that indexed element."""
+    function's parameter it is when it is one, past a variable index the bits from the start of that
+    indexed element, the bits from a register the machine code may hold instead (the value a helper
+    the image may call returns, or the address a loop keeps reassigning), and the variable indices
+    that are parameters: each parameter's position and the bits one step adds, which ``bits`` counts
+    as 0 and a caller that passes a constant fixes (__sb_end_write(sb, SB_FREEZE_WRITE)). A local
+    object's address also names that object and its bytes, so its fields can be found in the frame."""
 
     bits: int
     base: str
     param: int | None = None
     element: int | None = None
+    inner: int | None = None
+    index: tuple[tuple[int, int], ...] = ()
+    object: tuple[str, int] | None = None
 
     def shifted(self, bits: int) -> _Address:
         element = self.element + bits if self.element is not None else None
-        return replace(self, bits=self.bits + bits, element=element)
+        inner = self.inner + bits if self.inner is not None else None
+        return replace(self, bits=self.bits + bits, element=element, inner=inner)
+
+
+def _indexed(address: _Address, param: int | None, scale: int) -> _Address:
+    """An address past a variable index, with the index's term when the index is a parameter."""
+    if param is None or address.base == "unknown":
+        return address
+    return replace(address, index=(*address.index, (param, scale)))
+
+
+def _index_terms(address: _Address) -> list[dict[str, int]]:
+    """An address's parameter indices as the facts give them: the parameter and the bytes a step adds."""
+    return [{"param": param, "scale": scale // 8} for param, scale in address.index]
+
+
+def _agree(addresses: set[_Address]) -> _Address | None:
+    """The one address several definitions give: they agree on the base, the bits and the parameter
+    indices; a parameter, an element or an inner register they disagree on is dropped."""
+    agreed = {(address.bits, address.base, address.index, address.object) for address in addresses}
+    if len(agreed) != 1:
+        return None
+    (bits, base, index, held) = agreed.pop()
+    params = {address.param for address in addresses}
+    elements = {address.element for address in addresses}
+    inners = {address.inner for address in addresses}
+    return _Address(
+        bits,
+        base,
+        params.pop() if len(params) == 1 else None,
+        elements.pop() if len(elements) == 1 else None,
+        inners.pop() if len(inners) == 1 else None,
+        index,
+        held,
+    )
+
+
+def _object_keys(address: _Address) -> dict[str, Any]:
+    """The local object an address is in, as the facts give it: its name and its bytes."""
+    if address.object is None:
+        return {}
+    name, size = address.object
+    return {"object": name, "object_size": size}
 
 
 def _element_bytes(pointer: ci.Cursor) -> int:
@@ -231,6 +280,27 @@ def _element_bytes(pointer: ci.Cursor) -> int:
     pointee = pointer.type.get_canonical().get_pointee().get_canonical()
     size = pointee.get_size() if pointee.kind != TK.VOID else 1
     return size if size > 0 else 1
+
+
+# Where a construct is expanded: its file and the byte offsets its text spans there.
+_Place = tuple[str, int, int]
+_LOOPS = (K.FOR_STMT, K.WHILE_STMT, K.DO_STMT)
+
+
+def _place(cursor: ci.Cursor) -> _Place | None:
+    """The file and byte range of a construct where it is expanded (a macro's whole invocation for
+    what the macro writes), or None when its extent does not lie in one file."""
+    extent = cursor.extent
+    start, end = extent.start, extent.end
+    if start.file is None or end.file is None or start.file.name != end.file.name:
+        return None
+    return start.file.name, start.offset, end.offset
+
+
+def _is_null(expression: ci.Cursor) -> bool:
+    """A null pointer constant: ``0`` or ``((void *)0)``."""
+    node = _strip(expression)
+    return node.kind == K.INTEGER_LITERAL and libclang.constant_int(node) == 0
 
 
 def _container(node: ci.Cursor) -> tuple[ci.Cursor, int] | None:
@@ -350,6 +420,7 @@ class _Extractor:
         )  # fmt: skip
         self.ignored_cache: dict[str, frozenset[int]] = {}
         self.returned: dict[str, _Address | None] = {}
+        self.null_helpers: set[str] = set()  # the helpers whose every return is a null pointer
         self.texts: dict[Path, bytes] = {}
         # Each function's settled walk, the functions whose walk is under way, the functions whose
         # calls compute only their result, and each _Generic's selection, read once per node.
@@ -386,6 +457,11 @@ class _Extractor:
         location = self.location(cursor)
         return f"{location['file']}:{location['line']}"
 
+    def object_name(self, variable: ci.Cursor) -> str:
+        """A local object's name in the facts: its spelling and where it is declared."""
+        location = variable.location
+        return f"{variable.spelling}@{self.relative(location.file.name if location.file else None)}:{location.line}:{location.column}"
+
     def token_error(self, cursor: ci.Cursor, error: RuntimeError) -> ExtractionError:
         return ExtractionError(f"{self.source}: {self.where(cursor)}: cannot read tokens: {error}")
 
@@ -418,30 +494,45 @@ class _Extractor:
         )
 
     def returned_address(self, name: str) -> _Address | None:
-        """Where an inline helper of the unit returns a pointer to, from the parameter it derives it
-        from when it has one (``return &desc->irq_data``, ``return container_of(mnt, ...)``), or None
-        when its returns disagree. A call the compiler inlines adds those offsets to the argument."""
+        """Where a helper of the unit returns a pointer to, from the parameter it derives it from when
+        it has one (``return &desc->irq_data``, ``return container_of(mnt, ...)``), or None when its
+        returns disagree; ``return NULL`` is no address. A call the compiler inlines adds those
+        offsets to the argument; the compiler also inlines static helpers not declared inline
+        (inode_to_wb_and_lock_list), and the address is the same when it calls them."""
         if name in self.returned:
             return self.returned[name]
         self.returned[name] = None
         definition = self.evaluator.definitions.get(name)
-        if definition is None or not _is_inline(definition) or self.is_weak(definition):
+        if definition is None or self.is_weak(definition):
             return None
         walk = _FunctionWalk(self, definition)
         found: set[_Address] = set()
+        null = False
         for node in definition.walk_preorder():
             if node.kind == K.RETURN_STMT:
                 values = _children(node)
                 if not values:
                     return None
-                found.add(walk.pointer(values[0], 0, [], 0))
-        if len(found) != 1:
-            return None
-        (address,) = found
-        if address.base in ("unknown", "local"):
+                if _is_null(values[0]):
+                    null = True
+                else:
+                    found.add(walk.pointer(values[0], 0, [], 0))
+        if null and not found:
+            self.null_helpers.add(name)
+        address = _agree(found)
+        if address is None or address.base in ("unknown", "local"):
             return None
         self.returned[name] = address
         return address
+
+    def returns_null(self, expression: ci.Cursor) -> bool:
+        """A call of a helper of the unit whose every return is a null pointer (group_cfs_rq without
+        group scheduling)."""
+        node = _strip(expression)
+        if node.kind != K.CALL_EXPR or node.referenced is None or node.referenced.kind != K.FUNCTION_DECL:
+            return False
+        self.returned_address(node.referenced.spelling)
+        return node.referenced.spelling in self.null_helpers
 
     # State units ---------------------------------------------------------------------------
 
@@ -495,9 +586,10 @@ class _Extractor:
         }
 
     def global_from_ref(self, cursor: ci.Cursor) -> Unit | None:
-        """The global whose own storage an expression names, through ``.``, ``[]`` on an array and
-        ``&``, and through ``(&g)->m`` (static_key_enable(&(x)->key) of a global key); any other
-        ``->`` or ``*`` leaves the global for the object it points to."""
+        """The global whose own storage an expression names, through ``.``, ``[]`` on an array (also
+        where the array decays to a pointer, as ``timekeeper_data[0].shadow_timekeeper``) and ``&``,
+        and through ``(&g)->m`` (static_key_enable(&(x)->key) of a global key); any other ``->`` or
+        ``*`` leaves the global for the object it points to."""
         node = cursor
         while True:
             children = _children(node)
@@ -1666,9 +1758,14 @@ class _FunctionWalk:
         self.inner: set[int] = set()
         self.addressed: set[int] = set()
         self.fields: list[tuple[int, dict[str, Any]]] = _Tagged(self, pair=True)
-        self.derived_cache: dict[int, _Address | None] = {}
+        self.derived_cache: dict[tuple[int, tuple[int, ...], bool], _Address | None] = {}
         self.uses: dict[str, collections.Counter[int]] | None = None
-        self.definitions: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
+        # Each local's and parameter's plain assignments: the value and where the assignment is.
+        self.definitions: dict[int, list[tuple[ci.Cursor, _Place | None]]] = collections.defaultdict(list)
+        self.parents: dict[int, ci.Cursor] = {}
+        self.label_holders: set[int] = set()  # the nodes that hold a label or a case
+        self.loops: list[_Place] = []
+        self.backward = False  # the function jumps back (a goto to an earlier label, a computed goto)
         # Guards: the conditions on the parameters under which the code being walked is compiled.
         self.guard_table: list[dict[str, Any]] = []
         self.guard_ids: dict[str, int] = {}
@@ -1750,7 +1847,7 @@ class _FunctionWalk:
                 values = [self.x.evaluator.expression(initializer, self.held, depth + 1)]
             values += [
                 self.x.evaluator.expression(definition, self.held, depth + 1)
-                for definition in self.definitions.get(key, [])
+                for definition, _ in self.definitions.get(key, [])
             ]
         finally:
             self.holding.discard(key)
@@ -2013,22 +2110,28 @@ class _FunctionWalk:
             array, index = children
             size = node.type.get_canonical().get_size()
             value = self.x.evaluator.evaluate(index)
+            indexed = self.index_of(index) if value is None and size > 0 else None
             # A variable index is added in a register: the constant part of the address stays in the
             # displacement of an access the chain makes, but not past a value that holds the address.
-            element = value * size * 8 if value is not None and size > 0 else 0
+            steps = value if value is not None else indexed[1] if indexed is not None else 0
+            element = steps * size * 8 if size > 0 else 0
             if _strip(array).type.get_canonical().kind in _ARRAY_TYPES:
                 found = self.lvalue(array, bits + element, members, depth + 1)
             else:
                 found = self.pointer(array, bits + element, members, depth + 1)
+            if value is not None:
+                return found
             # The nearest variable index decides what a register that holds the element adds.
-            return found if value is not None else replace(found, element=bits)
+            return _indexed(replace(found, element=bits), indexed[0] if indexed is not None else None, size * 8)
         if node.kind == K.UNARY_OPERATOR and children and libclang.unary_kind(node) == _DEREF:
             return self.pointer(children[0], bits, members, depth + 1)
         if node.kind == K.DECL_REF_EXPR and node.referenced is not None:
             if _is_global_var(node.referenced):
                 return _Address(bits, "global")
             if node.referenced.kind in (K.PARM_DECL, K.VAR_DECL):
-                return _Address(bits, "local")
+                variable = node.referenced
+                size = variable.type.get_canonical().get_size()
+                return _Address(bits, "local", object=(self.x.object_name(variable), max(size, 0)))
         return _Address(bits, "other")
 
     def pointer(self, node: ci.Cursor, bits: int, members: list[ci.Cursor], depth: int) -> _Address:
@@ -2043,71 +2146,222 @@ class _FunctionWalk:
             return self.lvalue(children[0], bits, members, depth + 1)
         container = _container(node)
         if container is not None:
-            found = self.pointer(container[0], bits - container[1] * 8, members, depth + 1)
-            return found if found.base in _OBJECT_BASES else replace(found, base="container_of")
+            contained = self.pointer(container[0], bits - container[1] * 8, members, depth + 1)
+            return contained if contained.base in _OBJECT_BASES else replace(contained, base="container_of")
+        if node.type.get_canonical().kind in _ARRAY_TYPES:
+            # An array that decays to its address (sb->s_writers.rw_sem): the array's own address.
+            return self.lvalue(node, bits, members, depth + 1)
+        arithmetic = self.arithmetic(node)
+        if arithmetic is not None:
+            pointer, right, step, sign = arithmetic
+            value = self.x.evaluator.evaluate(right)
+            if value is not None:
+                return self.pointer(pointer, bits + sign * value * step, members, depth + 1)
+            # A variable index (rw_sem + level) is added in a register, as for o->slots[k]; a
+            # parameter's (or a parameter less a constant's) steps are a term a caller can fix.
+            indexed = self.index_of(right)
+            steps = sign * indexed[1] if indexed is not None else 0
+            stepped = self.pointer(pointer, bits + steps * step, members, depth + 1)
+            if stepped.base == "unknown":
+                return stepped
+            return _indexed(replace(stepped, element=bits), indexed[0] if indexed is not None else None, sign * step)
+        if node.kind == K.CONDITIONAL_OPERATOR and len(children) == 3:
+            # to_software_node(fwnode): is_software_node(fwnode) ? container_of(fwnode, ...) : NULL.
+            # A null arm is never dereferenced; arms that point the same way give that address.
+            agreed = _agree({self.pointer(arm, bits, members, depth + 1) for arm in children[1:] if not _is_null(arm)})
+            return agreed if agreed is not None else _Address(bits, "pointer")
+        if node.kind == K.GENERIC_SELECTION_EXPR and children:
+            # container_of_const(ptr, type, member): the association the control type selects.
+            selected = self.selection(node)
+            if selected is not None and len(selected) == 1:
+                (index,) = selected
+                if 0 < index < len(children):
+                    return self.pointer(children[index], bits, members, depth + 1)
         if node.kind == K.DECL_REF_EXPR and node.referenced is not None:
             referenced = node.referenced
-            array = referenced.type.get_canonical().kind in _ARRAY_TYPES
-            if referenced.kind == K.PARM_DECL:
-                if self.written(referenced):
-                    # A parameter the function writes (o = o->next in a walk) holds another pointer.
-                    return _Address(bits, "pointer")
+            if referenced.kind == K.PARM_DECL and not self.written(referenced):
                 return _Address(bits, "pointer", self.parameters.get(referenced.hash))
-            if _is_global_var(referenced):
-                return _Address(bits, "global" if array else "pointer")
-            if referenced.kind == K.VAR_DECL:
-                if array:
-                    return _Address(bits, "local")
-                derived = self.derived(referenced, depth)
+            if referenced.kind in (K.PARM_DECL, K.VAR_DECL) and not _is_global_var(referenced):
+                derived = self.derived(referenced, node, depth)
                 if derived is not None:
                     return derived.shifted(bits)
+            # A parameter the function has set before this use (o = o->next in a walk), or a local
+            # whose definitions disagree, holds another pointer.
             return _Address(bits, "pointer")
         if node.kind == K.CALL_EXPR and node.referenced is not None and node.referenced.kind == K.FUNCTION_DECL:
             returned = self.x.returned_address(node.referenced.spelling)
             arguments = list(node.get_arguments() or [])
+            found: _Address | None = None
+            if returned is not None:
+                # The helper's parameter indices, as the call's arguments give them.
+                shift, terms = 0, []
+                for position, scale in returned.index:
+                    value = self.x.evaluator.evaluate(arguments[position]) if position < len(arguments) else None
+                    indexed = (
+                        self.index_of(arguments[position]) if position < len(arguments) and value is None else None
+                    )
+                    if value is not None:
+                        shift += value * scale
+                    elif indexed is not None:
+                        shift += indexed[1] * scale
+                        terms.append((indexed[0], scale))
+                returned = replace(returned, bits=returned.bits + shift, index=tuple(terms))
             if returned is not None and returned.param is None:
-                return returned.shifted(bits)
-            if returned is not None and returned.param is not None and returned.param < len(arguments):
+                found = returned.shifted(bits)
+            elif returned is not None and returned.param is not None and returned.param < len(arguments):
                 found = self.pointer(arguments[returned.param], bits + returned.bits, members, depth + 1)
                 if returned.element is not None:
                     # The helper's variable index is nearer the access than any in the argument.
                     found = replace(found, element=returned.element + bits)
-                if found.base in _OBJECT_BASES or returned.base != "container_of":
-                    return found
-                return replace(found, base="container_of")
+                if found.base not in _OBJECT_BASES and returned.base == "container_of":
+                    found = replace(found, base="container_of")
+                if found.base != "unknown":
+                    found = replace(found, index=(*found.index, *returned.index))
+            if found is not None:
+                definition = self.x.evaluator.definitions.get(node.referenced.spelling)
+                if definition is not None and not _is_inline(definition) and found.base != "unknown":
+                    # A helper not declared inline may stay a call: then its result is a register,
+                    # and the access adds only its own offset to it.
+                    found = replace(found, inner=bits)
+                return found
         return _Address(bits, "pointer")
 
-    def derived(self, variable: ci.Cursor, depth: int) -> _Address | None:
-        """Where a local pointer points when every definition of it points the same way (``d =
-        &desc->irq_data``; list_for_each_entry's ``pos = container_of(..., member)``) and nothing
-        else writes it or takes its address. The members of the definitions are folded away when
-        every other use of the local is the base of a member access."""
-        key = variable.hash
+    def arithmetic(self, node: ci.Cursor) -> tuple[ci.Cursor, ci.Cursor, int, int] | None:
+        """Pointer arithmetic ``p + i``, ``i + p`` or ``p - i``: the pointer, the integer, the bits one
+        step moves and the sign of a step."""
+        if node.kind != K.BINARY_OPERATOR or libclang.binary_kind(node) not in (libclang.ADD, libclang.SUBTRACT):
+            return None
+        operands = _children(node)
+        if len(operands) != 2:
+            return None
+        left, right = operands
+        add = libclang.binary_kind(node) == libclang.ADD
+        if add and right.type.get_canonical().kind == TK.POINTER:
+            left, right = right, left
+        if left.type.get_canonical().kind != TK.POINTER or right.type.get_canonical().kind not in _SCALAR_KINDS:
+            return None
+        return left, right, _element_bytes(left) * 8, 1 if add else -1
+
+    def index_of(self, expression: ci.Cursor) -> tuple[int, int] | None:
+        """An index that is a parameter the function never writes, plus a constant (``level``,
+        ``k - 1``): the parameter's position and the constant."""
+        node = _strip(expression)
+        offset = 0
+        if node.kind == K.BINARY_OPERATOR and libclang.binary_kind(node) in (libclang.ADD, libclang.SUBTRACT):
+            operands = _children(node)
+            if len(operands) != 2:
+                return None
+            left, right = operands
+            value = self.x.evaluator.evaluate(right)
+            if value is not None:
+                offset, node = value if libclang.binary_kind(node) == libclang.ADD else -value, _strip(left)
+            elif libclang.binary_kind(node) == libclang.ADD and self.x.evaluator.evaluate(left) is not None:
+                offset, node = self.x.evaluator.evaluate(left) or 0, _strip(right)
+            else:
+                return None
+        referenced = node.referenced if node.kind == K.DECL_REF_EXPR else None
+        if referenced is None or referenced.kind != K.PARM_DECL or self.written(referenced):
+            return None
+        position = self.parameters.get(referenced.hash)
+        return (position, offset) if position is not None else None
+
+    def derived(self, variable: ci.Cursor, use: ci.Cursor, depth: int) -> _Address | None:
+        """Where a local or parameter points at ``use`` when every value that can reach it points the
+        same way (``d = &desc->irq_data``; list_for_each_entry's ``pos = container_of(..., member)``;
+        a parameter is its own value until the function sets it) and nothing writes it otherwise or
+        takes its address. When a parameter's own value and the values a walk assigns it disagree
+        and those values are all one container_of (an rb_entry walk), the parameter stays the base
+        and the machine code may keep the member's address instead. The members of the definitions
+        are folded away when every other use of the local is the base of a member access."""
+        uses = self.local_uses()
+        if uses["written"][variable.hash]:
+            return None
+        definitions, entry = self.reaching(variable, use)
+        key = (variable.hash, tuple(sorted(definition.hash for definition in definitions)), entry)
         if key in self.derived_cache:
             return self.derived_cache[key]
         self.derived_cache[key] = None
-        uses = self.local_uses()
-        if uses["written"][key]:
-            return None
-        definitions = list(self.definitions.get(key, []))
-        initializer = libclang.var_initializer(variable)
-        if initializer is not None:
-            definitions.append(initializer)
         members: list[ci.Cursor] = []
-        addresses = {self.pointer(definition, 0, members, depth + 1) for definition in definitions}
-        if len(addresses) != 1:
+        assigned = {self.pointer(definition, 0, members, depth + 1) for definition in definitions}
+        own = _Address(0, "pointer", self.parameters.get(variable.hash)) if entry else None
+        address = _agree(assigned | ({own} if own is not None else set()))
+        if address is None and own is not None:
+            walked = _agree(assigned)
+            if walked is not None and walked.base == "container_of":
+                address = replace(own, inner=walked.bits)
+        if address is None or address.base == "unknown":
             return None
-        (address,) = addresses
-        if address.base == "unknown":
-            return None
-        if uses["references"][key] - uses["assigned"][key] == uses["bases"][key]:
+        if uses["references"][variable.hash] - uses["assigned"][variable.hash] == uses["bases"][variable.hash]:
             self.inner.update(member.hash for member in members)
         self.derived_cache[key] = address
         return address
 
+    def reaching(self, variable: ci.Cursor, use: ci.Cursor) -> tuple[list[ci.Cursor], bool]:
+        """The values a local or parameter can hold at ``use``, without the null pointers, and whether
+        a parameter's own value can: its initializer and the assignments that can reach the use (each
+        one before it, or after it in a loop around both, or anywhere when the function jumps back),
+        less what an assignment every path to the use passes overwrites."""
+        self.local_uses()
+        here = _place(use)
+        values = [
+            (value, place) for value, place in self.definitions.get(variable.hash, []) if self.reaches(place, here)
+        ]
+        initializer = libclang.var_initializer(variable) if variable.kind == K.VAR_DECL else None
+        entry = variable.kind == K.PARM_DECL
+        dominating = self.dominating(variable, use)
+        if dominating is not None:
+            value, after, until = dominating
+            # Only the assignments between that one and the end of the statement that holds the use.
+            values = [(value, None)] + [
+                (other, place)
+                for other, place in values
+                if place is not None and place[0] == after[0] and after[2] < place[1] <= until[2]
+            ]
+            initializer, entry = None, False
+        found = [value for value, _ in values] + ([initializer] if initializer is not None else [])
+        return [value for value in found if not _is_null(value) and not self.x.returns_null(value)], entry
+
+    def reaches(self, definition: _Place | None, use: _Place | None) -> bool:
+        if definition is None or use is None or definition[0] != use[0] or definition[1] <= use[2] or self.backward:
+            return True
+        return any(loop[0] == use[0] and loop[1] <= use[1] and definition[2] <= loop[2] for loop in self.loops)
+
+    def dominating(self, variable: ci.Cursor, use: ci.Cursor) -> tuple[ci.Cursor, _Place, _Place] | None:
+        """The last plain assignment to the variable that every path to ``use`` passes: a statement of
+        a block that holds the use, before the statement the use is in, with no label or case from
+        there to the use. Its value, where it is, and where the statement that holds the use is."""
+        node = use
+        while node.hash != self.cursor.hash:
+            parent = self.parents.get(node.hash)
+            if parent is None or node.hash in self.label_holders:
+                return None
+            if parent.kind == K.COMPOUND_STMT:
+                siblings = _children(parent)
+                index = next((at for at, sibling in enumerate(siblings) if sibling.hash == node.hash), None)
+                for sibling in reversed(siblings[:index] if index is not None else []):
+                    if sibling.hash in self.label_holders:
+                        return None
+                    operands = _children(sibling)
+                    if (
+                        sibling.kind == K.BINARY_OPERATOR
+                        and libclang.binary_kind(sibling) == 22
+                        and len(operands) == 2
+                        and _strip(operands[0]).kind == K.DECL_REF_EXPR
+                        and _strip(operands[0]).referenced is not None
+                        and _strip(operands[0]).referenced.hash == variable.hash
+                    ):
+                        after, until = _place(sibling), _place(node)
+                        if after is None or until is None or after[0] != until[0]:
+                            return None
+                        return operands[1], after, until
+            node = parent
+        return None
+
     def local_uses(self) -> dict[str, collections.Counter[int]]:
-        """Per local or parameter, by its cursor's hash: references, plain assignments to it, writes the
-        derivation cannot follow (``+=``, ``++``, ``&local``), and uses as a member access's base."""
+        """Per local or parameter, by its cursor's hash: references, plain assignments to it (each kept
+        with where it is), writes the derivation cannot follow (``+=``, ``++``, ``&local`` unless an
+        inline callee never reads it), and uses as a member access's base; also each node's parent,
+        the nodes that hold a label or a case, the function's loops, and whether it jumps back."""
         if self.uses is not None:
             return self.uses
         uses: dict[str, collections.Counter[int]] = {
@@ -2120,26 +2374,88 @@ class _FunctionWalk:
                 return None
             return node.referenced.hash if node.referenced.kind in (K.VAR_DECL, K.PARM_DECL) else None
 
-        for node in self.cursor.walk_preorder():
+        stack: list[tuple[ci.Cursor, ci.Cursor | None]] = [(self.cursor, None)]
+        while stack:
+            node, parent = stack.pop()
+            operands = _children(node)
+            stack.extend((child, node) for child in reversed(operands))
+            if parent is not None:
+                self.parents[node.hash] = parent
             kind = node.kind
             if kind == K.DECL_REF_EXPR and node.referenced is not None:
                 uses["references"][node.referenced.hash] += 1
+                if self.tested(node):
+                    uses["bases"][node.referenced.hash] += 1
                 continue
-            operands = _children(node)
+            if kind in (K.LABEL_STMT, K.CASE_STMT, K.DEFAULT_STMT):
+                above: ci.Cursor | None = node
+                while above is not None and above.hash not in self.label_holders:
+                    self.label_holders.add(above.hash)
+                    above = self.parents.get(above.hash)
+            if kind in _LOOPS:
+                loop = _place(node)
+                if loop is not None:
+                    self.loops.append(loop)
+            elif kind == K.INDIRECT_GOTO_STMT:
+                self.backward = True
+            elif kind == K.GOTO_STMT:
+                label = next((child.referenced for child in operands if child.kind == K.LABEL_REF), None)
+                at, to = _place(node), _place(label) if label is not None else None
+                self.backward = self.backward or at is None or to is None or at[0] != to[0] or to[1] <= at[1]
             target = local(operands[0]) if operands else None
             if target is None:
                 continue
             if kind == K.BINARY_OPERATOR and libclang.binary_kind(node) == 22 and len(operands) == 2:
                 uses["assigned"][target] += 1
-                self.definitions[target].append(operands[1])
-            elif kind == K.COMPOUND_ASSIGNMENT_OPERATOR or (
-                kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node))
-            ):
+                self.definitions[target].append((operands[1], _place(node)))
+            elif kind == K.COMPOUND_ASSIGNMENT_OPERATOR or (kind == K.UNARY_OPERATOR and libclang.is_increment(node)):
                 uses["written"][target] += 1
+            elif kind == K.UNARY_OPERATOR and libclang.is_address_of(node):
+                if not self.ignored_address(node):
+                    uses["written"][target] += 1
             elif kind == K.MEMBER_REF_EXPR and operands[0].type.get_canonical().kind == TK.POINTER:
                 uses["bases"][target] += 1
         self.uses = uses
         return uses
+
+    def tested(self, reference: ci.Cursor) -> bool:
+        """A pointer only tested for null (``for (; se; se = NULL)``, ``if (!p)``, ``p && ...``): the
+        machine code needs no address for it when it folds the definition into the accesses."""
+        if reference.type.get_canonical().kind != TK.POINTER:
+            return False
+        operand = reference
+        parent = self.parents.get(operand.hash)
+        while parent is not None and parent.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR):
+            operand, parent = parent, self.parents.get(parent.hash)
+        if parent is None:
+            return False
+        children = _children(parent)
+        if parent.kind in (K.IF_STMT, K.WHILE_STMT, K.CONDITIONAL_OPERATOR):
+            return bool(children) and children[0].hash == operand.hash
+        if parent.kind == K.DO_STMT:
+            return bool(children) and children[-1].hash == operand.hash
+        if parent.kind == K.FOR_STMT:
+            # A bare pointer anywhere but the body of a for is its condition.
+            return bool(children) and children[-1].hash != operand.hash
+        if parent.kind == K.UNARY_OPERATOR:
+            return libclang.unary_kind(parent) == libclang.LOGICAL_NOT
+        return parent.kind == K.BINARY_OPERATOR and libclang.binary_kind(parent) in (
+            libclang.LOGICAL_AND,
+            libclang.LOGICAL_OR,
+        )
+
+    def ignored_address(self, address: ci.Cursor) -> bool:
+        """``&local`` passed straight to an inline callee that never reads that parameter
+        (find_matching_se(&se, &pse), empty without group scheduling): the local stays unwritten."""
+        argument = address
+        parent = self.parents.get(argument.hash)
+        while parent is not None and parent.kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR, K.CSTYLE_CAST_EXPR):
+            argument, parent = parent, self.parents.get(parent.hash)
+        if parent is None or parent.kind != K.CALL_EXPR:
+            return False
+        arguments = list(parent.get_arguments() or [])
+        position = next((at for at, item in enumerate(arguments) if item.hash == argument.hash), None)
+        return position is not None and position in self.x.ignored_parameters(parent.referenced)
 
     def written(self, variable: ci.Cursor) -> bool:
         """The function assigns the variable, changes it in place or takes its address."""
@@ -2147,9 +2463,10 @@ class _FunctionWalk:
         return bool(uses["assigned"][variable.hash] or uses["written"][variable.hash])
 
     def argument(self, expression: ci.Cursor) -> dict[str, Any]:
-        """What a call argument names: its state unit, the parameter it derives from, and, for the
-        address of a member reached from a pointer (wb_exit(&bdi->wb)), what that address adds to
-        the pointer, so a folded callee's field offsets can be rebased onto the caller's."""
+        """What a call argument names: its state unit, the parameter it derives from, and, for an
+        address the facts can follow (wb_exit(&bdi->wb), prepare_alloc_pages(..., &ac, ...),
+        clk_core_free_parent_map(container_of(ref, ...))), what that address adds to its base and
+        what the base is, so a folded callee's field offsets can be rebased onto the caller's."""
         item: dict[str, Any] = {
             "unit": self.held_global(expression) or self.x.unit_from_ref(expression) or self.global_storage(expression),
             "param": self.parameter_root(expression),
@@ -2162,6 +2479,20 @@ class _FunctionWalk:
                 # pointer loaded through a parameter (path->dentry) is a new base and gives none.
                 item["displacement"] = address.bits // 8
                 item["param"] = address.param
+                item["base"] = address.base
+            elif address.base in ("local", "other", "global"):
+                # The address of an object the caller names: its own local (on the stack or in
+                # registers once the callee is inlined), or a global's storage.
+                item["displacement"] = address.bits // 8
+                item["param"] = None
+                item["base"] = address.base
+                item.update(_object_keys(address))
+            if "displacement" in item and address.element is not None:
+                # Past a variable index (&cpu_base->clock_base[idx]): the bits from the indexed element.
+                item["element"] = address.element // 8
+            if "displacement" in item and address.index:
+                # sb->s_writers.rw_sem + level - 1: the steps of parameters a caller may pass constants.
+                item["index"] = _index_terms(address)
         # The value the argument passes, where it is a constant or depends on the caller's parameters:
         # the guards of a folded callee are decided by it (link._bind).
         value = self.x.evaluator.expression(expression, self.held)
@@ -2169,25 +2500,29 @@ class _FunctionWalk:
             item["expr"] = value
         return item
 
-    def held_global(self, expression: ci.Cursor) -> Unit | None:
-        """The global a local pointer holds when every definition of it is the address of the same
-        global's storage and nothing else writes it (free_area_init_node: pgdat = NODE_DATA(nid),
-        which is &contig_page_data; change_clocksource: tk = &tk_core.shadow_timekeeper)."""
+    def held_global(self, expression: ci.Cursor, depth: int = 0) -> Unit | None:
+        """The global whose storage an address holds: ``&g``, ``&g.a``, ``&g[i]`` or a global array's
+        decay; a call of an inline helper that returns one (NODE_DATA(nid), &contig_page_data
+        without NUMA); or a local whose every definition that can reach it holds the same and that
+        nothing else writes (free_area_init_node: pgdat = NODE_DATA(nid); change_clocksource:
+        tk = &tk_core.shadow_timekeeper)."""
         node = _strip(expression)
+        if depth > 8:
+            return None
+        found = self.global_storage(node)
+        if found is not None:
+            return found
         variable = node.referenced if node.kind == K.DECL_REF_EXPR else None
         if variable is None or variable.kind != K.VAR_DECL or _is_global_var(variable):
             return None
         if self.local_uses()["written"][variable.hash]:
             return None
-        definitions = list(self.definitions.get(variable.hash, []))
-        initializer = libclang.var_initializer(variable)
-        if initializer is not None:
-            definitions.append(initializer)
-        units = [self.global_storage(definition) for definition in definitions]
-        if not units or any(unit is None for unit in units):
+        values, _ = self.reaching(variable, node)
+        held = [self.held_global(value, depth + 1) for value in values]
+        if not held or any(unit is None for unit in held):
             return None
-        distinct = {jsonio.canonical(unit): unit for unit in units}
-        return next(iter(distinct.values())) if len(distinct) == 1 else None
+        units = {jsonio.canonical(unit): unit for unit in held if unit is not None}
+        return next(iter(units.values())) if len(units) == 1 else None
 
     def global_storage(self, expression: ci.Cursor, depth: int = 0) -> Unit | None:
         """The global whose storage an address is in: ``&g``, ``&g.a``, ``&g[i]``, a global array's
@@ -2259,7 +2594,19 @@ class _FunctionWalk:
                         member.hash != where.hash and member.type.get_canonical().kind in _ARRAY_TYPES
                     )
                 else:
-                    address = _Address(0, "unknown")
+                    # The lock helpers name a member through an inline call (spin_lock_irqsave's
+                    # spinlock_check(&rsp->rss_lock), which returns &lock->rlock): the address, when
+                    # it passes the unit's member.
+                    passed: list[ci.Cursor] = []
+                    address = (
+                        self.pointer(member, 0, passed, 0)
+                        if member.type.get_canonical().kind == TK.POINTER
+                        else _Address(0, "unknown")
+                    )
+                    if any(item.referenced.spelling == unit["field"] for item in passed):
+                        addressed = True
+                    else:
+                        address = _Address(0, "unknown")
                 known = (address, addressed)
             address, addressed = known
             field = member.referenced if member.kind == K.MEMBER_REF_EXPR else None
@@ -2289,6 +2636,16 @@ class _FunctionWalk:
                 # (o->slots[k].b: lw 0x6c) or keep the element's address in a register and add only
                 # this (__next_base's &cpu_base->clock_base[idx], then base->offset).
                 access["element_displacement"] = address.element // 8
+            if address.inner is not None and address.base != "unknown":
+                # The machine code may keep the value of a helper call or of a walk's container_of in
+                # a register and add only this.
+                access["inner_displacement"] = address.inner // 8
+            if address.index and address.base != "unknown":
+                # The parameters among the variable indices, which a caller that passes a constant fixes.
+                access["index"] = _index_terms(address)
+            if address.base == "local":
+                # The caller's or the function's own local object, which the frame may hold.
+                access.update(_object_keys(address))
             if addressed:
                 # &p->m, or an array member decaying to its address: no load or store.
                 access["address"] = True

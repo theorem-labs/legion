@@ -36,6 +36,8 @@ Facts = dict[str, Any]
 Unit = dict[str, Any]
 _EVENT_LISTS = ("accesses", "unevaluated", "list_calls", "indirect", "function_pointers", "field_accesses")
 _FIELD_KEYS = ("struct", "field", "offset", "displacement", "base", "size", "bitfield")
+# What a call argument says of the address it passes, which a value standing for it does not keep.
+_ADDRESS_KEYS = frozenset({"displacement", "base", "object", "object_size", "element", "index"})
 _CORE_FORMAT = "cgraph/link-core/v1"
 # The events a fold under a __builtin_constant_p choice marks ``conditional``, besides calls.
 _MARKED = ("accesses", "field_accesses")
@@ -601,23 +603,49 @@ class Linker:
         return self.own_cache[key]
 
 
+def _rebased_base(outer: str | None, inner: str) -> str:
+    """The base of an address a folded callee forms from its parameter, given what the caller passed:
+    the caller's local object stays that object; the caller's global or container_of pointer gives the
+    callee's known address that base; a plain pointer leaves the callee's own base (its container_of,
+    the pointer, or unknown)."""
+    if outer in ("local", "other"):
+        return outer
+    if outer in ("global", "container_of") and inner != "unknown":
+        return outer
+    return inner
+
+
 def _rebase(access: dict[str, Any], argument: dict[str, Any] | None) -> dict[str, Any]:
     """A field access a helper makes through its parameter, as its caller's code makes it.
 
     Only an argument whose ``displacement`` the facts give (a member's address reached from a pointer,
-    ``f(&p->m)``, or 0 for the pointer itself) is that far from the caller's pointer: the displacement
-    is added and the caller's parameter kept. A pointer loaded through the parameter (``f(p->q)``)
-    is another object, so the access keeps its own displacement and names no parameter."""
+    ``f(&p->m)``, 0 for the pointer itself, or the address of the caller's local or global object) is
+    that far from the caller's base: the displacement is added, the caller's parameter kept, and the
+    caller's base taken. A pointer loaded through the parameter (``f(p->q)``) is another object, so
+    the access keeps its own displacement and names no parameter."""
     if argument is None:
         return {**access, "param": None}
     if "displacement" in argument:
-        displacement = access["displacement"] + argument["displacement"] if access["displacement"] >= 0 else -1
-        rebased = {**access, "displacement": displacement, "param": argument.get("param")}
-        if argument["displacement"] != 0 and access["displacement"] >= 0:
+        # A container_of in the callee subtracts from its parameter: a negative displacement is known.
+        known = access["base"] != "unknown" and (access["displacement"] >= 0 or access["base"] == "container_of")
+        displacement = access["displacement"] + argument["displacement"] if known else -1
+        rebased = {
+            **access,
+            "displacement": displacement,
+            "param": argument.get("param"),
+            "base": _rebased_base(argument.get("base"), access["base"]),
+        }
+        if argument["displacement"] != 0 and known:
             # The machine code may keep the member's address in a register: the access's own
             # displacement from it, the innermost one.
             rebased["inner_displacement"] = access.get("inner_displacement", access["displacement"])
-        return rebased
+        if "element" in argument and known and access.get("element_displacement") is None:
+            # Past the argument's variable index (&cpu_base->clock_base[idx]): from the element.
+            rebased["element_displacement"] = argument["element"] + access["displacement"]
+        if argument.get("index"):
+            # The argument's own parameter indices, in the caller's parameters.
+            rebased["index"] = [*access.get("index", []), *argument["index"]]
+        return {**rebased, **_object_of(argument)}
     unit = argument.get("unit")
     if unit is not None and unit["kind"] == "global" and unit.get("field") is None and argument.get("param") is None:
         # The address of a whole global: the field is that far into the global.
@@ -637,7 +665,7 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
             _rebase(item, arguments[item["param"]] if item["param"] < len(arguments) else None)
             if item.get("param") is not None
             else item
-            for item in child.field_accesses
+            for item in (_fix_index(access, arguments) for access in child.field_accesses)
         ],
         folds=list(child.folds),
         unbound=list(child.unbound),
@@ -657,7 +685,7 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
             bound.unbound.append(access)
     for call in child.calls:
         rebound = []
-        for item in call["arguments"]:
+        for item in (_fix_index(argument, arguments) for argument in call["arguments"]):
             index = item.get("param")
             if index is None or index >= len(arguments):
                 rebound.append(item)
@@ -665,13 +693,17 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
                 # The parameter itself (0) or a member of it: the caller's argument, that much further.
                 outer = arguments[index]
                 if "displacement" in outer:
-                    rebound.append(
-                        {
-                            **item,
-                            "param": outer.get("param"),
-                            "displacement": item["displacement"] + outer["displacement"],
-                        }
-                    )
+                    nested = {
+                        **item,
+                        "param": outer.get("param"),
+                        "displacement": item["displacement"] + outer["displacement"],
+                        "base": _rebased_base(outer.get("base"), item.get("base", "pointer")),
+                    }
+                    if "element" in outer and "element" not in item:
+                        nested["element"] = outer["element"] + item["displacement"]
+                    if outer.get("index"):
+                        nested["index"] = [*item.get("index", []), *outer["index"]]
+                    rebound.append({**nested, **_object_of(outer)})
                 elif item["displacement"] == 0:
                     rebound.append(outer)
                 else:
@@ -679,12 +711,45 @@ def _bind(child: Effective, arguments: list[dict[str, Any]]) -> Effective:
             elif item.get("unit") is None:
                 # An untyped value derived from the parameter: the caller's argument stands for it, as a
                 # value, not as a pointer an offset can rebase.
-                rebound.append({key: value for key, value in arguments[index].items() if key != "displacement"})
+                rebound.append({key: value for key, value in arguments[index].items() if key not in _ADDRESS_KEYS})
             else:
                 # A value loaded through the parameter (p->q): another object.
                 rebound.append({**item, "param": None})
         bound.calls.append({**call, "arguments": rebound})
     return _guarded(bound, child, arguments)
+
+
+def _object_of(argument: dict[str, Any]) -> dict[str, Any]:
+    """The caller's local object an argument is the address of (prepare_alloc_pages(..., &ac, ...)),
+    which a folded callee's fields through that parameter are in."""
+    if argument.get("base") not in ("local", "other") or "object" not in argument:
+        return {}
+    return {"object": argument["object"], "object_size": argument["object_size"]}
+
+
+def _fix_index(item: dict[str, Any], arguments: list[dict[str, Any]]) -> dict[str, Any]:
+    """An access or argument whose address steps by the helper's parameters (``rw_sem + level - 1``),
+    as its caller's arguments give them: a constant argument adds its steps to the displacement
+    (sb_end_write's SB_FREEZE_WRITE: 96 bytes); the caller's own parameter carries the step on; any
+    other value leaves a variable index in a register."""
+    terms = item.get("index")
+    if not terms:
+        return item
+    shift, kept = 0, []
+    for term in terms:
+        argument = arguments[term["param"]] if term["param"] < len(arguments) else None
+        value = _constant(argument)
+        expression = argument.get("expr") if argument is not None else None
+        if value is not None:
+            shift += value * term["scale"]
+        elif isinstance(expression, dict) and "p" in expression and set(expression) <= {"p", "w", "s"}:
+            kept.append({"param": expression["p"], "scale": term["scale"]})
+    fixed = {key: value for key, value in item.items() if key != "index"}
+    if kept:
+        fixed["index"] = kept
+    if shift and "displacement" in fixed and fixed.get("base") != "unknown" and fixed["displacement"] != -1:
+        fixed["displacement"] += shift
+    return fixed
 
 
 # Guards: the code of a helper compiled only for some values of its parameters --------------------
@@ -1109,6 +1174,8 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
 
     c_calls: collections.Counter[tuple[str, str]] = collections.Counter()
     c_targets: dict[str, list[dict[str, Any]]] = {}
+    # The local objects whose address each function passes to a call: callee, position, object, offset.
+    object_arguments: dict[str, set[tuple[str, int, str, int]]] = collections.defaultdict(set)
     field_accesses: dict[str, list[dict[str, Any]]] = {}
     global_struct_offsets: dict[str, list[dict[str, Any]]] = {}
     named_records: dict[str, dict[str, str]] = collections.defaultdict(dict)
@@ -1161,6 +1228,12 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                 image=("tail" if image_call["tail"] else "direct") if image_call else "none",
             )
             c_calls[(identity, target)] += len(call["provenance"])
+            for position, argument in enumerate(call["arguments"]):
+                if argument.get("base") == "local" and "object" in argument and "displacement" in argument:
+                    # &object passed to a call the image makes: where the frame holds the object.
+                    object_arguments[identity].add(
+                        (call["callee"], position, argument["object"], argument["displacement"])
+                    )
         c_names = {call["callee"] for call in result.calls}
         for fact in image_facts:
             for call in fact.calls:
@@ -1377,6 +1450,7 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
     nodes, edges = builder.finalize()
     image_names = {identity: sorted(names) for identity, names in image_globals.items()}
     witnesses = [witness for tu in sorted(linker.part_files) for witness in linker.tus[tu]["witnesses"]]
+    image_analysis = _image_analysis(linker, functions, image_names, image_pairs, field_accesses)
     analysis.update(
         {
             "part_functions": sorted(functions),
@@ -1387,7 +1461,7 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
             ],
             "c_targets": c_targets,
             "field_accesses": field_accesses,
-            "image": _image_analysis(linker, functions, image_names, image_pairs),
+            "image": image_analysis,
             "callback_tables": tables,
             "excluded_embedding_bases": excluded,
             "membership_witnesses": sorted(witnesses, key=jsonio.canonical),
@@ -1399,6 +1473,9 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                 tu: linker.tus[tu]["errors"] for tu in sorted(linker.part_files) if linker.tus[tu]["errors"]
             },
             "global_struct_offsets": global_struct_offsets,
+            "object_arguments": {
+                identity: [list(item) for item in sorted(items)] for identity, items in sorted(object_arguments.items())
+            },
             "specialized_parameters": [
                 {"function": function, "parameter": index, "global": target}
                 for function, index, target in sorted(specializations)
@@ -1610,10 +1687,14 @@ def _image_analysis(
     functions: dict[str, Definition],
     image_globals: dict[str, list[str]],
     image_pairs: set[tuple[str, str]],
+    field_accesses: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any]:
     calls, globals_, addresses, outside = [], [], [], []
     offsets: dict[str, list[int]] = {}
     constants: dict[str, list[int]] = {}
+    frame_accesses: dict[str, list[list[int]]] = {}
+    frame_addresses: dict[str, list[int]] = {}
+    frame_arguments: dict[str, list[list[Any]]] = {}
     for identity, definition in sorted(functions.items()):
         facts = linker.image_facts(definition)
         for fact in facts:
@@ -1627,6 +1708,18 @@ def _image_analysis(
             outside += [{**item, "function": identity} for item in fact.outside]
         offsets[identity] = sorted({value for fact in facts for value in fact.memory_offsets})
         constants[identity] = sorted({value for fact in facts for value in fact.addi_constants})
+        if any(item.get("object") for item in field_accesses.get(identity, [])):
+            # The frame of a function with a local object's fields (frames.py); each copy's own.
+            frame_accesses[identity] = [
+                list(item) for item in sorted({item for fact in facts for item in fact.frame_accesses})
+            ]
+            frame_addresses[identity] = sorted({value for fact in facts for value in fact.frame_addresses})
+            targets = {call["provenance"][0]["address"]: call["target"] for fact in facts for call in fact.calls}
+            frame_arguments[identity] = [
+                [targets[_hex(address)], position, offset]
+                for address, position, offset in sorted({item for fact in facts for item in fact.frame_arguments})
+                if _hex(address) in targets
+            ]
 
     def unique(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return sorted({jsonio.canonical(item): item for item in items}.values(), key=jsonio.canonical)
@@ -1641,6 +1734,9 @@ def _image_analysis(
         "sized_symbol_names": linker.image.sized_object_names,
         "globals_by_function": image_globals,
         "call_pairs": len(image_pairs),
+        "frame_accesses": frame_accesses,
+        "frame_addresses": frame_addresses,
+        "frame_arguments": frame_arguments,
     }
 
 
@@ -1685,7 +1781,7 @@ def _field_access(item: dict[str, Any]) -> dict[str, Any]:
     if item.get("conditional"):
         # Under a __builtin_constant_p choice: the image decides whether it was compiled.
         access["conditional"] = True
-    for key in ("element_displacement", "inner_displacement", "param", "element_size"):
+    for key in ("element_displacement", "inner_displacement", "param", "element_size", "object", "object_size"):
         if item.get(key) is not None:
             access[key] = item[key]
     return access

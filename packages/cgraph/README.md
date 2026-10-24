@@ -128,10 +128,21 @@ These rules follow what the machine code shows, each only where it shows it:
   address its initializer stores): `analysis.specialized_parameters`.
 - A folded helper's field access through its parameter is rebased to the caller only where the
   argument's `displacement` is given (0 for the caller's pointer itself, the member's offset for
-  `wb_exit(&bdi->wb)`): the displacement is added, the argument's own parameter kept, and the access's
-  own displacement stays as `inner_displacement`, for code that keeps the member's address in a
-  register. A pointer loaded through the parameter (`f(path->dentry)`) is another object and is not
-  rebased. A parameter is followed to its callers' globals (above) on the same rule.
+  `wb_exit(&bdi->wb)`, the address of the caller's local or global object): the displacement is added,
+  the argument's own parameter kept, the argument's `base` taken (`local` and the `object` for
+  `f(&ac)`, `container_of` for `f(container_of(ref, ...))`, whose negative displacement the image
+  addresses), and the access's own displacement stays as `inner_displacement`, for code that keeps
+  the member's address in a register. An address that steps by a helper's parameter
+  (`sb->s_writers.rw_sem + level - 1`) gives an `index` term: a caller's constant argument adds its
+  steps at the fold, the caller's own parameter carries the term on. A pointer loaded through the
+  parameter (`f(path->dentry)`) is another object and is not rebased. A parameter is followed to its
+  callers' globals (above) on the same rule. `analysis.object_arguments` lists each local object whose
+  address a function passes to a call.
+- A local's or parameter's address is derived from the values that reach each use: the assignments
+  before it (or after it, around a loop or a backward goto), less those an assignment on every path
+  overwrites, without null pointers (`for (; se; se = NULL)`, a helper that returns NULL), through
+  `?:`, `_Generic`, pointer arithmetic, an array's decay, and the return of any helper of the unit (one
+  not declared inline also gives `inner_displacement`, for a call that stays).
 - A read of a global whose file-scope initializer stores other globals' addresses reaches each of
   those globals the machine code forms (the compiler folded the field's value); the edge names the
   holder in `initializer`.
