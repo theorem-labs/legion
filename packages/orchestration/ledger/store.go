@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -22,46 +21,12 @@ import (
 //go:embed schema/*.sql
 var schemaFS embed.FS
 
-// tableStatement finds a migration's statements that create or drop a table, at the start of a line.
-var tableStatement = regexp.MustCompile(`(?im)^\s*(create|drop)\s+table\s+(?:if\s+(?:not\s+)?exists\s+)?([a-z_][a-z0-9_]*)`)
-
-// migrationTables are the tables that the migration scripts, applied in order, leave: those they create, less
-// those a later one drops. It does not follow a rename: the old name would stay required, and OpenExisting would
-// refuse every database until the rename is added here.
-func migrationTables(scripts ...string) []string {
-	var tables []string
-	for _, script := range scripts {
-		for _, m := range tableStatement.FindAllStringSubmatch(script, -1) {
-			name := strings.ToLower(m[2])
-			tables = slices.DeleteFunc(tables, func(t string) bool { return t == name })
-			if strings.EqualFold(m[1], "create") {
-				tables = append(tables, name)
-			}
-		}
-	}
-	return tables
-}
-
-// schemaTables is every table the embedded ledger schema needs, so that OpenExisting refuses a database whose
-// version record survived a damaged table.
-func schemaTables() ([]string, error) {
-	files, err := schemaFiles()
-	if err != nil {
-		return nil, err
-	}
-	scripts := make([]string, len(files))
-	for i, file := range files {
-		raw, err := schemaFS.ReadFile(file)
-		if err != nil {
-			return nil, err
-		}
-		scripts[i] = string(raw)
-	}
-	tables := migrationTables(scripts...)
-	if len(tables) == 0 {
-		return nil, errors.New("the embedded ledger schema creates no table")
-	}
-	return tables, nil
+// schemaTables are the tables that the embedded schema leaves, which OpenExisting requires, so that it refuses a
+// database whose version record survived a damaged table. A migration that adds, drops or renames a table changes
+// this list; a test checks it against a migrated database.
+var schemaTables = []string{
+	"repositories", "work_items", "migrations", "migration_writes", "migration_reads",
+	"contracts", "agreements", "agreement_reads", "events",
 }
 
 // Store is a connection pool to one ledger database.
@@ -69,18 +34,18 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
-// SchemaError means an existing ledger database lacks an embedded schema version or a required ledger table.
-// OpenExisting returns it without applying any migration.
+// SchemaError means an existing ledger database lacks an embedded schema version (Missing) or, with every version,
+// a required ledger table (Tables). OpenExisting returns it without applying any migration.
 type SchemaError struct {
 	Missing []int
 	Tables  []string
 }
 
 func (e *SchemaError) Error() string {
-	if len(e.Tables) != 0 {
-		return fmt.Sprintf("ledger schema is missing versions %v or tables %v", e.Missing, e.Tables)
+	if len(e.Missing) != 0 {
+		return fmt.Sprintf("ledger schema is missing versions %v", e.Missing)
 	}
-	return fmt.Sprintf("ledger schema is missing versions %v", e.Missing)
+	return fmt.Sprintf("ledger schema is missing tables %v", e.Tables)
 }
 
 // Open connects to the database and applies any schema versions it lacks.
@@ -172,22 +137,17 @@ func (s *Store) checkSchema(ctx context.Context) error {
 	if len(missing) != 0 {
 		return &SchemaError{Missing: missing}
 	}
-	tables, err := schemaTables()
+	rows, err = s.pool.Query(ctx, `SELECT t FROM unnest($1::text[]) WITH ORDINALITY AS u(t, i)
+		WHERE to_regclass('public.' || t) IS NULL ORDER BY i`, schemaTables)
 	if err != nil {
-		return err
+		return fmt.Errorf("check the ledger tables: %w", err)
 	}
-	var missingTables []string
-	for _, table := range tables {
-		var exists bool
-		if err := s.pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
-			return fmt.Errorf("check ledger table %s: %w", table, err)
-		}
-		if !exists {
-			missingTables = append(missingTables, table)
-		}
+	missingTables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("check the ledger tables: %w", err)
 	}
 	if len(missingTables) != 0 {
-		return &SchemaError{Missing: want, Tables: missingTables}
+		return &SchemaError{Tables: missingTables}
 	}
 	return nil
 }

@@ -1,33 +1,35 @@
 package ledger
 
 import (
+	"context"
 	"slices"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
-// The tables that OpenExisting requires are those the migrations leave: created, less those a later migration
-// drops, whatever the statements' case, indentation or IF [NOT] EXISTS.
-func TestMigrationTablesFollowCreateAndDrop(t *testing.T) {
-	got := migrationTables(
-		"CREATE TABLE repositories (\n  name text\n);\n-- CREATE TABLE commented (x int);\ncreate table if not exists Events (x int);\n",
-		"  CREATE TABLE scratch (x int);\nALTER TABLE events ADD COLUMN y int;\n",
-		"DROP TABLE IF EXISTS scratch;\nCREATE TABLE contracts (x int);\n",
-	)
-	want := []string{"repositories", "events", "contracts"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("migration tables %v, want %v", got, want)
-	}
-}
-
-// The embedded schema yields every table it creates: here, two that the ledger's own queries use.
-func TestSchemaTablesReadTheEmbeddedMigrations(t *testing.T) {
-	tables, err := schemaTables()
+// The tables that OpenExisting requires (schemaTables) are those the embedded migrations leave: a migration that
+// adds, drops or renames a table must change the list too.
+func TestSchemaTablesAreTheMigratedTables(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, testpg.Database(t, "ledger_schema_tables"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"contracts", "events"} {
-		if !slices.Contains(tables, table) {
-			t.Errorf("schema tables %v lack %s", tables, table)
-		}
+	defer s.Close()
+	rows, err := s.pool.Query(ctx, `SELECT table_name FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> 'schema_versions'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(got)
+	if want := slices.Sorted(slices.Values(schemaTables)); !slices.Equal(got, want) {
+		t.Fatalf("the migrated ledger has tables %v; schemaTables lists %v", got, want)
 	}
 }

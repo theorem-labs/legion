@@ -3,6 +3,7 @@ package ledger_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -90,8 +91,11 @@ func TestOpenExistingRejectsAnIncompleteLedgerSchema(t *testing.T) {
 		t.Fatal("OpenExisting accepted a database with a missing ledger table")
 	} else {
 		var schemaErr *ledger.SchemaError
-		if !errors.As(err, &schemaErr) || len(schemaErr.Missing) == 0 {
-			t.Fatalf("OpenExisting error %v, want SchemaError with missing versions", err)
+		if !errors.As(err, &schemaErr) || len(schemaErr.Missing) != 0 || !slices.Equal(schemaErr.Tables, []string{"contracts"}) {
+			t.Fatalf("OpenExisting error %v, want SchemaError with the missing table contracts and no missing version", err)
+		}
+		if want := "ledger schema is missing tables [contracts]"; err.Error() != want {
+			t.Fatalf("OpenExisting error %q, want %q", err, want)
 		}
 	}
 	var contracts *string
