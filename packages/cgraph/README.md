@@ -60,24 +60,36 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   from the zero-size marker that often sits at its first instruction. Data addresses come from
   `auipc` arithmetic, shared anchors and compressed loads included, and count only inside the
   declared size of an object symbol that `System.map` names. An address a register holds survives a
-  spill to a frame slot and the reload from it. Where every path into a load gives its base a known
-  address but not the same one, the function reads each of those objects on some path
-  (`load_or_store_some_path`); where any path leaves the base unknown, no object is claimed. A call
-  to a function whose code has no return and no jump out of itself (`rest_init`, `panic`) does not
-  continue, so code the compiler places after it is reached only by its other paths. Nor does an
-  `ebreak` that `[image.trap_table]` lists without the resume flag (a BUG); a WARN's resumes, as does
-  any trap the table does not list.
+  spill to a frame slot and the reload from it, until a store over any byte of the slot, a store
+  through the other frame register, or a move of the frame register. Where every path into a load
+  gives its base a known address but not the same one, the function reads each of those objects on
+  some path (`load_or_store_some_path`); where any path leaves the base unknown, no object is
+  claimed. A loop's first pass is a path too: a load or store whose base the loop changes reads the
+  address the loop enters with. An address formed with an `addi`, or an index added to a known
+  address, is an access of its own only where the code uses it other than as the base of its loads
+  and stores (passes, returns, stores or compares it); an index added for a table the next load
+  reads is that load's access. An index never takes an access below the object it starts from
+  (`buf[len - 1]`). A call to a function whose code has no return and no jump out of itself
+  (`rest_init`, `panic`) does not continue, so code the compiler places after it is reached only
+  by its other paths. Nor does an `ebreak` that `[image.trap_table]` lists without the resume flag
+  (a BUG); a WARN's resumes, as does any trap the table does not list.
   Thread-pointer accesses are per-CPU state. Globals the machine code addresses but the C does not
   name become nodes with image-only access edges.
-- **What the image cannot tell apart is named by every name it has.** An address one past the end of
-  an object is that object's end pointer and, where another object starts there, that object too;
-  both names are kept, and a C access to either matches. Where the symbol table has a symbol of its
-  own at the address that `System.map` leaves out (a jump table, a constant pool), the address is
-  that symbol's and the object's end pointer is not claimed. The start of a block of globals LLVM
-  merged (`.L_MergedGlobals`) is also its first member's address: forming it accesses no member, so
-  it is recorded in `exclusions.json` (`image_access` / `merged_globals_block_base`, its `detail`
-  holding the block's size and the names its start has) and each member is named where a
-  displacement from the block reaches it.
+- **What the image cannot tell apart is named by every name it has.** A loop's bound, an address
+  the code only compares or subtracts, may be the end of an object: in C two pointers compared point
+  into one object, so the bound names the object its other side points into, and an address one
+  past an object is that object's end pointer and, where another object starts there, that object
+  too. No load or store reads the end of an object, and an address passed or returned is no bound
+  (a string right after an object has the object's end address). Where the symbol table has a
+  symbol of its own at the address that `System.map` leaves out (a jump table, a constant pool),
+  the address is that symbol's and the object's end pointer is not claimed. The start of a block of
+  globals LLVM merged (`.L_MergedGlobals`) is also its first member's address: forming it accesses
+  no member, so it is recorded in `exclusions.json` (`image_access` / `merged_globals_block_base`,
+  its `detail` holding the block's size and the names its start has) and each member is named where
+  a displacement from the block reaches it. Zero-size markers at a function's first instruction
+  (`_sinittext`, `__sched_text_start`) name the function's address as well: the function's address
+  is recorded, and the markers are an `image_access` / `code_marker_at_function_start` item whose
+  `detail.names` a C access to one of them matches.
 - **Field offsets** come from every offset from a base the machine code forms, not only from the
   ones it dereferences: the displacement of a load or store, the immediate of an `addi`, the constant
   a register already carries (with the shift that forms the size of an array element), and the sum of

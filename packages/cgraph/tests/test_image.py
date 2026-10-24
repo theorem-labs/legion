@@ -365,12 +365,13 @@ def test_an_address_only_used_as_a_base_is_not_itself_an_access(image: Image) ->
 
 
 def test_a_zero_size_name_at_an_objects_address_is_an_alias(image: Image) -> None:
+    """A load at pair_a reads pair_a's bytes, which pair_alias names too. It reads nothing of
+    flow_header_ops, which ends there: no load reads the end of an object."""
     start = image.functions["anchor_pair"][0].address
     high, low = _split(image.object_symbols["pair_a"][0].address - start)
     code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _load(A1, A5, 0), 0x00008067)
     (entry,) = [item for item in image.decode("synthetic", code, start).globals if item["global"] == "pair_a"]
-    # pair_a starts where flow_header_ops ends, so an end pointer to it has the very same address.
-    assert entry["aliases"] == ["flow_header_ops", "pair_alias"]
+    assert entry["aliases"] == ["pair_alias"]
 
 
 def test_a_displacement_split_into_addi_2047_and_a_load(image: Image) -> None:
@@ -485,38 +486,43 @@ def _address_in(image: Image, start: int, register: int, address: int) -> tuple[
     return _split(address - start)
 
 
-def test_an_address_one_past_an_object_also_names_that_object(image: Image) -> None:
-    """``&pair_a + 8`` is pair_b's address: the two cannot be told apart, so both name it."""
+def _bltu(rs1: int, rs2: int, offset: int) -> int:
+    """bltu rs1, rs2, offset."""
+    return _branch(rs1, rs2, offset) | 6 << 12
+
+
+def _compared(image: Image, address: int) -> FunctionFacts:
+    """``a5 = address``, then ``bltu a1, a5``: the address is a loop's bound, and nothing else."""
     start = image.functions["anchor_pair"][0].address
+    high, low = _split(address - start)
+    code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _bltu(A1, A5, 8), RET)
+    return image.decode("synthetic", code, start)
+
+
+def test_an_address_one_past_an_object_also_names_that_object(image: Image) -> None:
+    """``&pair_a + 8`` compared as a loop's bound is pair_b's address: the two cannot be told apart,
+    so both name it."""
     pair_a = image.object_symbols["pair_a"][0]
-    high, low = _split(pair_a.address + pair_a.size - start)
-    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
-    (entry,) = image.decode("synthetic", code, start).globals
+    (entry,) = _compared(image, pair_a.address + pair_a.size).globals
     assert (entry["global"], entry["offset"], entry["aliases"]) == ("pair_b", 0, ["pair_a"])
 
 
 def test_an_address_one_past_the_last_object_names_that_object(image: Image) -> None:
     """``&heap[sizeof heap]``, the end pointer of a loop: no object starts there, and the address
     lies outside every section, but it still names heap."""
-    start = image.functions["anchor_pair"][0].address
     heap = image.object_symbols["heap"][0]
     assert image.section_of(heap.address + heap.size) is None
-    high, low = _split(heap.address + heap.size - start)
-    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
-    (entry,) = image.decode("synthetic", code, start).globals
+    (entry,) = _compared(image, heap.address + heap.size).globals
     assert (entry["global"], entry["offset"]) == ("heap", heap.size)
 
 
 def test_an_object_the_image_hides_keeps_the_end_address_for_itself(image: Image) -> None:
     """A jump table or a constant pool (.LJTI..., .Lswitch.table...) often starts where an object
     ends, and System.map leaves it out. The address is the table's, so the object does not take it."""
-    start = image.functions["anchor_pair"][0].address
     heap = image.object_symbols["heap"][0]
-    high, low = _split(heap.address + heap.size - start)
-    code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
     image.hidden_starts.add(heap.address + heap.size)
     try:
-        assert image.decode("synthetic", code, start).globals == []
+        assert _compared(image, heap.address + heap.size).globals == []
     finally:
         image.hidden_starts.discard(heap.address + heap.size)
 
@@ -593,11 +599,11 @@ def test_an_address_spilled_to_the_frame_and_reloaded_keeps_its_object(image: Im
 
 
 def test_an_index_added_to_a_known_address_records_the_object(image: Image) -> None:
-    """``a5 = &pair_a; a5 += a0``: the sum is an address inside pair_a, whatever the index is. The
-    load that follows may be on a path where the state no longer holds it."""
+    """``a5 = &pair_a; a0 = a5 + a0``, returned: the sum is an address inside pair_a, whatever the
+    index is, and no load of this function shows it."""
     start = image.functions["anchor_pair"][0].address
     high, low = _split(image.object_symbols["pair_a"][0].address - start)
-    code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _add(A5, A5, A0), RET)
+    code = struct.pack("<4I", _u(0x17, A5, high), _addi(A5, A5, low), _add(A0, A5, A0), RET)
     assert ("pair_a", "indexed_address") in _operations(image.decode("synthetic", code, start))
 
 
@@ -807,3 +813,133 @@ def test_code_after_a_trap_that_resumes_is_reached_from_it(image: Image) -> None
     """A WARN (flags 0x909, the resume bit set) continues, so the load reads pair_a or pair_b."""
     facts = _after_a_trap(image, flags=0x909)
     assert {("pair_a", "load_or_store_some_path"), ("pair_b", "load_or_store_some_path")} <= _operations(facts)
+
+
+def _at(image: Image, register: int, address: int, *tail: int) -> FunctionFacts:
+    """``register = address`` (auipc, addi), then the ``tail`` instructions and ``ret``."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(address - start)
+    code = struct.pack(f"<{3 + len(tail)}I", _u(0x17, register, high), _addi(register, register, low), *tail, RET)
+    return image.decode("synthetic", code, start)
+
+
+def test_an_index_added_to_a_table_and_only_loaded_through_is_no_access_of_its_own(image: Image) -> None:
+    """``a5 = &pair_a + a0; ld a1, 0(a5)``, a lookup or jump table: the load is the access, at its
+    own instruction. The add only forms the address the load reads."""
+    facts = _at(image, A5, image.object_symbols["pair_a"][0].address, _add(A5, A5, A0), _load(A1, A5, 0))
+    assert _operations(facts) == {("pair_a", "indexed_access")}
+
+
+def test_no_load_reads_the_end_of_an_object(image: Image) -> None:
+    """A load at the address one past heap reads whatever lies there (a constant pool, a string),
+    never heap: in C, the end of an object is compared, not dereferenced."""
+    heap = image.object_symbols["heap"][0]
+    assert _at(image, A5, heap.address + heap.size, _load(A1, A5, 0)).globals == []
+
+
+def test_an_address_at_an_objects_end_passed_to_a_call_is_not_its_end_pointer(image: Image) -> None:
+    """A string literal right after an object has the object's end address. Passed to a call, it
+    is not a loop bound, so it does not name the object."""
+    start = image.functions["anchor_pair"][0].address
+    heap = image.object_symbols["heap"][0]
+    call = _jal(RA, image.functions["box_weight"][0].address - (start + 8))
+    assert _at(image, A0, heap.address + heap.size, call).globals == []
+
+
+def test_a_bound_at_an_objects_start_also_names_the_object_ending_there(image: Image) -> None:
+    """pair_a starts where flow_header_ops ends: compared as a bound, the address may be the end of
+    flow_header_ops, so it names both."""
+    (entry,) = [item for item in _compared(image, image.object_symbols["pair_a"][0].address).globals
+                if item["global"] == "pair_a"]  # fmt: skip
+    assert entry["aliases"] == ["flow_header_ops", "pair_alias"]
+
+
+def test_an_indexed_access_before_its_anchor_stays_in_the_anchors_object(image: Image) -> None:
+    """``a5 = &pair_b + len; sd zero, -8(a5)``, as ``buf[len - 1] = 0``: the index is at least one,
+    so the store is inside pair_b, not in pair_a before it."""
+    facts = _at(image, A5, image.object_symbols["pair_b"][0].address, _add(A5, A5, A0), _store(ZERO, A5, -8))
+    assert _operations(facts) == {("pair_b", "indexed_access")}
+
+
+def test_a_code_marker_at_a_function_start_is_kept_as_a_name_of_the_address(image: Image) -> None:
+    """_sinittext sits at the first instruction of the first init function. The C compares an
+    address with _sinittext; the image cannot tell the marker from the function, so the marker's
+    names go with the function's address for the C to match."""
+    callee = image.functions["box_weight"][0].address
+    image.zero_size_at[callee] = ["__init_begin", "_sinittext"]
+    try:
+        facts = _compared(image, callee)
+    finally:
+        del image.zero_size_at[callee]
+    assert [item["target"] for item in facts.function_addresses] == ["box_weight"]
+    assert facts.globals == []
+    assert [(item["reason"], item["detail"]) for item in facts.exclusions] == [
+        ("code_marker_at_function_start", {"function": "box_weight", "names": ["__init_begin", "_sinittext"]})
+    ]
+
+
+def test_a_load_in_a_loop_reads_the_first_elements_field_on_some_path(image: Image) -> None:
+    """``s1 = &box_table + 16; loop: sd zero, -8(s1); s1 += 32; bne s1, a0, loop``, as a walk over an
+    array of 32-byte elements: the store writes box_table's field at 8 on the loop's first pass."""
+    facts = _at(image, S1, image.object_symbols["box_table"][0].address + 16,
+                _store(ZERO, S1, -8), _addi(S1, S1, 32), _branch(S1, A0, -8) | 1 << 12)  # fmt: skip
+    entries = [
+        (item["global"], item["offset"]) for item in facts.globals if item["operation"] == "load_or_store_some_path"
+    ]
+    assert entries == [("box_table", 8)]
+
+
+def test_a_store_over_part_of_a_frame_slot_ends_the_address_spilled_there(image: Image) -> None:
+    """``sd s1, -24(s0)``, then ``sw zero, -20(s0)`` writes half of it: the reload is no address."""
+    facts = _at(image, S1, image.object_symbols["pair_a"][0].address, _store(S1, S0, -24),
+                _store(ZERO, S0, -20) & ~(1 << 12), _load(S1, S0, -24), _load(A1, S1, 8))  # fmt: skip
+    assert "pair_b" not in {name for name, _ in _operations(facts)}
+
+
+def test_a_loop_bound_inside_the_next_object_names_the_object_the_loop_walks(image: Image) -> None:
+    """``p = &pair_a; end = &pair_a + 10; loop: p += 2; bne p, end``, as a strength-reduced loop
+    over a field of each element: the bound lies inside pair_b, but in C the two pointers a loop
+    compares point into one object, and p points into pair_a. (The loop's head loses p, so p's own
+    address is an access of its own too.)"""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack(
+        "<7I", _u(0x17, A5, high), _addi(A5, A5, low), _addi(S1, A5, 0), _addi(A3, A5, 10),
+        _addi(S1, S1, 2), _branch(S1, A3, -4) | 1 << 12, RET,
+    )  # fmt: skip
+    entries = [(item["global"], item["offset"]) for item in image.decode("synthetic", code, start).globals]
+    assert entries == [("pair_a", 0), ("pair_a", 10)]
+
+
+def test_an_indexed_address_derived_from_after_a_join_that_lost_it_is_an_access(image: Image) -> None:
+    """``a5 = &pair_a + a0`` on one path, a pointer loaded on the other; after the join
+    ``s2 = a5 + 8; ld a2, 0(s2)``, as ``rq = cond ? this_rq() : dl_se->rq``: the load carries no
+    object, so only the add shows the access."""
+    start = image.functions["anchor_pair"][0].address
+    high, low = _split(image.object_symbols["pair_a"][0].address - start)
+    code = struct.pack(
+        "<8I", _u(0x17, A5, high), _addi(A5, A5, low), _add(A5, A5, A0), _branch(A1, ZERO, 8),
+        _load(A5, S1, 8), _addi(18, A5, 8), _load(A2, 18, 0), RET,
+    )  # fmt: skip
+    assert ("pair_a", "indexed_address") in _operations(image.decode("synthetic", code, start))
+
+
+def test_a_far_call_passes_only_the_arguments_its_callee_takes(image: Image) -> None:
+    """``a1 = &heap[sizeof heap]``, compared, then ``auipc ra; jalr ra`` to box_weight, which takes
+    one argument: a1 does not reach it, so the address stays a loop's bound, as with ``jal``."""
+    start = image.functions["anchor_pair"][0].address
+    heap = image.object_symbols["heap"][0]
+    high, low = _split(heap.address + heap.size - start)
+    upper, lower = _split(image.functions["box_weight"][0].address - (start + 12))
+    code = struct.pack(
+        "<6I", _u(0x17, A1, high), _addi(A1, A1, low), _bltu(A0, A1, 4),
+        _u(0x17, RA, upper), _i(0x67, RA, 0, RA, lower), RET,
+    )  # fmt: skip
+    saved = dict(image.arity)
+    image.arity["box_weight"] = 1
+    try:
+        facts = image.decode("synthetic", code, start)
+    finally:
+        image.arity.clear()
+        image.arity.update(saved)
+    assert [(item["global"], item["offset"]) for item in facts.globals] == [("heap", heap.size)]

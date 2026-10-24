@@ -162,6 +162,58 @@ _READS_DESTINATION = {
 _NUMBERS = {"lui", "c.lui", "li", "c.li"}
 # Instructions whose result is the address they read plus something: the address lives on in it.
 _DERIVES = {"addi", "addiw", "c.addi", "c.addiw", "mv", "c.mv", "add", "c.add", "addw", "c.addw"}
+# Comparisons of two registers and differences of two: in C, two pointers compared or subtracted
+# point into one object, so an address used only here may be the end of an object (a loop's bound).
+_BOUNDS = {
+    "beq", "bne", "blt", "bge", "bltu", "bgeu", "bgt", "ble", "bgtu", "bleu",
+    "slt", "sltu", "sgt", "sgtu", "sub", "subw", "c.sub", "c.subw",
+}  # fmt: skip
+# The bytes each store writes.
+_STORE_WIDTHS = {
+    "sb": 1, "sh": 2, "sw": 4, "sd": 8, "c.sw": 4, "c.sd": 8, "c.swsp": 4, "c.sdsp": 8,
+    "fsw": 4, "fsd": 8, "c.fsd": 8, "c.fsdsp": 8,
+}  # fmt: skip
+
+
+def _two_registers(operands: list[Any]) -> bool:
+    """Whether an instruction reads two registers (``bltu a0, a1``), not one and zero or a number."""
+    return sum(1 for operand in operands if operand.type == CS_OP_REG) >= 2
+
+
+def _holds(state: _State | None, register: int) -> bool:
+    """Whether a state still knows what a register holds: an address, an address plus an index,
+    one of several addresses, or an unknown base plus a constant."""
+    return state is not None and (
+        state.address(register) is not None
+        or register in state.anchored
+        or register in state.relative
+        or register in state.choices
+    )
+
+
+def _retreating(successors: list[list[int]]) -> frozenset[tuple[int, int]]:
+    """The edges of a depth-first search that lead back to an instruction still on its stack: a
+    loop's back edges. Without them every path from the entry runs each loop's body once."""
+    stage = [0] * len(successors)  # 0 unseen, 1 on the stack, 2 finished
+    found: set[tuple[int, int]] = set()
+    for root in range(len(successors)):
+        if stage[root]:
+            continue
+        stage[root] = 1
+        stack = [(root, iter(successors[root]))]
+        while stack:
+            node, following = stack[-1]
+            for child in following:
+                if stage[child] == 0:
+                    stage[child] = 1
+                    stack.append((child, iter(successors[child])))
+                    break
+                if stage[child] == 1:
+                    found.add((node, child))
+            else:
+                stage[node] = 2
+                stack.pop()
+    return frozenset(found)
 
 
 def _reads(instruction: Any, operands: list[Any]) -> tuple[set[int], set[int]]:
@@ -754,18 +806,26 @@ class Image:
         )
 
     def _direct_callees(self, instructions: list[Any]) -> list[str]:
-        """The text functions ``_arguments`` may read the arity of: every direct jump target."""
+        """The text functions ``_arguments`` may read the arity of: every direct jump target and
+        every callee of an ``auipc`` and ``jalr`` pair."""
         return sorted(
             {
                 name
-                for instruction in instructions
-                if instruction.mnemonic in _DIRECT_CALLS
-                for operands in [list(instruction.operands)]
-                if operands and operands[-1].type == CS_OP_IMM
-                for name in [self.text_at.get((instruction.address + operands[-1].imm) & _MASK)]
+                for index in range(len(instructions))
+                for address in [self._target(instructions, index)]
+                if address is not None
+                for name in [self.text_at.get(address)]
                 if name is not None
             }
         )
+
+    def _target(self, instructions: list[Any], index: int) -> int | None:
+        """The address a direct call or jump at ``index`` goes to, or a far call's (``_callee``)."""
+        instruction = instructions[index]
+        operands = list(instruction.operands)
+        if instruction.mnemonic in _DIRECT_CALLS and operands and operands[-1].type == CS_OP_IMM:
+            return int(instruction.address + operands[-1].imm) & _MASK
+        return _callee(self.decoder, instructions, index)
 
     def decode(self, name: str, code: bytes, address: int) -> FunctionFacts:
         """The facts of a function's machine code that starts at ``address``."""
@@ -776,22 +836,68 @@ class Image:
         successors = _flow(self.decoder, instructions, self.never_returns, self._halts)
         states = self._block_states(instructions, successors)
         before = dict(states)
+        first = dict(self._block_states(instructions, successors, _retreating(successors)))
         returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
         for index, state in states:
             instruction = instructions[index]
-            escapes = instruction.mnemonic not in _ADDI or self._escapes(
-                instructions, successors, before, index, returned
-            )
-            self._step(name, instruction, state, facts, escapes)
+            escapes, partner = None, None
+            if self._forms_address(instruction, state):
+                compares: list[tuple[int, int]] = []
+                escapes = self._escapes(instructions, successors, before, index, returned, compares=compares)
+                if escapes == "compared":
+                    partner = self._partner(compares, before, first)
+            self._first_pass(name, instruction, state, first.get(index), facts)
+            self._step(name, instruction, state, facts, escapes, partner)
         return facts
 
-    def _arguments(self, instruction: Any, operands: list[Any]) -> set[str]:
+    def _partner(
+        self, compares: list[tuple[int, int]], before: dict[int, _State], first: dict[int, _State]
+    ) -> int | None:
+        """The address a loop's bound is compared with, on every path or on the loop's first pass:
+        in C both point into one object."""
+        for position, register in sorted(compares):
+            for states in (before, first):
+                state = states.get(position)
+                address = None if state is None else state.address(register)
+                if address is not None:
+                    return address
+        return None
+
+    def _forms_address(self, instruction: Any, state: _State) -> bool:
+        """Whether the instruction forms an address the escape walk judges: an ``addi``, or an index
+        added to a known address."""
+        if instruction.mnemonic in _ADDI:
+            return True
+        return instruction.mnemonic in ("add", "c.add") and (
+            _anchored_value(instruction, list(instruction.operands), state, self.section_of) is not None
+        )
+
+    def _first_pass(
+        self, function: str, instruction: Any, state: _State, first: _State | None, facts: FunctionFacts
+    ) -> None:
+        """A load or store in a loop whose base the loop changes (``p += sizeof *p``): the state that
+        holds over every path loses it at the loop's head, but on the loop's first pass the base is
+        the address it enters with. The access there is one this instruction makes on some path."""
+        if first is None:
+            return
+        for base, displacement in _memory_references(instruction, list(instruction.operands)):
+            if self.decoder.reg_name(base) == "tp" or state.address(base) is not None or base in state.anchored:
+                continue
+            if base in state.choices or base in state.constants:
+                continue
+            entered = first.address(base)
+            if entered is not None:
+                self._record_address(
+                    function, (entered + displacement) & _MASK, instruction.address, "load_or_store_some_path", facts
+                )
+
+    def _arguments(self, instructions: list[Any], index: int) -> set[str]:
         """The argument registers a call or a tail jump passes: as many as the callee's C takes."""
         count = _DEFAULT_ARGUMENTS
-        if instruction.mnemonic in _DIRECT_CALLS and operands and operands[-1].type == CS_OP_IMM:
-            callee = self.text_at.get((instruction.address + operands[-1].imm) & _MASK)
-            if callee is not None:
-                count = self.arity.get(callee, _DEFAULT_ARGUMENTS)
+        target = self._target(instructions, index)
+        callee = None if target is None else self.text_at.get(target)
+        if callee is not None:
+            count = self.arity.get(callee, _DEFAULT_ARGUMENTS)
         return {f"a{position}" for position in range(count)}
 
     def _escapes(
@@ -802,19 +908,24 @@ class Image:
         index: int,
         returned: set[str],
         limit: int = 256,
-    ) -> bool:
-        """Whether the address an ``addi`` sets is used, on some path, other than as the base of loads
-        and stores whose state still holds it: passed to a call (in an argument the callee takes),
-        returned (in a register the function's C result uses), stored, compared or computed with.
-        Registers that hold the same address (``mv``) or the address plus an index (``add``) are
-        followed; an ``addi`` of it forms another address, judged at that ``addi``. Callee-saved
-        registers survive calls. Only an escaping address is itself an access; a base gives the
-        accesses of its loads and stores."""
+        compares: list[tuple[int, int]] | None = None,
+    ) -> str | None:
+        """Why the address an instruction sets is used, on some path, other than as the base of loads
+        and stores whose state still holds it; None when it is not. ``passed`` to a call (in an
+        argument the callee takes), ``returned`` (in a register the function's C result uses),
+        ``used`` (stored, computed with, tested), ``join`` (a load whose state lost it), ``limit``
+        (the walk did not finish), or ``compared`` when its only such use is as one side of a
+        comparison or a difference of two addresses: a loop's bound. ``compares`` gets each such
+        comparison's instruction and the register on its other side. Registers that hold the same
+        address (``mv``) or the address plus an index (``add``) are followed; an ``addi`` of it forms
+        another address, judged at that ``addi``. Callee-saved registers survive calls. Only an
+        escaping address is itself an access; a base gives the accesses of its loads and stores."""
         operands = list(instructions[index].operands)
         if not operands or operands[0].type != CS_OP_REG:
-            return True
+            return "used"
         pending = [(following, frozenset({operands[0].reg})) for following in successors[index]]
         seen: set[tuple[int, frozenset[int]]] = set()
+        compared = False
         while pending and limit:
             limit -= 1
             position, tracked = pending.pop()
@@ -827,16 +938,22 @@ class Image:
             bases, reads = _reads(instruction, current)
             state = before.get(position)
             for base in bases & tracked:
-                held = state is not None and (
-                    state.address(base) is not None or base in state.anchored or base in state.relative
-                )
-                if not held:
+                if not _holds(state, base):
                     # The state at this load lost the address (a join), so only the addi shows it.
-                    return True
+                    return "join"
             written = frozenset(_written_registers(instruction, current))
             used = reads & tracked
+            if used and mnemonic in _DERIVES and written and not all(_holds(state, register) for register in used):
+                # A register derived from it after a join that lost it (``addi s2, rq, 2047``): its
+                # loads carry no object, so only this instruction shows it.
+                return "join"
             if used and not (mnemonic in _DERIVES and written):
-                return True
+                if mnemonic not in _BOUNDS or not _two_registers(current):
+                    return "used"
+                # One side of a comparison: the other paths may still show more.
+                compared = True
+                if compares is not None:
+                    compares += [(position, register) for register in sorted(reads - tracked)]
             names = {self.decoder.reg_name(register) for register in tracked}
             calls = mnemonic in {"jal", "c.jal"} or (mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, current))
             tail = mnemonic in {"j", "c.j"} and not successors[position]
@@ -844,31 +961,41 @@ class Image:
             if calls or tail or indirect:
                 # An argument register the callee takes reaches it; across a call only callee-saved
                 # registers keep their values.
-                if names & self._arguments(instruction, current):
-                    return True
+                if names & self._arguments(instructions, position):
+                    return "passed"
                 tracked = frozenset(
                     register for register in tracked if self.decoder.reg_name(register).startswith(("s", "sp", "gp"))
                 )
             if mnemonic in _ENDS or tail:
                 if names & returned and not indirect:
-                    return True
+                    return "returned"
                 continue
-            if used and mnemonic in _ADDI:
-                # address + k is another address: its own addi decides whether it is an access.
+            if (used and mnemonic in _ADDI) or mnemonic in _BOUNDS:
+                # address + k is another address, judged at its own addi; a comparison's result is
+                # a truth value.
                 tracked = tracked - written
             else:
                 # mv and add keep the address (plus an index); any other write ends it there.
                 tracked = (tracked | written) if used else (tracked - written)
             if tracked:
                 pending += [(following, tracked) for following in successors[position]]
-        return bool(pending)
+        if pending:
+            return "limit"
+        return "compared" if compared else None
 
-    def _block_states(self, instructions: list[Any], successors: list[list[int]]) -> list[tuple[int, _State]]:
+    def _block_states(
+        self,
+        instructions: list[Any],
+        successors: list[list[int]],
+        ignored: frozenset[tuple[int, int]] = frozenset(),
+    ) -> list[tuple[int, _State]]:
         """Each instruction's index with the register state before it, from a forward must-analysis
         over the function's basic blocks: a register holds a value at a block's start only when every
         path into the block gives it that value, so an address formed before a branch and used after
         a join is followed, and one formed on only one path is not. Blocks no instruction leads to are
-        reached through an indirect jump (a jump table): they start from the state those jumps leave."""
+        reached through an indirect jump (a jump table): they start from the state those jumps leave.
+        The ``ignored`` edges (a loop's back edges) carry no state: then a loop's head holds what the
+        loop enters with, the state of its first pass."""
         if not instructions:
             return []
         leaders = {0}
@@ -902,6 +1029,8 @@ class Image:
                 ):
                     indirect.append(state.copy())
                 for successor in successors[ends[start] - 1]:
+                    if (ends[start] - 1, successor) in ignored:
+                        continue
                     known = entry.get(successor)
                     merged = state.copy() if known is None else known.meet(state)
                     if known is None or merged != known:
@@ -926,12 +1055,22 @@ class Image:
         return result
 
     def _record_address(
-        self, function: str, address: int, instruction: int, operation: str, facts: FunctionFacts
+        self,
+        function: str,
+        address: int,
+        instruction: int,
+        operation: str,
+        facts: FunctionFacts,
+        bound: bool = False,
+        partner: int | None = None,
     ) -> None:
+        """The object an address names. ``bound`` says the code uses the address only as a loop's
+        bound: then it may be the end of the object before it, which C compares and never reads.
+        ``partner`` is the address the bound is compared with: in C the two point into one object."""
         provenance = [{"source": "image", "address": _hex(instruction)}]
         section = self.section_of(address)
         zero_size = list(self.zero_size_at.get(address, []))
-        ended = self.object_ends.get(address, [])
+        ended = self.object_ends.get(address, []) if bound else []
         if operation in _ADDRESS_OPERATIONS and address in self.merged_blocks:
             # The start of a merged-globals block is its first member's address, but forming it
             # accesses no member: each is reached by a displacement from it, recorded where it is.
@@ -955,6 +1094,17 @@ class Image:
             return
         resolved = resolve_sized(self.objects, address) if section is not None else None
         target = resolve_sized(self.function_ranges, address) if resolved is None and section else None
+        walked = resolve_sized(self.objects, partner) if bound and partner is not None else None
+        if (
+            walked is not None
+            and walked[1] <= address
+            and walked != resolved
+            and not zero_size
+            and (resolved is None or resolved[1] != address)
+        ):
+            # A bound past the end of the object the loop walks (&flags[N].desc), inside the next
+            # object or outside every one: the object the loop walks, which its compare names.
+            resolved, target = walked, None
         if resolved is None and target is None and zero_size:
             # Only zero-size names at the address: an empty object, a marker the code compares, or
             # a section's end (_etext, _edata, _end), which belongs to no section at all.
@@ -979,8 +1129,21 @@ class Image:
                         "provenance": provenance,
                     }
                 )
-                # A code marker at a function's start (__entry_text_end, _sinittext) names the
-                # function's first instruction, which the entry above already records.
+                if zero_size and start == address:
+                    # Zero-size markers at the function's first instruction (_sinittext,
+                    # __sched_text_start, __entry_text_end): the C may have meant the function or
+                    # any of them, and the image cannot tell. The function's entry is above; the
+                    # markers' names go with the address, for a C access to one of them.
+                    facts.exclusions.append(
+                        {
+                            "kind": "image_access",
+                            "reason": "code_marker_at_function_start",
+                            "function": function,
+                            "target": _hex(address),
+                            "detail": {"function": name, "names": sorted(zero_size)},
+                            "provenance": provenance,
+                        }
+                    )
                 return
             if section is not None:
                 facts.outside.append(
@@ -1009,17 +1172,24 @@ class Image:
         aliases = sorted({alias for alias in zero_size if alias != name} | {end for end, _, _ in ended if end != name})
         if aliases:
             # The address cannot tell these names apart: jiffies is jiffies_64; a zero-size key
-            # shares the address of the object after it; the end of one object is the start of the
-            # next, and the C may have formed either.
+            # shares the address of the object after it; a loop's bound at the start of one object
+            # may be the end of the object before it.
             entry["aliases"] = aliases
         facts.globals.append(entry)
 
     def _step(
-        self, function: str, instruction: Any, state: _State, facts: FunctionFacts | None, escapes: bool = True
+        self,
+        function: str,
+        instruction: Any,
+        state: _State,
+        facts: FunctionFacts | None,
+        escapes: str | None = "used",
+        partner: int | None = None,
     ) -> None:
         """One instruction: its facts (when ``facts`` is given) and its effect on the register state.
 
-        ``escapes`` says whether an ``addi``'s address is used other than as a load or store base."""
+        ``escapes`` says why an address the instruction forms is used other than as a load or store
+        base (``_escapes``), or None when it is not; ``partner`` is what a bound is compared with."""
         values, relative, anchored = state.values, state.relative, state.anchored
         operands = list(instruction.operands)
         mnemonic = instruction.mnemonic
@@ -1049,10 +1219,15 @@ class Image:
                     # A known address plus a per-CPU offset or an index the code computed: the
                     # object at the known address and the displacement, and the field offset from
                     # the address the anchor was formed from.
+                    origin = state.origin.get(base, anchored[base])
                     self._record_address(
-                        function, (anchored[base] + displacement) & _MASK, instruction.address, "indexed_access", facts
+                        function,
+                        self._in_origin((anchored[base] + displacement) & _MASK, origin),
+                        instruction.address,
+                        "indexed_access",
+                        facts,
                     )
-                    facts.memory_offsets.add(anchored[base] - state.origin.get(base, anchored[base]) + displacement)
+                    facts.memory_offsets.add(anchored[base] - origin + displacement)
                 elif base in state.choices:
                     # Every path into this load gives the base a known address, but not the same
                     # one: the function reads each of those objects on some path.
@@ -1114,14 +1289,24 @@ class Image:
                 # lui and li form numbers (an ioctl command, a mask), not addresses.
                 state.constants.add(destination)
             elif facts is not None and mnemonic in _ADDI and escapes:
-                self._record_address(function, value, instruction.address, "addi_address", facts)
+                self._record_address(
+                    function, value, instruction.address, "addi_address", facts, escapes == "compared", partner
+                )
         elif indexed is not None:
             anchored[indexed[0]] = indexed[1]
             state.origin[indexed[0]] = indexed[2]
             if facts is not None and escapes and (mnemonic in _ADDI or mnemonic in ("add", "c.add")):
                 # An index added to a known address, or a per-CPU or indexed address plus a field
                 # offset: the object the sum names, whatever the index is.
-                self._record_address(function, indexed[1], instruction.address, "indexed_address", facts)
+                self._record_address(
+                    function,
+                    self._in_origin(indexed[1], indexed[2]),
+                    instruction.address,
+                    "indexed_address",
+                    facts,
+                    escapes == "compared",
+                    partner,
+                )
         elif derived is not None:
             relative[derived[0]] = derived[1]
             if facts is not None:
@@ -1133,9 +1318,16 @@ class Image:
     def _frame_slot(self, instruction: Any, operands: list[Any], state: _State) -> None:
         """A register holding an address, spilled to a frame slot and reloaded from it. Without
         this the address is lost at the first join after the reload, although every path gives the
-        slot the same value."""
+        slot the same value. A store over any byte of a slot ends what it held, and so does any
+        store through the other frame register (whose distance to this one the code does not show)
+        or a move of the frame register itself. Spill slots are not memory the code passes on, so a
+        call does not end them."""
         mnemonic = instruction.mnemonic
-        if mnemonic not in _SPILLS and mnemonic not in _RELOADS:
+        for register in _written_registers(instruction, operands):
+            if register in {key[0] for key in state.slots}:
+                state.slots = {key: value for key, value in state.slots.items() if key[0] != register}
+        width = _STORE_WIDTHS.get(mnemonic, 8 if mnemonic.startswith(_ATOMIC_PREFIXES) else None)
+        if width is None and mnemonic not in _RELOADS:
             return
         references = _memory_references(instruction, operands)
         if not references or not operands or operands[0].type != CS_OP_REG:
@@ -1144,15 +1336,31 @@ class Image:
         if self.decoder.reg_name(base) not in _FRAME_REGISTERS:
             return
         register = operands[0].reg
-        if mnemonic in _SPILLS:
-            address = state.address(register)
-            if address is None:
-                state.slots.pop((base, displacement), None)
-            else:
+        if width is not None:
+            state.slots = {
+                (slot_base, slot): value
+                for (slot_base, slot), value in state.slots.items()
+                if slot_base == base and (slot + 8 <= displacement or displacement + width <= slot)
+            }
+            address = state.address(register) if mnemonic in _SPILLS else None
+            if address is not None:
                 state.slots[(base, displacement)] = address
         elif (base, displacement) in state.slots:
             state.values[register] = state.slots[(base, displacement)]
             state.constants.discard(register)
+
+    def _in_origin(self, address: int, origin: int) -> int:
+        """An address formed from ``origin`` plus an index and a negative displacement
+        (``buf[len - 1]``): in C the index is never negative, so the address stays inside the
+        object at ``origin``; where the displacement takes it below that object, the object is named
+        at its origin. Above the origin it is the object there: a merged-globals block's base plus
+        an index and the displacement of a later member."""
+        if address >= origin:
+            return address
+        home = resolve_sized(self.objects, origin)
+        if home is None or resolve_sized(self.objects, address) == home:
+            return address
+        return origin
 
     def _thread_pointer(self, function: str, instruction: int, offset: int, operation: str) -> dict[str, Any]:
         return {
