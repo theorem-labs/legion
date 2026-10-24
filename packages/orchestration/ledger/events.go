@@ -41,26 +41,27 @@ func eventRecord(ctx context.Context, tx pgx.Tx, repo, kind, subject, actor stri
 	return event, nil
 }
 
-// Event is one entry of the append-only log.
+// Event is one entry of the append-only log. Login is the database login whose session appended it.
 type Event struct {
 	ID      int64           `json:"id"`
 	At      time.Time       `json:"at"`
 	Kind    string          `json:"kind"`
 	Subject string          `json:"subject"`
 	Actor   string          `json:"actor,omitempty"`
+	Login   string          `json:"login"`
 	Data    json.RawMessage `json:"data"`
 }
 
 // Events lists a repository's events after the given id, oldest first; subject "" means every subject.
 func (s *Store) Events(ctx context.Context, repo string, after int64, subject string) ([]Event, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, at, kind, subject, actor, data FROM events
+	rows, err := s.pool.Query(ctx, `SELECT id, at, kind, subject, actor, login, data FROM events
 		WHERE repo = $1 AND id > $2 AND ($3 = '' OR subject = $3) ORDER BY id`, repo, after, subject)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Event, error) {
 		var e Event
-		err := r.Scan(&e.ID, &e.At, &e.Kind, &e.Subject, &e.Actor, &e.Data)
+		err := r.Scan(&e.ID, &e.At, &e.Kind, &e.Subject, &e.Actor, &e.Login, &e.Data)
 		return e, err
 	})
 }
