@@ -8,7 +8,7 @@ from typing import Any
 
 from conftest import FIXTURE
 
-from cgraph import clangfacts, commands, config, link
+from cgraph import clangfacts, commands, config, expressions, link
 
 CONFIG = config.load(FIXTURE / "cgraph.toml")
 
@@ -99,7 +99,8 @@ def test_a_local_that_keeps_its_initializer_stands_for_it(tmp_path: Path) -> Non
     assert compiled(facts, "offline", [unknown(), constant(0x406)]) == {"pr"}
 
 
-def test_a_parameter_the_function_writes_guards_nothing(tmp_path: Path) -> None:
+def test_a_parameter_the_function_writes_holds_the_argument_or_what_it_writes(tmp_path: Path) -> None:
+    """With 4 the parameter holds 4 or 0, neither 5; with -1 it may hold 0."""
     facts = facts_of(
         tmp_path,
         """
@@ -109,11 +110,15 @@ def test_a_parameter_the_function_writes_guards_nothing(tmp_path: Path) -> None:
                 nid = 0;
             if (nid == 5)
                 late();
+            if (nid == 0)
+                other();
             kept();
         }
         """,
     )
-    assert compiled(facts, "alloc", [constant(4)]) == {"late", "kept"}
+    assert compiled(facts, "alloc", [constant(4)]) == {"other", "kept"}
+    assert compiled(facts, "alloc", [constant(5)]) == {"late", "other", "kept"}
+    assert compiled(facts, "alloc", [constant(-1)]) == {"other", "kept"}
 
 
 def test_a_parameter_is_read_at_its_own_width(tmp_path: Path) -> None:
@@ -165,7 +170,7 @@ def test_call_arguments_say_the_values_they_pass(tmp_path: Path) -> None:
     null, value, seven = call["arguments"]
     assert link._constant(null) == 0
     assert link._constant(seven) == 7
-    assert link._evaluate(link._substitute(value["expr"], [constant(4)])) == 5
+    assert expressions.evaluate(expressions.substitute(value["expr"], [constant(4)["expr"]])) == 5
 
 
 def test_a_helper_that_always_returns_one_negative_value_compares_as_that_value(tmp_path: Path) -> None:
@@ -419,3 +424,182 @@ def test_the_evaluator_compares_at_each_operand_s_width_and_signedness(tmp_path:
     )
     calls = {call["callee"] for call in facts["functions"]["copy"]["events"]["calls"]}
     assert {"note", "kept", "other"} <= calls
+
+
+FLAGS = """
+static inline void update(struct dev *d, int flags)
+{
+    if (!d->x && (flags & 4))
+        note();
+    else if (flags & 8)
+        late();
+    kept();
+}
+"""
+
+
+def test_an_argument_that_may_hold_several_values_decides_what_every_one_decides(tmp_path: Path) -> None:
+    """attach_entity_cfs_rq: update_load_avg(cfs_rq, se, sched_feat(ATTACH_AGE_LOAD) ? 0 : SKIP_AGE_LOAD).
+    Neither 0 nor 2 has DO_DETACH (8) or DO_ATTACH (4): both branches are dead."""
+    facts = facts_of(tmp_path, FLAGS + "void attach(struct dev *d, int age) { update(d, age ? 0 : 2); }")
+    (call,) = facts["functions"]["attach"]["events"]["calls"]
+    assert compiled(facts, "update", call["arguments"]) == {"kept"}
+
+
+def test_a_local_that_or_assignments_change_holds_each_value_they_may_give(tmp_path: Path) -> None:
+    """dequeue_entity: `int action = UPDATE_TG; if (migrating) action |= DO_DETACH;` then
+    update_load_avg(cfs_rq, se, action); faultin_page_range: `gup_flags = FOLL_TOUCH | …; if (write)
+    gup_flags |= FOLL_WRITE;`. Neither value has DO_ATTACH; one has DO_DETACH."""
+    facts = facts_of(
+        tmp_path,
+        FLAGS
+        + """
+        void dequeue(struct dev *d, int migrating) { int action = 1; if (migrating) action |= 8; update(d, action); }
+        void fault(struct dev *d, int write) { int flags; flags = 1 | 2; if (write) flags |= 16; update(d, flags); }
+        void other_write(struct dev *d, int k) { int flags = 1; flags += k; update(d, flags); }
+        """,
+    )
+    calls = {name: facts["functions"][name]["events"]["calls"] for name in ("dequeue", "fault", "other_write")}
+    arguments = {
+        name: next(call for call in found if call["callee"] == "update")["arguments"] for name, found in calls.items()
+    }
+    assert compiled(facts, "update", arguments["dequeue"]) == {"late", "kept"}
+    assert compiled(facts, "update", arguments["fault"]) == {"kept"}
+    assert compiled(facts, "update", arguments["other_write"]) == {"note", "late", "kept"}
+
+
+def test_a_helper_s_value_follows_the_arguments_its_call_passes(tmp_path: Path) -> None:
+    """dma_alloc_attrs: `ops = get_dma_ops(dev)` is NULL without CONFIG_DMA_OPS, so
+    dma_alloc_direct(dev, ops) → dma_go_direct(dev, mask, NULL) returns true: `ops->alloc` is dead.
+    gpio_clk_driver_probe: devm_gpiod_get returns ERR_PTR(-ENOSYS) without CONFIG_GPIOLIB, so
+    `if (IS_ERR(gpiod)) return …;` always returns."""
+    facts = facts_of(
+        tmp_path,
+        """
+        struct ops { int (*alloc)(void); };
+        static inline const struct ops *get_ops(struct dev *d) { return (void *)0; }
+        static inline int use_iommu(struct dev *d) { return 0; }
+        static int go_direct(struct dev *d, unsigned long mask, const struct ops *ops)
+        {
+            if (use_iommu(d))
+                return 0;
+            if (__builtin_expect(!ops, 1))
+                return 1;
+            return 0;
+        }
+        static inline int alloc_direct(struct dev *d, const struct ops *ops) { return go_direct(d, d->x, ops); }
+        void alloc(struct dev *d)
+        {
+            const struct ops *ops = get_ops(d);
+            if (alloc_direct(d, ops))
+                note();
+            else if (ops->alloc)
+                other();
+            kept();
+        }
+        static inline void *err_ptr(long error) { return (void *)error; }
+        static inline int is_err(const void *ptr)
+        {
+            return __builtin_expect(!!((unsigned long)(void *)(ptr) >= (unsigned long)-4095), 0);
+        }
+        static inline struct dev *get_gpio(struct dev *d) { warn(); return err_ptr(-38); }
+        int probe(struct dev *d)
+        {
+            struct dev *gpio;
+            gpio = get_gpio(d);
+            if (is_err(gpio))
+                return -1;
+            late();
+            return 0;
+        }
+        """,
+    )
+    alloc = facts["functions"]["alloc"]["events"]
+    assert {call["callee"] for call in alloc["calls"]} == {"get_ops", "alloc_direct", "note", "kept"}
+    assert not [item for item in alloc["field_accesses"] if item["field"] == "alloc"]
+    assert "late" not in {call["callee"] for call in facts["functions"]["probe"]["events"]["calls"]}
+
+
+def test_a_helper_whose_returns_are_several_constants_compares_as_each(tmp_path: Path) -> None:
+    """softleaf_is_device_exclusive(entry): softleaf_type returns SOFTLEAF_NONE, SOFTLEAF_SWAP or
+    SOFTLEAF_MARKER without CONFIG_DEVICE_PRIVATE, never SOFTLEAF_DEVICE_EXCLUSIVE."""
+    facts = facts_of(
+        tmp_path,
+        """
+        enum kind { K_NONE, K_SWAP, K_MIGRATE, K_DEVICE, K_MARKER };
+        static inline int is_none(unsigned long v) { return v == 0; }
+        static inline enum kind type_of(unsigned long v)
+        {
+            unsigned int n;
+            if (is_none(v))
+                return K_NONE;
+            n = v >> 58;
+            if (n < 30)
+                return K_SWAP;
+            switch (n) {
+            case 31:
+                return K_MARKER;
+            }
+            return K_NONE;
+        }
+        static inline int is_device(unsigned long v) { return type_of(v) == K_DEVICE; }
+        static inline int is_swap(unsigned long v) { return type_of(v) == K_SWAP; }
+        void copy(unsigned long v) { if (is_device(v)) other(); if (is_swap(v)) note(); kept(); }
+        """,
+    )
+    assert {call["callee"] for call in facts["functions"]["copy"]["events"]["calls"]} == {
+        "is_device", "is_swap", "note", "kept",
+    }  # fmt: skip
+
+
+def test_a_helper_s_value_on_its_parameters_guards_the_code_it_decides(tmp_path: Path) -> None:
+    """warn_if_node_offline: `if (node_online(this_node)) return;`, node_state(node, N_ONLINE) is
+    `node == 0` without NUMA, and folio_alloc passes numa_node_id(), cpu_to_node's `((void)(cpu),0)`.
+    __vm_normal_page: `if (pgtable_level_has_pxx_special(level))`, a switch on the level that
+    vm_normal_page passes as PGTABLE_LEVEL_PTE."""
+    facts = facts_of(
+        tmp_path,
+        """
+        extern int cpu;
+        static inline int node_state(int node, int state) { return node == 0; }
+        static inline int node_id(void) { return ((void)(cpu), 0); }
+        static inline void offline(int this_node, gfp_t gfp)
+        {
+            if ((gfp & 6u) != 6u)
+                return;
+            if (node_state(this_node, 1))
+                return;
+            pr();
+        }
+        static inline void alloc_node(gfp_t gfp, int nid) { offline(nid, gfp); kept(); }
+        void alloc(gfp_t gfp) { alloc_node(gfp, node_id()); }
+        enum level { L_PTE, L_PMD, L_PUD };
+        static inline int has_special(enum level level)
+        {
+            switch (level) {
+            case L_PTE:
+                return 1;
+            case L_PMD:
+                return 0;
+            default:
+                return 0;
+            }
+        }
+        static inline void normal(struct dev *d, int special, enum level level)
+        {
+            if (has_special(level)) {
+                if (special)
+                    warn();
+            } else if (d->x) {
+                note();
+            }
+            kept();
+        }
+        """,
+    )
+    (call,) = [item for item in facts["functions"]["alloc"]["events"]["calls"] if item["callee"] == "alloc_node"]
+    assert link._constant(call["arguments"][1]) == 0
+    assert compiled(facts, "offline", [constant(0), constant(6)]) == {"node_state"}
+    assert compiled(facts, "offline", [constant(1), constant(6)]) == {"node_state", "pr"}
+    assert compiled(facts, "normal", [unknown(), unknown(), constant(0)]) == {"has_special", "warn", "kept"}
+    assert compiled(facts, "normal", [unknown(), unknown(), constant(1)]) == {"has_special", "note", "kept"}

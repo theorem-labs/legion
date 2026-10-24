@@ -27,9 +27,9 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   macro pastes them together, the one association with the selection's own type is the selected
   one; a call of the function a `_Generic` selects is a direct call), branches whose condition
   folds to a constant (also through inline helpers whose reachable returns give one value or one
-  truth value, a return after one the helper always takes being unreachable, and locals every store
-  of which, initializer and plain assignments, gives one value; a weak definition decides nothing,
-  because another unit may replace it),
+  truth value, a return after one the helper always takes being unreachable, a helper's value for
+  the arguments its call passes, and locals every store of which gives one value; a weak definition
+  decides nothing, because another unit may replace it),
   the cases a `switch` on a value clang folds does not reach (`switch (sizeof(x))`,
   `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or `||`, an operand of `&` or `*`
   whose other operand is 0 (`IS_DAX(inode)` without `CONFIG_FS_DAX`), the left operand of an `&&`
@@ -169,8 +169,13 @@ These rules follow what the machine code shows, each only where it shows it:
   `inner_displacement`, from the register that holds the result.
 - The evaluator folds what the compiler does: a helper whose every live return gives one value (a
   return under a constant-false test is no return), a file-scope static nothing in the unit writes
-  or takes the address of (its initializer), and `x && 0` / `x || 1` whatever `x` is. GNU's `a ?: b`
-  is no constant.
+  or takes the address of (its initializer), `x && 0` / `x || 1` whatever `x` is, and `(x, 0)`. GNU's
+  `a ?: b` is no constant. Where one value is not enough it takes every value each part may hold
+  (`expressions.values`, up to 16): a helper's call is what the helper returns for the arguments
+  passed, its returns under the `if` and `switch` conditions that reach each (its template on its
+  parameters; dma_go_direct(dev, mask, NULL) is true, softleaf_type returns none of the device
+  types without `CONFIG_DEVICE_PRIVATE`), and a local is any value stored in it, `|=`, `&=` and `^=`
+  included; the expression is decided where every combination gives one value or one truth value.
 - A read of a global whose file-scope initializer stores other globals' addresses reaches each of
   those globals the machine code forms (the compiler folded the field's value); the edge names the
   holder in `initializer`.
@@ -183,10 +188,12 @@ These rules follow what the machine code shows, each only where it shows it:
   gotos before it reach, under the guards of those gotos; none across a label a later goto reaches),
   and each event the guards it is compiled under. A guard states each variable as the values it may
   hold: a parameter nothing writes (or whose address escapes only later in the text, outside any loop)
-  is the caller's argument, and a variable that plain assignments write is a choice among its first
-  value and each value assigned, decided only where all of them agree. A call argument gives the
-  value it passes (`expr`: a constant, or an expression on the caller's own parameters, at each
-  type's width). At a
+  is the caller's argument, a variable that plain assignments write is a choice among its first
+  value and each value assigned, one that `|=`, `&=` or `^=` change also each value those make of
+  it, and a call of a helper of the unit is its template with the arguments put in
+  (`node_online(this_node)` is `this_node == 0` without NUMA). A guard is decided where every value
+  it may take agrees. A call argument gives the value it passes (`expr`: a constant, a choice, or an
+  expression on the caller's own parameters, at each type's width). At a
   fold, link puts the arguments in; a call or an access a guard decides against becomes `unevaluated`
   with reason `constant_argument` (an exclusion), other events are dropped, and the guards still open
   carry up to the next fold.

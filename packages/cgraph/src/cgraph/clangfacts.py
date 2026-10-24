@@ -31,7 +31,7 @@ import clang.cindex as ci
 from clang.cindex import CursorKind as K
 from clang.cindex import TypeKind as TK
 
-from . import jsonio, libclang
+from . import expressions, jsonio, libclang
 from .config import Vocabulary
 from .errors import ExtractionError
 
@@ -1589,10 +1589,63 @@ def _integer_type(typ: ci.Type) -> dict[str, Any] | None:
     return None
 
 
-def _mentions_parameter(expression: dict[str, Any] | None) -> bool:
-    if expression is None:
-        return False
-    return "p" in expression or any(_mentions_parameter(operand) for operand in expression.get("a", []))
+# CXBinaryOperatorKind AndAssign, XorAssign, OrAssign: a variable they change holds a few values.
+_COMBINING = {30: "&", 31: "^", 32: "|"}
+# A variable changed by more combining assignments than this holds too many values to state.
+_COMBINED_LIMIT = 3
+# The statements a template follows, and the nodes of the expression it gives, at most.
+_FLOW_STEPS = 256
+_TEMPLATE_NODES = 256
+# The nesting of an expression the facts state, at most: IS_ERR's
+# __builtin_expect(!!((unsigned long)(void *)(ptr) >= (unsigned long)-MAX_ERRNO), 0) is 12 deep.
+_EXPRESSION_DEPTH = 48
+# A template refuses a label or a jump: the returns then take another shape.
+_JUMPS = (K.LABEL_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT)
+# Statements that may leave a statement around them for code elsewhere in the function.
+_TRANSFERS = (K.RETURN_STMT, K.BREAK_STMT, K.CONTINUE_STMT)
+# Expressions whose parts may each hold several values that still decide them (``chosen``).
+_CHOOSING = (K.BINARY_OPERATOR, K.UNARY_OPERATOR, K.CALL_EXPR, K.CONDITIONAL_OPERATOR, K.DECL_REF_EXPR)
+# A template's value where no path returns (each calls a noreturn function).
+_NEVER: Any = object()
+
+
+@dataclass(frozen=True)
+class _Writes:
+    """How a function writes its variables, by each one's hash: the values plain assignments store,
+    the ``|=``, ``&=`` and ``^=`` it makes (the operator and the value), and the variables it changes
+    otherwise (``+=``, ``++``) or whose address it takes."""
+
+    stores: dict[int, list[ci.Cursor]]
+    combined: dict[int, list[tuple[str, ci.Cursor]]]
+    opaque: frozenset[int]
+
+    def changed(self, key: int) -> bool:
+        """Written other than by plain assignments."""
+        return key in self.opaque or key in self.combined
+
+
+@dataclass(frozen=True)
+class _Resume:
+    """Among the statements a template follows: where a ``break`` continues again once a switch ends."""
+
+    after_break: list[Any] | None
+
+
+def _size(expression: dict[str, Any] | None) -> int:
+    if expression is None or "a" not in expression:
+        return 1
+    return 1 + sum(_size(operand) for operand in expression["a"])
+
+
+def _choose(test: dict[str, Any] | None, taken: Any, skipped: Any) -> Any:
+    """The value of ``test ? taken : skipped`` where either may never be given (``_NEVER``)."""
+    if taken is None or skipped is None:
+        return None
+    if taken is _NEVER:
+        return skipped
+    if skipped is _NEVER:
+        return taken
+    return {"op": "?:", "a": [test, taken, skipped]}
 
 
 # How a guard expression states a variable at a reference: (the variable's declaration, the reference,
@@ -1621,7 +1674,12 @@ class _Evaluator:
         self.locals: dict[int, int | None] = {}
         self.values: dict[tuple[int, bool], int | None] = {}
         self.deciding: dict[int, bool] = {}
-        self.written: dict[int, tuple[dict[int, list[ci.Cursor]], frozenset[int]]] = {}
+        self.written: dict[int, _Writes] = {}
+        self.templates: dict[str, dict[str, Any] | None] = {}
+        self.choices: dict[tuple[int, bool], int | None] = {}
+        self.transferring: dict[int, bool] = {}
+        # Variables as the unit's own values: a local as the values stored in it, a parameter unknown.
+        self.known = self.resolver({})
 
     def image_decides(self, cursor: ci.Cursor) -> bool:
         """``__builtin_constant_p`` or ``__builtin_object_size`` inside: the image decides. Once per cursor."""
@@ -1661,6 +1719,13 @@ class _Evaluator:
         value = libclang.constant_int(cursor)
         if value is not None or depth > 6:
             return value
+        value = self.folded(cursor, truth, depth)
+        if value is None and cursor.kind in _CHOOSING:
+            return self.chosen(cursor, truth)
+        return value
+
+    def folded(self, cursor: ci.Cursor, truth: bool, depth: int) -> int | None:
+        """What the expression folds to from the one value of each of its parts."""
         kind, inner = cursor.kind, _children(cursor)
         if kind in (K.UNEXPOSED_EXPR, K.PAREN_EXPR, K.CSTYLE_CAST_EXPR) and inner:
             operand = _operand(cursor)
@@ -1668,8 +1733,14 @@ class _Evaluator:
         if kind == K.UNARY_OPERATOR and inner and libclang.unary_kind(cursor) == libclang.LOGICAL_NOT:
             value = self.evaluate(inner[0], depth, truth=True)
             return None if value is None else int(not value)
+        if kind == K.CONDITIONAL_OPERATOR and len(inner) == 3:
+            condition = self.evaluate(inner[0], depth, truth=True)
+            return None if condition is None else self.evaluate(inner[1] if condition else inner[2], depth, truth)
         if kind == K.BINARY_OPERATOR and len(inner) == 2:
             operator = libclang.binary_kind(cursor)
+            if operator == _COMMA:
+                # cpu_to_node(cpu) without NUMA: ((void)(cpu), 0).
+                return self.evaluate(inner[1], depth, truth)
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
                 left = self.evaluate(inner[0], depth, truth=True)
                 if left is not None and bool(left) == (operator == libclang.LOGICAL_OR):
@@ -1767,8 +1838,8 @@ class _Evaluator:
             return None
         # A static declared before its definition (kernel/rcu/tree.h's uses of tree.c's statics): the
         # canonical declaration names it, and the definition holds its initializer.
-        stores, other = self.stores_in(variable.translation_unit.cursor)
-        if variable.canonical.hash in other or stores.get(variable.canonical.hash):
+        writes = self.stores_in(variable.translation_unit.cursor)
+        if writes.changed(variable.canonical.hash) or writes.stores.get(variable.canonical.hash):
             return None
         initializer = libclang.var_initializer(variable.get_definition() or variable)
         return self.evaluate(initializer, depth + 1) if initializer is not None else 0
@@ -1779,16 +1850,16 @@ class _Evaluator:
         function = variable.semantic_parent
         if initializer is None or function is None:
             return None
-        stores, other = self.stores_in(function)
-        return None if variable.hash in other or stores.get(variable.hash) else initializer
+        writes = self.stores_in(function)
+        return None if writes.changed(variable.hash) or writes.stores.get(variable.hash) else initializer
 
-    def stores_in(self, function: ci.Cursor) -> tuple[dict[int, list[ci.Cursor]], frozenset[int]]:
-        """The values plain assignments store in each variable of a function, and the variables it
-        changes otherwise (``op=``, ``++``) or takes the address of, by hash."""
+    def stores_in(self, function: ci.Cursor) -> _Writes:
+        """How a function writes its variables (see ``_Writes``)."""
         key = function.hash
         if key not in self.written:
             stores: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
-            other: set[int] = set()
+            combined: dict[int, list[tuple[str, ci.Cursor]]] = collections.defaultdict(list)
+            opaque: set[int] = set()
             for node in function.walk_preorder():
                 if node.kind not in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR, K.UNARY_OPERATOR):
                     continue
@@ -1798,16 +1869,21 @@ class _Evaluator:
                     target = _children(target)[0]
                 if target is None or target.kind != K.DECL_REF_EXPR or target.referenced is None:
                     continue
+                variables = {target.referenced.hash, target.referenced.canonical.hash}
                 if node.kind == K.BINARY_OPERATOR and libclang.is_assignment(node) and len(operands) == 2:
-                    stores[target.referenced.hash].append(operands[1])
-                    if target.referenced.canonical.hash != target.referenced.hash:
-                        # A file-scope static declared before its definition: one variable.
-                        stores[target.referenced.canonical.hash].append(operands[1])
-                elif node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR or (
-                    node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node))
-                ):
-                    other.update((target.referenced.hash, target.referenced.canonical.hash))
-            self.written[key] = (dict(stores), frozenset(other))
+                    # A file-scope static declared before its definition is one variable under both.
+                    for variable in variables:
+                        stores[variable].append(operands[1])
+                elif node.kind == K.COMPOUND_ASSIGNMENT_OPERATOR:
+                    operator = _COMBINING.get(libclang.binary_kind(node)) if len(operands) == 2 else None
+                    for variable in variables:
+                        if operator is None:
+                            opaque.add(variable)
+                        else:
+                            combined[variable].append((operator, operands[1]))
+                elif node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node)):
+                    opaque.update(variables)
+            self.written[key] = _Writes(dict(stores), dict(combined), frozenset(opaque))
         return self.written[key]
 
     def local(self, variable: ci.Cursor, depth: int) -> int | None:
@@ -1821,9 +1897,10 @@ class _Evaluator:
         function = variable.semantic_parent
         if function is None:
             return None
-        stores, other = self.stores_in(function)
-        if key in other:
+        writes = self.stores_in(function)
+        if writes.changed(key):
             return None
+        stores = writes.stores
         initializer = libclang.var_initializer(variable)
         if stores.get(key) and variable.storage_class in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN):
             # A static local keeps its value between calls: its first value is any earlier store.
@@ -1835,16 +1912,18 @@ class _Evaluator:
         return value
 
     def expression(
-        self, cursor: ci.Cursor, resolve: _Resolve, depth: int = 0, truth: bool = False
+        self, cursor: ci.Cursor, resolve: _Resolve, depth: int = 0, truth: bool = False, fold: bool = True
     ) -> dict[str, Any] | None:
-        """The expression as link evaluates it at a fold (link._evaluate): a constant, an operation, and
+        """The expression as link evaluates it at a fold (expressions.values): a constant, an operation,
         each variable as ``resolve`` states the values it may hold (a parameter, or a choice among
-        values), or None where a value is unknown (a field read, a call that does not fold)."""
+        values), and a helper's call as what it returns for the arguments (``template``); or None where
+        a value is unknown (a field read, a call that does not fold). Without ``fold`` the expression
+        itself is not first evaluated (``chosen`` states what evaluating it did not give)."""
         typed = _integer_type(cursor.type) if cursor.kind.is_expression() else None
-        value = self.evaluate(cursor, truth=truth)
+        value = self.evaluate(cursor, truth=truth) if fold else None
         if value is not None:
             return {"c": value, **(typed or {})}
-        if depth > 12 or self.image_decides(cursor):
+        if depth > _EXPRESSION_DEPTH or self.image_decides(cursor):
             return None
         kind, inner = cursor.kind, _children(cursor)
         if kind == K.PAREN_EXPR and inner:
@@ -1876,6 +1955,8 @@ class _Evaluator:
             operand = self.expression(inner[0], resolve, depth + 1, truth=name == "!")
             return None if name is None or operand is None else {"op": name, "a": [operand], **typed}
         if kind == K.BINARY_OPERATOR and len(inner) == 2:
+            if libclang.binary_kind(cursor) == _COMMA:
+                return self.expression(inner[1], resolve, depth + 1, truth)
             name = _BINARY_NAMES.get(libclang.binary_kind(cursor))
             if name is None:
                 return None
@@ -1888,6 +1969,16 @@ class _Evaluator:
         if kind == K.CALL_EXPR and cursor.referenced is not None and cursor.referenced.spelling == "__builtin_expect":
             arguments = list(cursor.get_arguments() or [])
             return self.expression(arguments[0], resolve, depth + 1, truth) if arguments else None
+        if kind == K.CALL_EXPR and cursor.referenced is not None and cursor.referenced.kind == K.FUNCTION_DECL:
+            template = self.template(cursor.referenced.spelling)
+            if template is None:
+                return None
+            arguments = [self.expression(argument, resolve, depth + 1) for argument in cursor.get_arguments() or []]
+            returned = expressions.substitute(template, arguments)
+            found = expressions.values(returned)
+            if found is not None and len(found) == 1:
+                return {"c": next(iter(found)), **typed}
+            return returned if _size(returned) <= _TEMPLATE_NODES else None
         return None
 
     def exits(self, statement: ci.Cursor, loop: bool = False) -> bool:
@@ -1920,6 +2011,204 @@ class _Evaluator:
             if node.kind == K.CALL_EXPR and (node.spelling in _UNREACHABLE or _is_noreturn(node.referenced)):
                 found = True
         return found
+
+    def chosen(self, cursor: ci.Cursor, truth: bool) -> int | None:
+        """The value an expression takes whichever value each of its parts holds (a helper whose returns
+        are several constants, a local several stores give): where every choice gives one value, or,
+        where only the truth is tested, one truth value. softleaf_type returns SOFTLEAF_NONE, _SWAP or
+        _MARKER without CONFIG_DEVICE_PRIVATE, so ``softleaf_type(entry) == SOFTLEAF_DEVICE_EXCLUSIVE``
+        is false."""
+        key = (cursor.hash, truth)
+        if key not in self.choices:
+            self.choices[key] = None
+            found = expressions.values(self.expression(cursor, self.known, truth=truth, fold=False))
+            truths = {int(value != 0) for value in found} if found is not None else set()
+            if found is not None and len(found) == 1:
+                self.choices[key] = next(iter(found))
+            elif truth and len(truths) == 1:
+                self.choices[key] = truths.pop()
+        return self.choices[key]
+
+    def template(self, name: str) -> dict[str, Any] | None:
+        """What a function of the unit returns, as an expression on its parameters (``{"p": i}``): the
+        value of each return control can reach, under the conditions it is reached by (an ``if``, a
+        ``switch`` case), as the compiler folds it once a call is inlined with its arguments
+        (dma_go_direct(dev, mask, NULL) is true; pgtable_level_has_pxx_special(PGTABLE_LEVEL_PTE) is
+        IS_ENABLED(CONFIG_ARCH_HAS_PTE_SPECIAL)). None where a label or a jump makes the returns
+        another shape, or one cannot be stated."""
+        if name in self.templates:
+            return self.templates[name]
+        self.templates[name] = None
+        definition = self.definitions.get(name)
+        if definition is None or self.weak(definition):
+            return None
+        typed = _integer_type(definition.result_type)
+        body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
+        if typed is None or body is None or any(node.kind in _JUMPS for node in body.walk_preorder()):
+            return None
+        positions = {parameter.hash: index for index, parameter in enumerate(definition.get_arguments() or [])}
+        returned = self.flow([body], None, self.resolver(positions), [_FLOW_STEPS])
+        if returned is None or returned is _NEVER:
+            return None
+        template = {"op": "cast", "a": [returned], **typed}
+        self.templates[name] = template if _size(template) <= _TEMPLATE_NODES else None
+        return self.templates[name]
+
+    def flow(self, items: list[Any], after_break: list[Any] | None, resolve: _Resolve, budget: list[int]) -> Any:
+        """The value control returns from the statements ``items`` (a ``_Resume`` among them restores
+        where a ``break`` continues, once a switch ends): an expression, ``_NEVER`` where no path
+        returns, or None where a return cannot be stated. A statement that is no branch only changes
+        variables, and ``resolve`` states each by every value stored in it."""
+        budget[0] -= 1
+        if budget[0] < 0 or not items:
+            return None
+        head, rest = items[0], items[1:]
+        if isinstance(head, _Resume):
+            return self.flow(rest, head.after_break, resolve, budget)
+        kind = head.kind
+        if kind == K.RETURN_STMT:
+            inner = _children(head)
+            return self.expression(inner[0], resolve, 1) if inner else None
+        if kind == K.COMPOUND_STMT:
+            return self.flow([*_children(head), *rest], after_break, resolve, budget)
+        if kind in (K.CASE_STMT, K.DEFAULT_STMT):
+            # Falling into the next case of a switch.
+            return self.flow([_children(head)[-1], *rest], after_break, resolve, budget)
+        if kind == K.BREAK_STMT:
+            return None if after_break is None else self.flow(after_break, None, resolve, budget)
+        if kind == K.IF_STMT:
+            return self.flow_if(head, rest, after_break, resolve, budget)
+        if kind == K.SWITCH_STMT:
+            return self.flow_switch(head, rest, after_break, resolve, budget)
+        if self.transfers(head):
+            return None
+        if self.exits(head):
+            return _NEVER
+        return self.flow(rest, after_break, resolve, budget)
+
+    def flow_if(
+        self, statement: ci.Cursor, rest: list[Any], after_break: list[Any] | None, resolve: _Resolve, budget: list[int]
+    ) -> Any:
+        parts = _children(statement)
+        if len(parts) < 2:
+            return None
+        condition, branches = parts[0], parts[1:3]
+        decided = self.evaluate(condition, truth=True)
+        if decided is not None:
+            branch = branches[0] if decided else (branches[1] if len(branches) > 1 else None)
+            return self.flow([branch, *rest] if branch is not None else rest, after_break, resolve, budget)
+        if not any(self.transfers(branch) or self.exits(branch) for branch in branches):
+            return self.flow(rest, after_break, resolve, budget)
+        taken = self.flow([branches[0], *rest], after_break, resolve, budget)
+        skipped = self.flow([*branches[1:], *rest], after_break, resolve, budget)
+        return _choose(self.expression(condition, resolve, 1, truth=True), taken, skipped)
+
+    def flow_switch(
+        self, statement: ci.Cursor, rest: list[Any], after_break: list[Any] | None, resolve: _Resolve, budget: list[int]
+    ) -> Any:
+        parts = _children(statement)
+        selector, body = parts[0], parts[-1]
+        if len(parts) < 2 or body.kind != K.COMPOUND_STMT or not _switch_labels_top_level(body):
+            return None
+        statements = _children(body)
+        # Past the switch, and where a break in it continues.
+        resume = [_Resume(after_break), *rest]
+        typed = _integer_type(selector.type) or {}
+        labels = [_case_values(statement) for statement in statements]
+        cases = [
+            None
+            if values is None
+            else {None if value is None else expressions.normalized(value, typed) for value in values}
+            for values in labels
+        ]
+        default = next((index for index, values in enumerate(cases) if values is not None and None in values), None)
+
+        def entered(index: int | None) -> Any:
+            return self.flow([*statements[index:], *resume] if index is not None else resume, resume, resolve, budget)
+
+        selected = self.evaluate(selector)
+        if selected is not None:
+            return entered(
+                next((index for index, values in enumerate(cases) if values and selected in values), default)
+            )
+        test = self.expression(selector, resolve, 1)
+        result = entered(default)
+        for index in reversed(range(len(statements))):
+            values = cases[index]
+            if values is None or None in values:
+                continue
+            condition = {
+                "op": "in",
+                "a": [test],
+                "set": sorted(value for value in values if value is not None),
+                "w": 32,
+                "s": True,
+            }
+            result = _choose(condition, entered(index), result)
+        return result
+
+    def transfers(self, statement: ci.Cursor) -> bool:
+        """A return, break or continue inside: control may leave the statement for elsewhere."""
+        key = statement.hash
+        if key not in self.transferring:
+            self.transferring[key] = any(node.kind in _TRANSFERS for node in statement.walk_preorder())
+        return self.transferring[key]
+
+    def resolver(self, positions: dict[int, int]) -> _Resolve:
+        """How expressions state a function's variables: a parameter ``positions`` names as itself
+        (``{"p": i}``) or as any value stored in it besides, a local as the values stored in it (see
+        ``choice``); another parameter is unknown."""
+        holding: set[int] = set()
+
+        def resolve(variable: ci.Cursor, reference: ci.Cursor, depth: int) -> dict[str, Any] | None:
+            key = variable.hash
+            function = variable.semantic_parent
+            if key in holding or depth > _EXPRESSION_DEPTH or function is None or function.kind != K.FUNCTION_DECL:
+                return None
+            first: dict[str, Any] | None = None
+            if variable.kind == K.PARM_DECL:
+                if key not in positions:
+                    return None
+                first = {"p": positions[key]}
+            elif variable.storage_class in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN):
+                return None
+            holding.add(key)
+            try:
+                return self.choice(function, variable, first, resolve, depth)
+            finally:
+                holding.discard(key)
+
+        return resolve
+
+    def choice(
+        self, function: ci.Cursor, variable: ci.Cursor, first: dict[str, Any] | None, resolve: _Resolve, depth: int
+    ) -> dict[str, Any] | None:
+        """The values a variable of ``function`` may hold, as a choice (``?:`` on no condition): ``first``
+        (a parameter's argument) or a local's initializer, each value a plain assignment stores, and
+        each one a ``|=``, ``&=`` or ``^=`` makes of those (dequeue_entity's ``action |= DO_DETACH``).
+        None where the function changes it otherwise or takes its address."""
+        writes = self.stores_in(function)
+        key = variable.hash
+        combined = writes.combined.get(key, [])
+        typed = _integer_type(variable.type)
+        if key in writes.opaque or len(combined) > _COMBINED_LIMIT or (combined and typed is None):
+            return None
+        sources: list[dict[str, Any] | None] = [first] if first is not None else []
+        initializer = libclang.var_initializer(variable) if variable.kind == K.VAR_DECL else None
+        if initializer is not None:
+            sources.append(self.expression(initializer, resolve, depth + 1))
+        sources += [self.expression(value, resolve, depth + 1) for value in writes.stores.get(key, [])]
+        if not sources or any(source is None for source in sources):
+            return None
+        held = sources[0]
+        for source in sources[1:]:
+            held = {"op": "?:", "a": [None, held, source]}
+        for operator, value in combined:
+            operand = self.expression(value, resolve, depth + 1)
+            if operand is None:
+                return None
+            held = {"op": "?:", "a": [None, held, {"op": operator, "a": [held, operand], **(typed or {})}]}
+        return held if _size(held) <= _TEMPLATE_NODES else None
 
 
 class _Tagged(list[Any]):
@@ -2050,38 +2339,55 @@ class _FunctionWalk:
         """The values a parameter or local may hold at ``reference``, for link to decide at a fold:
         a parameter nothing writes is the caller's argument; one whose address escapes only after the
         reference, which no loop or label puts before the escape, too. A variable that plain
-        assignments write may hold its first value (the argument, or the initializer) or any value
-        assigned: a choice, decided only where every choice agrees."""
+        assignments write may hold its first value (the argument, or the initializer; a local read
+        before every store reads an indeterminate value) or any value assigned, and one that ``|=``,
+        ``&=`` or ``^=`` change also what each makes of those (dequeue_entity's ``action |=
+        DO_DETACH``): a choice, decided only where every choice agrees."""
         key = variable.hash
-        if key in self.holding or depth > 12:
+        if key in self.holding or depth > _EXPRESSION_DEPTH:
             return None
         uses = self.local_uses()
         index = self.parameters.get(key) if variable.kind == K.PARM_DECL else None
-        if uses["written"][key]:
+        combined = self.combined(variable, uses["written"][key])
+        if combined is None:
             if index is None or uses["assigned"][key] or not self.escapes_after(variable, reference):
                 return None
             return {"p": index}
+        evaluator = self.x.evaluator
         self.holding.add(key)
         try:
-            if index is not None:
-                values: list[dict[str, Any] | None] = [{"p": index}]
-            else:
-                initializer = libclang.var_initializer(variable)
-                if initializer is None:
-                    return None
-                values = [self.x.evaluator.expression(initializer, self.held, depth + 1)]
+            values: list[dict[str, Any] | None] = [{"p": index}] if index is not None else []
+            initializer = libclang.var_initializer(variable) if index is None else None
+            if initializer is not None:
+                values.append(evaluator.expression(initializer, self.held, depth + 1))
             values += [
-                self.x.evaluator.expression(definition, self.held, depth + 1)
+                evaluator.expression(definition, self.held, depth + 1)
                 for definition, _ in self.definitions.get(key, [])
             ]
+            operands = [(operator, evaluator.expression(value, self.held, depth + 1)) for operator, value in combined]
         finally:
             self.holding.discard(key)
-        if any(value is None for value in values):
+        if not values or any(value is None for value in values) or any(operand is None for _, operand in operands):
             return None
         choice = values[0]
         for value in values[1:]:
             choice = {"op": "?:", "a": [None, choice, value]}
+        typed = _integer_type(variable.type) or {}
+        for operator, operand in operands:
+            choice = {"op": "?:", "a": [None, choice, {"op": operator, "a": [choice, operand], **typed}]}
         return choice
+
+    def combined(self, variable: ci.Cursor, written: int) -> list[tuple[str, ci.Cursor]] | None:
+        """The ``|=``, ``&=`` and ``^=`` the function makes to a variable, where those are its
+        ``written`` writes besides plain assignments (none for a variable no other write changes), or
+        None where another write changes it or takes its address, or there are too many."""
+        if not written:
+            return []
+        writes = self.x.evaluator.stores_in(self.cursor)
+        found = writes.combined.get(variable.hash, [])
+        if variable.hash in writes.opaque or len(found) != written or len(found) > _COMBINED_LIMIT:
+            return None
+        return found
 
     def escapes_after(self, parameter: ci.Cursor, reference: ci.Cursor) -> bool:
         """Every write to the parameter is ``&parameter`` after the reference in the function's text, the
@@ -2123,7 +2429,7 @@ class _FunctionWalk:
     def guard_expression(self, condition: ci.Cursor, truth: bool = True) -> dict[str, Any] | None:
         """The condition as an expression on the parameters, when it names one."""
         expression = self.x.evaluator.expression(condition, self.held, truth=truth)
-        return expression if _mentions_parameter(expression) else None
+        return expression if expressions.mentions_parameter(expression) else None
 
     def label_guard(self, label: ci.Cursor, fallthrough: list[dict[str, Any]] | None) -> dict[str, Any] | None:
         """The guard on a label's code: reached by the gotos met before it and, unless ``fallthrough`` is
@@ -2867,7 +3173,7 @@ class _FunctionWalk:
         # The value the argument passes, where it is a constant or depends on the caller's parameters:
         # the guards of a folded callee are decided by it (link._bind).
         value = self.x.evaluator.expression(expression, self.held)
-        if value is not None and ("c" in value or _mentions_parameter(value)):
+        if expressions.values(value) is not None or expressions.mentions_parameter(value):
             item["expr"] = value
         return item
 

@@ -25,7 +25,7 @@ from typing import Any
 
 import capstone
 
-from . import jsonio, structure
+from . import expressions, jsonio, structure
 from .config import Config
 from .contracts import ContractGraph
 from .contracts import address as contract_address
@@ -781,98 +781,20 @@ def _fix_index(item: dict[str, Any], arguments: list[dict[str, Any]]) -> dict[st
 
 # Guards: the code of a helper compiled only for some values of its parameters --------------------
 #
-# The facts give an event ``guards``: conditions on the function's parameters (C expressions as JSON:
-# {"c": int}, {"p": index}, null for a value the facts cannot name, or {"op": ..., "a": [...]}, each
-# with its type's width "w" and signedness "s"). An event is compiled only where every guard's
-# expression is truthy as its "v" says. At a fold the caller's arguments replace the parameters; a
-# guard decided against the event makes it dead code the compiler removed for these arguments.
-
-_BINARY: dict[str, Callable[[int, int], int | None]] = {
-    "+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
-    "/": lambda a, b: None if b == 0 else (abs(a) // abs(b)) * (1 if (a < 0) == (b < 0) else -1),
-    "%": lambda a, b: None if b == 0 else a - b * ((abs(a) // abs(b)) * (1 if (a < 0) == (b < 0) else -1)),
-    "<<": lambda a, b: a << b if 0 <= b < 128 else None, ">>": lambda a, b: a >> b if 0 <= b < 128 else None,
-    "&": lambda a, b: a & b, "|": lambda a, b: a | b, "^": lambda a, b: a ^ b,
-    "==": lambda a, b: int(a == b), "!=": lambda a, b: int(a != b), "<": lambda a, b: int(a < b),
-    ">": lambda a, b: int(a > b), "<=": lambda a, b: int(a <= b), ">=": lambda a, b: int(a >= b),
-}  # fmt: skip
+# The facts give an event ``guards``: conditions on the function's parameters (expressions.py states
+# them). An event is compiled only where every guard's expression is truthy as its "v" says. At a fold
+# the caller's arguments replace the parameters; a guard every value of which is decided against the
+# event makes it dead code the compiler removed for these arguments.
 
 
-def _normalized(value: int | None, expression: dict[str, Any]) -> int | None:
-    """The value as the expression's C type holds it: ``w`` bits, signed when ``s``; a _Bool (``b``)
-    holds 1 for any value that is not 0."""
-    width = expression.get("w")
-    if value is not None and expression.get("b"):
-        return int(value != 0)
-    if value is None or not width:
-        return value
-    value &= (1 << width) - 1
-    if expression.get("s") and value >= 1 << (width - 1):
-        value -= 1 << width
-    return value
-
-
-def _evaluate(expression: dict[str, Any] | None) -> int | None:
-    """An expression's value, or None where it depends on something unknown. ``&&``, ``||`` and
-    ``?:`` are decided by the operand that decides them, as C evaluates them."""
-    if expression is None or "p" in expression:
-        return None
-    if "c" in expression:
-        return _normalized(int(expression["c"]), expression)
-    operator, operands = expression["op"], expression["a"]
-    if operator in ("&&", "||"):
-        decisive = 0 if operator == "&&" else 1
-        values = [_evaluate(operand) for operand in operands[:2]]
-        if any(value is not None and int(value != 0) == decisive for value in values):
-            return decisive
-        return None if any(value is None for value in values) else 1 - decisive
-    if operator == "?:":
-        condition = _evaluate(operands[0])
-        if condition is None:
-            first, second = _evaluate(operands[1]), _evaluate(operands[2])
-            return _normalized(first, expression) if first is not None and first == second else None
-        return _normalized(_evaluate(operands[1] if condition else operands[2]), expression)
-    value = _evaluate(operands[0])
-    if operator == "in":
-        return None if value is None else int(value in expression["set"])
-    if operator in ("!", "~", "neg", "cast"):
-        if value is None:
-            return None
-        result = {"!": int(value == 0), "~": ~value, "neg": -value, "cast": value}[operator]
-        return _normalized(result, expression)
-    other = _evaluate(operands[1])
-    if operator in ("*", "&") and 0 in (value, other):
-        return 0
-    if value is None or other is None:
-        return None
-    return _normalized(_BINARY[operator](value, other), expression)
-
-
-def _mentions_parameter(expression: dict[str, Any] | None) -> bool:
-    if expression is None:
-        return False
-    if "p" in expression:
-        return True
-    return any(_mentions_parameter(operand) for operand in expression.get("a", []))
-
-
-def _substitute(expression: dict[str, Any] | None, arguments: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The expression in the caller's terms: each parameter becomes its argument's value, as the
-    parameter's type holds it, or unknown where the facts do not express the argument."""
-    if expression is None or "c" in expression:
-        return expression
-    if "p" in expression:
-        index = expression["p"]
-        value = arguments[index].get("expr") if index < len(arguments) else None
-        if value is None:
-            return None
-        return {"op": "cast", "a": [value], "w": expression.get("w"), "s": expression.get("s")}
-    return {**expression, "a": [_substitute(operand, arguments) for operand in expression["a"]]}
+def _argument_values(arguments: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
+    """The value each argument passes, as an expression in the caller's terms, or None."""
+    return [argument.get("expr") for argument in arguments]
 
 
 def _constant(argument: dict[str, Any] | None) -> int | None:
     """The integer an argument always passes, or None."""
-    return _evaluate(argument.get("expr")) if argument is not None else None
+    return expressions.evaluate(argument.get("expr")) if argument is not None else None
 
 
 def _resolved(items: list[dict[str, Any]], table: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -900,13 +822,14 @@ def _decided(guards: list[dict[str, Any]], arguments: list[dict[str, Any]]) -> l
     """The guards that still depend on a parameter once the arguments are bound, or None when one is
     decided against the event."""
     left = []
+    values = _argument_values(arguments)
     for guard in guards:
-        expression = _substitute(guard["e"], arguments)
-        value = _evaluate(expression)
-        if value is None:
-            if _mentions_parameter(expression):
+        expression = expressions.substitute(guard["e"], values)
+        truth = expressions.truth(expression)
+        if truth is None:
+            if expressions.mentions_parameter(expression):
                 left.append({"e": expression, "v": guard["v"]})
-        elif (value != 0) != guard["v"]:
+        elif bool(truth) != guard["v"]:
             return None
     return left
 
@@ -916,10 +839,11 @@ def _guarded(bound: Effective, child: Effective, arguments: list[dict[str, Any]]
     is dead for these arguments (a call or an access to state becomes unevaluated, with reason
     ``constant_argument``; any other event is dropped). Each call's argument values are restated in
     the caller's terms, for the folds below it."""
+    values = _argument_values(arguments)
     for original, call in zip(child.calls, bound.calls, strict=True):
         restated = []
         for item, argument in zip(original["arguments"], call["arguments"], strict=True):
-            value = _substitute(item["expr"], arguments) if "expr" in item else None
+            value = expressions.substitute(item["expr"], values) if "expr" in item else None
             restated.append(
                 {**argument, "expr": value} if value is not None else {k: v for k, v in argument.items() if k != "expr"}
             )
