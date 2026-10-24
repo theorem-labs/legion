@@ -182,6 +182,10 @@ const environmentKeys = [
   "ENVOY_CONFIG_FILE",
   "OMP_PROFILE",
   "PI_CODING_AGENT_DIR",
+  "LEGION_OWNER",
+  "LEGION_OWNER_START_FILE",
+  "LEGION_LEDGER_REPOSITORY",
+  "LEGION_LEDGER_DSN_FILE",
 ] as const;
 // The suite's baseline is "not a Legion pane": every key above except HOME starts unset and is
 // reset to unset after each test, and `beforeEach` hands on the Envoy entry's file again as
@@ -572,6 +576,8 @@ interface ClaimPane {
   readonly entries: AppendedEntry[];
   readonly sentMessages: SentMessage[];
   readonly sentMessageOptions: unknown[];
+  /** Every `sendUserMessage` text, in order: the turns the pane started itself. */
+  readonly sentUserMessages: string[];
   readonly title: HostTitle;
   readonly handlers: Map<string, Handler>;
   readonly context: SessionContext;
@@ -671,12 +677,13 @@ async function claimPane(options: {
     if (url.pathname.startsWith("/legion/")) {
       return Response.json({ error: "no route" }, { status: 404 });
     }
-    if (url.pathname === `/v1/roles/${claimToken}`) {
+    if (url.pathname.startsWith("/v1/roles/") && url.pathname !== "/v1/roles/set") {
+      const role = url.pathname.slice("/v1/roles/".length);
       const holder = options.roleHolder?.() ?? sessionId;
       if (holder === "") {
-        return Response.json({ error: `no holder for role ${claimToken}` }, { status: 404 });
+        return Response.json({ error: `no holder for role ${role}` }, { status: 404 });
       }
-      return Response.json({ role: claimToken, holder, last_seen: 1 });
+      return Response.json({ role, holder, last_seen: 1 });
     }
     return Response.json({
       session_id: sessionId,
@@ -736,6 +743,7 @@ async function claimPane(options: {
     entries: fixture.entries,
     sentMessages: fixture.sentMessages,
     sentMessageOptions: fixture.sentMessageOptions,
+    sentUserMessages: fixture.sentUserMessages,
     title: fixture.title,
     handlers: fixture.handlers,
     context,
@@ -812,6 +820,60 @@ describe("Legion OMP extension", () => {
     expect(classifySession({ LEGION_CONTROLLER: "1", LEGION_ROLE: "controller" })).toEqual({
       kind: "controller",
     });
+  });
+  // A standing owner's pane: the owner role, no issue or tree, its node id as LEGION_OWNER and its
+  // first turn in LEGION_OWNER_START_FILE, a read-only file the daemon wrote before the launch.
+  // The stand-in daemon answers its registration as the owner's, with no issue or tree.
+  async function ownerPane(startFile: string | undefined) {
+    const pane = await claimPane({
+      role: "implementer",
+      register: () =>
+        Response.json({
+          claimToken: "legion-omp-owner-function_cmnt__get__writers_afs_snamespace_dc",
+          tree: "",
+          issue: "",
+          role: "owner",
+          generation: 1,
+          secret: "owner-secret",
+          promptAgents: [],
+        }),
+    });
+    process.env.LEGION_ROLE = "owner";
+    process.env.LEGION_TREE = "";
+    process.env.LEGION_ISSUE = "";
+    process.env.LEGION_OWNER = "function:mnt_get_writers@fs/namespace.c";
+    if (startFile === undefined) delete process.env.LEGION_OWNER_START_FILE;
+    else process.env.LEGION_OWNER_START_FILE = startFile;
+    return pane;
+  }
+  test("a standing owner's first user turn is its start file, sent once after its registration", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "legion-owner-start-"));
+    temporaryPaths.push(dir);
+    const startFile = path.join(dir, "start.md");
+    await writeFile(startFile, "Own function:mnt_get_writers@fs/namespace.c.\n", { mode: 0o444 });
+    const pane = await ownerPane(startFile);
+    await pane.start();
+    expect(pane.exits).toEqual([]);
+    expect(pane.sentUserMessages).toEqual(["Own function:mnt_get_writers@fs/namespace.c.\n"]);
+    const paths = pane.requests.map((request) => request.path);
+    expect(paths.indexOf("/legion/v1/claims/register")).toBeGreaterThanOrEqual(0);
+    expect(eventOrder.indexOf("sendUserMessage")).toBeGreaterThanOrEqual(0);
+    // A second session_start in the same process (a resumed session) sends nothing more.
+    await pane.start();
+    expect(pane.sentUserMessages).toHaveLength(1);
+  });
+  test("a standing owner whose start file cannot be read exits so the daemon counts the failure", async () => {
+    const pane = await ownerPane("/nonexistent/legion-owner-start.md");
+    await expect(pane.start()).rejects.toThrow("process would exit");
+    expect(pane.exits).toEqual([1]);
+    expect(pane.sentUserMessages).toEqual([]);
+    expect(pane.errors.join("\n")).toContain("LEGION_OWNER_START_FILE");
+  });
+  test("a standing owner launched without LEGION_OWNER_START_FILE exits rather than idle", async () => {
+    const pane = await ownerPane(undefined);
+    await expect(pane.start()).rejects.toThrow("process would exit");
+    expect(pane.exits).toEqual([1]);
+    expect(pane.sentUserMessages).toEqual([]);
   });
   test("rejects an unrecognized LEGION_ROLE value", () => {
     expect(() => classifySession({ LEGION_ROLE: "explorer", LEGION_TREE: "REPO-42" })).toThrow(

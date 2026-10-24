@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { isLegionRole } from "@legion/contracts";
 import { activeDispatchSettings } from "@legion/envoy-client/dispatch-config";
@@ -206,6 +207,29 @@ export default function legionExtension(pi: PiApi): void {
   // with the id its copies carry, and owed until that run starts (agent_start), whatever starts it.
   let recreatedNotice: WorkspaceRecreatedNotice | undefined;
 
+  // A standing owner's first turn is the file the daemon wrote before its launch
+  // (LEGION_OWNER_START_FILE): its template prompt, owner key and ledger commands. It is sent once
+  // per process, after the registration, as the controller's start message is
+  // (controller-session.ts). A file the pane cannot read ends the process, a launch failure the
+  // daemon counts, rather than leave an owner idle with nothing to do.
+  let ownerStartSent = false;
+  const sendOwnerStart = (): void => {
+    if (ownerStartSent) return;
+    const file = process.env.LEGION_OWNER_START_FILE;
+    let start: string;
+    try {
+      if (!file) throw new Error("it is unset");
+      start = readFileSync(file, "utf8");
+    } catch (error) {
+      console.error(
+        `[legion] the standing owner's LEGION_OWNER_START_FILE ${file ?? ""} cannot be read; exiting so the daemon launches it again: ${messageFor(error)}`
+      );
+      exitProcess(1);
+    }
+    ownerStartSent = true;
+    pi.sendUserMessage(start);
+  };
+
   pi.on("session_start", async (_event, context) => {
     // A `task`-spawned subagent session loads a fresh instance of this whole module: bail out
     // before classification, or the inherited LEGION_* environment would look like a fresh
@@ -246,7 +270,10 @@ export default function legionExtension(pi: PiApi): void {
         }
       }
       await claimSession.bootstrap(context);
-      if (session.kind === "standing-owner") return;
+      if (session.kind === "standing-owner") {
+        sendOwnerStart();
+        return;
+      }
     }
     registerLegionTool();
     await activateLegionTool();

@@ -949,6 +949,10 @@ func shimAddress(bound, advertiseHost string) (string, error) {
 // daemon that cannot supervise refuses before its boot is recorded.
 func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, p plan, st *store.Store, apps appauth.Tokens) (*supervision, error) {
 	launches := ownerLaunches(cfg.StandingOwners)
+	var ledgerRepository, ledgerDSNFile string
+	if owners := cfg.StandingOwners; owners != nil {
+		ledgerRepository, ledgerDSNFile = owners.Repository, owners.LedgerDSNFile
+	}
 	queue, err := openStandingOwnerQueue(cfg.StandingOwners, log)
 	if err != nil {
 		return nil, err
@@ -1004,6 +1008,7 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 			designGate:   cfg.Gates.Design, slackChannels: cfg.Projects[cfg.Project].SlackChannels,
 			mergeRules: cfg.Projects[cfg.Project].Merge, runtimeName: cfg.Runtime.Name, plugins: p.plugins,
 			backend: cfg.BackendFor, ownerLaunch: launches,
+			ledgerRepository: ledgerRepository, ledgerDSNFile: ledgerDSNFile,
 		},
 		Identity:      adoptIdentity(p.identity, p.repository),
 		Secrets:       p.secretsEnroller,

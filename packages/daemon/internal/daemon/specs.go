@@ -14,6 +14,7 @@ import (
 	"github.com/sjawhar/legion/daemon/internal/config"
 	"github.com/sjawhar/legion/daemon/internal/ghrepo"
 	"github.com/sjawhar/legion/daemon/internal/notify"
+	"github.com/sjawhar/legion/daemon/internal/podsafety"
 	"github.com/sjawhar/legion/daemon/internal/prompts"
 	"github.com/sjawhar/legion/daemon/internal/runtime"
 	"github.com/sjawhar/legion/daemon/internal/supervise"
@@ -68,6 +69,9 @@ type specs struct {
 	// ownerLaunch is how a standing owner of a ledger key launches: its named entry, or its graph
 	// node kind's template.
 	ownerLaunch func(string) (config.OwnerTemplate, bool)
+	// ledgerRepository and ledgerDSNFile are standing_owners.repository and .ledger_dsn_file, which
+	// every owner's launch names (standingOwnerSpawnSpec).
+	ledgerRepository, ledgerDSNFile string
 }
 
 // rolePromptPath is where a claim's role prompt is kept for every launch of it.
@@ -222,9 +226,20 @@ func (s specs) controllerSpawnSpec() (runtime.SpawnSpec, error) {
 	}, nil
 }
 
+// ownerStartFile is where a standing owner's first turn is written for every launch of it: under
+// the owner's own directory, which the tmux runtime makes its working directory.
+func ownerStartFile(stateDir string, token claim.Token) string {
+	return filepath.Join(stateDir, "owners", string(token), "start.md")
+}
+
 // standingOwnerSpawnSpec is an owner's launch: its prompt, harness and deployment instructions,
-// the launch secrets, and LEGION_OWNER, the ledger key it serves its queue as — the holder name
-// every lease it takes must use, so that the supervisor's release of a stopped owner frees them.
+// the launch secrets, and what tells it its work. LEGION_OWNER is the ledger key it serves its
+// queue as, the holder name every lease it takes must use, so that the supervisor's release of a
+// stopped owner frees them; LEGION_LEDGER_REPOSITORY and LEGION_LEDGER_DSN_FILE are where that
+// queue is (a path, never the DSN). LEGION_OWNER_START_FILE names its first turn, written read-only
+// here, before the machine's spawn (and so before the launch is recorded as started): the template
+// prompt, then its key, its repository and the exact ledger commands that find, claim and complete
+// its items. The prompt stays in the system prompt too (RolePromptPaths).
 func (s specs) standingOwnerSpawnSpec(c supervise.Claim) (runtime.SpawnSpec, error) {
 	key, ok := c.StandingOwnerKey()
 	if !ok {
@@ -237,15 +252,57 @@ func (s specs) standingOwnerSpawnSpec(c supervise.Claim) (runtime.SpawnSpec, err
 	if !ok {
 		return runtime.SpawnSpec{}, fmt.Errorf("no standing-owner configuration for %s", key)
 	}
+	prompt, err := os.ReadFile(launch.PromptFile)
+	if err != nil {
+		return runtime.SpawnSpec{}, fmt.Errorf("the prompt of standing owner %s: %w", key, err)
+	}
+	startFile := ownerStartFile(s.stateDir, c.Token)
+	if err := os.MkdirAll(filepath.Dir(startFile), 0o700); err != nil {
+		return runtime.SpawnSpec{}, fmt.Errorf("the directory of standing owner %s: %w", key, err)
+	}
+	if err := podsafety.WriteReadOnly(startFile, []byte(ownerStartMessage(string(prompt), key, s.ledgerRepository))); err != nil {
+		return runtime.SpawnSpec{}, fmt.Errorf("the start file of standing owner %s: %w", key, err)
+	}
 	return runtime.SpawnSpec{
 		Backend: launch.Harness,
-		Env:     map[string]string{"LEGION_OWNER": key},
+		Env: map[string]string{
+			"LEGION_OWNER":             key,
+			"LEGION_LEDGER_REPOSITORY": s.ledgerRepository,
+			"LEGION_LEDGER_DSN_FILE":   s.ledgerDSNFile,
+			"LEGION_OWNER_START_FILE":  startFile,
+		},
 		Secrets: maps.Clone(s.secrets),
 		Prompt: runtime.PromptParts{
 			RolePromptPaths:            []string{launch.PromptFile},
 			DeploymentInstructionsPath: s.instructions,
 		},
 	}, nil
+}
+
+// ownerStartMessage is a standing owner's first turn: its template prompt, then where its work is
+// and the ledger commands, each spelled with the global flags before the command, as the ledger CLI
+// reads them, and the owner key as the holder of every lease it takes.
+func ownerStartMessage(prompt, key, repository string) string {
+	ledger := `ledger --dsn-file "$LEGION_LEDGER_DSN_FILE"`
+	owner := `"$LEGION_OWNER"`
+	lines := []string{
+		strings.TrimRight(prompt, "\n"),
+		"",
+		"## Your work",
+		"",
+		fmt.Sprintf("Your owner key is `%s` (LEGION_OWNER), and your work items are in the ledger repository `%s`", key, repository),
+		"(LEGION_LEDGER_REPOSITORY). Hold every lease under your owner key, and nothing else, so the daemon",
+		"frees your leases when your process stops.",
+		"",
+		fmt.Sprintf("1. List your open items: `%s --json items %s --owner %s`.", ledger, repository, owner),
+		fmt.Sprintf("2. For each item, claim it with no lease end: `%s --json claim %s <item> %s 0`. The answer", ledger, repository, owner),
+		"   carries the lease's generation.",
+		"3. Do the item's work.",
+		fmt.Sprintf("4. Record its result: `%s complete %s <item> %s <generation> <result>`.", ledger, repository, owner),
+		"",
+		"When no open item is left, end your session; the daemon starts you again when new work arrives.",
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // rolePromptPaths keeps an explicit operator prompt as a narrow test override. Every ordinary

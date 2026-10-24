@@ -490,3 +490,75 @@ func withContract(c supervise.Claim, contract int) supervise.Claim {
 	c.PluginContract = contract
 	return c
 }
+
+// A standing owner learns its work from its launch: LEGION_OWNER (the node id it holds leases
+// under), LEGION_LEDGER_REPOSITORY, LEGION_LEDGER_DSN_FILE (a path, never the DSN) and
+// LEGION_OWNER_START_FILE, a read-only file under the owner's own state directory holding its first
+// turn: the template prompt, the owner key, the repository and the exact ledger commands. Every
+// variable passes the spawn spec's own check, so no credential-shaped name reaches the pane.
+func TestAStandingOwnersLaunchDeliversItsWork(t *testing.T) {
+	stateDir := t.TempDir()
+	prompt := stateDir + "/function-owner.md"
+	if err := os.WriteFile(prompt, []byte("You own one kernel function.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const key = "function:mnt_get_writers@fs/namespace.c"
+	token, err := claim.OwnerToken("s1", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := specs{stateDir: stateDir, project: "s1", ledgerRepository: "example/repository", ledgerDSNFile: "/etc/legion/ledger-dsn",
+		ownerLaunch: func(owner string) (config.OwnerTemplate, bool) {
+			return config.OwnerTemplate{PromptFile: prompt, Harness: runtime.BackendOmp, MaxCostUSD: 1}, owner == key
+		}}
+	c := supervise.Claim{Token: token, Project: "s1", Role: claim.RoleOwner, OwnerKey: key, Generation: 3}
+	spec, err := s.SpawnSpec(context.Background(), c)
+	if err != nil {
+		t.Fatalf("SpawnSpec: %v", err)
+	}
+	startFile := stateDir + "/owners/" + string(token) + "/start.md"
+	want := map[string]string{
+		"LEGION_OWNER":             key,
+		"LEGION_LEDGER_REPOSITORY": "example/repository",
+		"LEGION_LEDGER_DSN_FILE":   "/etc/legion/ledger-dsn",
+		"LEGION_OWNER_START_FILE":  startFile,
+	}
+	if !maps.Equal(spec.Env, want) {
+		t.Fatalf("the owner's launch environment = %v, want %v", spec.Env, want)
+	}
+	for name := range spec.Env {
+		if runtime.IsSecretLikeName(name) {
+			t.Errorf("%s is shaped like a credential, which the pane would never see", name)
+		}
+	}
+	info, err := os.Stat(startFile)
+	if err != nil {
+		t.Fatalf("the start file: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode&0o222 != 0 {
+		t.Errorf("the start file is mode %o, want read-only", mode)
+	}
+	body, err := os.ReadFile(startFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []string{
+		"You own one kernel function.",
+		"Your owner key is `function:mnt_get_writers@fs/namespace.c`",
+		"ledger repository `example/repository`",
+		`ledger --dsn-file "$LEGION_LEDGER_DSN_FILE" --json items example/repository --owner "$LEGION_OWNER"`,
+		`ledger --dsn-file "$LEGION_LEDGER_DSN_FILE" --json claim example/repository <item> "$LEGION_OWNER" 0`,
+		`ledger --dsn-file "$LEGION_LEDGER_DSN_FILE" complete example/repository <item> "$LEGION_OWNER" <generation> <result>`,
+	} {
+		if !strings.Contains(string(body), line) {
+			t.Errorf("the start file lacks %q:\n%s", line, body)
+		}
+	}
+	if strings.Contains(string(body), "events") {
+		t.Errorf("the start file scans the event log:\n%s", body)
+	}
+	// A second launch of the same owner rewrites its read-only start file rather than failing on it.
+	if _, err := s.SpawnSpec(context.Background(), c); err != nil {
+		t.Fatalf("the relaunch's SpawnSpec over an existing start file: %v", err)
+	}
+}
