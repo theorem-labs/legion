@@ -1,10 +1,14 @@
 package declindex
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -25,7 +29,9 @@ func (e *TempError) Unwrap() error { return e.Err }
 
 // Sync returns the post-landing synchronisation that Refresh runs under the index's refresh lock
 // (RefreshOptions.Landed): it fetches an otherwise absent commit, checks it out, and runs the configured build before
-// the index reads it.
+// the index reads it. Worktrees of one repository share its refs, and each holds the refresh lock of its own index,
+// so a fetch writes the remote's branches only under a namespace of this run, which it deletes when the sync ends
+// (the checkout holds the commit through HEAD): no ref outlives the run for another run to move.
 func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error {
 	return func(ctx context.Context) error {
 		has, err := hasCommit(ctx, cfg.Tree, commit)
@@ -33,7 +39,12 @@ func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error 
 			return err
 		}
 		if !has && cfg.Remote != "" {
-			if err := runGit(ctx, cfg.Tree, log, "fetch", "--no-tags", cfg.Remote, "+refs/heads/*:refs/declindex/remote/*"); err != nil {
+			ns, err := privateRefNamespace()
+			if err != nil {
+				return err
+			}
+			defer deleteRefs(cfg.Tree, ns, log)
+			if err := runGit(ctx, cfg.Tree, log, "fetch", "--no-tags", "--no-write-fetch-head", cfg.Remote, "+refs/heads/*:"+ns+"*"); err != nil {
 				return &TempError{Err: fmt.Errorf("fetch %q: %w", cfg.Remote, err)}
 			}
 			has, err = hasCommit(ctx, cfg.Tree, commit)
@@ -51,6 +62,30 @@ func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error 
 			return nil
 		}
 		return runBuild(ctx, cfg.Tree, cfg.Build, cfg.BuildTimeout, log)
+	}
+}
+
+// privateRefNamespace is a ref namespace of this run alone: refs/declindex/remote/<pid>-<random>/.
+func privateRefNamespace() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("refs/declindex/remote/%d-%s/", os.Getpid(), hex.EncodeToString(b[:])), nil
+}
+
+// deleteRefs deletes every ref below ns. It runs after the checkout, which holds the commit through HEAD; a failure is
+// logged, since the refs are this run's and no other run reads them.
+func deleteRefs(tree, ns string, log io.Writer) {
+	ctx := context.Background()
+	out, err := exec.CommandContext(ctx, "git", "-C", tree, "for-each-ref", "--format=delete %(refname)", ns).Output()
+	if err == nil && len(out) > 0 {
+		cmd := exec.CommandContext(ctx, "git", "-C", tree, "update-ref", "--stdin")
+		cmd.Stdin = bytes.NewReader(out)
+		err = cmd.Run()
+	}
+	if err != nil {
+		logf(log, "sync: could not delete the fetched refs %s: %v", ns, err)
 	}
 }
 
