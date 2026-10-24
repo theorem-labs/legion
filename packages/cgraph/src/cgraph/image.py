@@ -880,7 +880,7 @@ class Image:
         before = dict(states)
         first = dict(self._block_states(instructions, successors, _retreating(successors)))
         returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
-        frame = _frame(self.decoder, instructions)
+        frame = _frame(self.decoder, instructions, successors)
         self.frame_rooted = frame.rooted
         for index, state in states:
             instruction = instructions[index]
@@ -1529,92 +1529,152 @@ class _Frame:
     rooted: dict[int, frozenset[str]]
 
 
-def _frame(decoder: Any, instructions: list[Any]) -> _Frame:
-    """The frame accesses, the frame addresses, the frame addresses passed in argument registers to
-    calls (the call's address, the argument's position, the offset), and the frame accesses past a
-    variable index of a function, as offsets from the value sp had on entry. The prologue's
-    ``addi sp, sp, -n`` and ``addi s0, sp, m`` give each frame register's offset; the saves of
-    callee-saved registers through sp before the frame pointer is set, and the restores at the same
-    offsets, are the frame's own and no local object's.
+# A register the frame analysis follows: whether it holds a frame address or one plus a variable
+# index ("held" / "indexed"), and the offsets it may hold. More offsets than this is no address.
+_Rooted = dict[str, tuple[str, frozenset[int]]]
+_FRAME_OFFSETS = 4
 
-    A register holds a frame address from the ``addi``/``mv`` that forms it (``addi s3, s0, -312``
-    for &fbatch.folios[0]; ``addi`` from such a register moves it) to its next write; ``add`` of one
-    and another register holds the address plus a variable index (fbatch.folios[i]). In address
-    order, a call or branch ends that for a caller-saved register (the setup of a call's arguments),
-    not for a callee-saved one, which keeps &object across the calls."""
-    deltas: dict[str, int] = {}
-    accesses: set[tuple[int, int]] = set()
-    addresses: set[int] = set()
-    arguments: set[tuple[int, int, int]] = set()
-    indexed_accesses: set[tuple[int, int]] = set()
-    held: dict[str, int] = {}  # registers holding a frame address
-    indexed: dict[str, int] = {}  # registers holding a frame address plus a variable index
+
+def _frame_deltas(decoder: Any, instructions: list[Any]) -> tuple[dict[str, tuple[int, int]], set[int]]:
+    """The prologue: sp's and s0's offsets from the value sp had on entry, each with the index from
+    which it holds (``addi sp, sp, -n``; ``addi s0, sp, m``), and the offsets where it saves
+    callee-saved registers through sp before s0 is set (the frame's own, as are their restores)."""
+    deltas: dict[str, tuple[int, int]] = {}
     saved: set[int] = set()
-    rooted: dict[int, frozenset[str]] = {}
-    for position, instruction in enumerate(instructions):
-        rooted[instruction.address] = frozenset({"sp", *deltas, *held, *indexed})
+    for position, instruction in enumerate(instructions[:_PROLOGUE_LIMIT]):
         operands = list(instruction.operands)
         mnemonic = instruction.mnemonic
         registers = [decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG]
         immediate = next((operand.imm for operand in operands if operand.type == CS_OP_IMM), None)
-        calls = mnemonic in _DIRECT_CALLS or (mnemonic in _REGISTER_CALLS and _links(decoder, operands))
-        if calls:
-            arguments.update(
-                (instruction.address, int(name[1:]), offset) for name, offset in held.items() if name in _ARGUMENTS
-            )
-        if calls or mnemonic in _REGISTER_CALLS or mnemonic in _BRANCHES or mnemonic in _ENDS:
-            # A callee-saved register keeps &object across calls and branches; the others do not.
-            held = {name: offset for name, offset in held.items() if name in _CALLEE_SAVED}
-            indexed = {name: offset for name, offset in indexed.items() if name in _CALLEE_SAVED}
-            continue
-        written = registers[0] if registers and mnemonic not in _STORE_WIDTHS else None
-        sources = {name: (held.get(name), indexed.get(name)) for name in registers[1:]}
-        if written in ("c.add", "c.mv"):
-            sources[written] = (held.get(written), indexed.get(written))
-        if written is not None:
-            held.pop(written, None)
-            indexed.pop(written, None)
         if mnemonic.startswith(("addi", "c.addi")) and registers and immediate is not None:
             target, source = registers[0], registers[-1]
             if target == source == "sp" and "sp" not in deltas and immediate < 0:
-                deltas["sp"] = immediate
+                deltas["sp"] = (immediate, position + 1)
             elif target == "s0" and source == "sp" and "s0" not in deltas and "sp" in deltas:
-                deltas["s0"] = deltas["sp"] + immediate
-            elif target in _FRAME_REGISTERS or target == "zero" or target == source:
-                pass
-            elif source in deltas:
-                addresses.add(deltas[source] + immediate)
-                held[target] = deltas[source] + immediate
-            elif sources.get(source, (None, None))[0] is not None:
-                held[target] = sources[source][0] + immediate
-                addresses.add(held[target])
-            elif sources.get(source, (None, None))[1] is not None:
-                indexed[target] = sources[source][1] + immediate
+                deltas["s0"] = (deltas["sp"][0] + immediate, position + 1)
             continue
-        if mnemonic in ("mv", "c.mv") and len(registers) == 2:
-            target, source = registers
-            if target in _FRAME_REGISTERS:
-                continue
-            if source in deltas:
-                addresses.add(deltas[source])
-                held[target] = deltas[source]
-            elif source in sources and sources[source][0] is not None:
-                held[target] = sources[source][0]  # type: ignore[assignment]
-            elif source in sources and sources[source][1] is not None:
-                indexed[target] = sources[source][1]  # type: ignore[assignment]
+        if "sp" in deltas and "s0" not in deltas and mnemonic in _STORE_WIDTHS and registers[:1]:
+            value = registers[0]
+            references = _memory_references(instruction, operands)
+            if mnemonic.endswith("sp") and len(operands) == 3 and operands[1].type == CS_OP_IMM:
+                references.append((operands[2].reg, operands[1].imm))
+            for base, displacement in references:
+                if decoder.reg_name(base) == "sp" and value in _CALLEE_SAVED:
+                    saved.add(deltas["sp"][0] + displacement)
+    return deltas, saved
+
+
+def _frame_step(decoder: Any, instruction: Any, state: _Rooted, deltas: dict[str, int]) -> _Rooted:
+    """The registers holding a frame address after an instruction, from those before it."""
+    operands = list(instruction.operands)
+    mnemonic = instruction.mnemonic
+    registers = [decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG]
+    immediate = next((operand.imm for operand in operands if operand.type == CS_OP_IMM), None)
+    if mnemonic in _DIRECT_CALLS or (mnemonic in _REGISTER_CALLS and _links(decoder, operands)) or mnemonic in _ENDS:
+        # A callee-saved register keeps &object across a call; the others do not.
+        return {name: value for name, value in state.items() if name in _CALLEE_SAVED}
+    written = registers[0] if registers and mnemonic not in _STORE_WIDTHS and mnemonic not in _BRANCHES else None
+    if written is None or written in _FRAME_REGISTERS or written == "zero":
+        return state
+
+    def source(name: str) -> tuple[str, frozenset[int]] | None:
+        if name in deltas:
+            return "held", frozenset({deltas[name]})
+        return state.get(name)
+
+    after = {name: value for name, value in state.items() if name != written}
+    found: tuple[str, frozenset[int]] | None = None
+    if mnemonic.startswith(("addi", "c.addi")) and immediate is not None:
+        origin = source(registers[-1])
+        if origin is not None and registers[-1] == written and origin[0] == "held" and written not in deltas:
+            # A pointer that walks itself (addi s1, s1, 4 in a loop over a local array): an index.
+            found = ("indexed", origin[1])
+        elif origin is not None:
+            found = (origin[0], frozenset(offset + immediate for offset in origin[1]))
+    elif mnemonic in ("mv", "c.mv") and len(registers) == 2:
+        found = source(registers[1])
+    elif mnemonic in ("add", "c.add"):
+        # rd = a frame address + a register: the address plus a variable index.
+        operands_read = registers[1:] if mnemonic == "add" else registers
+        known = [source(name) for name in operands_read]
+        if len(operands_read) == 2 and sum(value is not None for value in known) == 1:
+            found = ("indexed", next(value for value in known if value is not None)[1])
+    if found is not None and len(found[1]) <= _FRAME_OFFSETS:
+        after[written] = found
+    return after
+
+
+def _frame_join(states: list[_Rooted]) -> _Rooted:
+    """The registers every incoming path roots the same way, with every offset they may hold."""
+    first, *rest = states
+    joined: _Rooted = {}
+    for name, (kind, offsets) in first.items():
+        others = [state.get(name) for state in rest]
+        if all(other is not None and other[0] == kind for other in others):
+            merged = offsets.union(*(other[1] for other in others if other is not None))
+            if len(merged) <= _FRAME_OFFSETS:
+                joined[name] = (kind, merged)
+    return joined
+
+
+def _frame(decoder: Any, instructions: list[Any], successors: list[list[int]]) -> _Frame:
+    """The frame accesses, the frame addresses, the frame addresses passed in argument registers to
+    calls (the call's address, the argument's position, the offset), and the frame accesses past a
+    variable index of a function, as offsets from the value sp had on entry (``_frame_deltas``).
+
+    Which registers hold a frame address before each instruction is a forward must-analysis over the
+    function's flow: ``addi``/``mv`` from sp, s0 or such a register forms one (``addi s3, s0, -312``
+    for &fbatch.folios[0]), ``add`` of one and another register one plus a variable index
+    (fbatch.folios[i]), a call keeps only the callee-saved ones, and a join keeps a register only
+    where every incoming path holds a frame address in it (do_sys_poll's s1 is the frame's list head
+    on entry to its loop, a heap list after it), with every offset those paths give
+    (sched_balance_find_dst_cpu's &local_sgs or &idlest_sgs)."""
+    prologue, saved = _frame_deltas(decoder, instructions)
+    count = len(instructions)
+    entry: dict[int, _Rooted] = {0: {}} if count else {}
+    pending = [0] if count else []
+    while pending:
+        index = pending.pop()
+        deltas = {name: offset for name, (offset, start) in prologue.items() if start <= index}
+        after = _frame_step(decoder, instructions[index], entry[index], deltas)
+        for following in successors[index]:
+            known = entry.get(following)
+            merged = after if known is None else _frame_join([known, after])
+            if known is None or merged != known:
+                entry[following] = merged
+                pending.append(following)
+    accesses: set[tuple[int, int]] = set()
+    addresses: set[int] = set()
+    arguments: set[tuple[int, int, int]] = set()
+    indexed_accesses: set[tuple[int, int]] = set()
+    rooted: dict[int, frozenset[str]] = {}
+    for index, instruction in enumerate(instructions):
+        deltas = {name: offset for name, (offset, start) in prologue.items() if start <= index}
+        state = entry.get(index, {})
+        operands = list(instruction.operands)
+        mnemonic = instruction.mnemonic
+        registers = [decoder.reg_name(operand.reg) for operand in operands if operand.type == CS_OP_REG]
+        bases, values = _reads(instruction, operands)
+        read = {decoder.reg_name(register) for register in bases | values}
+        # The registers holding a frame address that the instruction reads (not one it only writes).
+        rooted[instruction.address] = frozenset({"sp", *deltas, *state} & (read | {"sp"}))
+        if mnemonic in _DIRECT_CALLS or (mnemonic in _REGISTER_CALLS and _links(decoder, operands)):
+            arguments.update(
+                (instruction.address, int(name[1:]), offset)
+                for name, (kind, offsets) in state.items()
+                if name in _ARGUMENTS and kind == "held"
+                for offset in offsets
+            )
             continue
-        if mnemonic in ("add", "c.add") and written is not None and written not in _FRAME_REGISTERS:
-            # rd = a frame address + a register: the address plus a variable index.
-            operands_read = registers[1:] if mnemonic == "add" else registers
-            bases = [sources.get(name, (None, None)) for name in operands_read if name not in _FRAME_REGISTERS]
-            known = [held_offset if held_offset is not None else index_offset for held_offset, index_offset in bases]
-            if (
-                len(operands_read) == 2
-                and not set(operands_read) & _FRAME_REGISTERS
-                and sum(value is not None for value in known) == 1
-            ):
-                indexed[written] = next(value for value in known if value is not None)
-            continue
+        after = _frame_step(decoder, instruction, state, deltas)
+        written = registers[0] if registers and mnemonic not in _STORE_WIDTHS else None
+        if (
+            written is not None
+            and written in after
+            and after[written][0] == "held"
+            and after[written] != state.get(written)
+        ):
+            addresses.update(after[written][1])
         width = _STORE_WIDTHS.get(mnemonic) or _LOAD_WIDTHS.get(mnemonic)
         if width is None:
             continue
@@ -1624,26 +1684,12 @@ def _frame(decoder: Any, instructions: list[Any]) -> _Frame:
             references.append((operands[2].reg, operands[1].imm))
         for base, displacement in references:
             name = decoder.reg_name(base)
-            # A load's destination may be its own base (ld a0, 0(a0)): the base is read before.
-            through, index_through = sources.get(name, (held.get(name), indexed.get(name)))
-            if name not in deltas:
-                if through is not None:
-                    accesses.add((through + displacement, width))
-                elif index_through is not None:
-                    indexed_accesses.add((index_through + displacement, width))
-                continue
-            offset = deltas[name] + displacement
-            value = registers[0] if registers else ""
-            if (
-                name == "sp"
-                and "s0" not in deltas
-                and position < _PROLOGUE_LIMIT
-                and mnemonic in _STORE_WIDTHS
-                and value in _CALLEE_SAVED
-            ):
-                saved.add(offset)
-            else:
-                accesses.add((offset, width))
+            if name in deltas:
+                accesses.add((deltas[name] + displacement, width))
+            elif name in state:
+                kind, offsets = state[name]
+                target = accesses if kind == "held" else indexed_accesses
+                target.update((offset + displacement, width) for offset in offsets)
     return _Frame({item for item in accesses if item[0] not in saved}, addresses, arguments, indexed_accesses, rooted)
 
 

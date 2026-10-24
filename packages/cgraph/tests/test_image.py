@@ -945,6 +945,40 @@ def test_a_frame_address_in_another_register_reaches_the_frame(image: Image) -> 
     assert not {8, -32} & facts.memory_offsets
 
 
+def _framed(image: Image, body: list[int]) -> FunctionFacts:
+    start = image.functions["anchor_pair"][0].address
+    return image.decode("synthetic", struct.pack(f"<{len(body) + 3}I", *_frame_prologue(), *body), start)
+
+
+def test_a_register_holds_a_frame_address_only_where_every_path_gives_it_one(image: Image) -> None:
+    """do_sys_poll: s1 = &head (s0 - 40) enters the loop, which sets s1 to a heap list: at the loop's
+    lw 12(s1) s1 is no frame address, so 12 is a field offset."""
+    facts = _framed(
+        image, [_addi(S1, S0, -40), _i(0x03, A0, 2, S1, 12), _load(S1, S1, 0), _branch(S1, ZERO, -8) | 1 << 12, RET]
+    )
+    assert 12 in facts.memory_offsets
+    assert (-28, 4) not in facts.frame_accesses
+
+
+def test_a_register_holding_either_of_two_frame_addresses_reaches_both(image: Image) -> None:
+    """sgs = local_group ? &local_sgs : &tmp_sgs: the store through sgs is at either slot, and the
+    displacement is no field offset. A register the instruction only writes (li a1) is no frame's."""
+    body = [
+        _branch(A1, ZERO, 12),
+        _addi(S1, S0, -40),
+        _jump(8),
+        _addi(S1, S0, -48),
+        _store(ZERO, S1, 8),
+        _addi(A1, S0, -16),
+        _addi(A1, ZERO, 0x30),
+        RET,
+    ]
+    facts = _framed(image, body)
+    assert {(-32, 8), (-40, 8)} <= facts.frame_accesses
+    assert 8 not in facts.memory_offsets
+    assert 0x30 in facts.addi_constants
+
+
 def test_a_store_over_part_of_a_frame_slot_ends_the_address_spilled_there(image: Image) -> None:
     """``sd s1, -24(s0)``, then ``sw zero, -20(s0)`` writes half of it: the reload is no address."""
     facts = _at(image, S1, image.object_symbols["pair_a"][0].address, _store(S1, S0, -24),
