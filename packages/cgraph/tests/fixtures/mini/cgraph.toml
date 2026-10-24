@@ -15,9 +15,12 @@ files = ["src/bags.c", "src/store.c"]
 [parts.flow]
 files = ["src/flow.c"]
 
+[parts.facts]
+files = ["src/facts.c"]
+
 [c]
 flags = ["-nostdinc", "-I{c_tree}/include/override", "-I{c_tree}/include", "--target=riscv64-unknown-elf",
-         "-march=rv64imac", "-mabi=lp64", "-std=gnu2x", "-ffreestanding", "-DMODULE={stem}"]
+         "-march=rv64imac", "-mabi=lp64", "-std=gnu2x", "-ffreestanding", "-fms-extensions", "-DMODULE={stem}"]
 kit_types = ["list_node"]
 value_types = []
 lock_types = ["spin", "rwsem", "seqlk"]

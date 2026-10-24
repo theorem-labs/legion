@@ -17,20 +17,28 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   database (`compile_commands.json`) or of `c.flags`. It gives accesses (read, write, lock, unlock,
   allocate, free), direct calls, calls through function-pointer fields, the functions a function uses
   as values (passes, stores, compares or names in an initializer), callback tables, record layouts,
-  and list or hash insertions. A field reached through `->` or `*` belongs to the struct it points
-  to; anonymous members are flattened.
+  the addresses of globals a global's initializer stores (`global_initializers`), and list or hash
+  insertions. A field reached through `->` or `*` belongs to the struct it points to; anonymous
+  members, also tagged ones, are flattened. A field access whose address is taken (`&p->m`, an array
+  member that decays) is marked `address`.
 - **What the compiler removes is left out**, and kept with a reason: `sizeof`/`_Alignof` operands,
   `typeof` and cast types, const scalars, the unselected associations of `_Generic` (their types are
   read from the macro bodies that write them, or, where a macro pastes them together, the one
   association with the selection's own type is the selected one; a call of the function a `_Generic`
   selects is a direct call), branches whose condition folds to a constant (also through inline
-  helpers that return one truth value and locals that keep their initializer), the right operand of
-  a decided `&&` or `||`, and statements after a `return`, `goto` or noreturn builtin. Branches of
-  `__builtin_constant_p` and `__builtin_object_size` are left to the machine code: their calls and
-  global accesses stay only where the image has them.
+  helpers that return one truth value and locals that keep their initializer; a weak definition
+  decides nothing, because another unit may replace it), the cases a `switch` on a value clang folds
+  does not reach (`switch (sizeof(x))`, `switch (_NSIG_WORDS)`), the right operand of a decided `&&` or
+  `||`, values without calls or effects that are discarded (`(void)x`, `(x, 0)`, an expression
+  statement; the last statement of `({ ... })` is its value), the operands of
+  `__builtin_constant_p`, and statements after a `return`, a `goto`, a noreturn builtin or function,
+  or a `do { ... } while (0)` that ends in one (`BUG()`). Branches of `__builtin_constant_p` and
+  `__builtin_object_size`, also as the left operand of `&&` or `||`, are left to the machine code:
+  their calls and global accesses stay only where the image has them.
 - **Implied calls**: a local of a cleanup class (`c.cleanup.class_type`) calls its destructor with
   the constructor's arguments; a local with any other cleanup attribute calls the function it names
-  (`c.cleanup.attribute_macros` maps macros such as `__free(x)` to that function).
+  (`c.cleanup.attribute_macros` maps macros such as `__free(x)` to that function, and a macro that is
+  only another function's name, such as `#define __free_path_put path_put`, names that function).
 - **The image** (ELF and `System.map`), decoded with capstone. Calls come from `jal`/`j` and from
   `auipc`+`jalr`, named by the code symbol at the target (`image.call_aliases` maps a library
   call the compiler substitutes, such as `bcmp`, to the one C names). An assembly routine, which the
@@ -80,8 +88,9 @@ Ids follow linkage, never a collision: `function:<name>` and `global:<name>` for
 `global:<function>.<name>@<file>`), `struct:<name>` for a header's struct and `struct:<name>@<file>`
 for one a C file defines, `percpu:` for per-CPU state, `subsystem:<name>`. A definition that appears
 later never renames an existing node. Of a weak and a strong definition of one name, the strong one is
-the node and the weak one is listed in its `weak_definitions`; a weak definition a macro generates is
-recognized through the macros it expands.
+the node and the weak one is listed in its `weak_definitions`. Weakness is read from the declaration's
+attributes, so a definition whose text begins inside a macro (`notrace ... __weak sched_clock`) or
+that a macro generates is recognized.
 
 Embedding and list or hash membership join data structures into groups. A value type (no pointer at
 any depth, or listed in `c.value_types`) and a base that at least `c.base_type_min_containers` types
@@ -113,8 +122,14 @@ topic, the id has every character outside `[A-Za-z0-9_:-]` percent-encoded, so i
 Each run writes `checks.json`: C calls against image calls (disagreements classified: a callback the
 compiler devirtualized, a caller with a weak alternate, a tail call), state accesses against image
 addresses, embeddings against clang's layout, and field accesses against the machine code. A field
-matches at its displacement from the base register (the sum of offsets along a `.` chain, less the
-member offset a `container_of` subtracts), as a load or store displacement, an `addi` constant or its
+matches at its displacement from the base register: the sum of offsets along the member chain,
+through constant subscripts, through a local every definition of which points the same way
+(`d = &desc->irq_data`) and through an inline helper that returns such an address, less the member
+offset a `container_of` subtracts. Past a variable index the facts also give the displacement from
+the indexed element (`element_displacement`), for code that keeps the element's address in a
+register. A field access through a parameter names it (`param`), and so does a call argument that is
+a member's address (`displacement`), so a folded callee's offsets rebase onto its caller's. It
+matches as a load or store displacement, an `addi` constant or its
 negative, a global's address offset, a narrower access inside the field, or a bitfield's storage
 unit; accesses to objects on the stack or in registers, and functions whose machine code makes no
 memory access, are counted apart.

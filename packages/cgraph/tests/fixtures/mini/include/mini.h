@@ -165,6 +165,8 @@ void tree_unlock(struct rwsem **s);
 int arch_hook(void);
 /* A weak stub a macro generates, as a table of optional system calls does. */
 #define __weak __attribute__((__weak__))
+/* include/linux/compiler_types.h: an attribute macro that can come first in a definition. */
+#define notrace __attribute__((__no_instrument_function__))
 #define COND_STUB(name) int __weak stub_##name(void) { return -1; }
 int stub_open(void);
 #define CHECK_VALUE(e) ((void)sizeof(e))

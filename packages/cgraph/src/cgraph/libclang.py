@@ -80,6 +80,15 @@ def is_macro_function_like(cursor: ci.Cursor) -> bool:
     return bool(function(cursor))
 
 
+def is_function_inlined(cursor: ci.Cursor) -> bool:
+    """A function declared ``inline`` (also through a macro that writes the definition)."""
+    lib = _lib()
+    function = lib.clang_Cursor_isFunctionInlined
+    function.argtypes = [ci.Cursor]
+    function.restype = ctypes.c_uint
+    return bool(function(cursor))
+
+
 def is_address_of(cursor: ci.Cursor) -> bool:
     """``&expr``: CXUnaryOperator_AddrOf is 5."""
     return int(_lib().clang_getCursorUnaryOperatorKind(cursor)) == 5

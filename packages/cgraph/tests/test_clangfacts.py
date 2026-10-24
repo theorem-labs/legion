@@ -200,7 +200,7 @@ def test_negative_record_layout_size_keeps_its_layout_error() -> None:
     assert facts["layout_error"] == "incomplete"
 
 
-def test_negative_access_field_size_keeps_its_layout_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_negative_access_field_size_keeps_its_layout_error() -> None:
     class FieldType:
         def get_size(self) -> int:
             return -2
@@ -214,25 +214,29 @@ def test_negative_access_field_size_keeps_its_layout_error(monkeypatch: pytest.M
     class Where:
         kind = clangfacts.K.MEMBER_REF_EXPR
         referenced = Field()
+        hash = 7
 
     class Extractor:
         def location(self, _: object) -> dict[str, object]:
             return {"source": "c", "file": "src/test.c", "line": 1}
 
-    monkeypatch.setattr(clangfacts, "_displacement", lambda _: (4, "pointer"))
     walk = object.__new__(clangfacts._FunctionWalk)
     walk.x = Extractor()
     walk.events = {"accesses": [], "field_accesses": [], "unevaluated": []}
     walk.conditional = 0
+    walk.fields, walk.inner, walk.addressed = [], set(), set()
+    # The member chain's address, as the walk records it at the chain's top.
+    walk.field_address = {Where.hash: (clangfacts._Address(32, "pointer"), False)}
     walk.add_access(
         {"kind": "struct", "name": "incomplete_record", "def": "src/test.c:1", "field": "member", "offset": 4},
         "read",
         Where(),
         None,
     )
+    walk.finish()
 
-    assert walk.events["field_accesses"][0]["size"] == -2
-    assert walk.events["field_accesses"][0]["layout_error"] == "incomplete"
+    (access,) = walk.events["field_accesses"]
+    assert (access["displacement"], access["size"], access["layout_error"]) == (4, -2, "incomplete")
 
 
 def test_unknown_result_register_size_is_an_exclusion(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -307,6 +311,8 @@ def test_callback_table_with_unavailable_tokens_is_an_exclusion(monkeypatch: pyt
     monkeypatch.setattr(clangfacts.ci.Index, "create", staticmethod(Index))
     monkeypatch.setattr(clangfacts, "_canonical_record", lambda _: (Record(), False, False))
     monkeypatch.setattr(clangfacts.libclang, "var_initializer", lambda _: Initializer())
+    # The fake table models only what the table reader reads.
+    monkeypatch.setattr(clangfacts, "_global_initializers", lambda *_: [])
     loaded = config.load(FIXTURE / "cgraph.toml")
     facts = clangfacts.extract(
         "src/store.c",
@@ -352,23 +358,3 @@ def test_unavailable_written_tokens_name_the_unit_and_location() -> None:
 
     with pytest.raises(ExtractionError, match=r"src/store\.c:7"):
         extractor.written_tokens(Cursor(), Cursor())
-
-
-def test_unavailable_inline_and_weak_tokens_name_the_unit_and_location() -> None:
-    class Definition:
-        spelling = "helper"
-        extent = object()
-
-    class TranslationUnit:
-        def get_tokens(self, *, extent: object) -> list[object]:
-            raise RuntimeError("tokens unavailable")
-
-    extractor = object.__new__(clangfacts._Extractor)
-    extractor.tu = TranslationUnit()
-    extractor.source = "src/store.c"
-    extractor.where = lambda _: "src/store.c:7"
-
-    with pytest.raises(ExtractionError, match=r"src/store\.c:7"):
-        clangfacts._is_inline(extractor, Definition())
-    with pytest.raises(ExtractionError, match=r"src/store\.c:7"):
-        clangfacts._is_weak(extractor, Definition())
