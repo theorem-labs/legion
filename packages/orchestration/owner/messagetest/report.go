@@ -26,25 +26,26 @@ type Report struct {
 	Edge   string   `json:"edge"`
 	// AllowedMissingKinds are the topic kinds the nodes lack that --allow-missing-kinds allowed: the arrival step
 	// published no notice of them.
-	AllowedMissingKinds []string      `json:"allowed_missing_kinds"`
-	Seed                int64         `json:"seed"`
-	Out                 string        `json:"out"`
-	Daemon              Daemon        `json:"daemon"`
-	Revisions           Revisions     `json:"revisions"`
-	StartedAt           time.Time     `json:"started_at"`
-	FinishedAt          time.Time     `json:"finished_at"`
-	Seconds             float64       `json:"seconds"`
-	Steps               []StepTiming  `json:"steps"`
-	Panes               []PaneCheck   `json:"panes"`
-	Published           []Publication `json:"published"`
-	Deliveries          []Delivery    `json:"deliveries"`
-	KillLog             []Kill        `json:"kills"`
-	Restart             *Restart      `json:"restart,omitempty"`
-	Expected            Expected      `json:"expected"`
-	Interrupted         string        `json:"interrupted,omitempty"` // why the run stopped before its steps ended: the signal
-	Teardown            Teardown      `json:"teardown"`
-	Failures            []Failure     `json:"failures"`
-	Passed              bool          `json:"passed"`
+	AllowedMissingKinds []string `json:"allowed_missing_kinds"`
+	// KillSchedule is the moment of each kill the run makes, in order (KillSchedule).
+	KillSchedule []string      `json:"kill_schedule"`
+	Out          string        `json:"out"`
+	Daemon       Daemon        `json:"daemon"`
+	Revisions    Revisions     `json:"revisions"`
+	StartedAt    time.Time     `json:"started_at"`
+	FinishedAt   time.Time     `json:"finished_at"`
+	Seconds      float64       `json:"seconds"`
+	Steps        []StepTiming  `json:"steps"`
+	Panes        []PaneCheck   `json:"panes"`
+	Published    []Publication `json:"published"`
+	Deliveries   []Delivery    `json:"deliveries"`
+	KillLog      []Kill        `json:"kills"`
+	Restart      *Restart      `json:"restart,omitempty"`
+	Expected     Expected      `json:"expected"`
+	Interrupted  string        `json:"interrupted,omitempty"` // why the run stopped before its steps ended: the signal
+	Teardown     Teardown      `json:"teardown"`
+	Failures     []Failure     `json:"failures"`
+	Passed       bool          `json:"passed"`
 }
 
 // Teardown is what the run stopped and removed when it ended: every daemon process it started, every owner process
@@ -123,25 +124,42 @@ type Delivery struct {
 	SawSeconds     float64 `json:"saw_seconds,omitempty"`
 }
 
-// Kill is one owner pane the driver killed, at the drawn moment of the owner's progress and the one it observed.
-// RelaunchSeconds is how long the supervisor took to start the owner again, or 0 when the item was already done.
+// Kill is one owner pane the driver killed: the moment the schedule set for it, the moment it landed at (the item's
+// state just after the kill: its holder, its record commit on the owner's branch, and whether it was done), the pane
+// and its root process, the owner command the hold paused (none for a kill before the claim), and how long the
+// supervisor took to start the owner again.
 type Kill struct {
 	Item            string    `json:"item"`
-	Drawn           string    `json:"drawn"`
+	Scheduled       string    `json:"scheduled"`
 	Observed        string    `json:"observed"`
+	Holder          string    `json:"holder"`
+	Record          string    `json:"record"`
+	Done            bool      `json:"done"`
 	Pane            string    `json:"pane"`
+	PID             int       `json:"pid"`
+	Held            int       `json:"held"`
 	At              time.Time `json:"at"`
 	RelaunchSeconds float64   `json:"relaunch_seconds"`
 }
 
-// Restart is the daemon restart while an owner ran: how long the stop and the start took and when its item finished.
+// Restart is the daemon restart while an owner ran. The old daemon stopped while the target's pane ran; the new one
+// started and listened; the run then killed that old pane and enqueued the item, so only a pane the new daemon
+// launched can answer it. Launched is every incarnation of the target the new daemon logged as launched; WorkPanes
+// are the target's panes the driver saw while the item was open; EventsFrom is the ledger's last event before the
+// item, and ClaimEvent and CompleteEvent the item's claim and completion after it.
 type Restart struct {
-	Item         string   `json:"item"`
-	StopSeconds  float64  `json:"stop_seconds"`
-	StartSeconds float64  `json:"start_seconds"`
-	ItemSeconds  float64  `json:"item_seconds"`
-	PanesBefore  []string `json:"panes_before"`
-	PanesAfter   []string `json:"panes_after"`
+	Item          string        `json:"item"`
+	OldDaemonPID  int           `json:"old_daemon_pid"`
+	NewDaemonPID  int           `json:"new_daemon_pid"`
+	OldPane       PaneProcess   `json:"old_pane"`
+	Launched      []string      `json:"launched"`
+	WorkPanes     []PaneProcess `json:"work_panes"`
+	EventsFrom    int64         `json:"events_from"`
+	ClaimEvent    int64         `json:"claim_event"`
+	CompleteEvent int64         `json:"complete_event"`
+	StopSeconds   float64       `json:"stop_seconds"`
+	StartSeconds  float64       `json:"start_seconds"`
+	ItemSeconds   float64       `json:"item_seconds"`
 }
 
 // Finish records the failures and the verdict: the run passes only when no assertion failed.
@@ -175,8 +193,8 @@ func (r Report) markdown() string {
 		verdict = fmt.Sprintf("FAILED (%d failures)", len(r.Failures))
 	}
 	fmt.Fprintf(&b, "# Owner message test %s\n\n", r.Run)
-	fmt.Fprintf(&b, "- Result: **%s**\n- Duration: %.1f s (%s to %s)\n- Prefix: `%s`\n- Nodes: %s\n- Edge: `%s`\n- Kill seed: %d\n",
-		verdict, r.Seconds, r.StartedAt.Format(time.RFC3339), r.FinishedAt.Format(time.RFC3339), r.Prefix, code(r.Nodes), r.Edge, r.Seed)
+	fmt.Fprintf(&b, "- Result: **%s**\n- Duration: %.1f s (%s to %s)\n- Prefix: `%s`\n- Nodes: %s\n- Edge: `%s`\n- Kill schedule: %s\n",
+		verdict, r.Seconds, r.StartedAt.Format(time.RFC3339), r.FinishedAt.Format(time.RFC3339), r.Prefix, code(r.Nodes), r.Edge, code(r.KillSchedule))
 	allowed := "none"
 	if len(r.AllowedMissingKinds) > 0 {
 		allowed = code(r.AllowedMissingKinds)
@@ -218,14 +236,27 @@ func (r Report) markdown() string {
 		}
 		fmt.Fprintf(&b, "| `%s` | `%s` | `%s` | %t | %s | %s | %s | %s |\n", d.Owner, d.ID, d.Topic, d.Required, arrived, arrival, saw, sawAt)
 	}
-	b.WriteString("\n## Kills\n\n| Item | Drawn | Observed | Pane | Relaunch (s) |\n| --- | --- | --- | --- | --- |\n")
-	for _, k := range r.KillLog {
-		fmt.Fprintf(&b, "| `%s` | %s | %s | %s | %s |\n", k.Item, k.Drawn, k.Observed, k.Pane, seconds(k.RelaunchSeconds))
+	b.WriteString("\n## Kills\n\nEach kill lands at the moment the schedule sets: the item's state is read just after the kill. A kill after the claim or after the answer holds the owner's `message-test answer` at that moment (its PID is in Held) until the killed processes are gone.\n\n" +
+		"| # | Item | Scheduled | Landed at | Holder | Record | Done | Pane (PID) | Held | Relaunch (s) |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+	for index, k := range r.KillLog {
+		held := "none"
+		if k.Held != 0 {
+			held = strconv.Itoa(k.Held)
+		}
+		fmt.Fprintf(&b, "| %d | `%s` | %s | %s | `%s` | `%s` | %t | %s (%d) | %s | %s |\n", index+1, k.Item, k.Scheduled, k.Observed, k.Holder, k.Record, k.Done,
+			k.Pane, k.PID, held, seconds(k.RelaunchSeconds))
 	}
 	if r.Restart != nil {
-		fmt.Fprintf(&b, "\n## Daemon restart\n\nItem `%s`: stop %s s, start %s s, item done %s s after the restart. Panes before %s, after %s.\n",
-			r.Restart.Item, seconds(r.Restart.StopSeconds), seconds(r.Restart.StartSeconds), seconds(r.Restart.ItemSeconds),
-			code(r.Restart.PanesBefore), code(r.Restart.PanesAfter))
+		x := r.Restart
+		work := make([]string, 0, len(x.WorkPanes))
+		for _, pane := range x.WorkPanes {
+			work = append(work, fmt.Sprintf("`%s` (PID %d, `%s`)", pane.Pane, pane.PID, pane.Incarnation))
+		}
+		fmt.Fprintf(&b, "\n## Daemon restart\n\nItem `%s`. The old daemon (PID %d) stopped in %s s while the old pane `%s` (PID %d, incarnation `%s`) ran; the new daemon (PID %d) listened %s s after its start. "+
+			"The run then killed the old pane and enqueued the item, so only a pane of the new daemon's could answer it.\n\n"+
+			"- The new daemon launched the target as %s.\n- The target's panes while the item was open: %s.\n- The item's claim is ledger event %d and its completion event %d, both after event %d (the restart); done %s s after the stop.\n",
+			x.Item, x.OldDaemonPID, seconds(x.StopSeconds), x.OldPane.Pane, x.OldPane.PID, x.OldPane.Incarnation, x.NewDaemonPID, seconds(x.StartSeconds),
+			code(x.Launched), strings.Join(work, ", "), x.ClaimEvent, x.CompleteEvent, x.EventsFrom, seconds(x.ItemSeconds))
 	}
 	fmt.Fprintf(&b, "\n## Teardown\n\nDaemon processes %s; owner processes %s; signalled by PID %s; still running %s; bearer directory `%s` and the daemon's boot tokens `%s` removed.\n",
 		pids(r.Teardown.DaemonPIDs), pids(r.Teardown.OwnerPIDs), pids(r.Teardown.Stopped), pids(r.Teardown.Left), r.Teardown.TokenDir, r.Teardown.DaemonSecrets)

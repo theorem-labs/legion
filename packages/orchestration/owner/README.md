@@ -123,13 +123,30 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    once. The need itself is enqueued twice; when the owner answers it between the two calls, the ledger refuses the
    second as an existing item, which is a duplicate too. The driver expects each answered need's offer by
    production's numbering: the n-th need the target answers queues `offer:<edge>@r<n>`.
-   Every notice to a running, subscribed owner is a required delivery: arrival, duplicates, out of order, the
-   restart's need when the target's pane runs, and a notice after the daemon restart to the pane it left running.
-   A killed owner's need notice is optional, because the kill can end the session before the notice reaches it.
-   `--kills` (default 5; at least 3, one at each moment, and fewer is a usage error, exit 2) panes are killed at a
-   moment drawn from the owner's progress, and the daemon is restarted
-   once while an owner runs. Each step ends when the ledger shows its items' outcomes and the sessions' transcripts
-   show its notices.
+   Every notice to a running, subscribed owner is a required delivery: arrival, duplicates, out of order, and a
+   notice after the daemon restart to the pane the new daemon launched. A killed owner's need notice, and the
+   restart's need notice (published while no pane of the target runs), are optional, because no session may be
+   there to take them; the ledger item is the wake that lasts.
+   **Kills.** `--kills` (default 5; at least 3, and fewer is a usage error, exit 2; in the `Run` API, 0 is the
+   default and 1 or 2 is refused) panes are killed on a fixed schedule, `KillSchedule`: before the claim, after the
+   claim, after the answer, in turn. A kill before the claim kills the running pane once the need is open and
+   unclaimed. A kill after the claim or after the answer first puts a hold on the need (`<state_dir>/message-test/
+   hold.json` of the test deployment): `message-test answer` then pauses with the item claimed and nothing recorded,
+   or inside the step runner's completion, its last call (`owner.Runner.Run`, `Ledger.Complete` in `owner/step.go`),
+   with the record committed and the follow-up queued and the item open. The paused command writes `held.json` with
+   its PID, the driver kills the pane and SIGKILLs every process under it that names the run, waits until they are
+   gone, and only then releases the hold. The item's state just after the kill (holder, record commit, done) is the
+   moment the kill landed at; the run fails (`kill`) on a kill that landed elsewhere than its schedule set, and on a
+   moment no kill landed at. The report lists each kill's scheduled and landed moment, the item's state and the held
+   command's PID.
+   **Restart.** With the target's pane running, the daemon is stopped (SIGTERM; the panes keep running) and started
+   again. The driver then kills the old daemon's pane of the target, and only then enqueues the restart's need, so
+   only a pane the new daemon launches can answer it. The step fails (`restart`) unless the need is claimed and
+   completed by the target after the restart (ledger events after the restart's last one), and every target pane
+   seen while it was open is one the new daemon logged as `supervise: launched`, by its incarnation (root PID and
+   start ticks, as the daemon records a pane), in the daemon log after the driver started it: that output is the new
+   daemon PID's alone. Each step ends when the ledger shows its items' outcomes and the sessions' transcripts show its
+   notices.
 6. **Check.** `messagetest.Check` reads the ledger's events, the owners' branches and the deliveries the owners'
    session transcripts record, and fails on a missed, duplicate or unexpected delivery (a notice of another run
    included), an item completed twice or never, recorded twice or not at all, an out-of-order item answered as

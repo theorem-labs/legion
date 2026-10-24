@@ -23,6 +23,8 @@ const (
 	FailLaunch          = "launch"
 	FailSubscription    = "subscription"
 	FailStep            = "step"
+	FailKill            = "kill"
+	FailRestart         = "restart"
 	FailInterrupted     = "interrupted"
 )
 

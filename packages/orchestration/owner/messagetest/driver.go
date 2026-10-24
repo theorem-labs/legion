@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -36,7 +35,7 @@ import (
 type Options struct {
 	Prefix string   // under notifications. and ending in a dot, empty for the graph's own; the run's topics are under it, then the run's name
 	Nodes  []string // the two owners; none means pickNodes chooses them from the graph
-	Kills  int      // how many owner panes to kill
+	Kills  int      // how many owner panes to kill, on KillSchedule; 0 is DefaultKills, and 1 or 2 is refused
 	Out    string   // the run's directory, absolute and new or empty
 	// AllowMissingKinds are the topic kinds (TopicKinds) the two nodes may lack: the run fails on any other kind
 	// that no topic of the nodes has, and the report lists each allowed kind they lack.
@@ -68,12 +67,11 @@ func DefaultTimeouts() Timeouts {
 // the owner claims the item, after it claims it, and after it answers it. A run kills at least one pane at each.
 var Moments = []string{MomentBeforeClaim, MomentAfterClaim, MomentAfterAnswer}
 
-func momentRank(moment string) int { return slices.Index(Moments, moment) }
-
 type driver struct {
 	opts   Options
 	report *Report
-	rng    *rand.Rand
+
+	killsStarted bool // a kill step ran, so the run's kills are checked against its schedule
 
 	run            string // the run's name: its ledger repository and the daemon's project
 	prefix         string // the run's topic prefix: the --prefix, or the graph's, then the run's name and a dot
@@ -133,10 +131,12 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	seed := now.UnixNano()
+	if opts.Kills == 0 {
+		opts.Kills = DefaultKills
+	}
 	d := &driver{
-		opts: opts, rng: rand.New(rand.NewPCG(uint64(seed), uint64(seed)>>1)), run: run, root: "skeleton",
-		report: &Report{Out: opts.Out, Seed: seed, StartedAt: now},
+		opts: opts, run: run, root: "skeleton",
+		report: &Report{Out: opts.Out, StartedAt: now, KillSchedule: KillSchedule(opts.Kills)},
 	}
 	d.report.Run = d.run
 	type step struct {
@@ -153,7 +153,7 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		{"out of order", d.outOfOrder, false},
 	}
 	for i := range opts.Kills {
-		steps = append(steps, step{fmt.Sprintf("kill %d of %d", i+1, opts.Kills), d.kill(i), false})
+		steps = append(steps, step{fmt.Sprintf("kill %d of %d (%s)", i+1, opts.Kills, d.report.KillSchedule[i]), d.kill(i), false})
 	}
 	steps = append(steps, step{"daemon restart", d.restart, false})
 	for _, s := range steps {
@@ -180,6 +180,8 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	failures := append(d.failures, Check(d.expected, recorded)...)
 	if d.report.Interrupted != "" {
 		failures = append(failures, Failure{Kind: FailInterrupted, Subject: "run", Detail: d.report.Interrupted + ": the steps after it did not run, and this report is partial"})
+	} else if d.killsStarted {
+		failures = append(failures, checkKills(d.report.KillSchedule, d.report.KillLog)...)
 	}
 	d.report.Expected = d.expected
 	d.report.FinishedAt = time.Now().UTC()
@@ -214,8 +216,8 @@ func (o Options) check() error {
 		return fmt.Errorf("prefix %q is not a prefix under notifications. that ends in a dot", o.Prefix)
 	case len(o.Nodes) != 0 && (len(o.Nodes) != 2 || o.Nodes[0] == o.Nodes[1]):
 		return fmt.Errorf("the message test takes two different nodes, not %v", o.Nodes)
-	case o.Kills < len(Moments):
-		return fmt.Errorf("kills %d: a run kills at least %d owner panes, one at each moment of a step (%s)", o.Kills, len(Moments), strings.Join(Moments, ", "))
+	case o.Kills < 0 || (o.Kills > 0 && o.Kills < len(Moments)):
+		return fmt.Errorf("kills %d: a run kills at least %d owner panes, one at each moment of a step (%s); 0 is the default %d", o.Kills, len(Moments), strings.Join(Moments, ", "), DefaultKills)
 	case !filepath.IsAbs(o.Out) || !filepath.IsAbs(o.Owner) || !filepath.IsAbs(o.Legion) || !filepath.IsAbs(o.Deploy.LedgerDSNFile):
 		return fmt.Errorf("the output directory, the owner and legion executables and the deployment's ledger_dsn_file must be absolute paths")
 	case strings.ContainsAny(o.Out+o.Owner, " \t\n"):
@@ -1029,161 +1031,268 @@ func (d *driver) outOfOrder(ctx context.Context) error {
 	})
 }
 
-// progress is how far the target has got with item: an answer record (or a completion), a claim, or neither.
-func (d *driver) progress(ctx context.Context, item string) (string, bool, error) {
+// itemAt is the target's item as it stands: its holder, the commit of its record on the target's branch (the commit
+// whose Owner-Item trailer names it), and whether it is done.
+func (d *driver) itemAt(ctx context.Context, item string) (holder, record string, done bool, err error) {
 	current, err := d.store.Item(ctx, d.run, item)
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
 	commits, err := branchCommits(ctx, d.bare, d.target)
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
 	for _, commit := range commits {
 		if slices.Contains(commit.Trailers[itemTrailer], item) {
-			return MomentAfterAnswer, current.State == "done", nil
+			record = commit.SHA
 		}
 	}
-	switch {
-	case current.State == "done":
-		return MomentAfterAnswer, true, nil
-	case current.Holder == d.target:
-		return MomentAfterClaim, false, nil
-	}
-	return MomentBeforeClaim, false, nil
+	return current.Holder, record, current.State == "done", nil
 }
 
-// kill enqueues a new need and kills the target's pane at a moment drawn from the owner's progress. The supervisor
-// must start the owner again while the item is open, and the item must still be answered once. The need's notice
-// is optional: the kill can end the session before it records it, and the ledger item is the wake that lasts.
+// kill enqueues a new need and kills the target's pane at the moment the schedule sets for this kill. Before the
+// claim, it kills the running pane as soon as the need is open and unclaimed. After the claim and after the answer,
+// it holds the owner's answer at that moment (PutHold: claimed with nothing recorded, or recorded and not yet
+// completed) and kills the pane once the answer says it is held. The pane's processes must all be gone before the
+// hold is released, so no process of the killed pane goes on with the step. The supervisor must start the owner
+// again while the item is open, and the item must still be answered once. The need's notice is optional: the kill can
+// end the session before it records it, and the ledger item is the wake that lasts.
 func (d *driver) kill(index int) func(context.Context) error {
 	return func(ctx context.Context) error {
+		d.killsStarted = true
+		moment := d.report.KillSchedule[index]
 		version := fmt.Sprintf("r%d", 4+index)
 		item := d.need(version)
-		drawn := Moments[d.rng.IntN(len(Moments))]
+		kill := Kill{Item: item, Scheduled: moment}
+		defer func() { d.report.KillLog = append(d.report.KillLog, kill) }()
+		if moment != MomentBeforeClaim {
+			if err := PutHold(d.stateDir, item, moment); err != nil {
+				return err
+			}
+			// A step that ends early must not leave the owner held for ever.
+			defer func() { _ = ReleaseHold(d.stateDir) }()
+		}
 		if _, err := d.enqueueNeed(ctx, "kill", version, false); err != nil {
 			return err
 		}
 		d.expectAnswered(version)
-		kill := Kill{Item: item, Drawn: drawn}
-		doneAtKill, killedPID := false, 0
-		err := d.wait(ctx, d.opts.Timeouts.Item, "the "+drawn+" moment of "+item, func() (bool, error) {
+		var target pane
+		err := d.wait(ctx, d.opts.Timeouts.Item, "the "+moment+" moment of "+item, func() (bool, error) {
 			panes, err := d.panes(ctx)
 			if err != nil {
 				return false, err
 			}
-			progress, done, err := d.progress(ctx, item)
+			holder, record, done, err := d.itemAt(ctx, item)
 			if err != nil {
 				return false, err
 			}
+			if done {
+				return false, fmt.Errorf("%s was answered before the %s kill: the owner did not pause at the hold", item, moment)
+			}
 			p, live := panes[d.target]
 			if !live {
-				if done {
-					return false, fmt.Errorf("%s was answered while %s had no pane to kill", item, d.target)
+				return false, nil
+			}
+			switch moment {
+			case MomentBeforeClaim:
+				if holder != "" || record != "" {
+					return false, fmt.Errorf("%s was claimed (by %q, record %q) before the driver could kill its owner's pane before the claim", item, holder, record)
 				}
-				return false, nil
+			default:
+				held, found, err := ReadHeld(d.stateDir)
+				if err != nil || !found || held.Item != item || held.Moment != moment {
+					return false, err
+				}
+				kill.Held = held.PID
 			}
-			if momentRank(progress) < momentRank(drawn) {
-				return false, nil
-			}
-			if err := killPane(ctx, d.socket, p.ID); err != nil {
-				return false, err
-			}
-			kill.Observed, kill.Pane, kill.At, doneAtKill, killedPID = progress, p.ID, time.Now().UTC(), done, p.PID
+			target = p
 			return true, nil
 		})
 		if err != nil {
 			return err
 		}
-		d.logf("killed %s of %s at %s (drawn %s)", kill.Pane, d.target, kill.Observed, drawn)
-		err = d.wait(ctx, d.opts.Timeouts.Item, item+" to be answered after the kill", func() (bool, error) {
-			if kill.RelaunchSeconds == 0 && !doneAtKill {
+		kill.Pane, kill.PID, kill.At = target.ID, target.PID, time.Now().UTC()
+		if err := d.killPaneTree(ctx, target); err != nil {
+			return err
+		}
+		if kill.Holder, kill.Record, kill.Done, err = d.itemAt(ctx, item); err != nil {
+			return err
+		}
+		kill.Observed = observedMoment(d.target, kill.Holder, kill.Record, kill.Done)
+		if moment != MomentBeforeClaim {
+			if err := ReleaseHold(d.stateDir); err != nil {
+				return err
+			}
+		}
+		d.logf("killed %s of %s %s (scheduled %s; holder %q, record %q, held owner command %d)", kill.Pane, d.target, kill.Observed, moment, kill.Holder, kill.Record, kill.Held)
+		return d.wait(ctx, d.opts.Timeouts.Item, item+" to be answered after the kill", func() (bool, error) {
+			if kill.RelaunchSeconds == 0 {
 				panes, err := d.panes(ctx)
 				if err != nil {
 					return false, err
 				}
 				// A pane id can come back when the killed pane was the server's last, so a relaunch is a new process.
-				if p, live := panes[d.target]; live && p.PID != killedPID {
+				if p, live := panes[d.target]; live && p.Root != target.Root {
 					kill.RelaunchSeconds = time.Since(kill.At).Seconds()
 				}
 			}
 			return d.answered(ctx, version)
 		})
-		d.report.KillLog = append(d.report.KillLog, kill)
-		return err
 	}
 }
 
-// restart enqueues a new need, waits until the target's pane runs, restarts the daemon, and waits for the need to be
-// answered once. The need's notice is required when the target's pane was running when it was published: a running
-// pane has answered an item since it started, so its session is subscribed. After the restart a second notice must
-// reach the pane that the restart left running.
+// killPaneTree kills an owner pane and every process under it that names the run, and waits until they are gone: a
+// pane's SIGHUP does not reach a command its session started in a process group of its own, and such a command
+// (a held answer) must not go on with the step once the pane is killed.
+func (d *driver) killPaneTree(ctx context.Context, p pane) error {
+	var tree []int
+	for queue := []int{p.Root}; len(queue) > 0; queue = queue[1:] {
+		if processEnv(queue[0])["LEGION_LEDGER_REPOSITORY"] == d.run {
+			tree = append(tree, queue[0])
+		}
+		queue = append(queue, children(queue[0])...)
+	}
+	if err := killPane(ctx, d.socket, p.ID); err != nil {
+		if _, alive, _ := ProcessIncarnation(p.Root); alive {
+			return err
+		}
+	}
+	ours := func(pid int) bool { return processEnv(pid)["LEGION_LEDGER_REPOSITORY"] == d.run }
+	for _, pid := range tree {
+		if ours(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	deadline := time.Now().Add(max(d.opts.Timeouts.DaemonStop, time.Second))
+	for {
+		left := slices.DeleteFunc(slices.Clone(tree), func(pid int) bool { return !ours(pid) })
+		if len(left) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the processes %v of the killed pane %s still run", left, p.ID)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d.opts.Timeouts.Poll):
+		}
+	}
+}
+
+// paneProcess is p as the report names a pane: its id, its root process and that process's incarnation.
+func paneProcess(p pane) (PaneProcess, error) {
+	incarnation, alive, err := ProcessIncarnation(p.Root)
+	if err == nil && !alive {
+		err = fmt.Errorf("the pane %s's process %d is gone", p.ID, p.Root)
+	}
+	return PaneProcess{Pane: p.ID, PID: p.Root, Incarnation: incarnation}, err
+}
+
+// restart stops the daemon while the target's pane runs, starts it again, kills that pane and enqueues a new need, so
+// that only a pane the new daemon launches can answer it. The step passes when the new daemon did the work
+// (checkRestart): the need claimed and completed by the target after the restart, with every target pane seen while
+// it was open one the new daemon logged as launched (the daemon's log after the driver started it, which only the new
+// daemon writes). The need's own notice is optional (no pane runs when it is published); after the need is answered,
+// a second notice must reach the session of the pane the new daemon launched.
 func (d *driver) restart(ctx context.Context) error {
 	version := fmt.Sprintf("r%d", 4+d.opts.Kills)
 	item := d.need(version)
-	panes, err := d.panes(ctx)
-	if err != nil {
-		return err
-	}
-	_, running := panes[d.target]
-	wake, err := d.enqueueNeed(ctx, "restart", version, running)
-	if err != nil {
-		return err
-	}
-	d.expectAnswered(version)
 	restart := &Restart{Item: item}
 	d.report.Restart = restart
+	var old pane
 	if err := d.wait(ctx, d.opts.Timeouts.PaneStart, "the pane of "+d.target, func() (bool, error) {
 		panes, err := d.panes(ctx)
 		if err != nil {
 			return false, err
 		}
-		restart.PanesBefore = paneIDs(panes)
-		_, live := panes[d.target]
+		p, live := panes[d.target]
+		old = p
 		return live, nil
 	}); err != nil {
 		return err
 	}
+	var err error
+	if restart.OldPane, err = paneProcess(old); err != nil {
+		return err
+	}
+	restart.OldDaemonPID = d.daemon.Process.Pid
 	start := time.Now()
 	if err := d.stopDaemon(); err != nil {
 		return err
 	}
 	restart.StopSeconds = time.Since(start).Seconds()
+	info, err := os.Stat(d.daemonLog)
+	if err != nil {
+		return err
+	}
+	offset := info.Size()
 	started := time.Now()
 	if err := d.startDaemon(ctx); err != nil {
 		return err
 	}
-	restart.StartSeconds = time.Since(started).Seconds()
+	restart.StartSeconds, restart.NewDaemonPID = time.Since(started).Seconds(), d.daemon.Process.Pid
+	// The old daemon's pane would otherwise answer the need itself.
+	if err := d.killPaneTree(ctx, old); err != nil {
+		return fmt.Errorf("kill the old daemon's pane %s of %s: %w", old.ID, d.target, err)
+	}
+	if restart.EventsFrom, err = d.store.LatestEventID(ctx, d.run); err != nil {
+		return err
+	}
+	if _, err := d.enqueueNeed(ctx, "restart", version, false); err != nil {
+		return err
+	}
+	d.expectAnswered(version)
+	seen := func() error {
+		panes, err := d.panes(ctx)
+		if err != nil {
+			return err
+		}
+		p, live := panes[d.target]
+		if !live || slices.ContainsFunc(restart.WorkPanes, func(w PaneProcess) bool { return w.PID == p.Root }) {
+			return nil
+		}
+		if work, err := paneProcess(p); err == nil {
+			restart.WorkPanes = append(restart.WorkPanes, work)
+		}
+		return nil
+	}
 	err = d.wait(ctx, d.opts.Timeouts.Item, item+" to be answered after the restart", func() (bool, error) {
+		if err := seen(); err != nil {
+			return false, err
+		}
 		return d.answered(ctx, version)
 	})
 	restart.ItemSeconds = time.Since(start).Seconds()
-	if panes, listErr := d.panes(ctx); listErr == nil {
-		restart.PanesAfter = paneIDs(panes)
-	}
 	if err != nil {
 		return err
 	}
+	if err := seen(); err != nil {
+		return err
+	}
+	if restart.Launched, err = launchedIncarnations(d.daemonLog, offset, d.target); err != nil {
+		return err
+	}
+	events, err := d.store.Events(ctx, d.run, restart.EventsFrom, item)
+	if err != nil {
+		return err
+	}
+	for _, event := range events {
+		switch event.Kind {
+		case "item.claimed":
+			restart.ClaimEvent = event.ID
+		case "item.completed":
+			restart.CompleteEvent = event.ID
+		}
+	}
+	d.failures = append(d.failures, checkRestart(*restart, events, d.target)...)
 	after, err := d.notifyTarget(ctx, "restart", item, true)
 	if err != nil {
 		return err
 	}
-	notices := []Publication{after}
-	if running {
-		notices = append(notices, wake)
-	}
-	return d.wait(ctx, d.opts.Timeouts.Delivery, "the restart's notices to reach the session", func() (bool, error) {
-		return d.arrived(notices...)
+	return d.wait(ctx, d.opts.Timeouts.Delivery, "the restart's notice to reach the new pane's session", func() (bool, error) {
+		return d.arrived(after)
 	})
-}
-
-func paneIDs(panes map[string]pane) []string {
-	var ids []string
-	for owner, p := range panes {
-		ids = append(ids, owner+"="+p.ID)
-	}
-	slices.Sort(ids)
-	return ids
 }
 
 // collect reads the run's ledger events, the owners' branches and every delivery the owners' session transcripts

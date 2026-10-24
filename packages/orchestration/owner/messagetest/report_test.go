@@ -21,8 +21,11 @@ func sampleReport() Report {
 			{Owner: st, ID: "evt-all", Topic: all, Required: true, Arrived: true, Transcript: "/sessions/2026-10-23T18-00-01_s.jsonl", Line: 41, ArrivalSeconds: 0.25},
 			{Owner: fn, ID: "evt-all", Topic: all, Required: true, Saw: true, SawSeconds: 3.5},
 		},
-		KillLog: []Kill{{Item: needR1, Drawn: MomentAfterClaim, Observed: MomentAfterClaim, Pane: "%3", RelaunchSeconds: 1.2}},
-		Restart: &Restart{Item: needR3, StopSeconds: 0.1, StartSeconds: 0.4, ItemSeconds: 2},
+		KillSchedule: KillSchedule(3),
+		KillLog:      []Kill{{Item: needR1, Scheduled: MomentAfterClaim, Observed: MomentAfterClaim, Holder: st, Pane: "%3", PID: 41, Held: 57, RelaunchSeconds: 1.2}},
+		Restart: &Restart{Item: needR3, OldDaemonPID: 7, NewDaemonPID: 9, OldPane: PaneProcess{Pane: "%2", PID: 11, Incarnation: "11:100"},
+			Launched: []string{"22:200"}, WorkPanes: []PaneProcess{{Pane: "%5", PID: 22, Incarnation: "22:200"}}, EventsFrom: 40, ClaimEvent: 42, CompleteEvent: 44,
+			StopSeconds: 0.1, StartSeconds: 0.4, ItemSeconds: 2},
 		Revisions: Revisions{
 			Owner:        Build{Path: "github.com/sjawhar/legion/orchestration", Revision: "0123456789abcdef0123456789abcdef01234567", Modified: "false", GoVersion: "go1.27"},
 			Dependencies: []Module{{Path: "gopkg.in/yaml.v3", Version: "v3.0.1"}},
@@ -72,6 +75,10 @@ func TestReportWritesJSONAndMarkdown(t *testing.T) {
 	for _, want := range []string{"FAILED", "| setup | 1.5 |", "%3", "evt-all", "0.25", MomentAfterClaim, needR1, "completed 2 times", "message-test-20261023t180000z",
 		"## Revisions", "0123456789abcdef0123456789abcdef01234567", "gopkg.in/yaml.v3 v3.0.1", "legion v9 (fedcba9876543210)", "omp 1.57.0", "tmux 3.4", "git version 2.43.0", "sha256:cc",
 		"panes running `/opt/omp/bin/omp`",
+		// Which moment each kill landed at, with the item's state and the held owner command.
+		"| 1 | `" + needR1 + "` | after-claim | after-claim | `" + st + "` | `` | false | %3 (41) | 57 | 1.2 |",
+		// The restart's work by a pane the new daemon launched.
+		"The old daemon (PID 7)", "the new daemon (PID 9)", "launched the target as `22:200`", "`%5` (PID 22, `22:200`)", "event 42 and its completion event 44, both after event 40",
 		// Each delivery's verdict evidence, the session transcript's line, and the owner's own record beside it.
 		"| `" + st + "` | `evt-all` | `" + all + "` | true | `2026-10-23T18-00-01_s.jsonl:41` | 0.25 | no |  |",
 		"| `" + fn + "` | `evt-all` | `" + all + "` | true | no |  | yes | 3.5 |"} {

@@ -158,10 +158,10 @@ func runUntilSetupStops(t *testing.T, prefix string) (Report, string) {
 	return report, opts.Out
 }
 
-// A full run kills one owner pane at each of the three moments of a step, so Run refuses fewer kills than moments,
-// 0 included, before it makes its output directory.
+// A full run kills one owner pane at each of the three moments of a step, so Run refuses an explicit count of one or
+// two kills, before it makes its output directory (0 is the default schedule).
 func TestRunRefusesFewerKillsThanMoments(t *testing.T) {
-	for _, kills := range []int{0, 2} {
+	for _, kills := range []int{1, 2} {
 		opts := setupStopOptions(t, "")
 		opts.Kills = kills
 		if _, err := Run(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "at least 3") {
