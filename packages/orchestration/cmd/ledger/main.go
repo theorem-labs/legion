@@ -42,6 +42,18 @@ func (records readyList) String() string {
 	return out.String()
 }
 
+// lease is a granted or renewed lease. It prints as ledger.Lease in JSON, and as one line without --json: a supervised
+// lease says so, because it has no end to print.
+type lease ledger.Lease
+
+func (l lease) String() string {
+	end := "supervised"
+	if !l.ExpiresAt.IsZero() {
+		end = "expires_at=" + l.ExpiresAt.Format(time.RFC3339Nano)
+	}
+	return fmt.Sprintf("%s holder=%s generation=%d %s", l.ID, l.Holder, l.Generation, end)
+}
+
 func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 }
@@ -169,7 +181,8 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if err != nil {
 			return nil, false, err
 		}
-		return mutation(s.Claim(ctx, args[0], args[1], args[2], ttl))
+		value, err := s.Claim(ctx, args[0], args[1], args[2], ttl)
+		return lease(value), false, err
 	case "release-holder":
 		if len(args) != 3 {
 			return nil, false, usagef("release-holder <repo> <holder> <reason>")
@@ -187,7 +200,8 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if err != nil {
 			return nil, false, err
 		}
-		return mutation(s.Renew(ctx, args[0], args[1], args[2], generation, ttl))
+		value, err := s.Renew(ctx, args[0], args[1], args[2], generation, ttl)
+		return lease(value), false, err
 	case "release":
 		if len(args) != 4 {
 			return nil, false, usagef("release <repo> <item> <holder> <generation>")

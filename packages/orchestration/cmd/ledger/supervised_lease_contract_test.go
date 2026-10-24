@@ -110,3 +110,33 @@ func TestClaimCommandTakesOnlyTheLiteralZeroAsSupervised(t *testing.T) {
 		t.Fatalf("claim with ttl 0: code=%d stdout=%q stderr=%q, want a supervised lease", code, stdout, stderr)
 	}
 }
+
+// TestLeaseCommandsTextNamesASupervisedLease catches the text output of a supervised claim printing a zero time as its
+// end. Without --json, a supervised lease says that it is supervised and prints no end, and a fixed-end lease, claimed
+// or renewed, prints its end.
+func TestLeaseCommandsTextNamesASupervisedLease(t *testing.T) {
+	dsn := testpg.Database(t, "ledger_lease_text")
+	getenv := func(key string) string {
+		if key == "LEDGER_DSN" {
+			return dsn
+		}
+		return ""
+	}
+	invoke := func(args ...string) string {
+		t.Helper()
+		var out, err bytes.Buffer
+		if code := run(context.Background(), args, getenv, &out, &err); code != 0 {
+			t.Fatalf("%v exited %d: %s", args, code, err.String())
+		}
+		return out.String()
+	}
+	invoke("repo", "ensure", "r", "3")
+	if got := invoke("claim", "r", "item", "supervisor:worker", "0"); got != "item holder=supervisor:worker generation=1 supervised\n" {
+		t.Fatalf("supervised claim text = %q", got)
+	}
+	for _, args := range [][]string{{"claim", "r", "fixed", "agent", "1h"}, {"renew", "r", "fixed", "agent", "1", "1m"}} {
+		if got := invoke(args...); !strings.HasPrefix(got, "fixed holder=agent generation=1 expires_at=2") || strings.Contains(got, "supervised") {
+			t.Fatalf("%v text = %q, want its end", args, got)
+		}
+	}
+}
