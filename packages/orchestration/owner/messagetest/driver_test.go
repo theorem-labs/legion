@@ -364,6 +364,9 @@ func TestBriefNamesTheTestDeploymentsOwnerCommand(t *testing.T) {
 	text := string(brief)
 	for _, want := range []string{
 		"Your owner command is: `/opt/bin/owner --deploy /runs/one/deploy.yaml`", "message-test topics", "envoy_subscribe",
+		// An owner of many topics once subscribed with the one wildcard <prefix>.> (run accept-gate-3), which takes
+		// every other owner's notices too: the brief names the exact list and forbids a wildcard.
+		"exactly as printed", "never a wildcard",
 		"message-test subscribed", "--json inbox", "claim <item>", "message-test answer <item>", "message-test saw <id> <topic>", "End the turn",
 	} {
 		if !strings.Contains(text, want) {

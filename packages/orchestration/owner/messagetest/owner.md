@@ -8,7 +8,10 @@ Your owner command is: `{{.Command}}`
 
 It names this test's own deployment. Run every step below with exactly that command where `<owner>` stands.
 
-1. Run `<owner> message-test topics`. Subscribe to every topic it prints, in one `envoy_subscribe` call.
+1. Run `<owner> message-test topics`. Subscribe to every topic it prints, exactly as printed, in one
+   `envoy_subscribe` call whose `topics` list holds each printed line once: never a wildcard (`>` or `*`), never a
+   prefix of them, and never a shorter list, however many topics it prints. A wildcard takes the notices of topics
+   that are not yours, and the test fails on them.
 2. Run `<owner> message-test subscribed`. It records the topics you subscribed to.
 3. Run `<owner> --json inbox`. For each item it lists, in that order:
    1. Run `<owner> claim <item>`. If it refuses because the item is already held by you, an earlier session of
