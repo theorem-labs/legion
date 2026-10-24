@@ -199,7 +199,8 @@ These rules follow what the machine code shows, each only where it shows it:
   pin_cookie` without lockdep), `no_memory_access_in_image`, `other_object`, `displacement_unknown`
   and `image_decided`. `field_offsets.frame_decoys` measures how often a slot holds fields by chance:
   the fields another call's frame argument would hold, and how often the frame alone would fit
-  another struct.
+  another struct. A miss at a frame slot (`no_access_at_frame_slot`) gives its `frame_slot`, the
+  field's `displacement` from it, its `size` and the `object`, for a per-item rule.
 
 ## Nodes and ids
 

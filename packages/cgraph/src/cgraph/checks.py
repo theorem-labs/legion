@@ -22,6 +22,9 @@ from .config import Thresholds
 # whitespace that Go's RE2 `\S` accepts.
 ID_PATTERN = re.compile(r"(function|struct|global|percpu|subsystem):[^\t\n\f\r ]+")
 SAMPLE = 50
+# What a field miss at a frame slot gives besides its offset: the slot, the field's displacement
+# from it and bytes, and the local object.
+_FRAME_MISS_KEYS = ("frame_slot", "displacement", "size", "object")
 
 
 def _pairs_examples(values: set[tuple[str, str]], limit: int = 5) -> list[dict[str, str]]:
@@ -402,6 +405,10 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             if not candidate["matched"]:
                 candidate["image_memory_offsets"] = offsets[function]
                 candidate["image_addi_constants"] = constants.get(function, [])
+                if "frame_slot" in item:
+                    # The object's slot and the field's place in it, which a per-item rule checks
+                    # against the frame facts (a memset over the field, a dead store).
+                    candidate.update({key: item[key] for key in _FRAME_MISS_KEYS if key in item})
             candidates.append(candidate)
     sample = candidates[:SAMPLE]
     subsystems = [node for node in graph["nodes"] if node["kind"] == "subsystem"]
@@ -426,7 +433,11 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             "excluded": dict(sorted(excluded.items())),
             "frame_decoys": frames.decoys(field_accesses, analysis),
             "misses": [
-                {key: item[key] for key in ("function", "struct", "field", "offset", "base", "method")}
+                {
+                    key: item[key]
+                    for key in ("function", "struct", "field", "offset", "base", "method", *_FRAME_MISS_KEYS)
+                    if key in item
+                }
                 for item in candidates
                 if not item["matched"]
             ],

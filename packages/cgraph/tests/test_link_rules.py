@@ -468,6 +468,20 @@ def test_a_container_of_member_is_matched_at_its_negative_displacement() -> None
     assert checks.structure(_structure_graph(item, [], {}))["field_offsets"]["matched"] == 0
 
 
+def test_a_frame_slot_miss_names_the_slot_object_and_frame_evidence() -> None:
+    """force_sig's info: a call passes s0 - 56 where the C passes &info, and no load or store is at
+    -56 + 16. The miss gives the classifier the slot, the object, the field's bytes and the frame."""
+    item = _field(16, base="local", object="info@k.c:1:1", object_size=48, size=4)
+    graph = _structure_graph(item, [], {})
+    graph["analysis"]["object_arguments"] = {"function:f": [["g", 0, "info@k.c:1:1", 0]]}
+    image = graph["analysis"]["image"]
+    image.update({"frame_arguments": {"function:f": [["g", 0, -56]]}, "frame_accesses": {"function:f": [[-56, 4]]},
+                  "frame_addresses": {"function:f": [-56]}, "frame_indexed": {"function:f": []}})  # fmt: skip
+    (miss,) = checks.structure(graph)["field_offsets"]["misses"]
+    assert miss["method"] == "no_access_at_frame_slot"
+    assert (miss["frame_slot"], miss["displacement"], miss["size"], miss["object"]) == (-56, 16, 4, "info@k.c:1:1")
+
+
 def test_a_parameter_passed_on_is_followed_even_where_the_argument_also_names_its_struct() -> None:
     """__do_adjtimex(tkd) passes its own parameter on: the facts type the argument as its struct and
     give its parameter with displacement 0 (the pointer itself)."""
