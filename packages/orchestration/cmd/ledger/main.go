@@ -175,9 +175,9 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if len(args) != 4 {
 			return nil, false, usagef("refuse-owner <repo> <owner> <revision> <reason>")
 		}
-		revision, err := canonicalInteger("revision", args[2])
+		revision, err := strconv.ParseInt(args[2], 10, 64)
 		if err != nil {
-			return nil, false, err
+			return nil, false, usagef("invalid revision %q: want an integer", args[2])
 		}
 		return mutation(s.RecordOwnerRefused(ctx, args[0], args[1], revision, args[3]))
 	case "claim":
@@ -512,15 +512,6 @@ func writeError(stderr io.Writer, jsonOutput bool, err error) int {
 
 func usagef(format string, args ...any) error { return &usageError{fmt.Sprintf(format, args...)} }
 
-// canonicalInteger parses value only in its canonical decimal form, so "07" and "+7" are refused rather than read as
-// the 7 that the ledger stores.
-func canonicalInteger(what, value string) (int64, error) {
-	n, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || strconv.FormatInt(n, 10) != value {
-		return 0, usagef("invalid %s %q: want a decimal integer without sign or leading zeros", what, value)
-	}
-	return n, nil
-}
 func integer(value string) (int64, error) {
 	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {

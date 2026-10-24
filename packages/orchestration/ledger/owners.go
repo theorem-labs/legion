@@ -3,7 +3,6 @@ package ledger
 import (
 	"context"
 	"errors"
-	"strconv"
 	"strings"
 	"time"
 
@@ -177,16 +176,14 @@ func (s *Store) RecordOwnerRefused(ctx context.Context, repo, owner string, revi
 		if revision > current {
 			return invalid("refusal revision %d of owner %s is newer than its work revision %d", revision, owner, current)
 		}
-		// The revision column holds the canonical decimal form, so text equality is integer equality.
-		stored := strconv.FormatInt(revision, 10)
 		err := tx.QueryRow(ctx, `INSERT INTO owner_refusals (repo, owner, revision, reason) VALUES ($1, $2, $3, $4)
-			ON CONFLICT DO NOTHING RETURNING at`, repo, owner, stored, reason).Scan(&refusal.At)
+			ON CONFLICT DO NOTHING RETURNING at`, repo, owner, revision, reason).Scan(&refusal.At)
 		if errors.Is(err, pgx.ErrNoRows) {
 			// ON CONFLICT waited for a concurrent insert of this row to commit, and under read committed the next
 			// statement's snapshot sees the committed row.
 			var storedReason string
 			if err := tx.QueryRow(ctx, `SELECT reason, at FROM owner_refusals WHERE repo = $1 AND owner = $2 AND revision = $3`,
-				repo, owner, stored).Scan(&storedReason, &refusal.At); err != nil {
+				repo, owner, revision).Scan(&storedReason, &refusal.At); err != nil {
 				return err
 			}
 			if storedReason != reason {
@@ -218,10 +215,10 @@ func (s *Store) OwnerRefusals(ctx context.Context, repo string) ([]OwnerRefusal,
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT r.owner, r.revision::bigint, r.reason, r.at
+		rows, err := tx.Query(ctx, `SELECT r.owner, r.revision, r.reason, r.at
 			FROM (SELECT DISTINCT owner FROM work_items WHERE repo = $1 AND state = 'open' AND owner <> '') o
 			CROSS JOIN LATERAL (`+ownerWorkRevisionQuery("o.owner")+`) AS work(revision)
-			JOIN owner_refusals r ON r.repo = $1 AND r.owner = o.owner AND r.revision = work.revision::text
+			JOIN owner_refusals r ON r.repo = $1 AND r.owner = o.owner AND r.revision = work.revision
 			ORDER BY r.owner`, repo)
 		if err != nil {
 			return err

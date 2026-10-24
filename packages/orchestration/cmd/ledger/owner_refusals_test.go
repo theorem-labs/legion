@@ -178,8 +178,8 @@ func TestRefuseOwnerCommandRecordsOneRefusalPerRevision(t *testing.T) {
 }
 
 // Every malformed refuse-owner exits 2 and records nothing: a wrong argument count, an empty owner or reason, a
-// revision below 1, a revision that is not in canonical decimal form (so "07" is never read as 7), and a revision
-// newer than the owner's work revision, whose error names the current one.
+// revision below 1 or not an integer, and a revision newer than the owner's work revision, whose error names the current
+// one.
 func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 	cli := newOwnerRefusalCLI(t)
 	const owner = "struct:mount"
@@ -196,8 +196,6 @@ func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 		{"empty reason", []string{"refuse-owner", "r", owner, canonical, ""}, "empty reason"},
 		{"zero revision", []string{"refuse-owner", "r", owner, "0", "no template"}, "revision 0"},
 		{"negative revision", []string{"refuse-owner", "r", owner, "-1", "no template"}, "revision -1"},
-		{"leading zero", []string{"refuse-owner", "r", owner, "0" + canonical, "no template"}, "revision"},
-		{"plus sign", []string{"refuse-owner", "r", owner, "+" + canonical, "no template"}, "revision"},
 		{"not a number", []string{"refuse-owner", "r", owner, canonical + "x", "no template"}, "revision"},
 		{"newer revision", []string{"refuse-owner", "r", owner, strconv.FormatInt(revision+1, 10), "no template"}, "work revision " + canonical},
 	} {
@@ -220,5 +218,25 @@ func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 	cli.assertOwners(cliOwnerLine{Owner: owner, Refusal: &refusal})
 	if code, stdout, stderr := cli.call("refuse-owner", "missing", owner, canonical, "no template"); code != 3 {
 		t.Fatalf("refusal in a missing repository: code=%d stdout=%q stderr=%q, want 3", code, stdout, stderr)
+	}
+}
+
+// The revision is an integer, so every decimal form of it names the same work revision: "07" and "+7" are 7, and a
+// refusal through either repeats the refusal at 7 rather than recording another.
+func TestRefuseOwnerCommandReadsTheRevisionAsAnInteger(t *testing.T) {
+	cli := newOwnerRefusalCLI(t)
+	const owner = "struct:mount"
+	revision := cli.enqueue("item-1", owner)
+	canonical := strconv.FormatInt(revision, 10)
+	first := cli.refuse(owner, revision, "no template")
+	for _, form := range []string{"0" + canonical, "+" + canonical} {
+		var repeat cliOwnerRefusal
+		cli.decode(cli.invoke("--json", "refuse-owner", "r", owner, form, "no template"), &repeat)
+		if repeat.Revision != revision || !repeat.At.Equal(first.At) {
+			t.Fatalf("refusal at %q = %+v, want the stored refusal %+v", form, repeat, first)
+		}
+	}
+	if n := cli.refusedEvents(owner); n != 1 {
+		t.Fatalf("%d owner.refused events, want 1", n)
 	}
 }

@@ -11,20 +11,28 @@ CREATE INDEX migrations_ready_event ON migrations (repo, ready_event) WHERE read
 -- The one migration owner whose landings may carry an upstream commit as their provenance.
 ALTER TABLE repositories ADD COLUMN upstream_owner text;
 
--- The idempotency key of each recorded landing round, so a retried round counts once.
+-- The record that advanced each contract's statement: its compatibility proof or its owner's review, with the
+-- upstream commit beside it for an upstream landing.
+ALTER TABLE contracts ADD COLUMN last_change jsonb;
+
+-- The idempotency key of each recorded landing round, so a retried round counts once. A key repeats only with the
+-- generation, reason and batch it was first recorded with.
 CREATE TABLE round_keys (
     repo text NOT NULL,
     migration text NOT NULL,
     key text NOT NULL,
+    generation bigint NOT NULL,
+    reason text NOT NULL,
+    batch text NOT NULL,
     PRIMARY KEY (repo, migration, key),
     FOREIGN KEY (repo, migration) REFERENCES migrations(repo, id)
 );
 
--- Why the supervisor declined to start an owner, recorded once per owner and work revision.
+-- Why the supervisor declined to start an owner, recorded once per owner and work revision (an event id).
 CREATE TABLE owner_refusals (
     repo text NOT NULL REFERENCES repositories(name),
     owner text NOT NULL,
-    revision text NOT NULL,
+    revision bigint NOT NULL,
     reason text NOT NULL,
     at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (repo, owner, revision)
