@@ -1,0 +1,24 @@
+bare_repo: /srv/owners/repo.git
+landing_repo: /srv/owners/landing
+ledger_dsn_file: /srv/owners/ledger-dsn
+vm_host: build.example.test
+ssh_config: /srv/owners/ssh_config
+vm_root: /srv/vm/owners
+graph_dir: /srv/graph/out
+state_dir: /srv/owners/state
+sessions_dir: /srv/owners/sessions
+score_work: /srv/owners/score
+ledger_remote_port: 15432
+ledger_local_port: 5432
+hooks:
+  score:
+    dir: /srv/score
+    command: /usr/local/bin/score-input
+    ledger: false
+    parts: [slice]
+upstream:
+  url: https://example.test/upstream.git
+  branch: main
+  cache_host: cache.example.test
+  cache_dir: /var/cache/owners
+  poll_seconds: "300"

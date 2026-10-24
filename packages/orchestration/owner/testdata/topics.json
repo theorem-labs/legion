@@ -1,0 +1,52 @@
+{
+  "format": "cgraph/topics/v1",
+  "part": "slice",
+  "prefix": "notifications.example.",
+  "token_rule": "node id with every character outside [A-Za-z0-9_:-] percent-encoded",
+  "owners": {
+    "function:callee": [
+      "notifications.example.all",
+      "notifications.example.node.function:callee.needs",
+      "notifications.example.node.function:caller.callees",
+      "notifications.example.node.function:caller.neighbors",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.callees",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.neighbors"
+    ],
+    "function:caller": [
+      "notifications.example.all",
+      "notifications.example.node.function:callee.callers",
+      "notifications.example.node.function:callee.neighbors",
+      "notifications.example.node.function:caller.needs",
+      "notifications.example.node.struct:state.neighbors",
+      "notifications.example.node.struct:state.users",
+      "notifications.example.node.subsystem:cluster.neighbors",
+      "notifications.example.node.subsystem:cluster.users"
+    ],
+    "function:second@kernel/second.c": [
+      "notifications.example.all",
+      "notifications.example.node.function:callee.callers",
+      "notifications.example.node.function:callee.neighbors",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.needs",
+      "notifications.example.node.struct:state.neighbors",
+      "notifications.example.node.struct:state.users",
+      "notifications.example.node.subsystem:cluster.neighbors",
+      "notifications.example.node.subsystem:cluster.users"
+    ],
+    "struct:state": [
+      "notifications.example.all",
+      "notifications.example.node.function:caller.neighbors",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.neighbors",
+      "notifications.example.node.struct:state.needs",
+      "notifications.example.node.subsystem:cluster.linked",
+      "notifications.example.node.subsystem:cluster.neighbors"
+    ],
+    "subsystem:cluster": [
+      "notifications.example.all",
+      "notifications.example.node.function:caller.neighbors",
+      "notifications.example.node.function:second%40kernel%2Fsecond%2Ec.neighbors",
+      "notifications.example.node.struct:state.linked",
+      "notifications.example.node.struct:state.neighbors",
+      "notifications.example.node.subsystem:cluster.needs"
+    ]
+  }
+}

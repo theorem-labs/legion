@@ -23,7 +23,10 @@ renderer: it produces a tolerant TOON block and never exposes raw envelope bytes
 Dispatch **BTW** frame runs the host's side turn (`ctx.runEphemeralTurn`, Oh My Pi 18.3 on) and
 posts its body or error to the correlated delivery attempt; **Aside** and **Steer** call
 `pi.sendMessage` with their respective delivery mode, except a person's direct Send or Aside
-(below). A BTW side turn still running when the handler that subscribed the agent subject
+(below). An Aside or Steer card's `details` are the delivery's record (`deliveryDetails`): the subject
+the frame arrived on and its envelope's `topic`, `event_id` and `dedupe_key`. Oh My Pi keeps them in
+the session transcript and never sends them to the model, and a reader of the transcript, such as a
+message test of owner sessions, reads a delivery's topic from them. A BTW side turn still running when the handler that subscribed the agent subject
 (`session_start`, a session switch, or a Legion handler re-establishing through the claim bridge)
 reaches the host's 30 s handler budget is aborted, and Dispatch gets the abort as the reply's error.
 A card whose text embeds Dispatch pictures (`RenderInboundResult.pictures`) carries them as image

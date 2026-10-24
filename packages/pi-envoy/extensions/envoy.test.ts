@@ -12007,6 +12007,56 @@ describe("envoy OMP extension", () => {
     ).toHaveLength(1);
   });
 
+  // A delivery's transcript entry records where it came from beside the card the model reads: the subject the frame
+  // arrived on, and its envelope's topic, event id and dedupe key. Oh My Pi keeps a custom message's `details` in the
+  // session file and never sends them to the model, so a reader of the transcript (the owner message test) judges a
+  // delivery's topic by Envoy's own record of it, not by anything its publisher wrote in the payload.
+  test("records each delivery's subject, topic, event id and dedupe key in its message details", async () => {
+    globalThis.fetch = async (input, init) => responseWithRegistration(input, init, []);
+    // Query isolation gives this stateful extension its own module state and NATS subscription.
+    const { default: envoyExtension } = await import("./envoy.ts?delivery-details");
+    const fixture = createPi();
+    const delivered = Promise.withResolvers<void>();
+    envoyExtension({
+      ...fixture.pi,
+      sendMessage: (message, options) => {
+        fixture.pi.sendMessage(message, options);
+        if (message.content.includes("a notice on its own topic")) delivered.resolve();
+      },
+    });
+    await fixture.handlers.get("session_start")?.({}, sessionContext("ses_details"));
+    const subscribeTool = fixture.tools.find((tool) => tool.name === "envoy_subscribe");
+    if (subscribeTool === undefined) throw new Error("subscription tool was not registered");
+    const topic = "notifications.team.owners.needs";
+    await subscribeTool.execute("", { topics: [topic] });
+    const subscription = natsState.controls.get(topic);
+    if (subscription === undefined) throw new Error("the topic was not followed");
+    const key = "publish.0123456789abcdef0123456789abcdef";
+    subscription.push(
+      JSON.stringify({
+        event_id: "evt-details",
+        source: "agent",
+        topic,
+        dedupe_key: key,
+        issued_at: 1,
+        payload_summary: "a notice on its own topic",
+        payload: JSON.stringify({ type: "need", topic: "notifications.team.owners.elsewhere" }),
+      })
+    );
+    await delivered.promise;
+
+    const delivery = fixture.deliveries.find((entry) =>
+      entry.content.includes("a notice on its own topic")
+    );
+    expect(delivery?.customType).toBe("envoy-message");
+    expect(delivery?.details).toEqual({
+      subject: topic,
+      topic,
+      event_id: "evt-details",
+      dedupe_key: key,
+    });
+  });
+
   test("inbound envoy messages deliver as steering so they interrupt an in-flight turn", async () => {
     globalThis.fetch = async (input, init) => responseWithRegistration(input, init, []);
     const { default: envoyExtension } = await import("./envoy.ts?deliver-as-steer");

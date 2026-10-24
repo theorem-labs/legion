@@ -1,0 +1,2 @@
+facts:
+  - {name: stack-alignment, owner: fact-stack-alignment, concept: LinuxMmu.SK.SpAligned}
