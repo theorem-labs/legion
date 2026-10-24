@@ -10,6 +10,8 @@ import (
 	"sort"
 	"sync"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // leanForTest finds a Lean toolchain on PATH. The exporter tests need one: CI installs it and sets
@@ -233,7 +235,7 @@ func TestCompileConfinedKeepsTheModulesCodeIn(t *testing.T) {
 		}
 		t.Skip(err)
 	}
-	dir, err := NewScratch(t.TempDir())
+	dir, err := confine.NewScratch(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +280,7 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 	x := &Exporter{Lean: l, Bin: exporterForTest(t, l)}
 	check := func(body string) error {
 		t.Helper()
-		work, err := NewScratch(t.TempDir())
+		work, err := confine.NewScratch(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}

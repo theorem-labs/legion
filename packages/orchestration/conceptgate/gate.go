@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // Proposal is a proposed shared concept: its registry entry, and a Lean module that declares it against the
@@ -386,14 +387,14 @@ func sourceFailed(err error) bool {
 // module against ex's search path. It gives the directory that holds the compiled module. When the source itself is
 // refused or does not compile, the error satisfies sourceFailed.
 func admit(ctx context.Context, ex *declindex.Exporter, run, module, source string) (string, error) {
-	check, err := declindex.NewScratch(run)
+	check, err := confine.NewScratch(run)
 	if err != nil {
 		return "", err
 	}
 	if err := ex.CheckSource(ctx, []byte(source), ex.SearchPath, check); err != nil {
 		return "", err
 	}
-	dir, err := declindex.NewScratch(run)
+	dir, err := confine.NewScratch(run)
 	if err != nil {
 		return "", err
 	}
@@ -464,7 +465,7 @@ func (g *Gate) export(ctx context.Context, reg Registry, p Proposal) ([]declinde
 	if err := os.MkdirAll(g.WorkDir, 0o700); err != nil {
 		return nil, nil, err
 	}
-	run, err := declindex.NewScratch(g.WorkDir)
+	run, err := confine.NewScratch(g.WorkDir)
 	if err != nil {
 		return nil, nil, err
 	}

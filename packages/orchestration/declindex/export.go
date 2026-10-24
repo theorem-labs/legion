@@ -184,10 +184,6 @@ func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel s
 		"-o", base+".olean", "-i", base+".ilean", base+".lean")
 }
 
-// NewScratch makes a fresh scratch directory for one confined run below base (the system's temporary directory
-// when empty): this user's, mode 0700, and empty.
-func NewScratch(base string) (string, error) { return confine.NewScratch(base) }
-
 // confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path
 // and its scratch directory, writes only the scratch directory (which must be fresh, and into which the inputs are
 // copied), starts no other process and opens no socket. It fails when the sandbox is unavailable, and then nothing
@@ -202,8 +198,9 @@ func (l Lean) confined(ctx context.Context, argv []string, scratch string, input
 var ErrSourceFailed = errors.New("the source does not compile")
 
 // CompileConfined compiles source as the module rel in the sandbox, for source that untrusted text wrote. scratch
-// must be fresh (NewScratch): the source is copied into it, and Lean writes its outputs there and nowhere else. An
-// error that Lean reports in the source wraps ErrSourceFailed; any other failure (the sandbox, a signal) does not.
+// must be fresh (confine.NewScratch): the source is copied into it, and Lean writes its outputs there and nowhere
+// else. An error that Lean reports in the source wraps ErrSourceFailed; any other failure (the sandbox, a signal)
+// does not.
 func CompileConfined(ctx context.Context, l Lean, searchPath []string, scratch, rel string, source []byte) error {
 	base := filepath.Join(scratch, filepath.FromSlash(rel))
 	argv := []string{l.bin("lean"), "-R", scratch, "-o", base + ".olean", "-i", base + ".ilean", base + ".lean"}
@@ -228,7 +225,7 @@ func CompileConfined(ctx context.Context, l Lean, searchPath []string, scratch, 
 // CheckSandbox reports whether toolchain l runs in the sandbox here: the sandbox is available, and a confined
 // `lean --version` runs.
 func CheckSandbox(ctx context.Context, l Lean) error {
-	dir, err := NewScratch("")
+	dir, err := confine.NewScratch("")
 	if err != nil {
 		return err
 	}
@@ -388,7 +385,7 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 	if err != nil {
 		return nil, err
 	}
-	tmp, err := NewScratch(x.ScratchDir)
+	tmp, err := confine.NewScratch(x.ScratchDir)
 	if err != nil {
 		return nil, err
 	}

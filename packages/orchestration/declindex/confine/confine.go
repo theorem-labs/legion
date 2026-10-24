@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -196,34 +197,40 @@ func Command(ctx context.Context, spec Spec) (*Cmd, error) {
 	cmd := exec.CommandContext(ctx, self)
 	cmd.Env = []string{envVar + "=" + string(raw)}
 	cmd.Dir = spec.Scratch
-	return &Cmd{Cmd: cmd}, nil
+	return &Cmd{cmd: cmd}, nil
 }
 
-// Cmd is a confined program. Start (and Run, CombinedOutput) also lets through the program's one exec; do not call
-// the embedded exec.Cmd's Start or Output, which would not.
+// Cmd is a confined program. Its Start, which CombinedOutput also runs, lets through the program's one exec; the
+// exec.Cmd it runs is not exposed, so nothing can start it without that.
 type Cmd struct {
-	*exec.Cmd
+	cmd *exec.Cmd
+	// Stderr, when set before Start, receives the program's standard error.
+	Stderr io.Writer
 }
+
+// StdoutPipe gives a pipe of the program's standard output, read until Wait (exec.Cmd.StdoutPipe).
+func (c *Cmd) StdoutPipe() (io.ReadCloser, error) { return c.cmd.StdoutPipe() }
 
 // Start starts the launcher, lets its exec of the program through, and closes the channel that would let another.
-func (c *Cmd) Start() error { return start(c.Cmd) }
-
-// Run starts the program and waits for it.
-func (c *Cmd) Run() error {
-	if err := c.Start(); err != nil {
-		return err
-	}
-	return c.Wait()
+func (c *Cmd) Start() error {
+	c.cmd.Stderr = c.Stderr
+	return start(c.cmd)
 }
+
+// Wait waits for the started program to exit (exec.Cmd.Wait).
+func (c *Cmd) Wait() error { return c.cmd.Wait() }
 
 // CombinedOutput runs the program and returns its standard output and error together.
 func (c *Cmd) CombinedOutput() ([]byte, error) {
-	if c.Stdout != nil || c.Stderr != nil {
+	if c.cmd.Stdout != nil || c.Stderr != nil {
 		return nil, errors.New("confine: Stdout or Stderr already set")
 	}
 	var out strings.Builder
 	// exec.Cmd writes one comparable writer from one goroutine at a time.
-	c.Stdout, c.Stderr = &out, &out
-	err := c.Run()
+	c.cmd.Stdout, c.Stderr = &out, &out
+	err := c.Start()
+	if err == nil {
+		err = c.cmd.Wait()
+	}
 	return []byte(out.String()), err
 }

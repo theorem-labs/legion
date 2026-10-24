@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // CompiledOptions turn on the compiled part of a refresh: types, compiled statement hashes, atoms and the
@@ -61,7 +63,7 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 				return nil, m, "", errors.New("a confined export needs the exporter's ScratchDir")
 			}
 			var err error
-			if dir, err = NewScratch(x.ScratchDir); err != nil {
+			if dir, err = confine.NewScratch(x.ScratchDir); err != nil {
 				return nil, m, "", err
 			}
 			if err := CompileConfined(ctx, x.Lean, x.SearchPath, dir, FormsModuleName, []byte(src)); err != nil {
