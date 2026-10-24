@@ -207,6 +207,9 @@ func (d *driver) fail(kind, subject, format string, args ...any) {
 	d.failures = append(d.failures, Failure{Kind: kind, Subject: subject, Detail: fmt.Sprintf(format, args...)})
 }
 
+// errTimedOut is the error of a wait whose timeout passed.
+var errTimedOut = errors.New("timed out")
+
 // wait polls done until it holds, the timeout passes, or the daemon exits on its own.
 func (d *driver) wait(ctx context.Context, timeout time.Duration, what string, done func() (bool, error)) error {
 	deadline := time.Now().Add(timeout)
@@ -224,7 +227,7 @@ func (d *driver) wait(ctx context.Context, timeout time.Duration, what string, d
 			}
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out after %s waiting for %s", timeout, what)
+			return fmt.Errorf("%w after %s waiting for %s", errTimedOut, timeout, what)
 		}
 		select {
 		case <-ctx.Done():
@@ -522,27 +525,11 @@ func (d *driver) wake(ctx context.Context) error {
 		}
 		d.expected.Outcomes = append(d.expected.Outcomes, Outcome{Item: item, Owner: node})
 	}
-	seen := map[string]time.Duration{}
-	var panes map[string]pane
-	err := d.wait(ctx, d.opts.Timeouts.PaneStart, "both owner panes", func() (bool, error) {
-		var err error
-		if panes, err = ownerPanes(ctx, d.socket); err != nil {
-			return false, err
-		}
-		for _, node := range d.nodes {
-			if _, ok := panes[node]; ok && seen[node] == 0 {
-				seen[node] = time.Since(start)
-			}
-		}
-		return len(seen) == len(d.nodes), nil
-	})
+	panes, seen, err := d.awaitPanes(ctx, ownerPanes, start)
 	if err != nil {
 		return fmt.Errorf("%w; the panes on tmux socket %s: %s", err, d.socket, paneCommands(ctx, d.socket))
 	}
-	ownersDir, err := filepath.EvalSymlinks(filepath.Join(d.daemonState, "owners"))
-	if err != nil {
-		ownersDir = filepath.Join(d.daemonState, "owners")
-	}
+	ownersDir := d.ownersDir()
 	for _, node := range d.nodes {
 		p := panes[node]
 		d.report.Panes = append(d.report.Panes, PaneCheck{Owner: node, Pane: p.ID, PID: p.PID, StartSeconds: seen[node].Seconds(), Env: p.Env, Dir: p.Dir})
@@ -573,6 +560,45 @@ func (d *driver) wake(ctx context.Context) error {
 		}
 		return true, nil
 	})
+}
+
+// ownersDir is the supervisor's directory of owner working directories, links resolved as /proc shows a working
+// directory.
+func (d *driver) ownersDir() string {
+	dir, err := filepath.EvalSymlinks(filepath.Join(d.daemonState, "owners"))
+	if err != nil {
+		return filepath.Join(d.daemonState, "owners")
+	}
+	return dir
+}
+
+// awaitPanes waits, within the pane timeout from start, until list shows a pane for every node and each pane works
+// in the supervisor's owners directory: a pane's shell starts in the tmux server's directory and changes into its
+// owner directory before it starts the owner, so a pane seen earlier is still starting. seen is when each pane first
+// appeared. When every pane appeared but one never reached the owners directory, the panes as last seen are
+// returned with no error, for the launch check to judge.
+func (d *driver) awaitPanes(ctx context.Context, list func(context.Context, string) (map[string]pane, error), start time.Time) (map[string]pane, map[string]time.Duration, error) {
+	seen := map[string]time.Duration{}
+	var panes map[string]pane
+	err := d.wait(ctx, d.opts.Timeouts.PaneStart, "both owner panes", func() (bool, error) {
+		var err error
+		if panes, err = list(ctx, d.socket); err != nil {
+			return false, err
+		}
+		owners, started := d.ownersDir(), true
+		for _, node := range d.nodes {
+			p, ok := panes[node]
+			if ok && seen[node] == 0 {
+				seen[node] = time.Since(start)
+			}
+			started = started && ok && filepath.Dir(p.Dir) == owners
+		}
+		return started, nil
+	})
+	if errors.Is(err, errTimedOut) && len(seen) == len(d.nodes) {
+		return panes, seen, nil
+	}
+	return panes, seen, err
 }
 
 func sameSet(a, b []string) bool {
