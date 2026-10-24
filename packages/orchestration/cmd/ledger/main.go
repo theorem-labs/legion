@@ -111,6 +111,7 @@ parsed:
 		}
 		return writeError(stderr, jsonOutput, err)
 	}
+	holdAfterCommit()
 	if value != nil {
 		if jsonOutput || read {
 			if err := json.NewEncoder(stdout).Encode(value); err != nil {

@@ -338,9 +338,12 @@ func (s *Store) BatchEffectDone(ctx context.Context, repo, batch, key string, re
 		if done.replayed {
 			return nil
 		}
-		return event(ctx, tx, repo, "effect.done", batch, "", map[string]any{
+		if err := event(ctx, tx, repo, "effect.done", batch, "", map[string]any{
 			"key": key, "follow_ons": done.followOns, "outputs": done.outputs, "escalation": done.escalation,
-		})
+		}); err != nil {
+			return err
+		}
+		return holdTransaction(ctx, tx, "inside")
 	})
 	return effect, err
 }
