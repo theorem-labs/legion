@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,12 +9,10 @@ import (
 	"testing"
 )
 
-// INFRA-145 plan v5, E3: "librarian: [record-librarian, --, owner, librarian-intake]", and README "Acceptance
-// drivers": record-librarian "runs the command after --, if one is given, and exits with its status". The gate
-// appends its own arguments after the configured command (conceptgate/librarian.go: Command[0],
-// append(Command[1:], "--id", id, "--proposer", proposer, "--proposal", path)), so record-librarian receives
-// `-- COMMAND ... --id ID --proposer P --proposal FILE`. It must record that call and run COMMAND with the
-// gate's arguments.
+// A gate configured with `librarian: [record-librarian, --, COMMAND, ARGS...]` appends its own arguments after the
+// configured command (conceptgate/librarian.go: Command[0], append(Command[1:], "--id", id, "--proposer", proposer,
+// "--proposal", path)), so record-librarian receives `-- COMMAND ARGS... --id ID --proposer P --proposal FILE`. It
+// must record that call and run COMMAND with its own arguments, then the gate's.
 func TestRecordLibrarianWrapsTheConfiguredCommandAsTheGateCallsIt(t *testing.T) {
 	dir := t.TempDir()
 	seen := filepath.Join(dir, "seen")
@@ -43,5 +42,34 @@ func TestRecordLibrarianWrapsTheConfiguredCommandAsTheGateCallsIt(t *testing.T) 
 		"function:alloc_mnt_ns", "--proposal"}, "\n")
 	if err != nil || !strings.HasPrefix(string(got), want+"\n") {
 		t.Fatalf("the wrapped command got %q (%v), want its own arguments, then the gate's", got, err)
+	}
+}
+
+// A gate configured with `librarian: [record-librarian]` calls it with the gate's arguments alone: it records the call
+// and exits 0. A command after those arguments is not a call form; a command goes first, after `--`, as the gate
+// passes it.
+func TestRecordLibrarianRecordsTheGatesCallAlone(t *testing.T) {
+	dir := t.TempDir()
+	proposal := filepath.Join(dir, "proposal")
+	if err := os.WriteFile(proposal, []byte("envelope\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(dir, "record.tsv")
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command("./record-librarian", args...)
+		cmd.Env = append(os.Environ(), "LIBRARIAN_RECORD="+record)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run("--id", "near-0123456789abcdef", "--proposer", "function:open_file", "--proposal", proposal); err != nil {
+		t.Fatalf("record-librarian: %v\n%s", err, out)
+	}
+	if line, err := os.ReadFile(record); err != nil || !strings.Contains(string(line), "\tnear-0123456789abcdef\tfunction:open_file\t") {
+		t.Fatalf("record %q, %v", line, err)
+	}
+	out, err := run("--id", "near-0123456789abcdef", "--proposer", "function:open_file", "--proposal", proposal, "--", "true")
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 {
+		t.Fatalf("a command after the gate's arguments: %v, want usage exit 2\n%s", err, out)
 	}
 }

@@ -161,7 +161,8 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 // LedgerDefect is a contract whose hash in the ledger is not the index's hash at the index's commit: a landing
 // changed the contract's statement without advancing it, or advanced it to a hash the build does not have.
 type LedgerDefect struct {
-	Contract   string `json:"contract"`
+	Contract string `json:"contract"`
+	// At is the contract's declaration as path:line (Found.At).
 	At         string `json:"at"`
 	LedgerHash string `json:"ledger_hash"`
 	Version    int64  `json:"version"`
@@ -184,28 +185,6 @@ type LedgerReport struct {
 // Defective reports whether the contract portion of a ledger check found a condition that makes the command exit 1.
 func (r LedgerReport) Defective() bool {
 	return len(r.Defects) != 0 || len(r.Gone) != 0 || len(r.Unowned) != 0 || len(r.Ambiguous) != 0
-}
-
-type ledgerDeclaration struct {
-	module string
-	hash   string
-}
-
-func (s *Store) ledgerDeclarations(ctx context.Context, names []string) (map[string][]ledgerDeclaration, error) {
-	out := make(map[string][]ledgerDeclaration, len(names))
-	err := eachRowIn(ctx, s.q, `SELECT name, module, stmt_hash FROM decls WHERE name IN`, names, func(r *sql.Rows) error {
-		var name string
-		var declaration ledgerDeclaration
-		if err := r.Scan(&name, &declaration.module, &declaration.hash); err != nil {
-			return err
-		}
-		out[name] = append(out[name], declaration)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 // CheckLedger runs after a landing, on the index of the landed build. It registers every contract the rule
@@ -235,7 +214,6 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 	for _, c := range contracts {
 		count[c.Name]++
 	}
-	selected := make(map[string]Found, len(contracts))
 	for _, c := range contracts {
 		if count[c.Name] > 1 {
 			// One ledger record per name: a name declared twice cannot be told apart there.
@@ -243,7 +221,6 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 			continue
 		}
 		r.Contracts++
-		selected[c.Name] = c
 		if _, ok := inLedger[c.Name]; ok {
 			continue
 		}
@@ -266,7 +243,7 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 			names = append(names, c.Name)
 		}
 	}
-	declarations, err := s.ledgerDeclarations(ctx, names)
+	declarations, err := s.declarationsNamed(ctx, names)
 	if err != nil {
 		return r, err
 	}
@@ -279,16 +256,12 @@ func (s *Store) CheckLedger(ctx context.Context, l ContractLedger, repo string, 
 		case 0:
 			r.Gone = append(r.Gone, c.Name)
 		case 1:
-			if c.StatementHash == decls[0].hash {
+			if c.StatementHash == decls[0].StmtHash {
 				r.Matching++
 				continue
 			}
-			at := sourcePath("", decls[0].module)
-			if found, ok := selected[c.Name]; ok {
-				at = found.At()
-			}
-			r.Defects = append(r.Defects, LedgerDefect{Contract: c.Name, At: at, LedgerHash: c.StatementHash,
-				Version: c.Version, IndexHash: decls[0].hash})
+			r.Defects = append(r.Defects, LedgerDefect{Contract: c.Name, At: decls[0].At(), LedgerHash: c.StatementHash,
+				Version: c.Version, IndexHash: decls[0].StmtHash})
 		default:
 			r.Ambiguous = append(r.Ambiguous, c.Name)
 		}

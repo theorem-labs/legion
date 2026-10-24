@@ -228,7 +228,7 @@ name = "LandHashFixture"
 		}
 		if trace.Synthetic {
 			sawFetch = true
-			freshness, err := declindex.Fresh(build, filepath.Join(".lake", "build", "lib", "lean"), filepath.ToSlash(rel), source)
+			freshness, _, err := declindex.Fresh(build, filepath.Join(".lake", "build", "lib", "lean"), filepath.ToSlash(rel), source)
 			if err != nil {
 				return err
 			}

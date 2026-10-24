@@ -395,7 +395,7 @@ func TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := declindex.Open(cfg.DB)
+	store, err := declindex.OpenReadOnly(context.Background(), cfg.DB, declindex.IndexOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,12 +587,13 @@ func TestLandHashReadsOneSnapshotWhileRefreshWaits(t *testing.T) {
 	release := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, err := store.RefreshAt(context.Background(), cfg.TreeSpec(), declindex.RefreshOptions{
+		_, err := store.Refresh(context.Background(), cfg.TreeSpec(), declindex.RefreshOptions{
 			Commit: git(t, tree, "rev-parse", "HEAD"),
-		}, func(context.Context) error {
-			close(entered)
-			<-release
-			return nil
+			Landed: func(context.Context) error {
+				close(entered)
+				<-release
+				return nil
+			},
 		})
 		done <- err
 	}()

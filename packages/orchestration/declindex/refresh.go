@@ -12,7 +12,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -35,9 +34,10 @@ type RefreshOptions struct {
 	// Commit is the source commit the build is of; it is recorded as the index's commit, and a change of commit as
 	// a landing (see Store.Landing).
 	Commit string
-	// CheckLandedCoverage makes RefreshAt refuse a tree with tracked changes and then compare Commit with the
-	// persisted index, before it runs a landed sync.
-	CheckLandedCoverage bool
+	// Landed is the post-landing synchronisation (Sync) that Refresh runs under its refresh lock before it reads the
+	// tree; nil refreshes the tree as it is. With it, Refresh first refuses a tree with tracked changes, and gives
+	// ErrAlreadyPast without running it when the persisted index already covers Commit.
+	Landed func(context.Context) error
 	// Jobs bounds the parallel readers; zero is min(48, CPUs).
 	Jobs int
 	// Compiled gives the options of the compiled part (types, compiled hashes, atoms, facts); nil skips that part.
@@ -86,7 +86,7 @@ func (o RefreshOptions) jobs() int {
 	if o.Jobs > 0 {
 		return o.Jobs
 	}
-	return min(48, runtime.NumCPU())
+	return defaultJobs()
 }
 
 // scan lists the modules with a reference file below the tree's library directory and their keys, read in
@@ -172,10 +172,10 @@ func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
 	return out, nil
 }
 
-// readSourceBlobs reads the sources table through q: each source's path and the blob the index read.
-func readSourceBlobs(ctx context.Context, q querier) (map[string]string, error) {
+// sourceBlobs reads the sources table: each source's path and the blob the index read.
+func (s *Store) sourceBlobs(ctx context.Context) (map[string]string, error) {
 	out := map[string]string{}
-	rows, err := q.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	rows, err := s.q.QueryContext(ctx, `SELECT path, blob FROM sources`)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var path, blob string
 		if err := r.Scan(&path, &blob); err != nil {
@@ -196,26 +196,24 @@ func logf(w io.Writer, format string, args ...any) {
 	}
 }
 
-// Refresh brings the index to the tree's current build. It is RefreshAt without a post-landing synchronisation.
+// Refresh brings the index to the tree's current build. It holds the refresh lock across the landed sync
+// (RefreshOptions.Landed) and the refresh: a post-landing fetch, checkout and build cannot race a second index
+// refresh, and a reader of the tree in a read-only directory observes only the result after both complete. The
+// refresh takes the write lock only while it writes the index (Store.write), so a reader of the index alone reads
+// the index of the refresh before while the sync runs.
 func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
-	return s.RefreshAt(ctx, tree, opt, nil)
-}
-
-// RefreshAt holds the refresh lock across syncTree and the refresh: a post-landing fetch, checkout and build cannot
-// race a second index refresh, and a reader of the tree in a read-only directory observes only the result after
-// both complete. The refresh takes the write lock only while it writes the index (Store.write), so a reader of the
-// index alone reads the index of the refresh before while syncTree runs.
-func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, syncTree func(context.Context) error) (RefreshStats, error) {
-	if s.beforeRefreshLock != nil {
-		s.beforeRefreshLock()
-	}
 	unlock, err := s.lockRefresh(ctx)
 	if err != nil {
 		return RefreshStats{}, err
 	}
 	defer unlock()
-	if syncTree != nil && opt.CheckLandedCoverage {
-		// The one check that the tree is clean, before a landed sync (Sync) checks out another commit there.
+	if s.afterRefreshLock != nil {
+		if err := s.afterRefreshLock(ctx); err != nil {
+			return RefreshStats{}, err
+		}
+	}
+	if opt.Landed != nil {
+		// The one check that the tree is clean, before the landed sync checks out another commit there.
 		if err := requireCleanTree(ctx, tree.Source); err != nil {
 			return RefreshStats{}, err
 		}
@@ -227,9 +225,7 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 			logf(opt.Log, "declindex: index at %s covers LAND_COMMIT %s", covering, opt.Commit)
 			return RefreshStats{}, ErrAlreadyPast
 		}
-	}
-	if syncTree != nil {
-		if err := syncTree(ctx); err != nil {
+		if err := opt.Landed(ctx); err != nil {
 			return RefreshStats{}, err
 		}
 	}
@@ -241,194 +237,46 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	var st RefreshStats
-	sourceBlobs, sourcePrefix, err := readSources(tree)
+	r, err := s.readReference(ctx, tree, opt.jobs())
 	if err != nil {
 		return st, err
 	}
-	previousCommit, err := s.Meta(ctx, "commit")
-	if err != nil {
-		return st, err
-	}
-	files, err := scan(tree, opt.jobs())
-	if err != nil {
-		return st, fmt.Errorf("scan %s: %w", tree.Lib, err)
-	}
-	old, err := s.storedModules(ctx)
-	if err != nil {
-		return st, err
-	}
-	storedSourceBlobs, err := readSourceBlobs(ctx, s.q)
-	if err != nil {
-		return st, err
-	}
-	seen := map[string]bool{}
-	var changed []moduleFile
-	for _, f := range files {
-		seen[f.rel] = true
-		sourceChanged := sourceBlobs != nil && sourceBlobs[f.rel+".lean"] != storedSourceBlobs[f.rel+".lean"]
-		if o, ok := old[f.rel]; !ok || o.ileanKey != f.ileanKey || sourceChanged {
-			changed = append(changed, f)
+	logf(opt.Log, "index: %d modules, %d reference files changed, %d gone, read in %s", len(r.files), len(r.changed),
+		len(r.gone), time.Since(t0).Round(time.Millisecond))
+	for i, err := range r.errs {
+		if err != nil {
+			st.Unreadable++
+			logf(opt.Log, "index: %v", err)
+			continue
 		}
+		st.Reread++
+		st.Stale += r.results[i].Stale
 	}
-	var gone []string
-	for rel := range old {
-		if !seen[rel] {
-			gone = append(gone, rel)
+	st.Removed = len(r.gone)
+	if err := s.writeTx(ctx, opt.Log, func(tx *sql.Tx) error {
+		if err := writeSources(ctx, tx, r.storedSources, r.sources); err != nil {
+			return err
 		}
-	}
-	results := make([]ModuleData, len(changed))
-	errs := make([]error, len(changed))
-	parallel(len(changed), opt.jobs(), func(i int) {
-		results[i], errs[i] = readModule(tree, changed[i].rel)
-	})
-	logf(opt.Log, "index: %d modules, %d reference files changed, %d gone, read in %s", len(files), len(changed),
-		len(gone), time.Since(t0).Round(time.Millisecond))
-	if err := s.write(ctx, opt.Log, func() error {
-		tx, err := s.db.BeginTx(ctx, nil)
+		if err := writeModules(ctx, tx, r); err != nil {
+			return err
+		}
+		token, err := s.writeMeta(ctx, tx, r, opt.Commit, st.Unreadable)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = tx.Rollback() }()
-		// The sources table becomes sourceBlobs: the rows of gone sources are deleted, and only new or changed rows
-		// written. The refresh lock, held since storedSourceBlobs was read, keeps another refresh from changing the
-		// table meanwhile, as it does for the modules in old.
-		if len(sourceBlobs) == 0 {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM sources`); err != nil {
-				return err
-			}
-		} else {
-			for path := range storedSourceBlobs {
-				if _, kept := sourceBlobs[path]; kept {
-					continue
-				}
-				if _, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE path = ?`, path); err != nil {
-					return err
-				}
-			}
-		}
-		sources := newBatch(tx, "sources", 2)
-		sources.verb = "INSERT OR REPLACE"
-		for _, path := range slices.Sorted(maps.Keys(sourceBlobs)) {
-			if blob, stored := storedSourceBlobs[path]; stored && blob == sourceBlobs[path] {
-				continue
-			}
-			if err := sources.add(ctx, path, sourceBlobs[path]); err != nil {
-				return err
-			}
-		}
-		if err := sources.flush(ctx); err != nil {
-			return err
-		}
-		if err := deleteModules(ctx, tx, slices.Concat(gone, relsOf(changed)), old); err != nil {
-			return err
-		}
-		for _, rel := range gone {
-			if err := deleteCompiled(ctx, tx, old[rel].module); err != nil {
-				return err
-			}
-		}
-		decls := newBatch(tx, "decls", 6)
-		uses := newBatch(tx, "uses", 6)
-		modules := newBatch(tx, "modules", 4)
-		for i, md := range results {
-			if errs[i] != nil {
-				st.Unreadable++
-				logf(opt.Log, "index: %v", errs[i])
-				continue
-			}
-			st.Reread++
-			st.Stale += md.Stale
-			for _, d := range md.Decls {
-				if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash); err != nil {
-					return err
-				}
-			}
-			for _, u := range md.Uses {
-				if err := uses.add(ctx, u.Target, u.Module, u.Line, u.Col, u.Parent, u.Class); err != nil {
-					return err
-				}
-			}
-			// The olean key says which compiled module the index's types and facts were read from; re-reading the
-			// reference file does not change it. Each re-read module's old row was deleted above.
-			if err := modules.add(ctx, md.Rel, md.Module, changed[i].ileanKey, old[md.Rel].oleanKey); err != nil {
-				return err
-			}
-		}
-		if err := modules.flush(ctx); err != nil {
-			return err
-		}
-		if err := decls.flush(ctx); err != nil {
-			return err
-		}
-		if err := uses.flush(ctx); err != nil {
-			return err
-		}
-		if err := insertEdges(ctx, tx, results, errs); err != nil {
-			return err
-		}
-		st.Removed = len(gone)
-		meta := map[string]string{
-			"commit":  opt.Commit,
-			"built":   time.Now().UTC().Format("2006-01-02T15:04Z"),
-			"errors":  fmt.Sprint(st.Unreadable),
-			"sources": "",
-			// The tree's path below the root of its repository: land-hash reads LAND_TREE below it.
-			"source_prefix": sourcePrefix,
-		}
-		if sourceBlobs != nil {
-			meta["sources"] = "git"
-		}
-		if opt.Commit != "" && opt.Commit != previousCommit {
-			if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO landings (landed, previous) VALUES (?, ?)`,
-				opt.Commit, previousCommit); err != nil {
-				return err
-			}
-		}
-		// The graph file is written from this transaction's rows just before its commit, so a reader whose snapshot
-		// begins after the commit finds its graph in place. Its generation token is the index's: a reader refuses a
-		// graph of another generation (graph), and a graph write or commit that fails leaves the two of different
-		// generations, which the next refresh repairs.
-		token, err := s.Meta(ctx, "graph")
-		if err != nil {
-			return err
-		}
-		if len(changed) > 0 || len(gone) > 0 || token == "" {
-			var b [8]byte
-			if _, err := rand.Read(b[:]); err != nil {
-				return err
-			}
-			token = hex.EncodeToString(b[:])
-			meta["graph"] = token
-		}
-		for k, v := range meta {
-			if err := s.setMeta(ctx, tx, k, v); err != nil {
-				return err
-			}
-		}
-		if graphToken(s.path+".graph") != token {
-			t1 := time.Now()
-			g, err := buildGraph(ctx, tx)
-			if err != nil {
-				return fmt.Errorf("build the declaration graph: %w", err)
-			}
-			g.token = token
-			if err := g.write(s.path + ".graph"); err != nil {
-				return fmt.Errorf("write the declaration graph: %w", err)
-			}
-			s.graphOnce, s.g, s.graphErr = sync.Once{}, nil, nil
-			logf(opt.Log, "index: declaration graph of %d declarations and %d edges written in %s", len(g.names), len(g.dst),
-				time.Since(t1).Round(time.Millisecond))
-		}
-		return tx.Commit()
+		return s.writeGraph(ctx, tx, token, opt.Log)
 	}); err != nil {
 		return st, err
 	}
+	// The write rewrote the modules and the graph: the store's answers, and the compiled step's walk
+	// (reachedModules), read them anew.
+	s.reload()
 	if opt.Compiled != nil {
 		co, err := opt.Compiled(ctx)
 		if err != nil {
 			return st, err
 		}
-		if st.Exported, st.Rematched, err = s.refreshCompiled(ctx, tree, co, files, opt.Commit, opt.Log); err != nil {
+		if st.Exported, st.Rematched, err = s.refreshCompiled(ctx, tree, co, r.files, opt.Commit, opt.Log); err != nil {
 			return st, err
 		}
 	}
@@ -436,6 +284,190 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	logf(opt.Log, "index: %d re-read, %d removed, %d unreadable, %d declarations newer than their build, %d compiled modules read, %d re-matched, %s",
 		st.Reread, st.Removed, st.Unreadable, st.Stale, st.Exported, st.Rematched, st.Elapsed.Round(time.Millisecond))
 	return st, nil
+}
+
+// reference is what a refresh read before it writes the reference part: the tree's sources (nil outside Git) and
+// the index's, the modules of the build and of the index, which of them changed or are gone, and the re-read
+// modules (an error for each that could not be read).
+type reference struct {
+	sources, storedSources map[string]string
+	sourcePrefix           string
+	previousCommit         string
+	files                  []moduleFile
+	old                    map[string]stored
+	changed                []moduleFile
+	gone                   []string
+	results                []ModuleData
+	errs                   []error
+}
+
+// readReference reads the tree's sources and build, and the index's sources and modules, and re-reads the modules
+// whose reference file or source changed, on jobs goroutines.
+func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (reference, error) {
+	var r reference
+	var err error
+	if r.sources, r.sourcePrefix, err = readSources(tree); err != nil {
+		return r, err
+	}
+	if r.previousCommit, err = s.Meta(ctx, "commit"); err != nil {
+		return r, err
+	}
+	if r.files, err = scan(tree, jobs); err != nil {
+		return r, fmt.Errorf("scan %s: %w", tree.Lib, err)
+	}
+	if r.old, err = s.storedModules(ctx); err != nil {
+		return r, err
+	}
+	if r.storedSources, err = s.sourceBlobs(ctx); err != nil {
+		return r, err
+	}
+	seen := map[string]bool{}
+	for _, f := range r.files {
+		seen[f.rel] = true
+		sourceChanged := r.sources != nil && r.sources[f.rel+".lean"] != r.storedSources[f.rel+".lean"]
+		if o, ok := r.old[f.rel]; !ok || o.ileanKey != f.ileanKey || sourceChanged {
+			r.changed = append(r.changed, f)
+		}
+	}
+	for rel := range r.old {
+		if !seen[rel] {
+			r.gone = append(r.gone, rel)
+		}
+	}
+	r.results = make([]ModuleData, len(r.changed))
+	r.errs = make([]error, len(r.changed))
+	parallel(len(r.changed), jobs, func(i int) {
+		r.results[i], r.errs[i] = readModule(tree, r.changed[i].rel)
+	})
+	return r, nil
+}
+
+// writeSources makes the sources table current: the rows of sources that stored has and current lacks are
+// deleted, and only new or changed rows written. The refresh lock, held since stored was read, keeps another
+// refresh from changing the table meanwhile, as it does for the modules.
+func writeSources(ctx context.Context, tx *sql.Tx, stored, current map[string]string) error {
+	for path := range stored {
+		if _, kept := current[path]; kept {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE path = ?`, path); err != nil {
+			return err
+		}
+	}
+	sources := newBatch(tx, "INSERT OR REPLACE", "sources", 2)
+	for _, path := range slices.Sorted(maps.Keys(current)) {
+		if blob, ok := stored[path]; ok && blob == current[path] {
+			continue
+		}
+		if err := sources.add(ctx, path, current[path]); err != nil {
+			return err
+		}
+	}
+	return sources.flush(ctx)
+}
+
+// writeModules replaces the reference rows of the changed and gone modules (and the compiled rows of the gone ones)
+// with those of the re-read modules: their declarations, uses, modules rows and edges.
+func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
+	if err := deleteModules(ctx, tx, slices.Concat(r.gone, relsOf(r.changed)), r.old); err != nil {
+		return err
+	}
+	for _, rel := range r.gone {
+		if err := deleteCompiled(ctx, tx, r.old[rel].module); err != nil {
+			return err
+		}
+	}
+	decls := newBatch(tx, "INSERT", "decls", 6)
+	uses := newBatch(tx, "INSERT", "uses", 6)
+	modules := newBatch(tx, "INSERT", "modules", 4)
+	for i, md := range r.results {
+		if r.errs[i] != nil {
+			continue
+		}
+		for _, d := range md.Decls {
+			if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash); err != nil {
+				return err
+			}
+		}
+		for _, u := range md.Uses {
+			if err := uses.add(ctx, u.Target, u.Module, u.Line, u.Col, u.Parent, u.Class); err != nil {
+				return err
+			}
+		}
+		// The olean key says which compiled module the index's types and facts were read from; re-reading the
+		// reference file does not change it. Each re-read module's old row was deleted above.
+		if err := modules.add(ctx, md.Rel, md.Module, r.changed[i].ileanKey, r.old[md.Rel].oleanKey); err != nil {
+			return err
+		}
+	}
+	for _, b := range []*batch{modules, decls, uses} {
+		if err := b.flush(ctx); err != nil {
+			return err
+		}
+	}
+	return insertEdges(ctx, tx, r.results, r.errs)
+}
+
+// writeMeta records the refresh in the meta table, and a change of commit as a landing. It gives the graph's
+// generation token: a new one when a module changed or is gone, or when the index has none.
+func (s *Store) writeMeta(ctx context.Context, tx *sql.Tx, r reference, commit string, unreadable int) (string, error) {
+	meta := map[string]string{
+		"commit":  commit,
+		"built":   time.Now().UTC().Format("2006-01-02T15:04Z"),
+		"errors":  fmt.Sprint(unreadable),
+		"sources": "",
+		// The tree's path below the root of its repository: land-hash reads LAND_TREE below it.
+		"source_prefix": r.sourcePrefix,
+	}
+	if r.sources != nil {
+		meta["sources"] = "git"
+	}
+	if commit != "" && commit != r.previousCommit {
+		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO landings (landed, previous) VALUES (?, ?)`,
+			commit, r.previousCommit); err != nil {
+			return "", err
+		}
+	}
+	token, err := s.Meta(ctx, "graph")
+	if err != nil {
+		return "", err
+	}
+	if len(r.changed) > 0 || len(r.gone) > 0 || token == "" {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return "", err
+		}
+		token = hex.EncodeToString(b[:])
+		meta["graph"] = token
+	}
+	for k, v := range meta {
+		if err := s.setMeta(ctx, tx, k, v); err != nil {
+			return "", err
+		}
+	}
+	return token, nil
+}
+
+// writeGraph writes the graph file of generation token from tx's rows, unless the file in place is of it. It runs
+// just before tx commits, so a reader whose snapshot begins after the commit finds its graph in place. A reader
+// refuses a graph of another generation than the index's (graph), and a graph write or commit that fails leaves the
+// two of different generations, which the next refresh repairs.
+func (s *Store) writeGraph(ctx context.Context, tx *sql.Tx, token string, log io.Writer) error {
+	if graphToken(s.path+".graph") == token {
+		return nil
+	}
+	t0 := time.Now()
+	g, err := buildGraph(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("build the declaration graph: %w", err)
+	}
+	g.token = token
+	if err := g.write(s.path + ".graph"); err != nil {
+		return fmt.Errorf("write the declaration graph: %w", err)
+	}
+	logf(log, "index: declaration graph of %d declarations and %d edges written in %s", len(g.names), len(g.dst),
+		time.Since(t0).Round(time.Millisecond))
+	return nil
 }
 
 // deleteModules deletes the reference rows of the modules at rels: the declarations, uses and edges of each one's
@@ -507,7 +539,7 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 // it uses as recorded. Which declaration a target belongs to (`X.wp` is X's field while nothing declares `X.wp`)
 // depends on every module's declarations, so buildGraph decides it when it writes the graph.
 func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []error) error {
-	edges := newBatch(tx, "edges", 5)
+	edges := newBatch(tx, "INSERT", "edges", 5)
 	for i, md := range results {
 		if errs[i] != nil {
 			continue
@@ -542,20 +574,18 @@ func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []e
 	return edges.flush(ctx)
 }
 
-// batch inserts rows into one table many at a time.
+// batch inserts rows into one table many at a time, with the statement verb INSERT or INSERT OR REPLACE.
 type batch struct {
-	tx    *sql.Tx
-	table string
-	cols  int
-	args  []any
-	// verb is the insert statement's verb: INSERT, or INSERT OR REPLACE.
-	verb string
+	tx          *sql.Tx
+	verb, table string
+	cols        int
+	args        []any
 }
 
 const batchRows = 400
 
-func newBatch(tx *sql.Tx, table string, cols int) *batch {
-	return &batch{tx: tx, table: table, cols: cols, verb: "INSERT"}
+func newBatch(tx *sql.Tx, verb, table string, cols int) *batch {
+	return &batch{tx: tx, verb: verb, table: table, cols: cols}
 }
 
 func (b *batch) add(ctx context.Context, vals ...any) error {

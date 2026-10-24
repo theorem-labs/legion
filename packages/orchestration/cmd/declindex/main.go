@@ -235,8 +235,8 @@ func (e *env) printJSONOr(v any, rc int) int {
 	return rc
 }
 
-// resolve gives the declarations that q names. A name that names none is reported on stderr and sets *rc to 1;
-// the second result is non-zero, an exit code, only when the index cannot answer.
+// resolve gives the declarations that q names, and 0 to go on or the exit code of a failure it has reported when
+// the index cannot answer. A name that names none is reported on stderr and sets *rc to 1.
 func (e *env) resolve(ctx context.Context, q string, rc *int) ([]declindex.Found, int) {
 	found, err := e.store.Resolve(ctx, q)
 	if err != nil {
@@ -258,13 +258,11 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	defer e.close()
 	tree := e.cfg.TreeSpec()
 	opt := declindex.RefreshOptions{Jobs: e.cfg.Jobs, Log: e.stderr}
-	var sync func(context.Context) error
 	if commit := e.getenv("LAND_COMMIT"); commit != "" {
 		if !declindex.IsObjectID(commit) {
 			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 lowercase hexadecimal characters"})
 		}
-		opt.Commit, opt.CheckLandedCoverage = commit, true
-		sync = declindex.Sync(e.cfg, commit, e.stderr)
+		opt.Commit, opt.Landed = commit, declindex.Sync(e.cfg, commit, e.stderr)
 	} else if head, err := declindex.TreeHead(ctx, e.cfg.Tree); err != nil {
 		// A build outside Git is indexed without a commit, which no ledger or gate check accepts.
 		fmt.Fprintf(e.stderr, "note: the index records no commit: %v\n", err)
@@ -274,7 +272,7 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	if e.cfg.Lean.Export {
 		opt.Compiled = func(ctx context.Context) (*declindex.CompiledOptions, error) { return compiledOptions(ctx, e) }
 	}
-	st, err := e.store.RefreshAt(ctx, tree, opt, sync)
+	st, err := e.store.Refresh(ctx, tree, opt)
 	if errors.Is(err, declindex.ErrAlreadyPast) {
 		return 0
 	}
@@ -346,7 +344,7 @@ func (e *env) staleNote(ctx context.Context) (string, error) {
 }
 
 // openQuery opens the index read-only for a query and notes a stale commit (staleNote). It gives the index's commit
-// and -1, or the exit code of a failure that it has reported, having closed the index it opened.
+// and 0 to go on, or the exit code of a failure that it has reported, having closed the index it opened.
 func (e *env) openQuery(ctx context.Context) (string, int) {
 	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
 		return "", fail(e.stderr, err)
@@ -357,11 +355,12 @@ func (e *env) openQuery(ctx context.Context) (string, int) {
 		e.close()
 		return "", code
 	}
-	return commit, -1
+	return commit, 0
 }
 
 func short(c string) string { return c[:min(9, len(c))] }
 
+// names gives a command's NAME arguments and 0 to go on, or the exit code of the usage failure it has reported.
 func names(e *env, cmd string, args []string) ([]string, int) {
 	if len(args) == 0 {
 		return nil, fail(e.stderr, &usageError{cmd + " needs at least one NAME"})
@@ -371,15 +370,15 @@ func names(e *env, cmd string, args []string) ([]string, int) {
 			return nil, fail(e.stderr, &usageError{fmt.Sprintf("unknown option %s for %s", a, cmd)})
 		}
 	}
-	return args, -1
+	return args, 0
 }
 
 func cmdWhere(ctx context.Context, e *env, args []string) int {
 	qs, code := names(e, "where", args)
-	if code >= 0 {
+	if code != 0 {
 		return code
 	}
-	if _, code = e.openQuery(ctx); code >= 0 {
+	if _, code = e.openQuery(ctx); code != 0 {
 		return code
 	}
 	defer e.close()
@@ -403,10 +402,10 @@ func cmdWhere(ctx context.Context, e *env, args []string) int {
 
 func cmdHash(ctx context.Context, e *env, args []string) int {
 	qs, code := names(e, "hash", args)
-	if code >= 0 {
+	if code != 0 {
 		return code
 	}
-	if _, code = e.openQuery(ctx); code >= 0 {
+	if _, code = e.openQuery(ctx); code != 0 {
 		return code
 	}
 	defer e.close()
@@ -468,11 +467,11 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 		}
 	}
 	qs, code := names(e, "users", qs)
-	if code >= 0 {
+	if code != 0 {
 		return code
 	}
 	commit, code := e.openQuery(ctx)
-	if code >= 0 {
+	if code != 0 {
 		return code
 	}
 	defer e.close()

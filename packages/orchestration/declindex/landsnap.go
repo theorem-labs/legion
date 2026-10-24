@@ -5,9 +5,9 @@ import (
 	"database/sql"
 )
 
-// LandSnapshot is the index state land-hash needs to answer one candidate tree. Its maps are read in one SQLite
-// transaction (the store's snapshot, or one that LandSnapshot begins), so a concurrent refresh cannot combine one
-// commit's sources with another commit's declarations.
+// LandSnapshot is the index state land-hash needs to answer one candidate tree. Its maps are read through the
+// store's reads: a store opened read-only (OpenReadOnly) reads them from its one snapshot, so a concurrent refresh
+// cannot combine one commit's sources with another commit's declarations.
 type LandSnapshot struct {
 	HasSources bool
 	// Prefix is the indexed tree's path below the root of its repository, with a trailing slash, empty at that
@@ -15,44 +15,26 @@ type LandSnapshot struct {
 	Prefix  string
 	Sources map[string]string
 	// Modules are the source modules that the index read, each by its source path without the .lean suffix.
-	Modules      map[string]bool
-	Declarations map[string][]LandDeclaration
+	Modules map[string]bool
+	// Declarations are the declarations of each requested name.
+	Declarations map[string][]Found
 }
 
-// LandDeclaration is one exact requested declaration from the snapshot, under its name in Declarations.
-type LandDeclaration struct {
-	Module   string
-	Path     string
-	StmtHash string
-}
-
-// LandSnapshot reads source blobs, modules, and declarations with names in names from one read transaction.
+// LandSnapshot reads source blobs, modules, and declarations with names in names.
 func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot, error) {
-	tx := s.q
-	if s.snapshot == nil {
-		own, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-		if err != nil {
-			return LandSnapshot{}, err
-		}
-		defer func() { _ = own.Rollback() }()
-		tx = own
-	}
-	snapshot := LandSnapshot{
-		Modules:      map[string]bool{},
-		Declarations: map[string][]LandDeclaration{},
-	}
-	sourceKind, err := readMeta(ctx, tx, "sources")
+	snapshot := LandSnapshot{Modules: map[string]bool{}}
+	sourceKind, err := s.Meta(ctx, "sources")
 	if err != nil {
 		return LandSnapshot{}, err
 	}
 	snapshot.HasSources = sourceKind == "git"
-	if snapshot.Prefix, err = readMeta(ctx, tx, "source_prefix"); err != nil {
+	if snapshot.Prefix, err = s.Meta(ctx, "source_prefix"); err != nil {
 		return LandSnapshot{}, err
 	}
-	if snapshot.Sources, err = readSourceBlobs(ctx, tx); err != nil {
+	if snapshot.Sources, err = s.sourceBlobs(ctx); err != nil {
 		return LandSnapshot{}, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT rel FROM modules`)
+	rows, err := s.q.QueryContext(ctx, `SELECT rel FROM modules`)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
 		var rel string
 		if err := r.Scan(&rel); err != nil {
@@ -64,16 +46,7 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 	if err != nil {
 		return LandSnapshot{}, err
 	}
-	err = eachRowIn(ctx, tx, foundSelect+` WHERE d.name IN`, names, func(r *sql.Rows) error {
-		f, err := scanFound(r)
-		if err != nil {
-			return err
-		}
-		snapshot.Declarations[f.Name] = append(snapshot.Declarations[f.Name],
-			LandDeclaration{Module: f.Module, Path: f.Path, StmtHash: f.StmtHash})
-		return nil
-	})
-	if err != nil {
+	if snapshot.Declarations, err = s.declarationsNamed(ctx, names); err != nil {
 		return LandSnapshot{}, err
 	}
 	return snapshot, nil

@@ -1,15 +1,12 @@
 package declindex
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
 	"io"
-	"io/fs"
 	"math"
-	"os"
 	"path"
 	"slices"
 	"sort"
@@ -56,6 +53,23 @@ func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 		}
 		return out[i].Module < out[j].Module
 	})
+	return out, nil
+}
+
+// declarationsNamed gives the declarations of each of the full names in names, by name.
+func (s *Store) declarationsNamed(ctx context.Context, names []string) (map[string][]Found, error) {
+	out := make(map[string][]Found, len(names))
+	err := eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, names, func(r *sql.Rows) error {
+		f, err := scanFound(r)
+		if err != nil {
+			return err
+		}
+		out[f.Name] = append(out[f.Name], f)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -179,37 +193,13 @@ func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
 	return out, nil
 }
 
-// paths maps modules to their source paths. A wide declaration's answer touches tens of thousands of modules, so
-// the map is read in one query (modulePaths), the first time an answer needs it.
-type paths struct {
-	s     *Store
-	cache map[string]string
-}
-
-func (p *paths) of(ctx context.Context, module string) (string, error) {
-	if p.cache == nil {
-		cache, err := p.s.modulePaths(ctx)
-		if err != nil {
-			return "", err
-		}
-		p.cache = cache
-	}
-	if v, ok := p.cache[module]; ok {
-		return v, nil
-	}
-	return sourcePath("", module), nil
-}
-
-// modulePaths maps every module the index read to its source path. A store opened read-only reads one snapshot for
-// its whole life, so it reads the map once and its answers share it; a writable store reads it for each answer,
-// because a refresh changes it. A failed read is not kept.
+// modulePaths maps every module the index read to its source path. A wide declaration's answer touches tens of
+// thousands of modules, so the map is read in one query, once for the store (derived); a failed read is not kept.
 func (s *Store) modulePaths(ctx context.Context) (map[string]string, error) {
-	if s.snapshot != nil {
-		s.pathsMu.Lock()
-		defer s.pathsMu.Unlock()
-		if s.snapshotPaths != nil {
-			return s.snapshotPaths, nil
-		}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.derived.paths != nil {
+		return s.derived.paths, nil
 	}
 	out := map[string]string{}
 	rows, err := s.q.QueryContext(ctx, `SELECT module, rel FROM modules`)
@@ -224,10 +214,17 @@ func (s *Store) modulePaths(ctx context.Context) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.snapshot != nil {
-		s.snapshotPaths = out
-	}
+	s.derived.paths = out
 	return out, nil
+}
+
+// pathOf is the source path of module in paths (modulePaths), or the path of its name for a module the index did
+// not read.
+func pathOf(paths map[string]string, module string) string {
+	if p, ok := paths[module]; ok {
+		return p
+	}
+	return sourcePath("", module)
 }
 
 func fileKind(p string, kinds []string) string {
@@ -264,7 +261,10 @@ func (s *Store) Answer(ctx context.Context, name string, opt AnswerOptions) (Ans
 	if decl == nil {
 		return Answer{}, &NotFoundError{Name: name}
 	}
-	ps := &paths{s: s}
+	paths, err := s.modulePaths(ctx)
+	if err != nil {
+		return Answer{}, err
+	}
 	a := Answer{Declaration: decl.Name, Kind: decl.Kind, At: decl.At(), StmtHash: decl.StmtHash}
 	uses, err := s.usersOf(ctx, name)
 	if err != nil {
@@ -281,10 +281,7 @@ func (s *Store) Answer(ctx context.Context, name string, opt AnswerOptions) (Ans
 		if u.parent == name {
 			continue
 		}
-		p, err := ps.of(ctx, u.module)
-		if err != nil {
-			return a, err
-		}
+		p := pathOf(paths, u.module)
 		a.Direct.Uses++
 		if u.parent != "" {
 			parents[u.parent] = true
@@ -318,7 +315,7 @@ func (s *Store) Answer(ctx context.Context, name string, opt AnswerOptions) (Ans
 			a.Lines = append(a.Lines, fmt.Sprintf("%s:%d:%d in %s [%s]", l.path, l.u.line, l.u.col, parent, l.u.class))
 		}
 	}
-	a.Reach, err = s.reach(ctx, ps, name, opt.Why)
+	a.Reach, err = s.reach(ctx, name, opt.Why)
 	return a, err
 }
 
@@ -333,33 +330,26 @@ var propagates = `(e.stmt = 1 OR e.kind IN ('` + strings.Join(defKinds, `', '`) 
 // reach computes the statements a change to root's statement changes, and the proofs at their edge, on the
 // declaration graph that the last refresh wrote. A declaration is its name and the module of its use: Lean names
 // every `example` `_example`, so one name can stand for a declaration of each of many modules.
-func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Reach, error) {
+func (s *Store) reach(ctx context.Context, root string, why bool) (Reach, error) {
 	g, err := s.graph()
+	if err != nil {
+		return Reach{}, err
+	}
+	paths, err := s.modulePaths(ctx)
 	if err != nil {
 		return Reach{}, err
 	}
 	changed, reprove, via := g.walk(root)
 	// byDir groups the names of reached declarations by the directory of their module's source.
-	byDir := func(set map[reachedDecl]bool) (map[string][]string, error) {
+	byDir := func(set map[reachedDecl]bool) map[string][]string {
 		out := map[string][]string{}
 		for d := range set {
-			p, err := ps.of(ctx, d.module)
-			if err != nil {
-				return nil, err
-			}
-			dir := dirOf(p)
+			dir := dirOf(pathOf(paths, d.module))
 			out[dir] = append(out[dir], d.name)
 		}
-		return out, nil
+		return out
 	}
-	cdirs, err := byDir(changed)
-	if err != nil {
-		return Reach{}, err
-	}
-	rdirs, err := byDir(reprove)
-	if err != nil {
-		return Reach{}, err
-	}
+	cdirs, rdirs := byDir(changed), byDir(reprove)
 	all := map[string]bool{}
 	for d := range cdirs {
 		all[d] = true
@@ -396,39 +386,35 @@ func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Re
 	return r, nil
 }
 
-// graph loads the declaration graph once per open index: for a store opened read-only, from the graph file that was
-// in place when its snapshot began, which a later refresh's replacement does not change.
+// graph loads the declaration graph once for the store (derived), from its graph file: for a store opened read-only,
+// the one in place when its snapshot began, which a later refresh's replacement does not change. A graph of another
+// generation than the index's is refused.
 func (s *Store) graph() (*graph, error) {
-	s.graphOnce.Do(func() {
-		var data []byte
-		switch {
-		case s.snapshot == nil:
-			data, s.graphErr = os.ReadFile(s.path + ".graph")
-		case s.graphFile == nil:
-			s.graphErr = fmt.Errorf("%s.graph: %w", s.path, fs.ErrNotExist)
-		default:
-			// Sized as os.ReadFile sizes its buffer; without the size the read still runs to the end of the file.
-			var buf bytes.Buffer
-			if info, err := s.graphFile.Stat(); err == nil {
-				buf.Grow(int(info.Size()) + bytes.MinRead)
-			}
-			_, s.graphErr = buf.ReadFrom(io.NewSectionReader(s.graphFile, 0, math.MaxInt64))
-			data = buf.Bytes()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.derived.graph != nil || s.derived.graphErr != nil {
+		return s.derived.graph, s.derived.graphErr
+	}
+	data, err := io.ReadAll(io.NewSectionReader(s.graphFile, 0, math.MaxInt64))
+	var g *graph
+	if err == nil {
+		g, err = parseGraph(s.path+".graph", data)
+	}
+	if err == nil {
+		if want, metaErr := s.Meta(context.Background(), "graph"); metaErr != nil {
+			err = metaErr
+		} else if g.token != want {
+			err = fmt.Errorf("the graph file is of generation %q, the index of %q", g.token, want)
 		}
-		if s.graphErr == nil {
-			s.g, s.graphErr = parseGraph(s.path+".graph", data)
-		}
-		if s.graphErr == nil {
-			if want, err := s.Meta(context.Background(), "graph"); err != nil {
-				s.graphErr = err
-			} else if s.g.token != want {
-				s.graphErr = fmt.Errorf("the graph file is of generation %q, the index of %q", s.g.token, want)
-			}
-		}
-		if s.graphErr != nil {
-			s.g = nil
-			s.graphErr = fmt.Errorf("the declaration graph is missing, unreadable or out of date: run declindex refresh: %w", s.graphErr)
-		}
-	})
-	return s.g, s.graphErr
+	}
+	if err != nil {
+		s.derived.graphErr = graphUnreadable(err)
+		return nil, s.derived.graphErr
+	}
+	s.derived.graph = g
+	return g, nil
+}
+
+func graphUnreadable(err error) error {
+	return fmt.Errorf("the declaration graph is missing, unreadable or out of date: run declindex refresh: %w", err)
 }

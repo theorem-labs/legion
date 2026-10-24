@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"path/filepath"
 	"slices"
-	"strings"
 )
 
 // RecheckNear is one near pair found among the additions of a landing.
@@ -49,7 +47,7 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 	}
 	seenPairs := map[string]bool{}
 	for _, path := range added {
-		key := strings.TrimSuffix(filepath.Base(path), ".yaml")
+		key := conceptKey(path)
 		concept, ok := byKey[key]
 		if !ok {
 			defect(Defect{Path: path, Message: "added file is not a registered concept"})

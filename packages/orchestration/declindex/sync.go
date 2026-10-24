@@ -23,9 +23,9 @@ func (e *TempError) Error() string { return e.Err.Error() }
 
 func (e *TempError) Unwrap() error { return e.Err }
 
-// Sync returns the synchronisation that RefreshAt runs while it holds the index's refresh lock: it fetches an
-// otherwise absent commit, checks it out, and runs the configured build before the index reads it. Pass it with
-// CheckLandedCoverage: RefreshAt then refuses a tree with tracked changes before it runs it.
+// Sync returns the post-landing synchronisation that Refresh runs under the index's refresh lock
+// (RefreshOptions.Landed): it fetches an otherwise absent commit, checks it out, and runs the configured build before
+// the index reads it.
 func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error {
 	return func(ctx context.Context) error {
 		has, err := hasCommit(ctx, cfg.Tree, commit)
@@ -55,7 +55,7 @@ func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error 
 }
 
 // indexCoversLandedCommit reports whether the complete persisted index has already read commit or a descendant,
-// with its compiled part too when compiled is set. RefreshAt calls it while holding its refresh lock, so a retry
+// with its compiled part too when compiled is set. Refresh calls it while holding its refresh lock, so a retry
 // never mistakes a tree left at a failed build, or an index whose compiled step failed, for an advanced index.
 func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string, compiled bool) (string, error) {
 	indexed, err := s.Meta(ctx, "commit")
@@ -146,6 +146,33 @@ func TreeHead(ctx context.Context, tree string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// CommitAtHead gives the index's commit once it has checked that it is the commit that the Git work tree at tree
+// has checked out, and, when landed is not empty, that landed is that commit or one of its ancestors. It is the
+// precondition of the commands that read the tree with the index: the gate and the post-landing check.
+func (s *Store) CommitAtHead(ctx context.Context, tree, landed string) (string, error) {
+	commit, err := s.Meta(ctx, "commit")
+	if err != nil {
+		return "", err
+	}
+	head, err := TreeHead(ctx, tree)
+	if err != nil {
+		return "", err
+	}
+	if commit != head {
+		return "", fmt.Errorf("the tree HEAD %s differs from the index commit %q: refresh the index", head, commit)
+	}
+	if landed != "" {
+		covers, err := CommitIsAncestor(ctx, tree, landed, commit)
+		if err != nil {
+			return "", err
+		}
+		if !covers {
+			return "", fmt.Errorf("LAND_COMMIT %s is neither the index's commit nor its ancestor", landed)
+		}
+	}
+	return commit, nil
+}
+
 // CommitIsAncestor reports whether ancestor is descendant or one of its ancestors, in the Git repository of tree.
 func CommitIsAncestor(ctx context.Context, tree, ancestor, descendant string) (bool, error) {
 	err := runGit(ctx, tree, nil, "merge-base", "--is-ancestor", ancestor, descendant)
@@ -182,7 +209,7 @@ func runGit(ctx context.Context, tree string, log io.Writer, args ...string) err
 // program runs it again.
 func runBuild(ctx context.Context, tree string, build []string, timeout time.Duration, log io.Writer) error {
 	if timeout <= 0 {
-		timeout = 6 * time.Hour
+		timeout = defaultBuildTimeout
 	}
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()

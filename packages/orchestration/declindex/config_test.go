@@ -87,7 +87,7 @@ func TestConfigBuildSettingsAndLibraryRelativePath(t *testing.T) {
 	if defaults.LibRel != filepath.Join(".lake", "build", "lib", "lean") || defaults.BuildTimeout != 6*time.Hour {
 		t.Fatalf("defaults: relative library %q, timeout %s", defaults.LibRel, defaults.BuildTimeout)
 	}
-	for _, timeout := range []string{"tomorrow", "-1s"} {
+	for _, timeout := range []string{"tomorrow", "-1s", "0s", "90"} {
 		if _, err := LoadConfig(writeConfig(t, "tree: tree\nroots: [A]\nbuild_timeout: "+timeout+"\n")); err == nil {
 			t.Errorf("accepted build_timeout %q", timeout)
 		}

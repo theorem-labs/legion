@@ -33,34 +33,31 @@ type librarianOperation struct {
 	Envelope string `json:"envelope"`
 }
 
-type contractsFileLedger struct {
+// emitter is the landing hook's ledger and librarian (`ledger --emit`): the hook has no network, so it keeps each
+// registration and each review request as an operation for the landing program to apply or deliver, in the order
+// the command makes them: the ledger check's registrations, then the recheck's near pairs.
+type emitter struct {
 	contracts  []ledger.Contract
-	operations []registerOperation
+	operations []any
 }
 
-func (l *contractsFileLedger) Contracts(context.Context, string) ([]ledger.Contract, error) {
-	return l.contracts, nil
+func (m *emitter) Contracts(context.Context, string) ([]ledger.Contract, error) {
+	return m.contracts, nil
 }
 
-func (l *contractsFileLedger) RegisterContract(_ context.Context, _ string, name, owner, hash string, _ bool) (ledger.Contract, error) {
-	l.operations = append(l.operations, registerOperation{
+func (m *emitter) RegisterContract(_ context.Context, _ string, name, owner, hash string, _ bool) (ledger.Contract, error) {
+	m.operations = append(m.operations, registerOperation{
 		Op: "register", Name: name, Owner: owner, StatementHash: hash,
 	})
 	return ledger.Contract{Name: name, Owner: owner, StatementHash: hash, Version: 1}, nil
 }
 
-// emittedLibrarian keeps each review request as an operation: the landing hook has no network, so the landing
-// program delivers them.
-type emittedLibrarian struct {
-	operations []librarianOperation
-}
-
-func (l *emittedLibrarian) Review(_ context.Context, r conceptgate.ReviewRequest) error {
+func (m *emitter) Review(_ context.Context, r conceptgate.ReviewRequest) error {
 	envelope, err := conceptgate.Envelope(r)
 	if err != nil {
 		return err
 	}
-	l.operations = append(l.operations, librarianOperation{Op: "librarian", ID: r.ID, Kind: r.Kind, Proposer: r.Proposer, Envelope: envelope})
+	m.operations = append(m.operations, librarianOperation{Op: "librarian", ID: r.ID, Kind: r.Kind, Proposer: r.Proposer, Envelope: envelope})
 	return nil
 }
 
@@ -128,33 +125,16 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	indexCommit, err := e.store.Meta(ctx, "commit")
+	commit, err := e.store.CommitAtHead(ctx, e.cfg.Tree, landed)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
-	}
-	head, err := declindex.TreeHead(ctx, e.cfg.Tree)
-	if err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	if indexCommit != head {
-		return fail(e.stderr, &unableError{fmt.Errorf("the index is at %q, not the tree's commit %s: refresh it after the landing first", indexCommit, head)})
-	}
-	if landed != "" {
-		covers, err := declindex.CommitIsAncestor(ctx, e.cfg.Tree, landed, indexCommit)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		if !covers {
-			return fail(e.stderr, &unableError{fmt.Errorf("LAND_COMMIT %s is neither the index's commit nor its ancestor", landed)})
-		}
 	}
 
 	var l declindex.ContractLedger
-	var emitted *contractsFileLedger
 	// The recheck's librarian: in emit mode the landing program delivers each request; else (nil) the configured
 	// command receives it.
 	var librarian conceptgate.Librarian
-	var emittedReviews *emittedLibrarian
+	var emitted *emitter
 	if contractsFile != "" {
 		raw, err := os.ReadFile(contractsFile)
 		if err != nil {
@@ -167,10 +147,8 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 			}
 			return fail(e.stderr, &unableError{fmt.Errorf("read contracts file: %w", err)})
 		}
-		emitted = &contractsFileLedger{contracts: contracts}
-		l = emitted
-		emittedReviews = &emittedLibrarian{}
-		librarian = emittedReviews
+		emitted = &emitter{contracts: contracts}
+		l, librarian = emitted, emitted
 	} else {
 		existing, err := ledger.OpenExisting(ctx, dsn)
 		if err != nil {
@@ -187,16 +165,9 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		}
 		return fail(e.stderr, &unableError{err})
 	}
-	registry := conceptgate.RecheckLanding(ctx, e.cfg, e.store, r.Commit, landed, conceptgate.Options{Librarian: librarian, Log: e.stderr})
+	registry := conceptgate.RecheckLanding(ctx, e.cfg, e.store, commit, landed, conceptgate.Options{Librarian: librarian, Log: e.stderr})
 	if emitted != nil {
-		operations := make([]any, 0, len(emitted.operations)+len(emittedReviews.operations))
-		for _, op := range emitted.operations {
-			operations = append(operations, op)
-		}
-		for _, op := range emittedReviews.operations {
-			operations = append(operations, op)
-		}
-		if err := writeLedgerOperations(emit, operations); err != nil {
+		if err := writeLedgerOperations(emit, emitted.operations); err != nil {
 			return fail(e.stderr, &unableError{err})
 		}
 	}

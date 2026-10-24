@@ -71,7 +71,7 @@ func TestFreshClassifiesLakeBuildOutputs(t *testing.T) {
 	sourcePath := filepath.Join(root, filepath.FromSlash(rel)+".lean")
 	writeLakeFile(t, sourcePath, source)
 
-	notBuilt, err := Fresh(root, libRel, rel, []byte(source))
+	notBuilt, _, err := Fresh(root, libRel, rel, []byte(source))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,17 +86,17 @@ func TestFreshClassifiesLakeBuildOutputs(t *testing.T) {
 			sourcePath, sourceHash, ileanOut, synthetic)
 	}
 	writeLakeFile(t, base+".trace", trace(false, hash))
-	fresh, err := Fresh(root, libRel, rel, []byte(source))
+	fresh, ilean, err := Fresh(root, libRel, rel, []byte(source))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fresh.State != FreshnessFresh {
-		t.Fatalf("matching build trace = %+v, want fresh", fresh)
+	if fresh.State != FreshnessFresh || string(ilean) != "{}" {
+		t.Fatalf("matching build trace = %+v with .ilean %q, want fresh with the .ilean it checked", fresh, ilean)
 	}
 
 	stale := func(what string) {
 		t.Helper()
-		got, err := Fresh(root, libRel, rel, []byte(source))
+		got, _, err := Fresh(root, libRel, rel, []byte(source))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -110,7 +110,7 @@ func TestFreshClassifiesLakeBuildOutputs(t *testing.T) {
 	writeLakeFile(t, base+".trace", `{"schemaVersion":"next","inputs":[],"synthetic":false}`)
 	stale("unknown schema")
 
-	// The plan's E5 control: the build directory's source rewritten after the build, its trace unchanged.
+	// A control: the build directory's source rewritten after the build, its trace unchanged.
 	writeLakeFile(t, base+".trace", trace(false, hash))
 	writeLakeFile(t, sourcePath, "one\ntwo rewritten\n")
 	stale("rewritten built source")
@@ -143,7 +143,7 @@ func TestFreshChecksFetchedSourceAgeAndBytes(t *testing.T) {
 	fetch := fmt.Sprintf(`{"schemaVersion":"2025-09-10","inputs":[],"outputs":{"i":%q},"synthetic":true}`, LakeTextHash([]byte("{}"))+".ilean")
 	writeLakeFile(t, tracePath, fetch)
 
-	fresh, err := Fresh(root, libRel, rel, []byte(source))
+	fresh, _, err := Fresh(root, libRel, rel, []byte(source))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestFreshChecksFetchedSourceAgeAndBytes(t *testing.T) {
 	if err := os.Chtimes(sourcePath, now.Add(time.Second), now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	oldFetch, err := Fresh(root, libRel, rel, []byte(source))
+	oldFetch, _, err := Fresh(root, libRel, rel, []byte(source))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestFreshChecksFetchedSourceAgeAndBytes(t *testing.T) {
 	}
 
 	writeLakeFile(t, sourcePath, "one\ntwo changed\n")
-	differentSource, err := Fresh(root, libRel, rel, []byte(source))
+	differentSource, _, err := Fresh(root, libRel, rel, []byte(source))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestFreshChecksFetchedSourceAgeAndBytes(t *testing.T) {
 	writeLakeFile(t, sourcePath, source)
 	writeLakeFile(t, tracePath, fetch)
 	writeLakeFile(t, base+".ilean", `{"decls":{}}`)
-	copied, err := Fresh(root, libRel, rel, []byte(source))
+	copied, _, err := Fresh(root, libRel, rel, []byte(source))
 	if err != nil {
 		t.Fatal(err)
 	}

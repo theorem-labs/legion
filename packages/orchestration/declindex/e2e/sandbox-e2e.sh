@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs the sandbox acceptance cases (E4). On the host this script only records Docker metadata and starts one-shot
+# Runs the sandbox acceptance cases. On the host this script only records Docker metadata and starts one-shot
 # containers; the fixture build, the index refresh and every gate probe run inside them.
 set -eu
 

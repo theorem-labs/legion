@@ -17,7 +17,7 @@ The image never builds Lean. It copies the prebuilt toolchain `/opt/lean/<LEAN_F
 
 The base is the digest-pinned `golang:1.27.1-trixie` image, because the prebuilt toolchain links the system `libgmp` and `libstdc++` of Debian trixie; the build checks that `libgmp10` is 6.3.0 or newer, which Lean requires. The image installs elan v4.2.4 after checking its SHA-256, links the toolchain as `LEAN_TOOLCHAIN` and makes it the default, and installs `declindex`, `ledger`, `python3` and `strace`.
 
-The checksum's negative control (E8) is the same build with one digit of `ELAN_SHA256` changed; it must fail at `sha256sum --check`, before `elan-init` runs:
+The checksum's negative control is the same build with one digit of `ELAN_SHA256` changed; it must fail at `sha256sum --check`, before `elan-init` runs:
 
 ```sh
 docker buildx build --tag declindex-e2e:bad-elan \
@@ -79,7 +79,7 @@ go run ./packages/orchestration/declindex/e2e/parity \
 
 ## Librarian recording
 
-Configure a gate's `librarian` command with `record-librarian`. The record path is supplied by `LIBRARIAN_RECORD`.
+Configure a gate's `librarian` command with `record-librarian`; the gate calls it with its own arguments, as below. The record path is supplied by `LIBRARIAN_RECORD`.
 
 ```sh
 LIBRARIAN_RECORD=/path/to/librarian-record \
@@ -89,15 +89,17 @@ packages/orchestration/declindex/e2e/record-librarian \
   --proposal /path/to/request
 ```
 
-It appends `<UTC>\t<id>\t<proposer>\t<SHA-256>` to the record, copies the proposal to `$LIBRARIAN_RECORD.d/<id>`, and then executes the optional command after `--`. Its exit status is that command's status.
+It appends `<UTC>\t<id>\t<proposer>\t<SHA-256>` to the record, copies the proposal to `$LIBRARIAN_RECORD.d/<id>`, and exits 0.
+
+To record in front of a real librarian, configure `librarian: [record-librarian, --, COMMAND, ARGS...]`. The gate appends `--id … --proposer … --proposal …` to that list, so `record-librarian` takes everything between the leading `--` and those six arguments as the command. It records the call, then runs `COMMAND ARGS... --id … --proposer … --proposal …`, and exits with its status.
 
 ## Ledger join
 
-Run the E7 join where `declindex`, `ledger`, Python 3, the configuration's indexed tree, and the ledger DSN are reachable. `E7_CANDIDATE_COMMIT` and `E7_CHANGED_HASH` must name the already prepared, real candidate; the driver does not invent a source mutation.
+Run the ledger join where `declindex`, `ledger`, Python 3, the configuration's indexed tree, and the ledger DSN are reachable. `JOIN_CANDIDATE_COMMIT` and `JOIN_CHANGED_HASH` must name the already prepared, real candidate; the driver does not invent a source mutation.
 
 ```sh
-E7_CANDIDATE_COMMIT=<40-lowercase-hex-commit> \
-E7_CHANGED_HASH=<16-lowercase-hex-statement-hash> \
+JOIN_CANDIDATE_COMMIT=<40-lowercase-hex-commit> \
+JOIN_CHANGED_HASH=<16-lowercase-hex-statement-hash> \
 packages/orchestration/declindex/e2e/ledger-join.sh \
   /path/to/declindex.yaml \
   <ledger-repository> \
@@ -106,7 +108,7 @@ packages/orchestration/declindex/e2e/ledger-join.sh \
   /path/to/ledger-dsn
 ```
 
-The driver ensures the repository with a three-round limit, then runs E7 steps 1 through 6 in order: register, open and verify `e7-a`, open `e7-b`, land `e7-a` at version 2, open and verify `e7-c` at version 2, then require the stale-read refusal for `e7-b`. It exits at the first deviation. `DECLINDEX_BIN` and `LEDGER_BIN` may override the commands on `PATH`.
+The driver ensures the repository with a three-round limit, then runs steps 1 through 6 in order: register, open and verify `join-a`, open `join-b`, land `join-a` at version 2, open and verify `join-c` at version 2, then require the stale-read refusal for `join-b`. It exits at the first deviation. `DECLINDEX_BIN` and `LEDGER_BIN` may override the commands on `PATH`.
 
 ## Driver tests
 

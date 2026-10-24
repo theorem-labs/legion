@@ -28,11 +28,11 @@ type Config struct {
 	Jobs      int      `yaml:"jobs"`
 	// Registry is the concept registry directory (see package conceptgate), relative to Tree.
 	Registry string `yaml:"registry"`
-	// Build runs in Tree after RefreshAt has moved it to LAND_COMMIT.
+	// Build runs in Tree after a landed refresh (Sync) has moved it to LAND_COMMIT.
 	Build []string `yaml:"build"`
-	// Remote is the sole remote RefreshAt fetches LAND_COMMIT from when Tree lacks it.
+	// Remote is the sole remote Sync fetches LAND_COMMIT from when Tree lacks it.
 	Remote string `yaml:"remote"`
-	// BuildTimeout bounds Build; LoadConfig defaults it to six hours.
+	// BuildTimeout bounds Build (a duration such as 90s); LoadConfig defaults it to six hours.
 	BuildTimeout time.Duration `yaml:"build_timeout"`
 	// Lean configures the exporter of compiled modules. With Lean.Export off, the index reads only the reference
 	// files (uses, positions, statement hashes).
@@ -48,25 +48,11 @@ type Config struct {
 	Librarian []string `yaml:"librarian"`
 }
 
-// configYAML retains YAML's strict field check while Config keeps resolved paths and a parsed duration.
-type configYAML struct {
-	Tree         string       `yaml:"tree"`
-	Lib          string       `yaml:"lib"`
-	DB           string       `yaml:"db"`
-	Roots        []string     `yaml:"roots"`
-	FileKinds    []string     `yaml:"file_kinds"`
-	Jobs         int          `yaml:"jobs"`
-	Registry     string       `yaml:"registry"`
-	Build        []string     `yaml:"build"`
-	Remote       string       `yaml:"remote"`
-	BuildTimeout string       `yaml:"build_timeout"`
-	Lean         LeanConfig   `yaml:"lean"`
-	Contracts    ContractRule `yaml:"contracts"`
-	Owners       string       `yaml:"owners"`
-	OwnersFormat string       `yaml:"owners_format"`
-	Repo         string       `yaml:"repo"`
-	Librarian    []string     `yaml:"librarian"`
-}
+// defaultBuildTimeout bounds a build that the configuration does not bound.
+const defaultBuildTimeout = 6 * time.Hour
+
+// defaultJobs is the parallelism that the configuration does not set: one job for each CPU, at most 48.
+func defaultJobs() int { return min(48, runtime.NumCPU()) }
 
 // LeanConfig says how to build and run the exporter.
 type LeanConfig struct {
@@ -98,33 +84,27 @@ func LoadConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	var y configYAML
+	// A build_timeout the file does not set keeps the default; one that it sets is checked below.
+	c := Config{BuildTimeout: defaultBuildTimeout}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
-	if err := dec.Decode(&y); err != nil {
+	if err := dec.Decode(&c); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
-	if y.Tree == "" {
+	if c.Tree == "" {
 		return Config{}, fmt.Errorf("%s: tree is required", path)
 	}
-	if len(y.Roots) == 0 {
+	if len(c.Roots) == 0 {
 		return Config{}, fmt.Errorf("%s: roots are required: the first components of the project's module names", path)
 	}
-	if y.Registry != "" {
+	if c.Registry != "" {
 		// IsLocal accepts "." (the tree itself), which is no registry directory below it.
-		if !filepath.IsLocal(y.Registry) || filepath.Clean(y.Registry) == "." {
+		if !filepath.IsLocal(c.Registry) || filepath.Clean(c.Registry) == "." {
 			return Config{}, fmt.Errorf("%s: registry must be a non-empty relative path below the tree", path)
 		}
 	}
-	timeout := 6 * time.Hour
-	if y.BuildTimeout != "" {
-		timeout, err = time.ParseDuration(y.BuildTimeout)
-		if err != nil || timeout <= 0 {
-			if err == nil {
-				err = errors.New("must be greater than zero")
-			}
-			return Config{}, fmt.Errorf("%s: build_timeout %q: %w", path, y.BuildTimeout, err)
-		}
+	if c.BuildTimeout <= 0 {
+		return Config{}, fmt.Errorf("%s: build_timeout %s: must be greater than zero", path, c.BuildTimeout)
 	}
 	// Every path is absolute, so that a relative --config gives paths that filepath.Rel can compare.
 	dir, err := filepath.Abs(filepath.Dir(path))
@@ -137,25 +117,9 @@ func LoadConfig(path string) (Config, error) {
 		}
 		return filepath.Join(base, p)
 	}
-	libRel := cmp.Or(y.Lib, filepath.Join(".lake", "build", "lib", "lean"))
-	c := Config{
-		Tree:         rel(dir, y.Tree),
-		LibRel:       libRel,
-		DB:           rel(dir, y.DB),
-		Roots:        y.Roots,
-		FileKinds:    y.FileKinds,
-		Jobs:         y.Jobs,
-		Registry:     y.Registry,
-		Build:        y.Build,
-		Remote:       y.Remote,
-		BuildTimeout: timeout,
-		Lean:         y.Lean,
-		Contracts:    y.Contracts,
-		Owners:       y.Owners,
-		OwnersFormat: y.OwnersFormat,
-		Repo:         y.Repo,
-		Librarian:    y.Librarian,
-	}
+	c.Tree = rel(dir, c.Tree)
+	c.DB = rel(dir, c.DB)
+	c.LibRel = cmp.Or(c.Lib, filepath.Join(".lake", "build", "lib", "lean"))
 	c.Lib = rel(c.Tree, c.LibRel)
 	c.Registry = rel(c.Tree, c.Registry)
 	c.Owners = rel(c.Tree, c.Owners)
@@ -277,7 +241,7 @@ func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) 
 		deps, _ := filepath.Glob(filepath.Join(c.Tree, ".lake", "packages", pattern, ".lake", "build", "lib", "lean"))
 		search = append(search, deps...)
 	}
-	jobs := cmp.Or(c.Lean.Jobs, c.Jobs, min(48, runtime.NumCPU()))
+	jobs := cmp.Or(c.Lean.Jobs, c.Jobs, defaultJobs())
 	per := cmp.Or(c.Lean.ModulesPerProcess, 400)
 	return &CompiledOptions{
 		Exporter: &Exporter{Lean: l, Bin: bin, SearchPath: search, Jobs: jobs, ModulesPerProcess: per, Log: log},

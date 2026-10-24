@@ -119,29 +119,57 @@ type Store struct {
 	// q is what every read of the store goes through: the database, or for a store opened read-only its snapshot.
 	q    dbReader
 	path string
-	// snapshot is the one read transaction that a store opened read-only reads for its whole life, and graphFile the
-	// graph file that was in place when it began (OpenReadOnly).
-	snapshot  *sql.Tx
-	graphFile *os.File
-	// release gives back the shared holds on the locks of a store opened in a read-only directory.
+	// release ends what a store opened read-only holds besides its files: its snapshot, and its shared holds on the
+	// locks.
 	release func()
 
-	graphOnce sync.Once
-	g         *graph
-	graphErr  error
+	// mu guards graphFile and derived.
+	mu sync.Mutex
+	// graphFile is the graph file that the store's answers read: for a store opened read-only the one in place when
+	// its snapshot began, and for a writable store the one in place when it opened or its last refresh wrote one.
+	graphFile *os.File
+	derived   derived
 
-	// snapshotPaths is the module-path map of a store opened read-only, read once (modulePaths).
-	pathsMu       sync.Mutex
-	snapshotPaths map[string]string
+	// afterRefreshLock is a test hook. Refresh runs it once it holds the refresh lock, before the landed sync.
+	afterRefreshLock func(context.Context) error
+}
 
-	// beforeRefreshLock is a test hook. It runs immediately before RefreshAt attempts the refresh lock.
-	beforeRefreshLock func()
+// derived is what a store reads from its index once and keeps for its answers: the declaration graph (or why it
+// could not), and each module's source path. reload drops it.
+type derived struct {
+	graph    *graph
+	graphErr error
+	paths    map[string]string
+}
+
+// reload holds the graph file now in place and drops what the store derived from the index before. Open and
+// OpenReadOnly call it once the index is open, and a refresh once it has rewritten the modules and the graph.
+func (s *Store) reload() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.graphFile != nil {
+		_ = s.graphFile.Close()
+	}
+	f, err := os.Open(s.path + ".graph")
+	s.graphFile, s.derived = f, derived{}
+	if err != nil {
+		s.graphFile, s.derived.graphErr = nil, graphUnreadable(err)
+	}
 }
 
 // Open opens (creating it if needed) the index at path. An index of another schema version is emptied, so the
 // next refresh rebuilds it.
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	// The file is created here, through a symlink when path is one, so that resolveIndex names the file itself.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	_ = f.Close()
+	if path, err = resolveIndex(path); err != nil {
 		return nil, err
 	}
 	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(" + busyTimeoutMS + ")" +
@@ -155,7 +183,20 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	s.reload()
 	return s, nil
+}
+
+// resolveIndex resolves the symlinks of the existing index file at path. An index's lock files and graph are named
+// from the path of the file itself, as SQLite names its -wal and -shm files, so that every path that names one index
+// (a symlink to it, or the resolved path that the gate opens, Config.GateIndexPath) takes the same locks and reads
+// the same graph.
+func resolveIndex(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve the index %s: %w", path, err)
+	}
+	return resolved, nil
 }
 
 // ReadScope is what a store opened read-only reads besides the index, and so which part of a running refresh a
@@ -196,6 +237,10 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 		return nil, err
 	} else if info.IsDir() {
 		return nil, fmt.Errorf("index %s is a directory", path)
+	}
+	path, err := resolveIndex(path)
+	if err != nil {
+		return nil, err
 	}
 	dsn := "file:" + path + "?mode=ro&_pragma=query_only(ON)&_pragma=busy_timeout(" + busyTimeoutMS + ")"
 	var release func()
@@ -239,11 +284,18 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 	s := &Store{db: db, q: db, path: path, release: release}
 	// One read transaction for the store's life, so that every read of it sees one committed state of the index. It
 	// lives until Close, not until ctx ends; its first read below begins the snapshot.
-	if s.snapshot, err = db.BeginTx(context.WithoutCancel(ctx), &sql.TxOptions{ReadOnly: true}); err != nil {
+	snapshot, err := db.BeginTx(context.WithoutCancel(ctx), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("open the index read-only: %w", err)
 	}
-	s.q = s.snapshot
+	s.q = snapshot
+	s.release = func() {
+		_ = snapshot.Rollback()
+		if release != nil {
+			release()
+		}
+	}
 	version, err := s.Meta(ctx, "schema")
 	if err != nil {
 		_ = s.Close()
@@ -256,9 +308,7 @@ func OpenReadOnly(ctx context.Context, path string, scope ReadScope) (*Store, er
 	// The graph file of this state: a refresh replaces it just before its commit, so this opens a later one only when
 	// a refresh replaced it after the snapshot's first read above, and graph() refuses that one. A reader keeps the
 	// file it opened when a later refresh replaces it.
-	if f, err := os.Open(path + ".graph"); err == nil {
-		s.graphFile = f
-	}
+	s.reload()
 	return s, nil
 }
 
@@ -328,22 +378,18 @@ func (s *Store) schemaVersion(ctx context.Context) (string, error) {
 	return s.Meta(ctx, "schema")
 }
 
-// Close closes the index: it ends the read-only store's snapshot and gives back its holds on the locks.
+// Close closes the index: it ends a read-only store's snapshot and gives back its holds on the locks, and closes the
+// graph file and the database.
 func (s *Store) Close() error {
-	if s.snapshot != nil {
-		_ = s.snapshot.Rollback()
-		s.snapshot = nil
+	if s.release != nil {
+		s.release()
+		s.release = nil
 	}
 	if s.graphFile != nil {
 		_ = s.graphFile.Close()
 		s.graphFile = nil
 	}
-	err := s.db.Close()
-	if s.release != nil {
-		s.release()
-		s.release = nil
-	}
-	return err
+	return s.db.Close()
 }
 
 type execer interface {
@@ -356,12 +402,9 @@ func (s *Store) setMeta(ctx context.Context, x execer, k, v string) error {
 }
 
 // Meta reads one value the index keeps about itself (commit, built, schema, errors); empty when unset.
-func (s *Store) Meta(ctx context.Context, k string) (string, error) { return readMeta(ctx, s.q, k) }
-
-// readMeta is Meta through q: the store's reader, or a read transaction of its own (LandSnapshot).
-func readMeta(ctx context.Context, q dbReader, k string) (string, error) {
+func (s *Store) Meta(ctx context.Context, k string) (string, error) {
 	var v string
-	err := q.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
+	err := s.q.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -392,6 +435,21 @@ func (s *Store) CheckComplete(ctx context.Context) error {
 // lock until ctx ends.
 func (s *Store) lockRefresh(ctx context.Context) (func(), error) {
 	return lockFile(ctx, s.path+refreshLockSuffix, true)
+}
+
+// writeTx runs f in one transaction of the index under the write lock (write), and commits it when f succeeds.
+func (s *Store) writeTx(ctx context.Context, log io.Writer, f func(*sql.Tx) error) error {
+	return s.write(ctx, log, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := f(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 // write runs f, a write of the index, while it holds the index's write lock exclusive, and then moves the

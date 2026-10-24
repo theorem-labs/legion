@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
 	"os/exec"
 	"path/filepath"
@@ -117,17 +118,32 @@ func workTreeLocation(dir string) (top, prefix string, err error) {
 	return top, prefix, nil
 }
 
+// nulRecords yields the NUL-terminated records of the -z output of a git command in order, and an error instead of
+// a last record that has no NUL.
+func nulRecords(command string, raw []byte) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		for len(raw) > 0 {
+			end := bytes.IndexByte(raw, 0)
+			if end < 0 {
+				yield("", fmt.Errorf("%s output is not NUL terminated", command))
+				return
+			}
+			if !yield(string(raw[:end]), nil) {
+				return
+			}
+			raw = raw[end+1:]
+		}
+	}
+}
+
 // parseTrackedSources reads `git ls-files -s -z --full-name` output. It keys each stage-0 Lean source by its path
 // without prefix and skips a path outside the tree.
 func parseTrackedSources(raw []byte, prefix string) (map[string]string, error) {
 	out := map[string]string{}
-	for len(raw) > 0 {
-		end := bytes.IndexByte(raw, 0)
-		if end < 0 {
-			return nil, fmt.Errorf("git ls-files output is not NUL terminated")
+	for record, err := range nulRecords("git ls-files", raw) {
+		if err != nil {
+			return nil, err
 		}
-		record := string(raw[:end])
-		raw = raw[end+1:]
 		fields, path, ok := strings.Cut(record, "\t")
 		if !ok {
 			return nil, fmt.Errorf("git ls-files record has no path")
@@ -150,26 +166,26 @@ func parseTrackedSources(raw []byte, prefix string) (map[string]string, error) {
 // each changed Lean source's path without prefix and skips a path outside the tree.
 func changedSourcePaths(raw []byte, prefix string) ([]string, error) {
 	set := map[string]bool{}
-	for len(raw) > 0 {
-		end := bytes.IndexByte(raw, 0)
-		if end < 0 {
-			return nil, fmt.Errorf("git status output is not NUL terminated")
+	// original is set when the next record is the original path of a rename or copy, which is skipped.
+	original := false
+	for record, err := range nulRecords("git status", raw) {
+		if err != nil {
+			return nil, err
 		}
-		record := string(raw[:end])
-		raw = raw[end+1:]
+		if original {
+			original = false
+			continue
+		}
 		if len(record) < 4 || record[2] != ' ' {
 			return nil, fmt.Errorf("git status record %q is malformed", record)
 		}
 		if rel, inTree := strings.CutPrefix(record[3:], prefix); inTree && strings.HasSuffix(rel, ".lean") {
 			set[rel] = true
 		}
-		if record[0] == 'R' || record[0] == 'C' || record[1] == 'R' || record[1] == 'C' {
-			end := bytes.IndexByte(raw, 0)
-			if end < 0 {
-				return nil, fmt.Errorf("git status rename record has no original path")
-			}
-			raw = raw[end+1:]
-		}
+		original = record[0] == 'R' || record[0] == 'C' || record[1] == 'R' || record[1] == 'C'
+	}
+	if original {
+		return nil, fmt.Errorf("git status rename record has no original path")
 	}
 	return slices.Sorted(maps.Keys(set)), nil
 }
