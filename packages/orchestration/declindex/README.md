@@ -55,7 +55,7 @@ declindex --config <cfg> gate --proposer <owner-id> [--accepted-by <owner-id>] P
 | 5 | `name-taken`: a concept, a declaration or a concept file that the loader refused already has the proposal name. | Use that concept, or use another name for a different statement. |
 | 2 | Usage error. | Correct the command invocation. |
 
-The comparison has no embedding threshold and no partial-atom threshold. Exact compiled hashes are refused. A statement that directly states a registered form, or states it through a declaration in the proposal, is near. A proposal that the gate cannot compare is also near rather than accepted. `--accepted-by` records a librarian decision that a near proposal is new; the resulting addition records `accepted_by` and `accepted_near`.
+The comparison has no embedding threshold and no partial-atom threshold. Exact compiled hashes are refused. Two statements have the same compiled hash when their elaborated terms are equal up to binder names, the declaration's own name, and how a numeral of core Lean's `Nat` and `BitVec` instances is written (`7#64` and `7 : BitVec 64` agree). Any other numeral counts with its type and instance, since its instance gives its value: `@OfNat.ofNat Nat 7 ⟨9⟩` is 9, so it is not `@OfNat.ofNat Nat 7 ⟨10⟩`. A statement that directly states a registered form, or states it through a declaration in the proposal, is near. Form matching compares numerals only by the value they are written with, so it gives only near results. A proposal that the gate cannot compare is also near rather than accepted. `--accepted-by` records a librarian decision that a near proposal is new; the resulting addition records `accepted_by` and `accepted_near`.
 
 For every near result, the configured `librarian: [cmd, args…]` receives:
 

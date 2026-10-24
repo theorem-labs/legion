@@ -96,6 +96,23 @@ func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	if again.Exported != 0 {
 		t.Fatalf("an unchanged build was exported again: %d", again.Exported)
 	}
+	// Changed exporter sources build to another path (BuildExporter names its directory by their digest), and the
+	// compiled part's digest covers that path: every module is read again, so no hash of the old exporter stays.
+	bin, err := os.ReadFile(co.Exporter.Bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	co.Exporter.Bin = filepath.Join(t.TempDir(), "declexport")
+	if err := os.WriteFile(co.Exporter.Bin, bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.Exported != 1 {
+		t.Fatalf("another exporter did not export again: %d", rebuilt.Exported)
+	}
 	co.Forms.Concepts[0].Forms = spForms[:1]
 	changed, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
 	if err != nil {

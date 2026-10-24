@@ -333,7 +333,8 @@ type Compiled struct {
 	Kind   string `json:"kind"`
 	Type   string `json:"type"`
 	// Hash is the compiled statement hash: equal for two declarations whose elaborated statements are equal up to
-	// the names of their binders and of the declaration itself.
+	// the names of their binders and of the declaration itself, and up to how a numeral of core Lean's Nat and
+	// BitVec instances is written. Any other numeral counts with its type and instance, which give its value.
 	Hash  string   `json:"compiled_hash"`
 	Atoms []string `json:"atoms,omitempty"`
 	Facts []Fact   `json:"facts,omitempty"`

@@ -1,21 +1,23 @@
 import Lean
 open Lean
 
-/-! Shared pieces of the exporter: numeric literals as values, and structural hashes of expressions that do not
-depend on binder names, binder kinds, metadata or the names of universe parameters. -/
+/-! Shared pieces of the exporter: structural hashes of expressions that do not depend on binder names, binder
+kinds, metadata, the names of universe parameters, or how a numeral of core Lean's `Nat` and `BitVec` instances is
+written. -/
 
 namespace DeclExport
 
-/-- The value of a numeric literal however it is elaborated: a raw literal, `OfNat.ofNat _ n _`, `instOfNatNat n`
-or `BitVec.ofNat w n` (the `n#w` notation). -/
-partial def lit? (e : Expr) : Option Nat :=
-  match e.consumeMData with
-  | .lit (.natVal n) => some n
-  | e =>
-    if e.isAppOfArity ``OfNat.ofNat 3 then lit? (e.getArg! 1)
-    else if e.isAppOfArity ``instOfNatNat 1 then lit? (e.getArg! 0)
-    else if e.isAppOfArity ``BitVec.ofNat 2 then lit? (e.getArg! 1)
+/-- What the numeral `OfNat.ofNat α n inst` unfolds to when `inst` is a core instance with a known value:
+`instOfNatNat m` gives the literal `m`, and `BitVec.instOfNat w i` gives `BitVec.ofNat w i`, the elaboration of
+`i#w`. Any other instance gives `none`: its value is the instance's, not `n`'s. -/
+def unfoldNumeral? (e : Expr) : Option Expr :=
+  if e.isAppOfArity ``OfNat.ofNat 3 then
+    let inst := (e.getArg! 2).consumeMData
+    if inst.isAppOfArity ``instOfNatNat 1 then some (inst.getArg! 0)
+    else if inst.isAppOfArity ``BitVec.instOfNat 2 then
+      some (mkApp2 (.const ``BitVec.ofNat []) (inst.getArg! 0) (inst.getArg! 1))
     else none
+  else none
 
 /-- Two independent 64-bit lanes, so that a hash collision among a million constants is not a concern. -/
 structure H where
@@ -86,7 +88,9 @@ structure HashState where
 
 abbrev HashM := StateM HashState
 
-/-- The structural hash of `e`. Numeric literals hash by value, so `7#64` and `OfNat.ofNat _ 7 _` agree. -/
+/-- The structural hash of `e`. A numeral of a core instance hashes as what it unfolds to (`unfoldNumeral?`), so
+`7 : Nat` and the literal `7` agree, and so do `7#64` and `7 : BitVec 64`. Any other numeral hashes as written, its
+type and instance included: the instance gives its value, so `@OfNat.ofNat Nat 7 ⟨9⟩` is 9. -/
 partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
   if let some h := (← get).memo[e]? then return h
   let h ← match e with
@@ -116,8 +120,8 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
           pure (H.tag "self" (H.ofU i.toUInt64 :: H.ofString suffix :: ls.map (hashLevel ctx)))
         | none => pure (H.tag "c" (H.ofString n.toString :: ls.map (hashLevel ctx)))
     | .app .. =>
-      match lit? e with
-      | some n => pure (H.tag "n" [H.ofString (toString n)])
+      match unfoldNumeral? e with
+      | some u => hashExpr ctx u
       | none => do pure (H.tag "a" [← hashExpr ctx e.appFn!, ← hashExpr ctx e.appArg!])
     | .lam _ d b _ => do pure (H.tag "L" [← hashExpr ctx d, ← hashExpr ctx b])
     | .forallE _ d b _ => do pure (H.tag "P" [← hashExpr ctx d, ← hashExpr ctx b])
