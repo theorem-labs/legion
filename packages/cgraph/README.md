@@ -213,15 +213,19 @@ These rules follow what the machine code shows, each only where it shows it:
   edge needs that table's initializer; another unit's table of the same name does not count.
 - A folded helper's code that its caller's arguments decide against is dead for that caller: the facts
   give each function a table of `guards`, conditions on its parameters (if, `?:`, the right operand of
-  `&&`/`||`, the other operand of an `&` or `*` that a parameter may make 0 (`file->f_mode & mask`,
+  `&&`/`||`, the left one too where neither has an effect and the right one may decide alone
+  (`page_group_by_mobility_disabled && migratetype < MIGRATE_PCPTYPES`, where
+  reserve_highatomic_pageblock passes `MIGRATE_PCPTYPES`), the other operand of an `&` or `*` that a
+  parameter may make 0 (`file->f_mode & mask`,
   where fdget_raw passes mask 0), switch cases, the statements after `if (c) return;`, and the code
   past a label that only gotos before it reach, under the guards of those gotos; none across a label
   a later goto reaches), and each event the guards it is compiled under. A guard states each variable
   as the values it may hold: a parameter nothing writes (or whose address escapes only later in the
   text, outside any loop)
   is the caller's argument, a variable that plain assignments write is a choice among its first
-  value and each value assigned, one that `|=`, `&=` or `^=` change also each value those make of
-  it, and a call of a helper of the unit is its template with the arguments put in
+  value and each value assigned (its first value alone where every assignment is later in the text,
+  outside any loop and after no label), one that `|=`, `&=` or `^=` change also each value those make
+  of it, and a call of a helper of the unit is its template with the arguments put in
   (`node_online(this_node)` is `this_node == 0` without NUMA). A guard is decided where every value
   it may take agrees, and an `==` or `!=` between two reads of one value is decided whatever that
   value is: a pointer local set once (by its initializer or one assignment no loop or label repeats)
@@ -245,6 +249,9 @@ These rules follow what the machine code shows, each only where it shows it:
   callee ignores) is marked `value_unused`; the facts give the callee a second event set,
   `value_unused`, from its walk with each return's value discarded, and link folds that set there:
   `rq_clock_task`'s `WARN_ON_ONCE` test stays and its read of `rq->clock_task` goes.
+  A discarded value whose only effects are where the image makes a choice (`cpumask_empty`'s
+  `find_first_bit`, after `bitmap_empty`'s `__builtin_constant_p` test returns, in `vmstat_cpu_dead`)
+  is `conditional`: the image decides whether it is compiled.
 - A member address the machine code never forms because container_of takes it back is no field
   access where the helper that does so is folded: an argument `&p->m` at a parameter whose every use
   is `container_of(·, T, m)` (directly, through a local it initializes, or through another helper's

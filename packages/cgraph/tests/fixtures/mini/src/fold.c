@@ -371,3 +371,58 @@ unsigned long fd_copy(struct fd_ra *r, unsigned long n)
 fallback:
 	return n - (index - start);
 }
+
+/* mm/page_alloc.c set_pageblock_migratetype: if (page_group_by_mobility_disabled && migratetype <
+ * MIGRATE_PCPTYPES) migratetype = MIGRATE_UNMOVABLE;, which reserve_highatomic_pageblock reaches
+ * with MIGRATE_HIGHATOMIC = MIGRATE_PCPTYPES: the && is 0 without its left operand. */
+struct fd_block {
+	int disabled;
+	int type;
+};
+
+static inline void fd_set_type(struct fd_block *b, int type)
+{
+	if (b->disabled && type < 3)
+		type = 0;
+	b->type = type;
+}
+
+void fd_set_high(struct fd_block *b)
+{
+	fd_set_type(b, 3);
+}
+
+void fd_set_low(struct fd_block *b)
+{
+	fd_set_type(b, 1);
+}
+
+/* mm/vmstat.c vmstat_cpu_dead: node_cpus = cpumask_of_node(node); if (!cpumask_empty(node_cpus))
+ * return 0; node_clear_state(node, N_CPU); return 0;, where bitmap_empty's effect (find_first_bit)
+ * is only beside its __builtin_constant_p path: the image decides, and drops it all (llvm-objdump:
+ * li a0, 0x0; ret). */
+struct fd_cpus {
+	unsigned long bits[1];
+};
+
+static inline int fd_empty(const unsigned long *bits, unsigned int n)
+{
+	if (__builtin_constant_p(n) && n < 64)
+		return !(*bits & ((1UL << n) - 1));
+	__asm__ volatile("" ::: "memory");
+	return !bits[0];
+}
+
+static inline void fd_clear_state(int node)
+{
+}
+
+int fd_cpu_dead(struct fd_cpus *online, int node)
+{
+	const unsigned long *mask = online->bits;
+
+	if (!fd_empty(mask, 32))
+		return 0;
+	fd_clear_state(node);
+	return 0;
+}

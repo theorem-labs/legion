@@ -178,3 +178,24 @@ def test_a_variable_less_its_copy_is_not_read(fold_build: dict[str, Any]) -> Non
     """fd_copy: mv a0, a1; ret (llvm-objdump): index - start is 0, and index's other stores are not
     compiled."""
     assert folded_fields(fold_build, "fd_copy") == set()
+
+
+@pytest.mark.parametrize(("function", "fields"), [("fd_set_high", {"type"}), ("fd_set_low", {"disabled", "type"})])
+def test_an_operand_the_arguments_make_unneeded_is_not_read(
+    fold_build: dict[str, Any], function: str, fields: set[str]
+) -> None:
+    """fd_set_type(b, 3): b->disabled && 3 < 3 is 0 (llvm-objdump: li a1, 0x3; sw a1, 0x4(a0)); with 1
+    the code reads disabled."""
+    assert folded_fields(fold_build, function) == fields
+
+
+def test_a_value_whose_only_effects_the_image_decides_is_left_to_the_image(
+    fold_facts: dict[str, Any], fold_build: dict[str, Any]
+) -> None:
+    """fd_cpu_dead: li a0, 0x0; ret (llvm-objdump). fd_empty's asm is only beside its
+    __builtin_constant_p path, so the call and the mask are the image's to decide."""
+    events = fold_facts["functions"]["fd_cpu_dead"]["events"]
+    assert {call["callee"]: call.get("conditional") for call in events["calls"]} == {"fd_empty": True}
+    assert {(item["field"], item.get("conditional")) for item in events["field_accesses"]} == {("bits", True)}
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert "function:fd_cpu_dead" not in {entry["function"] for entry in offsets["misses"]}

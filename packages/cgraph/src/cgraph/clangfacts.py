@@ -483,6 +483,7 @@ class _Extractor:
         self.unused_analyses: dict[str, tuple[_FunctionWalk, int | None]] = {}  # returns discarded
         self.analyzing: set[str] = set()
         self.effect_free_cache: dict[str, tuple[bool, int | None]] = {}
+        self.image_effect_free_cache: dict[str, tuple[bool, int | None]] = {}  # outside choices the image makes
         self.nesting = 0  # analyses under way, one inside another: bounded by _EFFECT_DEPTH
         self.depth_cuts = 0  # calls not followed at the depth bound, and kept answers resting on one
         self.selections: dict[int, set[int] | None] = {}
@@ -1179,30 +1180,32 @@ class _Extractor:
         definition = self.evaluator.definitions.get(name)
         return definition is not None and _is_inline(definition)
 
-    def effect_free(self, expression: ci.Cursor, dead: frozenset[int] = frozenset()) -> bool:
+    def effect_free(self, expression: ci.Cursor, dead: frozenset[int] = frozenset(), image: bool = False) -> bool:
         """Computing ``expression`` changes nothing but its value, so the compiler removes it when
         the value is not used: no asm that is volatile or has no output, no volatile access, no store
         except to a variable the expression declares or one in ``dead`` (which nothing reads), no
         loop that may not end, and calls only to the builtins that compute a value and to functions
         of the unit that are themselves effect-free. Operands that are never evaluated (sizeof,
-        typeof) do not count."""
+        typeof) do not count. With ``image``, neither do the effects under a choice the image makes
+        (bitmap_empty's find_first_bit beside its __builtin_constant_p path): the image decides."""
         own = {node.hash for node in _effect_nodes(expression) if node.kind == K.VAR_DECL and _is_local(node)}
-        return self._effect_free(expression, own | dead, inlined=True)
+        return self._effect_free(expression, own | dead, inlined=True, image=image)
 
-    def function_effect_free(self, name: str) -> bool:
+    def function_effect_free(self, name: str, image: bool = False) -> bool:
         """A call of the function changes nothing but its result: its compiled code, as its settled
         walk tells (dead branches, code after an exit and unselected associations left out, such as
         the WARN_ON_ONCE under IS_ENABLED(CONFIG_DEBUG_ATOMIC) in instrument_atomic_check_alignment),
-        has no effect. A function that is not inline and not static may not be inlined, and the
-        compiler knows such a call returns only when the function has no loop. A function that
-        calls itself again may not return, and a chain of calls deeper than _EFFECT_DEPTH is not
-        followed: both count as an effect."""
-        cached = self.reuse(self.effect_free_cache, name)
+        has no effect (with ``image``, none outside a choice the image makes). A function that is not
+        inline and not static may not be inlined, and the compiler knows such a call returns only
+        when the function has no loop. A function that calls itself again may not return, and a
+        chain of calls deeper than _EFFECT_DEPTH is not followed: both count as an effect."""
+        cache = self.image_effect_free_cache if image else self.effect_free_cache
+        cached = self.reuse(cache, name)
         if cached is not None:
             return cached
         definition = self.evaluator.definitions.get(name)
         if definition is None or self.is_weak(definition):
-            self.effect_free_cache[name] = (False, None)
+            cache[name] = (False, None)
             return False
         if not self.may_follow(name):
             return False
@@ -1213,12 +1216,29 @@ class _Extractor:
         finally:
             self.nesting -= 1
         inlined = _is_inline(definition) or definition.linkage == ci.LinkageKind.INTERNAL
-        result = walk.effects == 0 and (inlined or walk.compiled_loops == 0)
-        self.effect_free_cache[name] = (result, self.horizon(start))
+        result = (walk.firm_effects if image else walk.effects) == 0 and (inlined or walk.compiled_loops == 0)
+        cache[name] = (result, self.horizon(start))
         return result
 
-    def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool) -> bool:
-        for node in _effect_nodes(root, self.live_children):
+    def image_live(self, node: ci.Cursor, children: list[ci.Cursor]) -> list[ci.Cursor]:
+        """``live_children``, without the parts a choice the image makes selects (``if``, ``?:``,
+        ``&&`` and ``||`` on __builtin_constant_p): only the condition."""
+        if (
+            (
+                node.kind in (K.IF_STMT, K.CONDITIONAL_OPERATOR)
+                or (
+                    node.kind == K.BINARY_OPERATOR
+                    and libclang.binary_kind(node) in (libclang.LOGICAL_AND, libclang.LOGICAL_OR)
+                )
+            )
+            and children
+            and _mentions(children[0], _IMAGE_DECIDES)
+        ):
+            return children[:1]
+        return self.live_children(node, children)
+
+    def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool, image: bool = False) -> bool:
+        for node in _effect_nodes(root, self.image_live if image else self.live_children):
             kind = node.kind
             if kind == K.CALL_EXPR:
                 callee = node.referenced
@@ -1228,7 +1248,7 @@ class _Extractor:
                     arguments = list(node.get_arguments() or [])
                     if len(arguments) != 3 or not _address_of_local(arguments[2], own):
                         return False
-                elif callee.spelling not in _VALUE_BUILTINS and not self.function_effect_free(callee.spelling):
+                elif callee.spelling not in _VALUE_BUILTINS and not self.function_effect_free(callee.spelling, image):
                     return False
             elif (
                 (kind == K.ASM_STMT and not self.asm_removable(node))
@@ -2647,6 +2667,7 @@ class _FunctionWalk:
         # one, an asm the compiler keeps, a volatile access, a store outside the function's locals, a
         # loop that may not end) and loops. A call of the function may go when it has neither.
         self.effects = 0
+        self.firm_effects = 0  # the effects outside a choice the image makes
         self.compiled_loops = 0
         self.statement_values: set[int] = set()  # the expression statements outside blocks, discarded
         # The walk of a call whose value nothing uses: each return's value is discarded. The calls
@@ -2894,10 +2915,13 @@ class _FunctionWalk:
             initializer = libclang.var_initializer(variable) if index is None else None
             if initializer is not None:
                 values.append(evaluator.expression(initializer, self.held, depth + 1))
-            values += [
-                evaluator.expression(definition, self.held, depth + 1)
-                for definition, _ in self.definitions.get(key, [])
-            ]
+            if combined or not self.assigned_after(variable, reference):
+                # set_pageblock_migratetype's migratetype < MIGRATE_PCPTYPES before migratetype =
+                # MIGRATE_UNMOVABLE: only the first value reaches the reference.
+                values += [
+                    evaluator.expression(definition, self.held, depth + 1)
+                    for definition, _ in self.definitions.get(key, [])
+                ]
             operands = [(operator, evaluator.expression(value, self.held, depth + 1)) for operator, value in combined]
         finally:
             self.holding.discard(key)
@@ -2992,6 +3016,18 @@ class _FunctionWalk:
         if any(label < at for label in positions["labels"]):
             return False
         return bool(positions["escapes"][key]) and all(offset > at for offset in positions["escapes"][key])
+
+    def assigned_after(self, variable: ci.Cursor, reference: ci.Cursor) -> bool:
+        """Every plain assignment to the variable comes after the reference in the function's text,
+        the reference is in no loop, and no label is before it: control reaches it before any store."""
+        stored = self.definitions.get(variable.hash, [])
+        positions = self.layout()
+        here = _place(reference)
+        if not stored or here is None or reference.hash in positions["loops"]:
+            return False
+        if any(label < here[2] for label in positions["labels"]):
+            return False
+        return all(place is not None and place[0] == here[0] and place[1] > here[2] for _, place in stored)
 
     def guard_expression(self, condition: ci.Cursor, truth: bool = True) -> dict[str, Any] | None:
         """The condition as an expression on the parameters, when it names one."""
@@ -3099,6 +3135,16 @@ class _FunctionWalk:
         statements before the value are code and the value is discarded."""
         if self.x.effect_free(node, self.dead_variables):
             self.walk(node, parent, index, reason, generic)
+            return
+        if not self.conditional and self.x.effect_free(node, self.dead_variables, image=True):
+            # Its effects are only where the image makes a choice (vmstat_cpu_dead's
+            # cpumask_empty, whose find_first_bit is beside the __builtin_constant_p path): the image
+            # decides whether any of it is compiled.
+            self.conditional += 1
+            try:
+                self.walk(node, parent, index, None, generic)
+            finally:
+                self.conditional -= 1
             return
         kind = node.kind
         children = _children(node)
@@ -4382,6 +4428,17 @@ class _FunctionWalk:
         )
         if not self.x.function_effect_free(destructor):
             self.effects += 1
+            if not self.conditional and not self.x.function_effect_free(destructor, image=True):
+                self.firm_effects += 1
+
+    def image_effect(self, node: ci.Cursor, kind: ci.CursorKind) -> bool:
+        """A call whose callee's effects are all where the image makes a choice."""
+        callee = node.referenced if kind == K.CALL_EXPR else None
+        return (
+            callee is not None
+            and callee.kind == K.FUNCTION_DECL
+            and self.x.function_effect_free(callee.spelling, image=True)
+        )
 
     def count_effect(self, node: ci.Cursor, kind: ci.CursorKind) -> None:
         """Count what a node of compiled code does besides computing a value."""
@@ -4456,7 +4513,10 @@ class _FunctionWalk:
                 # An array member that decays to its address.
                 self.addressed.add(operand.hash)
         if reason is None:
+            effects = self.effects
             self.count_effect(node, kind)
+            if self.effects > effects and not self.conditional and not self.image_effect(node, kind):
+                self.firm_effects += 1
             if kind in (K.GOTO_STMT, K.ADDR_LABEL_EXPR):
                 # A goto in code, or a label whose address is taken (&&label): the label is code.
                 self.goto_targets.update(child.spelling for child in children if child.kind == K.LABEL_REF)
@@ -4691,7 +4751,22 @@ class _FunctionWalk:
                     self.discard(children[0], node, 0, generic)
                     self.walk(children[1], node, 1, reason, generic)
                     return
-                self.walk(children[0], node, 0, reason, generic)
+                absorbing = (
+                    self.guard_expression(children[1])
+                    if self.x.effect_free(children[0], self.dead_variables)
+                    and self.x.effect_free(children[1], self.dead_variables)
+                    and not _mentions(children[0], _IMAGE_DECIDES)
+                    else None
+                )
+                if absorbing is not None:
+                    # set_pageblock_migratetype's page_group_by_mobility_disabled && migratetype <
+                    # MIGRATE_PCPTYPES: where the arguments make the right operand false (and of ||
+                    # true), the value is decided without the left one, which has no effect.
+                    self.walk_guarded(
+                        (absorbing, operator == libclang.LOGICAL_AND), children[0], node, 0, reason, generic
+                    )
+                else:
+                    self.walk(children[0], node, 0, reason, generic)
                 if _mentions(children[0], _IMAGE_DECIDES):
                     # flush_workqueue's __builtin_constant_p(_wq == system_wq) && _wq == system_wq.
                     self.conditional += 1
