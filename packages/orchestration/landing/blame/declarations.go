@@ -105,10 +105,11 @@ func DeclarationsFor(reference string, declarations []Declaration) []Declaration
 	return out
 }
 
-// Refers reports whether a diagnostic name can refer to the declaration. A
-// qualified diagnostic name must be exact; an unqualified name can refer to a
-// declaration below an open namespace. A protected declaration is never
-// reachable by its last component alone.
+// Refers reports whether a diagnostic name can refer to the declaration. Lean
+// prints a name relative to the namespaces open where it reports the error, so
+// a reference matches a declaration whose fully qualified name ends in it at a
+// component boundary. A protected declaration is never reachable by its last
+// component alone.
 func Refers(reference string, declaration Declaration) bool {
 	return refers(reference, declaration.Name, declaration.Protected)
 }
@@ -118,10 +119,10 @@ func refers(reference, name string, protected bool) bool {
 	if reference == name {
 		return true
 	}
-	if strings.Contains(reference, ".") {
+	if !strings.HasSuffix(name, "."+reference) {
 		return false
 	}
-	return strings.HasSuffix(name, "."+reference) && !protected
+	return strings.Contains(reference, ".") || !protected
 }
 
 // refersToNamespace reports whether a name lies in the namespace: some leading

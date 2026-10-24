@@ -136,13 +136,29 @@ func TestDeclarationIdentityResolvesNestedNamespacesAndSections(t *testing.T) {
 		t.Fatalf("attributed %v (%+v), want only the member that removed Outer.Inner.value", members, got)
 	}
 
-	for name, want := range map[string]string{"Outer.after": "def after := 0", "Outer.later": "def later := 0", "Outer.A.B.dotted": "def dotted := 1", "Inner.value": "def value := 5"} {
-		declarations, err := (RepositoryGit{}).Declarations(context.Background(), repo, Tree(baseCommit), name)
-		if err != nil {
-			t.Fatal(err)
+	scanned, err := (RepositoryGit{}).TreeDeclarations(context.Background(), repo, Tree(baseCommit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := make(map[string]string, len(scanned))
+	for _, declaration := range scanned {
+		if declaration.File == "Names.lean" {
+			byName[declaration.Name] = declaration.Text
 		}
-		if len(declarations) != 1 || declarations[0].Name != name || declarations[0].Text != want {
-			t.Fatalf("Declarations(%s) = %+v, want the one declaration %q", name, declarations, want)
+	}
+	want := map[string]string{
+		"Outer.Inner.value": "def value := 0",
+		"Outer.A.B.dotted":  "def dotted := 1",
+		"Outer.after":       "def after := 0",
+		"Outer.later":       "def later := 0",
+		"Inner.value":       "def value := 5",
+	}
+	if len(byName) != len(want) {
+		t.Fatalf("Names.lean declarations = %v, want exactly %v", byName, want)
+	}
+	for name, text := range want {
+		if byName[name] != text {
+			t.Fatalf("declaration %s = %q, want %q (all: %v)", name, byName[name], text, byName)
 		}
 	}
 }
