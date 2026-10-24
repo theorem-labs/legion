@@ -145,6 +145,7 @@ var settingsExcluded = map[string]string{
 	"StandingOwners.Repository":     "standing-owner queue scope is not a pod setting",
 	"StandingOwners.MaxRunning":     "standing-owner admission policy is daemon-only",
 	"StandingOwners.BudgetUSD":      "standing-owner admission policy is daemon-only",
+	"StandingOwners.LedgerTimeout":  "standing-owner admission policy is daemon-only",
 	"StandingOwners.Owners":         "standing-owner launch policy is daemon-only",
 	"StandingOwner.Name":            "standing-owner launch policy is daemon-only",
 	"StandingOwner.PromptFile":      "a daemon-local prompt path",
