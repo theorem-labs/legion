@@ -49,6 +49,10 @@ func TestOpenExistingRequiresEveryEmbeddedSchemaVersion(t *testing.T) {
 	}
 	existing.Close()
 
+	var before int
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM schema_versions").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := conn.Exec(ctx, "DELETE FROM schema_versions WHERE version = (SELECT max(version) FROM schema_versions)"); err != nil {
 		t.Fatal(err)
 	}
@@ -65,8 +69,8 @@ func TestOpenExistingRequiresEveryEmbeddedSchemaVersion(t *testing.T) {
 	if err := conn.QueryRow(ctx, "SELECT count(*) FROM schema_versions").Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 0 {
-		t.Fatalf("OpenExisting restored %d schema-version rows", rows)
+	if rows != before-1 {
+		t.Fatalf("OpenExisting left %d schema-version rows, want the %d that remained after the delete", rows, before-1)
 	}
 }
 
