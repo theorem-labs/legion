@@ -1112,10 +1112,7 @@ func (d *driver) kill(index int) func(context.Context) error {
 			return err
 		}
 		kill.Pane, kill.PID, kill.At = target.ID, target.PID, time.Now().UTC()
-		if err := d.killPaneTree(ctx, target); err != nil {
-			return err
-		}
-		if kill.Holder, kill.Record, kill.Done, err = d.itemAt(ctx, item); err != nil {
+		if kill.Holder, kill.Record, kill.Done, err = d.killObserving(ctx, target, item); err != nil {
 			return err
 		}
 		kill.Observed = observedMoment(d.target, kill.Holder, kill.Record, kill.Done)
@@ -1138,6 +1135,39 @@ func (d *driver) kill(index int) func(context.Context) error {
 			}
 			return d.answered(ctx, version)
 		})
+	}
+}
+
+// killObserving kills the target's pane p and every process of it, and reads item as the kill found it: its holder,
+// its record commit and whether it is done. The read comes before the kill, while every process of the pane is
+// stopped (SIGSTOP) and still alive: the supervisor frees a dead owner's leases as soon as it sees its pane gone (the
+// daemon's "supervise: process died", the harness supervisor's probe), so a read after the kill can find the holder
+// gone, and stopped processes can change nothing while the item is read. A commit the owner sent before it stopped
+// lands within the poll interval the read waits first.
+func (d *driver) killObserving(ctx context.Context, p pane, item string) (holder, record string, done bool, err error) {
+	d.stopPane(p)
+	select {
+	case <-ctx.Done():
+	case <-time.After(d.opts.Timeouts.Poll):
+	}
+	holder, record, done, err = d.itemAt(ctx, item)
+	return holder, record, done, errors.Join(err, d.killPaneTree(ctx, p))
+}
+
+// stopPane stops (SIGSTOP) every process of the run under the pane's root, walking the tree again until a walk finds
+// none it has not stopped, so a process forked during a walk is stopped too.
+func (d *driver) stopPane(p pane) {
+	stopped := map[int]bool{}
+	for added := true; added; {
+		added = false
+		for queue := []int{p.Root}; len(queue) > 0; queue = queue[1:] {
+			pid := queue[0]
+			if !stopped[pid] && processEnv(pid)["LEGION_LEDGER_REPOSITORY"] == d.run {
+				_ = syscall.Kill(pid, syscall.SIGSTOP)
+				stopped[pid], added = true, true
+			}
+			queue = append(queue, children(pid)...)
+		}
 	}
 }
 

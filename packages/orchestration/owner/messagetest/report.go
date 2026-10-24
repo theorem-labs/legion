@@ -125,7 +125,8 @@ type Delivery struct {
 }
 
 // Kill is one owner pane the driver killed: the moment the schedule set for it, the moment it landed at (the item's
-// state just after the kill: its holder, its record commit on the owner's branch, and whether it was done), the pane
+// state at the kill, read while the pane's processes were stopped: its holder, its record commit on the owner's
+// branch, and whether it was done), the pane
 // and its root process, the owner command the hold paused (none for a kill before the claim), and how long the
 // supervisor took to start the owner again.
 type Kill struct {
@@ -236,7 +237,7 @@ func (r Report) markdown() string {
 		}
 		fmt.Fprintf(&b, "| `%s` | `%s` | `%s` | %t | %s | %s | %s | %s |\n", d.Owner, d.ID, d.Topic, d.Required, arrived, arrival, saw, sawAt)
 	}
-	b.WriteString("\n## Kills\n\nEach kill lands at the moment the schedule sets: the item's state is read just after the kill. A kill after the claim or after the answer holds the owner's `message-test answer` at that moment (its PID is in Held) until the killed processes are gone.\n\n" +
+	b.WriteString("\n## Kills\n\nEach kill lands at the moment the schedule sets: the item's state is read at the kill, while the pane's processes are stopped. A kill after the claim or after the answer holds the owner's `message-test answer` at that moment (its PID is in Held) until the killed processes are gone.\n\n" +
 		"| # | Item | Scheduled | Landed at | Holder | Record | Done | Pane (PID) | Held | Relaunch (s) |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
 	for index, k := range r.KillLog {
 		held := "none"
