@@ -1207,9 +1207,10 @@ func (d *driver) collect(ctx context.Context) (Recorded, error) {
 	return recorded, nil
 }
 
-// teardown stops what the run started and removes the bearer files it wrote: the daemon by its own PID, every pane
-// by the run's own tmux socket, then every owner process the run saw that still runs, by its own PID. It runs on a
-// context of its own, bounded by cleanupTimeout, so it also stops a run whose context ended (an interrupt).
+// teardown stops what the run started and removes the token files: the daemon by its own PID, every pane by the
+// run's own tmux socket, then every owner process the run saw that still runs, by its own PID; then the bearer files
+// the run wrote and the daemon's boot tokens. It runs on a context of its own, bounded by cleanupTimeout, so it also
+// stops a run whose context ended (an interrupt).
 func (d *driver) teardown(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
@@ -1232,6 +1233,15 @@ func (d *driver) teardown(ctx context.Context) error {
 	if d.tokenDir != "" {
 		d.report.Teardown.TokenDir = d.tokenDir
 		if err := os.RemoveAll(d.tokenDir); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	// The daemon writes each pane's boot token under its state_dir (<state_dir>/secrets/<claim token>), which is in
+	// the run's directory. With the daemon and every pane stopped, nothing reads them again.
+	if d.daemonState != "" {
+		secrets := filepath.Join(d.daemonState, "secrets")
+		d.report.Teardown.DaemonSecrets = secrets
+		if err := os.RemoveAll(secrets); err != nil {
 			errs = append(errs, err)
 		}
 	}

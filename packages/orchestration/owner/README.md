@@ -96,7 +96,8 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    The daemon refuses to start without an operator bearer, so the run writes a new random one for its operator routes,
    which it never calls. The bearers reach the daemon as files: the Envoy bearer is `ENVOY_TOKEN_FILE` when set, else
    a 0600 file, and the operator bearer is a 0600 file, both in `<state_dir>/message-test/<run>/` of the operator's
-   deployment, which the teardown removes; no token is written under `DIR`. The report records the revisions that
+   deployment, which the teardown removes; the run writes no token under `DIR` (the daemon's boot tokens there go at
+   teardown, step 7). The report records the revisions that
    ran: the owner's build and Go modules, `legion version`, `omp --version` of the omp the panes run, `tmux -V`,
    `git --version` and the SHA-256 of each graph input.
 2. **Nodes.** `--nodes A,B`, or else the first function whose id holds `@`, `/` and `.` with a data structure it
@@ -130,9 +131,10 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    not expect.
 7. **Teardown.** The run stops its daemon by its own PID, its panes by its own tmux socket, and then every owner
    process it saw in its panes that still runs, by its own PID (a PID counts only while its process names the run's
-   ledger repository), and removes its bearer directory; the report lists those PIDs. On SIGINT or SIGTERM the run
-   ends its steps, collects and tears down on a context of its own, and writes a partial report marked
-   `INTERRUPTED`; `owner message-test` then exits 1.
+   ledger repository). It then removes its bearer directory and the daemon's boot-token files, which the daemon writes
+   under its state directory in `DIR` (`DIR/daemon/state/secrets/`); the report lists those PIDs and paths. On SIGINT
+   or SIGTERM the run ends its steps, collects and tears down on a context of its own, and writes a partial report
+   marked `INTERRUPTED`; `owner message-test` then exits 1.
 
 A delivery's evidence is the owner session's own record of it: pi-envoy hands each Envoy delivery to the session as
 an Oh My Pi custom message of type `envoy-message`, which Oh My Pi appends to the session's JSONL transcript under

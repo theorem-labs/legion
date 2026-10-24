@@ -46,13 +46,15 @@ type Report struct {
 
 // Teardown is what the run stopped and removed when it ended: every daemon process it started, every owner process
 // it saw in its panes, the ones still running after its tmux server stopped, which it signalled by PID, and any it
-// could not stop; and its private bearer directory, which it removed.
+// could not stop; its private bearer directory, and the daemon's secret files (each pane's boot token), which it
+// removed.
 type Teardown struct {
-	DaemonPIDs []int  `json:"daemon_pids"`
-	OwnerPIDs  []int  `json:"owner_pids"`
-	Stopped    []int  `json:"stopped"`
-	Left       []int  `json:"left"`
-	TokenDir   string `json:"token_dir"`
+	DaemonPIDs    []int  `json:"daemon_pids"`
+	OwnerPIDs     []int  `json:"owner_pids"`
+	Stopped       []int  `json:"stopped"`
+	Left          []int  `json:"left"`
+	TokenDir      string `json:"token_dir"`
+	DaemonSecrets string `json:"daemon_secrets"`
 }
 
 // Daemon names the supervisor the run started, where its configuration, socket and log are, and the omp its panes
@@ -217,8 +219,8 @@ func (r Report) markdown() string {
 			r.Restart.Item, seconds(r.Restart.StopSeconds), seconds(r.Restart.StartSeconds), seconds(r.Restart.ItemSeconds),
 			code(r.Restart.PanesBefore), code(r.Restart.PanesAfter))
 	}
-	fmt.Fprintf(&b, "\n## Teardown\n\nDaemon processes %s; owner processes %s; signalled by PID %s; still running %s; bearer directory `%s` removed.\n",
-		pids(r.Teardown.DaemonPIDs), pids(r.Teardown.OwnerPIDs), pids(r.Teardown.Stopped), pids(r.Teardown.Left), r.Teardown.TokenDir)
+	fmt.Fprintf(&b, "\n## Teardown\n\nDaemon processes %s; owner processes %s; signalled by PID %s; still running %s; bearer directory `%s` and the daemon's boot tokens `%s` removed.\n",
+		pids(r.Teardown.DaemonPIDs), pids(r.Teardown.OwnerPIDs), pids(r.Teardown.Stopped), pids(r.Teardown.Left), r.Teardown.TokenDir, r.Teardown.DaemonSecrets)
 	b.WriteString("\n## Failures\n\n")
 	if len(r.Failures) == 0 {
 		b.WriteString("None.\n")

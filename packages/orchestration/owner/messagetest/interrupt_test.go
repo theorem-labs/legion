@@ -61,10 +61,20 @@ func TestTeardownStopsWhatTheRunStartedAfterTheRunContextEnded(t *testing.T) {
 	if _, err := operatorTokenFile(tokens); err != nil {
 		t.Fatal(err)
 	}
+	// The daemon's own secret files: each pane's boot token, which it writes under its state_dir in the run's
+	// directory, <state_dir>/secrets/<claim token>.
+	daemonState := filepath.Join(t.TempDir(), "run", "daemon", "state")
+	secrets := filepath.Join(daemonState, "secrets")
+	if err := os.MkdirAll(secrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secrets, "legion-run-owner-struct_cmountpoint"), []byte("boot token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	d := &driver{
 		opts: Options{Timeouts: Timeouts{DaemonStop: 5 * time.Second, Poll: 10 * time.Millisecond}},
-		run:  run, socket: socket, tokenDir: tokens, report: &Report{},
+		run:  run, socket: socket, tokenDir: tokens, daemonState: daemonState, report: &Report{},
 		daemon: daemon, daemonDone: done,
 		ownerPIDs: map[int]string{stray.Process.Pid: st, other.Process.Pid: st},
 	}
@@ -110,9 +120,12 @@ func TestTeardownStopsWhatTheRunStartedAfterTheRunContextEnded(t *testing.T) {
 	if _, err := os.Stat(tokens); !os.IsNotExist(err) {
 		t.Fatalf("the bearer directory %s is left: %v", tokens, err)
 	}
+	if _, err := os.Stat(secrets); !os.IsNotExist(err) {
+		t.Fatalf("the daemon's secret files in %s are left in the run's directory: %v", secrets, err)
+	}
 	report := d.report.Teardown
 	if !slices.Contains(report.Stopped, stray.Process.Pid) || slices.Contains(report.Stopped, other.Process.Pid) || len(report.Left) != 0 ||
-		!slices.Contains(report.OwnerPIDs, stray.Process.Pid) || report.TokenDir != tokens {
+		!slices.Contains(report.OwnerPIDs, stray.Process.Pid) || report.TokenDir != tokens || report.DaemonSecrets != secrets {
 		t.Fatalf("the teardown's report = %+v", report)
 	}
 }
