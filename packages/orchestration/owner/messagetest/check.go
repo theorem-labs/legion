@@ -23,6 +23,8 @@ const (
 	FailLaunch          = "launch"
 	FailSubscription    = "subscription"
 	FailStep            = "step"
+	FailKill            = "kill"
+	FailRestart         = "restart"
 	FailInterrupted     = "interrupted"
 )
 
@@ -184,10 +186,15 @@ func checkDeliveries(deliveries []ExpectedDelivery, arrivals []Arrival, fail fun
 	for _, k := range order {
 		topic, ok := expected[k]
 		for _, a := range arrived[k] {
-			if !ok || a.Topic != topic {
-				fail(FailUnexpected, fmt.Sprintf("%s on %s for %s", k.id, a.Topic, k.owner),
-					"the session recorded it at %s:%d (run %s, step %s); the driver published no such notice for this owner on this topic",
-					a.Transcript, a.Line, a.Run, a.Step)
+			// The delivered topic is pi-envoy's record: the envelope's topic and the subject the session took it on.
+			delivered := a.Subject
+			if a.Topic != topic {
+				delivered = a.Topic
+			}
+			if !ok || a.Topic != topic || a.Subject != topic {
+				fail(FailUnexpected, fmt.Sprintf("%s on %s for %s", k.id, delivered, k.owner),
+					"the session recorded it at %s:%d (run %s, step %s, envelope topic %s, subject %s); the driver published no such notice for this owner on this topic",
+					a.Transcript, a.Line, a.Run, a.Step, a.Topic, a.Subject)
 			}
 		}
 		if n := len(arrived[k]); ok && n > 1 {

@@ -108,7 +108,8 @@ func answerOutOfOrder(ctx context.Context, store *ledger.Store, listener *publis
 	defer file.Close()
 	for _, notice := range listener.published() {
 		content := "envoy:\n  from: agent\n  id: " + notice["id"] + "\n  message:\n    run: r\n    step: out of order\n    topic: " + notice["topic"] + "\n    type: message-test"
-		line, _ := json.Marshal(map[string]any{"type": "custom_message", "customType": "envoy-message", "content": content, "timestamp": time.Now().UTC()})
+		details := map[string]string{"subject": notice["topic"], "topic": notice["topic"], "event_id": notice["id"]}
+		line, _ := json.Marshal(map[string]any{"type": "custom_message", "customType": "envoy-message", "content": content, "details": details, "timestamp": time.Now().UTC()})
 		if _, err := file.Write(append(line, '\n')); err != nil {
 			return err
 		}

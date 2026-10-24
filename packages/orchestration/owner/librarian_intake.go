@@ -382,7 +382,7 @@ type IntakeOutcome struct {
 // reads the item first. An item of another owner is ErrIDOwner, and a done item of the librarian is a success that
 // writes and publishes nothing. A missing item is queued; a recheck first writes its inbox record, which keeps the first
 // envelope of an id (a record of another proposer is ErrRecordProposer). The notice of a missing or still open item is
-// then published under its one key c-<hex16(item)>: a delivery whose item is open may follow one that queued it and
+// then published under its one key NoticeKey(item): a delivery whose item is open may follow one that queued it and
 // then lost its notice, and the listener drops a copy it has. The host's journal keeps a notice no listener takes.
 // Each ledger call has a deadline of its own.
 func (in LibrarianIntake) Deliver(ctx context.Context, envelope GateEnvelope) (IntakeOutcome, error) {

@@ -194,6 +194,31 @@ const ClaimIdentitySchema = DedupeIdentitySchema.extend({
 });
 
 /**
+ * What a delivery's transcript entry records beside the card the model reads (Oh My Pi keeps a custom message's
+ * `details` in the session file and never sends them to the model): the subject the frame arrived on, and its
+ * envelope's topic, event id and dedupe key. A reader of the transcript, such as the owner message test, can then
+ * tell which topic a delivery came on, and which publish it was, from Envoy's own record of it.
+ */
+type EnvoyDeliveryDetails = {
+  readonly subject: string;
+  readonly topic?: string;
+  readonly event_id?: string;
+  readonly dedupe_key?: string;
+};
+
+function deliveryDetails(
+  subject: string,
+  envelope: RenderInboundResult["envelope"]
+): EnvoyDeliveryDetails {
+  return {
+    subject,
+    ...(envelope?.topic === undefined ? {} : { topic: envelope.topic }),
+    ...(envelope?.event_id === undefined ? {} : { event_id: envelope.event_id }),
+    ...(envelope?.dedupe_key === undefined ? {} : { dedupe_key: envelope.dedupe_key }),
+  };
+}
+
+/**
  * Transcript entry recording the role this session holds. Successful claims
  * write `{ role }`; legacy `{ role: null }` release records remain authoritative
  * when a resumed session decides whether to reclaim.
@@ -1065,7 +1090,12 @@ export default function envoyExtension(pi: PiApi): void {
               shown
             );
             pi.sendMessage(
-              { customType: "envoy-message", content: card.content, display: true },
+              {
+                customType: "envoy-message",
+                content: card.content,
+                display: true,
+                details: deliveryDetails(subject, rendered.envelope),
+              },
               {
                 deliverAs: rendered.delivery?.mode === "aside" ? "aside" : "steer",
                 triggerTurn: true,

@@ -31,9 +31,11 @@ Steps:
   trailer (`ErrUnattributed`, exit 4).
 - A step that answers no item (`need`, a spec revision with no open item) commits its record with no trailer,
   queues its follow-ups and sends its notices.
-- A notice about a work item carries the key `c-<hex16(item)>` and names the item. A spec revision that offers no
-  edge queues no item for the users of the spec, so its notice names none: its message names the revision, and its
-  key is `c-<hex16(record@commit)>`, one for each revision, which a re-run repeats.
+- A notice about a work item carries the key `hex32(item)` (the first 32 hex digits of SHA-256) and names the item.
+  A spec revision that offers no edge queues no item for the users of the spec, so its notice names none: its message
+  names the revision, and its key is `hex32(record@commit)`, one for each revision. A re-run repeats the key, and the
+  listener's dedupe key `publish.<key>` has Envoy's minted shape (`MINTED_DEDUPE_KEY_PATTERN` in
+  `packages/contracts`), so each subscribed session takes the repeated notice once.
 - Each commit holds the worktree's commit lock, `flock(2)` on `owner.flock` in the worktree's git directory, from
   its read of `HEAD` to its commit. Its git commands inherit the lock, so it holds until the last of them exits, also
   when the owner command is killed first. A command that holds the lock finds no live git of another owner command
@@ -58,10 +60,10 @@ Steps:
 | `need <target> <file> [--outside-part \| --answers <reply item>...]` | Writes `needs/E<hex16(target)>.md` (the draft sets `author_model`, `cites` and `resolves`), queues `need:<edge>@r<n>`, notifies by the routing table; `--outside-part` records the edge as `outside_part` with no item; `--answers` answers the target's replies about this need: the revision lists them in `resolves`, carries their trailers, and completes them |
 | `offer <file> [--answers <item>...]` | Writes `spec.md` revision n (the draft sets `author_model`, `complete` and `resolves`) and answers each item: a need to the owner, a reply about an edge whose target is the owner (both queue `offer:<edge>@r<n>`, n the spec revision, for the edge's source), or a reply that names the owner its premise owner; a reply is listed in `resolves`. It also answers an open `start:` item, and notifies. When every `--answers` item is done, it repeats the revision that answered them, or refuses a changed draft (exit 1), which would be a new revision that answers none of them |
 | `accept <item>` | Accepts `offer:<edge>@r<n>` while the target's spec is at r<n> and answers the current need; records the accept and the edge as `accepted`, answers the offer, notifies |
-| `reply <item> <reason> <file> [--premise-owner <id>]` | Records the reply, routes it by `PROTOCOL.yaml` `reasons`; `program-defect` and `false-shared-assumption` also write `escalations/<hex16>.yaml` and queue `escalation:` for `escalations` |
+| `reply <item> <reason> <file> [--premise-owner <id>]` | Records the reply, routes it by `PROTOCOL.yaml` `reasons`; a reason that goes to the premise owner queues the reply item for that owner and sends its notice to the premise owner's needs topic (`node.<id>.needs`, or `fact.<name>.needs`), with `to` the premise owner; `program-defect` and `false-shared-assumption` also write `escalations/<hex16>.yaml` and queue `escalation:` for `escalations` |
 | `done <need or offer item> --superseded r<n>` | Completes the item as `superseded:r<n>` with no record, when r<n> is later than the item's and exists: the source's need record, or the target's spec, is at r<n> or newer |
 | `returned <item>` | Prints the C13 `reason`, `detail`, `log`, `batch` and `key` of the return event. The producer requires `reason` and `key` (exit 4 without either) and writes an empty `batch`, `detail` or `log` when it was not given one: such a field prints as `(absent)`, and the JSON leaves it out |
-| `message-test [--prefix P] [--nodes A,B] [--kills N] --out DIR` | Runs the message test (below) and writes `DIR/report.json` and `DIR/report.md`; exit 0 only when every assertion held |
+| `message-test [--prefix P] [--nodes A,B] [--kills N] [--allow-missing-kinds K,...] --out DIR` | Runs the message test (below) and writes `DIR/report.json` and `DIR/report.md`; exit 0 only when every assertion held |
 | `message-test topics` | A test owner's topics: `owner topics` plus the fact and concept topics the driver gives it in the test deployment's `<state_dir>/message-test/topics.json` (plan Task 1.8 step 4: the driver subscribes a test owner to topics no node owner holds); no other command reads that file |
 | `message-test subscribed` | Records the topics the test owner subscribed to, at `message-test/subscribed.yaml` |
 | `message-test saw <delivery id> <topic>` | Records one delivery once, at `message-test/saw/<hex16(id)>.yaml`, with `Owner-Delivery` and `Owner-Topic` trailers |
@@ -119,7 +121,7 @@ no `LEGION_OWNER`, and it queues for `librarian`.
   listed as not ready.
 - **The notice** goes to `<topic prefix>concepts` (the routing table's concept row) with the payload of the notices
   above (`type: concept`, `from` the proposer, `to: librarian`, the item, and for a recheck its inbox record and
-  commit) and the key `c-<hex16(item)>`. The command reads no protocol manifest, so its `epoch` is 0, and it has no
+  commit) and the key `NoticeKey(item)`. The command reads no protocol manifest, so its `epoch` is 0, and it has no
   versions or models to name. The topic prefix is `--topic-prefix`, else `topic_prefix` of `skeleton/owner.yaml` at
   `main` of `--git-dir`, whose `repo` must be `--repository` (exit 2 otherwise); with neither, the command exits 2,
   and a configuration that does not load is exit 3, before it queues anything. The listener is `ResolveListener`'s,
@@ -178,7 +180,10 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    `git --version` and the SHA-256 of each graph input.
 2. **Nodes.** `--nodes A,B`, or else the first function whose id holds `@`, `/` and `.` with a data structure it
    accesses, such that the two hold every topic kind. The code names no project, so the plan's
-   `function:get_mountpoint@fs/namespace.c,struct:mountpoint` is passed with `--nodes`.
+   `function:get_mountpoint@fs/namespace.c,struct:mountpoint` is passed with `--nodes`. A topic kind (`needs`,
+   `callers`, `callees`, `users`, `neighbors`, `linked`, `all`) that no topic of the two nodes has fails the run in
+   setup, before the daemon starts, unless `--allow-missing-kinds` names it; the report lists each allowed kind the
+   nodes lack.
 3. **Wake.** `start:<node>@1` for each; both panes must start within 60 s on the tmux socket
    `legion-<project token>`, each process with `LEGION_OWNER`, `LEGION_LEDGER_REPOSITORY` and
    `LEGION_LEDGER_DSN_FILE` (C8; a `_KEY` name is credential-shaped and the daemon strips it from panes) and working
@@ -194,12 +199,30 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    once. The need itself is enqueued twice; when the owner answers it between the two calls, the ledger refuses the
    second as an existing item, which is a duplicate too. The driver expects each answered need's offer by
    production's numbering: the n-th need the target answers queues `offer:<edge>@r<n>`.
-   Every notice to a running, subscribed owner is a required delivery: arrival, duplicates, out of order, the
-   restart's need when the target's pane runs, and a notice after the daemon restart to the pane it left running.
-   A killed owner's need notice is optional, because the kill can end the session before the notice reaches it.
-   `--kills` (default 5) panes are killed at a moment drawn from the owner's progress, and the daemon is restarted
-   once while an owner runs. Each step ends when the ledger shows its items' outcomes and the sessions' transcripts
-   show its notices.
+   Every notice to a running, subscribed owner is a required delivery: arrival, duplicates, out of order, and a
+   notice after the daemon restart to the pane the new daemon launched. A killed owner's need notice, and the
+   restart's need notice (published while no pane of the target runs), are optional, because no session may be
+   there to take them; the ledger item is the wake that lasts.
+   **Kills.** `--kills` (default 5; at least 3, and fewer is a usage error, exit 2; in the `Run` API, 0 is the
+   default and 1 or 2 is refused) panes are killed on a fixed schedule, `KillSchedule`: before the claim, after the
+   claim, after the answer, in turn. A kill before the claim kills the running pane once the need is open and
+   unclaimed. A kill after the claim or after the answer first puts a hold on the need (`<state_dir>/message-test/
+   hold.json` of the test deployment): `message-test answer` then pauses with the item claimed and nothing recorded,
+   or inside the step runner's completion, its last call (`owner.Runner.Run`, `Ledger.Complete` in `owner/step.go`),
+   with the record committed and the follow-up queued and the item open. The paused command writes `held.json` with
+   its PID, the driver kills the pane and SIGKILLs every process under it that names the run, waits until they are
+   gone, and only then releases the hold. The item's state just after the kill (holder, record commit, done) is the
+   moment the kill landed at; the run fails (`kill`) on a kill that landed elsewhere than its schedule set, and on a
+   moment no kill landed at. The report lists each kill's scheduled and landed moment, the item's state and the held
+   command's PID.
+   **Restart.** With the target's pane running, the daemon is stopped (SIGTERM; the panes keep running) and started
+   again. The driver then kills the old daemon's pane of the target, and only then enqueues the restart's need, so
+   only a pane the new daemon launches can answer it. The step fails (`restart`) unless the need is claimed and
+   completed by the target after the restart (ledger events after the restart's last one), and every target pane
+   seen while it was open is one the new daemon logged as `supervise: launched`, by its incarnation (root PID and
+   start ticks, as the daemon records a pane), in the daemon log after the driver started it: that output is the new
+   daemon PID's alone. Each step ends when the ledger shows its items' outcomes and the sessions' transcripts show its
+   notices.
 6. **Check.** `messagetest.Check` reads the ledger's events, the owners' branches and the deliveries the owners'
    session transcripts record, and fails on a missed, duplicate or unexpected delivery (a notice of another run
    included), an item completed twice or never, recorded twice or not at all, an out-of-order item answered as
@@ -214,7 +237,13 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
 
 A delivery's evidence is the owner session's own record of it: pi-envoy hands each Envoy delivery to the session as
 an Oh My Pi custom message of type `envoy-message`, which Oh My Pi appends to the session's JSONL transcript under
-`.omp/agent/sessions/`. pi-envoy's `envoy_inbox` list lives in its process's memory, and the listener does not push to
+`.omp/agent/sessions/`. The message's `details` are pi-envoy's record of the delivery: the subject it arrived on and
+its envelope's `topic`, `event_id` and `dedupe_key`. A delivery's topic is that record, never the payload's `topic`
+the driver wrote: an envelope topic or subject that is not the published topic fails the run as `unexpected`, and a
+driver's notice with no such record stops the collect. `@sjawhar/pi-envoy` writes the record from the first release
+after 10.17.2 (its CHANGELOG's "Each Envoy delivery's `envoy-message` custom message records the delivery"); the
+owner panes must run that release or later, and with 10.17.2 a run stops at its first delivery. pi-envoy's
+`envoy_inbox` list lives in its process's memory, and the listener does not push to
 a session that holds its own NATS connection, so neither keeps a record. Every transcript of the owner's sessions in
 that directory counts (a relaunch's and a fork's; a fork's copy of its parent's entries counts once); a subagent's
 does not. The owners' own `message-test saw` and `subscribed` records are shown in the report beside the evidence,

@@ -132,7 +132,8 @@ func TestEveryGraphEdgeReceiverSubscribesToEveryRoute(t *testing.T) {
 		owners = append(owners, owner.ID)
 	}
 	for _, owner := range owners {
-		for _, route := range []Route{{Step: RouteOwnerItem, Owner: owner}, {Step: RouteLibrarianAnswer, Owner: owner}} {
+		// A reply that names its premise owner goes to that owner, as its own item: a graph or a fact owner.
+		for _, route := range []Route{{Step: RouteOwnerItem, Owner: owner}, {Step: RouteLibrarianAnswer, Owner: owner}, {Step: RouteReplyToPremise, Owner: owner}} {
 			assertRouteReachesReceivers(t, fixture, routing, route)
 		}
 	}

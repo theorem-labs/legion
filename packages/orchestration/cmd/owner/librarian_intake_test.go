@@ -146,7 +146,7 @@ func TestLibrarianIntakeQueuesANearMatchOnceAndPublishesItUnderOneKey(t *testing
 		t.Fatalf("item events = %v, want one item.enqueued", events)
 	}
 	notices := f.notices()
-	if len(notices) != 1 || notices[0].Topic != conceptsTopic || notices[0].IdempotencyKey != "c-"+ownerpkg.Hex16(item) {
+	if len(notices) != 1 || notices[0].Topic != conceptsTopic || notices[0].IdempotencyKey != ownerpkg.NoticeKey(item) {
 		t.Fatalf("notices = %+v", notices)
 	}
 	payload := decodePayload(t, notices[0])
@@ -350,7 +350,7 @@ func TestLibrarianIntakeWithoutAListenerJournalsTheNotice(t *testing.T) {
 		Payload                    map[string]any
 	}
 	if len(lines) != 1 || json.Unmarshal([]byte(lines[0]), &entry) != nil || entry.Topic != conceptsTopic ||
-		entry.Key != "c-"+ownerpkg.Hex16(item) || entry.Payload["item"] != item || entry.Error == "" {
+		entry.Key != ownerpkg.NoticeKey(item) || entry.Payload["item"] != item || entry.Error == "" {
 		t.Fatalf("journal = %q", lines)
 	}
 	if got := f.item(item); got.Owner != "librarian" || got.State != "open" {

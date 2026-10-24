@@ -88,7 +88,7 @@ func TestNeedOfferAcceptRoundTripUsesPostgresAndListener(t *testing.T) {
 	if len(posts) != 4 {
 		t.Fatalf("listener got %d posts, want need twice, offer and accept: %+v", len(posts), posts)
 	}
-	if posts[0].IdempotencyKey != posts[1].IdempotencyKey || posts[0].IdempotencyKey != "c-"+ownerpkg.Hex16(need) {
+	if posts[0].IdempotencyKey != posts[1].IdempotencyKey || posts[0].IdempotencyKey != ownerpkg.NoticeKey(need) {
 		t.Fatalf("repeated need keys = %q and %q", posts[0].IdempotencyKey, posts[1].IdempotencyKey)
 	}
 	wantTopics := []string{
@@ -111,7 +111,7 @@ func TestNeedOfferAcceptRoundTripUsesPostgresAndListener(t *testing.T) {
 	offerNotice := decodePayload(t, posts[2])
 	if offerNotice.Type != "offer" || offerNotice.From != state || offerNotice.To != caller || offerNotice.Item != offer ||
 		offerNotice.Commit != specCommit || offerNotice.Versions["need"] != needHash || offerNotice.Versions["offer"] != specHash ||
-		posts[2].IdempotencyKey != "c-"+ownerpkg.Hex16(offer) {
+		posts[2].IdempotencyKey != ownerpkg.NoticeKey(offer) {
 		t.Fatalf("offer notice = %+v key %q", offerNotice, posts[2].IdempotencyKey)
 	}
 	acceptNotice := decodePayload(t, posts[3])
@@ -218,7 +218,7 @@ func TestSpecRevisionWithNoEdgeNamesNoItem(t *testing.T) {
 			t.Errorf("post %d message %q does not name %s%s", index, post.Message, state, want)
 		}
 	}
-	if posts[0].IdempotencyKey == posts[1].IdempotencyKey || posts[1].IdempotencyKey != posts[2].IdempotencyKey || !strings.HasPrefix(posts[0].IdempotencyKey, "c-") {
+	if posts[0].IdempotencyKey == posts[1].IdempotencyKey || posts[1].IdempotencyKey != posts[2].IdempotencyKey || len(posts[0].IdempotencyKey) != 32 {
 		t.Fatalf("keys = %q, %q, %q; want one key for each revision, repeated by the re-run", posts[0].IdempotencyKey, posts[1].IdempotencyKey, posts[2].IdempotencyKey)
 	}
 }

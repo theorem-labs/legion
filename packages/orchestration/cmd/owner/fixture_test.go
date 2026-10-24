@@ -148,6 +148,11 @@ type ownerRun struct {
 func (f *commandFixture) as(owner string) ownerRun { return ownerRun{f: f, owner: owner} }
 
 func (o ownerRun) runIn(dir string, args ...string) (string, string, int) {
+	return o.runContext(o.f.ctx, dir, args...)
+}
+
+// runContext runs the command under ctx: cancelling it stops the command as a killed pane stops its process.
+func (o ownerRun) runContext(ctx context.Context, dir string, args ...string) (string, string, int) {
 	var stdout, stderr bytes.Buffer
 	env := func(key string) string {
 		if key == "LEGION_OWNER" {
@@ -155,7 +160,7 @@ func (o ownerRun) runIn(dir string, args ...string) (string, string, int) {
 		}
 		return o.f.env[key]
 	}
-	code := run(o.f.ctx, append([]string{"--deploy", o.f.deploy}, args...), env, dir, &stdout, &stderr)
+	code := run(ctx, append([]string{"--deploy", o.f.deploy}, args...), env, dir, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
 

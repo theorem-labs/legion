@@ -220,6 +220,7 @@ const (
 	RouteAccept          RouteStep = "accept"
 	RouteReplyFromTarget RouteStep = "reply-from-target"
 	RouteReplyFromSource RouteStep = "reply-from-source"
+	RouteReplyToPremise  RouteStep = "reply-to-premise-owner"
 	RouteOwnerItem       RouteStep = "owner-item"
 	RouteProposal        RouteStep = "proposal"
 	RouteConcept         RouteStep = "concept"
@@ -297,7 +298,8 @@ func (r Routing) Topics(route Route) []Delivery {
 			return []Delivery{r.toOwner(r.node(route.Source, "callees"), route.Target)}
 		}
 		return []Delivery{r.toOwner(r.node(route.Target, "needs"), route.Target)}
-	case RouteOwnerItem, RouteLibrarianAnswer:
+	case RouteOwnerItem, RouteLibrarianAnswer, RouteReplyToPremise:
+		// A reply whose reason goes to the premise owner is that owner's item, not the edge's other party's.
 		return []Delivery{r.toOwner(r.NeedsTopic(route.Owner), route.Owner)}
 	case RouteProposal:
 		return []Delivery{{Topic: r.node(route.Owner, "neighbors"), Audience: AudienceNeighbors, Node: route.Owner}}
@@ -343,10 +345,10 @@ type NoticeFields struct {
 	Models   map[string]any
 }
 
-// Notices builds one notice per delivery. Every notice of an item carries the key c-<hex16(item)>. A notice of a record
-// that queues no item names no item: its subject is its sender, and its key is c-<hex16(record@commit)>, one for each
-// revision of the record, which a re-run of the step repeats. The message names the record's commit when there is one:
-// the gate's near verdict has none yet.
+// Notices builds one notice per delivery. Every notice of an item carries the key NoticeKey(item). A notice of a record
+// that queues no item names no item: its subject is its sender, and its key is NoticeKey(record@commit), one for each
+// revision of the record. A re-run of the step repeats the key, so each subscribed session takes the notice once. The
+// message names the record's commit when there is one: the gate's near verdict has none yet.
 func Notices(deliveries []Delivery, fields NoticeFields) []Notice {
 	at := fields.Commit
 	if len(at) > 12 {
@@ -378,7 +380,7 @@ func Notices(deliveries []Delivery, fields NoticeFields) []Notice {
 		if fields.Item != "" {
 			payload["item"] = fields.Item
 		}
-		notices = append(notices, Notice{Topic: delivery.Topic, Message: message, Payload: payload, Key: "c-" + Hex16(key)})
+		notices = append(notices, Notice{Topic: delivery.Topic, Message: message, Payload: payload, Key: NoticeKey(key)})
 	}
 	return notices
 }

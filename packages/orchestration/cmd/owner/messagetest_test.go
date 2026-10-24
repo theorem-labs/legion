@@ -1,18 +1,154 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 	"github.com/sjawhar/legion/orchestration/owner/messagetest"
 	"gopkg.in/yaml.v3"
 )
+
+// heldAnswer runs `message-test answer` of item for owner under a hold of the driver's at moment, waits until the
+// command says it is held, and returns what it said and the cancel that kills it, with the channel of its exit code.
+func (f *commandFixture) heldAnswer(owner, item, moment string) (messagetest.Hold, context.CancelFunc, <-chan int) {
+	f.t.Helper()
+	if err := messagetest.PutHold(f.stateDir(), item, moment); err != nil {
+		f.t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(f.ctx)
+	f.t.Cleanup(cancel)
+	exit := make(chan int, 1)
+	run := f.as(owner)
+	go func() {
+		_, _, code := run.runContext(ctx, run.dir(), "message-test", "answer", item)
+		exit <- code
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		held, found, err := messagetest.ReadHeld(f.stateDir())
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		if found {
+			return held, cancel, exit
+		}
+		select {
+		case code := <-exit:
+			f.t.Fatalf("message-test answer %s exited %d without pausing at the %s hold", item, code, moment)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("message-test answer %s never paused at the %s hold", item, moment)
+		}
+	}
+}
+
+// enqueueCount is how many times the ledger enqueued item.
+func (f *commandFixture) enqueueCount(item string) int {
+	f.t.Helper()
+	events, err := f.store.Events(f.ctx, "r", 0, item)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	count := 0
+	for _, event := range events {
+		if event.Kind == "item.enqueued" {
+			count++
+		}
+	}
+	return count
+}
+
+// A kill after the answer lands between the record commit and the completion: the driver's hold pauses the answer
+// there, with the record committed on the owner's branch and the follow-up queued, and the item still open. A killed
+// command (its context cancelled) leaves the item open; once the supervisor frees its lease, the relaunched owner's
+// answer completes it with the same record, once, and queues no second follow-up.
+func TestMessageTestAnswerPausesAfterTheAnswerBeforeTheCompletion(t *testing.T) {
+	f := newCommandFixture(t)
+	edge := ownerpkg.EdgeID(caller, state)
+	need, offer := "need:"+edge+"@r4", "offer:"+edge+"@r1"
+	f.enqueue(need, state)
+	held, kill, exit := f.heldAnswer(state, need, messagetest.MomentAfterAnswer)
+	if held.Item != need || held.Moment != messagetest.MomentAfterAnswer || held.PID != os.Getpid() {
+		t.Fatalf("held = %+v", held)
+	}
+	path := messagetest.AnswerRecord("skeleton", state, "need", edge)
+	record := f.lastCommit(state, path)
+	if record == "" || f.trailer(record, "Owner-Item") != need {
+		t.Fatalf("at the hold the record of %s is %q, want a commit with its Owner-Item trailer", need, record)
+	}
+	if item := f.item(need); item.State != "open" || item.Holder != state {
+		t.Fatalf("at the hold %s = %+v, want open and held by %s", need, item, state)
+	}
+	if item := f.item(offer); item.State != "open" || item.Owner != caller {
+		t.Fatalf("at the hold the follow-up %s = %+v", offer, item)
+	}
+	kill()
+	if code := <-exit; code == 0 {
+		t.Fatal("a killed answer exited 0")
+	}
+	if item := f.item(need); item.State != "open" {
+		t.Fatalf("after the kill %s = %+v, want open", need, item)
+	}
+	if _, err := f.store.ReleaseHolder(f.ctx, "r", state, "owner pane stopped"); err != nil {
+		t.Fatal(err)
+	}
+	if err := messagetest.ReleaseHold(f.stateDir()); err != nil {
+		t.Fatal(err)
+	}
+	f.as(state).ok("message-test", "answer", need)
+	if item := f.item(need); item.State != "done" || item.Result != record {
+		t.Fatalf("the relaunched answer: %s = %+v, want done with the record %s", need, item, record)
+	}
+	if n := f.commitCount(state, path); n != 1 {
+		t.Fatalf("answer commits = %d, want 1", n)
+	}
+	if n := f.enqueueCount(offer); n != 1 {
+		t.Fatalf("%s was enqueued %d times", offer, n)
+	}
+}
+
+// A kill after the claim lands before the record: the hold pauses the answer with the item claimed by the owner
+// (claimed by the answer itself when the owner did not run `claim` first) and nothing recorded.
+func TestMessageTestAnswerPausesAfterTheClaimBeforeTheRecord(t *testing.T) {
+	f := newCommandFixture(t)
+	edge := ownerpkg.EdgeID(caller, state)
+	need := "need:" + edge + "@r5"
+	f.enqueue(need, state)
+	held, kill, exit := f.heldAnswer(state, need, messagetest.MomentAfterClaim)
+	if held.Item != need || held.Moment != messagetest.MomentAfterClaim {
+		t.Fatalf("held = %+v", held)
+	}
+	path := messagetest.AnswerRecord("skeleton", state, "need", edge)
+	if item := f.item(need); item.State != "open" || item.Holder != state {
+		t.Fatalf("at the hold %s = %+v, want claimed by %s", need, item, state)
+	}
+	if n := f.commitCount(state, path); n != 0 {
+		t.Fatalf("at the hold %d answer commits exist, want none", n)
+	}
+	kill()
+	<-exit
+	if _, err := f.store.ReleaseHolder(f.ctx, "r", state, "owner pane stopped"); err != nil {
+		t.Fatal(err)
+	}
+	if err := messagetest.ReleaseHold(f.stateDir()); err != nil {
+		t.Fatal(err)
+	}
+	f.as(state).ok("claim", need)
+	f.as(state).ok("message-test", "answer", need)
+	if item := f.item(need); item.State != "done" || item.Result != f.lastCommit(state, path) || f.commitCount(state, path) != 1 {
+		t.Fatalf("the relaunched answer: %s = %+v with %d commits", need, item, f.commitCount(state, path))
+	}
+}
 
 const prefix = "notifications.example."
 
@@ -225,6 +361,8 @@ func TestMessageTestUsage(t *testing.T) {
 		{"message-test", "--out"},
 		{"message-test", "--out", f.root + "/run", "--nodes", caller},
 		{"message-test", "--out", f.root + "/run", "--kills", "-1"},
+		{"message-test", "--out", f.root + "/run", "--kills", "0"},
+		{"message-test", "--out", f.root + "/run", "--kills", "2"},
 		{"message-test", "--out", f.root + "/run", "--frobnicate"},
 	} {
 		if code, stderr := f.as(caller).fails(args...); code != exitUsage {
@@ -233,5 +371,36 @@ func TestMessageTestUsage(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.root, "run")); err == nil {
 		t.Fatal("a refused message-test made its output directory")
+	}
+}
+
+// A full run kills one owner pane at each of the three moments of a step (before the claim, after the claim, after
+// the answer), so a count of kills below three, 0 included, is a usage error: such a run could not show every moment.
+func TestParseDriverFlagsRefusesFewerKillsThanMoments(t *testing.T) {
+	for _, kills := range []string{"0", "1", "2"} {
+		_, err := parseDriverFlags([]string{"--kills", kills, "--out", "/runs/one"})
+		var usage *usageError
+		if !errors.As(err, &usage) || !strings.Contains(err.Error(), "at least 3") {
+			t.Errorf("--kills %s: %v, want a usage error that asks for at least 3", kills, err)
+		}
+	}
+	if flags, err := parseDriverFlags([]string{"--kills", "3", "--out", "/runs/one"}); err != nil || flags.kills != 3 {
+		t.Fatalf("--kills 3 = %+v, %v", flags, err)
+	}
+}
+
+// --allow-missing-kinds names the topic kinds the nodes may lack, comma-separated; a name that is no topic kind is a
+// usage error.
+func TestParseDriverFlagsReadsTheAllowedMissingKinds(t *testing.T) {
+	flags, err := parseDriverFlags([]string{"--allow-missing-kinds", "linked,callees", "--out", "/runs/one"})
+	if err != nil || !reflect.DeepEqual(flags.allowMissingKinds, []string{"linked", "callees"}) {
+		t.Fatalf("--allow-missing-kinds linked,callees = %+v, %v", flags, err)
+	}
+	for _, value := range []string{"linkd", "linked,", ""} {
+		_, err := parseDriverFlags([]string{"--allow-missing-kinds", value, "--out", "/runs/one"})
+		var usage *usageError
+		if !errors.As(err, &usage) {
+			t.Errorf("--allow-missing-kinds %q: %v, want a usage error", value, err)
+		}
 	}
 }

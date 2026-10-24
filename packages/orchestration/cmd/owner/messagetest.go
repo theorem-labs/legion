@@ -7,17 +7,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/sjawhar/legion/orchestration/ledger"
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
 	"github.com/sjawhar/legion/orchestration/owner/messagetest"
 	"gopkg.in/yaml.v3"
 )
 
-const messageTestUsage = "message-test [--prefix P] [--nodes A,B] [--kills N] --out DIR | message-test topics | " +
+const messageTestUsage = "message-test [--prefix P] [--nodes A,B] [--kills N] [--allow-missing-kinds K,...] --out DIR | message-test topics | " +
 	"message-test subscribed | message-test saw <delivery id> <topic> | message-test answer <item>"
 
 // parseMessageTest reads `owner message-test`: a test owner's command, or the driver's options.
@@ -58,10 +60,11 @@ func parseMessageTest(args []string) (func(*session) (any, error), error) {
 }
 
 type driverFlags struct {
-	prefix string
-	nodes  []string
-	kills  int
-	out    string
+	prefix            string
+	nodes             []string
+	kills             int
+	allowMissingKinds []string
+	out               string
 }
 
 func parseDriverFlags(args []string) (driverFlags, error) {
@@ -86,10 +89,20 @@ func parseDriverFlags(args []string) (driverFlags, error) {
 			flags.nodes = nodes
 		case "--kills":
 			kills, err := strconv.Atoi(value)
-			if err != nil || kills < 0 {
-				return driverFlags{}, usagef("--kills takes a count, not %q", value)
+			if err != nil || kills < len(messagetest.Moments) {
+				return driverFlags{}, usagef("--kills takes a count of at least %d, one kill at each moment of a step (%s), not %q",
+					len(messagetest.Moments), strings.Join(messagetest.Moments, ", "), value)
 			}
 			flags.kills = kills
+		case "--allow-missing-kinds":
+			kinds := strings.Split(value, ",")
+			for _, kind := range kinds {
+				if !slices.Contains(messagetest.TopicKinds, kind) {
+					return driverFlags{}, usagef("--allow-missing-kinds takes topic kinds of %s, comma-separated, not %q",
+						strings.Join(messagetest.TopicKinds, ", "), value)
+				}
+			}
+			flags.allowMissingKinds = kinds
 		case "--out":
 			flags.out = value
 		default:
@@ -243,6 +256,15 @@ func (s *session) messageTestAnswer(item string, ref ownerpkg.ItemRef) (any, err
 	if err := s.checkNotHeldByOther(store, item); err != nil {
 		return nil, err
 	}
+	if err := s.holdAfterClaim(store, p, item, current); err != nil {
+		return nil, err
+	}
+	// The driver's hold after the answer pauses the step in its completion, the step runner's last call
+	// (owner.Runner.Run, owner/step.go): the record is committed and the follow-up queued, and the item is open.
+	p.runner.Ledger = completionHold{Ledger: p.runner.Ledger, await: func(ctx context.Context) error {
+		_, err := messagetest.AwaitRelease(ctx, s.deploy.StateDir, item, messagetest.MomentAfterAnswer)
+		return err
+	}}
 	outcome, err := s.runStep(p, ownerpkg.Step{Answers: item, Path: path, Data: data, Subject: "message-test: answer " + item, FollowUps: followUps})
 	if err != nil {
 		return nil, err
@@ -252,6 +274,35 @@ func (s *session) messageTestAnswer(item string, ref ownerpkg.ItemRef) (any, err
 		result.FollowUps = append(result.FollowUps, followUp.Item)
 	}
 	return result, nil
+}
+
+// holdAfterClaim pauses the answer while the driver holds item after the claim: with the item claimed by the owner
+// (claimed here when the owner did not run `claim` first, as the step would claim it) and nothing recorded.
+func (s *session) holdAfterClaim(store *ledger.Store, p party, item string, current ledger.Item) error {
+	hold, found, err := messagetest.ReadHold(s.deploy.StateDir)
+	if err != nil || !found || hold.Item != item || hold.Moment != messagetest.MomentAfterClaim {
+		return err
+	}
+	if current.Holder != p.ID {
+		if _, err := store.Claim(s.ctx, s.repo, item, p.ID, 0); err != nil {
+			return err
+		}
+	}
+	_, err = messagetest.AwaitRelease(s.ctx, s.deploy.StateDir, item, messagetest.MomentAfterClaim)
+	return err
+}
+
+// completionHold is a step runner's ledger whose Complete first waits out the driver's hold after the answer.
+type completionHold struct {
+	ownerpkg.Ledger
+	await func(context.Context) error
+}
+
+func (l completionHold) Complete(ctx context.Context, repo, id, holder string, gen int64, result string) error {
+	if err := l.await(ctx); err != nil {
+		return err
+	}
+	return l.Ledger.Complete(ctx, repo, id, holder, gen, result)
 }
 
 // versionAfter reports whether version a is newer than b: revisions r<n> and plain counts compare as numbers.
@@ -317,7 +368,7 @@ func (s *session) messageTestRun(flags driverFlags) (any, error) {
 		}
 	}()
 	report, err := messagetest.Run(ctx, messagetest.Options{
-		Prefix: flags.prefix, Nodes: flags.nodes, Kills: flags.kills, Out: out,
+		Prefix: flags.prefix, Nodes: flags.nodes, Kills: flags.kills, AllowMissingKinds: flags.allowMissingKinds, Out: out,
 		Deploy: deploy, Owner: owner, Legion: legion,
 		Environ: os.Environ(), Getenv: s.getenv, Progress: s.stderr, Timeouts: messagetest.DefaultTimeouts(),
 	})

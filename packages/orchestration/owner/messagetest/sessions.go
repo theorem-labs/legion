@@ -29,8 +29,9 @@ const envoyMessage = "envoy-message"
 // noticeType is the payload type of every notice the driver publishes.
 const noticeType = "message-test"
 
-// Arrival is one Envoy delivery an owner session's transcript records: the event id, the payload's type, run, step
-// and topic, when the session recorded it, where, and the transcript entry's own id.
+// Arrival is one Envoy delivery an owner session's transcript records: the event id, the payload's type, run and step,
+// pi-envoy's record of the delivery (the topic of its envelope, the subject the session took it on and its dedupe
+// key), when the session recorded it, where, and the transcript entry's own id.
 type Arrival struct {
 	Owner      string    `json:"owner"`
 	ID         string    `json:"id"`
@@ -38,6 +39,8 @@ type Arrival struct {
 	Run        string    `json:"run"`
 	Step       string    `json:"step"`
 	Topic      string    `json:"topic"`
+	Subject    string    `json:"subject"`
+	DedupeKey  string    `json:"dedupe_key"`
 	At         time.Time `json:"at"`
 	Transcript string    `json:"transcript"`
 	Line       int       `json:"line"`
@@ -52,9 +55,20 @@ type transcriptLine struct {
 	Type          string          `json:"type"`
 	CustomType    string          `json:"customType"`
 	Content       json.RawMessage `json:"content"`
+	Details       deliveryDetails `json:"details"`
 	Timestamp     time.Time       `json:"timestamp"`
 	ID            string          `json:"id"`
 	ParentSession string          `json:"parentSession"`
+}
+
+// deliveryDetails is pi-envoy's record of a delivery in its custom message's details (deliveryDetails in
+// packages/pi-envoy/extensions/envoy.ts), which Oh My Pi keeps in the transcript and never sends the model: the
+// subject the session's subscription took the frame on, and its envelope's topic, event id and dedupe key.
+type deliveryDetails struct {
+	Subject   string `json:"subject"`
+	Topic     string `json:"topic"`
+	EventID   string `json:"event_id"`
+	DedupeKey string `json:"dedupe_key"`
 }
 
 // transcriptHeaderLines is how far into a transcript its session header can be: Oh My Pi writes a title line, then
@@ -142,12 +156,12 @@ type renderedDelivery struct {
 	} `yaml:"envoy"`
 }
 
-// noticePayload is the payload of the driver's notices.
+// noticePayload is the payload of the driver's notices. Its topic is the driver's own word and decides nothing: a
+// delivery's topic is pi-envoy's record of it.
 type noticePayload struct {
-	Type  string `yaml:"type"`
-	Run   string `yaml:"run"`
-	Step  string `yaml:"step"`
-	Topic string `yaml:"topic"`
+	Type string `yaml:"type"`
+	Run  string `yaml:"run"`
+	Step string `yaml:"step"`
 }
 
 // readArrivals reads every delivery a transcript records, in order. A line still being written (no newline yet) is
@@ -186,6 +200,17 @@ func readArrivals(owner, path string) ([]Arrival, error) {
 				return nil, fmt.Errorf("%s:%d: a delivery that names %s and cannot be read: %w", path, number, noticeType, err)
 			}
 			continue
+		}
+		if arrival.Type == noticeType {
+			details := line.Details
+			switch {
+			case details.Topic == "" || details.Subject == "":
+				return nil, fmt.Errorf("%s:%d: the delivery %s of a %s notice holds no record of its topic and subject (the custom message's details, which pi-envoy writes)",
+					path, number, arrival.ID, noticeType)
+			case details.EventID != "" && details.EventID != arrival.ID:
+				return nil, fmt.Errorf("%s:%d: the delivery renders the id %s, but pi-envoy recorded the event %s", path, number, arrival.ID, details.EventID)
+			}
+			arrival.Topic, arrival.Subject, arrival.DedupeKey = details.Topic, details.Subject, details.DedupeKey
 		}
 		arrival.Owner, arrival.At, arrival.Transcript, arrival.Line, arrival.Entry = owner, line.Timestamp, path, number, line.ID
 		arrivals = append(arrivals, arrival)
@@ -231,7 +256,7 @@ func parseDelivery(content string) (Arrival, error) {
 		if err := rendered.Envoy.Message.Decode(&payload); err != nil {
 			return Arrival{}, err
 		}
-		arrival.Type, arrival.Run, arrival.Step, arrival.Topic = payload.Type, payload.Run, payload.Step, payload.Topic
+		arrival.Type, arrival.Run, arrival.Step = payload.Type, payload.Run, payload.Step
 	}
 	return arrival, nil
 }

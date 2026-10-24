@@ -182,7 +182,28 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 	if len(report.KillLog) != 3 || report.Restart == nil || report.Restart.ItemSeconds <= 0 {
 		t.Fatalf("kills = %+v, restart = %+v", report.KillLog, report.Restart)
 	}
-	for _, step := range []string{"setup", "start the daemon", "wake from the ledger", "arrival", "duplicates", "out of order", "kill 1 of 3", "daemon restart", "collect", "teardown"} {
+	// Each kill landed at the moment the schedule set for it: before the claim, after the claim, and between the
+	// answer's record and its completion, each time with the killed process gone before the hold was released.
+	for index, kill := range report.KillLog {
+		want := messagetest.Moments[index]
+		if kill.Scheduled != want || kill.Observed != want || kill.Done || (want == messagetest.MomentAfterAnswer) != (kill.Record != "") ||
+			(want == messagetest.MomentBeforeClaim) != (kill.Holder == "") || (want == messagetest.MomentBeforeClaim) != (kill.Held == 0) {
+			t.Errorf("kill %d = %+v, want it to land %s", index+1, kill, want)
+		}
+	}
+	// The new daemon did the restart's work: the old daemon's pane was killed, and every target pane that ran while
+	// the item was open is one the new daemon logged as launched.
+	restart := report.Restart
+	if restart.NewDaemonPID == restart.OldDaemonPID || len(restart.WorkPanes) == 0 || restart.ClaimEvent <= restart.EventsFrom || restart.CompleteEvent <= restart.ClaimEvent {
+		t.Fatalf("restart = %+v", restart)
+	}
+	for _, pane := range restart.WorkPanes {
+		if !slices.Contains(restart.Launched, pane.Incarnation) || pane.Incarnation == restart.OldPane.Incarnation {
+			t.Fatalf("the restart's item ran in %+v, which the new daemon did not launch (launched %v, old pane %+v)", pane, restart.Launched, restart.OldPane)
+		}
+	}
+	for _, step := range []string{"setup", "start the daemon", "wake from the ledger", "arrival", "duplicates", "out of order", "kill 1 of 3 (before-claim)",
+		"kill 2 of 3 (after-claim)", "kill 3 of 3 (after-answer)", "daemon restart", "collect", "teardown"} {
 		if !slices.ContainsFunc(report.Steps, func(s messagetest.StepTiming) bool { return s.Name == step && s.Error == "" }) {
 			t.Errorf("step %q did not run cleanly: %+v", step, report.Steps)
 		}

@@ -529,16 +529,28 @@ func (s *supervisor) launch(ctx context.Context, owner string, template Template
 	for _, pair := range env {
 		args = append(args, "-e", pair)
 	}
-	args = append(args, "-P", "-F", "#{pane_id}", shellQuote("exec", s.config.OMP, "--system-prompt-file", template.PromptFile))
+	args = append(args, "-P", "-F", "#{pane_id} #{pane_pid}", shellQuote("exec", s.config.OMP, "--system-prompt-file", template.PromptFile))
 	out, err := s.tmux(ctx, args...)
 	if err != nil {
 		return err
 	}
-	id := strings.TrimSpace(out)
+	id, pidText, _ := strings.Cut(strings.TrimSpace(out), " ")
+	pid, err := strconv.Atoi(pidText)
+	if err != nil {
+		return fmt.Errorf("tmux reported the pane %q with no pane pid: %w", strings.TrimSpace(out), err)
+	}
 	if _, err := s.tmux(ctx, "set-option", "-p", "-t", id, "@legion_owner", owner); err != nil {
 		return err
 	}
 	s.panes[owner] = id
 	s.logf("started %s in the pane %s (%s)", owner, id, workdir)
+	// The daemon's launch line (supervise: launched, packages/daemon/internal/supervise/machine.go), with the pane's
+	// incarnation as the daemon records it: the driver's restart check reads it.
+	incarnation, _, err := messagetest.ProcessIncarnation(pid)
+	if err != nil {
+		return err
+	}
+	line, _ := json.Marshal(map[string]any{"time": time.Now().UTC(), "level": "INFO", "msg": messagetest.LaunchedLine, "owner": owner, "incarnation": incarnation})
+	_, _ = fmt.Fprintf(s.log, "%s\n", line)
 	return nil
 }

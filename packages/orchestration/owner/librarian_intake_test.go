@@ -412,8 +412,8 @@ func TestDeliverPublishesAgainOnlyForAnItemStillOpenForTheLibrarian(t *testing.T
 		if outcome.Added || len(outcome.Undelivered) != c.notices {
 			t.Errorf("%s: outcome %+v, want %d notices and nothing added", name, outcome, c.notices)
 		}
-		if c.notices > 0 && len(outcome.Undelivered) > 0 && outcome.Undelivered[0].Key != "c-"+Hex16(item) {
-			t.Errorf("%s: key %s, want the first delivery's c-%s", name, outcome.Undelivered[0].Key, Hex16(item))
+		if c.notices > 0 && len(outcome.Undelivered) > 0 && outcome.Undelivered[0].Key != NoticeKey(item) {
+			t.Errorf("%s: key %s, want the first delivery's %s", name, outcome.Undelivered[0].Key, NoticeKey(item))
 		}
 	}
 }
