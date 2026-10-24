@@ -14,6 +14,7 @@ import (
 	"github.com/sjawhar/legion/daemon/internal/config"
 	"github.com/sjawhar/legion/daemon/internal/ghrepo"
 	"github.com/sjawhar/legion/daemon/internal/notify"
+	"github.com/sjawhar/legion/daemon/internal/podsafety"
 	"github.com/sjawhar/legion/daemon/internal/prompts"
 	"github.com/sjawhar/legion/daemon/internal/runtime"
 	"github.com/sjawhar/legion/daemon/internal/supervise"
@@ -65,8 +66,12 @@ type specs struct {
 	// backend is the backend a role runs on (config.Config.BackendFor); nil runs every role on Oh
 	// My Pi.
 	backend func(claim.Role) runtime.Backend
-	// owners maps each configured standing-owner claim to its launch shape.
-	owners map[claim.Token]config.StandingOwner
+	// ownerLaunch is how a standing owner of a ledger key launches: its named entry, or its graph
+	// node kind's template.
+	ownerLaunch func(string) (config.OwnerTemplate, bool)
+	// ledgerRepository and ledgerDSNFile are standing_owners.repository and .ledger_dsn_file, which
+	// every owner's launch names (standingOwnerSpawnSpec).
+	ledgerRepository, ledgerDSNFile string
 }
 
 // rolePromptPath is where a claim's role prompt is kept for every launch of it.
@@ -221,17 +226,54 @@ func (s specs) controllerSpawnSpec() (runtime.SpawnSpec, error) {
 	}, nil
 }
 
+// ownerStartFile is where a standing owner's first turn is written for every launch of it: under
+// the owner's own directory, which the tmux runtime makes its working directory.
+func ownerStartFile(stateDir string, token claim.Token) string {
+	return filepath.Join(stateDir, "owners", string(token), "start.md")
+}
+
+// standingOwnerSpawnSpec is an owner's launch: its prompt, harness and deployment instructions,
+// the launch secrets, and what tells it its work. LEGION_OWNER is the ledger key it serves its
+// queue as, the holder name every lease it takes must use, so that the supervisor's release of a
+// stopped owner frees them; LEGION_LEDGER_REPOSITORY and LEGION_LEDGER_DSN_FILE are where that
+// queue is (a path, never the DSN). LEGION_OWNER_START_FILE names its first turn, written read-only
+// here, before the machine's spawn (and so before the launch is recorded as started): the template
+// prompt, then its key, its repository and the exact ledger commands that find, claim and complete
+// its items. The prompt stays in the system prompt too (RolePromptPaths).
 func (s specs) standingOwnerSpawnSpec(c supervise.Claim) (runtime.SpawnSpec, error) {
-	owner, ok := s.owners[c.Token]
+	key, ok := c.StandingOwnerKey()
 	if !ok {
-		return runtime.SpawnSpec{}, fmt.Errorf("no standing-owner configuration for %s", c.Token)
+		return runtime.SpawnSpec{}, fmt.Errorf("standing owner %s names no owner key", c.Token)
+	}
+	var launch config.OwnerTemplate
+	if s.ownerLaunch != nil {
+		launch, ok = s.ownerLaunch(key)
+	}
+	if !ok {
+		return runtime.SpawnSpec{}, fmt.Errorf("no standing-owner configuration for %s", key)
+	}
+	prompt, err := os.ReadFile(launch.PromptFile)
+	if err != nil {
+		return runtime.SpawnSpec{}, fmt.Errorf("the prompt of standing owner %s: %w", key, err)
+	}
+	startFile := ownerStartFile(s.stateDir, c.Token)
+	if err := os.MkdirAll(filepath.Dir(startFile), 0o700); err != nil {
+		return runtime.SpawnSpec{}, fmt.Errorf("the directory of standing owner %s: %w", key, err)
+	}
+	if err := podsafety.WriteReadOnly(startFile, []byte(prompts.OwnerStart(string(prompt), key, s.ledgerRepository))); err != nil {
+		return runtime.SpawnSpec{}, fmt.Errorf("the start file of standing owner %s: %w", key, err)
 	}
 	return runtime.SpawnSpec{
-		Backend: owner.Harness,
-		Env:     map[string]string{},
+		Backend: launch.Harness,
+		Env: map[string]string{
+			"LEGION_OWNER":             key,
+			"LEGION_LEDGER_REPOSITORY": s.ledgerRepository,
+			"LEGION_LEDGER_DSN_FILE":   s.ledgerDSNFile,
+			"LEGION_OWNER_START_FILE":  startFile,
+		},
 		Secrets: maps.Clone(s.secrets),
 		Prompt: runtime.PromptParts{
-			RolePromptPaths:            []string{owner.PromptFile},
+			RolePromptPaths:            []string{launch.PromptFile},
 			DeploymentInstructionsPath: s.instructions,
 		},
 	}, nil

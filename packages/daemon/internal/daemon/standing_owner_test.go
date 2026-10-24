@@ -57,8 +57,8 @@ func standingOwnerConfig(t *testing.T, cfg *config.Config, queue *ledger.Store, 
 		t.Fatalf("write owner prompt: %v", err)
 	}
 	cfg.StandingOwners = &config.StandingOwners{LedgerDSNFile: dsnFile, Repository: repo, MaxRunning: 1, BudgetUSD: 10,
-		LedgerTimeout: 5 * time.Second,
-		Owners:        []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: "omp", MaxCostUSD: 1}}}
+		LedgerTimeout: 5 * time.Second, Reconcile: time.Minute,
+		Owners: []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: "omp", MaxCostUSD: 1}}}
 }
 
 func standingOwnerClaim(t *testing.T, cfg config.Config, state supervise.ClaimState, locator *runtime.Locator) supervise.Claim {
@@ -386,7 +386,7 @@ func TestStandingOwnerLedgerOutageLeavesDaemonServing(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.StandingOwners = &config.StandingOwners{
-		LedgerDSNFile: dsnFile, Repository: "example/repository", MaxRunning: 1, BudgetUSD: 1, LedgerTimeout: 5 * time.Second,
+		LedgerDSNFile: dsnFile, Repository: "example/repository", MaxRunning: 1, BudgetUSD: 1, LedgerTimeout: 5 * time.Second, Reconcile: time.Minute,
 		Owners: []config.StandingOwner{{Name: "owner-a", PromptFile: prompt, Harness: runtime.BackendOmp, MaxCostUSD: 1}},
 	}
 	rt := fake.NewRuntime()
@@ -808,4 +808,106 @@ func TestLedgerQueueReconnectsAfterServiceReturns(t *testing.T) {
 		hasWork, err := q.HasWork(context.Background(), "owner-a")
 		return err == nil && hasWork
 	})
+}
+
+// recordedRefusals stands in for the ledger's RecordOwnerRefused (OwnerRefusalRecorder) and keeps
+// every call it is given.
+type recordedRefusals struct {
+	mu    sync.Mutex
+	calls []api.OwnerRefusal
+}
+
+func (r *recordedRefusals) RecordOwnerRefused(_ context.Context, repo, owner string, revision int64, reason string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, api.OwnerRefusal{Repository: repo, Owner: owner, Revision: revision, Reason: reason})
+	return nil
+}
+
+func (r *recordedRefusals) of(owner string) []api.OwnerRefusal {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var calls []api.OwnerRefusal
+	for _, call := range r.calls {
+		if call.Owner == owner {
+			calls = append(calls, call)
+		}
+	}
+	return calls
+}
+
+// An owner on never_start is never started and never refused: its items stay open for a person.
+// An owner the daemon cannot launch — a node kind with no template, or a key outside the owner-key
+// grammar — is refused durably, once per work revision, through the ledger's RecordOwnerRefused,
+// and the operator API lists the refusal. New work for that owner is a new revision, refused again.
+func TestOwnersTheDaemonWillNotStartAreRefusedDurablyOncePerRevision(t *testing.T) {
+	cfg := testConfig(t)
+	queue := openOwnerLedger(t, cfg.PostgresDSN)
+	repo := "refusals-" + randomSuffix(t)
+	standingOwnerConfig(t, &cfg, queue, repo)
+	cfg.StandingOwners.NeverStart = []string{"escalations"}
+	cfg.StandingOwners.Reconcile = 50 * time.Millisecond
+	for item, owner := range map[string]string{"escalation-1": "escalations", "file-1": "file:fs/namespace.c", "struct-1": "struct:mount"} {
+		if err := queue.Enqueue(context.Background(), repo, item, owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refusals := &recordedRefusals{}
+	rt := fake.NewRuntime()
+	o := fakeRuntime(rt, &built{})
+	o.ownerRefusals = refusals
+	d := startDaemon(t, cfg, o)
+	testwait.Eventually(t, "both unlaunchable owners refused", func() bool {
+		return len(refusals.of("file:fs/namespace.c")) == 1 && len(refusals.of("struct:mount")) == 1
+	})
+	revision := func(owner string) int64 {
+		t.Helper()
+		got, err := queue.OwnerWorkRevision(context.Background(), repo, owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	for _, owner := range []string{"file:fs/namespace.c", "struct:mount"} {
+		if got := refusals.of(owner)[0]; got.Repository != repo || got.Revision != revision(owner) || got.Reason == "" {
+			t.Errorf("refusal of %s = %+v, want repository %s at revision %d with a reason", owner, got, repo, revision(owner))
+		}
+	}
+	status, body := d.request(http.MethodGet, "/legion/v1/operator/owners/refused", nil, true)
+	if status != http.StatusOK {
+		t.Fatalf("list the refused owners = %d: %s", status, body)
+	}
+	var listed api.OwnerRefusals
+	if err := json.Unmarshal(body, &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Refused) != 2 || listed.Refused[0].Owner != "file:fs/namespace.c" || listed.Refused[1].Owner != "struct:mount" ||
+		!listed.Refused[1].Recorded || listed.Refused[1].Revision != revision("struct:mount") {
+		t.Fatalf("the operator's refused owners = %+v, want file:fs/namespace.c and struct:mount, recorded at their revisions", listed.Refused)
+	}
+	// Sweeps over the same work refuse nothing again; never_start's owner is neither started nor
+	// refused, and the named owner with work starts beside them.
+	if err := queue.Enqueue(context.Background(), repo, "owner-a-wake", "owner-a"); err != nil {
+		t.Fatal(err)
+	}
+	testwait.Eventually(t, "the named owner starts", func() bool { return len(rt.CallsOf("Spawn")) == 1 })
+	time.Sleep(10 * cfg.StandingOwners.Reconcile)
+	if got := len(refusals.of("struct:mount")); got != 1 {
+		t.Fatalf("struct:mount refused %d times on unchanged work, want once", got)
+	}
+	if got := refusals.of("escalations"); len(got) != 0 {
+		t.Fatalf("never_start owner was refused: %+v", got)
+	}
+	for _, call := range rt.CallsOf("Spawn") {
+		if key, _ := call.Spec.Claim.OwnerKey(call.Spec.Project); key != "owner-a" {
+			t.Fatalf("spawned %s, want only owner-a", call.Spec.Claim)
+		}
+	}
+	if err := queue.Enqueue(context.Background(), repo, "struct-2", "struct:mount"); err != nil {
+		t.Fatal(err)
+	}
+	testwait.Eventually(t, "new work refused again", func() bool { return len(refusals.of("struct:mount")) == 2 })
+	if got := refusals.of("struct:mount")[1].Revision; got != revision("struct:mount") {
+		t.Fatalf("second refusal at revision %d, want %d", got, revision("struct:mount"))
+	}
 }

@@ -911,6 +911,11 @@ func resolve(file fileConfig, env func(string) string, configDir string) (Config
 		for i := range owners.Owners {
 			owners.Owners[i].PromptFile = underConfig(owners.Owners[i].PromptFile, configDir)
 		}
+		owners.Templates = maps.Clone(owners.Templates)
+		for kind, template := range owners.Templates {
+			template.PromptFile = underConfig(template.PromptFile, configDir)
+			owners.Templates[kind] = template
+		}
 		cfg.StandingOwners = &owners
 	}
 	if err := resolveStage2(file, configDir, &cfg); err != nil {

@@ -536,6 +536,9 @@ export const LegionOperatorClaimResponse = z.strictObject({
   suspensionHeld: z.literal(true).optional(),
   /** 0 = no contract recorded. */
   pluginContract: z.number().int().nonnegative(),
+  /** A standing owner's ledger key, the graph node id (`function:get_mountpoint`) or named role it
+   * owns; absent for every other claim. */
+  ownerKey: nonEmptyString.optional(),
 });
 
 export type LegionOperatorClaim = z.output<typeof LegionOperatorClaimResponse>;
@@ -543,6 +546,22 @@ export type LegionOperatorClaim = z.output<typeof LegionOperatorClaimResponse>;
 /** `api.OperatorClaims`, the body of `GET /legion/v1/operator/claims`, in token order. */
 export const LegionOperatorClaimsResponse = z.strictObject({
   claims: z.array(LegionOperatorClaimResponse),
+});
+
+/** `api.OwnerRefusal`: a standing owner the daemon will not start while its work stays at
+ * `revision`; `recorded` is whether the ledger holds the durable refusal. */
+export const LegionOwnerRefusal = z.strictObject({
+  repository: nonEmptyString,
+  owner: nonEmptyString,
+  revision: z.number().int().positive(),
+  reason: nonEmptyString,
+  refusedAt: z.string().datetime({ offset: true }),
+  recorded: z.boolean(),
+});
+
+/** `api.OwnerRefusals`, the body of `GET /legion/v1/operator/owners/refused`, in owner order. */
+export const LegionOwnerRefusalsResponse = z.strictObject({
+  refused: z.array(LegionOwnerRefusal),
 });
 
 /** The credential grant body from `internal/api/credentials.go`. */

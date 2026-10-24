@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import ownerTokens from "../fixtures/owner-tokens.json";
 import projectTokens from "../fixtures/project-tokens.json";
 import {
   controllerToken,
@@ -8,6 +9,8 @@ import {
   roleToken,
   roleTopic,
   sanitizeToken,
+  standingOwnerKey,
+  standingOwnerToken,
 } from "./legion-roles";
 
 const ENVOY_ROLE_TOKEN = /^[a-z0-9][a-z0-9_-]*$/;
@@ -64,6 +67,53 @@ describe("role token grammar", () => {
   test("rejects a token for another project or an unknown role", () => {
     expect(parseRoleToken("other", controllerToken("omp"))).toBeUndefined();
     expect(parseRoleToken("omp", "legion-omp-legion-42-operator")).toBeUndefined();
+  });
+});
+
+// The Go daemon's claim.OwnerToken and claim.DecodeOwnerName read the same fixture: an owner's
+// agent claims the role the daemon launched it under, and both sides decode it to one key.
+describe("standingOwnerToken", () => {
+  test("spells every owner key as fixtures/owner-tokens.json does, and decodes it back", () => {
+    for (const [key, token] of Object.entries(ownerTokens.tokens)) {
+      expect(standingOwnerToken(ownerTokens.project, key)).toBe(token);
+      expect(token).toMatch(ENVOY_ROLE_TOKEN);
+      expect(standingOwnerKey(ownerTokens.project, token)).toBe(key);
+    }
+  });
+
+  test("refuses a key outside the owner-key grammar", () => {
+    for (const key of ownerTokens.refused) {
+      expect(() => standingOwnerToken(ownerTokens.project, key)).toThrow("Invalid standing owner");
+    }
+  });
+
+  test("decodes no name that no key encodes to", () => {
+    for (const name of ownerTokens.malformed) {
+      expect(
+        standingOwnerKey(ownerTokens.project, `legion-${ownerTokens.project}-owner-${name}`)
+      ).toBeUndefined();
+    }
+    expect(
+      standingOwnerKey("other", standingOwnerToken(ownerTokens.project, "librarian"))
+    ).toBeUndefined();
+  });
+
+  test("round-trips every printable ASCII byte of a node id's suffix, each to its own token", () => {
+    const seen = new Map<string, string>();
+    for (let code = 0x21; code < 0x7f; code += 1) {
+      const key = `function:a${String.fromCharCode(code)}`;
+      const token = standingOwnerToken("p", key);
+      expect(token).toMatch(ENVOY_ROLE_TOKEN);
+      expect(seen.get(token)).toBeUndefined();
+      seen.set(token, key);
+      expect(standingOwnerKey("p", token)).toBe(key);
+    }
+  });
+
+  test("refuses a token past the length a state-directory file name allows", () => {
+    const limit = 200 - "legion-p-owner-".length;
+    expect(standingOwnerToken("p", "a".repeat(limit))).toHaveLength(200);
+    expect(() => standingOwnerToken("p", "a".repeat(limit + 1))).toThrow("Invalid standing owner");
   });
 });
 

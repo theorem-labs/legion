@@ -53,6 +53,25 @@
       },
       "suspensionHeld": true,
       "pluginContract": 0
+    },
+    {
+      "token": "legion-legion-owner-function_cget__mountpoint",
+      "tree": "",
+      "issue": "",
+      "role": "owner",
+      "generation": 0,
+      "state": "queued",
+      "session": "",
+      "sessionFile": "",
+      "budgets": {
+        "launchFailures": 0,
+        "deaths": 0,
+        "promptFailures": 0,
+        "promptRetires": 0
+      },
+      "uncertainStreak": 0,
+      "pluginContract": 0,
+      "ownerKey": "function:get_mountpoint"
     }
   ]
 }

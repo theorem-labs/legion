@@ -1,0 +1,20 @@
+{
+  "refused": [
+    {
+      "repository": "example/repository",
+      "owner": "file:fs/namespace.c",
+      "revision": 41,
+      "reason": "standing_owners.templates has no template for node kind file",
+      "refusedAt": "2026-10-23T18:40:00Z",
+      "recorded": true
+    },
+    {
+      "repository": "example/repository",
+      "owner": "struct:mount",
+      "revision": 44,
+      "reason": "standing_owners.templates has no template for node kind struct",
+      "refusedAt": "2026-10-23T18:40:00Z",
+      "recorded": false
+    }
+  ]
+}

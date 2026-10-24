@@ -152,6 +152,9 @@ type overrides struct {
 	// none of to reserve. nil, in production, is nothing: every launch reaches the real store's
 	// own check.
 	checkLaunch func(context.Context, supervise.Claim) error
+	// ownerRefusals stands in for the ledger's durable owner refusal (OwnerRefusalRecorder); nil,
+	// in production until the ledger serves RecordOwnerRefused, records none.
+	ownerRefusals OwnerRefusalRecorder
 }
 
 // Build is what the binary knows of its own build: Revision, the commit it was built from, and
@@ -587,6 +590,8 @@ type plan struct {
 	// checkLaunch is overrides.checkLaunch; nil wraps the store with nothing, so every launch
 	// reaches the real store's own CheckLaunch.
 	checkLaunch func(context.Context, supervise.Claim) error
+	// ownerRefusals is overrides.ownerRefusals.
+	ownerRefusals OwnerRefusalRecorder
 }
 
 // runtimeFactory builds the runtime over the worker stream (C3): ctx is supervision's lifetime,
@@ -657,6 +662,7 @@ func prepare(cfg config.Config, log *slog.Logger, o overrides) (plan, error) {
 		tools: reads.tmux.tools, clock: clock, orphanSweep: orphanSweep, controllerRetry: controllerRetry, stopBudget: stop,
 		secretsEnroller: secretsEnroller, secretsLogin: secretsLogin, strandedReported: o.strandedReported,
 		pluginRelaunchable: pluginRelaunchable, plugins: plugins, pluginsSource: pluginsSource, checkLaunch: o.checkLaunch,
+		ownerRefusals: o.ownerRefusals,
 	}
 	if cfg.Runtime.Name == "kubernetes" {
 		err = prepareSandbox(cfg, o, reads.sandbox, &p)
@@ -870,8 +876,10 @@ type supervision struct {
 	supervisor *supervisor
 	tokens     *api.BootTokens
 	claims     []supervise.Claim
-	workQueue  supervise.WorkQueue
-	ledger     *ledgerQueue
+	// ledger is the standing owners' ledger queue, nil without standing_owners.
+	ledger *ledgerQueue
+	// refused is the standing owners admission refused, which the operator API lists.
+	refused *ownerRefusals
 	// imageReport is what the worker image's passed probe reported: of the image, from its OK line,
 	// and of the pool, the attempts that waited on its capacity (bootprobe.ImageReport); under
 	// tmux, the model-fallback mark alone, read by plan.modelFallback. probed is whether the probe
@@ -940,17 +948,19 @@ func shimAddress(bound, advertiseHost string) (string, error) {
 // workflow's App tokens (nil without a workflow): every step of supervision that can refuse, so a
 // daemon that cannot supervise refuses before its boot is recorded.
 func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, p plan, st *store.Store, apps appauth.Tokens) (*supervision, error) {
-	owners, err := ownerConfigs(cfg.StandingOwners, p.project)
-	if err != nil {
-		return nil, err
+	launches := ownerLaunches(cfg.StandingOwners)
+	var ledgerRepository, ledgerDSNFile string
+	if owners := cfg.StandingOwners; owners != nil {
+		ledgerRepository, ledgerDSNFile = owners.Repository, owners.LedgerDSNFile
 	}
-	queue, err := openStandingOwnerQueue(cfg.StandingOwners)
+	queue, err := openStandingOwnerQueue(cfg.StandingOwners, log)
 	if err != nil {
 		return nil, err
 	}
 	var workQueue supervise.WorkQueue
+	var holderStopped func(owner, reason string)
 	if queue != nil {
-		workQueue = queue
+		workQueue, holderStopped = queue, queue.holderStopped
 	}
 	claims, err := st.Claims(boot)
 	if err != nil {
@@ -958,11 +968,6 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 		return nil, err
 	}
 	claims = ofProject(claims, p.project)
-	claims, err = ensureStandingOwners(boot, st, p.project, owners, claims)
-	if err != nil {
-		closeStandingOwnerQueue(queue, log)
-		return nil, err
-	}
 	reports, err := st.CapabilityReports(boot)
 	if err != nil {
 		return nil, err
@@ -995,23 +1000,25 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 	sup.deps = supervise.Deps{
 		Runtime: rt,
 		Conns:   listener,
-		Store:   pruning(gateLaunch(tokens.Recording(st), ownerLaunchCheck(st, cfg.StandingOwners, owners, workQueue, p.checkLaunch)), runtime.SecretsDir(cfg.StateDir), log),
+		Store:   pruning(gateLaunch(tokens.Recording(st), ownerLaunchCheck(st, cfg.StandingOwners, launches, queue, p.checkLaunch)), runtime.SecretsDir(cfg.StateDir), log),
 		Specs: specs{
 			stateDir: cfg.StateDir, project: p.project, instructions: p.instructions, secrets: p.secrets, prompts: p.prompts,
 			identity: p.identity, repository: p.repository,
 			repositories: func() api.RepositoriesView { return p.repositories.view(nil) },
 			designGate:   cfg.Gates.Design, slackChannels: cfg.Projects[cfg.Project].SlackChannels,
 			mergeRules: cfg.Projects[cfg.Project].Merge, runtimeName: cfg.Runtime.Name, plugins: p.plugins,
-			backend: cfg.BackendFor, owners: owners,
+			backend: cfg.BackendFor, ownerLaunch: launches,
+			ledgerRepository: ledgerRepository, ledgerDSNFile: ledgerDSNFile,
 		},
-		Identity:     adoptIdentity(p.identity, p.repository),
-		Secrets:      p.secretsEnroller,
-		PhaseHolds:   p.phaseHolds,
-		TreeClosable: p.treeClosable,
-		VolumeLost:   sup.volumeLost,
-		WorkQueue:    workQueue,
-		Clock:        p.clock,
-		Log:          log,
+		Identity:      adoptIdentity(p.identity, p.repository),
+		Secrets:       p.secretsEnroller,
+		PhaseHolds:    p.phaseHolds,
+		TreeClosable:  p.treeClosable,
+		VolumeLost:    sup.volumeLost,
+		WorkQueue:     workQueue,
+		HolderStopped: holderStopped,
+		Clock:         p.clock,
+		Log:           log,
 		Limits: supervise.Limits{
 			LaunchFailures: cfg.LaunchFailureLimit,
 			PromptFailures: cfg.PromptFailureLimit,
@@ -1031,7 +1038,7 @@ func openSupervision(boot context.Context, cfg config.Config, log *slog.Logger, 
 	stopping, beginStop := context.WithCancel(context.Background())
 	return &supervision{
 		cfg: cfg, log: log, plan: p, stream: listener, runtime: rt, supervisor: sup, tokens: tokens, claims: claims,
-		workQueue: workQueue, ledger: queue,
+		ledger: queue, refused: &ownerRefusals{byOwner: map[string]api.OwnerRefusal{}},
 		reports: reportsOfClaims(reports, claims), reportStore: st,
 		cancel: cancel, draining: draining, endDrain: endDrain, decided: api.NewRouteDecisions(),
 		stopping: stopping, beginStop: beginStop,
@@ -1434,6 +1441,7 @@ func serve(ctx context.Context, cfg config.Config, st *store.Store, startedAt ti
 		ClaimReady:         claimReadyHook(keeper, claimReady),
 		PromptAgents:       promptAgents(p.roleReferences),
 		CapabilityReported: s.capabilityReported,
+		RefusedOwners:      s.refused.list,
 	})
 
 	group, serving := errgroup.WithContext(ctx)

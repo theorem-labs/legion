@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -164,7 +166,10 @@ func controllerSpawns(rt *fake.Runtime, token claim.Token) int {
 
 // A controller whose launches run out of their budget fails, as any claim does, and nothing in the
 // machine relaunches a failed claim. The keeper does: after its wait it retries the claim with fresh
-// budgets, so the project is never left without a controller for good.
+// budgets, so the project is never left without a controller for good. The claim is failed only
+// for the keeper's wait, shorter than one poll of the operator's claim list under -race on a loaded
+// machine, so the failure is read from what the daemon logged as it happened rather than polled
+// for: a poll just before it and the next just after the retry would see no failed claim at all.
 func TestTheKeeperRetriesAControllerWhoseLaunchesRanOut(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ControllerLaunch = config.ControllerLaunchDaemon
@@ -173,14 +178,18 @@ func TestTheKeeperRetriesAControllerWhoseLaunchesRanOut(t *testing.T) {
 	rt.ScriptSpawn(fake.SpawnResult{Err: refused}, fake.SpawnResult{Err: refused}, fake.SpawnResult{Err: refused})
 	o := fakeRuntime(rt, &built{})
 	o.orphanSweep, o.controllerRetry = 50*time.Millisecond, 200*time.Millisecond
-	d := startDaemon(t, cfg, o)
+	logged := &lockedBuffer{}
+	d := startDaemonLogging(t, cfg, o, slog.New(slog.NewTextHandler(logged, nil)))
 	project, err := claim.ProjectToken(cfg.Project)
 	if err != nil {
 		t.Fatal(err)
 	}
 	token := claim.ControllerToken(project)
-	testwait.Eventually(t, "the controller's refused launches to fail its claim", func() bool {
-		return controllerSpawns(rt, token) == cfg.LaunchFailureLimit && d.claim(token).State == string(supervise.StateFailed)
+	failed := fmt.Sprintf(`msg="supervise: claim failed" claim=%s why="launch failures ran out" launchFailures=%d`, token, cfg.LaunchFailureLimit)
+	stopped := fmt.Sprintf(`msg="controller: the daemon's controller stopped; retrying it with fresh budgets" claim=%s state=failed`, token)
+	testwait.Eventually(t, "the controller's refused launches to fail its claim, and the keeper to see it failed", func() bool {
+		log := logged.String()
+		return strings.Contains(log, failed) && strings.Contains(log, stopped)
 	})
 	testwait.Eventually(t, "the keeper to retry the failed controller on fresh budgets", func() bool {
 		c := d.claim(token)

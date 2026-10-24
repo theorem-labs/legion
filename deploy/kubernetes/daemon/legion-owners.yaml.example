@@ -1,0 +1,37 @@
+# A legion.yaml for a daemon that runs standing owners alone: graph-node owners and named roles
+# woken from the orchestration ledger, each in a tmux pane, with no Dispatch project, no tree and
+# no GitHub App. It is the smallest file such a deployment needs; every key below is required but
+# never_start and the two timing keys. `legion start --check-config --config legion.yaml` accepts it
+# once the files it names exist and are readable by their owner alone (chmod 0600). Relative paths
+# resolve against this file's directory.
+
+project: OWNERS                         # the daemon's project: its claims, boots and tmux server are filed under it
+state_dir: ./state                      # every pane's working directory, prompt and secret file live under it
+postgres_dsn: postgres://legion:legion@127.0.0.1:5432/legion   # the daemon's own store (or set LEGION_POSTGRES_DSN)
+runtime: tmux                           # standing owners run under tmux only; runtime: kubernetes refuses them
+operator_token_file: ./operator-token   # the bearer the operator routes take: owner retries, the claim list,
+                                        # and GET /legion/v1/operator/owners/refused
+
+standing_owners:
+  ledger_dsn_file: ./ledger-dsn         # an owner-only file holding the ledger's PostgreSQL DSN; every owner
+                                        # pane receives its path as LEGION_LEDGER_DSN_FILE, never the DSN
+  repository: example/repository        # the ledger repository whose work items wake these owners
+  max_running: 4                        # at most this many owner launches or live owners at once
+  budget_usd: 20                        # every attempt reserves its owner's maximum cost before it launches
+  # ledger_timeout_seconds: 5           # each ledger call owner admission makes; default 5
+  # reconcile_seconds: 300              # the sweep that starts any owner with work no event woke; default 300
+  templates:                            # how the owner of a graph node of each kind launches: the part of the
+    function:                           # node id before the colon (function, struct, global, percpu, subsystem)
+      prompt_file: ./prompts/function-owner.md
+      harness: omp
+      max_cost_usd: 4
+    struct:
+      prompt_file: ./prompts/struct-owner.md
+      harness: omp
+      max_cost_usd: 4
+  owners:                               # named roles, each started while the ledger holds open work for it
+    - name: librarian                   # lowercase letters, digits and hyphens; the owner key it serves
+      prompt_file: ./prompts/librarian.md
+      harness: omp
+      max_cost_usd: 2
+  never_start: [escalations]            # owners the daemon never starts: their items wait for a person

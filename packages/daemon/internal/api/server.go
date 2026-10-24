@@ -120,6 +120,9 @@ type Options struct {
 	// store — on a context that outlives the agent's connection, and the route answers the agent
 	// once it has returned.
 	CapabilityReported func(ctx context.Context, c supervise.Claim, report capabilities.Report)
+	// RefusedOwners is the standing owners the daemon refused to start, in owner order, which
+	// GET /legion/v1/operator/owners/refused answers. Nil answers none.
+	RefusedOwners func() []OwnerRefusal
 }
 
 // TreeLifecycles is the store's durable tree barrier (store.Store) as the operator routes use it:
@@ -164,6 +167,7 @@ type server struct {
 	// promptAgents and capabilityReported are Options.PromptAgents and Options.CapabilityReported.
 	promptAgents       []string
 	capabilityReported func(ctx context.Context, c supervise.Claim, report capabilities.Report)
+	ownerRefusals      func() []OwnerRefusal
 	// stopping and drained are Options.Stopping and Options.Drained, decisions Options.Decisions.
 	stopping  context.Context
 	drained   context.Context
@@ -205,6 +209,7 @@ func NewServer(bind string, port int, opts Options) *http.Server {
 		claimReady:         opts.ClaimReady,
 		promptAgents:       opts.PromptAgents,
 		capabilityReported: opts.CapabilityReported,
+		ownerRefusals:      opts.RefusedOwners,
 		log:                opts.Log,
 		stopping:           opts.Stopping,
 		drained:            opts.Drained,
@@ -260,6 +265,7 @@ func NewServer(bind string, port int, opts Options) *http.Server {
 	mux.HandleFunc("POST /legion/v1/operator/claims/{token}/stop", s.operator(s.claimRequest("stop", stopEvent)))
 	mux.HandleFunc("POST /legion/v1/operator/claims/{token}/retry", s.operator(s.claimRequest("retry", retryEvent)))
 	mux.HandleFunc("POST /legion/v1/operator/claims/{token}/close", s.operator(s.closeTree))
+	mux.HandleFunc("GET /legion/v1/operator/owners/refused", s.operator(s.refusedOwners))
 
 	// The catch-all answers every unrouted request, including a known path asked for with the
 	// wrong method: "no route" is the whole story the plugin, the operator's CLI, or a proof
