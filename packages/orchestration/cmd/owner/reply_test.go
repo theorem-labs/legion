@@ -50,6 +50,8 @@ func TestProgramDefectReplyEnqueuesOneEscalation(t *testing.T) {
 	}
 }
 
+// A reply whose reason goes to the premise owner is that owner's item, so its notice goes to the premise owner's
+// needs topic and names the premise owner as its receiver (`to`); the edge's other party gets none.
 func TestMissingPremiseReplyGoesToThePremiseOwner(t *testing.T) {
 	f := newCommandFixture(t)
 	edge := ownerpkg.EdgeID(caller, state)
@@ -65,12 +67,20 @@ func TestMissingPremiseReplyGoesToThePremiseOwner(t *testing.T) {
 	if item := f.item(replyID); item.State != "open" || item.Owner != "subsystem:cluster" {
 		t.Fatalf("reply item = %+v", item)
 	}
-	posts := f.notices()
-	last := posts[len(posts)-1]
-	if last.Topic != "notifications.example.node.struct:state.users" || decodePayload(t, last).Item != replyID {
-		t.Fatalf("reply notice = %+v", last)
+	var notices []noticeAs
+	for _, post := range f.notices() {
+		if payload := decodePayload(t, post); payload.Item == replyID {
+			notices = append(notices, noticeAs{post.Topic, payload.From, payload.To})
+		}
+	}
+	want := []noticeAs{{"notifications.example.node.subsystem:cluster.needs", state, "subsystem:cluster"}}
+	if !reflect.DeepEqual(notices, want) {
+		t.Fatalf("the reply's notices (topic, from, to) = %+v, want %+v", notices, want)
 	}
 }
+
+// noticeAs is where a notice went: its topic, and its payload's from and to.
+type noticeAs struct{ topic, from, to string }
 
 // replyItem is the reply item of the reply record that replier wrote about the n-th revision it answered.
 func (f *commandFixture) replyItem(replier, edge string, n int) string {

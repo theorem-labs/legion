@@ -177,6 +177,10 @@ func (s *session) reply(item, reason, file, premiseOwner string) (any, error) {
 		row = ownerpkg.RouteReplyFromTarget
 	}
 	route := ownerpkg.Route{Step: row, Source: source, Target: target, TargetKind: step.targetKind}
+	if recipients[premiseOwner] {
+		// The reply item is the premise owner's, so its notice goes to that owner's needs topic, addressed to it.
+		route, step.to = ownerpkg.Route{Step: ownerpkg.RouteReplyToPremise, Owner: premiseOwner}, premiseOwner
+	}
 	return s.finishReply(p, step, "reply", route, data, followUps)
 }
 

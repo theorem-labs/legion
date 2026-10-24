@@ -220,6 +220,7 @@ const (
 	RouteAccept          RouteStep = "accept"
 	RouteReplyFromTarget RouteStep = "reply-from-target"
 	RouteReplyFromSource RouteStep = "reply-from-source"
+	RouteReplyToPremise  RouteStep = "reply-to-premise-owner"
 	RouteOwnerItem       RouteStep = "owner-item"
 	RouteProposal        RouteStep = "proposal"
 	RouteConcept         RouteStep = "concept"
@@ -297,7 +298,8 @@ func (r Routing) Topics(route Route) []Delivery {
 			return []Delivery{r.toOwner(r.node(route.Source, "callees"), route.Target)}
 		}
 		return []Delivery{r.toOwner(r.node(route.Target, "needs"), route.Target)}
-	case RouteOwnerItem, RouteLibrarianAnswer:
+	case RouteOwnerItem, RouteLibrarianAnswer, RouteReplyToPremise:
+		// A reply whose reason goes to the premise owner is that owner's item, not the edge's other party's.
 		return []Delivery{r.toOwner(r.NeedsTopic(route.Owner), route.Owner)}
 	case RouteProposal:
 		return []Delivery{{Topic: r.node(route.Owner, "neighbors"), Audience: AudienceNeighbors, Node: route.Owner}}
