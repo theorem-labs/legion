@@ -207,7 +207,8 @@ func TestRoundCommandAtLimitEscalatesOnceAcrossRetry(t *testing.T) {
 	})
 }
 
-func TestRoundCommandRefusesSameKeyWithDifferentBody(t *testing.T) {
+// A round key repeated with another generation, reason or batch exits 0 and replays the migration: it counts once.
+func TestRoundCommandReplaysAKeyWhateverItsBody(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate func(*roundCLIRequest)
@@ -223,14 +224,13 @@ func TestRoundCommandRefusesSameKeyWithDifferentBody(t *testing.T) {
 				if test.name == "generation" {
 					cli.invoke("takeover", "r", "M-1", "bob", "1")
 				}
-				conflicting := request
-				test.mutate(&conflicting)
-				code, stdout, stderr := cli.call(cli.roundArgs(conflicting)...)
-				if code != 1 || !strings.Contains(stdout+stderr, "round_key_conflict") {
-					t.Fatalf("conflicting key: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+				repeated := request
+				test.mutate(&repeated)
+				if replay := cli.round(repeated); replay.LandingRounds != 1 {
+					t.Fatalf("repeated key counted again: %+v", replay)
 				}
 				if events := cli.events("migration.round_failed"); len(events) != 1 {
-					t.Fatalf("conflicting key appended %d round events, want 1", len(events))
+					t.Fatalf("repeated key appended %d round events, want 1", len(events))
 				}
 			})
 		})

@@ -175,7 +175,9 @@ func TestRecordRoundAtLimitEscalatesOnceAcrossRetry(t *testing.T) {
 	}
 }
 
-func TestRecordRoundRefusesSameKeyWithDifferentBody(t *testing.T) {
+// TestRecordRoundReplaysAKeyWhateverItsBody catches a round key that counts twice, or that refuses its repeat: a key
+// repeated with another generation, reason or batch replays the migration as it is, and records nothing.
+func TestRecordRoundReplaysAKeyWhateverItsBody(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*ledger.RoundRequest)
@@ -194,16 +196,15 @@ func TestRecordRoundRefusesSameKeyWithDifferentBody(t *testing.T) {
 			if test.name == "generation" {
 				must(s.TakeOver(ctx, "r", "M-1", "bob", 1))
 			}
-			conflicting := request
-			test.mutate(&conflicting)
+			repeated := request
+			test.mutate(&repeated)
 
-			_, err := s.RecordRound(ctx, conflicting)
-			wantRefusal(t, err, ledger.ReasonRoundKeyConflict)
-			if migration := must(s.Migration(ctx, "r", "M-1")); migration.LandingRounds != 1 {
-				t.Fatalf("conflicting key changed migration: %+v", migration)
+			replay := must(s.RecordRound(ctx, repeated))
+			if migration := must(s.Migration(ctx, "r", "M-1")); migration.LandingRounds != 1 || replay.LandingRounds != 1 {
+				t.Fatalf("repeated key counted again: replay %+v, migration %+v", replay, migration)
 			}
-			if events := roundEvents(t, s); len(events) != 1 {
-				t.Fatalf("conflicting key appended round events: %+v", events)
+			if events := roundEvents(t, s); len(events) != 1 || events[0].Reason != "build failed" {
+				t.Fatalf("repeated key changed the round events: %+v", events)
 			}
 		})
 	}
@@ -220,8 +221,8 @@ func TestRecordRoundRequiresKey(t *testing.T) {
 }
 
 // TestRecordRoundAfterCloseReplaysAndRefusesNewKey catches a round counted on a closed migration: after a landing or
-// an abandonment, a retried key replays the closed migration with no change and no event, a new key is refused
-// not_open, and the retried key with another reason is refused round_key_conflict.
+// an abandonment, a retried key replays the closed migration with no change and no event, whatever its reason, and a
+// new key is refused not_open.
 func TestRecordRoundAfterCloseReplaysAndRefusesNewKey(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -256,8 +257,10 @@ func TestRecordRoundAfterCloseReplaysAndRefusesNewKey(t *testing.T) {
 			}
 			_, err := s.RecordRound(ctx, roundRequest(1, "round-2", "build failed"))
 			wantRefusal(t, err, ledger.ReasonNotOpen)
-			_, err = s.RecordRound(ctx, roundRequest(1, "round-1", "test failed"))
-			wantRefusal(t, err, ledger.ReasonRoundKeyConflict)
+			replay = must(s.RecordRound(ctx, roundRequest(1, "round-1", "test failed")))
+			if replay.State != test.state || replay.LandingRounds != 1 {
+				t.Fatalf("replay with another reason after %s: %+v", test.name, replay)
+			}
 
 			if migration := must(s.Migration(ctx, "r", "M-1")); migration.State != test.state || migration.LandingRounds != 1 {
 				t.Fatalf("migration after rounds on a closed migration: %+v", migration)

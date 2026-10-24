@@ -401,9 +401,10 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 	return m, err
 }
 
-// RecordRound records one landing round the migration failed (its candidate was sent back). A repeated key returns
-// the migration as it is now, even after a takeover, without counting or recording a second failure. When the
-// repository's limit is set and the migration has now used that many rounds, it is escalated to the steward.
+// RecordRound records one landing round the migration failed (its candidate was sent back). The key alone makes it
+// idempotent: a repeated key returns the migration as it is now, even after a takeover or with another reason, without
+// counting or recording a second failure. When the repository's limit is set and the migration has now used that many
+// rounds, it is escalated to the steward.
 func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, error) {
 	if req.Key == "" {
 		return Migration{}, invalid("a round needs an idempotency key")
@@ -420,31 +421,20 @@ func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, e
 			return err
 		}
 
-		var recorded struct {
-			Generation int64
-			Reason     string
-			Batch      string
-		}
-		err = tx.QueryRow(ctx, `SELECT generation, reason, batch FROM round_keys
-			WHERE repo = $1 AND migration = $2 AND key = $3`, req.Repo, req.ID, req.Key).
-			Scan(&recorded.Generation, &recorded.Reason, &recorded.Batch)
-		switch {
-		case err == nil:
-			if recorded.Generation != req.Generation || recorded.Reason != req.Reason || recorded.Batch != req.Batch {
-				return refuse(ReasonRoundKeyConflict, "round key %q for migration %s has a different generation, reason, or batch",
-					req.Key, req.ID)
-			}
-			m = cur
-			return nil
-		case !errors.Is(err, pgx.ErrNoRows):
+		var known bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM round_keys WHERE repo = $1 AND migration = $2 AND key = $3)`,
+			req.Repo, req.ID, req.Key).Scan(&known); err != nil {
 			return err
 		}
-
+		if known {
+			m = cur
+			return nil
+		}
 		if err := requireOpenAt(cur, req.Generation); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key, generation, reason, batch)
-			VALUES ($1, $2, $3, $4, $5, $6)`, req.Repo, req.ID, req.Key, req.Generation, req.Reason, req.Batch); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key) VALUES ($1, $2, $3)`,
+			req.Repo, req.ID, req.Key); err != nil {
 			return err
 		}
 

@@ -15,15 +15,12 @@ ALTER TABLE repositories ADD COLUMN upstream_owner text;
 -- upstream commit beside it for an upstream landing.
 ALTER TABLE contracts ADD COLUMN last_change jsonb;
 
--- The idempotency key of each recorded landing round, so a retried round counts once. A key repeats only with the
--- generation, reason and batch it was first recorded with.
+-- The idempotency key of each recorded landing round, so a retried round counts once: the first round with a key is
+-- recorded, and a repeat of that key replays the migration as it is.
 CREATE TABLE round_keys (
     repo text NOT NULL,
     migration text NOT NULL,
     key text NOT NULL,
-    generation bigint NOT NULL,
-    reason text NOT NULL,
-    batch text NOT NULL,
     PRIMARY KEY (repo, migration, key),
     FOREIGN KEY (repo, migration) REFERENCES migrations(repo, id)
 );
