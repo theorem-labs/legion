@@ -164,7 +164,10 @@ an Oh My Pi custom message of type `envoy-message`, which Oh My Pi appends to th
 `.omp/agent/sessions/`. The message's `details` are pi-envoy's record of the delivery: the subject it arrived on and
 its envelope's `topic`, `event_id` and `dedupe_key`. A delivery's topic is that record, never the payload's `topic`
 the driver wrote: an envelope topic or subject that is not the published topic fails the run as `unexpected`, and a
-driver's notice with no such record stops the collect. pi-envoy's `envoy_inbox` list lives in its process's memory, and the listener does not push to
+driver's notice with no such record stops the collect. `@sjawhar/pi-envoy` writes the record from the first release
+after 10.17.2 (its CHANGELOG's "Each Envoy delivery's `envoy-message` custom message records the delivery"); the
+owner panes must run that release or later, and with 10.17.2 a run stops at its first delivery. pi-envoy's
+`envoy_inbox` list lives in its process's memory, and the listener does not push to
 a session that holds its own NATS connection, so neither keeps a record. Every transcript of the owner's sessions in
 that directory counts (a relaunch's and a fork's; a fork's copy of its parent's entries counts once); a subagent's
 does not. The owners' own `message-test saw` and `subscribed` records are shown in the report beside the evidence,

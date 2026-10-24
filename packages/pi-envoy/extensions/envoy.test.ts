@@ -12049,7 +12049,12 @@ describe("envoy OMP extension", () => {
       entry.content.includes("a notice on its own topic")
     );
     expect(delivery?.customType).toBe("envoy-message");
-    expect(delivery?.details).toEqual({ subject: topic, topic, event_id: "evt-details", dedupe_key: key });
+    expect(delivery?.details).toEqual({
+      subject: topic,
+      topic,
+      event_id: "evt-details",
+      dedupe_key: key,
+    });
   });
 
   test("inbound envoy messages deliver as steering so they interrupt an in-flight turn", async () => {

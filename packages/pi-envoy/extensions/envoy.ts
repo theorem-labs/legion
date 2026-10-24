@@ -199,12 +199,12 @@ const ClaimIdentitySchema = DedupeIdentitySchema.extend({
  * envelope's topic, event id and dedupe key. A reader of the transcript, such as the owner message test, can then
  * tell which topic a delivery came on, and which publish it was, from Envoy's own record of it.
  */
-interface EnvoyDeliveryDetails {
+type EnvoyDeliveryDetails = {
   readonly subject: string;
   readonly topic?: string;
   readonly event_id?: string;
   readonly dedupe_key?: string;
-}
+};
 
 function deliveryDetails(
   subject: string,
