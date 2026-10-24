@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,26 +20,39 @@ const (
 
 // Report is the message test's result: DIR/report.json, and DIR/report.md for a person.
 type Report struct {
-	Run        string        `json:"run"`
-	Prefix     string        `json:"prefix"`
-	Nodes      []string      `json:"nodes"`
-	Edge       string        `json:"edge"`
-	Seed       int64         `json:"seed"`
-	Out        string        `json:"out"`
-	Daemon     Daemon        `json:"daemon"`
-	Revisions  Revisions     `json:"revisions"`
-	StartedAt  time.Time     `json:"started_at"`
-	FinishedAt time.Time     `json:"finished_at"`
-	Seconds    float64       `json:"seconds"`
-	Steps      []StepTiming  `json:"steps"`
-	Panes      []PaneCheck   `json:"panes"`
-	Published  []Publication `json:"published"`
-	Deliveries []Delivery    `json:"deliveries"`
-	KillLog    []Kill        `json:"kills"`
-	Restart    *Restart      `json:"restart,omitempty"`
-	Expected   Expected      `json:"expected"`
-	Failures   []Failure     `json:"failures"`
-	Passed     bool          `json:"passed"`
+	Run         string        `json:"run"`
+	Prefix      string        `json:"prefix"`
+	Nodes       []string      `json:"nodes"`
+	Edge        string        `json:"edge"`
+	Seed        int64         `json:"seed"`
+	Out         string        `json:"out"`
+	Daemon      Daemon        `json:"daemon"`
+	Revisions   Revisions     `json:"revisions"`
+	StartedAt   time.Time     `json:"started_at"`
+	FinishedAt  time.Time     `json:"finished_at"`
+	Seconds     float64       `json:"seconds"`
+	Steps       []StepTiming  `json:"steps"`
+	Panes       []PaneCheck   `json:"panes"`
+	Published   []Publication `json:"published"`
+	Deliveries  []Delivery    `json:"deliveries"`
+	KillLog     []Kill        `json:"kills"`
+	Restart     *Restart      `json:"restart,omitempty"`
+	Expected    Expected      `json:"expected"`
+	Interrupted string        `json:"interrupted,omitempty"` // why the run stopped before its steps ended: the signal
+	Teardown    Teardown      `json:"teardown"`
+	Failures    []Failure     `json:"failures"`
+	Passed      bool          `json:"passed"`
+}
+
+// Teardown is what the run stopped and removed when it ended: every daemon process it started, every owner process
+// it saw in its panes, the ones still running after its tmux server stopped, which it signalled by PID, and any it
+// could not stop; and its private bearer directory, which it removed.
+type Teardown struct {
+	DaemonPIDs []int  `json:"daemon_pids"`
+	OwnerPIDs  []int  `json:"owner_pids"`
+	Stopped    []int  `json:"stopped"`
+	Left       []int  `json:"left"`
+	TokenDir   string `json:"token_dir"`
 }
 
 // Daemon names the supervisor the run started, where its configuration, socket and log are, and the omp its panes
@@ -149,7 +163,10 @@ func (r Report) Write(dir string) error {
 func (r Report) markdown() string {
 	var b strings.Builder
 	verdict := "PASSED"
-	if !r.Passed {
+	switch {
+	case r.Interrupted != "":
+		verdict = fmt.Sprintf("INTERRUPTED (%s): a partial report, %d failures", r.Interrupted, len(r.Failures))
+	case !r.Passed:
 		verdict = fmt.Sprintf("FAILED (%d failures)", len(r.Failures))
 	}
 	fmt.Fprintf(&b, "# Owner message test %s\n\n", r.Run)
@@ -200,6 +217,8 @@ func (r Report) markdown() string {
 			r.Restart.Item, seconds(r.Restart.StopSeconds), seconds(r.Restart.StartSeconds), seconds(r.Restart.ItemSeconds),
 			code(r.Restart.PanesBefore), code(r.Restart.PanesAfter))
 	}
+	fmt.Fprintf(&b, "\n## Teardown\n\nDaemon processes %s; owner processes %s; signalled by PID %s; still running %s; bearer directory `%s` removed.\n",
+		pids(r.Teardown.DaemonPIDs), pids(r.Teardown.OwnerPIDs), pids(r.Teardown.Stopped), pids(r.Teardown.Left), r.Teardown.TokenDir)
 	b.WriteString("\n## Failures\n\n")
 	if len(r.Failures) == 0 {
 		b.WriteString("None.\n")
@@ -210,6 +229,17 @@ func (r Report) markdown() string {
 		fmt.Fprintf(&b, "| %s | `%s` | %s |\n", f.Kind, f.Subject, cell(f.Detail))
 	}
 	return b.String()
+}
+
+func pids(values []int) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, strconv.Itoa(value))
+	}
+	return strings.Join(out, ", ")
 }
 
 func seconds(value float64) string {

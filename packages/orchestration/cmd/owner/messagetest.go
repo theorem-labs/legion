@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	ownerpkg "github.com/sjawhar/legion/orchestration/owner"
@@ -300,7 +303,20 @@ func (s *session) messageTestRun(flags driverFlags) (any, error) {
 	if err != nil {
 		return nil, unable(fmt.Errorf("find the supervisor: %w", err))
 	}
-	report, err := messagetest.Run(s.ctx, messagetest.Options{
+	// SIGINT or SIGTERM ends the run's steps: the driver then stops what it started and writes a partial report.
+	ctx, cancel := context.WithCancelCause(s.ctx)
+	defer cancel(nil)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		select {
+		case received := <-signals:
+			cancel(fmt.Errorf("interrupted by %s", received))
+		case <-ctx.Done():
+		}
+	}()
+	report, err := messagetest.Run(ctx, messagetest.Options{
 		Prefix: flags.prefix, Nodes: flags.nodes, Kills: flags.kills, Out: out,
 		Deploy: deploy, Owner: owner, Legion: legion,
 		Environ: os.Environ(), Getenv: s.getenv, Progress: s.stderr, Timeouts: messagetest.DefaultTimeouts(),
@@ -309,7 +325,10 @@ func (s *session) messageTestRun(flags driverFlags) (any, error) {
 		return nil, err
 	}
 	path := filepath.Join(report.Out, "report.md")
-	if !report.Passed {
+	switch {
+	case report.Interrupted != "":
+		return nil, refusef("the message test was %s; partial report %s", report.Interrupted, path)
+	case !report.Passed:
 		return nil, refusef("the message test failed with %d failures; report %s", len(report.Failures), path)
 	}
 	return messageTestResult{Report: path, Passed: true}, nil

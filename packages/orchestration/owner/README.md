@@ -128,6 +128,11 @@ owner sessions and a supervisor restart leave each step done once (plan Task 1.8
    included), an item completed twice or never, recorded twice or not at all, an out-of-order item answered as
    current, a follow-up enqueued twice, never or for another owner, and a record or completion of an item the run did
    not expect.
+7. **Teardown.** The run stops its daemon by its own PID, its panes by its own tmux socket, and then every owner
+   process it saw in its panes that still runs, by its own PID (a PID counts only while its process names the run's
+   ledger repository), and removes its bearer directory; the report lists those PIDs. On SIGINT or SIGTERM the run
+   ends its steps, collects and tears down on a context of its own, and writes a partial report marked
+   `INTERRUPTED`; `owner message-test` then exits 1.
 
 A delivery's evidence is the owner session's own record of it: pi-envoy hands each Envoy delivery to the session as
 an Oh My Pi custom message of type `envoy-message`, which Oh My Pi appends to the session's JSONL transcript under

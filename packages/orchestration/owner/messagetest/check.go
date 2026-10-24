@@ -23,6 +23,7 @@ const (
 	FailLaunch          = "launch"
 	FailSubscription    = "subscription"
 	FailStep            = "step"
+	FailInterrupted     = "interrupted"
 )
 
 // Commit is one commit of an owner's branch: the owner whose branch holds it, and its trailers.

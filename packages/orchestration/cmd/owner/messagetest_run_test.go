@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -69,11 +72,17 @@ func writeMessageTestGraph(t *testing.T, dir string) {
 	}
 }
 
-// The message test runs end to end as `owner message-test`: real subprocesses, a real tmux server, the ledger on
-// real Postgres and an HTTP listener. The supervisor and the sessions are internal/ownerharness's test-only
-// stand-ins (linked as legion and omp), so this run checks the driver and the owner command, and is no evidence
-// that the Legion daemon meets C8, C9 or C33.
-func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
+// harnessRun is `owner message-test` against the harness: a ledger on real Postgres, the deployment graph of the
+// test nodes, an HTTP stand-in listener, and the test binary linked as owner, legion and omp in bin. out is the run's
+// directory and dsnFile the deployment's ledger DSN file.
+type harnessRun struct {
+	command      *exec.Cmd
+	out, dsnFile string
+	bin, state   string
+}
+
+func newHarnessRun(t *testing.T, ctx context.Context, env ...string) harnessRun {
+	t.Helper()
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux is not installed; the message test's owners run in a real tmux server")
 	}
@@ -94,7 +103,8 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener := httptest.NewServer(ownerharness.NewListener())
-	defer listener.Close()
+	// A run that left its panes subscribed holds connections open, which Close would wait on.
+	t.Cleanup(func() { listener.CloseClientConnections(); listener.Close() })
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -109,17 +119,28 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 		}
 	}
 	out := filepath.Join(root, "run")
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
-	defer cancel()
 	command := exec.CommandContext(ctx, filepath.Join(bin, "owner"), "--deploy", deploy, "message-test",
 		"--prefix", "notifications.example-message-test.", "--kills", "3", "--out", out)
 	// The driver reads its ledger from the deployment's ledger_dsn_file alone: a launch variable in the operator's
-	// shell names no ledger of the run. The owners take the out-of-order notices without recording them, as an owner
-	// model did in acceptance run 7: the run judges deliveries by the sessions' transcripts.
-	command.Env = append(os.Environ(), "PATH="+bin+string(filepath.ListSeparator)+os.Getenv("PATH"), "HOME="+root,
+	// shell names no ledger of the run.
+	command.Env = append(append(os.Environ(), "PATH="+bin+string(filepath.ListSeparator)+os.Getenv("PATH"), "HOME="+root,
 		"ENVOY_URL="+listener.URL, "ENVOY_TOKEN=message-test-token", "LEGION_POSTGRES_DSN=postgres://legion@127.0.0.1/legion",
-		"OWNER_HARNESS_STEP_DELAY=300ms", "OWNER_HARNESS_SKIP_SAW=out of order", "LEGION_LEDGER_DSN_FILE="+filepath.Join(root, "not-the-deployment-ledger"))
-	output, err := command.CombinedOutput()
+		"OWNER_HARNESS_STEP_DELAY=300ms", "LEGION_LEDGER_DSN_FILE="+filepath.Join(root, "not-the-deployment-ledger")), env...)
+	return harnessRun{command: command, out: out, dsnFile: dsnFile, bin: bin, state: stateDir}
+}
+
+// The message test runs end to end as `owner message-test`: real subprocesses, a real tmux server, the ledger on
+// real Postgres and an HTTP listener. The supervisor and the sessions are internal/ownerharness's test-only
+// stand-ins (linked as legion and omp), so this run checks the driver and the owner command, and is no evidence
+// that the Legion daemon meets C8, C9 or C33.
+func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	// The owners take the out-of-order notices without recording them, as an owner model did in acceptance run 7:
+	// the run judges deliveries by the sessions' transcripts.
+	harness := newHarnessRun(t, ctx, "OWNER_HARNESS_SKIP_SAW=out of order")
+	out, dsnFile, bin := harness.out, harness.dsnFile, harness.bin
+	output, err := harness.command.CombinedOutput()
 	reportText, _ := os.ReadFile(filepath.Join(out, "report.md"))
 	if err != nil {
 		t.Fatalf("owner message-test: %v\n%s\n%s", err, output, reportText)
@@ -220,6 +241,69 @@ func TestMessageTestRunsEndToEndAgainstTheSupervisorHarness(t *testing.T) {
 		revisions.Owner.GoVersion == "" || len(revisions.Graph) != 3 || !strings.Contains(string(reportText), "## Revisions") {
 		t.Fatalf("revisions = %+v", revisions)
 	}
+}
+
+// SIGINT to a running `owner message-test` stops the run: it stops its own daemon by its PID, its panes by its own tmux
+// socket and every owner process it saw by its PID, removes its bearer files, and writes a partial report marked
+// interrupted (acceptance run 7: cancelling the driver left the daemon, both panes and the bearer directory behind,
+// and no report).
+func TestMessageTestStopsWhatItStartedWhenInterrupted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	harness := newHarnessRun(t, ctx)
+	progress, err := harness.command.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout strings.Builder
+	harness.command.Stdout = &stdout
+	if err := harness.command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	lines := bufio.NewScanner(progress)
+	for lines.Scan() {
+		log.WriteString(lines.Text() + "\n")
+		if strings.HasSuffix(lines.Text(), " arrival") {
+			if err := harness.command.Process.Signal(os.Interrupt); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	for lines.Scan() {
+		log.WriteString(lines.Text() + "\n")
+	}
+	err = harness.command.Wait()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Fatalf("owner message-test after SIGINT: %v, want exit 1\n%s", err, log.String())
+	}
+	var report messagetest.Report
+	data, err := os.ReadFile(filepath.Join(harness.out, "report.json"))
+	if err != nil || json.Unmarshal(data, &report) != nil {
+		t.Fatalf("the partial report.json: %v\n%s", err, log.String())
+	}
+	markdown, _ := os.ReadFile(filepath.Join(harness.out, "report.md"))
+	if report.Passed || !strings.Contains(report.Interrupted, "interrupt") || !strings.Contains(string(markdown), "INTERRUPTED") {
+		t.Fatalf("the report after SIGINT: passed %t, interrupted %q\n%s", report.Passed, report.Interrupted, markdown)
+	}
+	teardown := report.Teardown
+	if len(teardown.DaemonPIDs) == 0 || len(teardown.OwnerPIDs) == 0 || len(teardown.Left) != 0 {
+		t.Fatalf("the teardown = %+v", teardown)
+	}
+	for _, pid := range append(slices.Clone(teardown.DaemonPIDs), teardown.OwnerPIDs...) {
+		if environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid)); err == nil && strings.Contains(string(environ), report.Run) {
+			t.Fatalf("the run's process %d still runs", pid)
+		}
+	}
+	if err := exec.Command("tmux", "-L", report.Daemon.Socket, "list-sessions").Run(); err == nil {
+		t.Fatalf("the daemon's tmux server %s still runs", report.Daemon.Socket)
+	}
+	if _, err := os.Stat(filepath.Join(harness.state, "message-test", report.Run)); !os.IsNotExist(err) || teardown.TokenDir == "" {
+		t.Fatalf("the bearer directory %q after SIGINT: %v", teardown.TokenDir, err)
+	}
+	t.Logf("%s\n%s", log.String(), markdown)
 }
 
 // A notice delivered twice under two keys reaches the session twice and is answered once; the out-of-order notices

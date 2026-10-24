@@ -111,7 +111,10 @@ type driver struct {
 }
 
 // Run runs the message test and writes DIR/report.json and DIR/report.md. The error is only for options it cannot
-// start with; every failure of the run is in the report, which passes only when every assertion held.
+// start with; every failure of the run is in the report, which passes only when every assertion held. When ctx ends
+// before the steps do (an operator's SIGINT), the run stops its steps, collects what it can, stops everything it
+// started and writes a partial report marked interrupted, with context.Cause(ctx) as the reason; collect and
+// teardown run on a context of their own.
 func Run(ctx context.Context, opts Options) (Report, error) {
 	if err := opts.check(); err != nil {
 		return Report{}, err
@@ -148,18 +151,30 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	}
 	steps = append(steps, step{"daemon restart", d.restart, false})
 	for _, s := range steps {
+		if ctx.Err() != nil {
+			break
+		}
 		if err := d.timed(ctx, s.name, s.run); err != nil && s.fatal {
 			break
 		}
 	}
+	if ctx.Err() != nil {
+		d.report.Interrupted = context.Cause(ctx).Error()
+		d.logf("interrupted (%s): collecting what the run left, then stopping what it started", d.report.Interrupted)
+	}
+	after, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
 	var recorded Recorded
-	_ = d.timed(ctx, "collect", func(ctx context.Context) error {
+	_ = d.timed(after, "collect", func(ctx context.Context) error {
 		var err error
 		recorded, err = d.collect(ctx)
 		return err
 	})
-	_ = d.timed(ctx, "teardown", d.teardown)
+	_ = d.timed(after, "teardown", d.teardown)
 	failures := append(d.failures, Check(d.expected, recorded)...)
+	if d.report.Interrupted != "" {
+		failures = append(failures, Failure{Kind: FailInterrupted, Subject: "run", Detail: d.report.Interrupted + ": the steps after it did not run, and this report is partial"})
+	}
 	d.report.Expected = d.expected
 	d.report.FinishedAt = time.Now().UTC()
 	d.report.Finish(failures)
@@ -180,6 +195,9 @@ func runName(at time.Time) (string, error) {
 	}
 	return "message-test-" + strings.ToLower(at.UTC().Format("20060102T150405Z")) + "-" + hex.EncodeToString(suffix[:]), nil
 }
+
+// cleanupTimeout bounds the collect and teardown of a run, which run on a context of their own.
+const cleanupTimeout = 2 * time.Minute
 
 func (o Options) check() error {
 	switch {
@@ -502,6 +520,7 @@ func (d *driver) startDaemon(ctx context.Context) error {
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
 	d.daemon, d.daemonDone, d.exited, d.daemonErr = command, done, false, nil
+	d.report.Teardown.DaemonPIDs = append(d.report.Teardown.DaemonPIDs, command.Process.Pid)
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(d.port))
 	return d.wait(ctx, d.opts.Timeouts.DaemonReady, "the daemon to listen on "+address, func() (bool, error) {
 		connection, err := net.DialTimeout("tcp", address, time.Second)
@@ -1188,18 +1207,30 @@ func (d *driver) collect(ctx context.Context) (Recorded, error) {
 	return recorded, nil
 }
 
-// teardown stops the daemon and every pane on its socket, and removes the bearer files the run wrote.
+// teardown stops what the run started and removes the bearer files it wrote: the daemon by its own PID, every pane
+// by the run's own tmux socket, then every owner process the run saw that still runs, by its own PID. It runs on a
+// context of its own, bounded by cleanupTimeout, so it also stops a run whose context ended (an interrupt).
 func (d *driver) teardown(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
 	var errs []error
 	if err := d.stopDaemon(); err != nil {
 		errs = append(errs, err)
 	}
 	if d.socket != "" {
+		// The panes' processes as they are now, so that the owners stopped below include the newest.
+		if _, err := d.panes(ctx); err != nil {
+			errs = append(errs, err)
+		}
 		if err := killServer(ctx, d.socket); err != nil {
 			errs = append(errs, err)
 		}
 	}
+	if err := d.stopOwners(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	if d.tokenDir != "" {
+		d.report.Teardown.TokenDir = d.tokenDir
 		if err := os.RemoveAll(d.tokenDir); err != nil {
 			errs = append(errs, err)
 		}
@@ -1208,4 +1239,43 @@ func (d *driver) teardown(ctx context.Context) error {
 		d.store.Close()
 	}
 	return errors.Join(errs...)
+}
+
+// stopOwners stops each owner process the run saw that still runs, by its own PID: SIGTERM, then SIGKILL to any left
+// after the daemon's stop timeout. A process is the run's only while its environment names the run's ledger
+// repository, so a PID that now names another process is left alone.
+func (d *driver) stopOwners(ctx context.Context) error {
+	pids := slices.Sorted(maps.Keys(d.ownerPIDs))
+	d.report.Teardown.OwnerPIDs = pids
+	running := func() []int {
+		return slices.DeleteFunc(slices.Clone(pids), func(pid int) bool { return processEnv(pid)["LEGION_LEDGER_REPOSITORY"] != d.run })
+	}
+	// awaitExit waits, up to the daemon's stop timeout, until none of the run's owner processes runs, and returns
+	// those that still do.
+	awaitExit := func() []int {
+		deadline := time.Now().Add(max(d.opts.Timeouts.DaemonStop, time.Second))
+		left := running()
+		for len(left) > 0 && time.Now().Before(deadline) && ctx.Err() == nil {
+			time.Sleep(d.opts.Timeouts.Poll)
+			left = running()
+		}
+		return left
+	}
+	for _, pid := range running() {
+		if err := syscall.Kill(pid, syscall.SIGTERM); err == nil {
+			d.report.Teardown.Stopped = append(d.report.Teardown.Stopped, pid)
+		}
+	}
+	left := awaitExit()
+	if len(left) > 0 {
+		for _, pid := range left {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		left = awaitExit()
+	}
+	if len(left) > 0 {
+		d.report.Teardown.Left = left
+		return fmt.Errorf("the run's owner processes %v still run after SIGTERM and SIGKILL", left)
+	}
+	return nil
 }
