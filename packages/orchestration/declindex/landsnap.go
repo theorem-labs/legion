@@ -12,16 +12,11 @@ type LandSnapshot struct {
 	HasSources bool
 	// Prefix is the indexed tree's path below the root of its repository, with a trailing slash, empty at that
 	// root: the index keys sources and declaration paths relative to the tree.
-	Prefix       string
-	Sources      map[string]string
-	Modules      map[string]LandModule
+	Prefix  string
+	Sources map[string]string
+	// Modules are the source modules that the index read, each by its source path without the .lean suffix.
+	Modules      map[string]bool
 	Declarations map[string][]LandDeclaration
-}
-
-// LandModule is a source module that the index read, keyed by its source path without the .lean suffix.
-type LandModule struct {
-	Rel    string
-	Module string
 }
 
 // LandDeclaration is one exact requested declaration from the snapshot.
@@ -41,7 +36,7 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 	defer func() { _ = tx.Rollback() }()
 	snapshot := LandSnapshot{
 		Sources:      map[string]string{},
-		Modules:      map[string]LandModule{},
+		Modules:      map[string]bool{},
 		Declarations: map[string][]LandDeclaration{},
 	}
 	meta := func(k string) (string, error) {
@@ -72,13 +67,13 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 	if err != nil {
 		return LandSnapshot{}, err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT rel, module FROM modules`)
+	rows, err = tx.QueryContext(ctx, `SELECT rel FROM modules`)
 	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var module LandModule
-		if err := r.Scan(&module.Rel, &module.Module); err != nil {
+		var rel string
+		if err := r.Scan(&rel); err != nil {
 			return err
 		}
-		snapshot.Modules[module.Rel] = module
+		snapshot.Modules[rel] = true
 		return nil
 	})
 	if err != nil {

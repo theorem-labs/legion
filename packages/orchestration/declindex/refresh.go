@@ -9,10 +9,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -288,13 +289,8 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sources`); err != nil {
 		return st, err
 	}
-	sourcePaths := make([]string, 0, len(sourceBlobs))
-	for path := range sourceBlobs {
-		sourcePaths = append(sourcePaths, path)
-	}
-	sort.Strings(sourcePaths)
 	sources := newBatch(tx, "sources", 2)
-	for _, path := range sourcePaths {
+	for _, path := range slices.Sorted(maps.Keys(sourceBlobs)) {
 		if err := sources.add(ctx, path, sourceBlobs[path]); err != nil {
 			return st, err
 		}
@@ -302,7 +298,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	if err := sources.flush(ctx); err != nil {
 		return st, err
 	}
-	for _, rel := range append(append([]string(nil), gone...), relsOf(changed)...) {
+	for _, rel := range slices.Concat(gone, relsOf(changed)) {
 		if o, ok := old[rel]; ok {
 			for _, t := range []string{"decls", "uses", "edges"} {
 				if _, err := tx.ExecContext(ctx, "DELETE FROM "+t+" WHERE module = ?", o.module); err != nil {
@@ -525,7 +521,7 @@ func (b *batch) flush(ctx context.Context) error {
 		return nil
 	}
 	n := len(b.args) / b.cols
-	row := "(" + strings.TrimSuffix(strings.Repeat("?,", b.cols), ",") + ")"
+	row := "(" + placeholders(b.cols) + ")"
 	q := b.verb + " INTO " + b.table + " VALUES " + strings.TrimSuffix(strings.Repeat(row+",", n), ",")
 	_, err := b.tx.ExecContext(ctx, q, b.args...)
 	b.args = b.args[:0]

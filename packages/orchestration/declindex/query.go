@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -358,9 +359,7 @@ func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Re
 			}
 			chain = append(chain, v)
 		}
-		for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
-			chain[i], chain[j] = chain[j], chain[i]
-		}
+		slices.Reverse(chain)
 		r.Why[d] = short + " -> " + strings.Join(chain, " -> ")
 	}
 	return r, nil

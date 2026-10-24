@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -293,21 +294,18 @@ type Manifest struct {
 // DefaultBudget is the node budget of one constant's walk.
 const DefaultBudget = 3000000
 
+// nonNil gives an empty slice for nil, so that JSON writes [] and not null.
+func nonNil[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
+}
+
 // complete gives every field a JSON value: the exporter reads no null.
 func (m Manifest) complete() Manifest {
-	nonNil := func(s []string) []string {
-		if s == nil {
-			return []string{}
-		}
-		return s
-	}
 	m.Modules, m.Imports, m.Roots = nonNil(m.Modules), nonNil(m.Imports), nonNil(m.Roots)
-	if m.Forms == nil {
-		m.Forms = []ConstRef{}
-	}
-	if m.Concepts == nil {
-		m.Concepts = []ConstRef{}
-	}
+	m.Forms, m.Concepts = nonNil(m.Forms), nonNil(m.Concepts)
 	if m.Budget == 0 {
 		m.Budget = DefaultBudget
 	}
@@ -364,10 +362,7 @@ func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
 	if per <= 0 {
 		per = (len(m.Modules) + max(1, x.Jobs) - 1) / max(1, x.Jobs)
 	}
-	var chunks [][]string
-	for i := 0; i < len(m.Modules); i += per {
-		chunks = append(chunks, m.Modules[i:min(i+per, len(m.Modules))])
-	}
+	chunks := slices.Collect(slices.Chunk(m.Modules, per))
 	results := make([][]Constant, len(chunks))
 	errs := make([]error, len(chunks))
 	var mu sync.Mutex

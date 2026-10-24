@@ -22,7 +22,7 @@ const (
 // LakeTextHash returns Lake.Hash.ofText for src. Lake normalizes CRLF before hashing text, then mixes Lean's
 // string hash with Hash.nil. The result is the lowercase hexadecimal value stored in a build trace.
 func LakeTextHash(src []byte) string {
-	if bytes.Index(src, []byte("\r\n")) >= 0 {
+	if bytes.Contains(src, []byte("\r\n")) {
 		src = bytes.ReplaceAll(src, []byte("\r\n"), []byte("\n"))
 	}
 	return hexUint64(leanUint64MixHash(lakeNilHash, leanStringHash(src)))

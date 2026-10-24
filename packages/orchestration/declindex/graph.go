@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 )
 
@@ -96,7 +98,7 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := &graph{names: keys(nameSet), modules: keys(modSet)}
+	g := &graph{names: slices.Sorted(maps.Keys(nameSet)), modules: slices.Sorted(maps.Keys(modSet))}
 	modID := make(map[string]uint32, len(g.modules))
 	for i, m := range g.modules {
 		modID[m] = uint32(i)
@@ -145,15 +147,6 @@ func buildGraph(ctx context.Context, q querier) (*graph, error) {
 		g.offs[i] += g.offs[i-1]
 	}
 	return g, nil
-}
-
-func keys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func putStrings(b *bytes.Buffer, ss []string) {

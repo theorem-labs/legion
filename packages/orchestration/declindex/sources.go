@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -100,16 +102,11 @@ func readSources(tree Tree) (blobs map[string]string, prefix string, err error) 
 // directory and its own file. An empty root names no source and is dropped. Refresh records the sources these
 // select, and land-hash lists the same ones in LAND_TREE.
 func SourcePathspecs(roots Roots) []string {
-	keys := make([]string, 0, len(roots))
-	for root := range roots {
+	out := make([]string, 0, len(roots)*2)
+	for _, root := range slices.Sorted(maps.Keys(roots)) {
 		if root != "" {
-			keys = append(keys, root)
+			out = append(out, root+"/", root+".lean")
 		}
-	}
-	sort.Strings(keys)
-	out := make([]string, 0, len(keys)*2)
-	for _, root := range keys {
-		out = append(out, root+"/", root+".lean")
 	}
 	return out
 }
@@ -181,10 +178,5 @@ func changedSourcePaths(raw []byte, prefix string) ([]string, error) {
 			raw = raw[end+1:]
 		}
 	}
-	out := make([]string, 0, len(set))
-	for p := range set {
-		out = append(out, p)
-	}
-	sort.Strings(out)
-	return out, nil
+	return slices.Sorted(maps.Keys(set)), nil
 }

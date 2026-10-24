@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -196,7 +198,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		return 0, 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, mod := range append(append([]string(nil), todo...), again...) {
+	for _, mod := range slices.Concat(todo, again) {
 		if err := deleteCompiled(ctx, tx, mod); err != nil {
 			return 0, 0, err
 		}
@@ -380,7 +382,7 @@ func (s *Store) owners(ctx context.Context, names []string) (map[string]Found, e
 		}
 	}
 	found := map[string]Found{}
-	err := eachRowIn(ctx, s.db, foundSelect+` WHERE d.name IN`, keys(cands), func(r *sql.Rows) error {
+	err := eachRowIn(ctx, s.db, foundSelect+` WHERE d.name IN`, slices.Sorted(maps.Keys(cands)), func(r *sql.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
