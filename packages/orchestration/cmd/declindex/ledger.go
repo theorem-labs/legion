@@ -266,6 +266,12 @@ func fillRegistryRecheck(ctx context.Context, e *env, indexCommit, landed string
 	if err != nil {
 		return err
 	}
+	// The tree's path in its repository, which refresh recorded: Git prints the paths of a diff from the
+	// repository's root, and the report names an added file by that repository-relative path, as the gate does.
+	prefix, err := e.store.Meta(ctx, "source_prefix")
+	if err != nil {
+		return err
+	}
 	if landed == "" {
 		landed = indexCommit
 	}
@@ -275,7 +281,7 @@ func fillRegistryRecheck(ctx context.Context, e *env, indexCommit, landed string
 	}
 	switch {
 	case recorded:
-		if report.Added, err = addedRegistryConcepts(ctx, tree, relative, previous, landed); err != nil {
+		if report.Added, err = addedRegistryConcepts(ctx, tree, prefix, relative, previous, landed); err != nil {
 			return err
 		}
 	case landed == indexCommit:
@@ -297,7 +303,7 @@ func fillRegistryRecheck(ctx context.Context, e *env, indexCommit, landed string
 	// An added file that the loader refused or keyed wrongly is already a defect; the rest are rechecked.
 	loaded := map[string]bool{}
 	for _, c := range reg.Concepts {
-		loaded[filepath.ToSlash(filepath.Join(relative, "concepts", conceptgate.Key(c)+".yaml"))] = true
+		loaded[prefix+filepath.ToSlash(filepath.Join(relative, "concepts", conceptgate.Key(c)+".yaml"))] = true
 	}
 	var recheck []string
 	for _, path := range report.Added {
@@ -341,19 +347,21 @@ func registryPathRelativeToTree(tree, registry string) (string, error) {
 }
 
 // addedRegistryConcepts lists the concept files (the .yaml files directly under concepts/, which the loader
-// reads) that the commits previous..commit added. Rename detection is off: a file added in the landing that deleted
-// a similar one is an addition.
-func addedRegistryConcepts(ctx context.Context, tree, registry, previous, commit string) ([]string, error) {
+// reads) that the commits previous..commit added, by their paths from the repository's root. registry is the
+// registry's path in the tree, and prefix the tree's path in the repository (empty at its root, else ending in a
+// slash). Rename detection is off: a file added in the landing that deleted a similar one is an addition.
+func addedRegistryConcepts(ctx context.Context, tree, prefix, registry, previous, commit string) ([]string, error) {
 	added := []string{}
 	if previous == "" || commit == "" {
 		return added, nil
 	}
 	concepts := filepath.ToSlash(filepath.Join(registry, "concepts"))
+	// The pathspec is relative to the tree, where git runs; the paths it prints are relative to the repository.
 	raw, err := exec.CommandContext(ctx, "git", "-C", tree, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", previous, commit, "--", concepts).Output()
 	if err != nil {
 		return nil, fmt.Errorf("list registry additions from %s to %s: %w", previous, commit, err)
 	}
-	prefix := concepts + "/"
+	prefix += concepts + "/"
 	for _, path := range strings.Split(string(raw), "\x00") {
 		if !strings.HasPrefix(path, prefix) {
 			continue

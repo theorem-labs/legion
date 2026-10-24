@@ -174,6 +174,40 @@ func TestARegistryAdditionBehindADeletionIsRechecked(t *testing.T) {
 	})
 }
 
+// A tree below its repository's root: the landing hook's check lists an added concept file by its
+// repository-relative path, the path the gate printed as its addition, and rechecks it.
+func TestARegistryAdditionInATreeBelowTheRepositoryRootIsRechecked(t *testing.T) {
+	config := fixture(t)
+	dir := filepath.Dir(config)
+	repo := filepath.Join(dir, "repo")
+	proj := filepath.Join(repo, "proj")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "tree"), proj); err != nil {
+		t.Fatal(err)
+	}
+	rewriteConfig(t, config, "tree: tree\n", "tree: repo/proj\n")
+	body, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, config, string(body)+"repo: r\nregistry: registry\ncontracts:\n  paths: [\"Nowhere/**\"]\n  kinds: [def]\n"+unavailableLean)
+	writeTestFile(t, filepath.Join(proj, "registry", "registry.yaml"), "version: 2\n")
+	git(t, repo, "init", "-q")
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-q", "-m", "one")
+	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
+		t.Fatalf("initial refresh: %+v", r)
+	}
+	writeTestFile(t, filepath.Join(proj, "registry", "concepts", conceptKeyB+".yaml"), registryConcept("P.New", conceptKeyB, "p2", "n < 4"))
+	landed := land(t, config, repo, "add B")
+	want := []string{"proj/" + conceptPath(conceptKeyB)}
+	if r := checkRegistry(t, config, landed); r.code != 75 || !slices.Equal(r.added, want) || r.unable == "" {
+		t.Fatalf("the check of the landing that added B below the repository root: want exit 75 with %v added and a cause, got %+v", want, r)
+	}
+}
+
 // A concept file that the loader refuses (a two-sentence meaning, an unknown key) is a registry defect of that
 // file: the ledger exits 1 and names it; it is not unable to check.
 func TestAMalformedConceptFileIsALedgerDefect(t *testing.T) {
