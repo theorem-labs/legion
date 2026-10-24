@@ -101,7 +101,7 @@ func gateWith(t *testing.T, compiled bool) (*Gate, *recordingLibrarian) {
 	}
 	co := &declindex.CompiledOptions{
 		Exporter: &declindex.Exporter{Lean: l, Bin: exporterBin, SearchPath: []string{tree}, Jobs: 1},
-		Forms:    r.FormsModule(),
+		Forms:    registryForms(r),
 		Dir:      t.TempDir(),
 	}
 	spec := declindex.Tree{Source: tree, Lib: tree, Roots: declindex.Roots{"Fixture": true}}
@@ -131,6 +131,16 @@ func gitHead(t *testing.T, dir string) string {
 		t.Fatal(err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// registryForms is the forms module of every concept of r, with no stored source in it: what a refresh's forms
+// module holds for a registry whose concepts the index all declares.
+func registryForms(r Registry) declindex.FormsModule {
+	fm := declindex.FormsModule{Imports: r.Imports, Opens: r.Opens}
+	for _, c := range r.Concepts {
+		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
+	}
+	return fm
 }
 
 func proposal(id, name, body string) Proposal {

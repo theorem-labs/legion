@@ -197,7 +197,8 @@ func Command(ctx context.Context, spec Spec) (*Cmd, error) {
 	return &Cmd{Cmd: cmd}, nil
 }
 
-// Cmd is a confined program. Start (and Run, Output, CombinedOutput) also lets through the program's one exec.
+// Cmd is a confined program. Start (and Run, CombinedOutput) also lets through the program's one exec; do not call
+// the embedded exec.Cmd's Start or Output, which would not.
 type Cmd struct {
 	*exec.Cmd
 }
@@ -211,17 +212,6 @@ func (c *Cmd) Run() error {
 		return err
 	}
 	return c.Wait()
-}
-
-// Output runs the program and returns its standard output.
-func (c *Cmd) Output() ([]byte, error) {
-	if c.Stdout != nil {
-		return nil, errors.New("confine: Stdout already set")
-	}
-	var out strings.Builder
-	c.Stdout = &out
-	err := c.Run()
-	return []byte(out.String()), err
 }
 
 // CombinedOutput runs the program and returns its standard output and error together.

@@ -213,13 +213,3 @@ func (r Registry) Find(name string) (Concept, bool) {
 	}
 	return Concept{}, false
 }
-
-// FormsModule is the Lean module that the index compiles to match the registry's forms. Stored proposal source
-// never enters this module.
-func (r Registry) FormsModule() declindex.FormsModule {
-	fm := declindex.FormsModule{Imports: r.Imports, Opens: r.Opens}
-	for _, c := range r.Concepts {
-		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
-	}
-	return fm
-}

@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,8 +79,8 @@ func main() {
 }
 
 type globals struct {
-	config, db, tree string
-	json             bool
+	config, db string
+	json       bool
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
@@ -95,17 +94,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 			g.json = true
 			args = args[1:]
 			continue
-		case "--config", "--db", "--tree":
+		case "--config", "--db":
 			if len(args) < 2 {
 				return fail(stderr, &usageError{args[0] + " needs a value"})
 			}
-			switch args[0] {
-			case "--config":
+			if args[0] == "--config" {
 				g.config = args[1]
-			case "--db":
+			} else {
 				g.db = args[1]
-			default:
-				g.tree = args[1]
 			}
 			args = args[2:]
 			continue
@@ -131,11 +127,6 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	}
 	if g.db != "" {
 		cfg.DB = g.db
-	}
-	if g.tree != "" {
-		if cfg.Tree, err = filepath.Abs(g.tree); err != nil {
-			return fail(stderr, &unableError{err})
-		}
 	}
 	if cfg.DB == "" {
 		return fail(stderr, &usageError{declindex.ErrNoDB.Error()})

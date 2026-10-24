@@ -26,7 +26,7 @@ func TestRefreshNeverCompilesStoredAddedSource(t *testing.T) {
 	if err != nil || len(defects) != 0 {
 		t.Fatalf("registry: %v, defects: %v", err, defects)
 	}
-	text, _ := reg.FormsModule().Source()
+	text, _ := registryForms(reg).Source()
 	if strings.Contains(text, source) || strings.Contains(text, "IO.FS.writeFile") {
 		t.Fatalf("FormsModule.Source contains stored source:\n%s", text)
 	}
