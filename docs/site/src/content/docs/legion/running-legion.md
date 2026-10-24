@@ -212,6 +212,13 @@ already real: a daemon whose own pod restarts onto a new IP binds every interfac
 file passes the [configuration check](#check-and-start-the-daemon) once the three token files and
 the kubeconfig it names exist and `LEGION_POSTGRES_DSN` (or `postgres_dsn`) names a Postgres.
 
+A daemon that runs standing owners alone (owners the orchestration ledger wakes) needs much less. The repository's
+`deploy/kubernetes/daemon/legion-owners.yaml.example`, rendered in the same reference, is that
+file whole: `project`, `state_dir`, `postgres_dsn`, `runtime: tmux`, `operator_token_file` (the
+bearer the owner retry, claim list and refused-owner routes take) and `standing_owners`, with no
+Dispatch, projects or GitHub Apps. It passes the configuration check once its token, ledger DSN and
+prompt files exist, each readable by its owner alone.
+
 What each part is for:
 
 - **`project`** is the Dispatch project key, and it must also be a key of `projects`, which names
