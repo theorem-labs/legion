@@ -131,7 +131,7 @@ func TestTakeoverRefusesTheOldOwnersGeneration(t *testing.T) {
 	if res.Pass || !hasViolation(res, ledger.ReasonStaleGeneration) {
 		t.Fatalf("old generation check: %+v", res)
 	}
-	_, err = s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "kicked", Key: "stale-round"})
+	_, err = s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "kicked", Key: "stale-round", ReadyEvent: unreadyEvent})
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 	_, err = s.ExtendMigration(ctx, "r", "M-1", 1, []string{"b.lean"}, nil)
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
@@ -438,6 +438,7 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		m := must(s.RecordRound(ctx, ledger.RoundRequest{
 			Repo: "r", ID: "M-1", Generation: 1, Reason: fmt.Sprintf("build failed %d", i), Key: fmt.Sprintf("round-%d", i),
+			ReadyEvent: unreadyEvent,
 		}))
 		if m.LandingRounds != i || m.EscalatedAt != nil {
 			t.Fatalf("after round %d: %+v", i, m)
@@ -446,7 +447,7 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	_, err := s.Escalate(ctx, "r", "M-1", 3)
 	wantRefusal(t, err, ledger.ReasonBelowLimit)
 
-	m := must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed 3", Key: "round-3"}))
+	m := must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed 3", Key: "round-3", ReadyEvent: unreadyEvent}))
 	if m.EscalatedAt == nil || m.State != ledger.StateOpen {
 		t.Fatalf("third failed round should escalate and leave it open: %+v", m)
 	}
@@ -470,7 +471,7 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	wantRefusal(t, err, ledger.ReasonNotEscalated)
 
 	// A sweep with a lower limit flags every open migration at or over it, once.
-	must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-2", Generation: 1, Reason: "kicked", Key: "m2-round"}))
+	must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-2", Generation: 1, Reason: "kicked", Key: "m2-round", ReadyEvent: unreadyEvent}))
 	flagged := must(s.Escalate(ctx, "r", "", 1))
 	if len(flagged) != 1 || flagged[0].ID != "M-2" {
 		t.Fatalf("sweep flagged %+v, want M-2", flagged)

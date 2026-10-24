@@ -381,7 +381,8 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			request = decoded
 		} else {
 			if len(args) < 4 {
-				return nil, false, usagef("round <repo> <id> <generation> <reason> --key <key> [--batch <batch>] [--detail <detail>] [--log <log>]")
+				return nil, false, usagef("round <repo> <id> <generation> <reason> --key <key> --ready-event <id> [--batch <batch>] " +
+					"[--detail <detail>] [--log <log>]")
 			}
 			generation, err := integer(args[2])
 			if err != nil {
@@ -758,6 +759,12 @@ func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
 		switch flag {
 		case "--key":
 			request.Key = value
+		case "--ready-event":
+			readyEvent, err := integer(value)
+			if err != nil {
+				return ledger.RoundRequest{}, err
+			}
+			request.ReadyEvent = readyEvent
 		case "--batch":
 			request.Batch = value
 		case "--detail":
@@ -770,6 +777,9 @@ func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
 	}
 	if request.Key == "" {
 		return ledger.RoundRequest{}, usagef("round needs --key")
+	}
+	if request.ReadyEvent == 0 {
+		return ledger.RoundRequest{}, usagef("round needs --ready-event")
 	}
 	return request, nil
 }

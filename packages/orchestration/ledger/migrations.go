@@ -57,7 +57,8 @@ type Review struct {
 	Head     string `json:"head"`
 }
 
-// RoundRequest records a failed landing round and its idempotency key.
+// RoundRequest records a failed landing round: the ready record whose candidate failed, and the round's idempotency
+// key.
 type RoundRequest struct {
 	Repo       string `json:"repo"`
 	ID         string `json:"id"`
@@ -65,6 +66,10 @@ type RoundRequest struct {
 	Reason     string `json:"reason"`
 	Batch      string `json:"batch"`
 	Key        string `json:"key"`
+	// ReadyEvent is the ready_event of the ready record the landing program took the failed candidate from, as
+	// ready-list prints it. The round clears the migration's ready record only while that record is still the stored
+	// one, so an owner's newer submission survives the return of an older one.
+	ReadyEvent int64  `json:"ready_event"`
 	Detail     string `json:"detail"`
 	Log        string `json:"log"`
 }
@@ -403,11 +408,16 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 
 // RecordRound records one landing round the migration failed (its candidate was sent back). The key alone makes it
 // idempotent: a repeated key returns the migration as it is now, even after a takeover or with another reason, without
-// counting or recording a second failure. When the repository's limit is set and the migration has now used that many
-// rounds, it is escalated to the steward.
+// counting or recording a second failure. The round clears the migration's ready record only when that record is
+// still the one the round consumed (req.ReadyEvent): a newer submission from the owner stays listed, and the round
+// still counts, because the older candidate really failed. When the repository's limit is set and the migration has
+// now used that many rounds, it is escalated to the steward.
 func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, error) {
 	if req.Key == "" {
 		return Migration{}, invalid("a round needs an idempotency key")
+	}
+	if req.ReadyEvent < 1 {
+		return Migration{}, invalid("a round needs the ready event of the record it consumed")
 	}
 
 	var m Migration
@@ -439,7 +449,7 @@ func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, e
 		}
 
 		rounds := cur.LandingRounds + 1
-		readyCleared, err := clearReady(ctx, tx, req.Repo, req.ID)
+		readyCleared, err := clearReadyEvent(ctx, tx, req.Repo, req.ID, req.ReadyEvent)
 		if err != nil {
 			return err
 		}
@@ -449,7 +459,7 @@ func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, e
 		}
 		if err := event(ctx, tx, req.Repo, "migration.round_failed", req.ID, "", map[string]any{
 			"generation": req.Generation, "landing_rounds": rounds, "reason": req.Reason, "batch": req.Batch, "key": req.Key,
-			"detail": req.Detail, "log": req.Log, "ready_cleared": readyCleared,
+			"detail": req.Detail, "log": req.Log, "ready_event": req.ReadyEvent, "ready_cleared": readyCleared,
 		}); err != nil {
 			return err
 		}

@@ -27,6 +27,7 @@ type roundCLIRequest struct {
 	Reason     string `json:"reason"`
 	Batch      string `json:"batch"`
 	Key        string `json:"key"`
+	ReadyEvent int64  `json:"ready_event,omitempty"`
 	Detail     string `json:"detail"`
 	Log        string `json:"log"`
 }
@@ -47,6 +48,7 @@ type roundCLIEvent struct {
 	Key           string `json:"key"`
 	Detail        string `json:"detail"`
 	Log           string `json:"log"`
+	ReadyEvent    int64  `json:"ready_event"`
 	ReadyCleared  bool   `json:"ready_cleared"`
 }
 
@@ -103,6 +105,9 @@ func (cli roundCLI) roundArgs(request roundCLIRequest) []string {
 		return []string{"--json", "round", "--request-file", file}
 	}
 	args := []string{"--json", "round", request.Repo, request.ID, fmt.Sprint(request.Generation), request.Reason, "--key", request.Key}
+	if request.ReadyEvent != 0 {
+		args = append(args, "--ready-event", fmt.Sprint(request.ReadyEvent))
+	}
 	for _, field := range []struct{ flag, value string }{
 		{"--batch", request.Batch},
 		{"--detail", request.Detail},
@@ -142,11 +147,27 @@ func (cli roundCLI) events(kind string) []json.RawMessage {
 	return matches
 }
 
+// cliUnreadyEvent is a ready event id that no migration in these tests stores: a round with it clears nothing.
+const cliUnreadyEvent = 1 << 40
+
 func cliRoundRequest(generation int64, key, reason string) roundCLIRequest {
 	return roundCLIRequest{
 		Repo: "r", ID: "M-1", Generation: generation, Reason: reason, Batch: "batch-a", Key: key,
-		Detail: "detail for " + key, Log: "https://logs.example.test/" + key,
+		ReadyEvent: cliUnreadyEvent, Detail: "detail for " + key, Log: "https://logs.example.test/" + key,
 	}
+}
+
+// readyEvent publishes a ready record for M-1 at head and returns its ready_event, as ready-list would print it.
+func (cli roundCLI) readyEvent(head string) int64 {
+	cli.t.Helper()
+	var record struct {
+		ReadyEvent int64 `json:"ready_event"`
+	}
+	if err := json.Unmarshal([]byte(cli.invoke("--json", "ready", "r", "M-1", "1", "--head", head)), &record); err != nil ||
+		record.ReadyEvent == 0 {
+		cli.t.Fatalf("ready %s: %v %+v", head, err, record)
+	}
+	return record.ReadyEvent
 }
 
 func TestRoundCommandRetryWithSameKeyCountsOnce(t *testing.T) {
@@ -249,12 +270,59 @@ func TestRoundCommandEmptyKeyExitsTwo(t *testing.T) {
 	})
 }
 
+// A round without the ready event it consumed exits 2, names the ready event, and records nothing.
+func TestRoundCommandWithoutReadyEventExitsTwo(t *testing.T) {
+	runRoundCLITests(t, func(t *testing.T, cli roundCLI) {
+		cli.readyEvent("head-1")
+		request := cliRoundRequest(1, "round-1", "build failed")
+		request.ReadyEvent = 0
+		code, stdout, stderr := cli.call(cli.roundArgs(request)...)
+		if code != 2 || !strings.Contains(stderr, "ready event") && !strings.Contains(stderr, "ready-event") {
+			t.Fatalf("no ready event: code=%d stdout=%q stderr=%q; want exit 2 naming the ready event", code, stdout, stderr)
+		}
+		if events := cli.events("migration.round_failed"); len(events) != 0 {
+			t.Fatalf("a round without a ready event appended %d round events", len(events))
+		}
+		var listed []json.RawMessage
+		if err := json.Unmarshal([]byte(cli.invoke("--json", "ready-list", "r")), &listed); err != nil || len(listed) != 1 {
+			t.Fatalf("a refused round changed the ready list: %v %d records", err, len(listed))
+		}
+	})
+}
+
+// The return of an older ready record leaves the owner's newer one listed: ready H1, ready H2 at the same
+// generation, then a round for H1's event. The round counts and says it cleared nothing; H2 is still listed.
+func TestRoundCommandForAnOlderReadyRecordKeepsItsReplacement(t *testing.T) {
+	runRoundCLITests(t, func(t *testing.T, cli roundCLI) {
+		h1 := cli.readyEvent("H1")
+		h2 := cli.readyEvent("H2")
+		request := cliRoundRequest(1, "round-1", "H1 build failed")
+		request.ReadyEvent = h1
+		if migration := cli.round(request); migration.LandingRounds != 1 {
+			t.Fatalf("the round for H1 did not count: %+v", migration)
+		}
+		var listed []struct {
+			Head       string `json:"head"`
+			ReadyEvent int64  `json:"ready_event"`
+		}
+		if err := json.Unmarshal([]byte(cli.invoke("--json", "ready-list", "r")), &listed); err != nil ||
+			len(listed) != 1 || listed[0].Head != "H2" || listed[0].ReadyEvent != h2 {
+			t.Fatalf("ready-list after the round for H1: %v %+v, want H2 at event %d", err, listed, h2)
+		}
+		events := cli.events("migration.round_failed")
+		var got roundCLIEvent
+		if len(events) != 1 || json.Unmarshal(events[0], &got) != nil || got.ReadyEvent != h1 || got.ReadyCleared {
+			t.Fatalf("round event %s, want ready_event %d and ready_cleared false", events, h1)
+		}
+	})
+}
+
 func TestRoundCommandEventHoldsEveryField(t *testing.T) {
 	runRoundCLITests(t, func(t *testing.T, cli roundCLI) {
-		cli.invoke("ready", "r", "M-1", "1", "--head", "head-1")
+		readied := cli.readyEvent("head-1")
 		request := roundCLIRequest{
 			Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Batch: "batch-a", Key: "round-1",
-			Detail: "compiler reported an error", Log: "https://logs.example.test/round-1",
+			ReadyEvent: readied, Detail: "compiler reported an error", Log: "https://logs.example.test/round-1",
 		}
 		cli.round(request)
 		events := cli.events("migration.round_failed")
@@ -267,7 +335,8 @@ func TestRoundCommandEventHoldsEveryField(t *testing.T) {
 		}
 		want := roundCLIEvent{
 			Generation: 1, LandingRounds: 1, Reason: "build failed", Batch: "batch-a", Key: "round-1",
-			Detail: "compiler reported an error", Log: "https://logs.example.test/round-1", ReadyCleared: true,
+			Detail: "compiler reported an error", Log: "https://logs.example.test/round-1", ReadyEvent: readied,
+			ReadyCleared: true,
 		}
 		if got != want {
 			t.Fatalf("round event: got %+v, want %+v", got, want)

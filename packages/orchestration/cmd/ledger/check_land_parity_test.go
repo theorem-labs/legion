@@ -96,7 +96,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 				}
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
 				if _, err := s.RecordRound(context.Background(), ledger.RoundRequest{
-					Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Key: "parity-round",
+					Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Key: "parity-round", ReadyEvent: 1 << 40,
 				}); err != nil {
 					t.Fatal(err)
 				}

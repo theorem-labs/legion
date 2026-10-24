@@ -44,6 +44,17 @@ func clearReady(ctx context.Context, tx pgx.Tx, repo, id string) (bool, error) {
 	return tag.RowsAffected() == 1, nil
 }
 
+// clearReadyEvent removes the stored ready record only when it is the one whose migration.ready event is readyEvent,
+// and reports whether it did. A record the owner published since then stays.
+func clearReadyEvent(ctx context.Context, tx pgx.Tx, repo, id string, readyEvent int64) (bool, error) {
+	tag, err := tx.Exec(ctx, `UPDATE migrations SET ready_at = NULL, ready_event = NULL, ready_records = NULL
+		WHERE repo = $1 AND id = $2 AND ready_event = $3`, repo, id, readyEvent)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // Ready records the exact landing inputs an owner supplies for an open, current, un-escalated migration. A ready
 // record names the head that was built. A later ready replaces the previous record and has the id of its own
 // migration.ready event. An absent list or map is recorded empty, so a record has one shape whether its request came

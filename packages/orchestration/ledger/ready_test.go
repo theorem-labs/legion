@@ -97,7 +97,7 @@ func TestReadyRefusesClosedStaleAndEscalatedMigrations(t *testing.T) {
 		s := newStore(t)
 		must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
 		for _, key := range []string{"round-1", "round-2", "round-3"} {
-			must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: key}))
+			must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: key, ReadyEvent: unreadyEvent}))
 		}
 		_, err := s.Ready(ctx, readyRequest("M-1", 1, "head"))
 		wantRefusal(t, err, ledger.ReasonEscalated)
@@ -150,7 +150,10 @@ func TestReadyClearsWhenMigrationMovesOn(t *testing.T) {
 		}, "migration.extended"},
 		{"abandon", func(t *testing.T, s *ledger.Store) { must(s.Abandon(ctx, "r", "M-1", 1, "stopped")) }, "migration.abandoned"},
 		{"round", func(t *testing.T, s *ledger.Store) {
-			must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: "round-1"}))
+			ready := must(s.ReadyMigrations(ctx, "r"))
+			must(s.RecordRound(ctx, ledger.RoundRequest{
+				Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: "round-1", ReadyEvent: ready[0].ReadyEvent,
+			}))
 		}, "migration.round_failed"},
 	}
 	for _, test := range tests {
