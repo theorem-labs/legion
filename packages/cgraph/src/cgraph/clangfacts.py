@@ -2513,8 +2513,11 @@ class _FunctionWalk:
                     self.reads[node.referenced.hash] += 1
         stored = _store_target(node)
         if stored is not None and _strip_parens(stored).kind == K.DECL_REF_EXPR:
-            # v = e, v op= e and v++ store into v; they read v's value only to store into it.
-            self.stores.add(_strip_parens(stored).hash)
+            # v = e stores into v without reading it. v op= e and v++ read v only to store into it,
+            # unless their own value is used (pcpu_dump_alloc_info's while (v /= 10)).
+            value_unused = parent is not None and parent.kind in _STATEMENT_PARENTS
+            if value_unused or (kind == K.BINARY_OPERATOR and libclang.is_assignment(node)):
+                self.stores.add(_strip_parens(stored).hash)
             variable = _strip_parens(stored).referenced
             if (
                 reason is None

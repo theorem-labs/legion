@@ -697,3 +697,11 @@ def test_a_local_read_only_where_the_image_decides_has_an_initial_value_the_imag
         16,
         True,
     )
+
+
+def test_a_compound_assignment_whose_value_is_used_reads_its_variable(dead_facts: dict[str, Any]) -> None:
+    """pcpu_dump_alloc_info's while (v /= 10): v is read, so v = num_possible_cpus() is code."""
+    events = fact_events(dead_facts, "dd_digits")
+    (field,) = events["field_accesses"]
+    assert (field["field"], field["displacement"], field.get("conditional")) == ("id", 16, None)
+    assert not [item for item in events["unevaluated"] if item["reason"] == "discarded"]

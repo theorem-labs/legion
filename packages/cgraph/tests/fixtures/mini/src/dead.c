@@ -375,3 +375,17 @@ void dd_conditional_local(struct box *b, struct dd_holder *h)
 
 	dd_init_nid(b, nid);
 }
+
+/* mm/percpu.c pcpu_dump_alloc_info: v = num_possible_cpus(); while (v /= 10) cpu_width++;. The value of
+ * v /= 2 is the loop's condition, so v is read and its stores are code. (A divisor of 2 needs no
+ * constant in .rodata, so the fixture's text addresses stay where the contract graph names them.) */
+int dd_digits(struct dd_holder *h)
+{
+	int width = 1;
+	long v;
+
+	v = h->ctx.id;
+	while (v /= 2)
+		width++;
+	return width;
+}
