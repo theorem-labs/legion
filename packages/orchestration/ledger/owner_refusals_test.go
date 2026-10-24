@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -101,13 +102,14 @@ func TestRecordOwnerRefusedRefusesAnotherReasonAtTheSameRevision(t *testing.T) {
 	}
 }
 
-// OwnerRefusals shows an owner's refusal only while the owner's work revision is the refused one: the owner's new work
-// or a completion hides it, a refusal at the new revision shows, and a claim or another owner's work changes nothing.
-// A refusal at an older revision is recorded once and never shown.
+// OwnerRefusals shows an owner's refusal only while the owner has open work and its work revision is the refused one:
+// the owner's new work or a completion hides it, a refusal at the new revision shows, and a claim, a release, a holder
+// stop, an expiry or another owner's work changes nothing. A refusal at an older revision, or of an owner whose work is
+// all done, is recorded once and never shown, as OpenOwners does not list that owner.
 func TestOwnerRefusalsShowOnlyTheRefusalOfTheCurrentWork(t *testing.T) {
-	s := newStore(t)
+	s, dsn := newStoreDSN(t)
 	ctx := context.Background()
-	const refused, other = "struct:mount", "function:a_b"
+	const refused, other, finished = "struct:mount", "function:a_b", "global:done"
 	assertOwnerRefusals(t, s)
 
 	refusedRevision := enqueueFor(t, s, "1", refused)
@@ -122,8 +124,35 @@ func TestOwnerRefusalsShowOnlyTheRefusalOfTheCurrentWork(t *testing.T) {
 	second := must(s.RecordOwnerRefused(ctx, "r", refused, newer, "owner id outside the accepted forms"))
 	assertOwnerRefusals(t, s, second)
 
+	// Leasing an item does not change its work, so none of these steps moves the revision or hides the refusal.
+	stillRefused := func(step string) {
+		t.Helper()
+		if current := must(s.OwnerWorkRevision(ctx, "r", refused)); current != newer {
+			t.Errorf("after %s: work revision %d, want %d", step, current, newer)
+		}
+		assertOwnerRefusals(t, s, second)
+	}
 	lease := must(s.Claim(ctx, "r", "4", refused, 0))
-	assertOwnerRefusals(t, s, second)
+	stillRefused("a claim")
+	if err := s.Release(ctx, "r", "4", refused, lease.Generation); err != nil {
+		t.Fatal(err)
+	}
+	stillRefused("a release")
+	must(s.Claim(ctx, "r", "4", refused, 0))
+	if freed := must(s.ReleaseHolder(ctx, "r", refused, "gone")); len(freed) != 1 {
+		t.Fatalf("holder stop freed %+v, want item 4", freed)
+	}
+	stillRefused("a holder stop")
+	lease = must(s.Claim(ctx, "r", "4", refused, 20*time.Millisecond))
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	waitForDatabaseExpiry(t, observer, lease.ExpiresAt)
+	if expired := must(s.Expire(ctx, "r")); len(expired) != 1 {
+		t.Fatalf("expiry freed %+v, want item 4", expired)
+	}
+	stillRefused("an expiry")
+
+	lease = must(s.Claim(ctx, "r", "4", refused, 0))
 	if err := s.Complete(ctx, "r", "4", refused, lease.Generation, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -134,10 +163,28 @@ func TestOwnerRefusalsShowOnlyTheRefusalOfTheCurrentWork(t *testing.T) {
 		t.Fatalf("older refusal = %+v, want revision %d", older, otherOld)
 	}
 	assertOwnerRefusals(t, s)
+
+	// An owner whose only item is done still has a work revision, its completion, and a refusal at it is recorded; but
+	// the owner has no open work, so it is listed by neither OpenOwners nor OwnerRefusals.
+	enqueueFor(t, s, "5", finished)
+	lease = must(s.Claim(ctx, "r", "5", finished, 0))
+	if err := s.Complete(ctx, "r", "5", finished, lease.Generation, "done"); err != nil {
+		t.Fatal(err)
+	}
+	finishedRevision := must(s.OwnerWorkRevision(ctx, "r", finished))
+	if refusal := must(s.RecordOwnerRefused(ctx, "r", finished, finishedRevision, "no template")); refusal.Revision != finishedRevision {
+		t.Fatalf("refusal of an owner with no open work = %+v, want revision %d", refusal, finishedRevision)
+	}
+	if open := must(s.OpenOwners(ctx, "r")); slices.Contains(open, finished) {
+		t.Fatalf("open owners %v list an owner whose work is done", open)
+	}
+	assertOwnerRefusals(t, s)
+
 	want := []ownerRefusedEvent{
 		{refused, refusedRevision, "no template"},
 		{refused, newer, "owner id outside the accepted forms"},
 		{other, otherOld, "no template"},
+		{finished, finishedRevision, "no template"},
 	}
 	if got := ownerRefusedEvents(t, s); !slices.Equal(got, want) {
 		t.Fatalf("owner.refused events = %+v, want %+v", got, want)

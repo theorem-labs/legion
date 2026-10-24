@@ -50,7 +50,9 @@ type OwnerRefusal struct {
 // owner for the work at revision, and appends one owner.refused event. A repeat with the same reason
 // returns the stored refusal and appends nothing; one with another reason is refused
 // (ReasonRefusalConflict) and changes nothing. A revision below 1, or newer than the owner's
-// OwnerWorkRevision, refuses no work that exists, so it is invalid input.
+// OwnerWorkRevision, refuses no work that exists, so it is invalid input. A refusal at an older
+// revision, or at a revision where the owner has no open work, is recorded but OwnerRefusals never
+// lists it.
 func (s *Store) RecordOwnerRefused(ctx context.Context, repo, owner string, revision int64, reason string) (OwnerRefusal, error) {
 	switch {
 	case strings.TrimSpace(owner) == "":
@@ -103,8 +105,10 @@ func (s *Store) RecordOwnerRefused(ctx context.Context, repo, owner string, revi
 	return refusal, nil
 }
 
-// OwnerRefusals lists, by owner, each owner's refusal at its current OwnerWorkRevision. A refusal of
-// work that has changed since is not listed: the supervisor will try that owner again.
+// OwnerRefusals lists, by owner, the refusal of each owner with open work at its current
+// OwnerWorkRevision: the owners OpenOwners lists, and no others. A refusal of work that has changed
+// since is not listed, because the supervisor will try that owner again; nor is the refusal of an
+// owner whose work is all done, because nothing is left to start it for.
 func (s *Store) OwnerRefusals(ctx context.Context, repo string) ([]OwnerRefusal, error) {
 	refusals := []OwnerRefusal{}
 	err := s.tx(ctx, func(tx pgx.Tx) error {
@@ -112,7 +116,7 @@ func (s *Store) OwnerRefusals(ctx context.Context, repo string) ([]OwnerRefusal,
 			return err
 		}
 		rows, err := tx.Query(ctx, `SELECT r.owner, r.revision::bigint, r.reason, r.at
-			FROM (SELECT DISTINCT owner FROM owner_refusals WHERE repo = $1) o
+			FROM (SELECT DISTINCT owner FROM work_items WHERE repo = $1 AND state = 'open' AND owner <> '') o
 			CROSS JOIN LATERAL (`+ownerWorkRevisionQuery("o.owner")+`) AS work(revision)
 			JOIN owner_refusals r ON r.repo = $1 AND r.owner = o.owner AND r.revision = work.revision::text
 			ORDER BY r.owner`, repo)
