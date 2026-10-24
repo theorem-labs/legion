@@ -1,0 +1,57 @@
+{
+  "format": "cgraph/topics/v1",
+  "part": "slice",
+  "prefix": "notifications.example.",
+  "token_rule": "node id with every character outside [A-Za-z0-9_:-] percent-encoded",
+  "owners": {
+    "function:alpha@lib/alpha.c": [
+      "notifications.example.all",
+      "notifications.example.node.function:alpha%40lib%2Falpha%2Ec.needs",
+      "notifications.example.node.function:beta_init%40lib%2Fsub%2Fbeta%2Ec.callers",
+      "notifications.example.node.function:beta_init%40lib%2Fsub%2Fbeta%2Ec.neighbors",
+      "notifications.example.node.global:counter%40lib%2Falpha%2Ec.neighbors",
+      "notifications.example.node.global:counter%40lib%2Falpha%2Ec.users",
+      "notifications.example.node.struct:widget.neighbors",
+      "notifications.example.node.struct:widget.users"
+    ],
+    "function:beta_init@lib/sub/beta.c": [
+      "notifications.example.all",
+      "notifications.example.node.function:alpha%40lib%2Falpha%2Ec.callees",
+      "notifications.example.node.function:alpha%40lib%2Falpha%2Ec.neighbors",
+      "notifications.example.node.function:beta_init%40lib%2Fsub%2Fbeta%2Ec.needs",
+      "notifications.example.node.function:gamma-helper.callers",
+      "notifications.example.node.function:gamma-helper.neighbors",
+      "notifications.example.node.percpu:cpu_state.neighbors",
+      "notifications.example.node.percpu:cpu_state.users"
+    ],
+    "function:gamma-helper": [
+      "notifications.example.all",
+      "notifications.example.node.function:beta_init%40lib%2Fsub%2Fbeta%2Ec.callees",
+      "notifications.example.node.function:beta_init%40lib%2Fsub%2Fbeta%2Ec.neighbors",
+      "notifications.example.node.function:gamma-helper.needs"
+    ],
+    "global:counter@lib/alpha.c": [
+      "notifications.example.all",
+      "notifications.example.node.function:alpha%40lib%2Falpha%2Ec.neighbors",
+      "notifications.example.node.global:counter%40lib%2Falpha%2Ec.needs"
+    ],
+    "percpu:cpu_state": [
+      "notifications.example.all",
+      "notifications.example.node.function:beta_init%40lib%2Fsub%2Fbeta%2Ec.neighbors",
+      "notifications.example.node.percpu:cpu_state.needs"
+    ],
+    "struct:widget": [
+      "notifications.example.all",
+      "notifications.example.node.function:alpha%40lib%2Falpha%2Ec.neighbors",
+      "notifications.example.node.struct:widget.needs",
+      "notifications.example.node.subsystem:core.linked",
+      "notifications.example.node.subsystem:core.neighbors"
+    ],
+    "subsystem:core": [
+      "notifications.example.all",
+      "notifications.example.node.struct:widget.linked",
+      "notifications.example.node.struct:widget.neighbors",
+      "notifications.example.node.subsystem:core.needs"
+    ]
+  }
+}

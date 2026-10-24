@@ -1,0 +1,21 @@
+repo: example-repo
+topic_prefix: notifications.example.
+records_root: skeleton
+lean_root: Linux/Skeleton
+active: skeleton/active/ns-match.yaml
+rule: skeleton/RULE.yaml
+manifest: skeleton/PROTOCOL.yaml
+facts: skeleton/facts.yaml
+controls: skeleton/controls.yaml
+graph_dir: /srv/graph/out
+score_part: slice
+paths:
+  edge_module: Linux/Skeleton/{key_source}/E{hex16_target}.lean
+  edge_theorem: Skeleton.{key_source}.E{hex16_target}.edge
+  interface_module: Linux/Skeleton/{key_ds}/I{hex16_interface}.lean
+  interface_theorem: Skeleton.{key_ds}.I{hex16_interface}.edge
+  node_module: Linux/Skeleton/{key}/Node.lean
+  edge_record: skeleton/nodes/{key_source}/edges/E{hex16_target}.yaml
+  agreement_id: edge:{source}->{target}@{n}
+build:
+  gate_targets: [Linux, Firmware, Combined]
