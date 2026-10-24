@@ -3275,9 +3275,11 @@ class _FunctionWalk:
             if len(live) == len(definitions) and key not in writes.opaque:
                 return self.held(variable, reference, depth)
             initializer = libclang.var_initializer(variable)
-            if initializer is None:
+            # A read before every store reads an indeterminate value: without an initial value, the
+            # live stores decide (shrink_folio_list's writeout: res = swap_writeout()'s 0).
+            sources = [*([initializer] if initializer is not None else []), *live]
+            if not sources:
                 return None
-            sources = [initializer, *live]
         self.holding.add(key)
         try:
             stated = [self.x.evaluator.expression(source, self.flowed, depth + 1) for source in sources]

@@ -984,6 +984,9 @@ FLOW = """
     static inline int highmem(void *p) { return 0; }
     void remap_fn(void *p) { int remap = 0; if (highmem(p)) remap = 1; if (remap) warn(); kept(); }
     void remap_live(void *p, int k) { int remap = 0; if (k) remap = 1; if (remap) warn(); kept(); }
+    int shmem_out(void *p);
+    static inline int swap_out(void *p) { return 0; }
+    void writeout(void *p) { int res; if (highmem(p)) res = shmem_out(p); else res = swap_out(p); if (res < 0) warn(); }
 """
 
 
@@ -1002,6 +1005,8 @@ def test_a_local_holds_what_the_stores_that_reach_a_use_on_live_paths_give(tmp_p
     assert "warn" not in callees("range")
     assert "warn" not in callees("remap_fn")
     assert "warn" in callees("remap_live")
+    # shrink_folio_list's writeout: res has no initializer; its one live store, swap_writeout's 0, decides.
+    assert "warn" not in callees("writeout")
 
 
 WARN_ONCE = """
