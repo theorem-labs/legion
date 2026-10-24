@@ -59,8 +59,8 @@ func resolveProject(ctx context.Context, cfg declindex.Config, index *declindex.
 	if err != nil {
 		return project{}, fmt.Errorf("find registry relative to tree: %w", err)
 	}
-	rel = filepath.Clean(rel)
-	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	// IsLocal refuses a path that leaves the tree; "." is the tree itself, no registry below it.
+	if !filepath.IsLocal(rel) || rel == "." {
 		return project{}, fmt.Errorf("registry %s is outside tree %s", registry, tree)
 	}
 	prefix, err := index.Meta(ctx, "source_prefix")
@@ -157,7 +157,7 @@ func OpenGate(ctx context.Context, cfg declindex.Config, opts Options) (_ *Gate,
 	if work, err = os.MkdirTemp("", "declindex-gate-"); err != nil {
 		return nil, err
 	}
-	registry, _, err := snapshotRegistry(ctx, p.tree, commit, p.rel, work)
+	registry, err := snapshotRegistry(ctx, p.tree, commit, p.rel, work)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +238,7 @@ func recheckLanding(ctx context.Context, cfg declindex.Config, index *declindex.
 		return err
 	}
 	defer os.RemoveAll(work)
-	snapshot, _, err := snapshotRegistry(ctx, p.tree, commit, p.rel, work)
+	snapshot, err := snapshotRegistry(ctx, p.tree, commit, p.rel, work)
 	if err != nil {
 		return fmt.Errorf("snapshot registry: %w", err)
 	}

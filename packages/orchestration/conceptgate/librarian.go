@@ -12,8 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
 // ReviewRequest is one message that the gate delivers to its librarian.
@@ -109,35 +110,24 @@ func (c CommandLibrarian) Review(ctx context.Context, r ReviewRequest) error {
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.Command(c.Command[0], append(c.Command[1:], "--id", r.ID, "--proposer", r.Proposer, "--proposal", filepath.Clean(path))...)
+	cmd := exec.CommandContext(runCtx, c.Command[0], append(c.Command[1:], "--id", r.ID, "--proposer", r.Proposer, "--proposal", filepath.Clean(path))...)
 	cmd.Stdin = strings.NewReader("")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	killed := declindex.InGroup(cmd)
 	cmd.WaitDelay = librarianWaitDelay
 	var output bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &output, &output
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("librarian command: %w", err)
 	}
-	wait := make(chan error, 1)
-	go func() {
-		err := cmd.Wait()
-		if errors.Is(err, exec.ErrWaitDelay) {
-			// The command exited 0; only a descendant still held its output.
-			err = nil
-		}
-		wait <- err
-	}()
-	select {
-	case err := <-wait:
-		if err != nil {
-			return fmt.Errorf("librarian command: %w: %s", err, strings.TrimSpace(output.String()))
-		}
+	err = cmd.Wait()
+	switch {
+	case err == nil || errors.Is(err, exec.ErrWaitDelay):
+		// With ErrWaitDelay the command exited 0; only a descendant still held its output.
 		return nil
-	case <-runCtx.Done():
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		<-wait
+	case killed():
+		// The timeout or the caller's end killed the command's process group.
 		return fmt.Errorf("librarian command: %w: %s", runCtx.Err(), strings.TrimSpace(output.String()))
+	default:
+		return fmt.Errorf("librarian command: %w: %s", err, strings.TrimSpace(output.String()))
 	}
 }

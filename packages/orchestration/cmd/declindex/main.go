@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -225,6 +226,27 @@ func (e *env) printJSON(v any) int {
 	return 0
 }
 
+// printJSONOr prints v as JSON and gives rc, or the exit code of a failed print.
+func (e *env) printJSONOr(v any, rc int) int {
+	if c := e.printJSON(v); c != 0 {
+		return c
+	}
+	return rc
+}
+
+// resolve gives the declarations that q names. A name that names none is reported on stderr and sets *rc to 1;
+// the second result is non-zero, an exit code, only when the index cannot answer.
+func (e *env) resolve(ctx context.Context, q string, rc *int) ([]declindex.Found, int) {
+	found, err := e.store.Resolve(ctx, q)
+	if err != nil {
+		return nil, fail(e.stderr, &unableError{err})
+	}
+	if len(found) == 0 {
+		*rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
+	}
+	return found, 0
+}
+
 func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"refresh takes no arguments"})
@@ -237,7 +259,7 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	opt := declindex.RefreshOptions{Jobs: e.cfg.Jobs, Log: e.stderr}
 	var sync func(context.Context) error
 	if commit := e.getenv("LAND_COMMIT"); commit != "" {
-		if !isCommitID(commit) {
+		if !declindex.IsObjectID(commit) {
 			return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 lowercase hexadecimal characters"})
 		}
 		opt.Commit, opt.CheckLandedCoverage = commit, true
@@ -267,19 +289,6 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 		return e.printJSON(st)
 	}
 	return 0
-}
-
-// isCommitID accepts a full object id as Git prints it: 40 lowercase hexadecimal characters.
-func isCommitID(commit string) bool {
-	if len(commit) != 40 {
-		return false
-	}
-	for _, r := range commit {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
-			return false
-		}
-	}
-	return true
 }
 
 type status struct {
@@ -364,21 +373,14 @@ func cmdWhere(ctx context.Context, e *env, args []string) int {
 	var all []declindex.Found
 	rc := 0
 	for _, q := range qs {
-		found, err := e.store.Resolve(ctx, q)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		if len(found) == 0 {
-			rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
-			continue
+		found, code := e.resolve(ctx, q, &rc)
+		if code != 0 {
+			return code
 		}
 		all = append(all, found...)
 	}
 	if e.g.json {
-		if c := e.printJSON(all); c != 0 {
-			return c
-		}
-		return rc
+		return e.printJSONOr(all, rc)
 	}
 	for _, f := range all {
 		fmt.Fprintf(e.stdout, "%s\t%s\t%s\t%s\n", f.Name, f.Kind, f.Module, f.At())
@@ -406,13 +408,9 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 	}
 	var out []hashed
 	for _, q := range qs {
-		found, err := e.store.Resolve(ctx, q)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		if len(found) == 0 {
-			rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
-			continue
+		found, code := e.resolve(ctx, q, &rc)
+		if code != 0 {
+			return code
 		}
 		for _, f := range found {
 			out = append(out, hashed{f.Name, f.StmtHash, f.At()})
@@ -423,10 +421,7 @@ func cmdHash(ctx context.Context, e *env, args []string) int {
 		}
 	}
 	if e.g.json {
-		if c := e.printJSON(out); c != 0 {
-			return c
-		}
-		return rc
+		return e.printJSONOr(out, rc)
 	}
 	for _, h := range out {
 		hash := h.Hash
@@ -477,13 +472,9 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 	rc := 0
 	var answers []declindex.Answer
 	for _, q := range qs {
-		found, err := e.store.Resolve(ctx, q)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		if len(found) == 0 {
-			rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
-			continue
+		found, code := e.resolve(ctx, q, &rc)
+		if code != 0 {
+			return code
 		}
 		if len(found) > 1 && !e.g.json {
 			fmt.Fprintf(e.stdout, "%s: %d declarations share this name; each is answered separately\n", q, len(found))
@@ -500,16 +491,14 @@ func cmdUsers(ctx context.Context, e *env, args []string) int {
 		}
 	}
 	if e.g.json {
-		if c := e.printJSON(map[string]any{"index": commit, "answers": answers}); c != 0 {
-			return c
-		}
+		return e.printJSONOr(map[string]any{"index": commit, "answers": answers}, rc)
 	}
 	return rc
 }
 
 func show(w io.Writer, a declindex.Answer, limit int) {
 	if limit == 0 {
-		limit = int(^uint(0) >> 1)
+		limit = math.MaxInt
 	}
 	d, r := a.Direct, a.Reach
 	fmt.Fprintf(w, "%s  (%s)  %s\n", a.Declaration, a.Kind, a.At)

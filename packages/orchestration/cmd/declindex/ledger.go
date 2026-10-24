@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/conceptgate"
@@ -110,7 +109,7 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &usageError{"LEDGER_DSN or --dsn-file is required for an operator ledger check"})
 	}
 	landed := e.getenv("LAND_COMMIT")
-	if landed != "" && !isCommitID(landed) {
+	if landed != "" && !declindex.IsObjectID(landed) {
 		return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 lowercase hexadecimal characters"})
 	}
 	if e.cfg.Repo == "" {
@@ -140,7 +139,7 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &unableError{fmt.Errorf("the index is at %q, not the tree's commit %s: refresh it after the landing first", indexCommit, head)})
 	}
 	if landed != "" {
-		covers, err := ledgerCommitCovers(ctx, e.cfg.Tree, landed, indexCommit)
+		covers, err := declindex.CommitIsAncestor(ctx, e.cfg.Tree, landed, indexCommit)
 		if err != nil {
 			return fail(e.stderr, &unableError{err})
 		}
@@ -220,18 +219,6 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		return 1
 	}
 	return 0
-}
-
-func ledgerCommitCovers(ctx context.Context, tree, landed, indexed string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", tree, "merge-base", "--is-ancestor", landed, indexed)
-	if err := cmd.Run(); err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) && exit.ExitCode() == 1 {
-			return false, nil
-		}
-		return false, fmt.Errorf("compare LAND_COMMIT %s with index commit %s: %w", landed, indexed, err)
-	}
-	return true, nil
 }
 
 func temporaryLedgerError(err error) error {

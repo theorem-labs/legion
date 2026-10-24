@@ -213,12 +213,9 @@ func (s *Store) RefreshAt(ctx context.Context, tree Tree, opt RefreshOptions, sy
 	}
 	defer unlock()
 	if sync != nil && opt.CheckLandedCoverage {
-		dirty, err := trackedChanges(ctx, tree.Source)
-		if err != nil {
+		// The one check that the tree is clean, before a landed sync (Sync) checks out another commit there.
+		if err := requireCleanTree(ctx, tree.Source); err != nil {
 			return RefreshStats{}, err
-		}
-		if dirty {
-			return RefreshStats{}, errors.New("the tree has tracked changes")
 		}
 		covering, err := s.indexCoversLandedCommit(ctx, tree.Source, opt.Commit, opt.Compiled != nil)
 		if err != nil {

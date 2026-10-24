@@ -141,11 +141,11 @@ func checkScratch(dir string) error {
 // writeInputs copies the inputs into the (checked, empty) scratch directory, creating each file new.
 func writeInputs(dir string, inputs []Input) error {
 	for _, in := range inputs {
-		clean := filepath.Clean(in.Name)
-		if in.Name == "" || filepath.IsAbs(in.Name) || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		// IsLocal refuses an empty, absolute or escaping name, and accepts "." (the scratch directory itself).
+		if !filepath.IsLocal(in.Name) || filepath.Clean(in.Name) == "." {
 			return fmt.Errorf("confine: the input name %q is not a path below the scratch directory", in.Name)
 		}
-		p := filepath.Join(dir, clean)
+		p := filepath.Join(dir, filepath.Clean(in.Name))
 		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 			return err
 		}

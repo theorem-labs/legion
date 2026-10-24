@@ -59,10 +59,7 @@ func cmdStates(ctx context.Context, e *env, args []string) int {
 		out[c] = rows
 	}
 	if e.g.json {
-		if c := e.printJSON(out); c != 0 {
-			return c
-		}
-		return rc
+		return e.printJSONOr(out, rc)
 	}
 	for _, c := range concepts {
 		decls := map[string]bool{}
@@ -92,13 +89,9 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 	out := map[string][]string{}
 	rc := 0
 	for _, q := range qs {
-		found, err := e.store.Resolve(ctx, q)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		if len(found) == 0 {
-			rc = fail(e.stderr, &declindex.NotFoundError{Name: q})
-			continue
+		found, code := e.resolve(ctx, q, &rc)
+		if code != 0 {
+			return code
 		}
 		for _, f := range found {
 			same, err := e.store.SameAtoms(ctx, f.Name)
@@ -109,10 +102,7 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 		}
 	}
 	if e.g.json {
-		if c := e.printJSON(out); c != 0 {
-			return c
-		}
-		return rc
+		return e.printJSONOr(out, rc)
 	}
 	for _, name := range slices.Sorted(maps.Keys(out)) {
 		same := out[name]

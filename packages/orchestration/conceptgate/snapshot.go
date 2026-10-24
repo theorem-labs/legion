@@ -24,49 +24,47 @@ func registryClean(ctx context.Context, tree, rel string) error {
 }
 
 // snapshotRegistry extracts the registry directory rel of tree, as committed at commit, into a new directory below
-// base, and gives the extracted registry directory and the cleanup that removes the snapshot. The gate and the
-// recheck read only this immutable snapshot, never the tree's mutable working directory.
-func snapshotRegistry(ctx context.Context, tree, commit, rel, base string) (string, func(), error) {
+// base, and gives the extracted registry directory; the caller removes base. The gate and the recheck read only
+// this immutable snapshot, never the tree's mutable working directory.
+func snapshotRegistry(ctx context.Context, tree, commit, rel, base string) (_ string, err error) {
 	root, err := os.MkdirTemp(base, "registry-snapshot-")
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
-	cleanup := func() { _ = os.RemoveAll(root) }
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(root)
+		}
+	}()
 	cmd := exec.CommandContext(ctx, "git", "-C", tree, "archive", "--format=tar", commit, "--", rel)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		cleanup()
-		return "", nil, err
+		return "", err
 	}
 	if err := cmd.Start(); err != nil {
-		cleanup()
-		return "", nil, err
+		return "", err
 	}
-	fail := func(err error) (string, func(), error) {
+	extracted := extractRegistryArchive(out, root, rel)
+	if extracted == nil {
+		_, extracted = io.Copy(io.Discard, out)
+	}
+	if extracted != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		cleanup()
-		return "", nil, err
-	}
-	if err := extractRegistryArchive(out, root, rel); err != nil {
-		return fail(err)
-	}
-	if _, err := io.Copy(io.Discard, out); err != nil {
-		return fail(err)
+		return "", extracted
 	}
 	if err := cmd.Wait(); err != nil {
-		cleanup()
-		return "", nil, err
+		return "", err
 	}
 	registry := filepath.Join(root, rel)
-	if info, err := os.Stat(registry); err != nil || !info.IsDir() {
-		cleanup()
-		if err != nil {
-			return "", nil, err
-		}
-		return "", nil, fmt.Errorf("the index commit has no registry directory %s", rel)
+	info, err := os.Stat(registry)
+	if err != nil {
+		return "", err
 	}
-	return registry, cleanup, nil
+	if !info.IsDir() {
+		return "", fmt.Errorf("the index commit has no registry directory %s", rel)
+	}
+	return registry, nil
 }
 
 // extractRegistryArchive writes the directories and regular files of a `git archive` tar of rel below root. An

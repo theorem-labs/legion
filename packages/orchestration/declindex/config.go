@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -111,8 +110,8 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("%s: roots are required: the first components of the project's module names", path)
 	}
 	if y.Registry != "" {
-		clean := filepath.Clean(y.Registry)
-		if filepath.IsAbs(y.Registry) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		// IsLocal accepts "." (the tree itself), which is no registry directory below it.
+		if !filepath.IsLocal(y.Registry) || filepath.Clean(y.Registry) == "." {
 			return Config{}, fmt.Errorf("%s: registry must be a non-empty relative path below the tree", path)
 		}
 	}
@@ -248,7 +247,7 @@ func canonicalStatePath(path string) (string, error) {
 
 func isInside(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	return err == nil && filepath.IsLocal(rel) && rel != "."
 }
 
 // ErrNoDB is returned when no index path is configured.

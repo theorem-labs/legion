@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -21,7 +20,9 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &usageError{"land-hash takes no arguments; it reads LAND_TREE, LAND_GIT_DIR, and LAND_NAMES"})
 	}
 	tree := strings.TrimSpace(e.getenv("LAND_TREE"))
-	if !validTreeID(tree) {
+	// LAND_TREE goes only to Git, which reads an object id in either case, so it may be uppercase; LAND_COMMIT is
+	// compared as text with the commits the index records, so it must be lowercase.
+	if !declindex.IsObjectID(strings.ToLower(tree)) {
 		return fail(e.stderr, &unableError{fmt.Errorf("LAND_TREE must be a 40-hex tree id")})
 	}
 	gitDir := strings.TrimSpace(e.getenv("LAND_GIT_DIR"))
@@ -51,14 +52,6 @@ func cmdLandHash(ctx context.Context, e *env, args []string) int {
 		fmt.Fprintf(e.stdout, "%s\t%s\t%s\n", answer.Name, answer.Hash, answer.Path)
 	}
 	return 0
-}
-
-func validTreeID(tree string) bool {
-	if len(tree) != 40 {
-		return false
-	}
-	_, err := hex.DecodeString(tree)
-	return err == nil
 }
 
 func landNames(getenv func(string) string) ([]string, error) {
