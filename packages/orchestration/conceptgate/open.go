@@ -20,8 +20,10 @@ type Options struct {
 	Librarian Librarian
 	// Log receives notes and the exporter's progress; nil discards them.
 	Log io.Writer
-	// SandboxAvailable is OpenGate's first check: whether this machine can build the sandbox at all. It starts no
-	// process and runs before any toolchain is looked up; nil is confine.Available.
+	// SandboxAvailable is OpenGate's first check, that this machine can build the sandbox at all (confine's
+	// kernel and architecture check). It starts no process, so a machine without the sandbox fails before any
+	// toolchain is looked up or exporter built; nil is confine.Available. It is not the authoritative check: Decide
+	// and Recheck run the toolchain in the sandbox (Gate.CheckSandbox) before they compile anything.
 	SandboxAvailable func() error
 }
 
@@ -32,8 +34,9 @@ func (o Options) log() io.Writer {
 	return o.Log
 }
 
-// afterRegistryStatus is a test hook: it runs after OpenGate's first check that the registry is clean.
-var afterRegistryStatus func()
+// beforeRegistryCheck is a test hook: it runs after OpenGate's snapshot, before its check that the registry has no
+// local changes.
+var beforeRegistryCheck func()
 
 // project is a configuration's tree, resolved through symlinks, and its registry: rel is the registry's
 // slash-separated path in the tree, and prefix the tree's path in its repository as refresh recorded it in the
@@ -97,11 +100,12 @@ func newGate(ctx context.Context, p project, index *declindex.Store, registry, w
 }
 
 // OpenGate builds the similarity gate of the project that cfg configures, after its preconditions: this machine
-// can build the sandbox (checked before any toolchain is looked up); the index is outside the tree, where the gate
-// opens it read-only, so that nothing the gate does can dirty the tree; the index is complete; the registry
-// resolves inside the tree; the tree's HEAD is the index's commit; and the registry has no local changes, before
-// and after the gate snapshots it as committed at that commit. The gate reads the registry only from that snapshot.
-// Close releases the index and removes the snapshot and the gate's work directory.
+// can build the sandbox (Options.SandboxAvailable, before any toolchain is looked up); the index is outside the
+// tree, where the gate opens it read-only, so that nothing the gate does can dirty the tree; the index is complete;
+// the registry resolves inside the tree; and the tree's HEAD is the index's commit. It then snapshots the registry
+// as committed at that commit, and the gate reads the registry only from that snapshot; and it checks, once, after
+// the snapshot, that the registry has no local changes, so that what the caller sees in its tree is what the gate
+// reads. Close releases the index and removes the snapshot and the gate's work directory.
 func OpenGate(ctx context.Context, cfg declindex.Config, opts Options) (_ *Gate, err error) {
 	available := opts.SandboxAvailable
 	if available == nil {
@@ -148,18 +152,15 @@ func OpenGate(ctx context.Context, cfg declindex.Config, opts Options) (_ *Gate,
 	if head != commit {
 		return nil, fmt.Errorf("the tree HEAD %s differs from the index commit %s", head, commit)
 	}
-	if err := registryClean(ctx, p.tree, p.rel); err != nil {
-		return nil, err
-	}
-	if afterRegistryStatus != nil {
-		afterRegistryStatus()
-	}
 	if work, err = os.MkdirTemp("", "declindex-gate-"); err != nil {
 		return nil, err
 	}
 	registry, err := snapshotRegistry(ctx, p.tree, commit, p.rel, work)
 	if err != nil {
 		return nil, err
+	}
+	if beforeRegistryCheck != nil {
+		beforeRegistryCheck()
 	}
 	if err := registryClean(ctx, p.tree, p.rel); err != nil {
 		return nil, err

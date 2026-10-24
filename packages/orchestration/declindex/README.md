@@ -42,7 +42,7 @@ An owner runs:
 declindex --config <cfg> gate --proposer <owner-id> [--accepted-by <owner-id>] PROPOSAL.json
 ```
 
-`PROPOSAL.json` has `id`, `concept` (`name`, `home`, `meaning`, and optional `extends`), and `source`, a Lean module that declares the concept. It carries no forms, and any `accepted_by` or `accepted_near` it carries is ignored. Before deciding, the gate requires the sandbox, an index at the tree's HEAD whose compiled part is of that commit, and a clean registry directory. Failure of any of those checks is exit 3 with a cause on stderr and no librarian request. The verdict's `defects` list the registry defects that the decision left out; the gate also prints them as notes.
+`PROPOSAL.json` has `id`, `concept` (`name`, `home`, `meaning`, and optional `extends`), and `source`, a Lean module that declares the concept. It carries no forms, and any `accepted_by` or `accepted_near` it carries is ignored. Before deciding, the gate requires the sandbox, an index at the tree's HEAD whose compiled part is of that commit, and a registry directory without local changes once it has taken its snapshot of the registry at that commit. Failure of any of those checks is exit 3 with a cause on stderr and no librarian request. The verdict's `defects` list the registry defects that the decision left out; the gate also prints them as notes.
 
 | Exit | Verdict | Owner action |
 | --- | --- | --- |
@@ -71,7 +71,7 @@ The gate applies three controls before it accepts a proposed source or a pending
 2. Lean's parser allow-list admits declarations and limited surrounding syntax, and refuses forms that execute during elaboration.
 3. `confine` runs checking, compilation, and export in a fresh Landlock and seccomp sandbox. It requires Landlock ABI 3 or later, allows writes only to fresh scratch directories, permits only the launched process, and blocks later `execve`, forks, sockets, mounts, namespace operations, and other privileged interfaces.
 
-Without that sandbox, the source is not compiled and the gate exits 3 (the recheck, 75). The sandbox controls are tested in containers by `e2e/sandbox-e2e.sh` ([e2e/README.md](e2e/README.md)), and by the gate's Lean tests where `DECLINDEX_SANDBOX_TEST=1` (a disposable container or CI runner).
+Without that sandbox, the source is not compiled and the gate exits 3 (the recheck, 75). The gate checks for it twice. First, before it looks up any toolchain or builds the exporter, it checks without starting a process that the kernel and architecture can build the sandbox. Then, before it compiles any source, it runs the toolchain's `lean --version` in the sandbox; that second check is the authoritative one, and the recheck runs it too. The sandbox controls are tested in containers by `e2e/sandbox-e2e.sh` ([e2e/README.md](e2e/README.md)), and by the gate's Lean tests where `DECLINDEX_SANDBOX_TEST=1` (a disposable container or CI runner).
 
 ## Landing interfaces
 

@@ -106,7 +106,7 @@ type Gate struct {
 	Librarian Librarian
 	// WorkDir holds the compiled proposals and librarian request files.
 	WorkDir string
-	// CheckSandbox is declindex.CheckSandbox, unless a test replaces it.
+	// CheckSandbox is declindex.CheckSandbox, unless a test replaces it: see checkSandbox.
 	CheckSandbox func(context.Context, declindex.Lean) error
 	// release closes what OpenGate opened for the gate (see Close).
 	release func()
@@ -308,7 +308,10 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	return v, nil
 }
 
-// checkSandbox is the one check that the sandbox runs the gate's toolchain, before any untrusted source compiles.
+// checkSandbox is the authoritative sandbox check, which Decide and Recheck run before any untrusted source
+// compiles: the gate's own toolchain runs `lean --version` in the sandbox. Decide and Recheck run it themselves,
+// because a Gate can be built without OpenGate. OpenGate's earlier check (Options.SandboxAvailable) starts no
+// process and only spares a machine without the sandbox the toolchain lookup and the exporter build.
 func (g *Gate) checkSandbox(ctx context.Context) error {
 	check := g.CheckSandbox
 	if check == nil {

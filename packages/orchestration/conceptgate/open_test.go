@@ -65,13 +65,13 @@ func openFixture(t *testing.T) (cfg declindex.Config, tree string) {
 	return cfg, tree
 }
 
-// A registry that changes while the gate is being opened, after its first check that the registry is clean, is
-// refused: the gate opens only over a registry that its snapshot matches.
+// A registry that changes while the gate is being opened, here after the gate began and before its check that the
+// registry is clean, is refused: the gate opens only over a registry that its snapshot matches.
 func TestGateRejectsRegistryMutationAfterInitialStatus(t *testing.T) {
 	cfg, tree := openFixture(t)
-	old := afterRegistryStatus
-	t.Cleanup(func() { afterRegistryStatus = old })
-	afterRegistryStatus = func() {
+	old := beforeRegistryCheck
+	t.Cleanup(func() { beforeRegistryCheck = old })
+	beforeRegistryCheck = func() {
 		if err := os.WriteFile(filepath.Join(tree, "registry", "mutated"), []byte("dirty"), 0o644); err != nil {
 			t.Fatal(err)
 		}
