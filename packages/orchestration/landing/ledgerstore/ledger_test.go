@@ -163,6 +163,23 @@ func TestDeclineBatchReturnsItsMembers(t *testing.T) {
 	}
 }
 
+// EndWithdraw marks the withdraw effect done, and a repeat succeeds, so the batch leaves the active list once its
+// admission ends.
+func TestEndWithdrawMarksTheEffectDoneOnce(t *testing.T) {
+	ctx := context.Background()
+	_, calls, store, _, _ := admittedBatch(t)
+	must(0, calls.BeginWithdraw(ctx, "r", "batch-1"))
+	for range 2 {
+		if err := calls.EndWithdraw(ctx, "r", "batch-1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	effects := must(store.BatchEffects(ctx, "r", "batch-1"))
+	if len(effects) != 1 || effects[0].State != ledger.EffectDone {
+		t.Fatalf("the batch's effects are %+v, want one done withdraw", effects)
+	}
+}
+
 // BeginWithdraw records the batch's withdraw effect, and a repeat records nothing more.
 func TestBeginWithdrawRecordsTheEffectOnce(t *testing.T) {
 	ctx := context.Background()

@@ -2,6 +2,7 @@ package ledgerstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/sjawhar/legion/orchestration/landing"
@@ -113,6 +114,21 @@ func (l *Ledger) DeclineBatch(ctx context.Context, batch *landing.Batch, reason 
 // BeginWithdraw records the batch's withdraw effect. A repeat records nothing more.
 func (l *Ledger) BeginWithdraw(ctx context.Context, repo, batch string) error {
 	if _, err := l.ledger.BeginWithdraw(ctx, repo, batch); err != nil {
+		return refusal(err)
+	}
+	return nil
+}
+
+// EndWithdraw records the batch's withdraw effect done. A repeat finds it done and succeeds.
+func (l *Ledger) EndWithdraw(ctx context.Context, repo, batch string) error {
+	_, err := l.ledger.BatchEffectDone(ctx, repo, batch, "withdraw/"+batch, ledger.DoneRequest{
+		Result: json.RawMessage(`{"outcome":"withdrawn"}`),
+	})
+	var refused *ledger.Refusal
+	if errors.As(err, &refused) && refused.Reason == ledger.ReasonEffectDone {
+		return nil
+	}
+	if err != nil {
 		return refusal(err)
 	}
 	return nil

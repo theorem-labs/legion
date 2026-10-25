@@ -34,6 +34,9 @@ type BatchLedger interface {
 	// BeginWithdraw records the withdraw effect of an admitted batch, so a crash during a withdraw is finished after
 	// the restart.
 	BeginWithdraw(ctx context.Context, repo, batch string) error
+	// EndWithdraw records the withdraw effect done, after GitHub removed and closed the pull request. A repeat is a
+	// success, so a restart that finds the effect already done finishes nothing twice.
+	EndWithdraw(ctx context.Context, repo, batch string) error
 	// ReadyMembers lists the repository's ready migrations, each as the member a batch freezes from it. A successor
 	// batch forms from them, so a returned member joins one only after its owner readies it again.
 	ReadyMembers(ctx context.Context, repo string) ([]Member, error)
