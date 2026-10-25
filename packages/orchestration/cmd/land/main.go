@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,9 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, output io.Writer) error {
+	if err := requireGit(ctx); err != nil {
+		return err
+	}
 	if len(args) == 0 {
 		return fmt.Errorf("usage: land <run|serve|status|blame>")
 	}
@@ -44,6 +48,51 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+// minimumGitMajor and minimumGitMinor are the oldest git the program runs on. Its merge-tree writes the tree of a
+// merge, which is how the program confirms an upstream sync's head.
+const (
+	minimumGitMajor = 2
+	minimumGitMinor = 38
+)
+
+// requireGit refuses a git older than 2.38 before any command reads a repository.
+func requireGit(ctx context.Context) error {
+	output, err := exec.CommandContext(ctx, "git", "--version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git --version: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	major, minor, err := gitVersion(string(output))
+	if err != nil {
+		return err
+	}
+	if major < minimumGitMajor || (major == minimumGitMajor && minor < minimumGitMinor) {
+		return fmt.Errorf("git %d.%d is too old: land needs git %d.%d or later, whose merge-tree writes the tree of a merge",
+			major, minor, minimumGitMajor, minimumGitMinor)
+	}
+	return nil
+}
+
+// gitVersion reads the major and minor version from the line `git --version` prints.
+func gitVersion(line string) (int, int, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 || fields[0] != "git" || fields[1] != "version" {
+		return 0, 0, fmt.Errorf("git --version printed %q, which names no version", strings.TrimSpace(line))
+	}
+	parts := strings.SplitN(fields[2], ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("git --version printed version %q, which has no major and minor part", fields[2])
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("git --version printed version %q: %w", fields[2], err)
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("git --version printed version %q: %w", fields[2], err)
+	}
+	return major, minor, nil
 }
 
 func runBatchCommand(ctx context.Context, command string, args []string, output io.Writer) error {
