@@ -355,7 +355,9 @@ jobs:
       # restored none of the test binaries' objects and none built for the race detector, and
       # compiled them all again on every run. This job keeps its own build and module cache, keyed
       # by the toolchain and every workspace manifest; a run whose manifests changed starts from the
-      # closest older cache and compiles only what differs.
+      # closest older cache and compiles only what differs. Only a push to main saves it (the last
+      # step), after testing everything: a pull request's cache is visible to that pull request
+      # alone, and main's is restored by every pull request, so one save per manifest set is enough.
       - id: go
         if: steps.scope.outputs.orchestration == 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -363,8 +365,9 @@ jobs:
           go-version-file: packages/daemon/go.mod
           cache: false
 
-      - if: steps.scope.outputs.orchestration == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - id: go-cache
+        if: steps.scope.outputs.orchestration == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/go/pkg/mod
@@ -448,3 +451,11 @@ jobs:
       - name: Stage 1 live proof
         if: steps.scope.outputs.other == 'true'
         run: bash scripts/e2e/stage1-skeleton.sh
+
+      - if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
