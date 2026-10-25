@@ -225,7 +225,7 @@ func ownersToCheck(ctx context.Context, q querier, names, modules []string) (map
 	if len(names) > 0 {
 		// The columns are COLLATE "C", so the names below n are those between n + "." and n + "/".
 		rows, err := q.Query(ctx, `
-			SELECT target, tmodule, owner, owner_module, by_closure FROM edges WHERE target = ANY($1)
+			SELECT target, tmodule, owner, owner_module, by_closure FROM edges WHERE target = ANY($1::text[])
 			UNION
 			SELECT e.target, e.tmodule, e.owner, e.owner_module, e.by_closure
 			  FROM unnest($1::text[]) AS n JOIN edges e ON e.target >= n || '.' AND e.target < n || '/'`, names)
