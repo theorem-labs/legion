@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -90,7 +91,7 @@ func candidate(ctx context.Context, repo, base string, members []Member, exclude
 			}
 			return Result{}, fmt.Errorf("merge member %q: %w", member.ID, err)
 		}
-		commit, err := git(ctx, repo, "commit-tree", mergedTree, "-p", result.Commit, "-p", head, "-m", "candidate merge")
+		commit, err := gitAs(ctx, repo, candidateIdentity, "commit-tree", mergedTree, "-p", result.Commit, "-p", head, "-m", "candidate merge")
 		if err != nil {
 			return Result{}, fmt.Errorf("commit member %q: %w", member.ID, err)
 		}
@@ -188,7 +189,23 @@ func gitLines(ctx context.Context, repo string, args ...string) ([]string, error
 }
 
 func git(ctx context.Context, repo string, args ...string) (string, error) {
+	return gitAs(ctx, repo, nil, args...)
+}
+
+// candidateIdentity is the author and committer of a candidate merge: the
+// landing program's own object, so it never depends on the git identity of
+// the host that builds it, which a build machine often lacks.
+var candidateIdentity = []string{
+	"GIT_AUTHOR_NAME=land", "GIT_AUTHOR_EMAIL=land@localhost",
+	"GIT_COMMITTER_NAME=land", "GIT_COMMITTER_EMAIL=land@localhost",
+}
+
+// gitAs runs git with environment added to the process's own.
+func gitAs(ctx context.Context, repo string, environment []string, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, "git", append([]string{"-C", repo}, args...)...)
+	if environment != nil {
+		command.Env = append(os.Environ(), environment...)
+	}
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
