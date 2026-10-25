@@ -21,9 +21,10 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
+// 18: 17 with edges_owner carrying what the reach walk reads, so that the walk reads the index alone.
 // 17: the Postgres schema of 15 with the graph checks' consts columns of main's 14 (binders, conclusion). 16 was
 // a head of this branch with another edges index, whose indexes must be rebuilt too.
-const SchemaVersion = "17"
+const SchemaVersion = "18"
 
 // schema is the index's tables. Every text column is COLLATE "C": the index's answers order and group names by
 // bytes, as Lean's own name order does, whatever collation the server's database was created with. The hashes,
@@ -55,11 +56,14 @@ CREATE INDEX uses_module ON uses (module);
 -- no declaration of the constant's names, so that a change of tmodule's closure can move the owner.
 CREATE TABLE edges (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, dst text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, stmt boolean NOT NULL, kind text COLLATE "C" NOT NULL, owner text COLLATE "C" NOT NULL, owner_module text COLLATE "C" NOT NULL, by_closure boolean NOT NULL);
 CREATE INDEX edges_module ON edges (module);
--- edges_owner is the index the reach walk reads: it visits a row for each edge out of its closure. It carries the
--- two names it is keyed by and no more: a btree row must stay under 2704 bytes, and a declaration's name has no
--- bound, so an index that also carried the user's name and module would refuse an edge of two long names that
--- this schema can hold (the longest edge of the copy's index takes 474 bytes for its four names).
-CREATE INDEX edges_owner ON edges (owner_module, owner);
+-- edges_owner is the index the reach walk reads: it visits a row for each edge out of its closure, and carries
+-- every column that walk reads, so the walk never touches the table (24 % of the reach of the most-used
+-- declaration of the copy's tree: 3.27 s to 2.63 s).
+-- One entry of it therefore holds four names and a kind, and a btree entry holds at most 2704 bytes. A tree
+-- whose edge would exceed that is refused as an index defect, which names it, before anything is written
+-- (NameTooLongError, indexEntryLimit): the longest edge of the copy's index holds 474 bytes of names, so the
+-- limit is about three times the longest name that tree has.
+CREATE INDEX edges_owner ON edges (owner_module, owner) INCLUDE (dst, module, stmt, kind);
 CREATE INDEX edges_target ON edges (target);
 CREATE INDEX edges_closure ON edges (tmodule) WHERE by_closure;
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated

@@ -263,6 +263,11 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, generation int64, 
 		st.Stale += r.results[i].Stale
 	}
 	st.Removed = len(r.gone)
+	// A name the index cannot hold in one entry of its indexes is a defect of the tree, named before the
+	// refresh writes anything (NameTooLongError), never a failure inside the database.
+	if err := checkReference(r.results, r.errs); err != nil {
+		return st, err
+	}
 	if err := s.writeTxFrom(ctx, generation, func(tx pgx.Tx) error {
 		if err := writeSources(ctx, tx, r.storedSources, r.sources); err != nil {
 			return err

@@ -72,6 +72,11 @@ func insertEdges(ctx context.Context, tx pgx.Tx, results []ModuleData, errs []er
 	rows := make([][]any, len(edges))
 	for i, e := range edges {
 		o := owned[declRef{e.tmodule, e.target}]
+		// A row that does not fit one entry of edges_owner is an index defect of the tree, named here, and
+		// never a failure inside the database (NameTooLongError).
+		if err := checkEdge(e.target, o.ref.module, o.ref.name, e.dst, e.module, e.kind); err != nil {
+			return err
+		}
 		rows[i] = []any{e.target, e.tmodule, e.dst, e.module, e.stmt, e.kind, o.ref.name, o.ref.module, o.byClosure}
 	}
 	_, err = tx.CopyFrom(ctx, pgx.Identifier{"edges"}, edgeColumns, pgx.CopyFromRows(rows))
@@ -198,6 +203,9 @@ func reresolveOwners(ctx context.Context, tx pgx.Tx, r reference, before indexBe
 		o := moved[c]
 		target[i], tmodule[i] = c.name, c.module
 		owner[i], ownerModule[i], byClosure[i] = o.ref.name, o.ref.module, o.byClosure
+	}
+	if err := checkMovedOwners(ctx, tx, target, tmodule, owner, ownerModule); err != nil {
+		return err
 	}
 	tag, err := tx.Exec(ctx, `UPDATE edges e SET owner = u.owner, owner_module = u.owner_module, by_closure = u.by_closure
 		FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::boolean[])

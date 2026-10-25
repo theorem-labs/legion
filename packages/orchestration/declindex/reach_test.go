@@ -3,6 +3,7 @@ package declindex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -105,12 +106,12 @@ func TestReachCountsAreTheSameWithAndWithoutWhy(t *testing.T) {
 	}
 }
 
-// Lean puts no bound on a declaration's name, and the index stores two names in one edge row: the user's and the
-// owner's. An index of the two names together holds both in one B-tree entry, which Postgres refuses past 2,704
-// bytes, so a refresh of a tree whose names are individually storable would fail with SQLSTATE 54000 and the
-// whole landing with it. The longest edge of the copy's index takes 474 bytes for its four names, so this is a
-// bound on what the index can hold, not on what it holds today.
-func TestARefreshStoresAnEdgeOfTwoNamesThatOneIndexEntryCouldNotHold(t *testing.T) {
+// Lean puts no bound on a declaration's name, and edges_owner holds four names in one B-tree entry, which
+// Postgres refuses past 2,704 bytes. A tree whose edge would exceed that is refused by name, as an index defect,
+// before the refresh writes anything, and never as a failure inside the database (SQLSTATE 54000), which would
+// stop a landing with no way to read what was wrong. The longest edge of the copy's index holds 474 bytes of
+// names, so the limit is about three times the longest name that tree has.
+func TestARefreshRefusesByNameAnEdgeThatOneIndexEntryCannotHold(t *testing.T) {
 	// Postgres compresses what it puts in an index, so a name of one letter repeated would fit however long it
 	// is. Lean's generated names are not of one letter: these are drawn from a fixed seed.
 	rng := rand.New(rand.NewPCG(20261025, 577))
@@ -130,10 +131,30 @@ func TestARefreshStoresAnEdgeOfTwoNamesThatOneIndexEntryCouldNotHold(t *testing.
 			uses: []leanUse{{owner, "A", owner}}},
 	)
 	s := openStore(t)
-	if _, err := s.Refresh(context.Background(), tree, RefreshOptions{Commit: "c0ffee"}); err != nil {
-		t.Fatalf("a refresh of two names of %d bytes: %v", len(owner), err)
+	_, err := s.Refresh(context.Background(), tree, RefreshOptions{Commit: "c0ffee"})
+	var defect *NameTooLongError
+	if !errors.As(err, &defect) {
+		t.Fatalf("a refresh of an edge of two names of %d bytes: %v; want an index defect that names them", len(owner), err)
 	}
-	got, err := answerFor(t, s, owner, AnswerOptions{})
+	for _, want := range []string{owner[:20], "shorten"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not hold %q: %v", want, err)
+		}
+	}
+	// The index is untouched: the refusal comes before the write.
+	if version, err := s.Meta(context.Background(), "commit"); err != nil || version != "" {
+		t.Errorf("the index after the refusal is at %q, %v; want nothing written", version, err)
+	}
+	// An edge of names the entry holds is stored and answered as ever.
+	short := leanTree(t, t.TempDir(),
+		leanModule{name: "A", decls: []string{"A.o"}, src: "def A.o : Prop := True\n"},
+		leanModule{name: "B", imports: []string{"A"}, decls: []string{"B.u"},
+			src: "theorem B.u (h : A.o) : True := trivial\n", uses: []leanUse{{"A.o", "A", "A.o"}}},
+	)
+	if _, err := s.Refresh(context.Background(), short, RefreshOptions{Commit: "c0ffee"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := answerFor(t, s, "A.o", AnswerOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
