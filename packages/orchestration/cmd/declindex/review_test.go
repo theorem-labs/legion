@@ -41,10 +41,7 @@ func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 	dsn := testpg.Database(t, "declindex_noschema")
 	config := fixture(t)
 	body, _ := os.ReadFile(config)
-	body = append(body, []byte("repo: r\ncontracts:\n  paths: [\"**/*.lean\"]\n  kinds: [def]\n")...)
-	if err := os.WriteFile(config, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body)+"repo: r\ncontracts:\n  paths: [\"**/*.lean\"]\n  kinds: [def]\n")
 	// The ledger compares the index's commit with the tree's, so the tree is a Git work tree.
 	tree := filepath.Join(filepath.Dir(config), "tree")
 	git(t, tree, "init", "-q")
@@ -54,7 +51,7 @@ func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 		t.Fatalf("refresh: %+v", r)
 	}
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", config, "ledger"}, func(k string) string {
+	code := run(context.Background(), withIndexDSN([]string{"--config", config, "ledger"}), func(k string) string {
 		if k == "LEDGER_DSN" {
 			return dsn
 		}
@@ -94,7 +91,7 @@ func TestLandHashRefusesADeclarationWhoseSourceIsNewerThanItsBuild(t *testing.T)
 	j, _ := json.Marshal([]string{"Gold.frame_lo"})
 	env := map[string]string{"LAND_TREE": git(t, tree, "rev-parse", "HEAD^{tree}"), "LAND_NAMES": string(j)}
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", config, "land-hash"}, func(k string) string { return env[k] }, &out, &errOut)
+	code := run(context.Background(), withIndexDSN([]string{"--config", config, "land-hash"}), func(k string) string { return env[k] }, &out, &errOut)
 	if code != 3 || out.Len() != 0 {
 		t.Fatalf("land-hash of a stale declaration: exit %d, %q %q", code, out.String(), errOut.String())
 	}
@@ -105,10 +102,7 @@ func TestLandHashRefusesADeclarationWhoseSourceIsNewerThanItsBuild(t *testing.T)
 func TestAModuleNewerThanItsBuildStopsQueriesAndTheLedger(t *testing.T) {
 	config := fixture(t)
 	body, _ := os.ReadFile(config)
-	body = append(body, []byte("repo: r\ncontracts:\n  paths: [\"**/*.lean\"]\n  kinds: [def]\n")...)
-	if err := os.WriteFile(config, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body)+"repo: r\ncontracts:\n  paths: [\"**/*.lean\"]\n  kinds: [def]\n")
 	src := filepath.Join(filepath.Dir(config), "tree", "Golden.lean")
 	data, _ := os.ReadFile(src)
 	if err := os.WriteFile(src, append([]byte("-- edited after the build\n"), data...), 0o644); err != nil {
@@ -121,7 +115,7 @@ func TestAModuleNewerThanItsBuildStopsQueriesAndTheLedger(t *testing.T) {
 		t.Fatalf("where: %+v", r)
 	}
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", config, "ledger"}, func(k string) string {
+	code := run(context.Background(), withIndexDSN([]string{"--config", config, "ledger"}), func(k string) string {
 		if k == "LEDGER_DSN" {
 			return "postgres://nobody@127.0.0.1:1/none"
 		}
@@ -151,10 +145,7 @@ func TestGateStartsNoLeanWithoutASandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(config)
-	body = append(body, []byte("registry: registry.yaml\n")...)
-	if err := os.WriteFile(config, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body)+"registry: registry.yaml\n")
 	proposal := filepath.Join(dir, "proposal.json")
 	p := `{"id":"p1","concept":{"name":"Fresh","home":"New.lean","meaning":"A fresh concept."},` +
 		`"source":"def Fresh (x : Nat) : Prop := x < 3\n"}`
