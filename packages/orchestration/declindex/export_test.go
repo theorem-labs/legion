@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -166,6 +167,22 @@ func TestExporterExportsNoMatcher(t *testing.T) {
 	for _, m := range []string{"Fx.pickA.match_1", "Fx.pickB.match_1"} {
 		if _, ok := consts[m]; ok {
 			t.Errorf("the matcher %s was exported as a declaration", m)
+		}
+	}
+}
+
+// A toolchain process takes the thread count of the build that runs it (LEAN_NUM_THREADS), so that many of them
+// together keep to the cores that build was given; nothing else of the caller's environment reaches it.
+func TestLeanEnvPassesTheThreadCount(t *testing.T) {
+	l := Lean{Prefix: t.TempDir()}
+	t.Setenv("LEAN_NUM_THREADS", "3")
+	if env := l.env(nil, t.TempDir()); !slices.Contains(env, "LEAN_NUM_THREADS=3") {
+		t.Errorf("env with LEAN_NUM_THREADS=3 set = %v; want it among them", env)
+	}
+	t.Setenv("LEAN_NUM_THREADS", "")
+	for _, v := range l.env(nil, t.TempDir()) {
+		if strings.HasPrefix(v, "LEAN_NUM_THREADS=") {
+			t.Errorf("env with LEAN_NUM_THREADS unset gave %q", v)
 		}
 	}
 }
