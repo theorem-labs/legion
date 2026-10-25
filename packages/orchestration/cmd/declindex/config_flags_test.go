@@ -110,7 +110,10 @@ func TestTheIndexAndStateFlagsOverrideTheConfigurationKeys(t *testing.T) {
 		t.Errorf("--state gave %q, want it resolved against the working directory", cfg.State)
 	}
 	// --state also moves the file whose lock guards the tree, which lives in the state directory.
-	got := cfg.Target()
+	got, err := cfg.Target()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.HasSuffix(got.TreeLock, string(filepath.Separator)+filepath.Join("elsewhere", "tree.lock")) {
 		t.Errorf("Target().TreeLock = %q, want tree.lock in the --state directory", got.TreeLock)
 	}

@@ -220,7 +220,10 @@ func indexDSN(file string, getenv func(string) string) (string, error) {
 // target is the index a command opens. A command that opens the index without a schema name or a connection
 // string is a usage error, as a missing db: was before it (P-1).
 func (e *env) target() (declindex.Target, error) {
-	t := e.cfg.Target()
+	t, err := e.cfg.Target()
+	if err != nil {
+		return declindex.Target{}, &usageError{err.Error()}
+	}
 	switch {
 	case t.Index == "":
 		return t, &usageError{"index: is required: the index is a schema of a Postgres database (or pass --index NAME)"}

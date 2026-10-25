@@ -163,12 +163,16 @@ func (c Config) GateRegistryDir() (string, error) {
 // whose lock guards the indexed tree on this machine. The lock file is in the state directory, which is outside
 // the tree; a configuration whose state cannot be resolved names no lock, and a command that writes the tree
 // resolves the state anyway (StateDir).
-func (c Config) Target() Target {
+func (c Config) Target() (Target, error) {
 	t := Target{DSN: c.DSN, Index: c.Index, Reader: c.Reader}
-	if state, err := c.StateDir(); err == nil {
-		t.TreeLock = filepath.Join(state, "tree.lock")
+	state, err := c.StateDir()
+	if err != nil {
+		// A state directory this configuration cannot resolve is an error, not a reason to guard the tree
+		// with nothing: a refresh under it would check out and build while a gate reads the tree.
+		return Target{}, err
 	}
-	return t
+	t.TreeLock = filepath.Join(state, "tree.lock")
+	return t, nil
 }
 
 // StateDir resolves the local directory that holds this index's exporter build and forms module: the configured
@@ -270,7 +274,10 @@ var ErrDBRemoved = errors.New("db: was removed: the index is a Postgres schema; 
 // besides the index. A program that only reads the index (graph checks) opens it through this one call, and needs
 // no knowledge of where or how the index is kept.
 func OpenReadOnlyConfig(ctx context.Context, c Config, scope ReadScope) (*Store, error) {
-	t := c.Target()
+	t, err := c.Target()
+	if err != nil {
+		return nil, err
+	}
 	switch {
 	case t.Index == "":
 		return nil, errors.New("index: is required: the index is a schema of a Postgres database")

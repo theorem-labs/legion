@@ -65,7 +65,11 @@ func invokeLedger(t *testing.T, config, dsn string, landCommit string) result {
 func declarationForLedger(t *testing.T, config, name string) declindex.Found {
 	t.Helper()
 	cfg := indexConfig(t, config)
-	s, err := declindex.Open(context.Background(), cfg.Target())
+	tgt, err := cfg.Target()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := declindex.Open(context.Background(), tgt)
 	if err != nil {
 		t.Fatal(err)
 	}

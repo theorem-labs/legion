@@ -112,7 +112,11 @@ func TestConfigReadsTheIndexItsStateAndItsReaderRole(t *testing.T) {
 	// The target names the file whose lock guards the tree, in the state directory, outside the tree.
 	want := Target{DSN: c.DSN, Index: "machcsl", Reader: "declindex_ro",
 		TreeLock: filepath.Join(resolved(t, filepath.Dir(config)), "state", "tree.lock")}
-	if got := c.Target(); got != want {
+	got, err := c.Target()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
 		t.Fatalf("Target() = %+v, want %+v", got, want)
 	}
 	state, err := c.StateDir()
@@ -153,6 +157,19 @@ func TestConfigKeepsAnIndexNameThatIsNoSchemaNameForTheCommandToRefuse(t *testin
 	}
 	if err := ValidIndexName(c.Index); err == nil {
 		t.Fatal("ValidIndexName accepted the name the command would open")
+	}
+}
+
+// A configuration whose state directory cannot be resolved names no file to lock the tree with. Target refuses
+// it rather than giving a target that guards nothing: a refresh under such a configuration would check out and
+// build the tree while a gate reads it.
+func TestTargetRefusesAConfigurationWhoseStateCannotBeResolved(t *testing.T) {
+	c, err := LoadConfig(writeConfig(t, "tree: ../tree\nroots: [A]\nindex: idx\nstate: ../tree/inside\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Target(); err == nil {
+		t.Fatal("a state directory inside the tree gave a target")
 	}
 }
 

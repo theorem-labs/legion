@@ -96,7 +96,11 @@ func TestReadersOfTheCompiledPartRefuseAnIndexBetweenItsTwoParts(t *testing.T) {
 	second := git(t, tree, "rev-parse", "HEAD")
 	// The refresh of the second commit writes its reference part and stops before its compiled part.
 	cfg := indexConfig(t, config)
-	s, err := declindex.Open(ctx, cfg.Target())
+	tgt, err := cfg.Target()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := declindex.Open(ctx, tgt)
 	if err != nil {
 		t.Fatal(err)
 	}

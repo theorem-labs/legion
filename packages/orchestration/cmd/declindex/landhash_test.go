@@ -392,7 +392,11 @@ func TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas(t *testing.T) {
 		t.Fatalf("refresh: %+v", r)
 	}
 	cfg := indexConfig(t, config)
-	store, err := declindex.OpenReadOnly(context.Background(), cfg.Target(), declindex.IndexOnly)
+	target, err := cfg.Target()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := declindex.OpenReadOnly(context.Background(), target, declindex.IndexOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -561,7 +565,11 @@ func TestLandHashRefusesAnIndexWithoutGitSources(t *testing.T) {
 func TestLandHashReadsOneSnapshotWhileRefreshWaits(t *testing.T) {
 	config, tree, baseTree := landBase(t)
 	cfg := indexConfig(t, config)
-	store, err := declindex.Open(context.Background(), cfg.Target())
+	tgt, err := cfg.Target()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := declindex.Open(context.Background(), tgt)
 	if err != nil {
 		t.Fatal(err)
 	}

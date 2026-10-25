@@ -303,3 +303,103 @@ func TestARefreshRefusesToWriteAPlanThatAnotherRefreshOutdated(t *testing.T) {
 		t.Errorf("the index's commit is %q, %v; want the one the refresh that wrote it recorded", commit, err)
 	}
 }
+
+// The compiled step plans its write from the modules the reference part read, so a refresh that another refresh
+// outdated while its exporter ran must not write its compiled part either: it would leave the index's reference
+// commit and its compiled commit of two different refreshes, which every compiled reader then refuses.
+func TestARefreshRefusesToWriteACompiledPartThatAnotherRefreshOutdated(t *testing.T) {
+	ctx := context.Background()
+	tree, co := compiledTree(t)
+	first := indexTarget(t)
+	second := first
+	second.TreeLock = filepath.Join(t.TempDir(), "tree.lock") // another machine's lock of its own copy
+	a, b := openAt(t, first), openAt(t, second)
+	if _, err := a.Refresh(ctx, tree, RefreshOptions{Commit: "base", Compiled: compiledWith(co)}); err != nil {
+		t.Fatal(err)
+	}
+	// B refreshes while A's exporter runs, after A's reference part has committed.
+	var bErr error
+	compiled := func(context.Context) (*CompiledOptions, error) {
+		_, bErr = b.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: compiledWith(co)})
+		return co, nil
+	}
+	_, err := a.Refresh(ctx, tree, RefreshOptions{Commit: "three", Compiled: compiled})
+	if bErr != nil {
+		t.Fatalf("the second refresh: %v", bErr)
+	}
+	var temp *TempError
+	if !errors.As(err, &temp) {
+		t.Fatalf("a refresh outdated before its compiled step: %v; want a retry", err)
+	}
+}
+
+// A landing hook decides whether the index already covers its commit before it fetches and builds. A slower
+// landing of an earlier commit must not publish it after a later landing has published its own: the index would
+// go backwards while both hooks reported success.
+func TestASlowLandingDoesNotOverwriteALaterOne(t *testing.T) {
+	ctx := context.Background()
+	first := indexTarget(t)
+	second := first
+	second.TreeLock = filepath.Join(t.TempDir(), "tree.lock")
+	a, b := openAt(t, first), openAt(t, second)
+	tree := goldenTree(t)
+	gitIn(t, tree.Source, "init", "-q")
+	gitIn(t, tree.Source, "add", "-A")
+	gitIn(t, tree.Source, "commit", "-q", "-m", "base")
+	if _, err := a.Refresh(ctx, tree, RefreshOptions{Commit: "c0"}); err != nil {
+		t.Fatal(err)
+	}
+	// A lands c1: it decides that c0 does not cover c1, and then its fetch and build are slow. B lands c2 in
+	// that time and finishes.
+	var bErr error
+	landed := func(context.Context) error {
+		_, bErr = b.Refresh(ctx, tree, RefreshOptions{Commit: "c2", Landed: func(context.Context) error { return nil }})
+		return nil
+	}
+	_, err := a.Refresh(ctx, tree, RefreshOptions{Commit: "c1", Landed: landed})
+	if bErr != nil {
+		t.Fatalf("the later landing: %v", bErr)
+	}
+	var temp *TempError
+	if !errors.As(err, &temp) {
+		t.Errorf("the slower landing of c1: %v; want a retry", err)
+	}
+	if commit, err := a.Meta(ctx, "commit"); err != nil || commit != "c2" {
+		t.Errorf("the index is at %q, %v; want the later landing's commit", commit, err)
+	}
+}
+
+// A landing hook skips its refresh when the index already covers its commit. An index that owes a compiled part
+// is not covered, whatever its two commit markers say: every compiled reader refuses it, so a landing that
+// skipped would report success while the index states no fact, run after run.
+func TestALandingDoesNotSkipAnIndexThatOwesACompiledPart(t *testing.T) {
+	ctx := context.Background()
+	tree, co := compiledTree(t)
+	gitIn(t, tree.Source, "init", "-q")
+	gitIn(t, tree.Source, "add", "-A")
+	gitIn(t, tree.Source, "commit", "-q", "-m", "base")
+	s := openStore(t)
+	const commit = "c0ffee"
+	ok := compiledWith(co)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: commit, Compiled: ok}); err != nil {
+		t.Fatal(err)
+	}
+	// A refresh of the same commit whose exporter fails: the index keeps its rows and owes a compiled part.
+	failing := func(context.Context) (*CompiledOptions, error) { return nil, errors.New("no toolchain now") }
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: commit, Compiled: failing}); err == nil {
+		t.Fatal("a refresh whose compiled step failed reported no error")
+	}
+	if _, err := s.CompiledCommit(ctx, false); err == nil {
+		t.Fatal("the index was accepted after its compiled step failed")
+	}
+	_, err := s.Refresh(ctx, tree, RefreshOptions{Commit: commit, Compiled: ok, Landed: func(context.Context) error { return nil }})
+	if errors.Is(err, ErrAlreadyPast) {
+		t.Fatal("a landing skipped an index that owes a compiled part")
+	}
+	if err != nil {
+		t.Fatalf("the landing refresh: %v", err)
+	}
+	if _, err := s.CompiledCommit(ctx, false); err != nil {
+		t.Errorf("the index after the landing refresh: %v", err)
+	}
+}

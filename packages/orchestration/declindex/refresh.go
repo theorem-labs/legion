@@ -215,6 +215,13 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 			return RefreshStats{}, err
 		}
 	}
+	// What the index held before this refresh read anything of it: the coverage check below, the reads of the
+	// tree and the reads of the index all rest on this state, and no lock of a pooled route can hold it, so
+	// every write of this refresh refuses when another writer has moved it since (writeTxFrom).
+	generation, err := s.generation(ctx)
+	if err != nil {
+		return RefreshStats{}, err
+	}
 	if opt.Landed != nil {
 		// The one check that the tree is clean, before the landed sync checks out another commit there.
 		if err := requireCleanTree(ctx, tree.Source); err != nil {
@@ -232,20 +239,14 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 			return RefreshStats{}, err
 		}
 	}
-	return s.refreshLocked(ctx, tree, opt)
+	return s.refreshLocked(ctx, tree, generation, opt)
 }
 
-// refreshLocked is Refresh's body. Its caller holds the index's lock; it reads the tree first, and then writes the
-// index in one transaction on the connection that holds the lock.
-func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
+// refreshLocked is Refresh's body. Its caller holds the tree's lock and gives the index's generation as it was
+// before this refresh read anything; it reads the tree, and then writes the index.
+func (s *Store) refreshLocked(ctx context.Context, tree Tree, generation int64, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	st := RefreshStats{WithoutForms: []FormsClash{}}
-	// What the index held before this refresh read it: its write refuses if another refresh has written since,
-	// because what it writes rests on these reads, which no lock of a pooled route can hold (writeTxFrom).
-	generation, err := s.generation(ctx)
-	if err != nil {
-		return st, err
-	}
 	r, err := s.readReference(ctx, tree, opt.jobs())
 	if err != nil {
 		return st, err
@@ -297,7 +298,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		if err != nil {
 			return st, err
 		}
-		if st.Exported, st.Rematched, err = s.refreshCompiled(ctx, tree, co, r.files, opt.Commit, opt.Log); err != nil {
+		if st.Exported, st.Rematched, err = s.refreshCompiled(ctx, tree, co, r.files, opt.Commit, generation+1, opt.Log); err != nil {
 			return st, err
 		}
 		if st.WithoutForms, err = s.WithoutForms(ctx); err != nil {

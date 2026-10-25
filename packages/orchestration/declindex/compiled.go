@@ -143,14 +143,12 @@ func ClashModules(clashes []FormsClash) int {
 // the build of a module in the forms' import closure changed), then the statements that a changed definition
 // reaches, since a definition's facts pass to every statement that applies it. It records commit as the commit
 // whose compiled part the index holds.
-func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOptions, files []moduleFile, commit string, log io.Writer) (int, int, error) {
+// refreshCompiled reads the compiled part of the tree and writes it. generation is what the index held before
+// this refresh read anything of it: this step plans its write from the modules its reference part read and from
+// what it reads here, so its write refuses when another writer has moved the index since (writeTxFrom). Its own
+// reference write raised the generation by one, which is what this step passes on.
+func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOptions, files []moduleFile, commit string, generation int64, log io.Writer) (int, int, error) {
 	t0 := time.Now()
-	// As the reference part does: what this step reads (the stored modules, the hashes before, the clashes) is
-	// read before its write takes the index's lock, so its write refuses if another refresh wrote since.
-	generation, err := s.generation(ctx)
-	if err != nil {
-		return 0, 0, err
-	}
 	x, m, src, err := co.prepare(ctx, tree.Roots)
 	if err != nil {
 		return 0, 0, err

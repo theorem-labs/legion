@@ -117,11 +117,17 @@ func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string
 		return "", nil
 	}
 	if compiled {
+		// The same rule the readers use (CompiledCommit): an index that owes a compiled part has none that
+		// counts, however its markers compare, so this landing is not covered and the refresh runs.
+		owed, err := s.Meta(ctx, "compiled_owed")
+		if err != nil {
+			return "", err
+		}
 		at, err := s.Meta(ctx, "compiled_commit")
 		if err != nil {
 			return "", err
 		}
-		if at != indexed {
+		if owed == "1" || at != indexed {
 			return "", nil
 		}
 	}
