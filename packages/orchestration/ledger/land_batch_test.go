@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -284,5 +285,97 @@ func TestLandBatchReplaysTheSameMergedCommit(t *testing.T) {
 	defer restarted.Close()
 	if loaded := must(restarted.LoadBatch(ctx, "r", "batch-1")); !reflect.DeepEqual(loaded, landed) {
 		t.Fatalf("after a restart the batch is %+v, want %+v", loaded, landed)
+	}
+}
+
+// waitsBehind runs first while a held connection keeps the repository's event lock, which every call takes after its
+// row locks, so first stops while it holds them. It then starts second, asserts that second waits on a lock instead
+// of returning, releases the event lock, and returns both results.
+func waitsBehind(t *testing.T, dsn string, first, second func(*ledger.Store) error) (firstErr, secondErr error) {
+	t.Helper()
+	ctx := context.Background()
+	racers := openStoreWithPool(t, dsn, "landing_lock_order", 2)
+	holder := must(pgx.Connect(ctx, dsn))
+	defer holder.Close(ctx)
+	watcher := must(pgx.Connect(ctx, dsn))
+	defer watcher.Close(ctx)
+	must(holder.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended('r', 0))`))
+	firstDone, secondDone := make(chan struct{}), make(chan struct{})
+	go func() { defer close(firstDone); firstErr = first(racers) }()
+	waitForBlockedConnections(t, watcher, 1)
+	go func() { defer close(secondDone); secondErr = second(racers) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for blocked := int64(0); blocked < 2; {
+		select {
+		case <-secondDone:
+			t.Fatalf("the second call returned while the first held its row locks: %v", secondErr)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if err := watcher.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the second call neither waited on a lock nor returned")
+		}
+	}
+	must(holder.Exec(ctx, `SELECT pg_advisory_unlock(hashtextextended('r', 0))`))
+	<-firstDone
+	<-secondDone
+	return firstErr, secondErr
+}
+
+// LandBatch and ResolveBatch take the repository row FOR UPDATE, so a registration of a name that an admitted member
+// reads, started during the landing, waits for the landing's release and then registers. Under FOR SHARE the fence
+// that the landing is about to lift would refuse it at once with batch_admitted.
+func TestRegistrationDuringALandingWaitsAndRegisters(t *testing.T) {
+	for _, call := range []string{"land", "resolve"} {
+		t.Run(call, func(t *testing.T) {
+			ctx := context.Background()
+			s, dsn := newStoreDSN(t)
+			member := readyMember(t, s, "M-1", "alice", "a.lean", map[string]string{"X": "x1"}, nil)
+			createBatch(t, s, "batch-1", batchRecord("checked"))
+			admitted := must(s.AdmitBatch(ctx, admitRequest("batch-1", 1, member)))
+			landErr, registerErr := waitsBehind(t, dsn, func(r *ledger.Store) error {
+				var err error
+				if call == "resolve" {
+					_, err = r.ResolveBatch(ctx, "r", "batch-1", "merged-1")
+				} else {
+					_, err = r.LandBatch(ctx, landBatchRequest("batch-1", admitted.RecordVersion, "merged-1"))
+				}
+				return err
+			}, func(r *ledger.Store) error {
+				_, err := r.RegisterContract(ctx, "r", "X", "bob", "x9", false)
+				return err
+			})
+			if landErr != nil || registerErr != nil {
+				t.Fatalf("landing %v, registration %v", landErr, registerErr)
+			}
+			if c := must(s.Contract(ctx, "r", "X")); c.Owner != "bob" || c.Version != 1 {
+				t.Fatalf("contract X = %+v", c)
+			}
+		})
+	}
+}
+
+// LandBatch writes the caller's record, so it can leave a batch landed_unrecorded: it then enqueues landing:<id> for
+// the record's escalate_to in its own transaction, and a retry replays without enqueuing it again.
+func TestLandBatchLandedUnrecordedEnqueuesItsEscalation(t *testing.T) {
+	ctx := context.Background()
+	f := admittedLanding(t)
+	request := landBatchRequest("batch-1", f.admitted.RecordVersion, "merged-1")
+	request.Record = unrecordedRecord(escalationOwner)
+	landed := must(f.s.LandBatch(ctx, request))
+	if landed.Phase != ledger.PhaseLandedUnrecorded {
+		t.Fatalf("landed batch = %+v", landed)
+	}
+	if item := must(f.s.Item(ctx, "r", "landing:batch-1")); item.Owner != escalationOwner || item.State != "open" {
+		t.Fatalf("escalation item = %+v", item)
+	}
+	if replayed := must(f.s.LandBatch(ctx, request)); !reflect.DeepEqual(replayed, landed) {
+		t.Fatalf("the retry returned %+v, want the stored %+v", replayed, landed)
+	}
+	if got := eventKinds(t, f.s, "landing:batch-1"); !slices.Equal(got, []string{"item.enqueued"}) {
+		t.Fatalf("escalation item events = %q, want one item.enqueued", got)
 	}
 }

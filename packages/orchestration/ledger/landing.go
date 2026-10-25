@@ -96,20 +96,19 @@ func (s *Store) ResolveBatch(ctx context.Context, repo, id, mergedCommit string)
 type batchMember struct {
 	migration  string
 	generation int64
-	head       string
 	readyEvent int64
 }
 
 // admittedMembers reads the members that batch id admits, in position order.
 func admittedMembers(ctx context.Context, tx pgx.Tx, repo, id string) ([]batchMember, error) {
-	rows, err := tx.Query(ctx, `SELECT migration, generation, head, ready_event FROM batch_members
+	rows, err := tx.Query(ctx, `SELECT migration, generation, ready_event FROM batch_members
 		WHERE repo = $1 AND batch = $2 AND admitted ORDER BY position`, repo, id)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (batchMember, error) {
 		var m batchMember
-		err := row.Scan(&m.migration, &m.generation, &m.head, &m.readyEvent)
+		err := row.Scan(&m.migration, &m.generation, &m.readyEvent)
 		return m, err
 	})
 }

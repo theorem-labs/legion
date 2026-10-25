@@ -201,3 +201,47 @@ func TestDeclinedBatchIsFollowedByItsSuccessorAfterARestart(t *testing.T) {
 		t.Fatalf("active batches with the successor = %q", active)
 	}
 }
+
+// DeclineBatch takes the repository row FOR UPDATE, so a registration of a name that an admitted member reads, started
+// during the decline, waits for the decline's release and then registers. Under FOR SHARE the fence that the decline
+// is about to lift would refuse it at once with batch_admitted. (A takeover of a returned member would not show it:
+// it also waits on the member's own row lock.)
+func TestRegistrationDuringADeclineWaitsAndRegisters(t *testing.T) {
+	ctx := context.Background()
+	s, dsn := newStoreDSN(t)
+	member := readyMember(t, s, "M-1", "alice", "a.lean", map[string]string{"X": "x1"}, nil)
+	createBatch(t, s, "batch-1", batchRecord("checked"))
+	admitted := must(s.AdmitBatch(ctx, admitRequest("batch-1", 1, member)))
+	declineErr, registerErr := waitsBehind(t, dsn, func(r *ledger.Store) error {
+		_, err := r.DeclineBatch(ctx, declineRequest("batch-1", admitted.RecordVersion, "batch-2"))
+		return err
+	}, func(r *ledger.Store) error {
+		_, err := r.RegisterContract(ctx, "r", "X", "bob", "x9", false)
+		return err
+	})
+	if declineErr != nil || registerErr != nil {
+		t.Fatalf("decline %v, registration %v", declineErr, registerErr)
+	}
+	if c := must(s.Contract(ctx, "r", "X")); c.Owner != "bob" || c.Version != 1 {
+		t.Fatalf("contract X = %+v", c)
+	}
+}
+
+// DeclineBatch writes the caller's record, so it can leave a batch landed_unrecorded: it then enqueues landing:<id>
+// for the record's escalate_to in its own transaction, and a retry replays without enqueuing it again.
+func TestDeclineBatchLandedUnrecordedEnqueuesItsEscalation(t *testing.T) {
+	ctx := context.Background()
+	f := admittedDecline(t)
+	request := declineRequest("batch-1", f.admitted.RecordVersion, "batch-2")
+	request.Record = unrecordedRecord(escalationOwner)
+	declined := must(f.s.DeclineBatch(ctx, request))
+	if item := must(f.s.Item(ctx, "r", "landing:batch-1")); item.Owner != escalationOwner || item.State != "open" {
+		t.Fatalf("escalation item = %+v", item)
+	}
+	if replayed := must(f.s.DeclineBatch(ctx, request)); !reflect.DeepEqual(replayed, declined) {
+		t.Fatalf("the retry returned %+v, want the stored %+v", replayed, declined)
+	}
+	if got := eventKinds(t, f.s, "landing:batch-1"); !slices.Equal(got, []string{"item.enqueued"}) {
+		t.Fatalf("escalation item events = %q, want one item.enqueued", got)
+	}
+}
