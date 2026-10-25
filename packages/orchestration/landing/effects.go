@@ -241,11 +241,23 @@ func (r Runner) closeEffects(ctx context.Context, batch *Batch, commit string) e
 		return fmt.Errorf("%w: %s", ErrEffectsPending, strings.Join(pending, ", "))
 	}
 	if r.Trees != nil && commit != "" {
-		if err := r.Trees.RemoveLandedTree(ctx, commit); err != nil {
+		// The clone the batch's hooks were frozen with, not the configured one: the worktree was added there.
+		if err := r.Trees.RemoveLandedTree(ctx, frozenGitDir(*batch), commit); err != nil {
 			return fmt.Errorf("remove the landed tree of %q: %w", commit, err)
 		}
 	}
 	return nil
+}
+
+// frozenGitDir is the clone the batch's hooks were frozen with, from the first hook definition it holds. An empty
+// result leaves the executor on its configured clone, which is what a batch with no hook wants.
+func frozenGitDir(batch Batch) string {
+	for _, effect := range batch.PostLandEffects {
+		if effect.Op == OpHook && effect.Definition != nil && effect.Definition.GitDir != "" {
+			return effect.Definition.GitDir
+		}
+	}
+	return ""
 }
 
 // hookOrder is the batch's hook effects in the frozen order: by the hook's index, then by the part's position at
@@ -433,7 +445,7 @@ func (r Runner) runHook(ctx context.Context, batch Batch, effect PostLandEffect,
 	}
 	tree := ""
 	if r.Trees != nil {
-		tree, err = r.Trees.LandedTree(ctx, commit)
+		tree, err = r.Trees.LandedTree(ctx, definition.GitDir, commit)
 		if err != nil {
 			return r.attempt(ctx, batch, effect.Key, definition,
 				map[string]any{"outcome": "tree_unavailable", "reason": err.Error()})
@@ -452,7 +464,7 @@ func (r Runner) runHook(ctx context.Context, batch Batch, effect PostLandEffect,
 			"LAND_EFFECT_KEY": effect.Key,
 		},
 		SafeDirectory:  tree,
-		Mounts:         definition.Mounts,
+		Mounts:         hookMounts(definition),
 		Network:        definition.Network,
 		Inputs:         inputs,
 		Outputs:        definition.Outputs,
@@ -476,6 +488,28 @@ func (r Runner) runHook(ctx context.Context, batch Batch, effect PostLandEffect,
 		// wrote is applied.
 		return r.attempt(ctx, batch, effect.Key, definition, map[string]any{"outcome": "exit", "exit": result.Exit})
 	}
+}
+
+// hookMounts are a hook's mounts: the program's clone read-only at its VM path, which holds LAND_TREE (its
+// worktree <git_dir>/trees/<commit>, with the worktree's git directory and the objects it reads), then the named
+// mounts its frozen definition gives. The clone is the program's contract with every hook, not a configured mount,
+// so no definition names it.
+func hookMounts(definition HookDefinition) []Mount {
+	mounts := make([]Mount, 0, len(definition.Mounts)+1)
+	if definition.GitDir != "" {
+		mounts = append(mounts, Mount{Name: "git_dir", HostPath: definition.GitDir, Mode: ReadOnly})
+	}
+	for _, mount := range definition.Mounts {
+		// A named mount at the clone's own path would be a second mount of one destination, which docker
+		// refuses ("Duplicate mount point"), so the hook would not start at all. The configuration is refused
+		// at load, and a definition frozen before that check keeps the clone, read-only. Docker cleans a
+		// destination before it compares it, so "/srv/repo.git/" is the same mount point as "/srv/repo.git".
+		if samePath(mount.HostPath, definition.GitDir) {
+			continue
+		}
+		mounts = append(mounts, mount)
+	}
+	return mounts
 }
 
 // recordHook records a hook that decided (exit 0 or 1) with the outputs it declared, the apply its kind asks for

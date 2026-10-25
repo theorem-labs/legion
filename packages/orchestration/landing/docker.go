@@ -467,9 +467,20 @@ func (d Docker) Push(ctx context.Context, objects ...string) error {
 	return nil
 }
 
-// LandedTree pushes the landed commit to the clone and adds its detached
-// worktree <git_dir>/trees/<commit> when it is absent; the hooks' LAND_TREE.
-func (d Docker) LandedTree(ctx context.Context, commit string) (string, error) {
+// at is this executor on the clone gitDir, the one a batch was admitted with;
+// an empty gitDir keeps the configured one.
+func (d Docker) at(gitDir string) Docker {
+	if gitDir != "" {
+		d.GitDir = gitDir
+	}
+	return d
+}
+
+// LandedTree pushes the landed commit to the clone gitDir and adds its
+// detached worktree <gitDir>/trees/<commit> when it is absent; the hooks'
+// LAND_TREE, in the clone their containers mount.
+func (d Docker) LandedTree(ctx context.Context, gitDir, commit string) (string, error) {
+	d = d.at(gitDir)
 	if !fullCommit.MatchString(commit) {
 		return "", fmt.Errorf("landed commit %q is not 40 hex characters", commit)
 	}
@@ -484,8 +495,9 @@ func (d Docker) LandedTree(ctx context.Context, commit string) (string, error) {
 	return tree, nil
 }
 
-// RemoveLandedTree removes the landed commit's worktree.
-func (d Docker) RemoveLandedTree(ctx context.Context, commit string) error {
+// RemoveLandedTree removes the landed commit's worktree from the clone gitDir.
+func (d Docker) RemoveLandedTree(ctx context.Context, gitDir, commit string) error {
+	d = d.at(gitDir)
 	if !fullCommit.MatchString(commit) {
 		return fmt.Errorf("landed commit %q is not 40 hex characters", commit)
 	}

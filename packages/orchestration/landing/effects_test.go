@@ -35,18 +35,22 @@ func (f *containerFake) names() []string {
 
 // treesFake is the landed commit's worktree in the program's clone.
 type treesFake struct {
-	path    string
+	path string
+	// gitDirs are the clones each call named, in order.
+	gitDirs []string
 	removed []string
 }
 
-func (f *treesFake) LandedTree(_ context.Context, commit string) (string, error) {
+func (f *treesFake) LandedTree(_ context.Context, gitDir, commit string) (string, error) {
+	f.gitDirs = append(f.gitDirs, gitDir)
 	if f.path == "" {
-		f.path = "/srv/land/repo.git/trees/" + commit
+		f.path = gitDir + "/trees/" + commit
 	}
 	return f.path, nil
 }
 
-func (f *treesFake) RemoveLandedTree(_ context.Context, commit string) error {
+func (f *treesFake) RemoveLandedTree(_ context.Context, gitDir, commit string) error {
+	f.gitDirs = append(f.gitDirs, gitDir)
 	f.removed = append(f.removed, commit)
 	return nil
 }
@@ -145,8 +149,9 @@ func TestAHookThatDecidesIsRecordedAndItsApplyFollowsIt(t *testing.T) {
 		run.Env["LAND_TREE"] != "/srv/land/repo.git/trees/merged" || run.Env["LAND_GIT_DIR"] != "/srv/land/repo.git" {
 		t.Fatalf("the hook's environment is %v", run.Env)
 	}
+	// The program's clone comes first, read-only: LAND_TREE is a worktree inside it.
 	if run.Image != "image@sha256:one" || run.User != "1002:1003" || run.Network != NetworkNone ||
-		!slices.Equal(run.Mounts, []Mount{{Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly}}) {
+		!slices.Equal(run.Mounts, []Mount{{Name: "git_dir", HostPath: "/srv/land/repo.git", Mode: ReadOnly}, {Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly}}) {
 		t.Fatalf("the hook's container is %+v", run)
 	}
 	if string(run.Inputs[ContractsInput]) != "[]" {

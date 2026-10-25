@@ -149,7 +149,7 @@ func indexHooks(t *testing.T, f indexFixture, withRemote bool) (Runner, *effectL
 		Containers:    d,
 		Trees:         d,
 	}
-	if err := runner.PostLanding.Validate(declared); err != nil {
+	if err := runner.PostLanding.Validate(runner.Container); err != nil {
 		t.Fatal(err)
 	}
 	effects := newEffectLog()

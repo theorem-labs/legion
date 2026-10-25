@@ -516,7 +516,7 @@ func (c config) program(ctx context.Context) (program, error) {
 		close: func() {},
 	}
 	container := c.container()
-	if err := c.PostLanding.Validate(container.Mounts); err != nil {
+	if err := c.PostLanding.Validate(container); err != nil {
 		return program{}, err
 	}
 	if len(c.PostLanding.Hooks) != 0 && strings.TrimSpace(c.Escalations.Owner) == "" {
