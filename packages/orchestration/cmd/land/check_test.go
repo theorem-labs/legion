@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,24 +12,22 @@ import (
 	"github.com/sjawhar/legion/orchestration/landing"
 )
 
-func checkConfiguration(t *testing.T, repo, base, state string, members []map[string]any, checks []map[string]any) string {
+func checkConfiguration(t *testing.T, repo, base string, members []map[string]any, checks []map[string]any) string {
 	t.Helper()
 	return writeConfig(t, map[string]any{
 		"batchId": "b", "repository": map[string]any{"name": "r", "path": repo, "git_dir": "/unused"}, "base": base,
-		"baseBranch": "trunk", "statePath": state, "members": members,
+		"baseBranch": "trunk", "members": members,
 		"build":  []string{"sh", "-c", "exit 99"},
 		"hasher": []string{"true"}, "toolchain": []string{"true"},
 		"escalations": map[string]any{"owner": "steward"},
-		"ledger":      map[string]any{"command": []string{"ledger"}, "status": []string{"true"}, "migrationState": []string{"true"}},
 		"checks":      checks,
 	})
 }
 
 func TestLandCheckRunsChecksWithoutBuildingOrSaving(t *testing.T) {
 	repo, base, heads := scratchRepository(t, map[string]string{"culprit": "-def gone := 0", "other": "+def extra := 1"})
-	state := filepath.Join(t.TempDir(), "state.json")
 	script := writeScript(t, `test "$LAND_BASE" = `+base+` || exit 9; printf 'refuse\tunknown\tAlpha.gone\tAlpha/Use.lean:2:12\tN1: Alpha/Core.lean no longer declares Alpha.gone\n'`)
-	config := checkConfiguration(t, repo, base, state, []map[string]any{
+	config := checkConfiguration(t, repo, base, []map[string]any{
 		{"migration": "culprit", "generation": 1, "head": heads["culprit"]},
 		{"migration": "other", "generation": 1, "head": heads["other"]},
 	}, []map[string]any{{"name": "names", "command": []string{script}, "format": "graph"}})
@@ -49,9 +45,6 @@ func TestLandCheckRunsChecksWithoutBuildingOrSaving(t *testing.T) {
 	if v := got.Checks[0]; v.Verdict != "fail" || len(v.Refused) != 1 || v.Refused[0].Member != "culprit" || v.Refused[0].Evidence != "removed" {
 		t.Fatalf("names verdict = %+v", v)
 	}
-	if _, err := os.Stat(state); !os.IsNotExist(err) {
-		t.Fatalf("land check wrote state: %v", err)
-	}
 }
 
 // Every check runs, even after one refuses, and an unable check makes land
@@ -60,7 +53,7 @@ func TestLandCheckRunsEveryCheckAndReportsUnable(t *testing.T) {
 	repo, base, heads := scratchRepository(t, map[string]string{"culprit": "-def gone := 0"})
 	refuse := writeScript(t, `printf 'refuse\tunknown\tAlpha.gone\tAlpha/Use.lean:2:12\tN1: x\n'`)
 	unable := writeScript(t, `echo 'index of another tree' >&2; exit 3`)
-	config := checkConfiguration(t, repo, base, filepath.Join(t.TempDir(), "state.json"),
+	config := checkConfiguration(t, repo, base,
 		[]map[string]any{{"migration": "culprit", "generation": 1, "head": heads["culprit"]}},
 		[]map[string]any{{"name": "names", "command": []string{refuse}, "format": "graph"}, {"name": "statements", "command": []string{unable}, "format": "graph"}})
 	var out bytes.Buffer

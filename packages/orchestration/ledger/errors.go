@@ -26,6 +26,13 @@ const (
 	ReasonInvalidCandidate   = "invalid_candidate"   // candidate metadata cannot describe a complete landing
 	ReasonUndeclaredWrite    = "undeclared_write"    // the candidate writes a path outside the migration lock
 	ReasonUndeclaredContract = "undeclared_contract" // the migration did not declare the changed contract as a read
+	ReasonStaleBatch         = "stale_batch"         // the batch is at another record version than the caller read
+	ReasonNotReady           = "not_ready"           // an admitted member has no ready record: it is not open, or it moved on
+	ReasonReadyChanged       = "ready_changed"       // an admitted member was readied again after the caller read it
+	ReasonBatchConflict      = "batch_conflict"      // two members of one batch change, or read and change, one contract
+	ReasonBatchAdmitted      = "batch_admitted"      // an admitted batch relies on the migration or contract
+	ReasonEffectDone         = "effect_done"         // another executor already finished the effect
+	ReasonContractConflict   = "contract_conflict"   // another landing registered the contract with another owner or hash
 	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.
 	ReasonStatementUnreviewed = "statement_unreviewed"
 )
@@ -34,9 +41,13 @@ const (
 type Refusal struct {
 	Reason  string `json:"reason"`
 	Message string `json:"message"`
-	// For an overlap: the other migration and the paths that overlap (ours -> theirs).
+	// For an overlap: the other migration and the paths that overlap (ours -> theirs). For a batch conflict: the
+	// earlier member.
 	Other    string      `json:"other,omitempty"`
 	Overlaps []PathClash `json:"overlaps,omitempty"`
+	// For a refused admission: the member it names, and for a member that Check refuses, every reason Check gives.
+	Member     string      `json:"member,omitempty"`
+	Violations []Violation `json:"violations,omitempty"`
 }
 
 func (r *Refusal) Error() string { return fmt.Sprintf("refused (%s): %s", r.Reason, r.Message) }

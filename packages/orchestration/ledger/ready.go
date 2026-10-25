@@ -100,6 +100,9 @@ func (s *Store) Ready(ctx context.Context, req ReadyRequest) (ReadyRecord, error
 		if err := requireOpenAt(migration, req.Generation); err != nil {
 			return err
 		}
+		if err := fenceMigration(ctx, tx, req.Repo, req.ID); err != nil {
+			return err
+		}
 		if migration.EscalatedAt != nil {
 			return refuse(ReasonEscalated, "%s", escalatedMessage(migration))
 		}
@@ -152,13 +155,15 @@ func (s *Store) ReadyMigrations(ctx context.Context, repo string) ([]ReadyRecord
 		if err != nil {
 			return err
 		}
-		ready, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (ReadyRecord, error) {
-			var record ReadyRecord
-			err := row.Scan(&record.ID, &record.Owner, &record.Generation, &record.ReadyEvent, &record.ReadyAt,
-				&record.StatementRecords)
-			return record, err
-		})
+		ready, err = pgx.CollectRows(rows, scanReadyRecord)
 		return err
 	})
 	return ready, err
+}
+
+// scanReadyRecord reads a ready record from a row of id, owner, generation, ready_event, ready_at and ready_records.
+func scanReadyRecord(row pgx.CollectableRow) (ReadyRecord, error) {
+	var record ReadyRecord
+	err := row.Scan(&record.ID, &record.Owner, &record.Generation, &record.ReadyEvent, &record.ReadyAt, &record.StatementRecords)
+	return record, err
 }

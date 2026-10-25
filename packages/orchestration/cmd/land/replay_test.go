@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -331,5 +333,98 @@ func TestLandReplayReadsCombinedKickReasons(t *testing.T) {
 	}
 	if !reflect.DeepEqual(kicked, []string{"culprit", "clasher"}) {
 		t.Fatalf("recorded name kicks = %v, want culprit and clasher", kicked)
+	}
+}
+
+// Only the members that changed a file are asked what they added to it, so a
+// round costs a diff per member and changed file, not per member and error.
+// Here one member changed Alpha/Core.lean and six did not, and the six are
+// never asked, which a git wrapper on PATH counts.
+func TestLandReplayAsksOnlyTheMembersThatChangedTheFile(t *testing.T) {
+	repo, base, heads := scratchRepository(t, map[string]string{"culprit": "-def gone := 0"})
+	// Six members that change another file, so only the culprit can have
+	// added a line of Alpha/Core.lean.
+	for _, id := range []string{"q1", "q2", "q3", "q4", "q5", "q6"} {
+		command(t, repo, "checkout", "-q", "-b", id, base)
+		write(t, filepath.Join(repo, "Alpha", id+".lean"), "def "+id+" := 1\n")
+		command(t, repo, "add", ".")
+		command(t, repo, "commit", "-qm", id)
+		heads[id] = command(t, repo, "rev-parse", "HEAD")
+	}
+	command(t, repo, "checkout", "-q", base)
+	dir := t.TempDir()
+	writeFile(t, dir, "build-round-1.log", "✖ [1/1] Building Alpha.Core\nerror: Alpha/Core.lean:4:14: Unknown identifier `gone`\n")
+	var manifestMembers []replay.Member
+	for id, head := range heads {
+		manifestMembers = append(manifestMembers, replay.Member{ID: id, Head: head})
+	}
+	sort.Slice(manifestMembers, func(i, j int) bool { return manifestMembers[i].ID < manifestMembers[j].ID })
+	manifest := writeManifest(t, dir, replay.Manifest{Repository: repo, Base: base, Members: manifestMembers,
+		BuildRounds: []replay.BuildRound{{Round: 1, Log: "build-round-1.log"}}})
+	counts := filepath.Join(t.TempDir(), "diffs")
+	path := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(path, "git"), "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = diff ] && echo \"$@\" >> "+counts+"; done\nexec "+real+" \"$@\"\n")
+	if err := os.Chmod(filepath.Join(path, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", path+":"+os.Getenv("PATH"))
+	if got := runReplay(t, manifest, replayConfig(t, repo)); got.err != nil {
+		t.Fatalf("replay: %v", got.err)
+	}
+	body, _ := os.ReadFile(counts)
+	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		// The per-path diff of the miss classification, not the evidence
+		// step's diff of every member's Lean files.
+		if strings.Contains(line, "-- Alpha/Core.lean") && !strings.Contains(line, heads["culprit"]) {
+			t.Fatalf("a member that did not change the file was asked: git %s", line)
+		}
+	}
+}
+
+// A field that a structure of the base or the candidate declares is no
+// generated name: the build blame names a field error, which the checks can
+// see. Round 304 of the corpus named `free` and `nbr` of a structure.
+func TestLandReplayDoesNotCallAFieldAGeneratedName(t *testing.T) {
+	repo, base, heads := scratchRepository(t, map[string]string{"culprit": "+structure Box where\n  free : Nat"})
+	dir := t.TempDir()
+	writeFile(t, dir, "build-round-1.log", "✖ [1/1] Building Alpha.Use\nerror: Alpha/Use.lean:2:12: Fields missing: `free`\n")
+	manifest := writeManifest(t, dir, replay.Manifest{Repository: repo, Base: base,
+		Members:     []replay.Member{{ID: "culprit", Head: heads["culprit"]}},
+		BuildRounds: []replay.BuildRound{{Round: 1, Log: "build-round-1.log"}}})
+	got := runReplay(t, manifest, replayConfig(t, repo))
+	if got.err != nil {
+		t.Fatalf("replay: %v", got.err)
+	}
+	for _, miss := range got.summary[0].Missed {
+		if miss.Name == "free" && miss.Cause == "generated name" {
+			t.Fatalf("missed = %+v: a declared field is no generated name", got.summary[0].Missed)
+		}
+	}
+}
+
+// When a check was unable in a build round, it decided nothing there, so a
+// name it did not refuse is no defect of the checks: its cause is "check
+// unable".
+func TestLandReplayGivesAMissUnderAnUnableCheckItsCause(t *testing.T) {
+	repo, base, heads := scratchRepository(t, map[string]string{"culprit": "-def gone := 0"})
+	dir := t.TempDir()
+	writeFile(t, dir, "build-round-1.log", goneLog)
+	manifest := writeManifest(t, dir, replay.Manifest{Repository: repo, Base: base,
+		Members:     []replay.Member{{ID: "culprit", Head: heads["culprit"]}},
+		BuildRounds: []replay.BuildRound{{Round: 1, Log: "build-round-1.log"}}})
+	unable := map[string]any{"name": "names", "command": []string{writeScript(t, "echo 'no toolchain' >&2; exit 3")}, "format": "graph"}
+	got := runReplay(t, manifest, replayConfig(t, repo, unable))
+	if got.err != nil {
+		t.Fatalf("replay: %v", got.err)
+	}
+	if want := []SummaryMiss{{Member: "culprit", Name: "gone", Cause: "check unable"}}; !reflect.DeepEqual(got.summary[0].Missed, want) {
+		t.Fatalf("missed = %+v, want %+v", got.summary[0].Missed, want)
 	}
 }
