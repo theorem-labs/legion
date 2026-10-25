@@ -3192,6 +3192,7 @@ class _FunctionWalk:
         # The locals whose reads, being walked, only give a value stored back into them.
         self.self_stored: set[int] = set()
         self.self_stores: dict[int, bool] = {}  # per plain assignment: it stores what is there already
+        self.loose_rights: set[int] = set()  # the || nodes whose right operand decides nothing
         self.subtractions = False  # a subtraction of two locals or parameters is code
         self.local_stores: dict[int, list[ci.Cursor]] | None = None
         self.same_outcomes: set[int] = set()  # the ifs whose two outcomes give the same, without effect
@@ -3718,9 +3719,164 @@ class _FunctionWalk:
         body = _function_body(self.cursor)
         falls_off = body is not None and block.hash == body.hash and self.cursor.result_type.kind == TK.VOID
         then = self.x.outcome(taken, self.dead_variables, falls_off=False)
-        return then is not None and then == self.x.outcome(
-            _children(block)[index + 1 :], self.dead_variables, falls_off
+        rest = _children(block)[index + 1 :]
+        if then is not None:
+            return then == self.x.outcome(rest, self.dead_variables, falls_off)
+        # Two returns of one value that is not a constant (from_vfsuid's KUIDT_INIT(uid) and
+        # make_kuid(fs_userns, uid), which gives KUIDT_INIT(uid) without CONFIG_USER_NS).
+        first = self.outcome_key(taken)
+        return first is not None and first == self.outcome_key(rest)
+
+    def loose_disjuncts(self, statement: ci.Cursor, block: ci.Cursor, index: int) -> set[int]:
+        """The ``||`` nodes of ``if (D1 || ... || Dn) return v;`` whose right operand decides nothing:
+        those past the first ``Di`` that is ``v`` itself, where the rest of the block, without an effect
+        but its stores to locals, returns 0 (platform_dma_configure's ``ret || !drv ||
+        to_platform_driver(drv)->driver_managed_dma`` before ``ret = iommu_device_use_default_domain(dev);
+        ... return ret;``, a stub that gives 0): once ``ret`` is 0 both ways give 0."""
+        children = _children(statement)
+        if len(children) != 2:
+            return set()
+        taken = _children(children[1]) if children[1].kind == K.COMPOUND_STMT else [children[1]]
+        values = _children(taken[0]) if len(taken) == 1 and taken[0].kind == K.RETURN_STMT else []
+        returned = _bare(values[0]) if values else None
+        variable = returned.referenced if returned is not None and returned.kind == K.DECL_REF_EXPR else None
+        if variable is None or not _is_local(variable):
+            return set()
+        ors: list[ci.Cursor] = []
+        node = _bare(children[0])
+        while node.kind == K.BINARY_OPERATOR and libclang.binary_kind(node) == libclang.LOGICAL_OR:
+            ors.append(node)
+            node = _bare(_children(node)[0])
+        disjuncts = [node] + [_children(operator)[1] for operator in reversed(ors)]
+        first = next(
+            (
+                at
+                for at, part in enumerate(disjuncts)
+                if _bare(part).kind == K.DECL_REF_EXPR and _bare(part).referenced.hash == variable.hash
+            ),
+            None,
         )
+        if first is None or first == len(disjuncts) - 1:
+            return set()
+        if not all(self.x.effect_free(part, self.dead_variables) for part in disjuncts[first + 1 :]):
+            return set()
+        if self.rest_returns(_children(block)[index + 1 :]) != 0:
+            return set()
+        return {operator.hash for operator in list(reversed(ors))[first:]}
+
+    def rest_returns(self, statements: list[ci.Cursor]) -> int | None:
+        """The constant ``statements`` return, where nothing but stores to locals in them has an
+        effect (with the conditions ``decided`` settles), as the stores that reach the return give it;
+        None otherwise."""
+        if not statements or statements[-1].kind != K.RETURN_STMT or not _children(statements[-1]):
+            return None
+        stored = frozenset(
+            variable.hash
+            for part in statements[:-1]
+            for node in part.walk_preorder()
+            if (target := _store_target(node)) is not None
+            and (variable := _stored_variable(target)) is not None
+            and _is_local(variable)
+            and variable.hash not in self.address_taken
+        )
+        if any(
+            _jumps_out(part, 0, self.held_live)
+            or not self.x.effect_free(part, self.dead_variables | stored, live=self.held_live)
+            for part in statements[:-1]
+        ):
+            return None
+        value = _children(statements[-1])[0]
+        if not self.x.effect_free(value, self.dead_variables):
+            return None
+        return expressions.evaluate(self.x.evaluator.expression(value, self.flowed))
+
+    def outcome_key(self, statements: list[ci.Cursor]) -> tuple[Any, ...] | None:
+        """The value ``statements`` return, where they have no effect and end in a return of a value
+        without effect, as ``value_key`` states it; None otherwise."""
+        if not statements or statements[-1].kind != K.RETURN_STMT:
+            return None
+        if any(
+            _jumps_out(part, 0, self.held_live) or not self.x.effect_free(part, self.dead_variables)
+            for part in statements[:-1]
+        ):
+            return None
+        value = _children(statements[-1])
+        if not value or not self.x.effect_free(value[0], self.dead_variables):
+            return None
+        return self.value_key(value[0], {}, 0)
+
+    def value_key(
+        self, node: ci.Cursor, names: dict[int, tuple[Any, ...] | None], depth: int
+    ) -> tuple[Any, ...] | None:
+        """A value as a term: constants, the function's locals and parameters (not those it writes
+        twice), globals, members, struct literals and calls of inline helpers whose body is one
+        ``return E;`` (E with their parameters as the arguments' terms, ``names``); None otherwise.
+        Two values with one term are one value."""
+        node = _bare(node)
+        while (
+            node.kind == K.CSTYLE_CAST_EXPR
+            and _children(node)
+            and node.type.get_canonical() == _bare(_children(node)[-1]).type.get_canonical()
+        ):
+            node = _bare(_children(node)[-1])
+        if depth > _EXPRESSION_DEPTH:
+            return None
+        constant = libclang.constant_int(node) if node.kind == K.INTEGER_LITERAL else None
+        if constant is not None:
+            return ("int", constant)
+        kind = node.kind
+        if kind == K.DECL_REF_EXPR and node.referenced is not None:
+            variable = node.referenced
+            if variable.hash in names:
+                return names[variable.hash]
+            if _is_local(variable):
+                uses = self.local_uses()
+                if (
+                    uses["assigned"][variable.hash] > 1
+                    or uses["written"][variable.hash]
+                    or variable.hash in self.address_taken
+                ):
+                    return None
+                return ("var", variable.hash)
+            return ("global", variable.get_usr()) if variable.kind == K.VAR_DECL else None
+        if kind == K.COMPOUND_LITERAL_EXPR and _children(node):
+            inner = self.value_key(_children(node)[-1], names, depth + 1)
+            return None if inner is None else ("literal", node.type.get_canonical().spelling, inner)
+        if kind == K.INIT_LIST_EXPR:
+            parts = [self.value_key(part, names, depth + 1) for part in _children(node)]
+            return None if any(part is None for part in parts) else ("init", *parts)
+        if kind == K.MEMBER_REF_EXPR and node.referenced is not None and _children(node):
+            base = self.value_key(_children(node)[0], names, depth + 1)
+            if base is None:
+                return None
+            if base[0] == "literal" and base[2][0] == "init":
+                # (kuid_t){ uid }.val is uid.
+                fields = [
+                    field.spelling
+                    for field in node.referenced.semantic_parent.get_children()
+                    if field.kind == K.FIELD_DECL
+                ]
+                at = fields.index(node.referenced.spelling) if node.referenced.spelling in fields else -1
+                if 0 <= at < len(base[2]) - 1:
+                    found: tuple[Any, ...] | None = base[2][at + 1]
+                    return found
+            return ("member", node.referenced.spelling, base)
+        if kind == K.CALL_EXPR and node.referenced is not None and self.x.inline_function(node.referenced.spelling):
+            definition = self.x.evaluator.definitions.get(node.referenced.spelling)
+            body = _function_body(definition) if definition is not None else None
+            statements = _children(body) if body is not None else []
+            if len(statements) != 1 or statements[0].kind != K.RETURN_STMT or not _children(statements[0]):
+                return None
+            arguments = list(node.get_arguments() or [])
+            parameters = list(definition.get_arguments() or []) if definition is not None else []
+            if len(arguments) != len(parameters):
+                return None
+            bound = {
+                parameter.hash: self.value_key(argument, names, depth + 1)
+                for parameter, argument in zip(parameters, arguments, strict=True)
+            }
+            return self.value_key(_children(statements[0])[0], bound, depth + 1)
+        return None
 
     # Guards ---------------------------------------------------------------------------------
 
@@ -6367,6 +6523,8 @@ class _FunctionWalk:
             return
         if kind in (K.IF_STMT, K.CONDITIONAL_OPERATOR) and len(children) >= 2 and reason is None:
             condition = children[0]
+            if kind == K.IF_STMT and parent is not None and parent.kind == K.COMPOUND_STMT:
+                self.loose_rights |= self.loose_disjuncts(node, parent, index)
             if _mentions(condition, _IMAGE_DECIDES):
                 # __builtin_constant_p and __builtin_object_size choose a branch only at compile
                 # time: both branches are walked, and the machine code decides which calls stay.
@@ -6455,6 +6613,17 @@ class _FunctionWalk:
                 else:
                     self.walk(other, node, 1 - addressed[0], reason, generic)
                 self.walk_guarded((compared, None), children[addressed[0]], node, addressed[0], reason, generic)
+                return
+            if operator == libclang.LOGICAL_OR and node.hash in self.loose_rights:
+                # platform_dma_configure's ret || !drv || ...->driver_managed_dma before return ret;,
+                # where falling through returns 0 = ret: past ret the operands decide nothing, and the
+                # compiler may or may not evaluate them.
+                self.walk(children[0], node, 0, reason, generic)
+                self.conditional += 1
+                try:
+                    self.walk(children[1], node, 1, reason, generic)
+                finally:
+                    self.conditional -= 1
                 return
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
                 right = self.x.evaluator.evaluate(children[1], truth=True)

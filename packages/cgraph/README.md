@@ -49,7 +49,11 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   a size that folds to 0 (`vm_area_init_from`'s copy of the empty `vm_userfaultfd_ctx`), an
   `if` whose branches have no effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)`
   without `CONFIG_PM`, an `if (c) return v;` whose return and the rest of its block give the same
-  without an effect (`rcutree_online_cpu`'s `return 0` before `tick_dep_clear(); return 0;`), a loop
+  without an effect (`rcutree_online_cpu`'s `return 0` before `tick_dep_clear(); return 0;`; also one
+  value that is not a constant, as terms of locals, members, struct literals and one-return inline
+  helpers: `from_vfsuid`'s `KUIDT_INIT(uid)` and `make_kuid(fs_userns, uid)`; and in `if (D1 || ... ||
+  Dn) return v;` before a rest that returns 0, the operands past a `Di` that is `v` itself are the
+  image's to decide: `platform_dma_configure`'s `driver_managed_dma`), a loop
   that may be assumed to end, that control leaves only by its end (not `__aggregate_find`'s list walk,
   which returns its cursor), and that stores only to locals nothing after it reads
   (`flush_all_rcu_sheaves`' list walk with `CONFIG_SLUB_TINY`; where only the `for` header's init has

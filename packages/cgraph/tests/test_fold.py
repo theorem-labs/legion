@@ -344,3 +344,18 @@ def test_a_store_of_what_is_there_is_not_code(fold_build: dict[str, Any], functi
     holds, so it, its reads and the switch around it are gone. fd_remap_changed stores 0 between, so
     its loads and stores of pfn stay."""
     assert folded_fields(fold_build, function) == fields
+
+
+def test_two_returns_of_one_value_decide_nothing(fold_build: dict[str, Any]) -> None:
+    """fd_from_vfsuid (llvm-objdump): box_size and its compare, never ns->level: both returns give
+    (fd_kuid_t){ uid }."""
+    assert folded_fields(fold_build, "fd_from_vfsuid") == set()
+
+
+def test_operands_past_the_returned_value_decide_nothing(fold_build: dict[str, Any]) -> None:
+    """fd_dma_configure (llvm-objdump): box_size, then ret alone; drv and managed are the image's to
+    decide, as both ways give 0 once ret is 0."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_dma_configure"]
+    assert {(item["field"], bool(item.get("conditional"))) for item in accesses} == {("drv", True), ("managed", True)}
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert "function:fd_dma_configure" not in {entry["function"] for entry in offsets["misses"]}

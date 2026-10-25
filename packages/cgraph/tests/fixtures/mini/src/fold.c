@@ -923,3 +923,52 @@ void fd_remap_changed(struct fd_remap *r)
 	obj_free(r);
 	r->pfn = fd_remap_pfn(orig_pfn, r->size);
 }
+
+/* fs/mnt_idmapping.c from_vfsuid without CONFIG_USER_NS: if (initial_idmapping(fs_userns)) return
+ * KUIDT_INIT(uid); return make_kuid(fs_userns, uid);, where make_kuid gives KUIDT_INIT(uid): the
+ * condition decides nothing (llvm-objdump: no load of level). */
+static inline fd_kuid_t fd_make_kuid(struct fd_user_ns *from, unsigned int uid)
+{
+	return (fd_kuid_t){ uid };
+}
+
+fd_kuid_t fd_from_vfsuid(struct fd_user_ns *ns, struct box *b)
+{
+	unsigned int uid = box_size(b);
+
+	if (uid == (unsigned int)-1)
+		return (fd_kuid_t){ 0 };
+	if (fd_initial(ns))
+		return (fd_kuid_t){ uid };
+	return fd_make_kuid(ns, uid);
+}
+
+/* drivers/base/platform.c platform_dma_configure without IOMMU_API: if (ret || !drv ||
+ * to_platform_driver(drv)->driver_managed_dma) return ret; ret = iommu_device_use_default_domain(dev);
+ * if (ret) arch_teardown_dma_ops(dev); return ret;, a stub that gives 0: once ret is 0 both ways give
+ * 0, so what comes past ret decides nothing (llvm-objdump: no load of managed). */
+struct fd_pdrv {
+	long pad[2];
+	unsigned char managed;
+};
+struct fd_pdev {
+	struct fd_pdrv *drv;
+};
+
+static inline int fd_use_default(struct fd_pdev *d)
+{
+	return 0;
+}
+
+int fd_dma_configure(struct fd_pdev *d, struct box *b)
+{
+	struct fd_pdrv *drv = d->drv;
+	int ret = box_size(b);
+
+	if (ret || !drv || drv->managed)
+		return ret;
+	ret = fd_use_default(d);
+	if (ret)
+		obj_free(b);
+	return ret;
+}
