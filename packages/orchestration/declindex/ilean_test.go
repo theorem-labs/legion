@@ -60,6 +60,11 @@ func TestParseModuleMatchesReferenceReader(t *testing.T) {
 	}
 	for i, w := range want.Decls {
 		g := decls[i]
+		// The reference reader gives no shape: a declaration has one exactly when it has a statement hash.
+		if (g.Shape != "") != (g.StmtHash != "") {
+			t.Errorf("declaration %d = %+v: a shape without a statement hash, or a statement hash without a shape", i, g)
+		}
+		g.Shape = ""
 		wantDecl := Decl{Name: w.Name, Short: w.Short, Module: w.Module, Kind: *w.Kind, Line: w.Line, StmtHash: *w.Hash}
 		if g != wantDecl {
 			t.Errorf("declaration %d = %+v, want %+v", i, g, wantDecl)

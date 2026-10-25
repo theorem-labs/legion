@@ -563,9 +563,11 @@ type sourceScope struct {
 	opens     []string
 }
 
+// sourceHeadKind reports whether SourceHeads reads the heads of a declaration of kind: an instance's conclusion head
+// is the class it provides.
 func sourceHeadKind(kind string) bool {
 	switch kind {
-	case "theorem", "lemma", "def", "abbrev", "structure":
+	case "theorem", "lemma", "def", "abbrev", "structure", "instance":
 		return true
 	default:
 		return false
