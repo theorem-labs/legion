@@ -114,9 +114,11 @@ func (s State) terminal() bool {
 // when the batch freezes. CurrentHashes and the ledger decision are derived
 // values, each stored with the batch key it was derived at.
 type Member struct {
-	Migration        string            `json:"migration"`
-	Generation       int64             `json:"generation"`
-	Head             string            `json:"head"`
+	Migration  string `json:"migration"`
+	Generation int64  `json:"generation"`
+	Head       string `json:"head"`
+	// ReadyEvent is the ready record that this batch froze, the one the ledger checked the member against.
+	ReadyEvent       int64             `json:"ready_event"`
 	ComparisonBase   string            `json:"comparisonBase"`
 	Changed          []string          `json:"changed"`
 	ReadNames        []string          `json:"readNames"`
@@ -195,7 +197,10 @@ type Batch struct {
 	// read, and the store replaces it with the version the write produced. It is not part of the stored record.
 	RecordVersion int64 `json:"record_version,omitempty"`
 	// Successor is the batch that the members of a declined batch go to next.
-	Successor         string               `json:"successor,omitempty"`
+	Successor string `json:"successor,omitempty"`
+	// Admission is the ledger's admission of this batch, which the store fills on every read. It is the ledger's
+	// column, not part of the record.
+	Admission         string               `json:"-"`
 	ID                string               `json:"id"`
 	Repository        string               `json:"repository"`
 	Base              string               `json:"base"`
@@ -290,6 +295,7 @@ type BatchStore interface {
 type Runner struct {
 	Store        BatchStore
 	Ledger       Ledger
+	Admission    BatchLedger
 	Builder      Builder
 	Hasher       Hasher
 	Git          Git

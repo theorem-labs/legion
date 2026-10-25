@@ -117,6 +117,7 @@ func decode(stored ledger.Batch) (landing.Batch, error) {
 		return landing.Batch{}, fmt.Errorf("decode batch %q: %w", stored.ID, err)
 	}
 	batch.RecordVersion = stored.RecordVersion
+	batch.Admission = stored.Admission
 	return batch, nil
 }
 
