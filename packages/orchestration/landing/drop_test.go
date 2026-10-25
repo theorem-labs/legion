@@ -30,19 +30,18 @@ type dropLedger struct {
 	returned []string
 }
 
-func (*dropLedger) Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error) {
-	return CheckResult{}, nil
+func (*dropLedger) Check(_ context.Context, request CheckRequest) (CheckResult, error) {
+	return passed(request), nil
 }
-func (*dropLedger) Land(context.Context, LandRequest) error { return nil }
-func (l *dropLedger) ReturnMember(_ context.Context, _ string, migration string, _ int64, _ string) error {
-	if err := l.refusals[migration]; err != nil {
+func (*dropLedger) Contracts(context.Context, string) ([]Contract, error)  { return nil, nil }
+func (*dropLedger) Escalate(context.Context, string, string, string) error { return nil }
+func (*dropLedger) Land(context.Context, LandRequest) error                { return nil }
+func (l *dropLedger) ReturnMember(_ context.Context, round RoundRequest) error {
+	if err := l.refusals[round.ID]; err != nil {
 		return err
 	}
-	l.returned = append(l.returned, migration)
+	l.returned = append(l.returned, round.ID)
 	return nil
-}
-func (*dropLedger) MigrationState(context.Context, string, string) (string, string, error) {
-	return "open", "", nil
 }
 
 type declineCall struct {
@@ -116,7 +115,7 @@ func TestDropMembersNotAdmittedReturnsEachAndEndsEmpty(t *testing.T) {
 
 func TestDropMembersStaleGenerationCompletesDrop(t *testing.T) {
 	store, ledger, _, runner, batch := dropFixture(t, NotAdmitted)
-	ledger.refusals["a"] = &Refusal{Reason: "stale_generation", Member: "a"}
+	ledger.refusals["a"] = &LedgerRefusal{Reason: "stale_generation", Member: "a"}
 	if err := runner.dropMembers(context.Background(), batch, map[string]string{"a": "overlap"}); err != nil {
 		t.Fatalf("drop error = %v", err)
 	}
@@ -134,7 +133,7 @@ func TestDropMembersStaleGenerationCompletesDrop(t *testing.T) {
 
 func TestDropMembersBatchAdmittedRefusalDropsNothing(t *testing.T) {
 	store, ledger, _, runner, batch := dropFixture(t, NotAdmitted)
-	ledger.refusals["a"] = &Refusal{Reason: "batch_admitted", Member: "a"}
+	ledger.refusals["a"] = &LedgerRefusal{Reason: "batch_admitted", Member: "a"}
 	err := runner.dropMembers(context.Background(), batch, map[string]string{"a": "overlap"})
 	if !errors.Is(err, ErrAdmissionConflict) {
 		t.Fatalf("drop error = %v, want ErrAdmissionConflict", err)
@@ -194,7 +193,7 @@ func TestDropMembersDeclinedRecordKeepsSuccessor(t *testing.T) {
 
 func TestDropMembersAdmittedStaleBatchIsConflict(t *testing.T) {
 	_, _, batches, runner, batch := dropFixture(t, Admitted)
-	batches.err = &Refusal{Reason: "stale_batch"}
+	batches.err = &LedgerRefusal{Reason: "stale_batch"}
 	if err := runner.dropMembers(context.Background(), batch, map[string]string{"a": "x"}); !errors.Is(err, ErrAdmissionConflict) {
 		t.Fatalf("drop error = %v, want ErrAdmissionConflict", err)
 	}

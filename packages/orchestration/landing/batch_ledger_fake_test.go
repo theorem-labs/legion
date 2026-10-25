@@ -9,7 +9,7 @@ import (
 // lands every active member at the merged commit in one call (recorded on the member ledger fake, so the tests that
 // count landings see them), and records each post-landing effect as pending; a decline records its returns.
 type batchLedgerFake struct {
-	ledger *ledgerFake
+	ledger lander
 	// store, when set, receives each call's record, as the ledger stores it in the call's own transaction.
 	store     BatchStore
 	landedAt  map[string]string
@@ -22,6 +22,11 @@ type batchLedgerFake struct {
 	effects *effectLogFake
 	refuse  error
 	landErr error
+}
+
+// lander is a member ledger fake that records a landing.
+type lander interface {
+	Land(context.Context, LandRequest) error
 }
 
 type declined struct {
@@ -69,8 +74,7 @@ func (f *batchLedgerFake) LandBatch(_ context.Context, batch *Batch, mergedCommi
 	f.landedAt[batch.ID] = mergedCommit
 	if f.ledger != nil {
 		for _, member := range batch.ActiveMembers {
-			if err := f.ledger.Land(context.Background(), LandRequest{Repo: batch.Repository, Migration: member.Migration,
-				Generation: member.Generation, Commit: mergedCommit}); err != nil {
+			if err := f.ledger.Land(context.Background(), landRequest(batch.Repository, member, mergedCommit, member.CurrentHashes, member.DerivedContracts)); err != nil {
 				return err
 			}
 		}

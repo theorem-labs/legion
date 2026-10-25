@@ -8,14 +8,14 @@ import (
 func TestCommandCheckerParsesCandidateFindings(t *testing.T) {
 	checker := CommandChecker{
 		CheckName: "policy",
-		Command:   []string{"sh", "-c", "test \"$LAND_TREE\" = tree && printf 'path\\treason\\n'"},
+		Command:   []string{"sh", "-c", "test \"$LAND_TREE\" = tree && test \"$LAND_BASE\" = base && printf 'path\\treason\\n'"},
 	}
 
-	findings, err := checker.Check(context.Background(), Tree("tree"))
+	findings, err := checker.Check(context.Background(), CheckInput{Tree: "tree", Base: "base"})
 	if err != nil {
 		t.Fatalf("Check() error = %v", err)
 	}
-	if got, want := findings, []Finding{{Path: "path", Reason: "reason"}}; !sameFindings(got, want) {
+	if got, want := findings, []Finding{{Path: "path", Reason: "reason", Verdict: VerdictRefuse}}; !sameFindings(got, want) {
 		t.Fatalf("Check() findings = %#v, want %#v", got, want)
 	}
 }
@@ -23,7 +23,7 @@ func TestCommandCheckerParsesCandidateFindings(t *testing.T) {
 func TestCommandCheckerRejectsMalformedOutput(t *testing.T) {
 	checker := CommandChecker{CheckName: "policy", Command: []string{"sh", "-c", "printf 'not-a-finding\\n'"}}
 
-	if _, err := checker.Check(context.Background(), Tree("tree")); err == nil {
+	if _, err := checker.Check(context.Background(), CheckInput{Tree: "tree", Base: "base"}); err == nil {
 		t.Fatal("Check() error = nil, want malformed output error")
 	}
 }

@@ -88,9 +88,9 @@ func (l *Ledger) ApplyContracts(ctx context.Context, repo, batch, key string) er
 	return refusal(err)
 }
 
-// Contracts is the repository's contract list as the program writes it for a contracts hook: the JSON array that
-// `ledger contract list` prints, and an empty array when the repository has no contract.
-func (l *Ledger) Contracts(ctx context.Context, repo string) ([]byte, error) {
+// ContractsFile is the repository's contract list as the program writes it for a contracts hook: the JSON array
+// that `ledger contract list` prints, and an empty array when the repository has no contract.
+func (l *Ledger) ContractsFile(ctx context.Context, repo string) ([]byte, error) {
 	contracts, err := l.ledger.Contracts(ctx, repo)
 	if err != nil {
 		return nil, refusal(err)

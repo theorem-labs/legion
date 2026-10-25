@@ -48,18 +48,10 @@ func TestReviewCommandBuilderMaterializesSymlink(t *testing.T) {
 	}
 }
 
-func TestReviewCommandLedgerRejectsEmptyCheckDecision(t *testing.T) {
-	ledger := CommandLedger{CheckCommand: []string{"sh", "-c", "exit 0"}}
-
-	if _, err := ledger.Check(context.Background(), "repo", "member", 1, nil, nil); err == nil {
-		t.Fatal("Check() error = nil, want explicit-decision error")
-	}
-}
-
 func TestReviewCommandHasherRequiresEveryStructuredHash(t *testing.T) {
-	hasher := CommandHasher{Command: []string{"sh", "-c", "printf 'Alpha.One\\thash-one\\n'"}}
+	hasher := CommandHasher{Command: []string{"sh", "-c", "printf 'Alpha.One\\thash-one\\tAlpha.lean\\n'"}}
 
-	if _, err := hasher.Hashes(context.Background(), Tree("tree"), []string{"Alpha.One", "Alpha.Two"}); err == nil {
+	if _, err := hasher.Hashes(context.Background(), HashInput{Tree: Tree("tree"), Names: []string{"Alpha.One", "Alpha.Two"}}); err == nil {
 		t.Fatal("Hashes() error = nil, want missing-name error")
 	}
 }
@@ -90,4 +82,34 @@ func commandReviewGit(t *testing.T, repo string, args ...string) string {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 	return strings.TrimSpace(string(output))
+}
+
+// The names are always in LAND_NAMES_FILE, and also in LAND_NAMES only while
+// the array fits in 131,072 bytes. A path of "-" is an absent name with the
+// empty hash, and comma-joined paths are an ambiguous name.
+func TestCommandHasherNamesAndPaths(t *testing.T) {
+	repo, commit := commandRepository(t, false)
+	script := `test -s "$LAND_NAMES_FILE" || exit 1
+if [ -n "${LAND_NAMES+set}" ]; then echo set > "$1"; else echo unset > "$1"; fi
+printf 'Absent\tx\t-\nAmbiguous\th\tA.lean,B.lean\n'`
+	marker := filepath.Join(t.TempDir(), "names")
+	hasher := CommandHasher{Command: []string{"sh", "-c", script, "hasher", marker}, Directory: repo}
+	hashes, err := hasher.Hashes(context.Background(), HashInput{Tree: Tree(commit), Names: []string{"Absent", "Ambiguous"}})
+	if err != nil {
+		t.Fatalf("Hashes() error = %v", err)
+	}
+	if got := hashes["Absent"]; got.Hash != "" || len(got.Paths) != 0 {
+		t.Fatalf("Absent = %+v, want the empty hash and no path", got)
+	}
+	if got := hashes["Ambiguous"]; !got.Ambiguous() {
+		t.Fatalf("Ambiguous = %+v, want ambiguous", got)
+	}
+	if body, _ := os.ReadFile(marker); strings.TrimSpace(string(body)) != "set" {
+		t.Fatalf("LAND_NAMES for a short list = %q, want set", body)
+	}
+	long := []string{"Absent", "Ambiguous", strings.Repeat("N", maxNamesEnvironment)}
+	_, _ = hasher.Hashes(context.Background(), HashInput{Tree: Tree(commit), Names: long})
+	if body, _ := os.ReadFile(marker); strings.TrimSpace(string(body)) != "unset" {
+		t.Fatalf("LAND_NAMES for a long list = %q, want unset", body)
+	}
 }

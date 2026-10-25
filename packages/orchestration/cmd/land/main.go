@@ -29,24 +29,38 @@ import (
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "land:", err)
+		var usage usageError
+		if errors.As(err, &usage) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 }
+
+// usageError is a command line that names no known command or lacks a
+// required flag; land exits 2 for it.
+type usageError struct{ error }
+
+func (e usageError) Unwrap() error { return e.error }
 
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if err := requireGit(ctx); err != nil {
 		return err
 	}
 	if len(args) == 0 {
-		return fmt.Errorf("usage: land <run|serve|status|blame>")
+		return usageError{fmt.Errorf("usage: land <run|serve|status|blame|check|replay>")}
 	}
 	switch args[0] {
 	case "blame":
 		return runBlame(ctx, args[1:], output)
+	case "check":
+		return runCheck(ctx, args[1:], output)
+	case "replay":
+		return runReplayCommand(ctx, args[1:], output)
 	case "run", "serve", "status":
 		return runBatchCommand(ctx, args[0], args[1:], output)
 	default:
-		return fmt.Errorf("unknown command %q", args[0])
+		return usageError{fmt.Errorf("unknown command %q", args[0])}
 	}
 }
 
@@ -188,13 +202,11 @@ type config struct {
 	Repository   repositoryConfig    `json:"repository"`
 	Base         string              `json:"base"`
 	BaseBranch   string              `json:"baseBranch"`
-	StatePath    string              `json:"statePath"`
 	Members      []landing.Member    `json:"members"`
 	Build        []string            `json:"build"`
 	Hasher       []string            `json:"hasher"`
 	Checks       []checkConfig       `json:"checks"`
 	Ledger       ledgerConfig        `json:"ledger"`
-	Escalations  escalationsConfig   `json:"escalations"`
 	Publishing   publishingConfig    `json:"publishing"`
 	Toolchain    []string            `json:"toolchain"`
 	Event        eventConfig         `json:"event"`
@@ -202,39 +214,53 @@ type config struct {
 	PostLanding  landing.PostLanding `json:"post_landing"`
 	Librarian    librarianConfig     `json:"librarian"`
 	Publish      publishConfig       `json:"publish"`
-	Effects      effectsConfig       `json:"effects"`
 	ModuleRoots  []string            `json:"moduleRoots"`
 	MaxRounds    int                 `json:"maxRounds"`
 	InfraRetries int                 `json:"infraRetries"`
 	Interval     time.Duration       `json:"interval"`
 	GitHub       githubConfig        `json:"github"`
+	Escalations  escalationsConfig   `json:"escalations"`
+	Effects      effectsConfig       `json:"effects"`
 	Digest       string              `json:"-"`
+}
+
+// escalationsConfig names the owner for whom every escalation of the program is
+// enqueued.
+type escalationsConfig struct {
+	Owner string `json:"owner"`
 }
 
 type checkConfig struct {
 	Name    string   `json:"name"`
 	Command []string `json:"command"`
-}
-type ledgerConfig struct {
-	// DSNFile is a file that holds the ledger database's connection string. When it is set, the batches are kept in
-	// the ledger and the batch calls go to it, in place of the state file.
-	DSNFile        string   `json:"dsn_file"`
-	Check          []string `json:"check"`
-	Land           []string `json:"land"`
-	Return         []string `json:"return"`
-	Status         []string `json:"status"`
-	MigrationState []string `json:"migrationState"`
+	Format  string   `json:"format"` // findings (the default) or graph
 }
 
-// escalationsConfig names the owner for whom every escalation of this program is enqueued.
-type escalationsConfig struct {
-	Owner string `json:"owner"`
+// ledgerConfig names the file that holds the ledger database's connection string. The program keeps its batches in
+// the ledger and makes every ledger call through its Go API on that database.
+type ledgerConfig struct {
+	DSNFile string `json:"dsn_file"`
 }
 
 // publishingConfig bounds the failed enqueues and waits of an admitted batch before it is withdrawn. Zero keeps the
 // runner's default.
 type publishingConfig struct {
 	RetryLimit int `json:"retry_limit"`
+}
+
+// UnmarshalJSON refuses the removed ledger commands, with the key to set instead.
+func (l *ledgerConfig) UnmarshalJSON(body []byte) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(body, &keys); err != nil {
+		return err
+	}
+	for _, removed := range []string{"check", "land", "return", "command", "status", "migrationState"} {
+		if _, found := keys[removed]; found {
+			return fmt.Errorf("ledger.%s is removed; set ledger.dsn_file, and the program calls the ledger directly", removed)
+		}
+	}
+	type plain ledgerConfig
+	return json.Unmarshal(body, (*plain)(l))
 }
 
 // repositoryConfig names the repository the program lands into: Name is its
@@ -318,9 +344,23 @@ func readConfig(path string) (config, error) {
 	if err := json.Unmarshal(body, &cfg); err != nil {
 		return config{}, fmt.Errorf("decode configuration: %w", err)
 	}
+	for index, check := range cfg.Checks {
+		if check.Format != "" && check.Format != landing.FormatFindings && check.Format != landing.FormatGraph {
+			return config{}, fmt.Errorf("checks[%d].format %q is not %q or %q", index, check.Format, landing.FormatFindings, landing.FormatGraph)
+		}
+	}
 	digest := sha256.Sum256(body)
 	cfg.Digest = hex.EncodeToString(digest[:])
 	return cfg, nil
+}
+
+// checkers are the configured checks, each run in the repository path.
+func (c config) checkers() []landing.Checker {
+	checkers := make([]landing.Checker, 0, len(c.Checks))
+	for _, check := range c.Checks {
+		checkers = append(checkers, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: c.Repository.Path, Format: check.Format})
+	}
+	return checkers
 }
 
 // program is the wiring of one configuration: the runner, the configured batch, how the status command lists
@@ -341,11 +381,14 @@ func (c config) program(ctx context.Context) (program, error) {
 	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" {
 		return program{}, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, and baseBranch are required")
 	}
-	if c.Ledger.DSNFile == "" && c.StatePath == "" {
-		return program{}, fmt.Errorf("ledger.dsn_file or statePath is required")
+	if c.Ledger.DSNFile == "" {
+		return program{}, fmt.Errorf("ledger.dsn_file is required: the batches are kept in the ledger")
 	}
-	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Check) == 0 || len(c.Ledger.Land) == 0 || len(c.Ledger.Return) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
-		return program{}, fmt.Errorf("build, hasher, toolchain, and every ledger command including state are required")
+	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 {
+		return program{}, fmt.Errorf("build, hasher, and toolchain are required")
+	}
+	if strings.TrimSpace(c.Escalations.Owner) == "" {
+		return program{}, fmt.Errorf("escalations.owner is required: the ledger enqueues every escalation for it")
 	}
 	publishing := c.GitHub.Remote != "" || c.GitHub.Executable != ""
 	if c.Publishing.RetryLimit < 0 {
@@ -364,7 +407,6 @@ func (c config) program(ctx context.Context) (program, error) {
 		return program{}, fmt.Errorf("escalations.owner is required: the ledger enqueues every escalation for it")
 	}
 	runner := landing.Runner{
-		Ledger:               landing.CommandLedger{Directory: path, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
 		Builder:              landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
 		Hasher:               landing.CommandHasher{Command: c.Hasher, Directory: path},
 		Git:                  landing.RepositoryGit{Path: path},
@@ -373,7 +415,7 @@ func (c config) program(ctx context.Context) (program, error) {
 		InfraRetries:         c.InfraRetries,
 		ConfigDigest:         c.Digest,
 		PublishingRetryLimit: c.Publishing.RetryLimit,
-		EscalationsOwner:     strings.TrimSpace(c.Escalations.Owner),
+		EscalateTo:           strings.TrimSpace(c.Escalations.Owner),
 		EscalateAfter:        c.Effects.EscalateAfter,
 		RetryBackoff:         c.Effects.Backoff,
 		PostLanding:          c.PostLanding,
@@ -382,9 +424,7 @@ func (c config) program(ctx context.Context) (program, error) {
 		Scores:               landing.RepositoryScore{Path: path},
 		Toolchain:            commandToolchain(path, c.Toolchain),
 	}
-	for _, check := range c.Checks {
-		runner.Checks = append(runner.Checks, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: path})
-	}
+	runner.Checks = c.checkers()
 	if len(c.Publish.Command) != 0 {
 		runner.Defects = landing.CommandDefects{Directory: path, Command: c.Publish.Command}
 	}
@@ -401,34 +441,26 @@ func (c config) program(ctx context.Context) (program, error) {
 			runner.Events = landing.CommandEvents{Directory: path, Command: event.Command, StatusCommand: event.Status}
 		}
 	}
-	if publishing && c.Ledger.DSNFile == "" {
-		return program{}, fmt.Errorf("github needs ledger.dsn_file: a batch is admitted in the ledger before its pull request is queued")
+	body, err := os.ReadFile(c.Ledger.DSNFile)
+	if err != nil {
+		return program{}, fmt.Errorf("read ledger.dsn_file: %w", err)
 	}
-	if c.Ledger.DSNFile != "" {
-		body, err := os.ReadFile(c.Ledger.DSNFile)
-		if err != nil {
-			return program{}, fmt.Errorf("read ledger.dsn_file: %w", err)
-		}
-		dsn := strings.TrimSpace(string(body))
-		if dsn == "" {
-			return program{}, fmt.Errorf("ledger.dsn_file %s is empty", c.Ledger.DSNFile)
-		}
-		store, err := ledger.Open(ctx, dsn)
-		if err != nil {
-			return program{}, fmt.Errorf("open the ledger: %w", err)
-		}
-		batches := ledgerstore.New(store, c.Repository.Name)
-		calls := ledgerstore.NewLedger(store, c.Repository.Name)
-		runner.Store = batches
-		runner.Admission = calls
-		runner.Effects = calls
-		out.list = batches.ListActive
-		out.close = store.Close
-	} else {
-		state := &landing.JSONStore{Path: c.StatePath}
-		runner.Store = state
-		out.list = state.List
+	dsn := strings.TrimSpace(string(body))
+	if dsn == "" {
+		return program{}, fmt.Errorf("ledger.dsn_file %s is empty", c.Ledger.DSNFile)
 	}
+	store, err := ledger.Open(ctx, dsn)
+	if err != nil {
+		return program{}, fmt.Errorf("open the ledger: %w", err)
+	}
+	batches := ledgerstore.New(store, c.Repository.Name)
+	calls := ledgerstore.NewLedger(store, c.Repository.Name)
+	runner.Store = batches
+	runner.Ledger = calls
+	runner.Admission = calls
+	runner.Effects = calls
+	out.list = batches.ListActive
+	out.close = store.Close
 	out.runner = runner
 	return out, nil
 }
@@ -536,10 +568,6 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 		return fmt.Errorf("read build log: %w", err)
 	}
 	report := blame.Parse(string(log), nil)
-	evidence, err := collectEvidence(ctx, *repository, *base, members)
-	if err != nil {
-		return err
-	}
 	var candidateTree blame.Tree
 	if *candidateRef != "" {
 		tree, err := git(ctx, *repository, "rev-parse", "--verify", *candidateRef+"^{tree}")
@@ -558,7 +586,14 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 		}
 		candidateTree = blame.Tree(candidate.Tree)
 	}
-	lines, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
+	// The trees are scanned first: their candidate names the generated
+	// instance names that no declaration may keep, and each member's
+	// evidence must use the same set as the trees.
+	lines, ambiguous, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
+	if err != nil {
+		return err
+	}
+	evidence, err := collectEvidence(ctx, *repository, *base, members, ambiguous)
 	if err != nil {
 		return err
 	}
@@ -621,11 +656,11 @@ func withoutExcluded(members []blame.Member, excluded map[string]struct{}) []bla
 	return out
 }
 
-func collectEvidence(ctx context.Context, repository, base string, members []blame.Member) (map[string]blame.Evidence, error) {
+func collectEvidence(ctx context.Context, repository, base string, members []blame.Member, ambiguous blame.InstanceNames) (map[string]blame.Evidence, error) {
 	evidence := make(map[string]blame.Evidence, len(members))
 	git := landing.RepositoryGit{}
 	for _, member := range members {
-		memberEvidence, err := git.DeclarationEvidence(ctx, repository, base, landing.Member{Migration: member.ID, Head: member.Head})
+		memberEvidence, err := git.DeclarationEvidence(ctx, repository, base, landing.Member{Migration: member.ID, Head: member.Head}, ambiguous)
 		if err != nil {
 			return nil, fmt.Errorf("read declaration evidence for %q: %w", member.ID, err)
 		}
@@ -634,30 +669,37 @@ func collectEvidence(ctx context.Context, repository, base string, members []bla
 	return evidence, nil
 }
 
-func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeDeclarations, error) {
+// collectTreeLines groups, by each name the report mentions, the declarations
+// of the base and candidate trees that carry it. It also returns the round's
+// ambiguous generated instance names, which it has resolved in both trees and
+// which every scan of the round must use.
+func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, blame.InstanceNames, error) {
 	git := landing.RepositoryGit{}
 	baseDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(base))
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at base: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at base: %w", err)
 	}
 	candidateDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(candidate))
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at candidate: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
 	}
+	ambiguous := blame.AmbiguousInstanceNames(candidateDeclarations)
+	blame.ResolveInstanceNames(candidateDeclarations, ambiguous)
+	blame.ResolveInstanceNames(baseDeclarations, ambiguous)
 	names := make(map[string]struct{})
 	for _, block := range report.Blocks {
 		for _, name := range blame.Names(block.Message) {
 			names[name.Value] = struct{}{}
 		}
 	}
-	declarations := make(map[string]blame.TreeDeclarations, len(names))
+	declarations := make(map[string]blame.TreeLines, len(names))
 	for name := range names {
-		declarations[name] = blame.TreeDeclarations{
+		declarations[name] = blame.TreeLines{
 			Base:      blame.DeclarationsFor(name, baseDeclarations),
 			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}
 	}
-	return declarations, nil
+	return declarations, ambiguous, nil
 }
 
 func confirmAttributions(ctx context.Context, repository, base string, members []blame.Member, modules []string, attributions []blame.Attribution, command string) ([]blame.Attribution, error) {

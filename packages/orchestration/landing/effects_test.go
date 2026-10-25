@@ -501,7 +501,7 @@ func TestAContractConflictHoldsTheApplyAndEscalatesOnce(t *testing.T) {
 		hookConfig("ledger", ApplyContracts, []string{"ops.jsonl"}, nil),
 		hookConfig("score", "", nil, nil),
 	}, []string{"slice"}, exits(0, nil))
-	effects.applyErr = &Refusal{Reason: "contract_conflict", Message: "line 1 registers X for another owner"}
+	effects.applyErr = &LedgerRefusal{Reason: "contract_conflict", Message: "line 1 registers X for another owner"}
 
 	for round := 1; round <= 3; round++ {
 		if err := runner.finishEffects(ctx, &batch); !errors.Is(err, ErrEffectsPending) {
@@ -533,7 +533,7 @@ func TestAConfigurationChangeAfterAdmissionDoesNotReachTheBatch(t *testing.T) {
 	changed := runner
 	changed.PostLanding = PostLanding{Parts: []string{"all"}, Hooks: []HookConfig{score, refresh}}
 	changed.Container = Container{Image: "image@sha256:two", User: "0:0", GitDir: "/other.git", Mounts: declaredMounts()}
-	changed.EscalationsOwner = "another-owner"
+	changed.EscalateTo = "another-owner"
 	containers.runs = nil
 	containers.result = func(run ContainerRun) (ContainerResult, error) {
 		if strings.HasPrefix(run.Env["LAND_EFFECT_KEY"], "hook/batch/1/") {

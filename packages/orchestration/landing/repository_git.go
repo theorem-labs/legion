@@ -123,9 +123,14 @@ func (g RepositoryGit) Ancestor(ctx context.Context, repository, commit, descend
 // each change carries its file and fully qualified Lean name. The unified diff
 // fills Inside (body edits), FieldsAdded, FieldsRemoved and Namespaces.
 //
+// ambiguous is the round's set of generated instance names that no
+// declaration may keep, from blame.AmbiguousInstanceNames over the candidate
+// tree. The same set must name the trees, so that a member's evidence and the
+// trees call one declaration by one name.
+//
 // Every blob is read through a single git cat-file --batch process keyed by
 // blob ID, not one git show per file.
-func (g RepositoryGit) DeclarationEvidence(ctx context.Context, repository, base string, member Member) (blame.Evidence, error) {
+func (g RepositoryGit) DeclarationEvidence(ctx context.Context, repository, base string, member Member, ambiguous blame.InstanceNames) (blame.Evidence, error) {
 	repository = g.path(repository)
 	mergeBase, err := repositoryGit(ctx, repository, "merge-base", base, member.Head)
 	if err != nil {
@@ -186,12 +191,12 @@ func (g RepositoryGit) DeclarationEvidence(ctx context.Context, repository, base
 	afterOwners := make(map[string][]blame.LineOwner, len(files))
 	for _, f := range files {
 		if src, ok := blobs[f.oldBlob]; ok {
-			before = append(before, blame.ScanDeclarations(f.path, src)...)
-			beforeOwners[f.path] = blame.ScanLineOwners(f.path, src)
+			before = append(before, blame.ScanDeclarations(f.path, src, ambiguous)...)
+			beforeOwners[f.path] = blame.ScanLineOwners(f.path, src, ambiguous)
 		}
 		if src, ok := blobs[f.newBlob]; ok {
-			after = append(after, blame.ScanDeclarations(f.path, src)...)
-			afterOwners[f.path] = blame.ScanLineOwners(f.path, src)
+			after = append(after, blame.ScanDeclarations(f.path, src, ambiguous)...)
+			afterOwners[f.path] = blame.ScanLineOwners(f.path, src, ambiguous)
 		}
 	}
 	evidence := blame.IndexDeclarations(before, after)
@@ -240,7 +245,7 @@ func (g RepositoryGit) TreeDeclarations(ctx context.Context, repository string, 
 	for range workers {
 		group.Go(func() {
 			for job := range jobs {
-				results[job.index] = blame.ScanDeclarations(paths[job.index], job.source)
+				results[job.index] = blame.ScanDeclarations(paths[job.index], job.source, nil)
 			}
 		})
 	}

@@ -66,7 +66,7 @@ func (f *effectLogFake) Attempt(_ context.Context, _, batch, key string, result 
 		return fmt.Errorf("no effect %s", key)
 	}
 	if effect.State == EffectDone {
-		return &Refusal{Reason: "effect_done", Message: "the effect is done"}
+		return &LedgerRefusal{Reason: "effect_done", Message: "the effect is done"}
 	}
 	effect.Attempts++
 	effect.At = time.Now()
@@ -132,7 +132,7 @@ func (f *effectLogFake) ApplyContracts(_ context.Context, _, _, key string) erro
 		return fmt.Errorf("no effect %s", key)
 	}
 	if effect.State == EffectDone {
-		return &Refusal{Reason: "effect_done", Message: "the apply is done"}
+		return &LedgerRefusal{Reason: "effect_done", Message: "the apply is done"}
 	}
 	effect.State, effect.At = EffectDone, time.Now()
 	effect.Result = []byte(`{"applied":[]}`)
@@ -143,7 +143,9 @@ func (f *effectLogFake) ApplyContracts(_ context.Context, _, _, key string) erro
 	return nil
 }
 
-func (f *effectLogFake) Contracts(context.Context, string) ([]byte, error) { return f.contracts, nil }
+func (f *effectLogFake) ContractsFile(context.Context, string) ([]byte, error) {
+	return f.contracts, nil
+}
 
 // pending are the keys the ledger still lists as intents, sorted.
 func (f *effectLogFake) pending() []string {

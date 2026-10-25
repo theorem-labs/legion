@@ -27,11 +27,11 @@ func declaredMounts() map[string]Mount {
 // hookRunner is a runner whose post-landing configuration is the hooks and parts given.
 func hookRunner(hooks []HookConfig, parts []string) Runner {
 	return Runner{
-		PostLanding:      PostLanding{Parts: parts, Hooks: hooks, TimeoutSeconds: 900, MaxOutputBytes: 1 << 20},
-		Container:        Container{Image: "image@sha256:one", User: "1002:1003", GitDir: "/srv/land/repo.git", Mounts: declaredMounts()},
-		EscalationsOwner: "escalations",
-		EscalateAfter:    3,
-		Librarian:        []string{"/bin/librarian-notify"},
+		PostLanding:   PostLanding{Parts: parts, Hooks: hooks, TimeoutSeconds: 900, MaxOutputBytes: 1 << 20},
+		Container:     Container{Image: "image@sha256:one", User: "1002:1003", GitDir: "/srv/land/repo.git", Mounts: declaredMounts()},
+		EscalateTo:    "escalations",
+		EscalateAfter: 3,
+		Librarian:     []string{"/bin/librarian-notify"},
 	}
 }
 

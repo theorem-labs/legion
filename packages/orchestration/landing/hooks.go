@@ -241,7 +241,7 @@ func (r Runner) freeze(hook HookConfig, partPosition int) HookDefinition {
 		GitDir:         r.Container.GitDir,
 		TimeoutSeconds: r.PostLanding.TimeoutSeconds,
 		MaxOutputBytes: r.PostLanding.MaxOutputBytes,
-		EscalateTo:     r.EscalationsOwner,
+		EscalateTo:     r.EscalateTo,
 		EscalateAfter:  r.escalateAfter(),
 		PartPosition:   partPosition,
 	}

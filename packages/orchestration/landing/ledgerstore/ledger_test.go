@@ -101,7 +101,7 @@ func TestAdmitRoutesItsRefusals(t *testing.T) {
 		ChangedPaths: []string{"outside.lean"},
 	}}
 	err := calls.Admit(ctx, &admitting, outside)
-	var refusal *landing.Refusal
+	var refusal *landing.LedgerRefusal
 	if !errors.As(err, &refusal) || !refusal.MemberRefusal() || refusal.Member != "M-1" {
 		t.Fatalf("an admission of a member with an undeclared write: %v", err)
 	}

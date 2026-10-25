@@ -86,8 +86,8 @@ type Return struct {
 	Key        string `json:"key"`
 }
 
-// Refusal is a ledger refusal of a batch call, which the runner routes by its outcome.
-type Refusal struct {
+// LedgerRefusal is a ledger refusal of a batch call, which the runner routes by its outcome.
+type LedgerRefusal struct {
 	// Reason is the ledger's refusal reason.
 	Reason string
 	// Message is the ledger's message.
@@ -98,7 +98,7 @@ type Refusal struct {
 	Violations []string
 }
 
-func (r *Refusal) Error() string {
+func (r *LedgerRefusal) Error() string {
 	if r.Member != "" {
 		return fmt.Sprintf("refused (%s): member %s: %s", r.Reason, r.Member, r.Message)
 	}
@@ -119,16 +119,16 @@ var memberRefusalReasons = []string{
 }
 
 // BatchConflict reports whether the refusal is another runner's or another batch's claim on this one.
-func (r *Refusal) BatchConflict() bool { return contains(batchConflictReasons, r.Reason) }
+func (r *LedgerRefusal) BatchConflict() bool { return contains(batchConflictReasons, r.Reason) }
 
 // MemberRefusal reports whether the refusal names a member that the runner drops.
-func (r *Refusal) MemberRefusal() bool {
+func (r *LedgerRefusal) MemberRefusal() bool {
 	return r.Member != "" && contains(memberRefusalReasons, r.Reason)
 }
 
 // Unclassified reports whether the refusal is neither of the two: the runner stops and leaves the batch for an
 // operator.
-func (r *Refusal) Unclassified() bool { return !r.BatchConflict() && !r.MemberRefusal() }
+func (r *LedgerRefusal) Unclassified() bool { return !r.BatchConflict() && !r.MemberRefusal() }
 
 // admissionMembers is the admission request's member list, built from the active members of the candidate that the
 // program checked: each member's frozen ready event, the current hash of each read it computed, and its changed

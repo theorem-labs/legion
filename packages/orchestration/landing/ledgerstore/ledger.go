@@ -181,7 +181,7 @@ func refusal(err error) error {
 	for _, violation := range refused.Violations {
 		kinds = append(kinds, violation.Kind)
 	}
-	return &landing.Refusal{
+	return &landing.LedgerRefusal{
 		Reason:     refused.Reason,
 		Message:    refused.Message,
 		Member:     refused.Member,

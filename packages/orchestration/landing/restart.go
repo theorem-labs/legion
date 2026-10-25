@@ -167,7 +167,8 @@ func (r Runner) createSuccessor(ctx context.Context, parent Batch) (Batch, error
 
 // recoverReturns finishes each return whose intent was recorded but whose
 // ledger call was not. The member already left the active set in the same
-// save as the intent.
+// save as the intent. The round's key replays a round the ledger already
+// recorded, so the return is sent again whether or not the first one arrived.
 func (r Runner) recoverReturns(ctx context.Context, batch *Batch) error {
 	for key, operation := range batch.Operations {
 		if operation.Kind != "return" || operation.State != OperationPending {
@@ -177,14 +178,8 @@ func (r Runner) recoverReturns(ctx context.Context, batch *Batch) error {
 		if !found {
 			return fmt.Errorf("return operation %q has no frozen member", key)
 		}
-		done, err := operationComplete(ctx, r.Ledger, operation)
-		if err != nil {
-			return fmt.Errorf("check return %q: %w", operation.Member, err)
-		}
-		if !done {
-			if err := r.Ledger.ReturnMember(ctx, batch.Repository, member.Migration, member.Generation, operation.Reason); err != nil {
-				return fmt.Errorf("complete return %q: %w", operation.Member, err)
-			}
+		if err := r.Ledger.ReturnMember(ctx, roundRequest(operation, member)); err != nil {
+			return fmt.Errorf("complete return %q: %w", operation.Member, err)
 		}
 		batch.completeOperation(key)
 		if err := r.Store.Save(ctx, batch); err != nil {

@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/internal/testpg"
+	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
 func TestBlameCommandPrintsEvidenceBackedMember(t *testing.T) {
@@ -127,22 +130,16 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 
 	config := filepath.Join(t.TempDir(), "config.json")
 	raw, err := json.Marshal(map[string]any{
-		"batchId":    "batch",
-		"repository": map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/theorem/land/repo.git"},
-		"base":       base,
-		"baseBranch": "trunk",
-		"statePath":  filepath.Join(t.TempDir(), "state.json"),
-		"members":    []map[string]any{{"migration": "one", "generation": 1, "head": head}},
-		"build":      []string{"sh", "-c", "exit 0"},
-		"hasher":     []string{"sh", "-c", "exit 0"},
-		"toolchain":  []string{"sh", "-c", "printf tool"},
-		"ledger": map[string]any{
-			"check":          []string{"sh", "-c", "printf '{\"pass\":true}\\n'"},
-			"return":         []string{"sh", "-c", "exit 0"},
-			"land":           []string{"sh", "-c", "exit 0"},
-			"status":         []string{"sh", "-c", "printf '{\"complete\":false}\\n'"},
-			"migrationState": []string{"sh", "-c", "printf '{\"state\":\"open\"}\\n'"},
-		},
+		"batchId":     "batch",
+		"repository":  map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/srv/land/repo.git"},
+		"base":        base,
+		"baseBranch":  "trunk",
+		"members":     []map[string]any{{"migration": "one", "generation": 1, "head": head}},
+		"build":       []string{"sh", "-c", "exit 0"},
+		"hasher":      []string{"sh", "-c", "exit 0"},
+		"toolchain":   []string{"sh", "-c", "printf tool"},
+		"escalations": map[string]any{"owner": "steward"},
+		"ledger":      map[string]any{"dsn_file": ledgerDSNFile(t, "owner/repo", "one", head)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -162,6 +159,53 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 	}
 	if got := output.String(); !strings.Contains(got, `"id":"batch"`) {
 		t.Fatalf("status output = %q, want stored batch", got)
+	}
+}
+
+// ledgerDSNFile is a file naming a fresh ledger database with repository repo and migration id open for head and
+// readied, as its owner leaves it before a batch picks it up.
+func ledgerDSNFile(t *testing.T, repo, id, head string) string {
+	t.Helper()
+	ctx := context.Background()
+	dsn := testpg.Database(t, "land_run")
+	store, err := ledger.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.EnsureRepo(ctx, repo, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.OpenMigration(ctx, ledger.OpenRequest{Repo: repo, ID: id, Owner: "alice", BaseCommit: "base", Branch: "branch/" + id, Writes: []string{"Alpha.lean"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ready(ctx, ledger.ReadyRequest{Repo: repo, ID: id, Generation: 1, Head: head, Key: "ready-" + id}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ledger.dsn")
+	write(t, path, dsn+"\n")
+	return path
+}
+
+// The escalations owner is required: an escalation enqueued for an empty owner
+// wakes nobody.
+func TestConfigRequiresEscalateTo(t *testing.T) {
+	cfg := publicationConfig(t)
+	cfg.Escalations.Owner = ""
+	if _, err := cfg.program(context.Background()); err == nil || !strings.Contains(err.Error(), "escalations.owner is required") {
+		t.Fatalf("program() error = %v, want escalations.owner required", err)
+	}
+}
+
+// The ledger commands are removed: the program calls the ledger directly, so a
+// configuration that still names one is refused with the key to set instead.
+func TestConfigRefusesRemovedLedgerCommands(t *testing.T) {
+	for _, key := range []string{"check", "land", "return", "command", "status", "migrationState"} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		write(t, path, `{"ledger": {"`+key+`": ["true"]}}`)
+		if _, err := readConfig(path); err == nil || !strings.Contains(err.Error(), "ledger."+key+" is removed; set ledger.dsn_file") {
+			t.Fatalf("readConfig() with ledger.%s error = %v, want it refused", key, err)
+		}
 	}
 }
 

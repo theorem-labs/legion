@@ -2,6 +2,7 @@ package landing
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/landing/blame"
@@ -237,7 +238,11 @@ func TestUpstreamCheckRunsBeforeTheLedgerCheck(t *testing.T) {
 	if got := droppedReasonFor(&batch, "sync"); got != "upstream_mismatch" {
 		t.Fatalf("dropped reason = %q, want upstream_mismatch", got)
 	}
-	if got, want := ledger.checked, []string{"keep"}; len(got) != len(want) || got[0] != want[0] {
-		t.Fatalf("ledger checked %v, want only %v", got, want)
+	checked := []string{}
+	for _, request := range ledger.checks {
+		checked = append(checked, request.Migration)
+	}
+	if !slices.Contains(checked, "keep") || slices.Contains(checked, "sync") {
+		t.Fatalf("the ledger checked %v, want the kept member and never the returned sync", checked)
 	}
 }

@@ -42,10 +42,12 @@ type GitHub interface {
 }
 
 // LandingEvent is emitted once per member after its merge is durably recorded.
+// Flags are the member's flags from the receipt's check verdicts.
 type LandingEvent struct {
 	Batch  string
 	Member string
 	Commit string
+	Flags  []Flag
 }
 
 // EventPublisher publishes post-landing member events.
@@ -132,7 +134,7 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 		}
 	}
 	batch.PullRequest = pull
-	batch.EscalateTo = r.EscalationsOwner
+	batch.EscalateTo = r.EscalateTo
 	// The hook definitions are frozen here, in the record the ledger stores with the admission, so a configuration
 	// change after it (a reorder of hooks or parts, another image, score ref or escalations owner) changes nothing
 	// for this batch.
@@ -147,7 +149,7 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 // member it names; a batch conflict drops and declines nothing and continues from the stored batch; any other
 // refusal stops the runner and leaves the batch for an operator.
 func (r Runner) admissionRefused(ctx context.Context, batch *Batch, err error) (Batch, error) {
-	var refusal *Refusal
+	var refusal *LedgerRefusal
 	if !errors.As(err, &refusal) {
 		return *batch, fmt.Errorf("admit batch %q: %w", batch.ID, err)
 	}
@@ -274,7 +276,7 @@ func (r Runner) land(ctx context.Context, batch *Batch) (Batch, error) {
 	record := cloneBatch(*batch)
 	record.State, record.Reason = Landed, ""
 	if err := r.Admission.LandBatch(ctx, &record, batch.PullRequest.MergedCommit); err != nil {
-		var refusal *Refusal
+		var refusal *LedgerRefusal
 		if errors.As(err, &refusal) {
 			return r.landedUnrecorded(ctx, batch, "ledger: "+refusal.Error())
 		}
@@ -290,7 +292,7 @@ func (r Runner) land(ctx context.Context, batch *Batch) (Batch, error) {
 // landedUnrecorded ends a batch that GitHub merged and the ledger did not land. The ledger escalates it to the
 // escalations owner in the same transaction, and the fence stays until an operator resolves it.
 func (r Runner) landedUnrecorded(ctx context.Context, batch *Batch, reason string) (Batch, error) {
-	batch.EscalateTo = r.EscalationsOwner
+	batch.EscalateTo = r.EscalateTo
 	if err := r.transition(ctx, batch, LandedUnrecorded, reason); err != nil {
 		return *batch, err
 	}
@@ -335,6 +337,22 @@ func (r Runner) pause(ctx context.Context, attempt int) {
 	case <-ctx.Done():
 	case <-timer.C:
 	}
+}
+
+// memberFlags is a member's flags in the receipt's check verdicts, never nil.
+func memberFlags(receipt *Receipt, member string) []Flag {
+	flags := []Flag{}
+	if receipt == nil {
+		return flags
+	}
+	for _, verdict := range receipt.Checks {
+		for _, flag := range verdict.Flags {
+			if flag.Member == member {
+				flags = append(flags, flag)
+			}
+		}
+	}
+	return flags
 }
 
 func operationComplete(ctx context.Context, dependency any, operation Operation) (bool, error) {

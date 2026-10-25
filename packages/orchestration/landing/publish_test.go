@@ -88,9 +88,9 @@ func TestPublishFailsBeforeAdmissionWhenThePushFails(t *testing.T) {
 // A member that admission refuses is dropped through the not-admitted branch, and nothing is enqueued; a batch
 // conflict drops nothing; any other refusal stops the runner.
 func TestPublishRoutesAdmissionRefusals(t *testing.T) {
-	member := &Refusal{Reason: "stale_read", Member: "one", Violations: []string{"stale_read"}}
-	conflict := &Refusal{Reason: "batch_admitted"}
-	other := &Refusal{Reason: "something_new"}
+	member := &LedgerRefusal{Reason: "stale_read", Member: "one", Violations: []string{"stale_read"}}
+	conflict := &LedgerRefusal{Reason: "batch_admitted"}
+	other := &LedgerRefusal{Reason: "something_new"}
 
 	ledger := &ledgerFake{}
 	runner := Runner{Store: &MemoryStore{}, Ledger: ledger, Admission: &batchLedgerFake{ledger: ledger, refuse: member}, GitHub: &githubFake{wait: PullRequest{Number: 7, Head: "candidate"}}}

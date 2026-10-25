@@ -87,8 +87,9 @@ type EffectLog interface {
 	Outputs(ctx context.Context, repo, batch, key string) (map[string][]byte, error)
 	// ApplyContracts applies a contracts apply's stored operations and records the apply done, in one transaction.
 	ApplyContracts(ctx context.Context, repo, batch, key string) error
-	// Contracts is the repository's contract list, which the program writes as the contracts hook's input.
-	Contracts(ctx context.Context, repo string) ([]byte, error)
+	// ContractsFile is the repository's contract list as the program writes it for a contracts hook: the JSON
+	// array that the ledger's contract list prints.
+	ContractsFile(ctx context.Context, repo string) ([]byte, error)
 }
 
 // ScoreStore is the remote score ref that a score apply reads and pushes, with the program's own credential.
@@ -377,7 +378,7 @@ func (r Runner) definitionOf(batch Batch, effect PostLandEffect, current Effect)
 			return *frozen.Definition
 		}
 	}
-	return HookDefinition{EscalateTo: r.EscalationsOwner, EscalateAfter: r.escalateAfter()}
+	return HookDefinition{EscalateTo: r.EscalateTo, EscalateAfter: r.escalateAfter()}
 }
 
 // effectWait is how long an effect that failed before still waits, doubling from the configured backoff and capped,
@@ -405,8 +406,9 @@ func (r Runner) effectWait(effect Effect) time.Duration {
 // runEvent publishes one member's landing event and records the effect done.
 func (r Runner) runEvent(ctx context.Context, batch Batch, effect PostLandEffect, commit string) error {
 	if r.Events != nil {
-		if err := r.Events.Publish(ctx, LandingEvent{Batch: batch.ID, Member: effect.Member, Commit: commit}); err != nil {
-			return r.attempt(ctx, batch, effect.Key, HookDefinition{EscalateTo: r.EscalationsOwner, EscalateAfter: r.escalateAfter()},
+		event := LandingEvent{Batch: batch.ID, Member: effect.Member, Commit: commit, Flags: memberFlags(batch.Receipt, effect.Member)}
+		if err := r.Events.Publish(ctx, event); err != nil {
+			return r.attempt(ctx, batch, effect.Key, HookDefinition{EscalateTo: r.EscalateTo, EscalateAfter: r.escalateAfter()},
 				map[string]any{"outcome": "failed", "reason": err.Error()})
 		}
 	}
@@ -531,7 +533,7 @@ func (r Runner) hookInputs(ctx context.Context, batch Batch, definition HookDefi
 		}
 		inputs[PreviousInput] = previous
 	case ApplyContracts:
-		contracts, err := r.Effects.Contracts(ctx, batch.Repository)
+		contracts, err := r.Effects.ContractsFile(ctx, batch.Repository)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -622,7 +624,7 @@ func (r Runner) applyContracts(ctx context.Context, batch Batch, effect PostLand
 	if err == nil {
 		return nil
 	}
-	var refusal *Refusal
+	var refusal *LedgerRefusal
 	if errors.As(err, &refusal) {
 		if refusal.Reason == "effect_done" {
 			return nil

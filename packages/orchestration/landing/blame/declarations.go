@@ -18,7 +18,85 @@ type Declaration struct {
 	Text      string
 	Private   bool
 	Protected bool
+	Kind      string   // the command keyword: def, theorem, structure, class, …
+	Line      int      // 1-based line of the keyword
+	Fields    []string // structure or class: its own field names, in order
+	Extends   bool     // structure or class: it has an `extends` clause
+	// Generated is set when Name is the name Lean generates for an
+	// anonymous instance, computed from its signature alone. Lean numbers a
+	// repeated name by what the whole namespace holds, so such a name is
+	// Lean's only while no other file of the namespace generates it, which
+	// AmbiguousInstanceNames decides over a whole tree.
+	Generated bool
 }
+
+// InstanceNames is a set of generated instance names.
+type InstanceNames map[string]struct{}
+
+// AmbiguousInstanceNames returns the generated instance names that more than
+// one file of declarations generates. Lean gives such a name to one of those
+// instances and numbers the rest, and a scan of one file cannot tell which,
+// so no declaration may keep it. Build it once per round over the candidate
+// tree, and use that one set for every scan of the round, so that the base
+// tree, the candidate tree and each member's evidence name a declaration
+// alike.
+func AmbiguousInstanceNames(declarations []Declaration) InstanceNames {
+	files := make(map[string]string, len(declarations))
+	ambiguous := InstanceNames{}
+	for _, declaration := range declarations {
+		if !declaration.Generated {
+			continue
+		}
+		switch first, found := files[declaration.Name]; {
+		case !found:
+			files[declaration.Name] = declaration.File
+		case first != declaration.File:
+			ambiguous[declaration.Name] = struct{}{}
+		}
+	}
+	return ambiguous
+}
+
+// ResolveInstanceNames renames in place every declaration whose generated
+// name is ambiguous, giving it the positional name its file's scan would have
+// given it. Declarations of one file must keep their source order.
+func ResolveInstanceNames(declarations []Declaration, ambiguous InstanceNames) {
+	positions := map[string]int{}
+	for index, declaration := range declarations {
+		if !declaration.Generated && !isPositionalInstanceName(declaration.Name) {
+			continue
+		}
+		positions[declaration.File]++
+		if _, found := ambiguous[declaration.Name]; !found || !declaration.Generated {
+			continue
+		}
+		namespace, _ := splitLastComponent(declaration.Name)
+		declarations[index].Name = positionalInstanceName(namespace, positions[declaration.File])
+		declarations[index].Generated = false
+	}
+}
+
+// positionalInstanceName is the name of the nth anonymous instance of a file,
+// in a namespace. `<anon-instance>` is not a Lean identifier, so the name
+// never equals one Lean generates.
+func positionalInstanceName(namespace string, position int) string {
+	return qualifyIn(namespace, anonymousInstanceMarker+strconv.Itoa(position))
+}
+
+func isPositionalInstanceName(name string) bool {
+	return strings.Contains(name, anonymousInstanceMarker)
+}
+
+// splitLastComponent splits a qualified name into its namespace and its last
+// component.
+func splitLastComponent(name string) (string, string) {
+	if dot := strings.LastIndex(name, "."); dot >= 0 {
+		return name[:dot], name[dot+1:]
+	}
+	return "", name
+}
+
+const anonymousInstanceMarker = "<anon-instance>#"
 
 // DeclarationID identifies a declaration in one Lean source file.
 type DeclarationID struct {
@@ -92,9 +170,18 @@ type scanned struct {
 // string literals that span lines, modifiers written on their own line above a
 // declaration, and the declaration whose signature or body it is in.
 type scanner struct {
-	file   string
-	scopes []scope
-	depth  int
+	// ambiguous holds the generated instance names that no declaration may
+	// keep, because more than one file of the round's candidate tree
+	// generates them.
+	ambiguous InstanceNames
+	file      string
+	scopes    []scope
+	depth     int
+	// line is the 1-based number of the line being scanned.
+	line int
+	// fieldColumn is the indentation of the current structure or class
+	// body's first line, or -1 until that line is read.
+	fieldColumn int
 	// declarations holds the declarations read so far, in source order.
 	// While inDeclaration is set the scanner is in the signature or body of
 	// the last one, and while inSignature is also set its signature is still
@@ -145,9 +232,12 @@ type scanner struct {
 }
 
 // ScanDeclarations returns every declaration in one Lean source file, each with
-// its fully qualified name and its whole signature.
-func ScanDeclarations(file, source string) []Declaration {
-	s := scanner{file: file}
+// its fully qualified name and its whole signature. ambiguous holds the
+// generated instance names that no declaration may keep, from
+// AmbiguousInstanceNames over the round's candidate tree; it is nil for a
+// scan that has no tree to compare with, such as a single file's.
+func ScanDeclarations(file, source string, ambiguous InstanceNames) []Declaration {
+	s := scanner{file: file, ambiguous: ambiguous}
 	for line := range strings.SplitSeq(source, "\n") {
 		s.scan(line)
 	}
@@ -206,6 +296,7 @@ func refersToNamespace(reference, namespace string) bool {
 
 // scan reads one source line.
 func (s *scanner) scan(line string) scanned {
+	s.line++
 	startedInString := s.inString
 	code := s.uncomment(line)
 	result := s.command(code, startedInString)
@@ -279,7 +370,7 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 	}
 	if match := declarationRE.FindStringSubmatch(code); match != nil {
 		modifiers := strings.Fields(match[1])
-		s.startDeclaration(code, pendingText, s.qualify(strings.TrimSuffix(match[3], ".")), pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
+		s.startDeclaration(code, pendingText, s.qualify(strings.TrimSuffix(match[3], ".")), strings.Join(strings.Fields(match[2]), " "), pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
 		s.currentIsStructure = isStructureDecl(code)
 		switch match[2] {
 		case "def", "theorem", "lemma", "instance", "abbrev":
@@ -292,7 +383,7 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 	}
 	if match := anonymousInstanceRE.FindStringSubmatch(code); match != nil {
 		modifiers := strings.Fields(match[1])
-		s.startDeclaration(code, pendingText, "", pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
+		s.startDeclaration(code, pendingText, "", "instance", pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
 		s.currentMatchArm, s.anonymous = true, true
 		s.signatureLine(code)
 		return scanned{kind: declarationLine, owned: true, signature: true}
@@ -330,15 +421,17 @@ func (s *scanner) recordVariables(code string) {
 	}
 }
 
-// startDeclaration ends the current declaration and starts one named name on
-// a declaration line. An anonymous instance's name is set by
-// nameAnonymousInstances, once the whole file is read.
-func (s *scanner) startDeclaration(code, pendingText, name string, private, protected bool) {
+// startDeclaration ends the current declaration and starts one named name,
+// declared by the keyword kind, on a declaration line. An anonymous
+// instance's name is set by nameAnonymousInstances, once the whole file is
+// read.
+func (s *scanner) startDeclaration(code, pendingText, name, kind string, private, protected bool) {
 	s.endDeclaration()
-	s.declarations = append(s.declarations, Declaration{File: s.file, Name: name, Private: private, Protected: protected})
+	s.declarations = append(s.declarations, Declaration{File: s.file, Name: name, Private: private, Protected: protected, Kind: kind, Line: s.line})
 	s.inDeclaration, s.inSignature = true, true
 	s.brackets, s.column = 0, indentation(code)
 	s.blockColumn, s.blockPending = -1, false
+	s.fieldColumn = -1
 	s.signature = appendFields(appendFields(s.signature[:0], pendingText), code)
 }
 
@@ -366,8 +459,12 @@ func (s *scanner) continuation(code string, armMayStart bool) scanned {
 	}
 	defer s.endLine(code)
 	arm := armMayStart && s.currentMatchArm && s.brackets == 0 && startsMatchArm(code)
+	brackets := s.brackets
 	bodyStarts := s.track(code)
 	if !s.inSignature {
+		if armMayStart && brackets == 0 {
+			s.bodyField(code)
+		}
 		return scanned{owned: true}
 	}
 	if arm {
@@ -379,6 +476,97 @@ func (s *scanner) continuation(code string, armMayStart bool) scanned {
 		s.endSignature()
 	}
 	return scanned{owned: true, signature: true}
+}
+
+// bodyField records the fields that a body line of a structure or class
+// declares, when the line is at the body's first indentation.
+func (s *scanner) bodyField(code string) {
+	declaration := &s.declarations[len(s.declarations)-1]
+	if declaration.Kind != "structure" && declaration.Kind != "class" {
+		return
+	}
+	if s.fieldColumn < 0 {
+		s.fieldColumn = indentation(code)
+	}
+	if indentation(code) != s.fieldColumn {
+		return
+	}
+	declaration.Fields = append(declaration.Fields, fieldNames(code)...)
+}
+
+// fieldNames returns the fields an indented structure line declares, in
+// order: attributes and `private` or `protected`, one or more names, binder
+// groups, then `:`. A constructor line (`mk ::`), a default for a parent's
+// field (`base := 0`) and any other line declare none.
+func fieldNames(code string) []string {
+	if indentation(code) == 0 {
+		return nil
+	}
+	rest := strings.TrimSpace(code)
+	for {
+		if strings.HasPrefix(rest, "@[") {
+			end := strings.IndexByte(rest, ']')
+			if end < 0 {
+				return nil
+			}
+			rest = strings.TrimLeft(rest[end+1:], " \t")
+			continue
+		}
+		if word := firstWord(rest); word == "private" || word == "protected" {
+			rest = strings.TrimLeft(rest[len(word):], " \t")
+			continue
+		}
+		break
+	}
+	var names []string
+	binders := false
+	for rest != "" {
+		first, size := utf8.DecodeRuneInString(rest)
+		switch {
+		case first == ':':
+			if strings.HasPrefix(rest, ":=") || strings.HasPrefix(rest, "::") {
+				return nil
+			}
+			return names
+		case strings.ContainsRune("([{⦃", first):
+			if len(names) == 0 {
+				return nil
+			}
+			end := closingBracket(rest)
+			if end < 0 {
+				return nil
+			}
+			rest, binders = rest[end:], true
+		case first == ' ' || first == '\t':
+			rest = rest[size:]
+		default:
+			word := firstWord(rest)
+			if word == "" || binders || !startsIdentifier(word) {
+				return nil
+			}
+			names = append(names, word)
+			rest = rest[len(word):]
+		}
+	}
+	return nil
+}
+
+// closingBracket is the index just after the bracket that closes the one text
+// starts with, or -1.
+func closingBracket(text string) int {
+	depth := 0
+	for index, r := range text {
+		switch {
+		case strings.ContainsRune("([{⦃", r):
+			depth++
+		case strings.ContainsRune(")]}⦄", r):
+			depth--
+			if depth == 0 {
+				return index + utf8.RuneLen(r)
+			}
+		}
+	}
+	return -1
 }
 
 // endLine records a code line of the current declaration as its last one. A
@@ -515,12 +703,29 @@ func (s *scanner) endSignature() {
 	declaration := &s.declarations[len(s.declarations)-1]
 	declaration.Text = string(s.signature)
 	s.inSignature = false
+	if declaration.Kind == "structure" || declaration.Kind == "class" {
+		declaration.Extends = extendsBeforeWhere(declaration.Text)
+	}
 	if s.anonymous {
 		name, computed := instanceName(declaration.Text, s.variables)
 		s.anonymousInstances = append(s.anonymousInstances, anonymousInstance{
 			index: len(s.declarations) - 1, prefix: s.prefix(), name: name, computed: computed,
 		})
 	}
+}
+
+// extendsBeforeWhere reports whether a structure or class signature has the
+// word `extends` before the `where` that opens its body.
+func extendsBeforeWhere(text string) bool {
+	for _, word := range identifiers(text) {
+		switch word {
+		case "extends":
+			return true
+		case "where":
+			return false
+		}
+	}
+	return false
 }
 
 // anonymousInstance is an instance declared without a name: index is its
@@ -545,13 +750,10 @@ type anonymousInstance struct {
 // such a name never equals a name Lean generates, and a diagnostic that names
 // a generated instance finds no declaration rather than the wrong one.
 //
-// The scanner reads one file, so it cannot see the rest of the namespace:
-// when two files of one namespace generate the same name, Lean numbers the
-// later one and the scanner gives both the unnumbered name. On the round-177
-// base that is 8 names over 19 of the 1,712 anonymous instances, all of the
-// form instDecidable<Predicate> or instPersistent<Predicate>. Closing it
-// needs the whole project, which neither the evidence step (a member's
-// changed files) nor one tree scan gives a declaration in isolation.
+// A name that more than one file of the round's candidate tree generates is
+// in ambiguous, and no declaration keeps it: Lean gives it to one of those
+// instances and numbers the rest, and a scan of one file cannot tell which.
+// AmbiguousInstanceNames builds that set over a whole tree.
 func (s *scanner) nameAnonymousInstances() {
 	taken := map[string]int{}
 	for index, declaration := range s.declarations {
@@ -566,10 +768,13 @@ func (s *scanner) nameAnonymousInstances() {
 	}
 	for position, instance := range s.anonymousInstances {
 		name := qualifyIn(instance.prefix, instance.name)
-		if !instance.computed || taken[name] != 1 {
-			name = qualifyIn(instance.prefix, "<anon-instance>#"+strconv.Itoa(position+1))
+		_, shared := s.ambiguous[name]
+		if !instance.computed || shared || taken[name] != 1 {
+			s.declarations[instance.index].Name = positionalInstanceName(instance.prefix, position+1)
+			continue
 		}
 		s.declarations[instance.index].Name = name
+		s.declarations[instance.index].Generated = true
 	}
 }
 
@@ -1070,9 +1275,11 @@ type LineOwner struct {
 	code, namespace string
 }
 
-// ScanLineOwners returns one LineOwner per source line, in order.
-func ScanLineOwners(file, source string) []LineOwner {
-	s := scanner{file: file}
+// ScanLineOwners returns one LineOwner per source line, in order. ambiguous
+// is the round's set of generated instance names that no declaration may
+// keep, as for ScanDeclarations.
+func ScanLineOwners(file, source string, ambiguous InstanceNames) []LineOwner {
+	s := scanner{file: file, ambiguous: ambiguous}
 	lines := strings.Split(source, "\n")
 	owners := make([]LineOwner, len(lines))
 	// owned holds, for each line, 1 + the index of its owner in
