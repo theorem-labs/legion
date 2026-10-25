@@ -316,3 +316,9 @@ def test_a_loop_past_its_init_whose_effects_the_image_decides_is_left_to_the_ima
     }
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert "function:fd_report_leaves_image" not in {entry["function"] for entry in offsets["misses"]}
+
+
+def test_a_copy_of_no_bytes_is_not_code(fold_build: dict[str, Any]) -> None:
+    """fd_area_copy: ld a2, 0x0(a1); sd a2, 0x0(a0); ret (llvm-objdump): the copy of the empty uffd
+    is gone with its arguments."""
+    assert folded_fields(fold_build, "fd_area_copy") == {"start"}

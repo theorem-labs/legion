@@ -2119,6 +2119,10 @@ def _without_casts(expression: Any) -> Any:
 # CXBinaryOperatorKind AddAssign, SubAssign, ShlAssign, ShrAssign, XorAssign and OrAssign: with 0 on
 # the right, the variable keeps its value.
 _IDENTITY_WITH_ZERO = (26, 27, 28, 29, 31, 32)
+# The copies and fills the compiler drops whole where their size is 0.
+_ZERO_SIZE_COPIES = frozenset(
+    {"memcpy", "memmove", "memset", "__builtin_memcpy", "__builtin_memmove", "__builtin_memset"}
+)
 
 
 def _store_target(node: ci.Cursor) -> ci.Cursor | None:
@@ -5936,6 +5940,11 @@ class _FunctionWalk:
                 finally:
                     self.conditional -= 1
             return
+        if kind == K.CALL_EXPR and reason is None and self.zero_size_copy(node):
+            # memcpy(d, s, 0) copies nothing, and the compiler drops it with its arguments
+            # (vm_area_init_from's memcpy of the empty vm_userfaultfd_ctx without USERFAULTFD).
+            self.walk(node, parent, index, "discarded", generic)
+            return
         if kind == K.CALL_EXPR:
             self.call(node, parent, reason, generic)
         elif kind in (K.DECL_REF_EXPR, K.MEMBER_REF_EXPR):
@@ -6427,6 +6436,19 @@ class _FunctionWalk:
                 self.walk(child, call, index, reason, generic)
             finally:
                 self.conditional -= 1
+
+    def zero_size_copy(self, call: ci.Cursor) -> bool:
+        """memcpy, memmove or memset (or their builtins) of a size that folds to 0, whose arguments
+        have no effect: nothing is copied, and nothing of it is code."""
+        callee = call.referenced
+        if callee is None or callee.kind != K.FUNCTION_DECL or callee.spelling not in _ZERO_SIZE_COPIES:
+            return False
+        arguments = list(call.get_arguments() or [])
+        return (
+            len(arguments) == 3
+            and self.x.evaluator.evaluate(arguments[2]) == 0
+            and all(self.x.effect_free(argument, self.dead_variables) for argument in arguments)
+        )
 
     def mark_cancelled(self, argument: ci.Cursor, callee: str, position: int) -> None:
         """An argument ``&p->m`` at a parameter the callee takes back with container_of

@@ -45,7 +45,8 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   `if (c) v = a; else v = b;` whose two values are one as the evaluator states them (`make_vfsuid`'s
   `__kuid_val(kuid)` and `from_kuid(fs_userns, kuid)` without `CONFIG_USER_NS`), whose condition
   decides nothing, a `v += e` (or `-=`, `|=`, `^=`, a shift) with `e` folding to 0, which stores
-  nothing (`len += sysfs_emit_at(...)` without `CONFIG_SYSFS`), an
+  nothing (`len += sysfs_emit_at(...)` without `CONFIG_SYSFS`), a `memcpy`, `memmove` or `memset` of
+  a size that folds to 0 (`vm_area_init_from`'s copy of the empty `vm_userfaultfd_ctx`), an
   `if` whose branches have no effect such as `if (dev->parent) pm_runtime_get_sync(dev->parent)`
   without `CONFIG_PM`, an `if (c) return v;` whose return and the rest of its block give the same
   without an effect (`rcutree_online_cpu`'s `return 0` before `tick_dep_clear(); return 0;`), a loop

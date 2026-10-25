@@ -775,3 +775,19 @@ void fd_report_leaves_image(struct fd_leaf *r, unsigned long mask, struct box *b
 			continue;
 	obj_free(b);
 }
+
+/* mm/vma_init.c vm_area_init_from without USERFAULTFD: memcpy(&dest->vm_userfaultfd_ctx,
+ * &src->vm_userfaultfd_ctx, sizeof(dest->vm_userfaultfd_ctx)) of an empty struct copies nothing
+ * (llvm-objdump: ld a2, 0x0(a1); sd a2, 0x0(a0); ret). */
+struct fd_uffd {};
+struct fd_area {
+	long start;
+	struct fd_uffd uffd;
+	long end;
+};
+
+void fd_area_copy(struct fd_area *dest, const struct fd_area *src)
+{
+	dest->start = src->start;
+	__builtin_memcpy(&dest->uffd, &src->uffd, sizeof(dest->uffd));
+}
