@@ -1063,3 +1063,30 @@ group_exit:
 exit:
 	obj_free((void *)(long)error);
 }
+
+/* drivers/base/swnode.c software_node_unregister: swnode = software_node_to_swnode(node), an out of
+ * line call that returns a container_of of a list entry, then kobject_put(&swnode->kobj), kobj at
+ * offset 0: the code passes the returned pointer itself (llvm-objdump: jal fd_find_kset; beqz a0;
+ * j obj_free, no addi). */
+static __attribute__((noinline)) struct fd_kset *fd_find_kset(struct list_node *head)
+{
+	struct list_node *pos;
+
+	dd_for_each(pos, head) {
+		struct fd_kobj *kobj = container_of(pos, struct fd_kobj, entry);
+		struct fd_kset *kset = container_of(kobj, struct fd_kset, kobj);
+
+		if (kset->lock)
+			return kset;
+	}
+	return NULL;
+}
+
+void fd_put_first(struct list_node *head)
+{
+	struct fd_kset *k = fd_find_kset(head);
+
+	if (k)
+		obj_free(&k->list);
+	obj_free(head->prev);
+}

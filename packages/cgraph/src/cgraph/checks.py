@@ -347,8 +347,12 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 method = "global_address_offset"
             elif register is not None:
                 method = register
-            elif offset == 0 and item.get("address"):
-                # &p->m (or an array member decaying to a pointer) at offset 0 is the base pointer itself.
+            elif item.get("address") and 0 in alternates:
+                # &p->m (or an array member decaying to a pointer) at offset 0 is the base pointer
+                # itself; so is a member at offset 0 of an address the code keeps in a register (an
+                # inner displacement of 0, or the field's own offset where the code holds the
+                # container: software_node_unregister's &swnode->kobj, the pointer
+                # software_node_to_swnode returns).
                 method = "member_address_at_zero"
             elif item.get("address") and any(
                 candidate <= value < candidate + item.get("element_size", 0)

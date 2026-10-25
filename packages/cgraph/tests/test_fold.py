@@ -376,3 +376,14 @@ def test_stores_into_a_static_nothing_reads_are_not_code(fold_build: dict[str, A
     fd_notes_attr is given only to a stub that ignores it."""
     targets = {edge["target"] for edge in fold_build["graph"]["edges"] if edge["source"] == "function:fd_notes_init"}
     assert not targets & {"global:all_bags", "global:tree_sem", "global:fd_notes_attr@src/fold.c"}
+
+
+def test_a_member_at_offset_zero_of_a_held_address_is_that_address(fold_build: dict[str, Any]) -> None:
+    """fd_put_first (llvm-objdump: jal fd_find_kset; beqz a0; j obj_free): &k->list is the pointer
+    fd_find_kset returns, and the check takes it as that pointer, not as an address 32 below it. The
+    read of head->prev at 8 makes the function a candidate; 0 is no displacement of it."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_put_first"]
+    (item,) = [item for item in accesses if item["field"] == "list"]
+    assert (item["address"], item["displacement"], item["offset"]) == (True, -32, 0)
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert "function:fd_put_first" not in {entry["function"] for entry in offsets["misses"]}
