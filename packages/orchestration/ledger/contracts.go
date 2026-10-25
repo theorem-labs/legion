@@ -49,7 +49,8 @@ func loadContract(ctx context.Context, q querier, repo, name string, forUpdate b
 	return c, err
 }
 
-// RegisterContract records a new contract at version one. Its first hash is the one that later changes compare.
+// RegisterContract records a new contract at version one. Its first hash is the one that later changes compare. A name
+// that an admitted member reads is refused with batch_admitted, because its admission checked that read as no contract.
 func (s *Store) RegisterContract(ctx context.Context, repo, name, owner, hash string, pinned bool) (Contract, error) {
 	if err := checkContractArgs(name, owner, hash); err != nil {
 		return Contract{}, err
@@ -57,6 +58,9 @@ func (s *Store) RegisterContract(ctx context.Context, repo, name, owner, hash st
 	var c Contract
 	err := s.tx(ctx, func(tx pgx.Tx) error {
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		if err := fenceContract(ctx, tx, repo, name, true); err != nil {
 			return err
 		}
 		var err error
@@ -125,15 +129,22 @@ func (s *Store) Contracts(ctx context.Context, repo string) ([]Contract, error) 
 	return contracts, nil
 }
 
-// TransferContract moves a contract to a new owner without changing its statement or version.
+// TransferContract moves a contract to a new owner without changing its statement or version. A contract that an
+// admitted member changes is refused with batch_admitted, because its admission's review rule checked the owner.
 func (s *Store) TransferContract(ctx context.Context, repo, name, fromOwner, toOwner string) (Contract, error) {
 	if strings.TrimSpace(name) == "" || strings.TrimSpace(fromOwner) == "" || strings.TrimSpace(toOwner) == "" {
 		return Contract{}, invalid("a contract transfer needs a name, current owner and new owner")
 	}
 	var c Contract
 	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
 		current, err := loadContract(ctx, tx, repo, name, true)
 		if err != nil {
+			return err
+		}
+		if err := fenceContract(ctx, tx, repo, name, false); err != nil {
 			return err
 		}
 		if current.Owner != fromOwner {
@@ -502,6 +513,8 @@ func refusalForViolation(v Violation) error {
 		return refuse(ReasonUpstreamNotAllowed, "%s", v.Message)
 	case ViolationStatementUnreviewed:
 		return refuse(ReasonStatementUnreviewed, "%s", v.Message)
+	case ViolationBatchAdmitted:
+		return refuse(ReasonBatchAdmitted, "%s", v.Message)
 	default:
 		return fmt.Errorf("unmapped violation kind %q", v.Kind)
 	}

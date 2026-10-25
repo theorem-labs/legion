@@ -299,6 +299,27 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			},
 		},
 		{
+			name: "an admitted member lands only with its batch",
+			kind: ledger.ReasonBatchAdmitted,
+			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
+				parityAdmit(t, s, "M-1", "a.lean", nil)
+				return candidate
+			},
+		},
+		{
+			name: "a candidate advances a contract that an admitted member reads",
+			kind: ledger.ReasonBatchAdmitted,
+			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+				parityRegister(t, s, "C", "hash-1", false)
+				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
+				parityStatement(&candidate, "head-1", "head-1")
+				parityOpen(t, s, "M-2", "b.lean", map[string]string{"C": "hash-1"})
+				parityAdmit(t, s, "M-2", "b.lean", map[string]string{"C": "hash-1"})
+				return candidate
+			},
+		},
+		{
 			name: "clean candidate passes",
 			kind: "",
 			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
@@ -368,6 +389,29 @@ func parityOpen(t *testing.T, s *ledger.Store, id, path string, reads map[string
 		land: ledger.LandRequest{
 			Repo: "r", Migration: m.ID, Generation: m.Generation, Commit: "candidate", ChangedPaths: []string{path}, Current: copyStringMap(reads),
 		},
+	}
+}
+
+// parityAdmit readies open migration id and admits it alone in batch-1, with the candidate's changed path and the
+// current hashes given. LandBatch or DeclineBatch releases that admission.
+func parityAdmit(t *testing.T, s *ledger.Store, id, path string, current map[string]string) {
+	t.Helper()
+	ctx := context.Background()
+	ready, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: id, Generation: 1, Head: "head-" + id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateBatch(ctx, "r", "batch-1", json.RawMessage(`{"state":"checked"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AdmitBatch(ctx, ledger.AdmitRequest{
+		Repo: "r", ID: "batch-1", Base: "base", CandidateCommit: "candidate-batch-1", CandidateTree: "tree-batch-1",
+		Members: []ledger.AdmitMember{{
+			Migration: id, ReadyEvent: ready.ReadyEvent, CurrentHashes: copyStringMap(current), ChangedPaths: []string{path},
+		}},
+		ExpectedVersion: 1, Record: json.RawMessage(`{"state":"publishing"}`),
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

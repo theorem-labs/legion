@@ -437,6 +437,16 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		value, err := s.SaveBatch(ctx, request.Repo, request.ID, request.Record, request.ExpectedVersion)
 		return value, true, err
+	case "admit-batch":
+		request, jsonInput, err := requestFile[ledger.AdmitRequest](args)
+		if !jsonInput {
+			return nil, true, usagef("admit-batch --request-file <json>")
+		}
+		if err != nil {
+			return nil, true, err
+		}
+		value, err := s.AdmitBatch(ctx, request)
+		return value, true, err
 	case "batch":
 		if len(args) != 2 {
 			return nil, true, usagef("batch <repo> <id>")

@@ -32,6 +32,8 @@ type Batch struct {
 	RecordVersion int64 `json:"record_version"`
 	// Admission is admitted while the batch's members are fenced, then landed or declined, and empty before that.
 	Admission string `json:"admission,omitempty"`
+	// AdmissionDigest identifies the request that admitted the batch, so that a retry of it replays (AdmitBatch).
+	AdmissionDigest string `json:"admission_digest,omitempty"`
 	// Successor is the batch that the members of a declined batch go to next, when it names one.
 	Successor string `json:"successor,omitempty"`
 	// PendingEffects are the sorted keys of the batch's effects that are still to do.
@@ -41,14 +43,15 @@ type Batch struct {
 }
 
 // batchColumns selects a batch from a query over the batches table, in the order scanBatch reads it.
-const batchColumns = `repo, id, phase, record, record_version, coalesce(admission, ''), coalesce(successor, ''),
+const batchColumns = `repo, id, phase, record, record_version, coalesce(admission, ''), coalesce(admission_digest, ''),
+	coalesce(successor, ''),
 	array(SELECT e.key FROM batch_effects e WHERE e.repo = batches.repo AND e.batch = batches.id AND e.state = 'intent'
 		ORDER BY e.key),
 	created_at, updated_at`
 
 func scanBatch(row pgx.Row) (Batch, error) {
 	var b Batch
-	err := row.Scan(&b.Repo, &b.ID, &b.Phase, &b.Record, &b.RecordVersion, &b.Admission, &b.Successor,
+	err := row.Scan(&b.Repo, &b.ID, &b.Phase, &b.Record, &b.RecordVersion, &b.Admission, &b.AdmissionDigest, &b.Successor,
 		&b.PendingEffects, &b.CreatedAt, &b.UpdatedAt)
 	if b.PendingEffects == nil {
 		b.PendingEffects = []string{}
