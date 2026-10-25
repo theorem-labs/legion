@@ -48,28 +48,40 @@ func (c CommandChecker) Check(ctx context.Context, in CheckInput) ([]Finding, er
 	if len(c.Command) == 0 {
 		return nil, fmt.Errorf("check %q has no command", c.CheckName)
 	}
-	graph := c.Format == FormatGraph
 	command := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
 	command.Dir = c.Directory
 	command.Env = append(os.Environ(), "LAND_TREE="+string(in.Tree), "LAND_BASE="+in.Base)
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
-	err := command.Run()
-	message := strings.TrimSpace(stderr.String())
-	if err != nil {
+	code := 0
+	if err := command.Run(); err != nil {
 		var exit *exec.ExitError
-		if graph && errors.As(err, &exit) && exit.ExitCode() == 3 {
-			return nil, &CheckUnableError{Check: c.CheckName, Reason: message}
+		if !errors.As(err, &exit) {
+			return nil, fmt.Errorf("run check %q: %w", c.CheckName, err)
 		}
-		return nil, fmt.Errorf("run check %q: %w: %s", c.CheckName, err, message)
+		code = exit.ExitCode()
+	}
+	return checkOutcome(c.CheckName, c.Format, code, stdout.String(), strings.TrimSpace(stderr.String()))
+}
+
+// checkOutcome reads a check's exit status and output: for the graph format,
+// exit 3 is a *CheckUnableError whose reason is stderr; any other nonzero exit,
+// and exit 0 with anything on stderr, is an error that holds stderr.
+func checkOutcome(name, format string, code int, stdout, message string) ([]Finding, error) {
+	graph := format == FormatGraph
+	if code != 0 {
+		if graph && code == 3 {
+			return nil, &CheckUnableError{Check: name, Reason: message}
+		}
+		return nil, fmt.Errorf("run check %q: exit status %d: %s", name, code, message)
 	}
 	if message != "" {
-		return nil, fmt.Errorf("check %q exited 0 with stderr: %s", c.CheckName, message)
+		return nil, fmt.Errorf("check %q exited 0 with stderr: %s", name, message)
 	}
 	if graph {
-		return parseGraphFindings(stdout.String())
+		return parseGraphFindings(stdout)
 	}
-	return parseFindings(stdout.String())
+	return parseFindings(stdout)
 }
 
 func parseFindings(output string) ([]Finding, error) {

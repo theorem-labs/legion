@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,16 +13,22 @@ import (
 	"github.com/sjawhar/legion/orchestration/landing"
 )
 
+// checkConfiguration is a land check configuration whose checks run in containers on this host, each script's
+// directory mounted read-only.
 func checkConfiguration(t *testing.T, repo, base string, members []map[string]any, checks []map[string]any) string {
 	t.Helper()
-	return writeConfig(t, map[string]any{
-		"batchId": "b", "repository": map[string]any{"name": "r", "path": repo, "git_dir": "/unused"}, "base": base,
+	var reads []string
+	for _, check := range checks {
+		reads = append(reads, filepath.Dir(check["command"].([]string)[0]))
+	}
+	return writeConfig(t, withContainer(map[string]any{
+		"batchId": "b", "repository": map[string]any{"name": "r", "path": repo}, "base": base,
 		"baseBranch": "trunk", "members": members,
 		"build":  []string{"sh", "-c", "exit 99"},
 		"hasher": []string{"true"}, "toolchain": []string{"true"},
 		"escalations": map[string]any{"owner": "steward"},
 		"checks":      checks,
-	})
+	}, containerSection(t, reads...)))
 }
 
 func TestLandCheckRunsChecksWithoutBuildingOrSaving(t *testing.T) {

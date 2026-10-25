@@ -660,6 +660,20 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 			return r.fail(ctx, batch, "max-rounds")
 		}
 		build, infra, err := r.build(ctx, batch)
+		var changed PackagesChangedError
+		if errors.As(err, &changed) {
+			returned, err := r.dropManifestChanges(ctx, batch)
+			if err != nil {
+				if r.reloaded(ctx, batch, err) {
+					return *batch, nil
+				}
+				return r.fail(ctx, batch, "return")
+			}
+			if !returned {
+				return r.fail(ctx, batch, "packages-unable")
+			}
+			continue
+		}
 		if err != nil {
 			return r.fail(ctx, batch, "build")
 		}
@@ -1413,6 +1427,10 @@ func (r Runner) build(ctx context.Context, batch *Batch) (KeptBuild, bool, error
 		}
 		if err != nil {
 			build.Release()
+			var changed PackagesChangedError
+			if errors.As(err, &changed) {
+				return KeptBuild{Release: noRelease}, false, err
+			}
 			if attempt == r.infraLimit() {
 				return KeptBuild{Release: noRelease}, true, nil
 			}

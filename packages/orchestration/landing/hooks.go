@@ -170,9 +170,9 @@ func (h HookConfig) validate(mounts map[string]Mount) error {
 		return fmt.Errorf("apply %q needs outputs: its apply reads the first of them", apply)
 	}
 	switch h.Network {
-	case "", NetworkNone, NetworkDefault:
+	case "", NetworkNone, NetworkHost:
 	default:
-		return fmt.Errorf("network %q is not %q or %q", h.Network, NetworkDefault, NetworkNone)
+		return fmt.Errorf("network %q is not %q or %q", h.Network, NetworkHost, NetworkNone)
 	}
 	for _, name := range slices.Sorted(maps.Keys(h.Mounts)) {
 		mode := h.Mounts[name]

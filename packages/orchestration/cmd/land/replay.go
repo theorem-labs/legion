@@ -99,13 +99,14 @@ func runReplayCommand(ctx context.Context, args []string, output io.Writer) erro
 	manifestPath := flags.String("manifest", "", "replay manifest")
 	configPath := flags.String("config", "", "land configuration")
 	only := flags.Int("round", 0, "replay only this build round")
-	confirm := flags.String("confirm-with", "", "confirmation build command")
+	confirm := flags.String("confirm-with", "", "confirmation build command, run on this host")
+	confirmConfigured := flags.Bool("confirm", false, "confirm with the configured build, in a container on the build VM")
 	summaryPath := flags.String("summary", "", "write the round summaries here")
-	usage := usageError{fmt.Errorf("usage: land replay --manifest FILE --config FILE [--round R] [--confirm-with CMD] [--summary FILE]")}
+	usage := usageError{fmt.Errorf("usage: land replay --manifest FILE --config FILE [--round R] [--confirm | --confirm-with CMD] [--summary FILE]")}
 	if err := flags.Parse(args); err != nil {
 		return usageError{err}
 	}
-	if *manifestPath == "" || *configPath == "" || flags.NArg() != 0 {
+	if *manifestPath == "" || *configPath == "" || flags.NArg() != 0 || (*confirm != "" && *confirmConfigured) {
 		return usage
 	}
 	manifest, err := replay.Load(*manifestPath)
@@ -122,19 +123,38 @@ func runReplayCommand(ctx context.Context, args []string, output io.Writer) erro
 	if cfg.Repository.Path == "" {
 		cfg.Repository.Path = manifest.Repository
 	}
+	// With a container section the checks and the --confirm builds run in containers on the build VM, as land run
+	// runs them; without one the checks run on this host.
+	checkers := cfg.checkers()
+	var containers containers
+	if cfg.Container.Image != "" || len(cfg.Container.SSH) != 0 {
+		if containers, err = cfg.docker(); err != nil {
+			return err
+		}
+		if err := containers.docker.Start(ctx, containers.declared, false); err != nil {
+			return err
+		}
+		checkers = containers.checkers(cfg.Checks)
+	}
 	r := &replayer{
 		manifest:   manifest,
 		logDir:     filepath.Dir(*manifestPath),
 		roots:      cfg.ModuleRoots,
-		runner:     landing.Runner{Git: landing.RepositoryGit{Path: manifest.Repository}, Checks: cfg.checkers()},
+		runner:     landing.Runner{Git: landing.RepositoryGit{Path: manifest.Repository}, Checks: checkers},
 		blames:     map[int]*roundBlame{},
 		unresolved: map[string]bool{},
 		files:      map[string][]string{},
 		added:      map[string]map[string]bool{},
 		output:     output,
 	}
-	if *confirm != "" {
-		r.builder = &landing.CommandBuilder{RepositoryPath: manifest.Repository, Command: []string{"sh", "-c", *confirm}}
+	switch {
+	case *confirm != "":
+		r.builder = landing.CommandBuilder{RepositoryPath: manifest.Repository, Command: []string{"sh", "-c", *confirm}}
+	case *confirmConfigured:
+		if containers.docker.Image == "" || len(cfg.Build) == 0 {
+			return fmt.Errorf("--confirm needs the configuration's container section and build")
+		}
+		r.builder = containers.builder(cfg.Build)
 	}
 	for _, unresolved := range manifest.Unresolved {
 		r.unresolved[unresolved.ID] = true
@@ -170,7 +190,7 @@ type replayer struct {
 	logDir     string
 	roots      []string
 	runner     landing.Runner
-	builder    *landing.CommandBuilder
+	builder    blame.Builder
 	blames     map[int]*roundBlame
 	unresolved map[string]bool
 	files      map[string][]string        // tree:path -> its lines

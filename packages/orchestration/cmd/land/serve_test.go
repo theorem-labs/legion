@@ -60,8 +60,8 @@ func readyRepository(t *testing.T, migrations ...string) (repo, base string, hea
 // forms each batch from the ledger's ready migrations.
 func servingConfig(t *testing.T, repository, repo, dsnFile string, interval time.Duration) string {
 	t.Helper()
-	return writeConfig(t, map[string]any{
-		"repository":  map[string]any{"name": repository, "path": repo, "git_dir": "/srv/land/repo.git"},
+	return writeConfig(t, withContainer(map[string]any{
+		"repository":  map[string]any{"name": repository, "path": repo},
 		"baseBranch":  "trunk",
 		"build":       []string{"sh", "-c", "exit 0"},
 		"hasher":      []string{"sh", "-c", "exit 0"},
@@ -70,7 +70,7 @@ func servingConfig(t *testing.T, repository, repo, dsnFile string, interval time
 		"escalations": map[string]any{"owner": "landing-operator"},
 		"batch":       map[string]any{"max_members": 2},
 		"interval":    int64(interval),
-	})
+	}, containerSection(t)))
 }
 
 // land serve starts without a configured batch and forms its first one from the ledger's ready migrations, in

@@ -21,13 +21,16 @@ type Mount struct {
 	Mode     MountMode
 }
 
-// Network is a container's network: NetworkDefault is docker's bridge, and
-// NetworkNone (also the empty value) gives it no network at all.
+// Network is a container's network: NetworkHost is the build VM's own network
+// stack, and NetworkNone (also the empty value) gives it no network at all.
+// The bridge is not offered: from it the Cloud SQL proxy, which listens on the
+// VM's 127.0.0.1 only, cannot be reached (measured on the build VM,
+// 2026-10-25 18:56Z).
 type Network string
 
 const (
-	NetworkNone    Network = "none"
-	NetworkDefault Network = "default"
+	NetworkNone Network = "none"
+	NetworkHost Network = "host"
 )
 
 // ContainerRun is one command run in a container of the pinned image on the

@@ -12,10 +12,9 @@ import (
 // hookedConfig is a publication configuration with two declared mounts and one configured hook.
 func hookedConfig(t *testing.T, hook landing.HookConfig) config {
 	cfg := publicationConfig(t)
-	cfg.Container = containerConfig{
-		Image: "image@sha256:one", User: "1002:1003",
-		Mounts: []mountConfig{{Name: "index", HostPath: "/srv/land/index"}, {Name: "graph", HostPath: "/srv/land/graph"}},
-	}
+	cfg.Container.Image, cfg.Container.User = "image@sha256:one", "1002:1003"
+	cfg.Container.Mounts = append(cfg.Container.Mounts,
+		mountConfig{Name: "index", HostPath: "/srv/land/index"}, mountConfig{Name: "graph", HostPath: "/srv/land/graph"})
 	cfg.PostLanding = landing.PostLanding{Parts: []string{"slice", "all"}, TimeoutSeconds: 21600, Hooks: []landing.HookConfig{hook}}
 	cfg.Librarian = librarianConfig{Command: []string{"/usr/local/bin/librarian-notify"}}
 	cfg.Effects = effectsConfig{EscalateAfter: 4}

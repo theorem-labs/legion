@@ -34,7 +34,14 @@ func runCheck(ctx context.Context, args []string, output io.Writer) error {
 	if cfg.Repository.Path == "" || cfg.Base == "" {
 		return fmt.Errorf("repository.path and base are required")
 	}
-	runner := landing.Runner{Git: landing.RepositoryGit{Path: cfg.Repository.Path}, Checks: cfg.checkers()}
+	containers, err := cfg.docker()
+	if err != nil {
+		return err
+	}
+	if err := containers.docker.Start(ctx, containers.declared, false); err != nil {
+		return err
+	}
+	runner := landing.Runner{Git: landing.RepositoryGit{Path: cfg.Repository.Path}, Checks: containers.checkers(cfg.Checks)}
 	report, err := runner.CheckCandidate(ctx, landing.Input{ID: cfg.BatchID, Repository: cfg.Repository.Name, Base: cfg.Base, BaseBranch: cfg.BaseBranch, Members: cfg.Members})
 	if err != nil {
 		return err
