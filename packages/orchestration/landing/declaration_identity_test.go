@@ -74,10 +74,10 @@ func attribute(t *testing.T, repo, base string, heads map[string]string, candida
 		}
 		evidence[name] = memberEvidence
 	}
-	lines := make(map[string]blame.TreeDeclarations)
+	lines := make(map[string]blame.TreeLines)
 	for _, block := range report.Blocks {
 		for _, name := range blame.Names(block.Message) {
-			lines[name.Value] = blame.TreeDeclarations{
+			lines[name.Value] = blame.TreeLines{
 				Base:      declarationLines(t, git, repo, Tree(base), name.Value),
 				Candidate: declarationLines(t, git, repo, candidate, name.Value),
 			}

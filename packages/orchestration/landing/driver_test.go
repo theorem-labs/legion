@@ -294,9 +294,9 @@ type checkerFake struct {
 
 func (f checkerFake) Name() string { return f.name }
 
-func (f checkerFake) Check(_ context.Context, tree Tree) ([]Finding, error) {
+func (f checkerFake) Check(_ context.Context, in CheckInput) ([]Finding, error) {
 	if f.findingsByTree != nil {
-		return f.findingsByTree[tree], f.err
+		return f.findingsByTree[in.Tree], f.err
 	}
 	return f.findings, f.err
 }
