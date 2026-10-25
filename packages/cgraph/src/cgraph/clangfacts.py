@@ -20,6 +20,7 @@ of conditions on those parameters, which a caller's constant arguments decide at
 from __future__ import annotations
 
 import collections
+import itertools
 import re
 import sys
 from collections.abc import Callable, Iterator
@@ -1753,15 +1754,40 @@ def _is_inline(definition: ci.Cursor) -> bool:
 def _is_noinline(definition: ci.Cursor) -> bool:
     """A function marked ``noinline`` on any declaration, also through a macro (the kernel's
     ``noinline``, a ``NEVER_INLINE``): libclang gives each declaration the attributes it inherits, as
-    an attribute cursor whose first token is the attribute's name. The compiler calls such a function,
-    so its returns do not fold into the caller's code."""
+    an attribute cursor whose first token is the attribute's name, after a scope (``[[gnu::noinline]]``).
+    The compiler calls such a function, so its returns do not fold into the caller's code."""
     for declaration in (definition, definition.canonical):
         for child in declaration.get_children():
             if child.kind.is_attribute():
-                first = next(iter(child.get_tokens()), None)
-                if first is not None and first.spelling in ("noinline", "__noinline__"):
+                tokens = [token.spelling for token in itertools.islice(child.get_tokens(), 3)]
+                name = tokens[2] if len(tokens) == 3 and tokens[1] == "::" else (tokens[0] if tokens else "")
+                if name in ("noinline", "__noinline__"):
                     return True
     return False
+
+
+# A body clang -O2 inlines at each call whatever its linkage: no loop, no asm, no call of itself, and at
+# most this many calls and syntax nodes (fct_init_always: an if, one call and two returns).
+_SMALL_CALLS = 4
+_SMALL_NODES = 60
+
+
+def _small_body(definition: ci.Cursor) -> bool:
+    """The function's body is small enough that clang inlines it at every call (``_SMALL_CALLS``)."""
+    body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
+    if body is None:
+        return False
+    calls = 0
+    for nodes, node in enumerate(body.walk_preorder(), 1):
+        if node.kind in (*_LOOPS, K.ASM_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT) or nodes > _SMALL_NODES:
+            return False
+        if node.kind == K.CALL_EXPR:
+            calls += 1
+            if calls > _SMALL_CALLS or (
+                node.referenced is not None and node.referenced.spelling == definition.spelling
+            ):
+                return False
+    return True
 
 
 def _is_noreturn(function: ci.Cursor | None) -> bool:
@@ -2237,8 +2263,33 @@ class _Evaluator:
         self.choices: dict[tuple[int, bool], int | None] = {}
         self.transferring: dict[int, bool] = {}
         self.structs: dict[int, dict[str, Any] | None] = {}  # each const global struct's value, by its hash
+        self.folded_into: dict[str, bool] = {}  # per function, whether its calls fold its body (``folds_into``)
         # Variables as the unit's own values: a local as the values stored in it, a parameter unknown.
         self.known = self.resolver({})
+
+    def folds_into(self, name: str) -> bool:
+        """The compiler puts the function's body into each call (so its returns fold there): one
+        declared ``inline``, a static one the unit calls once and whose address it never takes, or one
+        whose body is small (``_small_body``), as clang -O2 inlines under its cost threshold; never one
+        marked ``noinline`` or weak. Another may be called out of line: big(), whose loop makes 15
+        calls a pass, is called from its two callers."""
+        if name not in self.folded_into:
+            definition = self.definitions.get(name)
+            if definition is None or self.weak(definition) or _is_noinline(definition):
+                self.folded_into[name] = False
+            elif _is_inline(definition) or _small_body(definition):
+                self.folded_into[name] = True
+            else:
+                # A whole-unit scan for this one function, once (the answer is cached).
+                uses = [
+                    node
+                    for node in definition.translation_unit.cursor.walk_preorder()
+                    if node.kind == K.DECL_REF_EXPR and node.referenced is not None and node.referenced.spelling == name
+                    and node.referenced.kind == K.FUNCTION_DECL
+                ]  # fmt: skip
+                static = definition.storage_class == ci.StorageClass.STATIC
+                self.folded_into[name] = static and len(uses) == 1
+        return self.folded_into[name]
 
     def image_decides(self, cursor: ci.Cursor) -> bool:
         """``__builtin_constant_p`` or ``__builtin_object_size`` inside: the image decides. Once per cursor."""
@@ -2345,7 +2396,7 @@ class _Evaluator:
             # Too deep to fold here; a shallower use may still fold it, so nothing is kept.
             return (None, None)
         self.helpers[name] = (None, None)
-        if definition is None or self.weak(definition) or _is_noinline(definition):
+        if definition is None or not self.folds_into(name):
             return (None, None)
         body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
         returns = self.live_returns(body) if body is not None else []
@@ -2797,7 +2848,7 @@ class _Evaluator:
             return self.templates[name]
         self.templates[name] = None
         definition = self.definitions.get(name)
-        if definition is None or self.weak(definition) or _is_noinline(definition):
+        if definition is None or not self.folds_into(name):
             return None
         typed = _integer_type(definition.result_type)
         body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)

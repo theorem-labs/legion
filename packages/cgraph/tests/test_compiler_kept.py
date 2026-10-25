@@ -1,10 +1,12 @@
-"""Review probes for cgraph-link e40c6cef: what clang -O2 compiles, for the paths this delta touches."""
+"""C inputs whose code clang-21 -O2 keeps and the facts must keep too: the review probes of the flow and
+evaluator rules (calls, globals and fields the compiled function still has)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
+import pytest
 from test_guards import facts_of, fold
 
 
@@ -107,3 +109,63 @@ def test_a_noinline_an_earlier_declaration_or_a_macro_writes_is_called(tmp_path:
     facts = facts_of(tmp_path, ROUND_SIX)
     assert "warn" in compiled(facts, "declared_noinline")
     assert "warn" in compiled(facts, "macro_noinline")
+
+
+ROUND_SIX_CLAUDE = """
+    #define noinline __attribute__((__noinline__))
+    #define noinline_for_stack noinline
+    #define notrace __attribute__((__no_instrument_function__))
+    #define noinstr noinline notrace __attribute__((__section__(".noinstr.text")))
+    void step(int i);
+    static noinline_for_stack int dbl_stack(int x) { return x * 2; }
+    static inline void chk_stack(int k) { if (dbl_stack(k) == 6) warn(); kept(); }
+    void sa(void) { chk_stack(1); }
+    static noinstr int dbl_instr(int x) { return x * 2; }
+    void si(void) { if (dbl_instr(1) == 6) warn(); kept(); }
+    static int dbl_late(int x) __attribute__((__noinline__));
+    static int dbl_late(int x) { return x * 2; }
+    void sl(void) { if (dbl_late(1) == 6) warn(); kept(); }
+    static int big(int x)
+    {
+        for (int i = 0; i < x + 64; i++) {
+            step(i); step(i + 1); step(i + 2); step(i + 3); step(i + 4); step(i + 5); step(i + 6);
+            step(i + 7); step(i + 8); step(i + 9); step(i + 10); step(i + 11); step(i + 12); step(i + 13);
+            step(i + 14);
+        }
+        return x * 2;
+    }
+    void ba(void) { if (big(1) == 6) warn(); kept(); }
+    void bb(void) { if (big(3) == 6) warn(); kept(); }
+    static int once(int x) { return x * 2; }
+    void oa(void) { if (once(1) == 6) warn(); kept(); }
+    void two_way_a(void) { goto L; if (1) { return; } else { L: warn(); } kept(); }
+    void two_way_b(void) { goto L; if (0) { L: warn(); } else return; kept(); }
+"""
+
+
+@pytest.mark.parametrize("function", ["si", "sl", "ba", "bb", "two_way_a", "two_way_b"])
+def test_round_six_keeps_what_clang_keeps(tmp_path: Path, function: str) -> None:
+    """A noinline the kernel's wrapper macros or a later attribute write, a static with two call sites
+    clang does not inline (big), and both shapes of a goto into one branch of a constant if: clang-21
+    -O2 keeps `call warn` and `kept` in each."""
+    facts = facts_of(tmp_path, ROUND_SIX_CLAUDE)
+    assert {"warn", "kept"} <= compiled(facts, function)
+
+
+def test_a_noinline_for_stack_callee_is_called_at_a_fold(tmp_path: Path) -> None:
+    facts = facts_of(tmp_path, ROUND_SIX_CLAUDE)
+    assert "warn" in {call["callee"] for call in fold(facts, "sa", "chk_stack").calls}
+
+
+def test_a_static_with_one_call_site_still_folds(tmp_path: Path) -> None:
+    """`once` has one call site, which clang inlines: `once(1) == 6` is false there."""
+    assert "warn" not in compiled(facts_of(tmp_path, ROUND_SIX_CLAUDE), "oa")
+
+
+def test_a_scoped_noinline_attribute_is_read(tmp_path: Path) -> None:
+    """`[[gnu::noinline]] static int sq(int x)`: clang calls sq and keeps `tail warn`, which a folded
+    `sq(1) == 6` would rule out."""
+    facts = facts_of(
+        tmp_path, "[[gnu::noinline]] static int sq(int x) { return x * 2; } void sc(void) { if (sq(1) == 6) warn(); }"
+    )
+    assert "warn" in compiled(facts, "sc")
