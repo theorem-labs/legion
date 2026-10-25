@@ -129,9 +129,9 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 	head := command(t, repo, "rev-parse", "HEAD")
 
 	config := filepath.Join(t.TempDir(), "config.json")
-	raw, err := json.Marshal(map[string]any{
+	raw, err := json.Marshal(withContainer(map[string]any{
 		"batchId":     "batch",
-		"repository":  map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/srv/land/repo.git"},
+		"repository":  map[string]any{"name": "owner/repo", "path": repo},
 		"base":        base,
 		"baseBranch":  "trunk",
 		"members":     []map[string]any{{"migration": "one", "generation": 1, "head": head}},
@@ -140,7 +140,7 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 		"toolchain":   []string{"sh", "-c", "printf tool"},
 		"escalations": map[string]any{"owner": "steward"},
 		"ledger":      map[string]any{"dsn_file": ledgerDSNFile(t, "owner/repo", "one", head)},
-	})
+	}, containerSection(t)))
 	if err != nil {
 		t.Fatal(err)
 	}

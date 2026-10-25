@@ -22,13 +22,15 @@ type ReadyRequest struct {
 	StatementRecords
 }
 
-// ReadyRecord is a ready migration's stored landing record.
+// ReadyRecord is a ready migration's stored landing record. Reads are the contract names the migration declared, in
+// name order, which a landing program needs to hash each read before the full check.
 type ReadyRecord struct {
 	ID         string    `json:"id"`
 	Owner      string    `json:"owner"`
 	Generation int64     `json:"generation"`
 	ReadyEvent int64     `json:"ready_event"`
 	ReadyAt    time.Time `json:"ready_at"`
+	Reads      []string  `json:"reads"`
 	StatementRecords
 }
 
@@ -148,10 +150,12 @@ func (s *Store) ReadyMigrations(ctx context.Context, repo string) ([]ReadyRecord
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT id, owner, generation, ready_event, ready_at, ready_records
-			FROM migrations
-			WHERE repo = $1 AND state = 'open' AND ready_event IS NOT NULL
-			ORDER BY ready_event`, repo)
+		rows, err := tx.Query(ctx, `SELECT m.id, m.owner, m.generation, m.ready_event, m.ready_at, m.ready_records,
+				coalesce((SELECT array_agg(r.name ORDER BY r.name) FROM migration_reads r
+					WHERE r.repo = m.repo AND r.migration = m.id), '{}')
+			FROM migrations m
+			WHERE m.repo = $1 AND m.state = 'open' AND m.ready_event IS NOT NULL
+			ORDER BY m.ready_event`, repo)
 		if err != nil {
 			return err
 		}
@@ -161,9 +165,11 @@ func (s *Store) ReadyMigrations(ctx context.Context, repo string) ([]ReadyRecord
 	return ready, err
 }
 
-// scanReadyRecord reads a ready record from a row of id, owner, generation, ready_event, ready_at and ready_records.
+// scanReadyRecord reads a ready record from a row of id, owner, generation, ready_event, ready_at, ready_records and
+// the declared read names.
 func scanReadyRecord(row pgx.CollectableRow) (ReadyRecord, error) {
 	var record ReadyRecord
-	err := row.Scan(&record.ID, &record.Owner, &record.Generation, &record.ReadyEvent, &record.ReadyAt, &record.StatementRecords)
+	err := row.Scan(&record.ID, &record.Owner, &record.Generation, &record.ReadyEvent, &record.ReadyAt,
+		&record.StatementRecords, &record.Reads)
 	return record, err
 }

@@ -98,7 +98,7 @@ func TestAConfigurationTheExecutorsCouldNotRunIsRefused(t *testing.T) {
 		"an apply with no outputs":              {Command: []string{"/bin/hook"}, Apply: ApplyContracts},
 		"a mount mode that is neither":          {Command: []string{"/bin/hook"}, Mounts: map[string]MountMode{"index": "rw"}},
 		"a mount that is not declared":          {Command: []string{"/bin/hook"}, Mounts: map[string]MountMode{"lake-cache": ReadOnly}},
-		"a network that is neither":             {Command: []string{"/bin/hook"}, Network: "host"},
+		"a network that is neither":             {Command: []string{"/bin/hook"}, Network: "bridge"},
 		"an input the program writes itself": {Command: []string{"/bin/hook"}, Inputs: []HookInput{
 			{Name: ContractsInput, Command: []string{"/bin/contracts"}}}},
 		"an input command that is not absolute": {Command: []string{"/bin/hook"}, Inputs: []HookInput{

@@ -18,13 +18,15 @@ const (
 	PullRequestClosed  PullRequestState = "closed"
 )
 
-// PullRequest identifies the candidate pull request and its observed outcome.
+// PullRequest identifies the candidate pull request and its observed outcome. Its JSON names are the ledger's: an
+// operator's resolution of a landed_unrecorded batch writes pull_request.merged_commit into the stored record, and
+// the program reads the resolved commit back from there.
 type PullRequest struct {
-	Number       int
-	Head         string
-	MergedCommit string
-	State        PullRequestState
-	Reason       string
+	Number       int              `json:"number"`
+	Head         string           `json:"head"`
+	MergedCommit string           `json:"merged_commit"`
+	State        PullRequestState `json:"state"`
+	Reason       string           `json:"reason,omitempty"`
 }
 
 // GitHub is the merge-queue surface the publisher needs.

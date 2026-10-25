@@ -36,8 +36,8 @@ func TestServePostsNoMergeGroupStatus(t *testing.T) {
 	repo, _, _ := readyRepository(t)
 	_, dsnFile := servingLedger(t, "owner/repo")
 	executable, log := fakeGitHub(t)
-	config := writeConfig(t, map[string]any{
-		"repository":  map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/srv/land/repo.git"},
+	config := writeConfig(t, withContainer(map[string]any{
+		"repository":  map[string]any{"name": "owner/repo", "path": repo},
 		"baseBranch":  "trunk",
 		"build":       []string{"sh", "-c", "exit 0"},
 		"hasher":      []string{"sh", "-c", "exit 0"},
@@ -46,9 +46,9 @@ func TestServePostsNoMergeGroupStatus(t *testing.T) {
 		"escalations": map[string]any{"owner": "landing-operator"},
 		"github":      map[string]any{"remote": "origin", "executable": executable, "pollInterval": int64(50 * time.Millisecond)},
 		"interval":    int64(time.Hour),
-	})
+	}, containerSection(t)))
 
-	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, stop := context.WithTimeout(context.Background(), 60*time.Second)
 	defer stop()
 	if err := run(ctx, []string{"serve", "--config", config}, &lockedBuffer{}); err == nil || !strings.Contains(err.Error(), "context") {
 		t.Fatalf("serve() error = %v, want the ended context", err)

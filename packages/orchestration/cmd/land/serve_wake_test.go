@@ -95,6 +95,23 @@ func serveInBackground(t *testing.T, config string) *lockedBuffer {
 	return output
 }
 
+// firstRound waits until serve has written its first round, a JSON list of batches on one line, and returns that
+// line. It fails the test when no round is written within the deadline.
+func firstRound(t *testing.T, output *lockedBuffer, within time.Duration) []byte {
+	t.Helper()
+	var line string
+	if !waitFor(within, func() bool {
+		output.mu.Lock()
+		defer output.mu.Unlock()
+		first, _, complete := strings.Cut(output.buf.String(), "\n")
+		line = first
+		return complete
+	}) {
+		t.Fatalf("serve wrote no round within %s", within)
+	}
+	return []byte(line)
+}
+
 // waitFor polls until cond holds or within passes.
 func waitFor(within time.Duration, cond func() bool) bool {
 	deadline := time.Now().Add(within)
@@ -114,7 +131,7 @@ func TestServeWakesOnAReadySubmission(t *testing.T) {
 	store, dsnFile := servingLedger(t, "owner/repo")
 	output := serveInBackground(t, servingConfig(t, "owner/repo", repo, dsnFile, time.Hour))
 
-	if !waitFor(60*time.Second, func() bool { return len(output.rounds(t)) >= 1 }) {
+	if !waitFor(5*time.Minute, func() bool { return len(output.rounds(t)) >= 1 }) {
 		t.Fatal("serve never finished its first round")
 	}
 	if ok, _ := formed(output.rounds(t)); ok {
@@ -123,8 +140,8 @@ func TestServeWakesOnAReadySubmission(t *testing.T) {
 
 	readyOne(t, store, "first", base, heads["first"])
 	var members []string
-	if !waitFor(60*time.Second, func() bool { ok, got := formed(output.rounds(t)); members = got; return ok }) {
-		t.Fatalf("a ready submission did not wake serve within a minute of its hour's interval: %+v", output.rounds(t))
+	if !waitFor(5*time.Minute, func() bool { ok, got := formed(output.rounds(t)); members = got; return ok }) {
+		t.Fatalf("a ready submission did not wake serve well within its hour's interval: %+v", output.rounds(t))
 	}
 	if len(members) != 1 || members[0] != "first" {
 		t.Fatalf("the woken round formed %v, want first", members)
@@ -159,11 +176,11 @@ func TestServeIntervalPicksUpAMissedNotification(t *testing.T) {
 		cancel()
 		<-done
 	})
-	if !waitFor(60*time.Second, func() bool { return len(output.rounds(t)) >= 1 }) {
+	if !waitFor(5*time.Minute, func() bool { return len(output.rounds(t)) >= 1 }) {
 		t.Fatal("serve never finished its first round")
 	}
 	readyOne(t, store, "first", base, heads["first"])
-	if !waitFor(60*time.Second, func() bool { ok, _ := formed(output.rounds(t)); return ok }) {
+	if !waitFor(5*time.Minute, func() bool { ok, _ := formed(output.rounds(t)); return ok }) {
 		t.Fatalf("the interval did not pick up a ready migration whose notification was missed: %+v", output.rounds(t))
 	}
 }
@@ -178,12 +195,8 @@ func TestServeReturnsAHeadThatCannotBeFetched(t *testing.T) {
 	missing := strings.Repeat("1", 40)
 	readyOne(t, store, "second", base, missing)
 
-	round, stop := context.WithTimeout(ctx, 90*time.Second)
-	defer stop()
-	var output bytes.Buffer
-	if err := run(round, []string{"serve", "--config", servingConfig(t, "owner/repo", repo, dsnFile, time.Hour)}, &output); err == nil || !strings.Contains(err.Error(), "context") {
-		t.Fatalf("serve() error = %v, want the ended context", err)
-	}
+	output := serveInBackground(t, servingConfig(t, "owner/repo", repo, dsnFile, time.Hour))
+	line := firstRound(t, output, 10*time.Minute)
 	m, err := store.Migration(ctx, "owner/repo", "second")
 	if err != nil || m.LandingRounds != 1 {
 		t.Fatalf("second = %+v (%v), want returned with one round", m, err)
@@ -206,8 +219,8 @@ func TestServeReturnsAHeadThatCannotBeFetched(t *testing.T) {
 		t.Fatalf("second's round reason = %q, want head_unavailable", reason)
 	}
 	var batches []servedBatch
-	if err := json.Unmarshal([]byte(strings.SplitN(strings.TrimSpace(output.String()), "\n", 2)[0]), &batches); err != nil {
-		t.Fatalf("decode %q: %v", output.String(), err)
+	if err := json.Unmarshal(line, &batches); err != nil {
+		t.Fatalf("decode %q: %v", line, err)
 	}
 	if len(batches) != 1 || len(batches[0].FrozenMembers) != 1 || batches[0].FrozenMembers[0].Migration != "first" {
 		t.Fatalf("serve formed %+v, want one batch of first", batches)

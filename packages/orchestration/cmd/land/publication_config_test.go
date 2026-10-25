@@ -2,21 +2,32 @@ package main
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/sjawhar/legion/orchestration/internal/testdocker"
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
+	"github.com/sjawhar/legion/orchestration/landing"
 )
 
 // publicationConfig is a complete configuration with GitHub publication and neither a score nor an event command.
-// Its ledger DSN names no database: a test that opens the ledger gives it one with withLedger.
+// Its ledger DSN names no database: a test that opens the ledger gives it one with withLedger. Its containers run
+// on this host through the stand-in SSH.
 func publicationConfig(t *testing.T) config {
 	dsnFile := filepath.Join(t.TempDir(), "ledger.dsn")
 	write(t, dsnFile, "postgres://unopened.invalid/ledger\n")
+	root := t.TempDir()
+	clone, runs, cache := filepath.Join(root, "clone.git"), filepath.Join(root, "runs"), filepath.Join(root, "lakecache")
+	for _, dir := range []string{clone, runs, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return config{
 		BatchID:     "batch",
-		Repository:  repositoryConfig{Name: "owner/repo", Path: t.TempDir(), GitDir: "/srv/land/repo.git"},
+		Repository:  repositoryConfig{Name: "owner/repo", Path: t.TempDir(), GitDir: clone},
 		Base:        "base",
 		BaseBranch:  "trunk",
 		Build:       []string{"sh", "-c", "true"},
@@ -25,6 +36,11 @@ func publicationConfig(t *testing.T) config {
 		Escalations: escalationsConfig{Owner: "landing-operator"},
 		Ledger:      ledgerConfig{DSNFile: dsnFile},
 		GitHub:      githubConfig{Remote: "origin"},
+		Container: containerConfig{
+			SSH: testdocker.SSH(t), Image: testdocker.Image, User: "1000:1000", RunRoot: runs, BuildRoot: "lake-cache",
+			Mounts:      []mountConfig{{Name: "lake-cache", HostPath: cache}},
+			BuildMounts: map[string]landing.MountMode{"lake-cache": landing.ReadWrite},
+		},
 	}
 }
 

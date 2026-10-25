@@ -11,9 +11,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -135,6 +137,13 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 	}
 	defer program.close()
 	runner := program.runner
+	if command != "status" {
+		// Before any command runs on the VM: refuse a missing path and make the clone. serve also removes the
+		// landed trees and build directories that an earlier process left behind.
+		if err := program.containers.docker.Start(ctx, program.containers.declared, command == "serve"); err != nil {
+			return err
+		}
+	}
 	switch command {
 	case "run":
 		batch, err := runner.Run(ctx, program.input)
@@ -284,12 +293,24 @@ type githubConfig struct {
 }
 
 // containerConfig is the container boundary every command that reads candidate or landed content runs behind: the
-// image pinned by digest, the uid:gid of the VM user that owns the mounted paths, and the named mounts a hook, a
-// build or the hasher may be given.
+// SSH argv that reaches the build VM (its last word is the host), the image pinned by digest, the uid:gid of the VM
+// user that owns the mounted paths, the VM directory that holds each run's inputs and scratch, and the named mounts
+// a hook, a build, the hasher or a check may be given. A mount's host path may be a file (a DSN file) or a
+// directory. build_root names the mount that holds the build directories and the package store, and
+// packages_source the mount whose .lake/packages fills the store.
 type containerConfig struct {
-	Image  string        `json:"image"`
-	User   string        `json:"user"`
-	Mounts []mountConfig `json:"mounts"`
+	SSH            []string                     `json:"ssh"`
+	Image          string                       `json:"image"`
+	User           string                       `json:"user"`
+	RunRoot        string                       `json:"run_root"`
+	BuildRoot      string                       `json:"build_root"`
+	PackagesSource string                       `json:"packages_source"`
+	Mounts         []mountConfig                `json:"mounts"`
+	BuildMounts    map[string]landing.MountMode `json:"build_mounts"`
+	HasherMounts   map[string]landing.MountMode `json:"hasher_mounts"`
+	HasherNetwork  landing.Network              `json:"hasher_network"`
+	CheckMounts    map[string]landing.MountMode `json:"check_mounts"`
+	CheckNetwork   landing.Network              `json:"check_network"`
 }
 
 // mountConfig declares one named path of the build VM, mounted at that same path inside a container.
@@ -323,6 +344,103 @@ func (c config) container() landing.Container {
 		mounts[mount.Name] = landing.Mount{Name: mount.Name, HostPath: mount.HostPath}
 	}
 	return landing.Container{Image: c.Container.Image, User: c.Container.User, GitDir: c.Repository.GitDir, Mounts: mounts}
+}
+
+// docker is the executor of every container on the build VM, and the mounts that the builds, the hasher and the
+// checks get. It refuses a container section that lacks a key, a mode or network that is not one of the two, and a
+// mount map that names an undeclared mount.
+func (c config) docker() (containers, error) {
+	k := c.Container
+	if len(k.SSH) == 0 || k.Image == "" || k.User == "" || k.RunRoot == "" || k.BuildRoot == "" {
+		return containers{}, fmt.Errorf("container.ssh, container.image, container.user, container.run_root, and container.build_root are required: every build, check, hasher and hook runs in a container on the build VM")
+	}
+	declared := c.container().Mounts
+	resolve := func(key string, modes map[string]landing.MountMode) ([]landing.Mount, error) {
+		var mounts []landing.Mount
+		for _, name := range slices.Sorted(maps.Keys(modes)) {
+			mount, found := declared[name]
+			if !found {
+				return nil, fmt.Errorf("container.%s names %q, which container.mounts does not declare", key, name)
+			}
+			if mode := modes[name]; mode != landing.ReadOnly && mode != landing.ReadWrite {
+				return nil, fmt.Errorf("container.%s.%s is %q, not %q or %q", key, name, mode, landing.ReadOnly, landing.ReadWrite)
+			}
+			mount.Mode = modes[name]
+			mounts = append(mounts, mount)
+		}
+		return mounts, nil
+	}
+	var out containers
+	var err error
+	if out.build, err = resolve("build_mounts", k.BuildMounts); err != nil {
+		return containers{}, err
+	}
+	if out.hasher, err = resolve("hasher_mounts", k.HasherMounts); err != nil {
+		return containers{}, err
+	}
+	if out.check, err = resolve("check_mounts", k.CheckMounts); err != nil {
+		return containers{}, err
+	}
+	for key, network := range map[string]landing.Network{"hasher_network": k.HasherNetwork, "check_network": k.CheckNetwork} {
+		switch network {
+		case "", landing.NetworkNone, landing.NetworkHost:
+		default:
+			return containers{}, fmt.Errorf("container.%s %q is not %q or %q", key, network, landing.NetworkHost, landing.NetworkNone)
+		}
+	}
+	out.checkNetwork = k.CheckNetwork
+	buildRoot, found := declared[k.BuildRoot]
+	if !found {
+		return containers{}, fmt.Errorf("container.build_root names %q, which container.mounts does not declare", k.BuildRoot)
+	}
+	if mode, built := k.BuildMounts[k.BuildRoot]; !built || mode != landing.ReadWrite {
+		return containers{}, fmt.Errorf("container.build_mounts must make the build root %q read-write: the builds are made inside it", k.BuildRoot)
+	}
+	source := ""
+	if k.PackagesSource != "" {
+		mount, found := declared[k.PackagesSource]
+		if !found {
+			return containers{}, fmt.Errorf("container.packages_source names %q, which container.mounts does not declare", k.PackagesSource)
+		}
+		source = mount.HostPath
+	}
+	out.docker = landing.Docker{
+		SSH:            append([]string(nil), k.SSH...),
+		Image:          k.Image,
+		User:           k.User,
+		GitDir:         c.Repository.GitDir,
+		RepositoryPath: c.Repository.Path,
+		Repository:     c.Repository.Name,
+		RunRoot:        k.RunRoot,
+		BuildRoot:      buildRoot.HostPath,
+		PackagesSource: source,
+	}
+	for _, mount := range c.Container.Mounts {
+		out.declared = append(out.declared, landing.Mount{Name: mount.Name, HostPath: mount.HostPath})
+	}
+	return out, nil
+}
+
+// containers is the configured executor and the mounts of each kind of container.
+type containers struct {
+	docker               landing.Docker
+	build, hasher, check []landing.Mount
+	checkNetwork         landing.Network
+	declared             []landing.Mount
+}
+
+// builder is the build adapter of land run, land serve, land blame and land replay.
+func (k containers) builder(command []string) landing.ContainerBuilder {
+	return landing.ContainerBuilder{Docker: k.docker, Command: command, Mounts: k.build}
+}
+
+// checkers are the configured checks, each in a container.
+func (k containers) checkers(checks []checkConfig) []landing.Checker {
+	checkers := make([]landing.Checker, 0, len(checks))
+	for _, check := range checks {
+		checkers = append(checkers, landing.ContainerChecker{Docker: k.docker, CheckName: check.Name, Command: check.Command, Format: check.Format, Mounts: k.check, Network: k.checkNetwork})
+	}
+	return checkers
 }
 
 type eventConfig struct {
@@ -362,10 +480,11 @@ func (c config) checkers() []landing.Checker {
 // batches, and what to release at the end. The merge queue's required landing/merge-group status comes from the
 // repository's GitHub Actions workflow, not from this program.
 type program struct {
-	runner landing.Runner
-	input  landing.Input
-	list   func(context.Context) ([]landing.Batch, error)
-	close  func()
+	runner     landing.Runner
+	containers containers
+	input      landing.Input
+	list       func(context.Context) ([]landing.Batch, error)
+	close      func()
 	// ledger and dsn are the open ledger and its database, from which `land serve` opens its wake source.
 	ledger *ledger.Store
 	dsn    string
@@ -403,10 +522,17 @@ func (c config) program(ctx context.Context) (program, error) {
 	if len(c.PostLanding.Hooks) != 0 && strings.TrimSpace(c.Escalations.Owner) == "" {
 		return program{}, fmt.Errorf("escalations.owner is required: the ledger enqueues every escalation for it")
 	}
+	containers, err := c.docker()
+	if err != nil {
+		return program{}, err
+	}
+	out.containers = containers
 	git := landing.RepositoryGit{Path: path, FetchURL: c.Repository.FetchURL}
 	runner := landing.Runner{
-		Builder:              landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
-		Hasher:               landing.CommandHasher{Command: c.Hasher, Directory: path},
+		Builder:              containers.builder(c.Build),
+		Hasher:               landing.ContainerHasher{Docker: containers.docker, Command: c.Hasher, Mounts: containers.hasher, Network: c.Container.HasherNetwork},
+		Containers:           containers.docker,
+		Trees:                containers.docker,
 		Git:                  git,
 		Heads:                git,
 		ModuleRoots:          append([]string(nil), c.ModuleRoots...),
@@ -423,7 +549,7 @@ func (c config) program(ctx context.Context) (program, error) {
 		Scores:               landing.RepositoryScore{Path: path},
 		Toolchain:            commandToolchain(path, c.Toolchain),
 	}
-	runner.Checks = c.checkers()
+	runner.Checks = containers.checkers(c.Checks)
 	if len(c.Publish.Command) != 0 {
 		runner.Defects = landing.CommandDefects{Directory: path, Command: c.Publish.Command}
 	}
@@ -588,12 +714,39 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 	excludeFile := flags.String("exclude", "", "member identifiers to exclude")
 	candidateRef := flags.String("candidate", "", "recorded candidate commit or tree")
 	logFile := flags.String("log", "", "build log")
-	confirm := flags.String("confirm-with", "", "builder command")
+	confirm := flags.String("confirm-with", "", "confirmation build command, run on this host")
+	configPath := flags.String("config", "", "land configuration whose build confirms, in a container on the build VM")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *repository == "" || *base == "" || *membersFile == "" || *logFile == "" {
 		return fmt.Errorf("--repo, --base, --members, and --log are required")
+	}
+	if *confirm != "" && *configPath != "" {
+		return fmt.Errorf("--confirm-with and --config are two ways to confirm; give one")
+	}
+	var confirmer blame.Builder
+	switch {
+	case *confirm != "":
+		confirmer = archiveBuilder{repository: *repository, command: *confirm}
+	case *configPath != "":
+		cfg, err := readConfig(*configPath)
+		if err != nil {
+			return err
+		}
+		if len(cfg.Build) == 0 {
+			return fmt.Errorf("--config: the configuration has no build")
+		}
+		// The trees come from --repo, so the pushes to the program's clone do too.
+		cfg.Repository.Path = *repository
+		containers, err := cfg.docker()
+		if err != nil {
+			return err
+		}
+		if err := containers.docker.Start(ctx, containers.declared, false); err != nil {
+			return err
+		}
+		confirmer = containers.builder(cfg.Build)
 	}
 	members, err := readMembers(*membersFile)
 	if err != nil {
@@ -641,8 +794,8 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 	attributions := blame.IdentifyDetailed(report, evidence, lines)
-	if *confirm != "" {
-		attributions, err = confirmAttributions(ctx, *repository, *base, members, report.RedModules, attributions, *confirm)
+	if confirmer != nil {
+		attributions, err = confirmAttributions(ctx, *repository, *base, members, report.RedModules, attributions, confirmer)
 		if err != nil {
 			return err
 		}
@@ -754,7 +907,7 @@ func collectTreeLines(ctx context.Context, repository string, base, candidate bl
 	return declarations, ambiguous, fields, nil
 }
 
-func confirmAttributions(ctx context.Context, repository, base string, members []blame.Member, modules []string, attributions []blame.Attribution, command string) ([]blame.Attribution, error) {
+func confirmAttributions(ctx context.Context, repository, base string, members []blame.Member, modules []string, attributions []blame.Attribution, builder blame.Builder) ([]blame.Attribution, error) {
 	suspects := make(map[string][]string)
 	for _, attribution := range attributions {
 		suspects[attribution.Module] = append(suspects[attribution.Module], attribution.Member)
@@ -770,7 +923,7 @@ func confirmAttributions(ctx context.Context, repository, base string, members [
 		}
 		return blame.Tree(result.Tree), nil
 	}
-	confirmation, err := blame.ConfirmModules(ctx, base, modules, members, suspects, candidate, archiveBuilder{repository: repository, command: command})
+	confirmation, err := blame.ConfirmModules(ctx, base, modules, members, suspects, candidate, builder)
 	if err != nil {
 		return nil, err
 	}
@@ -805,25 +958,6 @@ func firstReason(report blame.Report) string {
 		}
 	}
 	return "bisect"
-}
-
-func confirmCulprits(ctx context.Context, repository, base string, members []blame.Member, modules, named []string, command string) ([]string, error) {
-	candidate := func(ctx context.Context, base string, selected []blame.Member) (blame.Tree, error) {
-		inputs := make([]gitx.Member, len(selected))
-		for index, member := range selected {
-			inputs[index] = gitx.Member{ID: member.ID, Head: member.Head}
-		}
-		result, err := gitx.Candidate(ctx, repository, base, inputs)
-		if err != nil {
-			return "", err
-		}
-		return blame.Tree(result.Tree), nil
-	}
-	result, err := blame.Confirm(ctx, base, modules, members, named, candidate, archiveBuilder{repository: repository, command: command})
-	if err != nil {
-		return nil, err
-	}
-	return append(result.Confirmed, result.Bisected...), nil
 }
 
 type archiveBuilder struct {
