@@ -313,3 +313,88 @@ func TestALetInATypeHidesNoHead(t *testing.T) {
 		}
 	}
 }
+
+// A type annotation (`optParam`, `autoParam`) under metadata, on the whole annotation or on its partly applied
+// function, is read as the annotation it is: the head is the head of the type under it, and no head at all where
+// that type has none. Lean reads an annotation only on an application that holds no metadata, so the exporter
+// removes the two in turn. Metadata on what is not an annotation (a sort, a lambda, a variable, a let) makes no head.
+func TestAnAnnotationUnderMetadataIsNoHead(t *testing.T) {
+	ctx := context.Background()
+	l := leanForTest(t)
+	dir := t.TempDir()
+	compileSource(t, l, dir, "Annotations", "import Lean\nopen Lean Elab Term\n"+
+		// whole: metadata on the whole term; spine: on the function of its application, as an elaborator can leave a
+		// partly applied constant; firstDomainSpine: the first binder type of a declaration, the same way.
+		"elab \"whole\" t:term : term => do\n"+
+		"  return mkMData (KVMap.empty.setBool `annotated true) (← elabTerm t none)\n"+
+		"elab \"spine\" t:term : term => do\n"+
+		"  match ← elabTerm t none with\n"+
+		"  | .app f a => return .app (mkMData (KVMap.empty.setBool `annotated true) f) a\n"+
+		"  | e => throwError \"not an application: {e}\"\n"+
+		"elab \"firstDomainSpine\" id:ident : term => do\n"+
+		"  let .forallE _ (.app f a) _ _ := (← getConstInfo id.getId).type | throwError \"no applied binder type\"\n"+
+		"  return .app (mkMData (KVMap.empty.setBool `annotated true) f) a\n"+
+		"elab \"lambdaUnderMetadata\" : term => do\n"+
+		"  return mkMData (KVMap.empty.setBool `annotated true) (← elabTerm (← `(fun T : Type => T)) none)\n"+
+		"def defaultPlain (h : optParam Nat 0) : Nat := h\n"+
+		"def defaultSpine (h : spine (optParam Nat 0)) : Nat := h\n"+
+		"def defaultWhole (h : whole (optParam Nat 0)) : Nat := h\n"+
+		"theorem predicateDefaultPlain (P : optParam (Nat → Prop) (fun _ => True)) : True := trivial\n"+
+		"theorem predicateDefaultSpine (P : spine (optParam (Nat → Prop) (fun _ => True))) : True := trivial\n"+
+		"def tacticDefault (h : Nat := by exact 0) : Nat := h\n"+
+		"def tacticDefaultSpine (h : firstDomainSpine tacticDefault) : Nat := h\n"+
+		"def sortWhole : whole Type := Nat\n"+
+		"def lambdaSpine : lambdaUnderMetadata Nat := (0 : Nat)\n"+
+		"def letWhole : whole (let T := Nat; T) := (0 : Nat)\n"+
+		"theorem variableSpine (P : Nat → Prop) (h : (whole P) 0) : (whole P) 0 := h\n")
+	x := &Exporter{Lean: l, Bin: exporterForTest(t, l), SearchPath: []string{dir}, Jobs: 1}
+	cs, err := x.Run(ctx, Manifest{Modules: []string{"Annotations"}, Roots: []string{"Annotations"}, Types: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Constant{}
+	for _, c := range cs {
+		got[c.Name] = c
+	}
+	for name, want := range map[string]struct {
+		binders    []string
+		conclusion string
+	}{
+		"defaultPlain":          {[]string{"Nat"}, "Nat"},
+		"defaultSpine":          {[]string{"Nat"}, "Nat"},
+		"defaultWhole":          {[]string{"Nat"}, "Nat"},
+		"predicateDefaultPlain": {[]string{""}, "True"},
+		"predicateDefaultSpine": {[]string{""}, "True"},
+		"tacticDefault":         {[]string{"Nat"}, "Nat"},
+		"tacticDefaultSpine":    {[]string{"Nat"}, "Nat"},
+		"sortWhole":             {[]string{}, ""},
+		"lambdaSpine":           {[]string{}, ""},
+		"letWhole":              {[]string{}, ""},
+		"variableSpine":         {[]string{"", ""}, ""},
+	} {
+		c, ok := got[name]
+		if !ok {
+			t.Errorf("the exporter gave no constant %s", name)
+			continue
+		}
+		if !reflect.DeepEqual(c.Binders, want.binders) || c.Conclusion != want.conclusion {
+			t.Errorf("%s (%s): binders %q, conclusion %q; want %q, %q", name, c.Type, c.Binders, c.Conclusion, want.binders, want.conclusion)
+		}
+	}
+	// The index holds what the exporter gave, once a refresh with the compiled part has read the module.
+	s := openStore(t)
+	tree := Tree{Source: dir, Lib: dir, Roots: Roots{"Annotations": true}}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: goldenCommit, Compiled: compiledWith(&CompiledOptions{Exporter: x, Dir: t.TempDir()})}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompiledCommit(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	held, err := s.ConstantsIn(ctx, []string{"Annotations"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := byModuleAndName(cs); !reflect.DeepEqual(held, want) {
+		t.Errorf("the index holds:\n%+v\nthe exporter gave:\n%+v", held, want)
+	}
+}

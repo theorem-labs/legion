@@ -46,28 +46,36 @@ def kindOf : ConstantInfo → String
   | .defnInfo _ => "def" | .thmInfo _ => "theorem" | .inductInfo _ => "inductive" | .ctorInfo _ => "ctor"
   | .axiomInfo _ => "axiom" | .opaqueInfo _ => "opaque" | .recInfo _ => "rec" | .quotInfo _ => "quot"
 
-/-- The constant at the bottom of the application `e`, past metadata anywhere on its spine (an elaborator can put
-metadata on a partly applied constant); empty when there is none. -/
-partial def appHead (e : Expr) : String :=
-  match e.consumeMData with
-  | .app f _ => appHead f
-  | .const n _ => n.toString
-  | _ => ""
+/-- `e` with the metadata on its application spine removed: on `e` itself and on the function of each application
+down to the head. An elaborator can put metadata on a partly applied constant, `optParam` and `autoParam` among
+them. -/
+partial def spineWithoutMData : Expr → Expr
+  | .app f a => .app (spineWithoutMData f) a
+  | e => e.consumeMData
 
-/-- The constant at the head of `e` past its own binders, a `let` or `have` of its body, its type annotations
-(`optParam`, `autoParam`, `outParam`) and metadata, as Lean prints its full name; empty when the head is not a
-constant (a variable, a sort). -/
+/-- `e` past metadata and type annotations (`optParam`, `autoParam`, `outParam`) at its top, however they nest:
+Lean's `cleanupAnnotations` recognises an annotation only on an application spine that holds no metadata, so the
+two are removed in turn until neither changes `e`. -/
+partial def withoutAnnotations (e : Expr) : Expr :=
+  let e' := (spineWithoutMData e).cleanupAnnotations
+  if e' == e then e else withoutAnnotations e'
+
+/-- The constant at the head of `e` past its own binders, a `let` or `have` of its body, and metadata and type
+annotations (`withoutAnnotations`), as Lean prints its full name; empty when the head is not a constant (a variable,
+a sort, a lambda). -/
 partial def headOf (e : Expr) : String :=
-  match e.cleanupAnnotations with
+  match withoutAnnotations e with
   | .forallE _ _ b _ => headOf b
   | .letE _ _ _ b _ => headOf b
-  | e => appHead e
+  | e => match e.getAppFn with
+    | .const n _ => n.toString
+    | _ => ""
 
 /-- The heads (`headOf`) of the types of a type's explicit binders, in order, and the head of its conclusion: the
 type past all its binders, and past a `let` or `have` between them. Read from the elaborated type, not from how its
 source writes it. -/
 partial def headsOf (e : Expr) (binders : Array String := #[]) : Array String × String :=
-  match e.cleanupAnnotations with
+  match withoutAnnotations e with
   | .forallE _ t b bi => headsOf b (if bi.isExplicit then binders.push (headOf t) else binders)
   | .letE _ _ _ b _ => headsOf b binders
   | e => (binders, headOf e)
