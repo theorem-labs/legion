@@ -235,6 +235,9 @@ if $refresh_landing; then
 	cp "$work/out" "$work/refresh.json"
 	cat "$work/err" >&2
 	[ "$status" -eq 0 ] || die "the refresh of $land_commit exited $status"
+	# A refresh of a commit the index already covers prints that and no report: it did no work, so there is
+	# nothing to time. The measurement needs a commit this index has not read.
+	[ -s "$work/refresh.json" ] || die "the index already covers $land_commit, so this refresh did no work: give TIMINGS_LAND_COMMIT a commit the index has not read"
 	python3 - "$work/refresh.json" "$seconds" <<'PY'
 import json
 import sys

@@ -9,9 +9,13 @@ import (
 )
 
 // bars runs the timing driver's reducer over the runs it is given, one `label<TAB>name<TAB>seconds<TAB>status`
-// for each line, and gives its exit code and its report.
+// for each line, and gives its exit code and its report. The driver reduces with python3, as it measures with
+// GNU time, so a machine without it cannot run these tests.
 func bars(t *testing.T, runs string) (int, string) {
 	t.Helper()
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed: the timing driver reduces its runs with it")
+	}
 	file := filepath.Join(t.TempDir(), "runs.tsv")
 	if err := os.WriteFile(file, []byte(runs), 0o600); err != nil {
 		t.Fatal(err)
