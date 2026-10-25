@@ -372,17 +372,18 @@ func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
 	return unreachable(conn.Conn(), tx.Commit(ctx))
 }
 
-// analyze reads the statistics of the tables a refresh wrote, and marks their pages all-visible, on the
-// connection that holds the refresh lock: COPY leaves neither, so the planner would read a declaration's reach
-// with the wrong plan until autovacuum's nap ended, and the post-landing hooks and the owners' first queries run
-// before that. VACUUM cannot run in a transaction block, so this is one statement of its own, after the writes
-// commit.
+// analyze reads the statistics of the tables a refresh wrote, on the connection that holds the refresh lock:
+// COPY leaves none, so the planner would read a declaration's reach with the wrong plan until autovacuum's nap
+// ended, and the post-landing hooks and the owners' first queries run before that. VACUUM cannot run in a
+// transaction block, so this is one statement of its own, after the writes commit. It does not truncate: a
+// reader that opened after the commit holds the tables a landing emptied rows of, and VACUUM would wait five
+// seconds for each of them to give the lock back.
 func (s *Store) analyze(ctx context.Context) error {
 	conn := s.refresh
 	if conn == nil {
 		return fmt.Errorf("analyze the index %q outside its refresh lock", s.index)
 	}
-	_, err := conn.Exec(ctx, "VACUUM (ANALYZE) "+strings.Join(analyzed, ", "))
+	_, err := conn.Exec(ctx, "VACUUM (ANALYZE, TRUNCATE false) "+strings.Join(analyzed, ", "))
 	return unreachable(conn.Conn(), err)
 }
 

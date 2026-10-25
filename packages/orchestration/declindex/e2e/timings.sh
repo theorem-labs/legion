@@ -72,6 +72,11 @@ for label, (median_bar, p95_bar) in bars.items():
     # answer is not a slow answer: it is a measurement the acceptance did not get, and the bar fails.
     values = sorted(answers.get(label, []))
     tried = len(runs.get(label, []))
+    if tried == 0:
+        # A bar no run measured is not a bar that was met: the sample, or the concepts of `states`, was empty.
+        print(f"bar\t{label}\truns\t0\tof the sample\tFAIL")
+        failed = True
+        continue
     if len(values) < tried:
         print(f"bar\t{label}\tanswered\t{len(values)}\tof {tried}\tFAIL")
         failed = True

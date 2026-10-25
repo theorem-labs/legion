@@ -74,3 +74,19 @@ func TestACommandWithNoBarDoesNotFailTheRun(t *testing.T) {
 		}
 	}
 }
+
+// A bar that no run measured is not a bar that was met: a run with no sample at all, or one whose --concepts
+// file was empty so `states` never ran, measures nothing and fails.
+func TestABarWithNoRunOfItsCommandFails(t *testing.T) {
+	if code, out := bars(t, ""); code != 1 {
+		t.Errorf("a measurement with no run at all: exit %d, want 1\n%s", code, out)
+	}
+	without := lines("where", 10, "0.010", "0") + lines("users", 10, "0.010", "0") + lines("same", 10, "0.010", "0")
+	code, out := bars(t, without)
+	if code != 1 {
+		t.Errorf("a measurement in which states never ran: exit %d, want 1\n%s", code, out)
+	}
+	if !strings.Contains(out, "states") {
+		t.Errorf("the report does not name the command that no run measured:\n%s", out)
+	}
+}
