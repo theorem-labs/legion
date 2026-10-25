@@ -226,6 +226,46 @@ func TestTheGateRefusesACopyThatUsesAnotherDeclarationsAbstractedProof(t *testin
 	gateRefuses(t, config, "a copy of foo", "Copy", "def Copy (n : Nat) (h : 0 < n) : Fin n := ⟨n - 1, by omega⟩\n", "bar", "foo")
 }
 
+// Only a theorem whose name Lean generated for an abstracted proof (`X._proof_2`), or a matcher, is an auxiliary that
+// the hash reads by its content. A user's constructor whose name merely looks like one (`Choice._proof_left`,
+// `Pick.match_left`) keeps its own identity, so a definition that returns another constructor of the same type is a
+// new statement: the gate adds it.
+func TestTheGateAddsADefinitionOfAnotherConstructorWhoseNameLooksGenerated(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	config, tree, lean := leanRegistryTree(t, "A")
+	writeTestFile(t, filepath.Join(tree, "A.lean"), "inductive Choice : Type where\n  | _proof_left\n  | _proof_right\n\n"+
+		"inductive Pick : Type where\n  | match_left\n  | match_right\n\n"+
+		"def Original : Choice := Choice._proof_left\n\ndef Picked : Pick := Pick.match_left\n")
+	if err := declindex.CompileModule(context.Background(), lean, nil, tree, "A"); err != nil {
+		t.Fatal(err)
+	}
+	land(t, config, tree, "add A")
+	for _, c := range []struct{ name, source string }{
+		{"Different", "import A\n\ndef Different : Choice := Choice._proof_right\n"},
+		{"Other", "import A\n\ndef Other : Pick := Pick.match_right\n"},
+	} {
+		raw, err := json.Marshal(conceptgate.Proposal{ID: c.name, Concept: conceptgate.Concept{Name: c.name, Home: c.name + ".lean",
+			Meaning: "The other constructor."}, Source: c.source})
+		if err != nil {
+			t.Fatal(err)
+		}
+		proposal := filepath.Join(t.TempDir(), c.name+".json")
+		writeTestFile(t, proposal, string(raw))
+		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+		var v conceptgate.Verdict
+		if err := json.Unmarshal([]byte(r.out), &v); err != nil || r.code != 0 || v.Outcome != conceptgate.Added {
+			t.Errorf("gate %s: want exit 0, added, got %+v, %+v (%v)", c.name, r, v, err)
+		}
+	}
+	// The control: a copy of Original, which returns the same constructor, is still refused.
+	gateRefuses(t, config, "a copy of Original", "Same", "import A\n\ndef Same : Choice := Choice._proof_left\n", "Original")
+}
+
 // An abstracted proof in a theorem's type (`t3._proof_1`) is merged with the theorem when two modules declare it, so
 // its identity, like the theorem's, does not depend on the modules that one exporter run read together. B's
 // `Original` restates `t3`'s type; a proposal that imports B and states it again is refused after a refresh that read

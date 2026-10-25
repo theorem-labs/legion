@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -204,6 +205,43 @@ func TestExporterAtomsAgreeAcrossSidesOfAnEquation(t *testing.T) {
 	}
 	if shared("Fx.inline", "Fx.other_reg") {
 		t.Error("the atoms about x2 and x10 agree")
+	}
+}
+
+// A relation atom counts an abstracted proof by its type, as the statement hash does. A's `one` and B's `two` each
+// abstract the proof `0 < n + 1` out of their types (`one._proof_1`, `two._proof_1`), so every atom of `one`,
+// `(⟨0, _⟩ : Fin (n + 1)).val = 0` among them, is an atom of `two`.
+func TestAnAtomCountsAnAbstractedProofByItsType(t *testing.T) {
+	l := leanForTest(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	for _, m := range []struct{ name, source string }{
+		{"A", "theorem one (n : Nat) : (⟨0, by omega⟩ : Fin (n + 1)).val = 0 := rfl\n"},
+		{"B", "theorem two (n : Nat) : (⟨0, by omega⟩ : Fin (n + 1)).val = 0 ∧ True := ⟨rfl, trivial⟩\n"},
+	} {
+		if err := os.WriteFile(filepath.Join(dir, m.name+".lean"), []byte(m.source), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := CompileModule(ctx, l, nil, dir, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x := &Exporter{Lean: l, Bin: exporterForTest(t, l), SearchPath: []string{dir}, Jobs: 1}
+	consts, err := x.Run(ctx, Manifest{Modules: []string{"A", "B"}, Roots: []string{"A", "B"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	atoms := map[string][]string{}
+	for _, c := range consts {
+		atoms[c.Name] = c.Atoms
+	}
+	if len(atoms["one"]) == 0 {
+		t.Fatalf("one has no atom: %v", atoms)
+	}
+	for _, a := range atoms["one"] {
+		if !slices.Contains(atoms["two"], a) {
+			t.Errorf("one's atom %s is not an atom of two: one %v, two %v", a, atoms["one"], atoms["two"])
+		}
 	}
 }
 

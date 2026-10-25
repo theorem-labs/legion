@@ -4,10 +4,10 @@ open Lean Meta DeclExport
 
 /-! `declexport MANIFEST.json`: load compiled modules (no elaboration, no build) and print one JSON line for each
 constant of the target modules: its name `n`, module `m`, kind `k`, printed type `t`, compiled statement hash `h`,
-value hash `vh` (definitions), relation atom hashes `a`, the registered facts it states `f`, and `tr` when the walk
-hit its node budget. The manifest names the target modules, extra modules to import, the project's roots, the
-forms (`{concept, const}`: a constant whose value is a form lambda), the concepts' own declarations, and the module
-that the hashes count the target modules' constants as declared in (`home`). -/
+relation atom hashes `a`, the registered facts it states `f`, and `tr` when the walk hit its node budget. The
+manifest names the target modules, extra modules to import, the project's roots, the forms (`{concept, const}`: a
+constant whose value is a form lambda), the concepts' own declarations, and the module that the hashes count the
+target modules' constants as declared in (`home`). -/
 
 structure ConstRef where
   concept : String
@@ -74,16 +74,17 @@ partial def binderNames : Expr → List String
 
 mutual
 /-- Records in `ids` the identity that a reference to each constant of `e` counts in the hashes (`identify`), and,
-for an auxiliary definition that the hash reads by content, of the constants of its type and value. -/
+for an auxiliary definition that the hash reads by content, of the constants of the parts it reads (`auxParts`: an
+abstracted proof's type, a matcher's type and value). -/
 partial def identifyIn (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Name) (e : Expr) : MetaM Unit := do
   let env ← getEnv
   for c in e.getUsedConstants do
     if (← ids.get).contains c then continue
     match env.find? c with
     | some ci =>
-      if isElabAux env c then
+      if isElabAux env c ci then
         ids.modify (·.insert c (base c))
-        for x in ci.type :: ci.value?.toList do identifyIn ids base x
+        for x in auxParts ci do identifyIn ids base x
       else identify ids base c ci
     | none => ids.modify (·.insert c (base c))
 
@@ -116,7 +117,9 @@ def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Na
   let mut w : Walk := {}
   for e in exprs do
     w ← walk cfg e w
-  for e in exprs ++ ci.value?.toList ++ w.atoms.toList do
+  -- The constants that the hashes read: those of the statement (a definition's value included) and of its atoms;
+  -- never a theorem's proof.
+  for e in exprs ++ w.atoms.toList do
     identifyIn ids base e
   let tbl ← ids.get
   let moduleOf : Name → Name := fun c => tbl.getD c (base c)
@@ -141,8 +144,6 @@ def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Na
     ("n", toJson c.toString), ("m", toJson m.toString), ("k", toJson (kindOf ci)), ("t", toJson ty),
     ("h", toJson h.hex), ("a", toJson atoms),
     ("f", Json.arr (fs.map fun f => Json.mkObj [("c", toJson f.concept), ("how", toJson f.how)]))]
-  if let some v := ci.value? then
-    fields := fields ++ [("vh", toJson (hashOf hctx [v]).hex)]
   if w.truncated then fields := fields ++ [("tr", toJson true)]
   return Json.mkObj fields
 

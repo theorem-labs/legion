@@ -60,13 +60,30 @@ private name holds the module that compiled it, which `moduleOf` already gives (
 def constId (ctx : HashCtx) (n : Name) : List H :=
   [H.ofString ((privateToUserName? n).getD n).toString, H.ofString (ctx.moduleOf n).toString]
 
-/-- An auxiliary definition that elaboration made: a matcher, or a proof abstracted out of a body (`X._proof_1`;
-older toolchains wrote `X.proof_1`). -/
-def isElabAux (env : Environment) (n : Name) : Bool :=
+/-- Whether the name component `s` is a name that Lean generates for an abstracted proof: `_proof_` (older
+toolchains `proof_`) and an index, digits with a further `_<digits>` for each nested name generator (`_proof_1`,
+`_proof_1_2`). -/
+def abstractedProofComponent (s : String) : Bool :=
+  let rest := (if s.startsWith "_proof_" then s.toList.drop 7 else if s.startsWith "proof_" then s.toList.drop 6 else [])
+  (rest.head?.any Char.isDigit) && (rest.getLast?.any Char.isDigit) &&
+    rest.all (fun c => c.isDigit || c == '_') && !((rest.zip rest.tail).any fun (a, b) => a == '_' && b == '_')
+
+/-- Whether `n`, whose constant is `ci`, is an auxiliary definition that elaboration made: a matcher, or a theorem
+that holds a proof abstracted out of a body (`abstractedProofComponent`, `X._proof_1`). A constant of another kind,
+or with another last name component, is a declaration like any other, also when its name starts the same way: the
+constructor `Choice._proof_left` keeps its own identity. -/
+def isElabAux (env : Environment) (n : Name) (ci : ConstantInfo) : Bool :=
   Meta.isMatcherCore env n ||
-    match n with
-    | .str _ s => s.startsWith "_proof_" || s.startsWith "proof_" || s.startsWith "match_" || s.startsWith "_auxLemma"
-    | _ => false
+    match ci, n with
+    | .thmInfo _, .str _ s => abstractedProofComponent s
+    | _, _ => false
+
+/-- The parts of the auxiliary definition `ci` that the hashes read: an abstracted proof's type alone, since
+elaboration reuses an earlier declaration's proof of that type, and a matcher's type and value. -/
+def auxParts (ci : ConstantInfo) : List Expr :=
+  match ci with
+  | .thmInfo _ => [ci.type]
+  | _ => ci.type :: ci.value?.toList
 
 /-- A name component Lean generates for a declaration's own parts: equation and unfolding lemmas, recursors and
 the other parts of an inductive, the parts of structural and well-founded recursion, and compiler auxiliaries. -/
@@ -118,15 +135,10 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
     | .mvar _ => pure (H.tag "?" [])
     | .sort l => pure (H.tag "S" [hashLevel ctx l])
     | .const n ls =>
-      match ctx.env?.bind fun env => if isElabAux env n then env.find? n else none with
+      match ctx.env?.bind fun env => (env.find? n).filter (isElabAux env n) with
       | some ci =>
         let sub : HashCtx := { ctx with levels := ci.levelParams, self := n :: ctx.self }
-        -- An abstracted proof counts by its type alone: elaboration reuses an earlier declaration's proof of that
-        -- type, so its value is that declaration's.
-        let body := match ci with
-          | .thmInfo _ => [ci.type]
-          | _ => ci.type :: ci.value?.toList
-        let parts : List H := Id.run ((body.mapM (hashExpr sub)).run' {})
+        let parts : List H := Id.run (((auxParts ci).mapM (hashExpr sub)).run' {})
         pure (H.tag "aux" (parts ++ ls.map (hashLevel ctx)))
       | none =>
         let own := ctx.self.findIdx? fun p => p == n || (p.isPrefixOf n && generatedSuffix (n.replacePrefix p .anonymous))
