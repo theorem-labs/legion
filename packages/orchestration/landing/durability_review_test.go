@@ -59,7 +59,7 @@ func TestReviewReconcileKeepsRetryablePublishingBatch(t *testing.T) {
 	batch.State = Publishing
 	batch.PullRequest = PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}
 	batch.MergeValidated = true
-	if err := store.Save(context.Background(), batch); err != nil {
+	if err := store.Save(context.Background(), &batch); err != nil {
 		t.Fatal(err)
 	}
 

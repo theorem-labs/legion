@@ -92,7 +92,23 @@ const (
 	Publishing State = "publishing"
 	Landed     State = "landed"
 	Failed     State = "failed"
+	// Declined ends a batch that was admitted and did not land: its returned members are back with their owners and
+	// its other members go to its successor.
+	Declined State = "declined"
+	// Empty ends a batch that lost every member.
+	Empty State = "empty"
+	// LandedUnrecorded ends a batch that GitHub merged and the ledger did not land. An operator resolves it.
+	LandedUnrecorded State = "landed_unrecorded"
 )
+
+// terminal reports whether a state ends a batch: the runner never advances, admits or saves it again.
+func (s State) terminal() bool {
+	switch s {
+	case Landed, Failed, Declined, Empty, LandedUnrecorded:
+		return true
+	}
+	return false
+}
 
 // Member is the frozen identity of one proposed migration. Changed is read once,
 // when the batch freezes. CurrentHashes and the ledger decision are derived
@@ -173,6 +189,13 @@ type Operation struct {
 // exception: it completes under the receipt, and so the policy, that the merge
 // validated, whatever policy the runner has later.
 type Batch struct {
+	// SchemaVersion is the version of this record's shape, which the ledger stores as the program sends it.
+	SchemaVersion int `json:"schema_version"`
+	// RecordVersion is the ledger's version of the stored record. It orders every write: a save names the version it
+	// read, and the store replaces it with the version the write produced. It is not part of the stored record.
+	RecordVersion int64 `json:"record_version,omitempty"`
+	// Successor is the batch that the members of a declined batch go to next.
+	Successor         string               `json:"successor,omitempty"`
 	ID                string               `json:"id"`
 	Repository        string               `json:"repository"`
 	Base              string               `json:"base"`
@@ -251,10 +274,14 @@ type Input struct {
 	Members    []Member `json:"members"`
 }
 
-// BatchStore persists each state transition before its following side effect.
+// BatchSchemaVersion is the version of the batch record that this program writes.
+const BatchSchemaVersion = 1
+
+// BatchStore persists each state transition before its following side effect. Create and Save take the batch so that
+// the store can replace its record version with the version its write produced.
 type BatchStore interface {
-	Create(context.Context, Batch) (bool, error)
-	Save(context.Context, Batch) error
+	Create(context.Context, *Batch) (bool, error)
+	Save(context.Context, *Batch) error
 	Load(context.Context, string) (Batch, bool, error)
 	ListActive(context.Context) ([]Batch, error)
 }
@@ -316,7 +343,7 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 	}
 	r.setCandidate(&batch, candidate)
 	batch.InitialCandidate = candidate
-	created, err := r.Store.Create(ctx, batch)
+	created, err := r.Store.Create(ctx, &batch)
 	if err != nil {
 		return Batch{}, fmt.Errorf("create batch %q: %w", batch.ID, err)
 	}
@@ -342,7 +369,7 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 	if policy := r.policyDigest(); batch.CheckPolicyDigest != policy {
 		batch.CheckPolicyDigest = policy
-		if err := r.Store.Save(ctx, *batch); err != nil {
+		if err := r.Store.Save(ctx, batch); err != nil {
 			return *batch, fmt.Errorf("record check policy: %w", err)
 		}
 	}
@@ -479,7 +506,7 @@ func (r Runner) ensureCandidate(ctx context.Context, batch *Batch) error {
 			return fmt.Errorf("rebuild candidate: %w", err)
 		}
 		r.setCandidate(batch, candidate)
-		if err := r.Store.Save(ctx, *batch); err != nil {
+		if err := r.Store.Save(ctx, batch); err != nil {
 			return fmt.Errorf("record rebuilt candidate: %w", err)
 		}
 	}
@@ -532,7 +559,7 @@ func (r Runner) checkLedger(ctx context.Context, batch *Batch) (bool, error) {
 			}
 			member.CurrentHashes = cloneHashes(hashes)
 			member.HashesKey = key
-			if err := r.Store.Save(ctx, *batch); err != nil {
+			if err := r.Store.Save(ctx, batch); err != nil {
 				return returned, fmt.Errorf("record current hashes for %q: %w", member.Migration, err)
 			}
 		}
@@ -552,7 +579,7 @@ func (r Runner) checkLedger(ctx context.Context, batch *Batch) (bool, error) {
 			continue
 		}
 		member.LedgerKey = key
-		if err := r.Store.Save(ctx, *batch); err != nil {
+		if err := r.Store.Save(ctx, batch); err != nil {
 			return returned, fmt.Errorf("record ledger decision for %q: %w", member.Migration, err)
 		}
 	}
@@ -586,14 +613,14 @@ func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reaso
 		batch.Dropped = append(batch.Dropped, DroppedMember{Migration: migration, Reason: reason})
 	}
 	batch.startOperation(Operation{Key: key, Kind: "return", Batch: batch.ID, Repository: batch.Repository, Member: migration, Generation: member.Generation, Reason: reason})
-	if err := r.Store.Save(ctx, *batch); err != nil {
+	if err := r.Store.Save(ctx, batch); err != nil {
 		return fmt.Errorf("record return intent for %q: %w", migration, err)
 	}
 	if err := r.Ledger.ReturnMember(ctx, batch.Repository, member.Migration, member.Generation, reason); err != nil {
 		return fmt.Errorf("return %q: %w", migration, err)
 	}
 	batch.completeOperation(key)
-	if err := r.Store.Save(ctx, *batch); err != nil {
+	if err := r.Store.Save(ctx, batch); err != nil {
 		return fmt.Errorf("record returned member %q: %w", migration, err)
 	}
 	return nil
@@ -618,7 +645,7 @@ func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 		findings, err := checker.Check(ctx, Tree(batch.Candidate.Tree))
 		if err != nil {
 			batch.setCheck(CheckVerdict{Name: name, Verdict: "unable", Reason: err.Error()})
-			if saveErr := r.Store.Save(ctx, *batch); saveErr != nil {
+			if saveErr := r.Store.Save(ctx, batch); saveErr != nil {
 				return false, fmt.Errorf("record unavailable check: %w", saveErr)
 			}
 			return false, checkUnable{err}
@@ -638,7 +665,7 @@ func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 			}
 			if !matched {
 				batch.setCheck(CheckVerdict{Name: name, Verdict: "unable", Reason: finding.Reason})
-				if err := r.Store.Save(ctx, *batch); err != nil {
+				if err := r.Store.Save(ctx, batch); err != nil {
 					return false, fmt.Errorf("record unattributable check: %w", err)
 				}
 				return false, checkUnable{fmt.Errorf("check %q cannot attribute %q", name, finding.Path)}
@@ -897,7 +924,7 @@ func (r Runner) fail(ctx context.Context, batch *Batch, reason string) (Batch, e
 func (r Runner) transition(ctx context.Context, batch *Batch, state State, reason string) error {
 	batch.State = state
 	batch.Reason = reason
-	if err := r.Store.Save(ctx, *batch); err != nil {
+	if err := r.Store.Save(ctx, batch); err != nil {
 		return fmt.Errorf("store %s state: %w", state, err)
 	}
 	return nil
@@ -1041,27 +1068,30 @@ type MemoryStore struct {
 }
 
 // Create stores a batch only when its identity is not already present.
-func (s *MemoryStore) Create(_ context.Context, batch Batch) (bool, error) {
+func (s *MemoryStore) Create(_ context.Context, batch *Batch) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.batches == nil {
 		s.batches = make(map[string]Batch)
 	}
-	if _, found := s.batches[batch.ID]; found {
+	if stored, found := s.batches[batch.ID]; found {
+		batch.RecordVersion = stored.RecordVersion
 		return false, nil
 	}
-	s.batches[batch.ID] = cloneBatch(batch)
+	batch.SchemaVersion, batch.RecordVersion = BatchSchemaVersion, 1
+	s.batches[batch.ID] = cloneBatch(*batch)
 	return true, nil
 }
 
 // Save writes a deep copy of a batch.
-func (s *MemoryStore) Save(_ context.Context, batch Batch) error {
+func (s *MemoryStore) Save(_ context.Context, batch *Batch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.batches == nil {
 		s.batches = make(map[string]Batch)
 	}
-	s.batches[batch.ID] = cloneBatch(batch)
+	batch.SchemaVersion, batch.RecordVersion = BatchSchemaVersion, batch.RecordVersion+1
+	s.batches[batch.ID] = cloneBatch(*batch)
 	return nil
 }
 
@@ -1079,12 +1109,18 @@ func (s *MemoryStore) ListActive(_ context.Context) ([]Batch, error) {
 	defer s.mu.Unlock()
 	out := make([]Batch, 0, len(s.batches))
 	for _, batch := range s.batches {
-		if batch.State != Failed && batch.State != Landed {
+		if !batch.State.terminal() || (batch.State == Declined && batch.Successor != "" && !s.has(batch.Successor)) {
 			out = append(out, cloneBatch(batch))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+// has reports whether the store holds the batch id. The caller holds the lock.
+func (s *MemoryStore) has(id string) bool {
+	_, found := s.batches[id]
+	return found
 }
 
 func cloneBatch(batch Batch) Batch {

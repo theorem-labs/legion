@@ -26,7 +26,7 @@ func TestReviewFrozenReturnRecoveryChecksSurvivingMembers(t *testing.T) {
 			"return/bad": {Key: "return/bad", Kind: "return", Member: "bad", Reason: "conflict", State: OperationPending},
 		},
 	}
-	if err := store.Save(context.Background(), batch); err != nil {
+	if err := store.Save(context.Background(), &batch); err != nil {
 		t.Fatal(err)
 	}
 

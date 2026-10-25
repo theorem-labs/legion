@@ -68,7 +68,7 @@ func (r Runner) recoverReturns(ctx context.Context, batch *Batch) error {
 			}
 		}
 		batch.completeOperation(key)
-		if err := r.Store.Save(ctx, *batch); err != nil {
+		if err := r.Store.Save(ctx, batch); err != nil {
 			return fmt.Errorf("record completed return %q: %w", operation.Member, err)
 		}
 	}

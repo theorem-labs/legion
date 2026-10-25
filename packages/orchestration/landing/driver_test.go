@@ -359,14 +359,14 @@ type storeFake struct {
 	states []State
 }
 
-func (f *storeFake) Save(_ context.Context, batch Batch) error {
+func (f *storeFake) Save(_ context.Context, batch *Batch) error {
 	f.states = append(f.states, batch.State)
 	return nil
 }
 
 func (f *storeFake) Load(context.Context, string) (Batch, bool, error) { return Batch{}, false, nil }
 
-func (f *storeFake) Create(ctx context.Context, batch Batch) (bool, error) {
+func (f *storeFake) Create(ctx context.Context, batch *Batch) (bool, error) {
 	return true, f.Save(ctx, batch)
 }
 func (f *storeFake) ListActive(context.Context) ([]Batch, error) { return nil, nil }

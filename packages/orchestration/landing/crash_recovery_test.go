@@ -27,7 +27,7 @@ func (s *crashStore) wrote() {
 	}
 }
 
-func (s *crashStore) Create(ctx context.Context, batch Batch) (bool, error) {
+func (s *crashStore) Create(ctx context.Context, batch *Batch) (bool, error) {
 	created, err := s.MemoryStore.Create(ctx, batch)
 	if err == nil && created {
 		s.wrote()
@@ -35,7 +35,7 @@ func (s *crashStore) Create(ctx context.Context, batch Batch) (bool, error) {
 	return created, err
 }
 
-func (s *crashStore) Save(ctx context.Context, batch Batch) error {
+func (s *crashStore) Save(ctx context.Context, batch *Batch) error {
 	if err := s.MemoryStore.Save(ctx, batch); err != nil {
 		return err
 	}

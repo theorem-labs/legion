@@ -25,7 +25,7 @@ func TestReviewRestartRerunsChecksWhenPolicyChanges(t *testing.T) {
 				t.Fatalf("Run() = %q, %v; want green", batch.State, err)
 			}
 			batch.State = state
-			if err := store.Save(context.Background(), batch); err != nil {
+			if err := store.Save(context.Background(), &batch); err != nil {
 				t.Fatal(err)
 			}
 
@@ -62,7 +62,7 @@ func TestMergedBatchCompletesUnderValidatedPolicy(t *testing.T) {
 	batch.State = Publishing
 	batch.PullRequest = PullRequest{Number: 7, Head: batch.Candidate.Commit, MergedCommit: "merged", State: PullRequestMerged}
 	batch.MergeValidated = true
-	if err := store.Save(context.Background(), batch); err != nil {
+	if err := store.Save(context.Background(), &batch); err != nil {
 		t.Fatal(err)
 	}
 
@@ -102,7 +102,7 @@ func TestQueuedBatchWaitsForTheQueueUnderAChangedPolicy(t *testing.T) {
 			batch.State = Publishing
 			batch.Branch = "land/batch"
 			batch.PullRequest = PullRequest{Number: 7, Head: batch.Candidate.Commit, State: PullRequestOpen}
-			if err := store.Save(context.Background(), batch); err != nil {
+			if err := store.Save(context.Background(), &batch); err != nil {
 				t.Fatal(err)
 			}
 

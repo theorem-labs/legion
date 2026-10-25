@@ -54,7 +54,7 @@ type landCrashStore struct {
 	failed bool
 }
 
-func (s *landCrashStore) Save(ctx context.Context, batch Batch) error {
+func (s *landCrashStore) Save(ctx context.Context, batch *Batch) error {
 	if operation, found := batch.Operations["land/one"]; found && operation.State == OperationComplete && !s.failed {
 		s.failed = true
 		return errors.New("injected checkpoint failure")

@@ -17,17 +17,19 @@ type JSONStore struct {
 }
 
 // Create writes a batch only when its identity is absent.
-func (s *JSONStore) Create(_ context.Context, batch Batch) (bool, error) {
+func (s *JSONStore) Create(_ context.Context, batch *Batch) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	batches, err := s.read()
 	if err != nil {
 		return false, err
 	}
-	if _, found := batches[batch.ID]; found {
+	if stored, found := batches[batch.ID]; found {
+		batch.RecordVersion = stored.RecordVersion
 		return false, nil
 	}
-	batches[batch.ID] = cloneBatch(batch)
+	batch.SchemaVersion, batch.RecordVersion = BatchSchemaVersion, 1
+	batches[batch.ID] = cloneBatch(*batch)
 	if err := s.write(batches); err != nil {
 		return false, err
 	}
@@ -35,14 +37,15 @@ func (s *JSONStore) Create(_ context.Context, batch Batch) (bool, error) {
 }
 
 // Save writes the complete batch set atomically.
-func (s *JSONStore) Save(_ context.Context, batch Batch) error {
+func (s *JSONStore) Save(_ context.Context, batch *Batch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	batches, err := s.read()
 	if err != nil {
 		return err
 	}
-	batches[batch.ID] = cloneBatch(batch)
+	batch.SchemaVersion, batch.RecordVersion = BatchSchemaVersion, batch.RecordVersion+1
+	batches[batch.ID] = cloneBatch(*batch)
 	return s.write(batches)
 }
 
@@ -68,7 +71,7 @@ func (s *JSONStore) ListActive(_ context.Context) ([]Batch, error) {
 	}
 	out := make([]Batch, 0, len(batches))
 	for _, batch := range batches {
-		if batch.State != Failed && batch.State != Landed {
+		if !batch.State.terminal() || (batch.State == Declined && batch.Successor != "" && batches[batch.Successor].ID == "") {
 			out = append(out, cloneBatch(batch))
 		}
 	}
