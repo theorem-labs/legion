@@ -52,9 +52,10 @@ func FindLean(ctx context.Context, dir, prefix string) (Lean, error) {
 }
 
 // env is the whole environment of a toolchain process: the toolchain first on a system PATH, its root
-// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, and HOME and TMPDIR at home. Nothing else of
-// the caller's environment (credentials, tokens) reaches Lean, and a module that a proposal compiles sees only its
-// scratch directory as home.
+// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, HOME and TMPDIR at home, and the thread count
+// of the build that runs it (LEAN_NUM_THREADS), so that many toolchain processes together keep to the cores that
+// build was given. Nothing else of the caller's environment (credentials, tokens) reaches Lean, and a module that a
+// proposal compiles sees only its scratch directory as home.
 func (l Lean) env(searchPath []string, home string) []string {
 	env := []string{
 		"LEAN_SYSROOT=" + l.Prefix,
@@ -63,8 +64,10 @@ func (l Lean) env(searchPath []string, home string) []string {
 		"HOME=" + home,
 		"TMPDIR=" + home,
 	}
-	if v := os.Getenv("LANG"); v != "" {
-		env = append(env, "LANG="+v)
+	for _, name := range []string{"LANG", "LEAN_NUM_THREADS"} {
+		if v := os.Getenv(name); v != "" {
+			env = append(env, name+"="+v)
+		}
 	}
 	return env
 }
