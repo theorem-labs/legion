@@ -463,10 +463,17 @@ any output; and call agreement (|both| / |either|), state access agreement, and 
 
 ## Incremental builds
 
-With `--cache`, each unit's facts are kept under a key of the tool's code, the vocabulary, the unit's
-arguments and the contents of every file it included. A later build parses only the units whose key
-changed, so after a landing it parses the changed files (and every unit including a changed header)
-and gives the same bytes as a full build.
+With `--cache`, each unit's facts are kept under a key of the code that makes them (`clangfacts.py`
+and every module of the package it imports, directly or through another), the vocabulary, the unit's
+arguments, the contents of every file it included, and whether each file a header search of the unit
+may reach exists. The last covers a header that appears only when it is added: every `#include` and
+`__has_include` of the unit's files gives one probe per search directory, and a spelling a macro
+writes is expanded first (`#define HEADER "optional.h"`), so creating `optional.h` or a shadowing
+`hi/choice.h` parses the unit again. A spelling the facts cannot reduce to a literal header (a
+function-like macro builds it) leaves the unit unreusable: the facts record `reusable: false` and no
+later build takes it from the cache. A later build parses only the units whose key changed, so after
+a landing it parses the changed files (and every unit including a changed header) and gives the same
+bytes as a full build.
 
 The same directory keeps each image function's decoded facts under `image/`. An entry's key covers
 the image, `System.map`, the `[image]` table, the decoder's source and the capstone and pyelftools

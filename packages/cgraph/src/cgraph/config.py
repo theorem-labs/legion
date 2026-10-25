@@ -414,6 +414,14 @@ def load(path: Path, root: Path | None = None) -> Config:
     flags = tuple(_strings(c_table, "flags", "c"))
     if inputs.compile_commands is None and not flags:
         raise ConfigError("c.flags is required when inputs.compile_commands is not set")
+    for flag in flags:
+        # The flags are templates: only {c_tree}, {module} and {stem} stand for something.
+        try:
+            flag.format(c_tree="", module="", stem="")
+        except (IndexError, KeyError, ValueError) as error:
+            raise ConfigError(
+                f"c.flags has {flag}, which is no template of c_tree, module and stem: {error}"
+            ) from error
     rewrites_table = _expect(c_table, "argument_rewrites", dict, "c") or {}
     rewrites: list[tuple[re.Pattern[str], str]] = []
     for pattern, replacement in sorted(rewrites_table.items()):

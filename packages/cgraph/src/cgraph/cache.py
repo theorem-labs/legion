@@ -15,7 +15,7 @@ from typing import Any, TextIO
 
 import clang.cindex as cindex
 
-from . import clangfacts, libclang
+from . import clangfacts, config, errors, expressions, jsonio, libclang
 from .errors import CacheError
 
 
@@ -32,6 +32,10 @@ def tool_digest(cindex_bytes: bytes, library_bytes: bytes, python_version: str, 
     return _digest([cindex_bytes, library_bytes, python_version.encode(), machine.encode()])
 
 
+# Every module of the package whose code makes a unit's facts: clangfacts and what it imports.
+TOOL_MODULES = (clangfacts, config, errors, expressions, jsonio, libclang)
+
+
 @functools.cache
 def _tool_digest() -> str:
     bindings = cindex.__file__
@@ -40,7 +44,7 @@ def _tool_digest() -> str:
         raise RuntimeError("libclang did not disclose its bindings and library paths")
     return _digest(
         [
-            *(Path(module.__file__ or "").read_bytes() for module in (clangfacts, libclang)),
+            *(Path(module.__file__ or "").read_bytes() for module in TOOL_MODULES),
             tool_digest(
                 Path(bindings).read_bytes(), Path(library).read_bytes(), sys.version, platform.machine()
             ).encode(),
@@ -183,6 +187,14 @@ class Cache:
         facts.setdefault("include_probes", [])
         return facts
 
+    def facts_key(self, source: str, facts: dict[str, Any]) -> str:
+        """What a later layer keys a unit's facts by: its cache key, or, for a unit the cache keeps no
+        entry for (``reusable: false``, or no cache at all), the SHA-256 of the facts themselves."""
+        entry = self.manifest.get(source)
+        if entry is not None:
+            return str(entry["key"])
+        return "facts:" + hashlib.sha256(json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
     def lookup(
         self, source: str, arguments: list[str], vocabulary_digest: str, contents: Contents
     ) -> dict[str, Any] | None:
@@ -215,6 +227,11 @@ class Cache:
         if self.directory is None:
             return
         self._acquire()
+        if facts.get("reusable") is False:
+            # A header spelling the facts could not expand: what the preprocessor searched is unknown,
+            # so no later run may take this unit from the cache (C5).
+            self.manifest.pop(source, None)
+            return
         includes = facts.get("includes")
         probes = facts.get("include_probes", [])
         if (

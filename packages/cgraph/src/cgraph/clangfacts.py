@@ -44,9 +44,16 @@ _T = TypeVar("_T")
 
 _RECORD_KINDS = (K.STRUCT_DECL, K.UNION_DECL)
 _TABLE_ENTRY = re.compile(r"\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)")
-_INCLUDE_DIRECTIVE = re.compile(r'(?m)^\s*#\s*include(?:_next)?\s*(?:"([^"]+)"|<([^>]+)>)')
-_HAS_INCLUDE = re.compile(r'__has_include(?:_next)?\s*\(\s*(?:"([^"]+)"|<([^>]+)>)\s*\)')
+_INCLUDE_DIRECTIVE = re.compile(r"(?m)^\s*#\s*include(?:_next)?\s*(.+)$")
+_HAS_INCLUDE = re.compile(r"__has_include(?:_next)?\s*\(((?:[^()]|\([^()]*\))*)\)")
+_LITERAL_HEADER = re.compile(r'^\s*(?:"([^"]+)"|<([^>]+)>)\s*$')
+_MACRO_NAME = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*$")
+# A comment after a directive's operand (``#include <linux/init.h> /* init_rootfs */``), also one that
+# goes on past the line.
+_TRAILING_COMMENT = re.compile(r"/\*.*?\*/|/\*.*$|//.*$")
 _INCLUDE_DIR_FLAGS = ("-iquote", "-I", "-isystem", "-idirafter")
+# How many macro names a header spelling may go through before the facts give it up.
+_MACRO_HEADER_STEPS = 8
 
 _LAYOUT_ERRORS = {
     -1: "invalid",
@@ -62,13 +69,28 @@ def _layout_error(size: int) -> str | None:
     return _LAYOUT_ERRORS.get(size)
 
 
-def _include_spellings(text: str) -> list[tuple[str, bool]]:
-    """Literal include spellings and whether each has quoted-header search semantics."""
-    result: list[tuple[str, bool]] = []
+def _include_spellings(text: str, macros: dict[str, str]) -> list[tuple[int, bool, tuple[str, bool] | None]]:
+    """Each ``#include`` and ``__has_include`` of a file: its line, whether it is an ``__has_include``,
+    and the header spelling it names with whether that has quoted-header search semantics, or None
+    where the facts cannot reduce it to a literal header. A spelling written as a macro name is the
+    text that macro stands for (``#define HEADER "optional.h"``); a comment after it is no part of it."""
+    result: list[tuple[int, bool, tuple[str, bool] | None]] = []
     for pattern in (_INCLUDE_DIRECTIVE, _HAS_INCLUDE):
         for match in pattern.finditer(text):
-            quoted, angled = match.groups()
-            result.append((quoted or angled, quoted is not None))
+            line = text.count("\n", 0, match.start(1)) + 1
+            operand = _TRAILING_COMMENT.sub("", match.group(1))
+            spelling: tuple[str, bool] | None = None
+            for _ in range(_MACRO_HEADER_STEPS):
+                literal = _LITERAL_HEADER.match(operand)
+                if literal is not None:
+                    quoted, angled = literal.groups()
+                    spelling = (quoted or angled, quoted is not None)
+                    break
+                name = _MACRO_NAME.match(operand)
+                if name is None or name.group(1) not in macros:
+                    break
+                operand = macros[name.group(1)]
+            result.append((line, pattern is _HAS_INCLUDE, spelling))
     return result
 
 
@@ -96,19 +118,52 @@ def _include_directories(arguments: list[str], c_tree: Path) -> list[Path]:
     ]
 
 
-def _include_probes(tu: ci.TranslationUnit, main: Path, arguments: list[str], extractor: _Extractor) -> list[str]:
-    """Every location libclang could consult for literal include and ``__has_include`` spellings."""
+def _include_probes(
+    tu: ci.TranslationUnit, main: Path, arguments: list[str], extractor: _Extractor
+) -> tuple[list[str], bool]:
+    """Every location the preprocessor could consult for the ``#include`` and ``__has_include``
+    directives of the unit's files, and whether each such search could be stated (C5). A spelling a
+    macro writes is expanded (``#define HEADER "optional.h"``). An ``#include`` the facts cannot
+    expand (``#include TRACE_INCLUDE(TRACE_INCLUDE_FILE)``) is stated by what it included: each way
+    of reaching that file from a search directory, as a spelling probed in every directory; one that
+    included nothing was in a branch the preprocessor skipped, which only already-recorded files
+    decide. An ``__has_include`` the facts cannot expand leaves the unit unreusable."""
     directories = _include_directories(arguments, extractor.tree)
-    files = {main, *(Path(include.include.name) for include in tu.get_includes())}
+    inclusions = list(tu.get_includes())
+    files = {main, *(Path(include.include.name) for include in inclusions)}
+    included: dict[tuple[Path, int], set[Path]] = collections.defaultdict(set)
+    for include in inclusions:
+        if include.location.file is not None:
+            source = Path(include.location.file.name).resolve()
+            included[(source, include.location.line)].add(Path(include.include.name).resolve())
+    macros = {
+        name: " ".join(tokens) for name, (parameters, tokens) in extractor.object_macros().items() if not parameters
+    }
     probes: set[str] = set()
-    for file in files:
+    reusable = True
+
+    def probe(origin: Path, spelling: str, quoted: bool) -> None:
+        candidates = [origin.parent / spelling] if quoted else []
+        candidates.extend(directory / spelling for directory in directories)
+        probes.update(extractor.relative(str(candidate)) for candidate in candidates)
+
+    for file in sorted(files):
         if not file.is_file():
             continue
-        for spelling, quoted in _include_spellings(file.read_text(encoding="utf-8", errors="replace")):
-            candidates = [file.parent / spelling] if quoted else []
-            candidates.extend(directory / spelling for directory in directories)
-            probes.update(extractor.relative(str(candidate)) for candidate in candidates)
-    return sorted(probes)
+        resolved = file.resolve()
+        for line, has_include, spelling in _include_spellings(
+            file.read_text(encoding="utf-8", errors="replace"), macros
+        ):
+            if spelling is not None:
+                probe(file, *spelling)
+            elif has_include:
+                reusable = False
+            else:
+                for target in included.get((resolved, line), ()):
+                    for base in (resolved.parent, *directories):
+                        if target.is_relative_to(base):
+                            probe(file, target.relative_to(base).as_posix(), True)
+    return sorted(probes), reusable
 
 
 def _named_struct(cursor: ci.Cursor | None) -> ci.Cursor | None:
@@ -856,6 +911,10 @@ class _Extractor:
         return result
 
     # Macros --------------------------------------------------------------------------------
+
+    def object_macros(self) -> dict[str, tuple[frozenset[str], list[str]]]:
+        """Every macro the unit defines, by name (``macro``)."""
+        return {name: found for name in self.macros if (found := self.macro(name)) is not None}
 
     def macro(self, name: str) -> tuple[frozenset[str], list[str]] | None:
         """A macro's parameters and the tokens of its body, or None when ``name`` is no macro."""
@@ -7414,7 +7473,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
         }
     )
     includes = sorted({extractor.relative(include.include.name) for include in tu.get_includes()})
-    include_probes = _include_probes(tu, main, arguments, extractor)
+    include_probes, reusable = _include_probes(tu, main, arguments, extractor)
     definitions = _definitions(tu)
     # The unit's own functions, then every function they or a file-scope initializer reach.
     owned = {name for name, cursor in definitions.items() if _owned(extractor, cursor, main)}
@@ -7498,6 +7557,7 @@ def extract(source: str, c_tree: Path, arguments: list[str], vocabulary: Vocabul
         "source": source,
         "includes": includes,
         "include_probes": include_probes,
+        **({} if reusable else {"reusable": False}),
         "exclusions": exclusions,
         "errors": errors,
         "functions": dict(sorted(functions.items())),

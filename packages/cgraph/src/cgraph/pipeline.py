@@ -152,7 +152,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
             link.LinkCache(
                 cache_directory,
                 {
-                    "facts": {source: cache.manifest[source]["key"] for source in files},
+                    "facts": {source: cache.facts_key(source, facts[source]) for source in files},
                     "image": recorded["image"],
                     "system_map": recorded["system_map"],
                 },

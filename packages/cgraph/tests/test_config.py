@@ -67,6 +67,14 @@ def test_bad_regex_names_the_key(tmp_path: Path) -> None:
         config.load(write(tmp_path, MINIMAL + '[c.calls]\nlock = "("\n'))
 
 
+@pytest.mark.parametrize("flag", ["-I{bar}", "-I{c_tree", "-I{0}"])
+def test_a_flag_with_an_unknown_placeholder_names_the_key(tmp_path: Path, flag: str) -> None:
+    """LegionR6ReviewClaude finding on exit status: a bad c.flags placeholder is a configuration
+    error (2), not an input that cannot be read (3) and no traceback."""
+    with pytest.raises(config.ConfigError, match=r"c\.flags"):
+        config.load(write(tmp_path, MINIMAL.replace('flags = ["-nostdinc"]', f'flags = ["{flag}"]')))
+
+
 def test_all_files_needs_a_compilation_database(tmp_path: Path) -> None:
     with pytest.raises(config.ConfigError, match=r'files = "all" needs inputs\.compile_commands'):
         config.load(write(tmp_path, MINIMAL.replace('files = ["a.c"]', 'files = "all"')))
