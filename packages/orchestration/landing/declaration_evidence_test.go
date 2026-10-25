@@ -183,24 +183,62 @@ func TestDeclarationEvidenceMatchArmIsBody(t *testing.T) {
 	wantEvidence(t, evidence, blame.Name{Value: "f", Kind: blame.Unknown}, 1, "edited")
 }
 
-// Git names a hunk's enclosing declaration by the line it finds above the
-// hunk. Two declarations share the short name Changed, and the hunk lies
-// inside Beta's: the evidence belongs to Beta.Changed, not to the first
-// Changed in the file. A context line that is not a declaration, such as
-// `namespace Beta`, names no declaration.
-func TestDeclarationEvidenceHunkHeaderResolvesPosition(t *testing.T) {
+// A hunk is evidence only for the declarations whose lines it changes. Adding
+// or removing a declaration leaves its unchanged neighbours without evidence,
+// even where git names a neighbour in the hunk header or slides the hunk
+// across a neighbour's identical last line. An edit inside a declaration is
+// evidence for that declaration only, not for one of the same short name.
+func TestDeclarationEvidenceLeavesUnchangedNeighboursAlone(t *testing.T) {
+	const file = "Alpha.lean"
 	base := "namespace Alpha\ndef Changed := 0\nend Alpha\nnamespace Beta\ndef Changed := 1\nend Beta\n"
 
-	// The hunk adds Beta.Extra after Beta.Changed; git's context is
-	// `def Changed := 1`.
-	added := memberEvidence(t, map[string]string{"Alpha.lean": base}, map[string]string{"Alpha.lean": "namespace Alpha\ndef Changed := 0\nend Alpha\nnamespace Beta\ndef Changed := 1\ndef Extra := 2\nend Beta\n"})
-	wantEvidence(t, added, blame.Name{Value: "Beta.Changed", Kind: blame.Changed}, 2, "edited")
-	wantEvidence(t, added, blame.Name{Value: "Alpha.Changed", Kind: blame.Changed}, 0, "")
+	// Git's header for this hunk is `def Changed := 1`.
+	added := memberEvidence(t, map[string]string{file: base}, map[string]string{file: "namespace Alpha\ndef Changed := 0\nend Alpha\nnamespace Beta\ndef Changed := 1\ndef Extra := 2\nend Beta\n"})
+	wantEvidence(t, added, blame.Name{Value: "Beta.Changed", Kind: blame.Changed}, 0, "")
+	wantEvidence(t, added, blame.Name{Value: "Beta.Extra", Kind: blame.Added}, 3, "added")
 
-	// The hunk edits Beta.Changed itself; git's context is `namespace Beta`.
-	edited := memberEvidence(t, map[string]string{"Alpha.lean": base}, map[string]string{"Alpha.lean": "namespace Alpha\ndef Changed := 0\nend Alpha\nnamespace Beta\ndef Changed := 2\nend Beta\n"})
+	edited := memberEvidence(t, map[string]string{file: base}, map[string]string{file: "namespace Alpha\ndef Changed := 0\nend Alpha\nnamespace Beta\ndef Changed := 2\nend Beta\n"})
 	wantEvidence(t, edited, blame.Name{Value: "Beta.Changed", Kind: blame.Changed}, 3, "signature changed")
 	wantEvidence(t, edited, blame.Name{Value: "Alpha.Changed", Kind: blame.Changed}, 0, "")
+
+	// A new theorem below an unchanged one whose last line it repeats: git
+	// may place the added lines on either side of that repeated line.
+	const kept = "theorem kept : True := by\n  trivial\n"
+	below := memberEvidence(t, map[string]string{file: kept}, map[string]string{file: kept + "\ntheorem fresh : True := by\n  trivial\n"})
+	wantEvidence(t, below, blame.Name{Value: "kept", Kind: blame.Changed}, 0, "")
+	wantEvidence(t, below, blame.Name{Value: "kept", Kind: blame.Unknown}, 0, "")
+	wantEvidence(t, below, blame.Name{Value: "fresh", Kind: blame.Added}, 3, "added")
+
+	// Removing the declaration between two unchanged ones.
+	const first, last = "def first : Nat :=\n  0\n", "def last : Nat :=\n  2\n"
+	removed := memberEvidence(t, map[string]string{file: first + "def middle : Nat :=\n  1\n" + last}, map[string]string{file: first + last})
+	wantEvidence(t, removed, blame.Name{Value: "first", Kind: blame.Changed}, 0, "")
+	wantEvidence(t, removed, blame.Name{Value: "last", Kind: blame.Changed}, 0, "")
+	wantEvidence(t, removed, blame.Name{Value: "middle", Kind: blame.Unknown}, 3, "removed")
+}
+
+// An anonymous instance is a declaration: Lean names it inst<Class>…, so an
+// edit to its body is evidence for a diagnostic that names the generated
+// instance, and removing it is evidence that it is gone. A named instance and
+// an anonymous instance of another class are not that instance.
+func TestDeclarationEvidenceRecordsAnonymousInstances(t *testing.T) {
+	const file = "Alpha.lean"
+	base := "namespace Alpha\n" +
+		"instance : Inhabited Point where\n  default := ⟨0⟩\n" +
+		"instance : Repr Point where\n  reprPrec _ _ := \"p\"\n" +
+		"instance named : Inhabited Box where\n  default := ⟨0⟩\n" +
+		"end Alpha\n"
+
+	edited := memberEvidence(t, map[string]string{file: base}, map[string]string{file: strings.Replace(base, "default := ⟨0⟩\ninstance : Repr", "default := ⟨1⟩\ninstance : Repr", 1)})
+	wantEvidence(t, edited, blame.Name{Value: "Alpha.instInhabitedPoint", Kind: blame.Changed}, 2, "edited")
+	wantEvidence(t, edited, blame.Name{Value: "instInhabitedPoint", Kind: blame.Changed}, 2, "edited")
+	wantEvidence(t, edited, blame.Name{Value: "Alpha.instReprPoint", Kind: blame.Changed}, 0, "")
+	wantEvidence(t, edited, blame.Name{Value: "Alpha.named", Kind: blame.Changed}, 0, "")
+	wantEvidence(t, edited, blame.Name{Value: "Beta.instInhabitedPoint", Kind: blame.Changed}, 0, "")
+
+	gone := memberEvidence(t, map[string]string{file: base}, map[string]string{file: strings.Replace(base, "instance : Inhabited Point where\n  default := ⟨0⟩\n", "", 1)})
+	wantEvidence(t, gone, blame.Name{Value: "Alpha.instInhabitedPoint", Kind: blame.Unknown}, 3, "removed")
+	wantEvidence(t, gone, blame.Name{Value: "Alpha.instReprPoint", Kind: blame.Unknown}, 0, "")
 }
 
 // A `namespace` line inside a block comment opens no namespace, so removing

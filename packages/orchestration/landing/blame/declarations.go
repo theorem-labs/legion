@@ -44,8 +44,14 @@ var (
 	// commandRE is an unindented command that ends the previous declaration
 	// without declaring a name. Each word is a Lean keyword, so no term
 	// continuing a signature can start with it. A syntax line that names a
-	// declaration is read by declarationRE first.
-	commandRE = regexp.MustCompile(`^(?:#|@\[|(?:open|variable|universe|set_option|attribute|export|example|instance|deriving|initialize|import|omit|include)\b|(?:(?:local|scoped)\s+)?(?:macro_rules|elab_rules|syntax|declare_syntax_cat)\b)`)
+	// declaration is read by declarationRE first, and an instance by
+	// declarationRE or anonymousInstanceRE.
+	commandRE = regexp.MustCompile(`^(?:#|@\[|(?:open|variable|universe|set_option|attribute|export|example|deriving|initialize|import|omit|include)\b|(?:(?:local|scoped)\s+)?(?:macro_rules|elab_rules|syntax|declare_syntax_cat)\b)`)
+	// anonymousInstanceRE is the line of an instance declared without a
+	// name, and instancePrefixRE the words before such an instance's binders
+	// in its signature.
+	anonymousInstanceRE = regexp.MustCompile(`^\s*(?:@\[[^\]]*\]\s*)*((?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*)instance\b\s*(?:\(priority\s*:=\s*[^)]*\)\s*)?(?:[:(\[{⦃]|$)`)
+	instancePrefixRE    = regexp.MustCompile(`^(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|noncomputable|scoped|local|unsafe|partial|nonrec|public|meta)\s+)*instance\b\s*(?:\(priority\s*:=\s*[^)]*\)\s*)?`)
 )
 
 type scopeKind int
@@ -92,18 +98,33 @@ type scanner struct {
 	// declarations holds the declarations read so far, in source order.
 	// While inDeclaration is set the scanner is in the signature or body of
 	// the last one, and while inSignature is also set its signature is still
-	// open: signature holds its normalised text so far, and brackets the
-	// depth of the brackets it leaves open.
+	// open: signature holds its normalised text so far.
 	declarations  []Declaration
 	inDeclaration bool
 	inSignature   bool
 	signature     []byte
-	brackets      int
+	// brackets is the depth of the brackets the current declaration's lines
+	// leave open, column the indentation of its declaration line, and
+	// lastCode its last code line. blockColumn is the indentation of the
+	// block that its last line ending in `where` or `do` opened, or -1, and
+	// blockPending is set while that block's first line is still to come.
+	brackets     int
+	column       int
+	lastCode     string
+	blockColumn  int
+	blockPending bool
 	// currentIsStructure is set when the current declaration was declared by
-	// structure or class, and currentMatchArm when a line that starts with
-	// `|` begins its body.
+	// structure or class, currentMatchArm when a line that starts with `|`
+	// begins its body, and currentArrow when `=>` begins its body, as in a
+	// macro, an elab or a notation, whose expansion follows the arrow.
 	currentIsStructure bool
 	currentMatchArm    bool
+	currentArrow       bool
+	// anonymous is set while the current declaration is an instance without
+	// a name, which is named when its signature ends; instances counts the
+	// file's anonymous instances of each class so far.
+	anonymous bool
+	instances map[string]int
 	// inString is set inside a string literal. rawHashes is the number of #
 	// that close a raw string literal, or -1 in an ordinary one. literals
 	// holds the byte spans of the current line's code that are string or
@@ -252,31 +273,51 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 		return scanned{}
 	}
 	if match := declarationRE.FindStringSubmatch(code); match != nil {
-		s.endDeclaration()
 		modifiers := strings.Fields(match[1])
-		s.declarations = append(s.declarations, Declaration{
-			File:      s.file,
-			Name:      s.qualify(strings.TrimSuffix(match[3], ".")),
-			Private:   pendingPrivate || containsString(modifiers, "private"),
-			Protected: pendingProtected || containsString(modifiers, "protected"),
-		})
-		s.inDeclaration, s.inSignature, s.brackets = true, true, 0
+		s.startDeclaration(code, pendingText, s.qualify(strings.TrimSuffix(match[3], ".")), pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
 		s.currentIsStructure = isStructureDecl(code)
 		switch match[2] {
 		case "def", "theorem", "lemma", "instance", "abbrev":
 			s.currentMatchArm = true
+		case "macro", "elab", "notation":
+			s.currentArrow = true
 		}
-		s.signature = appendFields(appendFields(s.signature[:0], pendingText), code)
-		if s.opensBody(code) {
-			s.endSignature()
-		}
+		s.signatureLine(code)
 		return scanned{kind: declarationLine, owned: true, signature: true}
 	}
-	if commandRE.MatchString(code) {
+	if match := anonymousInstanceRE.FindStringSubmatch(code); match != nil {
+		modifiers := strings.Fields(match[1])
+		s.startDeclaration(code, pendingText, "", pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
+		s.currentMatchArm, s.anonymous = true, true
+		s.signatureLine(code)
+		return scanned{kind: declarationLine, owned: true, signature: true}
+	}
+	if commandRE.MatchString(code) || s.inDeclaration && s.startsCommand(code) {
 		s.endDeclaration()
 		return scanned{}
 	}
 	return s.continuation(code, true)
+}
+
+// startDeclaration ends the current declaration and starts one named name on
+// a declaration line. An anonymous instance's name is "" until its signature
+// ends.
+func (s *scanner) startDeclaration(code, pendingText, name string, private, protected bool) {
+	s.endDeclaration()
+	s.declarations = append(s.declarations, Declaration{File: s.file, Name: name, Private: private, Protected: protected})
+	s.inDeclaration, s.inSignature = true, true
+	s.brackets, s.column = 0, indentation(code)
+	s.blockColumn, s.blockPending = -1, false
+	s.signature = appendFields(appendFields(s.signature[:0], pendingText), code)
+}
+
+// signatureLine reads the declaration line, whose code is already in the
+// signature.
+func (s *scanner) signatureLine(code string) {
+	if s.track(code) {
+		s.endSignature()
+	}
+	s.endLine(code)
 }
 
 // continuation records a line of the current declaration after its
@@ -289,25 +330,43 @@ func (s *scanner) continuation(code string, armMayStart bool) scanned {
 	if !s.inDeclaration {
 		return scanned{}
 	}
+	if s.blockPending {
+		s.blockColumn, s.blockPending = indentation(code), false
+	}
+	defer s.endLine(code)
+	arm := armMayStart && s.currentMatchArm && s.brackets == 0 && startsMatchArm(code)
+	bodyStarts := s.track(code)
 	if !s.inSignature {
 		return scanned{owned: true}
 	}
-	if armMayStart && s.currentMatchArm && s.brackets == 0 && startsMatchArm(code) {
+	if arm {
 		s.endSignature()
 		return scanned{owned: true}
 	}
 	s.signature = appendFields(s.signature, code)
-	if s.opensBody(code) {
+	if bodyStarts {
 		s.endSignature()
 	}
 	return scanned{owned: true, signature: true}
 }
 
-// opensBody reports whether a code line of the open signature starts the
-// body: a `:=`, or a `where` that ends the line, outside every bracket the
-// signature has opened so far. It carries the bracket depth to the next line,
-// and skips the line's string and character literals.
-func (s *scanner) opensBody(code string) bool {
+// endLine records a code line of the current declaration as its last one. A
+// line that ends in `where` or `do` opens a block, whose first line sets the
+// block's column.
+func (s *scanner) endLine(code string) {
+	s.lastCode = code
+	word := lastWord(code)
+	s.blockPending = word == "where" || word == "do"
+}
+
+// track counts the brackets a code line of the current declaration opens
+// and closes, skipping its string and character literals, and carries the
+// depth to the next line. It reports whether the line starts the body of an
+// open signature: a `:=`, or for a macro, an elab or a notation a `=>`,
+// outside every bracket, or a `where` that ends the line outside every
+// bracket.
+func (s *scanner) track(code string) bool {
+	bodyStarts := false
 	literal := 0
 	for index := 0; index < len(code); index++ {
 		if literal < len(s.literals) && index == s.literals[literal][0] {
@@ -323,28 +382,307 @@ func (s *scanner) opensBody(code string) bool {
 				s.brackets--
 			}
 		case ':':
-			if s.brackets == 0 && index+1 < len(code) && code[index+1] == '=' {
+			bodyStarts = bodyStarts || s.brackets == 0 && strings.HasPrefix(code[index+1:], "=")
+		case '=':
+			bodyStarts = bodyStarts || s.currentArrow && s.brackets == 0 && strings.HasPrefix(code[index+1:], ">")
+		}
+	}
+	return bodyStarts || s.brackets == 0 && lastWord(code) == "where"
+}
+
+// startsCommand reports whether a code line of the current declaration
+// starts a new command instead. Lean reads a command from the column it
+// starts at, and a term's argument must lie to the right of it, so an
+// identifier at or left of the declaration's column starts the next command,
+// unless a bracket is open, the line above leaves its term incomplete, the
+// line is in a block that `where` or `do` opened at that column, or it starts
+// with a keyword that continues a declaration.
+func (s *scanner) startsCommand(code string) bool {
+	trimmed := strings.TrimLeft(code, " \t")
+	if column := len(code) - len(trimmed); column > s.column || column == s.blockColumn || s.brackets > 0 {
+		return false
+	}
+	if !startsIdentifier(trimmed) || continuingKeywords[firstWord(trimmed)] {
+		return false
+	}
+	return termComplete(s.lastCode)
+}
+
+var (
+	// continuingKeywords start a line that continues a declaration.
+	continuingKeywords = map[string]bool{"where": true, "termination_by": true, "decreasing_by": true, "then": true, "else": true, "with": true, "extends": true, "from": true, "at": true, "using": true, "in": true, "do": true, "by": true, "deriving": true}
+	// openingKeywords end a line whose term continues on the next line.
+	openingKeywords = map[string]bool{"where": true, "then": true, "else": true, "do": true, "by": true, "fun": true, "with": true, "from": true, "in": true, "if": true, "let": true, "have": true, "show": true, "match": true, "calc": true, "at": true, "using": true, "return": true, "suffices": true, "extends": true}
+)
+
+// termComplete reports whether a code line can end a term: it ends in an
+// identifier, a literal or a closing bracket, not in an operator, a
+// separator or a keyword that needs what follows.
+func termComplete(code string) bool {
+	code = strings.TrimRight(code, " \t")
+	if code == "" {
+		return true
+	}
+	last, _ := utf8.DecodeLastRuneInString(code)
+	if strings.ContainsRune(")]}⟩⦄⟧»⌝\"'", last) {
+		return true
+	}
+	return identifierRune(last) && !openingKeywords[lastWord(code)]
+}
+
+// startsIdentifier reports whether code starts with an identifier: a letter
+// other than λ, a «, or an _ that is not a hole such as a calc step's `_ = …`.
+func startsIdentifier(code string) bool {
+	first, size := utf8.DecodeRuneInString(code)
+	switch {
+	case first == '«':
+		return true
+	case first == '_':
+		next, _ := utf8.DecodeRuneInString(code[size:])
+		return next == '_' || unicode.IsLetter(next) || unicode.IsDigit(next)
+	}
+	return unicode.IsLetter(first) && first != 'λ'
+}
+
+// identifierRune reports whether a rune can be part of an identifier.
+func identifierRune(r rune) bool {
+	return r == '_' || r == '\'' || r == '!' || r == '?' || unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// firstWord returns the identifier that starts code.
+func firstWord(code string) string {
+	if end := strings.IndexFunc(code, func(r rune) bool { return !identifierRune(r) }); end >= 0 {
+		return code[:end]
+	}
+	return code
+}
+
+// lastWord returns the identifier that ends code, after trailing spaces.
+func lastWord(code string) string {
+	code = strings.TrimRight(code, " \t")
+	start := strings.LastIndexFunc(code, func(r rune) bool { return !identifierRune(r) })
+	if start < 0 {
+		return code
+	}
+	_, size := utf8.DecodeRuneInString(code[start:])
+	return code[start+size:]
+}
+
+// indentation is the number of spaces and tabs before a line's code.
+func indentation(code string) int {
+	return len(code) - len(strings.TrimLeft(code, " \t"))
+}
+
+// endSignature stores the open signature as the current declaration's Text,
+// and names an anonymous instance from it.
+func (s *scanner) endSignature() {
+	if !s.inSignature {
+		return
+	}
+	declaration := &s.declarations[len(s.declarations)-1]
+	declaration.Text = string(s.signature)
+	s.inSignature = false
+	if s.anonymous {
+		// A line that changes the scopes ends the declaration first, so the
+		// scopes are still the instance's. Lean names a repeated name in a
+		// namespace name_1, name_2 and so on.
+		base := s.qualify(instanceName(declaration.Text))
+		if s.instances == nil {
+			s.instances = map[string]int{}
+		}
+		declaration.Name = base
+		if count := s.instances[base]; count != 0 {
+			declaration.Name = base + "_" + strconv.Itoa(count)
+		}
+		s.instances[base]++
+	}
+}
+
+// instanceBinder is one binder group of an anonymous instance: the names it
+// binds and their type.
+type instanceBinder struct {
+	names []string
+	typ   string
+}
+
+// instanceName is the name Lean generates for an anonymous instance from its
+// signature (Lean.Elab.Command.NameGen): "inst", the constants of the
+// instance's type, then "Of" and the constants of each binder that neither
+// the type nor a later binder depends on. Each constant is its last name
+// component, capitalised, and appears once. Bound names, one-letter names
+// (which Lean binds automatically), named arguments and keywords add nothing.
+//
+// The scanner does not elaborate, so the name differs from Lean's for an
+// instance whose type has a numeral (Lean names its OfNat), an implicit
+// argument written explicitly, or only constants from outside the project
+// (Lean adds a module suffix), and Lean counts repeats across every module
+// of the namespace, not one file. A diagnostic naming Lean's name then finds
+// no declaration, as it did before anonymous instances were recorded.
+func instanceName(text string) string {
+	binders, typ := splitInstance(instancePrefixRE.ReplaceAllString(text, ""))
+	bound := map[string]bool{}
+	groups := make([]instanceBinder, 0, len(binders))
+	for _, group := range binders {
+		names, typ := "", group
+		if colon := topLevelIndex(group[1:], ":"); colon >= 0 && !strings.HasPrefix(group[1+colon:], ":=") {
+			names, typ = group[1:1+colon], group[2+colon:len(group)-1]
+		} else {
+			typ = group[1 : len(group)-1]
+		}
+		binder := instanceBinder{typ: strings.TrimSpace(typ)}
+		// An instance binder's name is never written in the type.
+		if group[0] != '[' {
+			binder.names = strings.Fields(names)
+		}
+		for _, name := range binder.names {
+			bound[name] = true
+		}
+		groups = append(groups, binder)
+	}
+	seen := map[string]bool{}
+	name := "inst" + constantWords(typ, bound, seen)
+	// Lean names the type first, then each binder from the innermost out,
+	// and writes the binders from the outermost in.
+	suffixes := make([]string, len(groups))
+	for index := len(groups) - 1; index >= 0; index-- {
+		if dependsOn(groups[index].names, typ, groups[index+1:]) {
+			continue
+		}
+		if words := constantWords(groups[index].typ, bound, seen); words != "" {
+			suffixes[index] = "Of" + words
+		}
+	}
+	return name + strings.Join(suffixes, "")
+}
+
+// splitInstance splits an anonymous instance's signature after the word
+// instance into its bracketed binder groups and its type, without the body.
+func splitInstance(text string) ([]string, string) {
+	var groups []string
+	depth, start := 0, -1
+	for index, r := range text {
+		switch {
+		case strings.ContainsRune("([{⦃", r):
+			if depth == 0 {
+				start = index
+			}
+			depth++
+		case strings.ContainsRune(")]}⦄", r):
+			depth--
+			if depth == 0 && start >= 0 {
+				groups = append(groups, text[start:index+utf8.RuneLen(r)])
+				start = -1
+			}
+		case r == ':' && depth == 0:
+			typ := text[index+1:]
+			if body := topLevelIndex(typ, ":="); body >= 0 {
+				typ = typ[:body]
+			}
+			typ = strings.TrimSpace(typ)
+			if lastWord(typ) == "where" {
+				typ = strings.TrimSpace(strings.TrimSuffix(typ, "where"))
+			}
+			return groups, typ
+		}
+	}
+	return groups, ""
+}
+
+// topLevelIndex is the index of the first token in text outside every
+// bracket, or -1.
+func topLevelIndex(text, token string) int {
+	depth := 0
+	for index, r := range text {
+		switch {
+		case strings.ContainsRune("([{⦃⟨", r):
+			depth++
+		case strings.ContainsRune(")]}⦄⟩", r):
+			depth--
+		case depth == 0 && strings.HasPrefix(text[index:], token):
+			return index
+		}
+	}
+	return -1
+}
+
+// dependsOn reports whether the type or a later binder mentions one of a
+// binder group's names.
+func dependsOn(names []string, typ string, later []instanceBinder) bool {
+	for _, name := range names {
+		if mentions(typ, name) {
+			return true
+		}
+		for _, binder := range later {
+			if mentions(binder.typ, name) {
 				return true
 			}
 		}
 	}
-	trimmed := strings.TrimSpace(code)
-	return s.brackets == 0 && (trimmed == "where" || strings.HasSuffix(trimmed, " where"))
+	return false
 }
 
-// endSignature stores the open signature as the current declaration's Text.
-func (s *scanner) endSignature() {
-	if s.inSignature {
-		s.declarations[len(s.declarations)-1].Text = string(s.signature)
-		s.inSignature = false
+// mentions reports whether a term mentions an identifier.
+func mentions(term, name string) bool {
+	for _, word := range identifiers(term) {
+		if word == name {
+			return true
+		}
 	}
+	return false
+}
+
+var (
+	namedArgumentRE = regexp.MustCompile(`\(\s*[A-Za-z_][A-Za-z0-9_']*\s*:=[^()]*\)`)
+	termKeywords    = map[string]bool{"fun": true, "forall": true, "if": true, "then": true, "else": true, "let": true, "have": true, "show": true, "by": true, "do": true, "match": true, "with": true, "Type": true, "Sort": true, "Prop": true}
+)
+
+// constantWords renders the constants of a term as Lean's instance names
+// do, and adds them to seen.
+func constantWords(term string, bound, seen map[string]bool) string {
+	var out strings.Builder
+	for _, word := range identifiers(namedArgumentRE.ReplaceAllString(term, "")) {
+		component := word[strings.LastIndex(word, ".")+1:]
+		if bound[word] || seen[word] || termKeywords[word] || utf8.RuneCountInString(component) <= 1 {
+			continue
+		}
+		seen[word] = true
+		first, size := utf8.DecodeRuneInString(component)
+		out.WriteRune(unicode.ToUpper(first))
+		out.WriteString(component[size:])
+	}
+	return out.String()
+}
+
+// identifiers returns the dotted identifiers of a term, in order.
+func identifiers(term string) []string {
+	var out []string
+	for index := 0; index < len(term); {
+		r, size := utf8.DecodeRuneInString(term[index:])
+		if !unicode.IsLetter(r) && r != '_' || r == 'λ' || index > 0 && identifierBefore(term, index) {
+			index += size
+			continue
+		}
+		end := index
+		for end < len(term) {
+			next, nextSize := utf8.DecodeRuneInString(term[end:])
+			if !identifierRune(next) && next != '.' {
+				break
+			}
+			end += nextSize
+		}
+		if word := strings.Trim(term[index:end], "."); word != "" && word != "_" {
+			out = append(out, word)
+		}
+		index = end
+	}
+	return out
 }
 
 // endDeclaration leaves the current declaration, if any.
 func (s *scanner) endDeclaration() {
 	s.endSignature()
 	s.inDeclaration = false
-	s.currentIsStructure, s.currentMatchArm = false, false
+	s.currentIsStructure, s.currentMatchArm, s.currentArrow, s.anonymous = false, false, false, false
 }
 
 // finish ends the source and returns its declarations.
@@ -581,10 +919,9 @@ type LineOwner struct {
 	Kind        lineKind
 	IsSignature bool // the declaration line or a continuation line before the body
 	IsStructure bool // the owner was declared by structure or class
-	// text is the line as written and code the line without its comments.
-	// namespace is the fully qualified namespace that a namespace line opens
-	// or closes.
-	text, code, namespace string
+	// code is the line without its comments, and namespace the fully
+	// qualified namespace that a namespace line opens or closes.
+	code, namespace string
 }
 
 // ScanLineOwners returns one LineOwner per source line, in order.
@@ -598,7 +935,7 @@ func ScanLineOwners(file, source string) []LineOwner {
 	owned := make([]int, len(lines))
 	for index, line := range lines {
 		result := s.scan(line)
-		owners[index] = LineOwner{Kind: result.kind, text: line, code: result.code, namespace: result.namespace}
+		owners[index] = LineOwner{Kind: result.kind, code: result.code, namespace: result.namespace}
 		if result.owned {
 			owned[index] = len(s.declarations)
 			owners[index].IsSignature = result.signature

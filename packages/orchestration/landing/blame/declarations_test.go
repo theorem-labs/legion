@@ -211,6 +211,46 @@ func TestScanDeclarationsEndsSignatureOnlyAtBody(t *testing.T) {
 		text:   map[string]string{"m": "theorem m (h : (match n with | 0 => True | _ => False)) : True := trivial"},
 		owners: []string{"sig m", "sig m", "sig m", ""},
 	}, {
+		name: "a macro's expansion after => is its body",
+		source: "local macro \"my_decide\" l:ident : tactic =>\n" +
+			"  `(tactic| (rw [$l:ident, data_eq]; decide))\n" +
+			"\n" +
+			"mirror_cmd Data.check 1 check_m1\n" +
+			"\n" +
+			"elab \"my_tac\" : tactic => do\n" +
+			"  pure ()\n" +
+			"theorem after : True := trivial\n",
+		text: map[string]string{
+			`"my_decide"`: `local macro "my_decide" l:ident : tactic =>`,
+			`"my_tac"`:    `elab "my_tac" : tactic => do`,
+			"after":       "theorem after : True := trivial",
+		},
+		owners: []string{`sig "my_decide"`, `body "my_decide"`, "", "", "", `sig "my_tac"`, `body "my_tac"`, "sig after", ""},
+	}, {
+		name: "an unindented word after a complete term starts a command",
+		source: "axiom ax : Nat\n" +
+			"register_thing ax\n" +
+			"def d : Nat :=\n" +
+			"  f 1\n" +
+			"mirror_cmd d 1 d_m1\n" +
+			"theorem after : True := trivial\n",
+		text:   map[string]string{"ax": "axiom ax : Nat", "d": "def d : Nat :=", "after": "theorem after : True := trivial"},
+		owners: []string{"sig ax", "", "sig d", "body d", "", "sig after", ""},
+	}, {
+		name: "unindented lines that continue a body",
+		source: "def d : Nat :=\n" +
+			"  f 1 +\n" +
+			"g 2\n" +
+			"def l : List Nat := [1,\n" +
+			"two, 3]\n" +
+			"def r : Nat := go 3\n" +
+			"where\n" +
+			"  go n := n\n" +
+			"termination_by 0\n" +
+			"theorem after : True := trivial\n",
+		text:   map[string]string{"d": "def d : Nat :=", "l": "def l : List Nat := [1,", "r": "def r : Nat := go 3", "after": "theorem after : True := trivial"},
+		owners: []string{"sig d", "body d", "body d", "sig l", "body l", "sig r", "body r", "body r", "body r", "sig after", ""},
+	}, {
 		name: "syntax commands end an open signature",
 		source: "syntax \"one\" : tactic\n" +
 			"declare_syntax_cat pat\n" +
@@ -257,5 +297,44 @@ func TestScanDeclarationsEndsSignatureOnlyAtBody(t *testing.T) {
 				t.Errorf("line owners = %q, want %q", shape, test.owners)
 			}
 		})
+	}
+}
+
+// An anonymous instance is recorded under the name Lean generates for it:
+// inst, the constants of its type, and Of with the constants of each binder
+// its type does not depend on; a repeat in the same namespace gets _1, _2.
+// The expected names are what Lean 4.35 generated for this source. The type
+// may be on a continuation line, after modifiers and a priority.
+func TestScanDeclarationsNamesAnonymousInstances(t *testing.T) {
+	source := "namespace Alpha\n" +
+		"instance : Inhabited Point := ⟨⟨0⟩⟩\n" +
+		"noncomputable instance (priority := low) [Group G] (x : G) :\n" +
+		"    Inhabited (Box x) where\n" +
+		"  default := ⟨0⟩\n" +
+		"@[simp] instance {n : Nat} : Data.Shape.Decidable (Fits n) := ⟨true⟩\n" +
+		"instance named : Inhabited Unit := ⟨()⟩\n" +
+		"instance : Inhabited Point := ⟨⟨2⟩⟩\n" +
+		"end Alpha\n" +
+		"instance : Inhabited Point := ⟨⟨1⟩⟩\n"
+	got := ScanDeclarations("Instances.lean", source)
+	want := []Declaration{
+		{File: "Instances.lean", Name: "Alpha.instInhabitedPoint", Text: "instance : Inhabited Point := ⟨⟨0⟩⟩"},
+		{File: "Instances.lean", Name: "Alpha.instInhabitedBoxOfGroup", Text: "noncomputable instance (priority := low) [Group G] (x : G) : Inhabited (Box x) where"},
+		{File: "Instances.lean", Name: "Alpha.instDecidableFits", Text: "@[simp] instance {n : Nat} : Data.Shape.Decidable (Fits n) := ⟨true⟩"},
+		{File: "Instances.lean", Name: "Alpha.named", Text: "instance named : Inhabited Unit := ⟨()⟩"},
+		{File: "Instances.lean", Name: "Alpha.instInhabitedPoint_1", Text: "instance : Inhabited Point := ⟨⟨2⟩⟩"},
+		{File: "Instances.lean", Name: "instInhabitedPoint", Text: "instance : Inhabited Point := ⟨⟨1⟩⟩"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ScanDeclarations() = %+v, want %+v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Errorf("declaration %d = %+v, want %+v", index, got[index], want[index])
+		}
+	}
+	owners := ScanLineOwners("Instances.lean", source)
+	if owner := owners[4].Owner.Name; owner != "Alpha.instInhabitedBoxOfGroup" || owners[4].IsSignature {
+		t.Errorf("line 5 owner = %q (signature %v), want the body of Alpha.instInhabitedBoxOfGroup", owner, owners[4].IsSignature)
 	}
 }
