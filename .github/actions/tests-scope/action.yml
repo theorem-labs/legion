@@ -23,16 +23,19 @@ runs:
         EVENT: ${{ github.event_name }}
       run: |
         set -euo pipefail
-        {
-          if [ "$EVENT" != pull_request ]; then
-            echo "$EVENT runs every step." >&2
-            printf 'orchestration=true\nother=true\n'
-          elif ! git rev-parse -q --verify 'HEAD^2' >/dev/null; then
-            echo "::warning::HEAD is not a pull request's merge commit with two parents; every step runs."
-            printf 'orchestration=true\nother=true\n'
-          else
-            git diff --name-only --no-renames 'HEAD^1' HEAD > "$RUNNER_TEMP/tests-scope-files"
-            echo "The pull request changes $(wc -l < "$RUNNER_TEMP/tests-scope-files") file(s)." >&2
-            .github/scripts/tests-scope.sh < "$RUNNER_TEMP/tests-scope-files"
-          fi
-        } | tee -a "$GITHUB_OUTPUT"
+        # Everything the job log should read is printed on its own, never through the pipe to
+        # GITHUB_OUTPUT: the runner refuses an output file line that is not key=value, and a
+        # `::warning::` written into it failed the step instead of running every check.
+        if [ "$EVENT" != pull_request ]; then
+          echo "$EVENT runs every step."
+          scope=$'orchestration=true\nother=true'
+        elif ! git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+          echo "::warning::HEAD is not a pull request's merge commit with two parents; every step runs."
+          scope=$'orchestration=true\nother=true'
+        else
+          git diff --name-only --no-renames 'HEAD^1' HEAD > "$RUNNER_TEMP/tests-scope-files"
+          echo "The pull request changes $(wc -l < "$RUNNER_TEMP/tests-scope-files") file(s)."
+          scope=$(.github/scripts/tests-scope.sh < "$RUNNER_TEMP/tests-scope-files")
+        fi
+        printf '%s\n' "$scope"
+        printf '%s\n' "$scope" >> "$GITHUB_OUTPUT"

@@ -20,8 +20,16 @@
 #   workspace mode (go.work), where each workspace module's requirements move the versions the
 #   other modules compile against.
 # - Any other file under packages/orchestration/ selects the orchestration ledger alone. No other
-#   module imports it (`go list -deps -test ./...` in packages/daemon and packages/envoy names none
-#   of its packages), and no step outside the ledger's own reads its files.
+#   module imports it (`go list -deps -test ./...` in packages/daemon, with and without -tags e2e,
+#   in packages/envoy and in packages/envoy/infra names none of its packages), and no step outside
+#   the ledger's own compiles or reads its files. One gated step does scan the whole repository,
+#   this file and packages/orchestration included: check-plugin-names.test.sh ends by running its
+#   checker over the real tree ("case: the real repository passes"). Skipping it loses no check of
+#   the tree, because the lint job runs that same checker, unconditionally, over the same files on
+#   every head; what the skipped test proves is the checker's own behaviour on fixtures, which
+#   only a change to the checker or its test can break, and either of those selects everything.
+#   check-private-names.test.sh, by contrast, runs only against temporary fixtures and its own
+#   captured log, so it reads no file of packages/orchestration at all.
 # - The orchestration-lean and orchestration-branches workflows and the package selection they run
 #   select nothing: no step of the Tests workflow reads them but the lint job's workflow checks,
 #   which always run.
@@ -30,7 +38,7 @@
 #
 # Usage: git diff --name-only --no-renames <base> <head> | .github/scripts/tests-scope.sh
 # CI runs it through .github/actions/tests-scope in each job of pr-and-main.yaml, and its tests
-# (tests-scope.test.sh) in that workflow's test job.
+# (tests-scope.test.sh, and tests-scope-action.test.sh for the action) in that workflow's test job.
 set -euo pipefail
 
 orchestration=false
