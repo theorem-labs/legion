@@ -1,36 +1,59 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
-// publicationConfig is a complete configuration with GitHub publication and
-// neither a score nor an event command.
+// publicationConfig is a complete configuration with GitHub publication and neither a score nor an event command.
+// Its ledger DSN names no database: a test that opens the ledger gives it one with withLedger.
 func publicationConfig(t *testing.T) config {
+	dsnFile := filepath.Join(t.TempDir(), "ledger.dsn")
+	write(t, dsnFile, "postgres://unopened.invalid/ledger\n")
 	return config{
-		BatchID:    "batch",
-		Repository: repositoryConfig{Name: "owner/repo", Path: t.TempDir(), GitDir: "/theorem/land/repo.git"},
-		Base:       "base",
-		BaseBranch: "trunk",
-		StatePath:  t.TempDir() + "/state.json",
-		Build:      []string{"sh", "-c", "true"},
-		Hasher:     []string{"sh", "-c", "true"},
-		Toolchain:  []string{"sh", "-c", "printf tool"},
-		Ledger:     ledgerConfig{Check: []string{"sh", "-c", "printf '{\"pass\":true}'"}, Land: []string{"sh", "-c", "true"}, Return: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, MigrationState: []string{"sh", "-c", "printf '{\"state\":\"open\"}'"}},
-		GitHub:     githubConfig{Remote: "origin"},
+		BatchID:     "batch",
+		Repository:  repositoryConfig{Name: "owner/repo", Path: t.TempDir(), GitDir: "/theorem/land/repo.git"},
+		Base:        "base",
+		BaseBranch:  "trunk",
+		Build:       []string{"sh", "-c", "true"},
+		Hasher:      []string{"sh", "-c", "true"},
+		Toolchain:   []string{"sh", "-c", "printf tool"},
+		Ledger:      ledgerConfig{DSNFile: dsnFile, Check: []string{"sh", "-c", "printf '{\"pass\":true}'"}, Land: []string{"sh", "-c", "true"}, Return: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, MigrationState: []string{"sh", "-c", "printf '{\"state\":\"open\"}'"}},
+		Escalations: escalationsConfig{Owner: "landing-operator"},
+		GitHub:      githubConfig{Remote: "origin"},
 	}
+}
+
+// withLedger points cfg's ledger.dsn_file at a fresh ledger database.
+func withLedger(t *testing.T, cfg config) config {
+	t.Helper()
+	write(t, cfg.Ledger.DSNFile, testpg.Database(t, "land_config")+"\n")
+	return cfg
+}
+
+// buildProgram wires cfg and releases it at the test's end.
+func buildProgram(t *testing.T, cfg config) (program, error) {
+	t.Helper()
+	built, err := cfg.program(context.Background())
+	if err == nil {
+		t.Cleanup(built.close)
+	}
+	return built, err
 }
 
 func TestReviewConfiguredPublicationWiresScoreAndEvents(t *testing.T) {
 	cfg := publicationConfig(t)
 	cfg.Score = scoreConfig{Command: []string{"sh", "-c", "printf score"}, Commit: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, Path: "scores/out"}
 	cfg.Event = eventConfig{Command: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}}
-	runner, _, _, err := cfg.runner()
+	built, err := buildProgram(t, withLedger(t, cfg))
 	if err != nil {
-		t.Fatalf("runner() error = %v", err)
+		t.Fatalf("program() error = %v", err)
 	}
+	runner := built.runner
 	if runner.GitHub == nil || runner.Score == nil || runner.Events == nil {
 		t.Fatalf("publication dependencies = GitHub:%T Score:%T Events:%T, want all configured", runner.GitHub, runner.Score, runner.Events)
 	}
@@ -40,10 +63,11 @@ func TestReviewConfiguredPublicationWiresScoreAndEvents(t *testing.T) {
 // without them the program publishes no score status and runs no member
 // event, and the ledger's migration.landed is the record.
 func TestConfiguredPublicationStartsWithoutScoreOrEvent(t *testing.T) {
-	runner, _, _, err := publicationConfig(t).runner()
+	built, err := buildProgram(t, withLedger(t, publicationConfig(t)))
 	if err != nil {
-		t.Fatalf("runner() error = %v", err)
+		t.Fatalf("program() error = %v", err)
 	}
+	runner := built.runner
 	if runner.GitHub == nil || runner.Score != nil || runner.Events != nil {
 		t.Fatalf("publication dependencies = GitHub:%T Score:%T Events:%T, want GitHub only", runner.GitHub, runner.Score, runner.Events)
 	}
@@ -53,12 +77,12 @@ func TestConfiguredPublicationStartsWithoutScoreOrEvent(t *testing.T) {
 func TestConfiguredPublicationRefusesPartialScoreOrEvent(t *testing.T) {
 	score := publicationConfig(t)
 	score.Score = scoreConfig{Command: []string{"sh", "-c", "printf score"}}
-	if _, _, _, err := score.runner(); err == nil || !strings.Contains(err.Error(), "score") {
+	if _, err := buildProgram(t, score); err == nil || !strings.Contains(err.Error(), "score") {
 		t.Fatalf("runner() error = %v, want the incomplete score refused", err)
 	}
 	event := publicationConfig(t)
 	event.Event = eventConfig{Command: []string{"sh", "-c", "true"}}
-	if _, _, _, err := event.runner(); err == nil || !strings.Contains(err.Error(), "event") {
+	if _, err := buildProgram(t, event); err == nil || !strings.Contains(err.Error(), "event") {
 		t.Fatalf("runner() error = %v, want the incomplete event refused", err)
 	}
 }
@@ -98,7 +122,7 @@ func TestRunnerRequiresRepositoryNamePathAndGitDir(t *testing.T) {
 		case "git_dir":
 			cfg.Repository.GitDir = ""
 		}
-		if _, _, _, err := cfg.runner(); err == nil || !strings.Contains(err.Error(), "repository."+missing) {
+		if _, err := buildProgram(t, cfg); err == nil || !strings.Contains(err.Error(), "repository."+missing) {
 			t.Errorf("runner() without repository.%s error = %v, want it named", missing, err)
 		}
 	}

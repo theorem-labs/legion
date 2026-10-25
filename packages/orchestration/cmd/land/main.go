@@ -21,6 +21,8 @@ import (
 	"github.com/sjawhar/legion/orchestration/landing"
 	"github.com/sjawhar/legion/orchestration/landing/blame"
 	"github.com/sjawhar/legion/orchestration/landing/gitx"
+	"github.com/sjawhar/legion/orchestration/landing/ledgerstore"
+	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
 func main() {
@@ -58,13 +60,23 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 	if err != nil {
 		return err
 	}
-	runner, input, store, err := config.runner()
+	if command == "serve" && strings.TrimSpace(config.Escalations.Owner) == "" {
+		return fmt.Errorf("escalations.owner is required to serve: an escalation enqueued for an empty owner wakes nobody")
+	}
+	program, err := config.program(ctx)
 	if err != nil {
 		return err
 	}
+	defer program.close()
+	runner := program.runner
+	if command != "status" && program.queue != nil {
+		attestCtx, stopAttesting := context.WithCancel(ctx)
+		defer stopAttesting()
+		go attestMergeGroups(attestCtx, runner, program.queue, program.input.Repository, program.input.BaseBranch, config.GitHub.PollInterval)
+	}
 	switch command {
 	case "run":
-		batch, err := runner.Run(ctx, input)
+		batch, err := runner.Run(ctx, program.input)
 		if err != nil {
 			return err
 		}
@@ -88,38 +100,62 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 		}
 		return writeJSON(output, batch)
 	case "status":
-		batches, err := store.List(ctx)
+		batches, err := program.list(ctx)
 		if err != nil {
 			return err
 		}
 		return writeJSON(output, batches)
 	case "serve":
-		return serve(ctx, runner, input, store, config.Interval, output)
+		return serve(ctx, runner, program.input, config.Interval, output)
 	default:
 		return fmt.Errorf("unknown batch command %q", command)
 	}
 }
 
+// attestMergeGroups sets the merge-group status on the base branch's merge groups until ctx ends. It runs beside the
+// publisher, which waits for the queue's outcome, because the queue merges a group only after its status is set. A
+// failed round is tried again at the next tick.
+func attestMergeGroups(ctx context.Context, runner landing.Runner, queue landing.MergeQueue, repository, branch string, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	posted := make(map[string]string)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := runner.AttestMergeGroups(ctx, queue, repository, branch, posted); err != nil && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "land: merge-group status:", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 type config struct {
-	BatchID      string           `json:"batchId"`
-	Repository   repositoryConfig `json:"repository"`
-	Base         string           `json:"base"`
-	BaseBranch   string           `json:"baseBranch"`
-	StatePath    string           `json:"statePath"`
-	Members      []landing.Member `json:"members"`
-	Build        []string         `json:"build"`
-	Hasher       []string         `json:"hasher"`
-	Checks       []checkConfig    `json:"checks"`
-	Ledger       ledgerConfig     `json:"ledger"`
-	Toolchain    []string         `json:"toolchain"`
-	Score        scoreConfig      `json:"score"`
-	Event        eventConfig      `json:"event"`
-	ModuleRoots  []string         `json:"moduleRoots"`
-	MaxRounds    int              `json:"maxRounds"`
-	InfraRetries int              `json:"infraRetries"`
-	Interval     time.Duration    `json:"interval"`
-	GitHub       githubConfig     `json:"github"`
-	Digest       string           `json:"-"`
+	BatchID      string            `json:"batchId"`
+	Repository   repositoryConfig  `json:"repository"`
+	Base         string            `json:"base"`
+	BaseBranch   string            `json:"baseBranch"`
+	StatePath    string            `json:"statePath"`
+	Members      []landing.Member  `json:"members"`
+	Build        []string          `json:"build"`
+	Hasher       []string          `json:"hasher"`
+	Checks       []checkConfig     `json:"checks"`
+	Ledger       ledgerConfig      `json:"ledger"`
+	Escalations  escalationsConfig `json:"escalations"`
+	Publishing   publishingConfig  `json:"publishing"`
+	Toolchain    []string          `json:"toolchain"`
+	Score        scoreConfig       `json:"score"`
+	Event        eventConfig       `json:"event"`
+	ModuleRoots  []string          `json:"moduleRoots"`
+	MaxRounds    int               `json:"maxRounds"`
+	InfraRetries int               `json:"infraRetries"`
+	Interval     time.Duration     `json:"interval"`
+	GitHub       githubConfig      `json:"github"`
+	Digest       string            `json:"-"`
 }
 
 type checkConfig struct {
@@ -127,11 +163,25 @@ type checkConfig struct {
 	Command []string `json:"command"`
 }
 type ledgerConfig struct {
+	// DSNFile is a file that holds the ledger database's connection string. When it is set, the batches are kept in
+	// the ledger and the batch calls go to it, in place of the state file.
+	DSNFile        string   `json:"dsn_file"`
 	Check          []string `json:"check"`
 	Land           []string `json:"land"`
 	Return         []string `json:"return"`
 	Status         []string `json:"status"`
 	MigrationState []string `json:"migrationState"`
+}
+
+// escalationsConfig names the owner for whom every escalation of this program is enqueued.
+type escalationsConfig struct {
+	Owner string `json:"owner"`
+}
+
+// publishingConfig bounds the failed enqueues and waits of an admitted batch before it is withdrawn. Zero keeps the
+// runner's default.
+type publishingConfig struct {
+	RetryLimit int `json:"retry_limit"`
 }
 
 // repositoryConfig names the repository the program lands into: Name is its
@@ -185,53 +235,104 @@ func readConfig(path string) (config, error) {
 	return cfg, nil
 }
 
-func (c config) runner() (landing.Runner, landing.Input, *landing.JSONStore, error) {
+// program is the wiring of one configuration: the runner, the configured batch, how the status command lists
+// batches, the merge queue whose groups get the merge-group status (nil without GitHub), and what to release at the
+// end.
+type program struct {
+	runner landing.Runner
+	input  landing.Input
+	list   func(context.Context) ([]landing.Batch, error)
+	queue  landing.MergeQueue
+	close  func()
+}
+
+func (c config) program(ctx context.Context) (program, error) {
 	if c.BatchID == "" {
-		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("batchId is required")
+		return program{}, fmt.Errorf("batchId is required")
 	}
-	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" || c.StatePath == "" {
-		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, baseBranch, and statePath are required")
+	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" {
+		return program{}, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, and baseBranch are required")
+	}
+	if c.Ledger.DSNFile == "" && c.StatePath == "" {
+		return program{}, fmt.Errorf("ledger.dsn_file or statePath is required")
 	}
 	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Check) == 0 || len(c.Ledger.Land) == 0 || len(c.Ledger.Return) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
-		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build, hasher, toolchain, and every ledger command including state are required")
+		return program{}, fmt.Errorf("build, hasher, toolchain, and every ledger command including state are required")
+	}
+	publishing := c.GitHub.Remote != "" || c.GitHub.Executable != ""
+	if c.Publishing.RetryLimit < 0 {
+		return program{}, fmt.Errorf("publishing.retry_limit must not be negative")
 	}
 	path := c.Repository.Path
-	store := &landing.JSONStore{Path: c.StatePath}
+	out := program{
+		input: landing.Input{ID: c.BatchID, Repository: c.Repository.Name, Base: c.Base, BaseBranch: c.BaseBranch, Members: c.Members},
+		close: func() {},
+	}
 	runner := landing.Runner{
-		Store:        store,
-		Ledger:       landing.CommandLedger{Directory: path, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
-		Builder:      landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
-		Hasher:       landing.CommandHasher{Command: c.Hasher, Directory: path},
-		Git:          landing.RepositoryGit{Path: path},
-		ModuleRoots:  append([]string(nil), c.ModuleRoots...),
-		MaxRounds:    c.MaxRounds,
-		InfraRetries: c.InfraRetries,
-		ConfigDigest: c.Digest,
-		Toolchain:    commandToolchain(path, c.Toolchain),
+		Ledger:               landing.CommandLedger{Directory: path, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
+		Builder:              landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
+		Hasher:               landing.CommandHasher{Command: c.Hasher, Directory: path},
+		Git:                  landing.RepositoryGit{Path: path},
+		ModuleRoots:          append([]string(nil), c.ModuleRoots...),
+		MaxRounds:            c.MaxRounds,
+		InfraRetries:         c.InfraRetries,
+		ConfigDigest:         c.Digest,
+		PublishingRetryLimit: c.Publishing.RetryLimit,
+		EscalationsOwner:     strings.TrimSpace(c.Escalations.Owner),
+		Toolchain:            commandToolchain(path, c.Toolchain),
 	}
 	for _, check := range c.Checks {
 		runner.Checks = append(runner.Checks, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: path})
 	}
-	if c.GitHub.Remote != "" || c.GitHub.Executable != "" {
-		runner.GitHub = landing.GitHubCLI{RepositoryPath: path, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
+	if publishing {
+		github := landing.GitHubCLI{RepositoryPath: path, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
+		runner.GitHub = github
+		out.queue = github
 		// The score and the member event are optional: without them the
 		// program publishes no score status and runs no event, and the
 		// ledger's migration.landed is the record. A partial one is refused.
 		if score := c.Score; len(score.Command) != 0 || len(score.Commit) != 0 || len(score.Status) != 0 || score.Path != "" {
 			if len(score.Command) == 0 || len(score.Commit) == 0 || len(score.Status) == 0 || score.Path == "" {
-				return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("score needs command, commit, status, and path")
+				return program{}, fmt.Errorf("score needs command, commit, status, and path")
 			}
 			runner.Score = landing.CommandScorer{Directory: path, ScoreCommand: score.Command, CommitCommand: score.Commit, StatusCommand: score.Status}
 			runner.ScorePath = score.Path
 		}
 		if event := c.Event; len(event.Command) != 0 || len(event.Status) != 0 {
 			if len(event.Command) == 0 || len(event.Status) == 0 {
-				return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("event needs command and status")
+				return program{}, fmt.Errorf("event needs command and status")
 			}
 			runner.Events = landing.CommandEvents{Directory: path, Command: event.Command, StatusCommand: event.Status}
 		}
 	}
-	return runner, landing.Input{ID: c.BatchID, Repository: c.Repository.Name, Base: c.Base, BaseBranch: c.BaseBranch, Members: c.Members}, store, nil
+	if publishing && c.Ledger.DSNFile == "" {
+		return program{}, fmt.Errorf("github needs ledger.dsn_file: a batch is admitted in the ledger before its pull request is queued")
+	}
+	if c.Ledger.DSNFile != "" {
+		body, err := os.ReadFile(c.Ledger.DSNFile)
+		if err != nil {
+			return program{}, fmt.Errorf("read ledger.dsn_file: %w", err)
+		}
+		dsn := strings.TrimSpace(string(body))
+		if dsn == "" {
+			return program{}, fmt.Errorf("ledger.dsn_file %s is empty", c.Ledger.DSNFile)
+		}
+		store, err := ledger.Open(ctx, dsn)
+		if err != nil {
+			return program{}, fmt.Errorf("open the ledger: %w", err)
+		}
+		batches := ledgerstore.New(store, c.Repository.Name)
+		runner.Store = batches
+		runner.Admission = ledgerstore.NewLedger(store, c.Repository.Name)
+		out.list = batches.ListActive
+		out.close = store.Close
+	} else {
+		state := &landing.JSONStore{Path: c.StatePath}
+		runner.Store = state
+		out.list = state.List
+	}
+	out.runner = runner
+	return out, nil
 }
 
 func commandToolchain(directory string, command []string) func(context.Context, landing.Tree) (string, error) {
@@ -250,7 +351,9 @@ func commandToolchain(directory string, command []string) func(context.Context, 
 	}
 }
 
-func serve(ctx context.Context, runner landing.Runner, input landing.Input, store *landing.JSONStore, interval time.Duration, output io.Writer) error {
+// serve reconciles and publishes until ctx ends. A StopError (an unclassified ledger refusal) stops it, and the batch
+// stays for an operator.
+func serve(ctx context.Context, runner landing.Runner, input landing.Input, interval time.Duration, output io.Writer) error {
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
@@ -270,7 +373,9 @@ func serve(ctx context.Context, runner landing.Runner, input landing.Input, stor
 			if (batches[index].State == landing.Green || batches[index].State == landing.Publishing) && runner.GitHub != nil {
 				batch, err := runner.Publish(ctx, batches[index])
 				if err != nil {
-					if batch.State != landing.Publishing {
+					var stop *landing.StopError
+					retry := batch.State == landing.Publishing || errors.Is(err, landing.ErrEffectsPending)
+					if errors.As(err, &stop) || !retry {
 						return err
 					}
 					batches[index] = batch
