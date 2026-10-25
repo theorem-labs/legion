@@ -90,7 +90,7 @@ func (l *lakeTree) write(path string, raw []byte) {
 
 // candidate is a candidate over the tree whose changed modules are changed, each with its imports.
 func (l *lakeTree) candidate(changed map[string][]string) *Candidate {
-	c := &Candidate{icfg: declindex.Config{Lib: l.lib}, modules: map[string]*Module{}, leanPath: []string{l.lib}}
+	c := &Candidate{icfg: declindex.Config{Lib: l.lib, Roots: []string{"Lib", "Fresh"}}, modules: map[string]*Module{}, leanPath: []string{l.lib}}
 	for _, dep := range l.deps {
 		c.leanPath = append(c.leanPath, dep.lib)
 	}
@@ -192,6 +192,49 @@ func TestLeanArgsIsUnableWhenImportsDisagreeOnPluginOrder(t *testing.T) {
 	var u *UnableError
 	if _, err := c.leanArgs(c.modules["Lib.New"]); !errors.As(err, &u) {
 		t.Fatalf("leanArgs error %v, want *UnableError", err)
+	}
+}
+
+// An added module that imports a changed precompiled module is in the same position as a modified one: the shared
+// library Lake would load is the stale base one, so the check is unable rather than compiling without it.
+func TestLeanArgsIsUnableForAnAddedModuleImportingAChangedPrecompiledModule(t *testing.T) {
+	l := newLakeTree(t)
+	l.setup("Lib.Pre", nil, "/tc/libLake_shared.so")
+	l.precompiled("Lib.Pre")
+	c := l.candidate(map[string][]string{"Lib.New": {"Lib.Pre"}, "Lib.Pre": nil})
+	c.modules["Lib.New"].Status = Added
+	var u *UnableError
+	if _, err := c.leanArgs(c.modules["Lib.New"]); !errors.As(err, &u) || !strings.Contains(u.Reason, "Lib.Pre") {
+		t.Fatalf("leanArgs = %v, want *UnableError naming Lib.Pre", err)
+	}
+}
+
+// A precompiled module of a dependency package has its shared library in that package's build, not the root's.
+func TestLeanArgsFindsADependencysSharedLibrary(t *testing.T) {
+	l := newLakeTree(t)
+	l.setup("Lib.B", map[string]any{})
+	dep := l.dependency("dep")
+	dep.setup("Dep.X", nil, "/tc/libLake_shared.so")
+	lib := dep.precompiled("Dep.X")
+	c := l.candidate(map[string][]string{"Lib.New": {"Dep.X"}})
+	c.modules["Lib.New"].Status = Added
+	args, err := c.leanArgs(c.modules["Lib.New"])
+	want := []string{"--plugin=/tc/libLake_shared.so", "--plugin=" + lib}
+	if err != nil || !slices.Equal(args, want) {
+		t.Fatalf("leanArgs = %q, %v, want %q", args, err, want)
+	}
+}
+
+// A module the base build never built says nothing about what Lake loads for it: the check is unable rather than
+// compiling its importer without the plugins.
+func TestLeanArgsIsUnableForAnImportTheBaseBuildLacks(t *testing.T) {
+	l := newLakeTree(t)
+	l.setup("Lib.B", map[string]any{})
+	c := l.candidate(map[string][]string{"Lib.New": {"Lib.Unknown"}})
+	c.modules["Lib.New"].Status = Added
+	var u *UnableError
+	if _, err := c.leanArgs(c.modules["Lib.New"]); !errors.As(err, &u) || !strings.Contains(u.Reason, "Lib.Unknown") {
+		t.Fatalf("leanArgs = %v, want *UnableError naming Lib.Unknown", err)
 	}
 }
 

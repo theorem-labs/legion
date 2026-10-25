@@ -8,22 +8,31 @@ import (
 	"github.com/sjawhar/legion/orchestration/landing/blame"
 )
 
-// compileFindings runs C1 (README.md, "The rules"): a changed module that the build builds and Lean refuses is a
-// certain build failure, so each declaration Lean's errors name is one refusal, at the error's position, with the
-// kind the landing program's build blame would give it. A module whose errors name nothing leaves the check
-// unable: the batch gets Lean's reason, never a silent pass.
+// compileFindings runs C1 (README.md, "The rules"): a module that the build builds and Lean refuses is a certain
+// build failure, so each declaration Lean's errors name is one refusal, at the error's position, with the kind the
+// landing program's build blame would give it. A changed module whose errors name nothing leaves the check unable:
+// the batch gets Lean's reason, never a silent pass.
 //
-// Only the modules the build builds are compiled, so only they are refused here: the build never reads a changed
-// module that no build target imports, and a scratch compile of one could refuse a change the build accepts.
-func compileFindings(c *Candidate, cfg Config) ([]landing.Finding, error) {
+// It covers the batch's changed modules and the unchanged ones the check compiled: a module N1 asked Lean about,
+// or one between a changed module and its importer. So a module that one member's change breaks is refused with
+// the names Lean gives, whoever else touched it. An unchanged module that N1 already reported is left to N1, which
+// names the declaration that went rather than the identifier Lean wrote; one whose errors name nothing is left
+// alone, because it is no change of this batch and the rule that asked for its compile has decided it.
+//
+// Only modules the build builds are compiled, and only they are refused: the build never reads a changed module
+// that no build target imports, and refusing one could refuse a change the build accepts.
+func compileFindings(c *Candidate, cfg Config, reported map[string]bool) ([]landing.Finding, error) {
 	var out []landing.Finding
-	for _, ch := range c.Changes {
-		m := c.Module(ch.Module)
-		if m == nil || m.State != Failed || !c.Built(ch.Module) {
+	for _, module := range c.failed() {
+		m := c.Module(module)
+		if m.Unchanged && reported[module] {
 			continue
 		}
 		findings, err := refusals(m, cfg)
 		if err != nil {
+			if m.Unchanged {
+				continue
+			}
 			return nil, err
 		}
 		out = append(out, findings...)

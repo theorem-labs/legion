@@ -37,7 +37,7 @@ func Names(ctx context.Context, c *Candidate, idx *declindex.Store, cfg Config) 
 	out = append(out, duplicates...)
 	// C1 runs last: N1's confirming compiles are part of what Lean has said by now, so a module another member
 	// broke is reported with the names Lean's own errors carry.
-	refused, err := compileFindings(c, cfg)
+	refused, err := compileFindings(c, cfg, n.reportedModules)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +72,8 @@ type nameState struct {
 	// closures each user module to its candidate import closure, for N1.
 	reverse  map[string][]string
 	closures map[string]map[string]bool
+	// reportedModules are the modules N1 has reported on, which C1 then leaves to it.
+	reportedModules map[string]bool
 }
 
 // located is one declaration of a compiled candidate module.
@@ -137,7 +139,8 @@ func readNames(ctx context.Context, c *Candidate, idx *declindex.Store, cfg Conf
 	}
 	n := &nameState{c: c, idx: idx, cfg: cfg, paths: map[string]string{}, modules: map[string]string{},
 		baseDecls: map[string][]declindex.Decl{}, public: map[string][]located{}, closures: map[string]map[string]bool{},
-		private: map[string]bool{}, unchanged: map[string][]declindex.Decl{}}
+		reportedModules: map[string]bool{},
+		private:         map[string]bool{}, unchanged: map[string][]declindex.Decl{}}
 	for module, file := range paths {
 		n.paths[normalName(module)] = file
 		n.modules[file] = module
@@ -480,11 +483,22 @@ func startsUpper(s string) bool {
 	return s != "" && unicode.IsUpper(firstRune(s))
 }
 
+// group is the recorded uses of one removed name in one module: how many, which is first, and the lines they sit
+// on, which is where Lean's own error must sit for N1 to refuse.
+type group struct {
+	r      *removal
+	module string
+	first  declindex.Use
+	count  int
+	lines  map[int]bool
+}
+
 // removedUses runs N1: a built module whose file no changes uses a name its own import closure no longer declares.
 // A recorded base use is evidence, not proof: a use inside a tactic that has a fallback leaves a module that still
 // builds. So every module N1 would refuse is compiled against the candidate first (Candidate.Confirm), and Lean
-// decides: a module that compiles gives no finding, one that fails is refused, and one Lean could not compile (a
-// changed module it needs failed) is flagged. A changed module that uses a removed name is C1's.
+// decides: a module that compiles gives no finding, one that fails over the removal is refused, one that fails for
+// another member's change is C1's, and one Lean could not compile is flagged. A changed module that uses a removed
+// name is C1's too.
 func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) {
 	if len(n.removed) == 0 {
 		return nil, nil
@@ -511,12 +525,6 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 	if err := n.askUnchanged(ctx, names); err != nil {
 		return nil, err
 	}
-	type group struct {
-		r      *removal
-		module string
-		first  declindex.Use
-		count  int
-	}
 	groups := map[[2]string]*group{}
 	var order [][2]string
 	for _, u := range uses {
@@ -534,12 +542,13 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 		key := [2]string{r.Target, module}
 		g, ok := groups[key]
 		if !ok {
-			g = &group{r: r, module: module, first: u}
+			g = &group{r: r, module: module, first: u, lines: map[int]bool{}}
 			groups[key] = g
 			order = append(order, key)
 		} else if u.Line < g.first.Line || (u.Line == g.first.Line && u.Col < g.first.Col) {
 			g.first = u
 		}
+		g.lines[u.Line] = true
 		g.count++
 	}
 	if len(order) == 0 {
@@ -561,7 +570,7 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 		g := groups[key]
 		// A module Lean refused for something else is another member's doing, not this removal's: C1 reports the
 		// names Lean's own errors carry, and N1 keeps quiet about it.
-		if m != nil && m.State == Failed && !n.blamed(m, g.r) {
+		if m != nil && m.State == Failed && !n.blamed(m, g) {
 			return true
 		}
 		c := counts[g.r]
@@ -577,6 +586,7 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 		if m := n.c.Module(g.module); m == nil || m.State != Failed {
 			verdict, doubt = landing.VerdictFlag, "; Lean could not compile this module against the candidate to confirm"+r.doubt()
 		}
+		n.reportedModules[g.module] = true
 		out = append(out, landing.Finding{
 			Path: n.fileOf(g.module), Line: max(g.first.Line, 1), Col: max(g.first.Col, 1),
 			Verdict: verdict, Declaration: r.Name, Kind: r.kind(),
@@ -586,22 +596,37 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 	return out, nil
 }
 
-// blamed reports whether a module's compile failed over the removed declaration: one of the names the landing
-// program's blame reads out of Lean's errors is it, or Lean's text names it, its last component or the module it
-// came from (a missing module, a field Lean reports under its structure). A module that fails for another reason
+// blamed reports whether a module's compile failed over this removal. Either Lean's error sits on a line where the
+// base recorded a use of the removed name and the landing program's blame reads, there, an unknown or field name
+// that is the removed declaration — its full name, or a suffix of it, which is how Lean writes a name an open
+// namespace shortens — or the module the name came from is gone from the candidate's build and Lean's error says
+// that module is missing. A name that merely ends in the same last component is another declaration: that failure
 // is another member's, and C1 names it.
-func (n *nameState) blamed(m *Module, r *removal) bool {
-	short := lastComponent(r.Name)
+func (n *nameState) blamed(m *Module, g *group) bool {
+	r := g.r
+	gone := n.c.Module(r.Module) == nil && !n.c.Built(normalName(r.Module))
 	for _, e := range m.Errors {
+		if gone && namesWord(e.Message, normalName(r.Module)) {
+			return true
+		}
+		if !g.lines[e.Line] {
+			continue
+		}
 		for _, block := range blame.Parse(blameLog(m.Module, e), n.cfg.Roots).Blocks {
 			for _, name := range blame.Names(block.Message) {
-				if name.Value == r.Name || name.Value == short || strings.HasSuffix(name.Value, "."+short) {
+				if name.Kind != blame.Unknown && name.Kind != blame.Field {
+					continue
+				}
+				if name.Value == r.Name || strings.HasSuffix(r.Name, "."+name.Value) {
+					return true
+				}
+				// A removed field: at a line where the base recorded a use of it, a field Lean cannot place, and
+				// the structure itself, are how Lean writes that the field went ("`S` has no field `f`", "Fields
+				// missing: `g`", `g` being what the candidate has instead).
+				if r.Field != "" && (name.Kind == blame.Field || name.Value == r.Structure) {
 					return true
 				}
 			}
-		}
-		if namesWord(e.Message, r.Name) || namesWord(e.Message, short) || namesWord(e.Message, normalName(r.Module)) {
-			return true
 		}
 	}
 	return false

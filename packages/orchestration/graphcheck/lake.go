@@ -134,10 +134,22 @@ func (s *lakeState) pluginsOf(m *Module) ([]string, error) {
 				return nil, err
 			}
 			if setup == nil {
-				continue
+				if !s.ofRoots(imp) {
+					// A module of the toolchain or of a package Lake builds outside the project: it brings no
+					// plugin of its own, as the setups of the modules that do import it show.
+					continue
+				}
+				// A module of the project that the base build did not build: the check cannot read what Lake
+				// loads for it.
+				return nil, unable("%s imports %s, which the base build did not build, so the plugins Lake gives "+
+					"the compile cannot be read off it", m.Module, imp)
 			}
 			list = setup.pluginPaths()
-			if lib, ok := s.sharedLibrary(imp, setup.Package); ok {
+		}
+		// An import that is precompiled loads its own shared library, whether the batch changes it or not; a
+		// changed one's is stale, which the caller refuses.
+		if pkg, ok := s.packageOf(imp); ok {
+			if lib, ok := s.sharedLibrary(imp, pkg); ok {
 				list = append(list, lib)
 			}
 		}
@@ -305,12 +317,32 @@ func readSetup(path string) (*lakeSetup, error) {
 	return &setup, nil
 }
 
-// sharedLibrary is the module's precompiled shared library in the base build's library directory, when it has one.
-// Lake names it by Lean's module initialization stem: `<package>_<Module>`, mangled.
+// ofRoots reports whether a module belongs to the project the index reads, by its first name component. A module
+// of the toolchain or of a package outside the project is not one the base build builds.
+func (s *lakeState) ofRoots(module string) bool {
+	return slices.Contains(s.c.icfg.Roots, nameComponents(module)[0])
+}
+
+// packageOf is the package that builds a module, from its base setup; false when the base build has none.
+func (s *lakeState) packageOf(module string) (string, bool) {
+	setup, err := s.setup(module)
+	if err != nil || setup == nil {
+		return "", false
+	}
+	return setup.Package, true
+}
+
+// sharedLibrary is a module's precompiled shared library, when the base build has one. Lake names it by Lean's
+// module initialization stem, `<package>_<Module>` mangled, and keeps it in the library directory of the package
+// that builds it, so every library directory on the search path is looked in, the root's first.
 func (s *lakeState) sharedLibrary(module, pkg string) (string, bool) {
-	path := filepath.Join(s.c.icfg.Lib, initializationStem(module, pkg)+".so")
-	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
-		return path, true
+	name := initializationStem(module, pkg) + ".so"
+	for _, lib := range append([]string{s.c.icfg.Lib}, s.c.leanPath...) {
+		for _, path := range []string{filepath.Join(lib, name), filepath.Join(filepath.Dir(lib), name)} {
+			if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+				return path, true
+			}
+		}
 	}
 	return "", false
 }

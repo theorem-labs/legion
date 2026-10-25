@@ -53,23 +53,54 @@ func TestUnableCarriesLeansOwnOutput(t *testing.T) {
 }
 
 // Two members break one unchanged module: one removes a name the module uses only in a tactic fallback, the other
-// changes a type the same module uses. The fallback module no longer compiles, but not for the removal, so N1 says
-// nothing about it and C1 reports the names Lean's errors carry.
+// changes a type the same module uses, and a third declaration binds a variable whose name is the removed name's
+// last component. The module no longer compiles, but not for the removal: N1 says nothing about it, and C1 reports
+// the names Lean's errors carry, so the member Lean names is the one refused.
 func TestNamesDoesNotRefuseARemovalForAnotherMembersBreak(t *testing.T) {
 	f := graphchecktest.NewVariant(t, graphchecktest.Variant{Files: map[string]string{
-		"Lib/Fb.lean":    "namespace Lib.Fb\ndef fb : Nat := 1\nend Lib.Fb\n",
+		"Lib/Sz.lean":    "namespace Lib.Sz\ndef size : Nat := 1\nend Lib.Sz\n",
 		"Lib/Other.lean": "namespace Lib.Other\ndef other : Nat := 2\nend Lib.Other\n",
-		"Lib/User.lean":  "import Lib.Fb\nimport Lib.Other\n\ntheorem user : Lib.Other.other = 2 := by\n  first\n  | have h := Lib.Fb.fb\n    rfl\n  | rfl\n",
-		"Lib.lean":       libRoot + "import Lib.User\n",
+		"Lib/User.lean": "import Lib.Sz\nimport Lib.Other\n\ntheorem user : Lib.Other.other = 2 := by\n  first\n  | have h := Lib.Sz.size\n    rfl\n  | rfl\n\n" +
+			"theorem eqUse (size : Nat) (h : Lib.Other.other = size) : Lib.Other.other = size := h\n",
+		"Lib.lean": libRoot + "import Lib.User\n",
 	}})
 	tree := f.EditMany(t, map[string][2]string{
-		"Lib/Fb.lean":    {"def fb : Nat := 1", "private def fb : Nat := 1"},
+		"Lib/Sz.lean":    {"def size : Nat := 1", "private def size : Nat := 1"},
 		"Lib/Other.lean": {"def other : Nat := 2", "def other : String := \"2\""},
 	})
-	for _, h := range names(t, f, tree) {
-		if h.Declaration == "Lib.Fb.fb" && h.Verdict == landing.VerdictRefuse {
+	hits := names(t, f, tree)
+	for _, h := range hits {
+		if h.Declaration == "Lib.Sz.size" && h.Verdict == landing.VerdictRefuse {
 			t.Fatalf("refusal %+v: the module fails on the other member's change, not on this removal", h)
 		}
+	}
+	if len(ruleHits(hits, "C1")) == 0 {
+		t.Fatalf("findings %v, want C1 to report the module Lean refused", hits)
+	}
+}
+
+// Two removals whose names end in the same last component: one is used only in a tactic fallback and the module
+// still builds without it, the other is used directly and Lean names it. Only the second is refused.
+func TestNamesRefusesOnlyTheRemovalLeanNames(t *testing.T) {
+	f := graphchecktest.NewVariant(t, graphchecktest.Variant{Files: map[string]string{
+		"Lib/Fb.lean":    "namespace Lib.Fb\ndef helper : Nat := 1\nend Lib.Fb\n",
+		"Lib/Other.lean": "namespace Lib.Other\ndef helper : Nat := 2\nend Lib.Other\n",
+		"Lib/User.lean": "import Lib.Fb\nimport Lib.Other\n\ntheorem user : True := by\n  first\n  | have h := Lib.Fb.helper\n    trivial\n  | trivial\n\n" +
+			"def direct : Nat := Lib.Other.helper\n",
+		"Lib.lean": libRoot + "import Lib.User\n",
+	}})
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Fb.lean":    {"def helper : Nat := 1", "private def helper : Nat := 1"},
+		"Lib/Other.lean": {"def helper : Nat := 2", "def helper2 : Nat := 2"},
+	})
+	hits := names(t, f, tree)
+	for _, h := range hits {
+		if h.Declaration == "Lib.Fb.helper" && h.Verdict == landing.VerdictRefuse {
+			t.Fatalf("refusal %+v: that module builds without the name, and Lean names the other one", h)
+		}
+	}
+	if _, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Other.helper", "Lib/User.lean", "N1"); !ok {
+		t.Fatalf("no N1 refusal of Lib.Other.helper in %v", hits)
 	}
 }
 
@@ -88,15 +119,51 @@ func TestNamesNeverNeedsTheOutputOfAModuleNoTargetBuilds(t *testing.T) {
 	}
 }
 
-// A module the index knows but the base build has no object file for (a build pruned to its targets' closure) is
-// outside what the build builds: no finding is made at it, and the check still decides.
-func TestNamesMakesNoFindingInAModuleTheBaseBuildDidNotBuild(t *testing.T) {
+// A module inside the closure of the build's targets whose base object file is missing means the base build is not
+// the build of those targets. The check cannot decide against it and says which module is missing, rather than
+// reporting a clean candidate where the build would fail.
+func TestAnIncompleteBaseBuildIsUnable(t *testing.T) {
 	f := graphchecktest.NewVariant(t, graphchecktest.Variant{Pruned: []string{"Lib.Make"}})
 	tree := f.Edit(t, "Lib/Core.lean", "  val : Nat", "  value : Nat")
-	for _, h := range names(t, f, tree) {
-		if h.Path == "Lib/Make.lean" {
-			t.Fatalf("finding %+v in a module the base build did not build", h)
-		}
+	_, _, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, tree)
+	isUnable(t, err)
+	var unable *graphcheck.UnableError
+	if errors.As(err, &unable) && !strings.Contains(unable.Reason, "Lib.Make") {
+		t.Fatalf("reason %q, want the module whose object file is missing", unable.Reason)
+	}
+}
+
+// A batch that changes a Lean file of another package of the project cannot be decided: that package's module is
+// built in its own context before the modules that import it. Both directions — a name added there and used, and
+// a name removed there — must be unable, never a refusal and never a clean pass.
+func TestAChangedDependencyPackageIsUnable(t *testing.T) {
+	dep := graphchecktest.Variant{
+		Lakefile: "\n[[require]]\nname = \"dep\"\npath = \"vendor/Dep\"\n",
+		Files: map[string]string{
+			"vendor/Dep/lakefile.toml": "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n\n[[lean_lib]]\nname = \"Dep\"\n",
+			"vendor/Dep/Dep.lean":      "def Dep.answer : Nat := 42\n",
+			"Lib/WithDep.lean":         "import Dep\n\ndef Lib.withDep : Nat := Dep.answer\n",
+			"Lib.lean":                 libRoot + "import Lib.WithDep\n",
+		},
+	}
+	for name, edits := range map[string]map[string][2]string{
+		"a name added there and used": {
+			"vendor/Dep/Dep.lean": {"def Dep.answer : Nat := 42", "def Dep.answer : Nat := 42\ndef Dep.more : Nat := 1"},
+			"Lib/WithDep.lean":    {"def Lib.withDep : Nat := Dep.answer", "def Lib.withDep : Nat := Dep.more"},
+		},
+		"a name removed there": {
+			"vendor/Dep/Dep.lean": {"def Dep.answer : Nat := 42", "def Dep.gone : Nat := 42"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := graphchecktest.NewVariant(t, dep)
+			tree := f.EditMany(t, edits)
+			c, idx, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, tree)
+			if err == nil {
+				_, err = graphcheck.Names(context.Background(), c, idx, f.Cfg)
+			}
+			isUnable(t, err)
+		})
 	}
 }
 

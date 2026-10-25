@@ -38,8 +38,11 @@ A check that judges Lean code reads Lean's compiled output, never Lean source te
 - Text is used for two things only, and judges nothing: `git diff` says **which** files changed, and a candidate
   file's line gives the **column** of a declaration whose line the compiled output records.
 
-The check compiles the changed modules and nothing downstream of them, so it ends well before the build it runs
-in front of. It prints no timing: the landing program records each check's wall time in `CheckVerdict.Seconds`.
+The check compiles the batch's changed modules, the unchanged modules between them and the modules that import
+them (which the build rebuilds too), and the unchanged modules N1 asks Lean about before it refuses. It never
+compiles the whole closure below a change, so it ends well before the build it runs in front of, but a large batch
+costs minutes rather than a second. It prints no timing: the landing program records each check's wall time in
+`CheckVerdict.Seconds`.
 
 ## The rules
 

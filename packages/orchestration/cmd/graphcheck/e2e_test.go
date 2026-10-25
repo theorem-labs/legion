@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/graphcheck/graphchecktest"
+	"github.com/sjawhar/legion/orchestration/internal/testdocker"
 	"github.com/sjawhar/legion/orchestration/landing"
 )
 
@@ -69,13 +70,41 @@ func runBin(t *testing.T, bin string, args ...string) (int, string, string) {
 	}
 }
 
+// landConfig is a land configuration whose only check is this graphcheck binary. Every check now runs in a
+// container on the build VM, so the container section stands the host in for that VM (as cmd/land's own tests do)
+// and gives the container read-only mounts of everything the check reads: the repository, the index and the Lean
+// toolchain the fixture built with.
 func landConfig(t *testing.T, f *graphchecktest.Fixture, members []map[string]any) string {
 	t.Helper()
+	user := testdocker.Require(t)
+	root := t.TempDir()
+	clone, runs, cache := filepath.Join(root, "clone.git"), filepath.Join(root, "runs"), filepath.Join(root, "lakecache")
+	for _, dir := range []string{clone, runs, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mounts := []map[string]any{{"name": "lake-cache", "host_path": cache}}
+	shared := map[string]any{}
+	for i, dir := range []string{f.Repo, filepath.Dir(f.ConfigPath), filepath.Dir(filepath.Dir(graphcheckBin)), f.Lean.Prefix} {
+		name := "read-" + string(rune('a'+i))
+		mounts = append(mounts, map[string]any{"name": name, "host_path": dir})
+		shared[name] = "read-only"
+	}
+	build := map[string]any{"lake-cache": "read-write"}
+	for name, mode := range shared {
+		build[name] = mode
+	}
 	return writeJSON(t, map[string]any{
-		"batchId": "e2e", "repository": map[string]any{"name": "fixture", "path": f.Repo, "git_dir": filepath.Join(f.Repo, ".git")},
+		"batchId": "e2e", "repository": map[string]any{"name": "fixture", "path": f.Repo, "git_dir": clone},
 		"base": f.Base, "baseBranch": "main", "members": members,
 		"build": []string{"sh", "-c", "exit 99"}, "hasher": []string{"true"}, "toolchain": []string{"true"},
 		"escalations": map[string]any{"owner": "steward"},
+		"container": map[string]any{
+			"ssh": testdocker.SSH(t), "image": testdocker.Image, "user": user,
+			"run_root": runs, "build_root": "lake-cache", "mounts": mounts,
+			"build_mounts": build, "check_mounts": shared,
+		},
 		"checks": []map[string]any{{"name": "names", "format": "graph",
 			"command": []string{graphcheckBin, "names", "--config", f.ConfigPath}}},
 	})

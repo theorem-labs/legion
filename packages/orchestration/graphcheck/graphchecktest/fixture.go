@@ -37,7 +37,9 @@ type Fixture struct {
 	// ConfigPath is the graphcheck configuration file; Cfg is what LoadConfig read from it.
 	ConfigPath string
 	Cfg        graphcheck.Config
-	heads      map[string]string
+	// Lean is the toolchain the fixture built with, which the candidate's modules compile with too.
+	Lean  declindex.Lean
+	heads map[string]string
 }
 
 // The default vocabulary of the fixture's configuration: the slice 3 rules read it.
@@ -173,7 +175,7 @@ func build(t testing.TB, v Variant, damage func(lib string), compiled bool) *Fix
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Fixture{Repo: repo, Base: base, ConfigPath: configPath, Cfg: cfg, heads: map[string]string{}}
+	return &Fixture{Repo: repo, Base: base, ConfigPath: configPath, Cfg: cfg, Lean: lean, heads: map[string]string{}}
 }
 
 // compiledPart reads the base build's types and compiled statement hashes into the index, as a production

@@ -103,13 +103,15 @@ type Candidate struct {
 	scratch string
 	// leanPath is the search path Lake gives `lean` in the index's tree (lakeLeanPath); the scratch goes first.
 	leanPath []string
-	byPath   map[string]*Change
-	byModule map[string]*Change
-	text     map[string]string  // path -> candidate text, for added and modified files
-	modules  map[string]*Module // added and modified modules
-	graph    map[string][]string
-	built    map[string]bool
-	paths    map[string]string // module -> path, of the index and the changed files
+	// otherLean are the batch's changed .lean files outside roots: a package of the project builds them.
+	otherLean []string
+	byPath    map[string]*Change
+	byModule  map[string]*Change
+	text      map[string]string  // path -> candidate text, for added and modified files
+	modules   map[string]*Module // added and modified modules
+	graph     map[string][]string
+	built     map[string]bool
+	paths     map[string]string // module -> path, of the index and the changed files
 
 	exportOnce              sync.Once
 	constants, baseConstant map[string][]declindex.Constant // module -> constants
@@ -215,6 +217,7 @@ func (c *Candidate) read(ctx context.Context, g gitDir, idx *declindex.Store) er
 		}
 		module = strings.ReplaceAll(module, "/", ".")
 		if !c.cfg.inRoots(module) {
+			c.otherLean = append(c.otherLean, file)
 			continue
 		}
 		if strings.ContainsAny(file, "\n\t") {
@@ -296,6 +299,9 @@ func (c *Candidate) compile(ctx context.Context, idx *declindex.Store) error {
 		c.modules[ch.Module] = m
 		c.paths[ch.Module] = ch.Path
 		changed = append(changed, m)
+	}
+	if err := c.checkOtherPackages(ctx); err != nil {
+		return err
 	}
 	if len(changed) == 0 {
 		return c.closure()
@@ -545,8 +551,36 @@ func moduleOfOutput(rel string) string {
 	return strings.ReplaceAll(rel, "/", ".")
 }
 
+// checkOtherPackages refuses to decide a batch that changes a Lean file of another package of the project: an
+// in-repo dependency's module is built in its own package's context, before the modules that import it, and the
+// check does not reproduce that. Compiling the importers against the old build of it would refuse a change the
+// build accepts, or miss one it refuses, so the check says it cannot decide.
+func (c *Candidate) checkOtherPackages(ctx context.Context) error {
+	if len(c.otherLean) == 0 {
+		return nil
+	}
+	if err := c.ensureScratch(ctx); err != nil {
+		return err
+	}
+	for _, lib := range c.leanPath {
+		pkg, err := filepath.Rel(c.icfg.Tree, filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(lib)))))
+		if err != nil || pkg == "." || strings.HasPrefix(pkg, "..") {
+			continue
+		}
+		for _, file := range c.otherLean {
+			if rel, err := filepath.Rel(pkg, file); err == nil && !strings.HasPrefix(rel, "..") {
+				return unable("the batch changes %s, a Lean file of the package at %s, which the build builds in "+
+					"its own context before the modules that import it; the check does not reproduce that", file, pkg)
+			}
+		}
+	}
+	return nil
+}
+
 // closure computes the modules the build builds: the closure of build_roots over the candidate's import graph,
-// with each added module a root too when root_new_modules is set.
+// with each added module a root too when root_new_modules is set. Membership is the import graph's answer, never
+// the presence of an object file; a module in the closure whose base object file is missing says the base build is
+// not the build of those targets, and the check cannot decide against it.
 func (c *Candidate) closure() error {
 	roots := normalNames(c.cfg.BuildRoots)
 	for _, ch := range c.Changes {
@@ -555,6 +589,7 @@ func (c *Candidate) closure() error {
 		}
 	}
 	c.built = map[string]bool{}
+	var missing []string
 	stack := roots
 	for len(stack) > 0 {
 		module := stack[len(stack)-1]
@@ -563,13 +598,16 @@ func (c *Candidate) closure() error {
 		if !ok || c.built[module] {
 			continue
 		}
-		// An unchanged module the base build has no object file for lies outside what the build's targets build:
-		// the build does not read it, so neither does the check.
-		if c.byModule[module] == nil && !c.baseBuilt(module) {
-			continue
-		}
 		c.built[module] = true
+		if c.byModule[module] == nil && !c.baseBuilt(module) {
+			missing = append(missing, module)
+		}
 		stack = append(stack, imported...)
+	}
+	if len(missing) != 0 {
+		sort.Strings(missing)
+		return unable("the base build has no object file for %s, which %s builds: it is not the build of those targets",
+			strings.Join(missing[:min(len(missing), 3)], ", "), strings.Join(c.cfg.BuildRoots, ", "))
 	}
 	return nil
 }
@@ -654,19 +692,6 @@ func (c *Candidate) compileBuilt(ctx context.Context, changed []*Module) error {
 	roots := declindex.Roots{}
 	for _, r := range c.icfg.Roots {
 		roots[r] = true
-	}
-	// Every changed module that one of these imports is compiled too, whether or not a build root reaches it: its
-	// base output is of the old source, and Lean reads the .olean of every module in the import closure.
-	for grown := true; grown; {
-		grown = false
-		for _, m := range pending {
-			for _, d := range c.changedDeps(m) {
-				if dep := c.modules[d]; pending[d] == nil && dep != nil && dep.State == NotBuilt {
-					pending[d] = dep
-					grown = true
-				}
-			}
-		}
 	}
 	// deps are the changed modules in each module's closure, waits how many of them are still pending, and users
 	// the pending modules that wait for each one.
@@ -856,12 +881,18 @@ func (c *Candidate) ChangeOfModule(module string) *Change { return c.byModule[no
 // Module returns an added or modified module, or nil.
 func (c *Candidate) Module(module string) *Module { return c.modules[normalName(module)] }
 
-// CompiledModules are the changed modules Lean compiled, in name order: those the build builds, and no module
-// downstream of them. The check's cost is theirs.
-func (c *Candidate) CompiledModules() []string {
+// CompiledModules are the modules Lean compiled, in name order: the batch's changed ones that the build builds,
+// the unchanged ones between them and their importers, and the ones a rule asked Lean about. The check's cost is
+// theirs.
+func (c *Candidate) CompiledModules() []string { return c.inState(Compiled) }
+
+// failed are the modules whose compile Lean refused, in name order.
+func (c *Candidate) failed() []string { return c.inState(Failed) }
+
+func (c *Candidate) inState(state CompileState) []string {
 	out := make([]string, 0, len(c.modules))
 	for module, m := range c.modules {
-		if m.State == Compiled {
+		if m.State == state && c.built[module] {
 			out = append(out, module)
 		}
 	}
