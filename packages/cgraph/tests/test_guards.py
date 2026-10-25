@@ -1290,16 +1290,15 @@ NAMESPACES = """
 def test_a_decided_condition_of_inline_code_is_not_computed(tmp_path: Path) -> None:
     """vfs_fileattr_set: `if (current_user_ns() != &init_user_ns)`, current_user_ns() being `return
     &init_user_ns;` without CONFIG_USER_NS: the compiler folds it and forms no &init_user_ns. A call of
-    a function the compiler may call instead (device_add's device_create_file) leaves its branch to the
-    image, so warn() is `conditional`, not dead."""
+    a function that is neither inline nor a static called once (device_add's device_create_file) gives
+    no value, so its branch stays code."""
     facts = facts_of(tmp_path, NAMESPACES)
     events = facts["functions"]["fileattr"]["events"]
     assert ({call["callee"] for call in events["calls"]}, events["accesses"]) == ({"kept"}, [])
-    calls = facts["functions"]["dev_add"]["events"]["calls"]
-    assert {call["callee"]: bool(call.get("conditional")) for call in calls} == {
-        "stub_file": False,
-        "warn": True,
-        "kept": False,
+    assert {call["callee"] for call in facts["functions"]["dev_add"]["events"]["calls"]} == {
+        "stub_file",
+        "warn",
+        "kept",
     }
 
 

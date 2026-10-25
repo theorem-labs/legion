@@ -364,10 +364,13 @@ def test_every_non_container_field_offset_of_the_unit_matches_the_image(fct_buil
         for name, fields in FIELD_DISPLACEMENTS.items()
         if any(f[3] == "container_of" for f in fields)
     }
-    # &o->x is o itself (llvm-objdump: mv s0, a0; jal obj_free): no instruction carries offset 0, so the
-    # image cannot show this field; the facts mark it `address` and the checks' rule decides it. Before
     # 6bb98770's image change it matched `sd s0, 0x0(sp)`, a stack store, by coincidence.
-    no_instruction = {("function:fct_member_address", "fct_outer", "x")}
+    # fct_alloc_object's x: clang inlines fct_init_always (an external function, so no rule says it
+    # folds) and drops the store; the facts keep it rather than guess the inliner, a miss on purpose.
+    no_instruction = {
+        ("function:fct_member_address", "fct_outer", "x"),
+        ("function:fct_alloc_object", "fct_outer", "x"),
+    }
     assert {miss for miss in misses if miss[0] not in container} <= no_instruction
     assert offsets["matched"] >= 8
 
@@ -905,13 +908,12 @@ def test_a_folded_callee_s_field_is_that_far_from_the_register_a_call_returns(fc
 
 
 def test_a_constant_helper_result_and_an_unwritten_static_decide_branches(fct_facts: dict[str, Any]) -> None:
-    """fct_never_set is always 0, so fct_maybe_use reads no x. fct_init_always always returns 0, but
-    only the inliner model says the compiler folds that body into fct_alloc_object, so the image
-    settles its branch: the x it stores there is ``conditional``."""
+    """fct_never_set is always 0, so fct_maybe_use reads no x. fct_init_always always returns 0, but it
+    is neither inline nor a static called once, so whether clang folds it is no rule: its branch stays
+    code, and fct_alloc_object's store of x stays (the image, which inlines it, shows a miss)."""
     assert "x" not in {field for field, *_ in _fields_of(fct_facts, "fct_maybe_use")}
     assert "fct_cur" in {call["callee"] for call in fact_events(fct_facts, "fct_maybe_use")["calls"]}
-    fields = fact_events(fct_facts, "fct_alloc_object")["field_accesses"]
-    assert [item.get("conditional") for item in fields if item["field"] == "x"] == [True]
+    assert "x" in {field for field, *_ in _fields_of(fct_facts, "fct_alloc_object")}
 
 
 def test_gnu_conditional_with_an_omitted_middle_is_no_conversion_of_its_last_operand(fct_facts: dict[str, Any]) -> None:

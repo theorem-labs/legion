@@ -1413,15 +1413,9 @@ def _link_core(linker: Linker, config: Config, part_files: list[str]) -> dict[st
                 continue
             state = state_node(unit, access["provenance"])
             if state is None:
-                exclude(
-                    "access",
-                    "record_unknown",
-                    identity,
-                    unit_id,
-                    {"unit": unit["name"], "kind": unit["kind"]},
-                    access["provenance"],
-                )
-                continue
+                # clangfacts writes the record of every struct an access names into the same unit's
+                # records, so this is inconsistent facts (a cache from another extractor), not C.
+                raise ValueError(f"struct unit {unit['name']}@{unit.get('def')} has no record in the facts")
             target = state
             builder.edge(
                 "access", identity, target, access["provenance"], access=access["access"], field=access.get("field")

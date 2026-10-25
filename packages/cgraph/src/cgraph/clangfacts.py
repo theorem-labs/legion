@@ -1778,41 +1778,6 @@ def _is_noinline(definition: ci.Cursor) -> bool:
     return False
 
 
-# A body clang -O2 inlines at each call whatever its linkage: no loop, no asm, no call of itself, and at
-# most this many calls and syntax nodes (fct_init_always: an if, one call and two returns).
-_SMALL_CALLS = 4
-_SMALL_NODES = 60
-
-
-def _small_body(definition: ci.Cursor, definitions: dict[str, ci.Cursor]) -> bool:
-    """The function's body is small enough that clang inlines it at every call (``_SMALL_CALLS``),
-    counted as clang weighs it: bottom-up, with the bodies of the inline functions it calls already
-    in it (wrap()'s call of an __always_inline heavy() with 40 calls makes wrap large)."""
-    seen: set[str] = {definition.spelling}
-    pending = [definition]
-    calls = nodes = 0
-    while pending:
-        current = pending.pop()
-        body = next((child for child in _children(current) if child.kind == K.COMPOUND_STMT), None)
-        if body is None:
-            return False
-        for node in body.walk_preorder():
-            nodes += 1
-            if node.kind in (*_LOOPS, K.ASM_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT) or nodes > _SMALL_NODES:
-                return False
-            if node.kind != K.CALL_EXPR:
-                continue
-            calls += 1
-            callee = node.referenced.spelling if node.referenced is not None else ""
-            if calls > _SMALL_CALLS or callee == definition.spelling:
-                return False
-            inner = definitions.get(callee)
-            if inner is not None and callee not in seen and _is_inline(inner):
-                seen.add(callee)
-                pending.append(inner)
-    return True
-
-
 def _is_noreturn(function: ci.Cursor | None) -> bool:
     """A function declared ``__noreturn`` (``__attribute__((noreturn))``: panic, do_exit)."""
     return function is not None and function.kind == K.FUNCTION_DECL and "noreturn" in function.type.spelling
@@ -2287,18 +2252,16 @@ class _Evaluator:
         self.transferring: dict[int, bool] = {}
         self.structs: dict[int, dict[str, Any] | None] = {}  # each const global struct's value, by its hash
         self.folded_into: dict[str, bool] = {}  # per function, whether its calls fold its body (``folds_into``)
-        # The names ``folds_into`` admits by the inliner model alone (``_small_body``), not by a rule.
-        self.modelled: set[str] = set()
         # Variables as the unit's own values: a local as the values stored in it, a parameter unknown.
         self.known = self.resolver({})
 
     def folds_into(self, name: str) -> bool:
         """The compiler puts the function's body into each call (so its returns fold there): one
-        declared ``inline``, a static one the unit calls once and whose address it never takes, or one
-        whose body is small (``_small_body``), as clang -O2 inlines under its cost threshold; never one
-        marked with an attribute of ``_OUT_OF_LINE``, weak, or a caller of ``va_start``. The last route
-        is a model of clang's inliner, not a rule of the language, so its names are kept in
-        ``modelled``: the walk leaves what they decide to the image."""
+        declared ``inline``, or a static one the unit calls once and whose address it never takes;
+        never one marked with an attribute of ``_OUT_OF_LINE``, weak, or a caller of ``va_start``. A
+        small body alone is not enough: whether clang inlines it is a model of its inliner (bottom-up,
+        with thresholds, caller attributes and target features), which the reviewers broke at every
+        site that used it, so such a call keeps no value the facts state."""
         if name not in self.folded_into:
             definition = self.definitions.get(name)
             if definition is None or self.weak(definition) or _is_noinline(definition):
@@ -2313,22 +2276,8 @@ class _Evaluator:
                     if node.kind == K.DECL_REF_EXPR and node.referenced is not None and node.referenced.spelling == name
                     and node.referenced.kind == K.FUNCTION_DECL
                 ]  # fmt: skip
-                once = definition.storage_class == ci.StorageClass.STATIC and len(uses) == 1
-                self.folded_into[name] = once or _small_body(definition, self.definitions)
-                if self.folded_into[name] and not once:
-                    self.modelled.add(name)
+                self.folded_into[name] = definition.storage_class == ci.StorageClass.STATIC and len(uses) == 1
         return self.folded_into[name]
-
-    def modelled_in(self, cursor: ci.Cursor) -> set[str]:
-        """The functions whose bodies only the inliner model folds into the calls of this expression:
-        what they decide there is the image's to settle (``folds_into``)."""
-        found = set()
-        for node in cursor.walk_preorder():
-            callee = node.referenced if node.kind == K.CALL_EXPR else None
-            name = callee.spelling if callee is not None and callee.kind == K.FUNCTION_DECL else None
-            if name is not None and self.folds_into(name) and name in self.modelled:
-                found.add(name)
-        return found
 
     def image_decides(self, cursor: ci.Cursor) -> bool:
         """``__builtin_constant_p`` or ``__builtin_object_size`` inside: the image decides. Once per cursor."""
@@ -4231,19 +4180,13 @@ class _FunctionWalk:
             self.labelled[key] = found
         return self.labelled[key]
 
-    def guard_id(
-        self, expression: dict[str, Any], value: bool | None, image: bool = False, inlined: str | None = None
-    ) -> int:
+    def guard_id(self, expression: dict[str, Any], value: bool | None, image: bool = False) -> int:
         """The guard's index in the function's table, added once. A guard with no ``value`` holds where
         its expression is not decided (``u``): what only computes an operand of a comparison the caller's
-        constants fold. Where an ``image`` guard is decided against, the image decides. An ``inlined``
-        guard names the function whose returns gave the value: the image settles it, because only the
-        inliner model says the compiler folds that body here (``_Evaluator.folds_into``)."""
+        constants fold. Where an ``image`` guard is decided against, the image decides."""
         guard = {"e": expression, "v": value} if value is not None else {"e": expression, "u": True}
         if image:
             guard["image"] = True
-        if inlined is not None:
-            guard["inlined"] = inlined
         key = jsonio.canonical(guard)
         if key not in self.guard_ids:
             self.guard_ids[key] = len(self.guard_table)
@@ -6053,22 +5996,6 @@ class _FunctionWalk:
                 self.conditional -= 1
                 return
             value = self.decided(condition)
-            if value is not None and (modelled := self.x.evaluator.modelled_in(condition)):
-                # Only the inliner model says the compiler folds that callee's body here (folds_into),
-                # so the image decides: the branch is `conditional`, under an `inlined` guard naming
-                # the callee, and link keeps it where the image still calls that function.
-                self.walk(condition, node, 0, reason, generic)
-                settled: dict[str, Any] = {"op": "in", "a": [{"c": int(bool(value)), "w": 32, "s": True}], "set": [1], "w": 32, "s": True}  # fmt: skip
-                for name in sorted(modelled):
-                    self.guard_stack.append(self.guard_id(settled, True, inlined=name))
-                self.conditional += 1
-                try:
-                    for child_index, child in enumerate(children[1:], 1):
-                        self.walk(child, node, child_index, reason, generic)
-                finally:
-                    self.conditional -= 1
-                    del self.guard_stack[len(self.guard_stack) - len(modelled) :]
-                return
             if value is not None:
                 live = 1 if value else 2
                 if self.x.foldable(condition):
