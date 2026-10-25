@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/landing"
@@ -180,11 +181,51 @@ type replayer struct {
 
 // roundBlame is the build blame of one recorded build round.
 type roundBlame struct {
-	tree         string
-	members      map[string]landing.Member // the candidate's members
+	tree    string
+	members map[string]landing.Member // the candidate's members
+	// changed holds, per source path asked for, the members whose head has
+	// another blob there than the base. A member whose file is the base's
+	// added no line of it, so only these members are asked what they added.
+	changed      map[string][]landing.Member
 	report       blame.Report
 	lines        map[string]blame.TreeLines
+	fields       map[string]struct{} // the qualified fields either tree declares
 	attributions []blame.Attribution
+}
+
+// membersChanging returns the round's members whose head holds another blob
+// at path than the base does. It asks git once for every member, through one
+// cat-file --batch-check process, and keeps the answer for the path.
+func (r *replayer) membersChanging(ctx context.Context, built *roundBlame, path string) []landing.Member {
+	if found, ok := built.changed[path]; ok {
+		return found
+	}
+	ids := make([]string, 0, len(built.members))
+	for id := range built.members {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var request strings.Builder
+	request.WriteString(r.manifest.Base + ":" + path + "\n")
+	for _, id := range ids {
+		request.WriteString(built.members[id].Head + ":" + path + "\n")
+	}
+	command := exec.CommandContext(ctx, "git", "-C", r.manifest.Repository, "cat-file", "--batch-check=%(objectname)")
+	command.Stdin = strings.NewReader(request.String())
+	output, err := command.Output()
+	var changed []landing.Member
+	if err == nil {
+		answers := strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
+		if len(answers) == len(ids)+1 {
+			for index, id := range ids {
+				if answers[index+1] != answers[0] {
+					changed = append(changed, built.members[id])
+				}
+			}
+		}
+	}
+	built.changed[path] = changed
+	return changed
 }
 
 // roundMembers is the manifest's members less the build round's excluded ones.
@@ -221,7 +262,7 @@ func (r *replayer) blameFor(ctx context.Context, index int) (*roundBlame, error)
 	for _, drop := range candidate.Dropped {
 		dropped[drop.ID] = true
 	}
-	result := &roundBlame{tree: candidate.Tree, members: map[string]landing.Member{}}
+	result := &roundBlame{tree: candidate.Tree, members: map[string]landing.Member{}, changed: map[string][]landing.Member{}}
 	var blameMembers []blame.Member
 	for _, member := range members {
 		if !dropped[member.Migration] {
@@ -234,7 +275,7 @@ func (r *replayer) blameFor(ctx context.Context, index int) (*roundBlame, error)
 		return nil, fmt.Errorf("read build round %d log: %w", index+1, err)
 	}
 	result.report = blame.Parse(string(log), r.roots)
-	lines, ambiguous, err := collectTreeLines(ctx, r.manifest.Repository, blame.Tree(r.manifest.Base), blame.Tree(candidate.Tree), result.report)
+	lines, ambiguous, fields, err := collectTreeLines(ctx, r.manifest.Repository, blame.Tree(r.manifest.Base), blame.Tree(candidate.Tree), result.report)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +283,7 @@ func (r *replayer) blameFor(ctx context.Context, index int) (*roundBlame, error)
 	if err != nil {
 		return nil, err
 	}
-	result.lines = lines
+	result.lines, result.fields = lines, fields
 	result.attributions = blame.IdentifyDetailed(result.report, evidence, lines)
 	r.blames[index] = result
 	return result, nil
@@ -307,7 +348,7 @@ func (r *replayer) round(ctx context.Context, index int) (RoundSummary, error) {
 		if coversName(covered[attribution.Member], attribution.Name) {
 			continue
 		}
-		miss := SummaryMiss{Member: attribution.Member, Name: attribution.Name, Cause: r.cause(ctx, built, attribution)}
+		miss := SummaryMiss{Member: attribution.Member, Name: attribution.Name, Cause: r.cause(ctx, built, attribution, len(summary.Unable) != 0)}
 		if r.builder != nil {
 			outcome, err := r.confirmation(ctx, attribution.Module, []string{attribution.Member})
 			if err != nil {
@@ -325,11 +366,11 @@ func (r *replayer) round(ctx context.Context, index int) (RoundSummary, error) {
 		}
 	}
 	for _, kick := range r.manifest.BuildRounds[index].RecordedKicks {
-		reason, name, _ := strings.Cut(kick.Reason, ":")
-		if err := r.row(number, kick.Member, "recorded", reason, name, "", "", ""); err != nil {
+		reasons, name, nameKick := parseKick(kick.Reason)
+		if err := r.row(number, kick.Member, "recorded", reasons, name, "", "", ""); err != nil {
 			return RoundSummary{}, err
 		}
-		if reason != "ident" && reason != "clash" && reason != "unprune" {
+		if !nameKick {
 			continue
 		}
 		summary.RecordedNameKicks = append(summary.RecordedNameKicks, kick)
@@ -340,6 +381,25 @@ func (r *replayer) round(ctx context.Context, index int) (RoundSummary, error) {
 		}
 	}
 	return summary, nil
+}
+
+// parseKick reads a recorded kick's reason. The recorded program joins one
+// kick's reasons with "; ", and a reason may carry a name after a colon
+// ("ident:X; red"). It returns the reasons without their names, joined the
+// same way, the first name, and whether one reason is a name error (ident,
+// clash or unprune).
+func parseKick(reason string) (string, string, bool) {
+	var kinds []string
+	name, nameKick := "", false
+	for _, part := range strings.Split(reason, ";") {
+		kind, value, _ := strings.Cut(strings.TrimSpace(part), ":")
+		kinds = append(kinds, kind)
+		if name == "" {
+			name = value
+		}
+		nameKick = nameKick || kind == "ident" || kind == "clash" || kind == "unprune"
+	}
+	return strings.Join(kinds, "; "), name, nameKick
 }
 
 // refusalOutcome is explained-by-log when the recorded log of this build round
@@ -410,16 +470,32 @@ func (r *replayer) confirmation(ctx context.Context, module string, members []st
 }
 
 // cause classifies a build-named name error that no check refused or flagged.
-func (r *replayer) cause(ctx context.Context, built *roundBlame, attribution blame.Attribution) string {
+// A name is generated when no declaration and no declared field of either
+// tree carries it. When a check was unable in the round, it decided nothing,
+// so a miss that would be a defect is "check unable" instead.
+func (r *replayer) cause(ctx context.Context, built *roundBlame, attribution blame.Attribution, unable bool) string {
 	switch {
 	case r.useAdded(ctx, built, attribution):
 		return "use added in the same batch"
-	case len(built.lines[attribution.Name].Base) == 0 && len(built.lines[attribution.Name].Candidate) == 0:
+	case len(built.lines[attribution.Name].Base) == 0 && len(built.lines[attribution.Name].Candidate) == 0 && !declaresField(built.fields, attribution.Name):
 		return "generated name"
 	case attribution.Kind == blame.Weak || attribution.Kind == blame.Changed && attribution.Strength < 3:
 		return "not a name error"
+	case unable:
+		return "check unable"
 	}
 	return "defect"
+}
+
+// declaresField reports whether a diagnostic name, bare or qualified, can name
+// one of the fields.
+func declaresField(fields map[string]struct{}, name string) bool {
+	for field := range fields {
+		if namesDeclaration(name, field) {
+			return true
+		}
+	}
+	return false
 }
 
 // useAdded reports whether a use the error names is on a line that a member
@@ -437,7 +513,7 @@ func (r *replayer) useAdded(ctx context.Context, built *roundBlame, attribution 
 		if use == "" {
 			continue
 		}
-		for _, member := range built.members {
+		for _, member := range r.membersChanging(ctx, built, block.Path) {
 			if r.addedLines(ctx, member, block.Path)[use] {
 				return true
 			}

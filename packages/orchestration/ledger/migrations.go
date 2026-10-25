@@ -345,6 +345,9 @@ func (s *Store) ExtendMigration(ctx context.Context, repo, id string, gen int64,
 		if err != nil {
 			return err
 		}
+		if err := fenceMigration(ctx, tx, repo, id); err != nil {
+			return err
+		}
 		sets, err := openWriteSets(ctx, tx, repo, id)
 		if err != nil {
 			return err
@@ -381,8 +384,14 @@ func (s *Store) TakeOver(ctx context.Context, repo, id, owner string, gen int64)
 	}
 	var m Migration
 	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
 		cur, err := lockOpenAt(ctx, tx, repo, id, gen)
 		if err != nil {
+			return err
+		}
+		if err := fenceMigration(ctx, tx, repo, id); err != nil {
 			return err
 		}
 		readyCleared, err := clearReady(ctx, tx, repo, id)
@@ -424,53 +433,62 @@ func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, e
 		if err != nil {
 			return err
 		}
-		cur, err := loadMigration(ctx, tx, req.Repo, req.ID, true)
-		if err != nil {
-			return err
-		}
-
-		var known bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM round_keys WHERE repo = $1 AND migration = $2 AND key = $3)`,
-			req.Repo, req.ID, req.Key).Scan(&known); err != nil {
-			return err
-		}
-		if known {
-			m = cur
-			return nil
-		}
-		if err := requireOpenAt(cur, req.Generation); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key) VALUES ($1, $2, $3)`,
-			req.Repo, req.ID, req.Key); err != nil {
-			return err
-		}
-
-		rounds := cur.LandingRounds + 1
-		readyCleared, err := clearReadyEvent(ctx, tx, req.Repo, req.ID, req.ReadyEvent)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE migrations SET landing_rounds = $3 WHERE repo = $1 AND id = $2`,
-			req.Repo, req.ID, rounds); err != nil {
-			return err
-		}
-		if err := event(ctx, tx, req.Repo, "migration.round_failed", req.ID, "", map[string]any{
-			"generation": req.Generation, "landing_rounds": rounds, "reason": req.Reason, "batch": req.Batch, "key": req.Key,
-			"detail": req.Detail, "log": req.Log, "ready_event": req.ReadyEvent, "ready_cleared": readyCleared,
-		}); err != nil {
-			return err
-		}
-		if r.MaxLandingRounds > 0 && rounds >= r.MaxLandingRounds && cur.EscalatedAt == nil {
-			why := fmt.Sprintf("failed %d of %d landing rounds; last: %s", rounds, r.MaxLandingRounds, req.Reason)
-			if err := escalate(ctx, tx, req.Repo, req.ID, why); err != nil {
-				return err
-			}
-		}
-		m, err = loadMigration(ctx, tx, req.Repo, req.ID, false)
+		m, err = recordRound(ctx, tx, r, req)
 		return err
 	})
 	return m, err
+}
+
+// recordRound makes RecordRound's checks and writes in tx, whose caller holds the repository's row lock, and returns the
+// migration after them. DeclineBatch records its returns through it, in its own transaction. A known key replays
+// before the fence, so a repeat of a round that the migration recorded before its admission still returns.
+func recordRound(ctx context.Context, tx pgx.Tx, r Repository, req RoundRequest) (Migration, error) {
+	cur, err := loadMigration(ctx, tx, req.Repo, req.ID, true)
+	if err != nil {
+		return Migration{}, err
+	}
+
+	var known bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM round_keys WHERE repo = $1 AND migration = $2 AND key = $3)`,
+		req.Repo, req.ID, req.Key).Scan(&known); err != nil {
+		return Migration{}, err
+	}
+	if known {
+		return cur, nil
+	}
+	if err := requireOpenAt(cur, req.Generation); err != nil {
+		return Migration{}, err
+	}
+	if err := fenceMigration(ctx, tx, req.Repo, req.ID); err != nil {
+		return Migration{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key) VALUES ($1, $2, $3)`,
+		req.Repo, req.ID, req.Key); err != nil {
+		return Migration{}, err
+	}
+
+	rounds := cur.LandingRounds + 1
+	readyCleared, err := clearReadyEvent(ctx, tx, req.Repo, req.ID, req.ReadyEvent)
+	if err != nil {
+		return Migration{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE migrations SET landing_rounds = $3 WHERE repo = $1 AND id = $2`,
+		req.Repo, req.ID, rounds); err != nil {
+		return Migration{}, err
+	}
+	if err := event(ctx, tx, req.Repo, "migration.round_failed", req.ID, "", map[string]any{
+		"generation": req.Generation, "landing_rounds": rounds, "reason": req.Reason, "batch": req.Batch, "key": req.Key,
+		"detail": req.Detail, "log": req.Log, "ready_event": req.ReadyEvent, "ready_cleared": readyCleared,
+	}); err != nil {
+		return Migration{}, err
+	}
+	if r.MaxLandingRounds > 0 && rounds >= r.MaxLandingRounds && cur.EscalatedAt == nil {
+		why := fmt.Sprintf("failed %d of %d landing rounds; last: %s", rounds, r.MaxLandingRounds, req.Reason)
+		if err := escalate(ctx, tx, req.Repo, req.ID, why); err != nil {
+			return Migration{}, err
+		}
+	}
+	return loadMigration(ctx, tx, req.Repo, req.ID, false)
 }
 
 func escalate(ctx context.Context, tx pgx.Tx, repo, id, why string) error {
@@ -506,6 +524,9 @@ func (s *Store) Escalate(ctx context.Context, repo, id string, maxRounds int) ([
 			if err != nil {
 				return err
 			}
+			if err := fenceMigration(ctx, tx, repo, id); err != nil {
+				return err
+			}
 			if m.State != StateOpen {
 				return refuse(ReasonNotOpen, "migration %s is %s", id, m.State)
 			}
@@ -516,8 +537,11 @@ func (s *Store) Escalate(ctx context.Context, repo, id string, maxRounds int) ([
 				ids = []string{id}
 			}
 		} else {
+			// A sweep passes over an admitted member: its batch's decline returns it, and the next sweep escalates it.
 			rows, err := tx.Query(ctx, `SELECT id FROM migrations WHERE repo = $1 AND state = 'open'
-				AND escalated_at IS NULL AND landing_rounds >= $2 ORDER BY id FOR UPDATE`, repo, n)
+				AND escalated_at IS NULL AND landing_rounds >= $2
+				AND NOT EXISTS (SELECT 1 FROM batch_members b WHERE b.repo = migrations.repo AND b.migration = migrations.id AND b.admitted)
+				ORDER BY id FOR UPDATE`, repo, n)
 			if err != nil {
 				return err
 			}
@@ -584,6 +608,9 @@ func (s *Store) Abandon(ctx context.Context, repo, id string, gen int64, reason 
 		}
 		cur, err := lockOpenAt(ctx, tx, repo, id, gen)
 		if err != nil {
+			return err
+		}
+		if err := fenceMigration(ctx, tx, repo, id); err != nil {
 			return err
 		}
 		readyCleared, err := clearReady(ctx, tx, repo, id)

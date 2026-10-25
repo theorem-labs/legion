@@ -25,7 +25,7 @@ func TestReviewRestartRerunsChecksWhenPolicyChanges(t *testing.T) {
 				t.Fatalf("Run() = %q, %v; want green", batch.State, err)
 			}
 			batch.State = state
-			if err := store.Save(context.Background(), batch); err != nil {
+			if err := store.Save(context.Background(), &batch); err != nil {
 				t.Fatal(err)
 			}
 
@@ -47,8 +47,8 @@ func TestReviewRestartRerunsChecksWhenPolicyChanges(t *testing.T) {
 	}
 }
 
-// A merged batch completes under the receipt and policy that its merge
-// validated: the merge is irreversible, so a later policy cannot recheck it.
+// An admitted batch completes under the receipt and policy that its admission
+// checked: it is in the merge queue, so a later policy cannot recheck it.
 func TestMergedBatchCompletesUnderValidatedPolicy(t *testing.T) {
 	ledger := &ledgerFake{}
 	store := &MemoryStore{}
@@ -60,15 +60,16 @@ func TestMergedBatchCompletesUnderValidatedPolicy(t *testing.T) {
 		t.Fatalf("Run() = %q, %v; want green", batch.State, err)
 	}
 	batch.State = Publishing
-	batch.PullRequest = PullRequest{Number: 7, Head: batch.Candidate.Commit, MergedCommit: "merged", State: PullRequestMerged}
-	batch.MergeValidated = true
-	if err := store.Save(context.Background(), batch); err != nil {
+	batch.Branch = "land/batch"
+	batch.PullRequest = PullRequest{Number: 7, Head: batch.Candidate.Commit, State: PullRequestOpen}
+	if err := store.Save(context.Background(), &batch); err != nil {
 		t.Fatal(err)
 	}
 
+	runner.Store = admittedStore{MemoryStore: store}
 	runner.ConfigDigest = "new-policy"
 	runner.Checks = []Checker{checkerFake{name: "new-blocking-check", err: errors.New("unable")}}
-	runner.GitHub = &githubFake{}
+	runner.GitHub = &githubFake{pull: batch.PullRequest, wait: PullRequest{Number: 7, Head: batch.Candidate.Commit, MergedCommit: "merged", State: PullRequestMerged}}
 	resumed, err := runner.Reconcile(context.Background())
 	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
@@ -102,10 +103,12 @@ func TestQueuedBatchWaitsForTheQueueUnderAChangedPolicy(t *testing.T) {
 			batch.State = Publishing
 			batch.Branch = "land/batch"
 			batch.PullRequest = PullRequest{Number: 7, Head: batch.Candidate.Commit, State: PullRequestOpen}
-			if err := store.Save(context.Background(), batch); err != nil {
+			if err := store.Save(context.Background(), &batch); err != nil {
 				t.Fatal(err)
 			}
 
+			admission := runner.Admission.(*batchLedgerFake)
+			runner.Store = admittedStore{MemoryStore: store}
 			runner.ConfigDigest = "new-policy"
 			runner.Checks = []Checker{checkerFake{name: "new-blocking-check", err: errors.New("unable")}}
 			wait := PullRequest{Number: 7, Head: batch.Candidate.Commit, State: outcome, Reason: "checks failed"}
@@ -124,10 +127,33 @@ func TestQueuedBatchWaitsForTheQueueUnderAChangedPolicy(t *testing.T) {
 					t.Fatalf("resumed = %q, lands %v, receipt key %q; want landed once under the queued receipt %q", got.State, ledger.landed, got.Receipt.Key, batch.Receipt.Key)
 				}
 			default:
-				if got.State != Failed || got.Reason != "github: checks failed" || len(ledger.landed) != 0 {
-					t.Fatalf("resumed = %q/%q, lands %v; want failed with the queue's reason and no land", got.State, got.Reason, ledger.landed)
+				// An admitted batch that the queue removes is declined with the queue's reason; no member is blamed.
+				if got.State != Declined || len(ledger.landed) != 0 || len(admission.declines) != 1 ||
+					admission.declines[0].reason != "checks failed" || len(admission.declines[0].returns) != 0 {
+					t.Fatalf("resumed = %q/%q, lands %v, declines %+v; want one decline with the queue's reason and no land", got.State, got.Reason, ledger.landed, admission.declines)
 				}
 			}
 		})
 	}
+}
+
+// admittedStore reads every active batch as the ledger shows it once admitted: its pull request is in the merge queue.
+type admittedStore struct{ *MemoryStore }
+
+func (s admittedStore) Load(ctx context.Context, id string) (Batch, bool, error) {
+	batch, found, err := s.MemoryStore.Load(ctx, id)
+	if found && !batch.State.terminal() {
+		batch.Admission = Admitted
+	}
+	return batch, found, err
+}
+
+func (s admittedStore) ListActive(ctx context.Context) ([]Batch, error) {
+	batches, err := s.MemoryStore.ListActive(ctx)
+	for index := range batches {
+		if !batches[index].State.terminal() {
+			batches[index].Admission = Admitted
+		}
+	}
+	return batches, err
 }
