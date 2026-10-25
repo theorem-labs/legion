@@ -280,6 +280,95 @@ func TestLoadRefusesNoncanonicalLogPaths(t *testing.T) {
 	}
 }
 
+// A repeated key would let a later value silently reuse an earlier one: a second members array keeps the first
+// array's head for a member that has none of its own.
+func TestLoadRefusesRepeatedKeys(t *testing.T) {
+	a, b := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	head := `{"format":"landing-replay/v1","base":"` + a + `",`
+	rounds := `"buildRounds":[{"round":1,"log":"build-round-1.log"}]}`
+	cases := map[string]string{
+		"members twice":   head + `"members":[{"id":"m1","head":"` + b + `"}],"members":[{"id":"m2"}],` + rounds,
+		"member id twice": head + `"members":[{"id":"m1","id":"m2","head":"` + b + `"}],` + rounds,
+		"round key twice": head + `"members":[{"id":"m1","head":"` + b + `"}],"buildRounds":[{"round":1,"round":1,"log":"build-round-1.log"}]}`,
+		"format twice":    `{"format":"x","format":"landing-replay/v1","base":"` + a + `","members":[],` + rounds,
+	}
+	for name, body := range cases {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "build-round-1.log"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "manifest.json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if m, err := Load(path); err == nil || !strings.Contains(err.Error(), "duplicate") {
+			t.Errorf("%s: Load = %+v, %v; want a duplicate-key error", name, m, err)
+		}
+	}
+}
+
+// A key matches its field only when spelled exactly: "BASE" is not "base".
+func TestLoadRefusesAKeyInAnotherCase(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "build-round-1.log"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"format":"landing-replay/v1","BASE":"` + strings.Repeat("a", 40) + `","members":[],"buildRounds":[{"round":1,"log":"build-round-1.log"}]}`
+	path := filepath.Join(dir, "manifest.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := Load(path); err == nil {
+		t.Fatalf("Load = %+v; it read BASE as base", m)
+	}
+}
+
+// A log is a regular file reached with no symbolic link, even one that stays inside the manifest's directory.
+func TestLoadRefusesALogThroughASymbolicLinkInsideTheDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "real.log"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real.log", filepath.Join(dir, "link.log")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "logs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("logs", filepath.Join(dir, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "logs", "r.log"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, log := range []string{"link.log", "alias/r.log"} {
+		if m, err := Load(writeManifestIn(t, dir, minimalManifest(log))); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+			t.Errorf("log %q: Load = %+v, %v; want a symbolic-link refusal", log, m, err)
+		}
+	}
+}
+
+// The manifest and its logs are read from one directory: a manifest path through a symbolic link and `..` must not
+// open the manifest in one directory and check its logs in another.
+func TestLoadReadsTheManifestAndItsLogsInOneDirectory(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"actual/child", "lexical"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeManifestIn(t, filepath.Join(root, "actual"), minimalManifest("build.log")) // actual/build.log does not exist
+	if err := os.WriteFile(filepath.Join(root, "lexical", "build.log"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "actual", "child"), filepath.Join(root, "lexical", "jump")); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := Load(root + "/lexical/jump/../manifest.json"); err == nil {
+		t.Fatalf("Load = %+v; it read the manifest of actual/ and the log of lexical/", m)
+	}
+}
+
 func minimalManifest(log string) Manifest {
 	return Manifest{
 		Format:     Format,

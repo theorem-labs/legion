@@ -1,7 +1,7 @@
 package replay
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -17,23 +17,23 @@ var commitID = regexp.MustCompile(`^[0-9a-f]{40}$`)
 type Manifest struct {
 	Format      string       `json:"format"`
 	Name        string       `json:"name"`
-	Repository  string       `json:"repository"`
-	Base        string       `json:"base"`
-	Members     []Member     `json:"members"`
+	Repository  string       `json:"repository"` // a git repository holding every commit below
+	Base        string       `json:"base"`       // 40 lowercase hex
+	Members     []Member     `json:"members"`    // in the recorded merge order
 	BuildRounds []BuildRound `json:"buildRounds"`
 	Unresolved  []Unresolved `json:"unresolved,omitempty"`
 }
 
 type Member struct {
 	ID   string `json:"id"`
-	Head string `json:"head"`
+	Head string `json:"head"` // 40 lowercase hex
 }
 
 type BuildRound struct {
 	Round         int      `json:"round"`
-	Excluded      []string `json:"excluded"`
-	Log           string   `json:"log"`
-	RecordedKicks []Kick   `json:"recordedKicks"`
+	Excluded      []string `json:"excluded"`      // members removed before this build round
+	Log           string   `json:"log"`           // this build round's recorded log, relative to the manifest
+	RecordedKicks []Kick   `json:"recordedKicks"` // the recorded program's removals after this build round
 }
 
 type Kick struct {
@@ -46,38 +46,37 @@ type Unresolved struct {
 	Why string `json:"why"`
 }
 
+// Load reads and checks a manifest. It reads the manifest and its logs through one handle on the manifest's
+// directory, so a path through a symbolic link and `..` cannot read the manifest in one directory and its logs in
+// another. The JSON must spell every key exactly once and exactly as the format does: a repeated key, a key in
+// another case, an unknown key or a trailing value is refused.
 func Load(path string) (Manifest, error) {
-	file, err := os.Open(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return Manifest{}, fmt.Errorf("open manifest directory: %w", err)
+	}
+	defer root.Close()
+	file, err := root.Open(filepath.Base(path))
 	if err != nil {
 		return Manifest{}, fmt.Errorf("open manifest: %w", err)
 	}
-	defer file.Close()
+	data, err := io.ReadAll(file)
+	file.Close()
+	if err != nil {
+		return Manifest{}, fmt.Errorf("read manifest: %w", err)
+	}
 
 	var manifest Manifest
-	decoder := json.NewDecoder(file)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&manifest); err != nil {
+	if err := json.Unmarshal(data, &manifest, json.RejectUnknownMembers(true)); err != nil {
 		return Manifest{}, fmt.Errorf("decode manifest: %w", err)
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return Manifest{}, fmt.Errorf("decode manifest: unexpected trailing JSON value")
-		}
-		return Manifest{}, fmt.Errorf("decode manifest trailing data: %w", err)
-	}
-	if err := manifest.validate(filepath.Dir(path)); err != nil {
+	if err := manifest.validate(root); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil
 }
 
-func (m Manifest) validate(dir string) error {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return fmt.Errorf("open manifest directory: %w", err)
-	}
-	defer root.Close()
+func (m Manifest) validate(root *os.Root) error {
 	if m.Format != Format {
 		return fmt.Errorf("manifest format %q, want %q", m.Format, Format)
 	}
