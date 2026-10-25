@@ -132,6 +132,14 @@ func (s *Store) Importers(ctx context.Context, modules []string) (map[string]boo
 	return seen, nil
 }
 
+// owned is the declaration that a constant belongs to, and whether the index's imports decided it: the resolution
+// read the import closure of the constant's module, or found no declaration of any of the constant's names, so
+// that a module added to that closure can move the owner without any declaration changing (reresolveOwners).
+type owned struct {
+	ref       declRef
+	byClosure bool
+}
+
 // ownerResolver gives the declaration that a recorded constant belongs to (owner), from the declarations of the
 // names it was made with and, when a name is declared by several modules, the index's imports.
 type ownerResolver struct {
@@ -140,37 +148,63 @@ type ownerResolver struct {
 	declaring declaring
 	imports   importGraph // read at its first need
 	closures  map[string]map[string]bool
-	memo      map[declRef]declRef
+	memo      map[declRef]owned
 }
 
 func newOwnerResolver(ctx context.Context, q querier, declaring declaring) *ownerResolver {
-	return &ownerResolver{ctx: ctx, q: q, declaring: declaring, closures: map[string]map[string]bool{}, memo: map[declRef]declRef{}}
+	return &ownerResolver{ctx: ctx, q: q, declaring: declaring, closures: map[string]map[string]bool{}, memo: map[declRef]owned{}}
 }
 
-// maxClosures bounds the import closures that a resolver keeps: the graph's edges come ordered by the module of
-// their constant, so each module's closure is computed about once.
+// prefixResolver reads the declarations of names and of their dotted prefixes, all that the owner of a constant of
+// one of those names needs, and resolves against them.
+func prefixResolver(ctx context.Context, q querier, names []string) (*ownerResolver, error) {
+	d, err := declaringPrefixes(ctx, q, names)
+	if err != nil {
+		return nil, err
+	}
+	return newOwnerResolver(ctx, q, d), nil
+}
+
+// maxClosures bounds the import closures that a resolver keeps: a caller resolves the constants in the order of
+// their module (all), so each module's closure is computed about once.
 const maxClosures = 64
+
+// all resolves every constant of cs, in the order of its module so that each import closure is read once.
+func (o *ownerResolver) all(cs map[declRef]bool) (map[declRef]owned, error) {
+	byModule := slices.SortedFunc(maps.Keys(cs), func(a, b declRef) int {
+		return cmp.Or(cmp.Compare(a.module, b.module), cmp.Compare(a.name, b.name))
+	})
+	out := make(map[declRef]owned, len(cs))
+	for _, c := range byModule {
+		r, err := o.owner(c)
+		if err != nil {
+			return nil, err
+		}
+		out[c] = r
+	}
+	return out, nil
+}
 
 // owner is the declaration that the constant c belongs to: the longest of c's name and its dotted prefixes that c's
 // module declares (`X.mk` is X's constructor). A constant that Lean made in the module that uses it (an equation
 // lemma `f.eq_1`, recorded under that module) belongs to the declaration of the longest prefix that a module in its
 // module's import closure declares. A constant that belongs to no declaration is its own.
-func (o *ownerResolver) owner(c declRef) (declRef, error) {
+func (o *ownerResolver) owner(c declRef) (owned, error) {
 	if r, ok := o.memo[c]; ok {
 		return r, nil
 	}
 	r, err := o.resolve(c)
 	if err != nil {
-		return declRef{}, err
+		return owned{}, err
 	}
 	o.memo[c] = r
 	return r, nil
 }
 
-func (o *ownerResolver) resolve(c declRef) (declRef, error) {
+func (o *ownerResolver) resolve(c declRef) (owned, error) {
 	for p := range dottedPrefixes(c.name) {
 		if _, ok := slices.BinarySearch(o.declaring[p], c.module); ok {
-			return declRef{c.module, p}, nil
+			return owned{ref: declRef{c.module, p}}, nil
 		}
 	}
 	for p := range dottedPrefixes(c.name) {
@@ -180,15 +214,16 @@ func (o *ownerResolver) resolve(c declRef) (declRef, error) {
 		}
 		closure, err := o.closure(c.module)
 		if err != nil {
-			return declRef{}, err
+			return owned{}, err
 		}
 		for _, m := range mods {
 			if closure[m] {
-				return declRef{m, p}, nil
+				return owned{declRef{m, p}, true}, nil
 			}
 		}
 	}
-	return c, nil
+	// No declaration of any of c's names: c is its own, until a landing gives c's module a closure that holds one.
+	return owned{c, true}, nil
 }
 
 func (o *ownerResolver) closure(module string) (map[string]bool, error) {
