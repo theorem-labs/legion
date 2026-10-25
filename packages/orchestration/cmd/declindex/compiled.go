@@ -207,6 +207,11 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fail(e.stderr, &usageError{fmt.Sprintf("%s: %v", args[0], err)})
 	}
+	// The index's schema name and connection string, as every sibling command resolves them: without them the
+	// configuration is wrong, which is a usage error (2), not a condition a later refresh repairs (3).
+	if _, err := e.target(); err != nil {
+		return fail(e.stderr, err)
+	}
 	g, err := conceptgate.OpenGate(ctx, e.cfg, conceptgate.Options{Log: e.stderr})
 	if err != nil {
 		return fail(e.stderr, &unableError{err})

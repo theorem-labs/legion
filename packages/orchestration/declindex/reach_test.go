@@ -3,6 +3,7 @@ package declindex
 import (
 	"context"
 	"encoding/json"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
@@ -101,5 +102,42 @@ func TestReachCountsAreTheSameWithAndWithoutWhy(t *testing.T) {
 		if plain.Reach.ReachCounts != why.Reach.ReachCounts {
 			t.Errorf("%s: reach %+v, with --why %+v", name, plain.Reach.ReachCounts, why.Reach.ReachCounts)
 		}
+	}
+}
+
+// Lean puts no bound on a declaration's name, and the index stores two names in one edge row: the user's and the
+// owner's. An index of the two names together holds both in one B-tree entry, which Postgres refuses past 2,704
+// bytes, so a refresh of a tree whose names are individually storable would fail with SQLSTATE 54000 and the
+// whole landing with it. The longest edge of the copy's index takes 474 bytes for its four names, so this is a
+// bound on what the index can hold, not on what it holds today.
+func TestARefreshStoresAnEdgeOfTwoNamesThatOneIndexEntryCouldNotHold(t *testing.T) {
+	// Postgres compresses what it puts in an index, so a name of one letter repeated would fit however long it
+	// is. Lean's generated names are not of one letter: these are drawn from a fixed seed.
+	rng := rand.New(rand.NewPCG(20261025, 577))
+	long := func(prefix string) string {
+		const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+		b := make([]byte, 1400)
+		for i := range b {
+			b[i] = alphabet[rng.IntN(len(alphabet))]
+		}
+		return prefix + string(b)
+	}
+	owner, user := long("A.o"), long("B.u")
+	tree := leanTree(t, t.TempDir(),
+		leanModule{name: "A", decls: []string{owner}, src: "def " + owner + " : Prop := True\n"},
+		leanModule{name: "B", imports: []string{"A"}, decls: []string{user},
+			src:  "theorem " + user + " (h : " + owner + ") : True := trivial\n",
+			uses: []leanUse{{owner, "A", owner}}},
+	)
+	s := openStore(t)
+	if _, err := s.Refresh(context.Background(), tree, RefreshOptions{Commit: "c0ffee"}); err != nil {
+		t.Fatalf("a refresh of two names of %d bytes: %v", len(owner), err)
+	}
+	got, err := answerFor(t, s, owner, AnswerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Reach.StatementsChanged != 1 {
+		t.Errorf("the statement that uses it changes %d statements, want 1: %+v", got.Reach.StatementsChanged, got.Reach.ReachCounts)
 	}
 }

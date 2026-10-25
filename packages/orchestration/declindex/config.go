@@ -110,11 +110,8 @@ func LoadConfig(path string) (Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
-	if c.Index != "" {
-		if err := ValidIndexName(c.Index); err != nil {
-			return Config{}, fmt.Errorf("%s: %w", path, err)
-		}
-	}
+	// index: is checked where a command resolves the index it opens, not here: --index overrides the key, so a
+	// name this file gets wrong must not refuse a right one on the command line (P-1).
 	if c.Tree == "" {
 		return Config{}, fmt.Errorf("%s: tree is required", path)
 	}

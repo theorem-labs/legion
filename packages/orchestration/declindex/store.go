@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/jackc/pgx/v5"
@@ -19,7 +20,7 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
-const SchemaVersion = "16"
+const SchemaVersion = "15"
 
 // schema is the index's tables. Every text column is COLLATE "C": the index's answers order and group names by
 // bytes, as Lean's own name order does, whatever collation the server's database was created with. The hashes,
@@ -51,10 +52,11 @@ CREATE INDEX uses_module ON uses (module);
 -- no declaration of the constant's names, so that a change of tmodule's closure can move the owner.
 CREATE TABLE edges (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, dst text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, stmt boolean NOT NULL, kind text COLLATE "C" NOT NULL, owner text COLLATE "C" NOT NULL, owner_module text COLLATE "C" NOT NULL, by_closure boolean NOT NULL);
 CREATE INDEX edges_module ON edges (module);
--- edges_owner carries every column the reach walk reads, so that the walk of a declaration that a large part of
--- the tree uses reads the index alone: it visits a row for each edge out of its closure, and the heap of this
--- table is 1.1 GB for the copy's 5.0 million edges.
-CREATE INDEX edges_owner ON edges (owner_module, owner) INCLUDE (dst, module, stmt, kind);
+-- edges_owner is the index the reach walk reads: it visits a row for each edge out of its closure. It carries the
+-- two names it is keyed by and no more: a btree row must stay under 2704 bytes, and a declaration's name has no
+-- bound, so an index that also carried the user's name and module would refuse an edge of two long names that
+-- this schema can hold (the longest edge of the copy's index takes 474 bytes for its four names).
+CREATE INDEX edges_owner ON edges (owner_module, owner);
 CREATE INDEX edges_target ON edges (target);
 CREATE INDEX edges_closure ON edges (tmodule) WHERE by_closure;
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated
@@ -80,6 +82,10 @@ CREATE TABLE without_forms (module text COLLATE "C" NOT NULL, name text COLLATE 
 -- replaced ('' for the first). The post-landing registry check of a landing compares those two commits.
 CREATE TABLE landings (landed text COLLATE "C" PRIMARY KEY, previous text COLLATE "C" NOT NULL);
 `
+
+// analyzed are the tables a refresh reads statistics of again when it has written them: every table a query
+// reads rows from. meta and landings hold a handful of rows that no plan turns on.
+var analyzed = []string{"sources", "modules", "imports", "decls", "uses", "edges", "consts", "atoms", "facts", "without_forms"}
 
 // Store is an open index: a pool to the index's database, whose connections resolve every unqualified name in the
 // index's schema.
@@ -364,6 +370,20 @@ func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
 		return unreachable(conn.Conn(), err)
 	}
 	return unreachable(conn.Conn(), tx.Commit(ctx))
+}
+
+// analyze reads the statistics of the tables a refresh wrote, and marks their pages all-visible, on the
+// connection that holds the refresh lock: COPY leaves neither, so the planner would read a declaration's reach
+// with the wrong plan until autovacuum's nap ended, and the post-landing hooks and the owners' first queries run
+// before that. VACUUM cannot run in a transaction block, so this is one statement of its own, after the writes
+// commit.
+func (s *Store) analyze(ctx context.Context) error {
+	conn := s.refresh
+	if conn == nil {
+		return fmt.Errorf("analyze the index %q outside its refresh lock", s.index)
+	}
+	_, err := conn.Exec(ctx, "VACUUM (ANALYZE) "+strings.Join(analyzed, ", "))
+	return unreachable(conn.Conn(), err)
 }
 
 // deleteCompiled drops what the exporter read from the modules, and their clashes with the forms.

@@ -288,6 +288,9 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 			return st, err
 		}
 	}
+	if err := s.analyze(ctx); err != nil {
+		return st, err
+	}
 	st.Elapsed = time.Since(t0)
 	logf(opt.Log, "index: %d re-read, %d removed, %d unreadable, %d declarations newer than their build, %d compiled modules read, %d re-matched, %s",
 		st.Reread, st.Removed, st.Unreadable, st.Stale, st.Exported, st.Rematched, st.Elapsed.Round(time.Millisecond))

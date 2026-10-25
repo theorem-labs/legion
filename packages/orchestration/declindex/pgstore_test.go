@@ -459,6 +459,29 @@ func TestASessionTheServerEndsIsAnUnreachableDatabase(t *testing.T) {
 	}
 }
 
+// A refresh writes the index's rows with COPY, which leaves the tables without statistics and without a
+// visibility map: the planner then reads a declaration's reach with the wrong plan, and the post-landing hooks
+// and the owners' first queries run before autovacuum's nap ends. A refresh ends by analysing what it wrote.
+func TestARefreshLeavesTheIndexWithStatisticsForThePlanner(t *testing.T) {
+	s := refreshed(t, goldenTree(t))
+	ctx := context.Background()
+	for _, table := range []string{"decls", "uses", "edges", "modules", "imports"} {
+		var rows float32
+		var visible int
+		err := s.q.QueryRow(ctx, `SELECT reltuples, relallvisible FROM pg_class WHERE oid = $1::regclass`,
+			"idx."+table).Scan(&rows, &visible)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rows < 0 {
+			t.Errorf("%s has no row estimate after a refresh (reltuples %v): the planner has no statistics", table, rows)
+		}
+		if visible == 0 {
+			t.Errorf("%s has no page marked all-visible after a refresh: a query reads the heap of every row it answers from", table)
+		}
+	}
+}
+
 // A landing writes no row of a module it did not read, in the compiled tables as in the reference ones. The
 // fixture's compiled part needs the Lean toolchain, so this test runs where the exporter tests do. The rows of
 // the module the landing re-reads, and of the modules a changed definition reaches, are the exceptions the plan

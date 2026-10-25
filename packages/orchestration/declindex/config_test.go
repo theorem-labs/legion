@@ -138,10 +138,19 @@ func TestValidIndexNameTakesASchemaNameOfTheIndex(t *testing.T) {
 	}
 }
 
-func TestConfigRefusesAnIndexNameThatIsNoSchemaName(t *testing.T) {
-	err := refusedConfig(t, "tree: ../tree\nroots: [A]\nindex: Idx\n")
-	if !strings.Contains(err.Error(), "Idx") {
-		t.Fatalf("an invalid index name was reported as %v", err)
+// A name this file gets wrong is refused where a command resolves the index it opens, not here: --index
+// overrides index:, so a wrong key must not refuse a right flag (P-1, cmd/declindex TestAWrongIndexNameInThe
+// FileDoesNotRefuseTheFlag). LoadConfig keeps what the file says.
+func TestConfigKeepsAnIndexNameThatIsNoSchemaNameForTheCommandToRefuse(t *testing.T) {
+	c, err := LoadConfig(writeConfig(t, "tree: ../tree\nroots: [A]\nindex: Idx\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Index != "Idx" {
+		t.Fatalf("index: %q, want the file's own %q", c.Index, "Idx")
+	}
+	if err := ValidIndexName(c.Index); err == nil {
+		t.Fatal("ValidIndexName accepted the name the command would open")
 	}
 }
 

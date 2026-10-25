@@ -8,8 +8,10 @@ set -eu
 usage() {
 	printf '%s\n' 'usage: timings.sh [--index-dsn-file FILE] [--limit N] [--concepts FILE] [--proposer OWNER] [--gate-proposal FILE] CONFIG SAMPLE' >&2
 	printf '%s\n' '       timings.sh [--index-dsn-file FILE] --refresh-landing CONFIG' >&2
+	printf '%s\n' '       timings.sh --bars RUNS.tsv' >&2
 	printf '%s\n' 'SAMPLE is one declaration name for each line; write one with go run ./declindex/e2e/sample.' >&2
 	printf '%s\n' 'The landed commit of --refresh-landing is TIMINGS_LAND_COMMIT. DECLINDEX_BIN overrides the command.' >&2
+	printf '%s\n' '--bars decides the bars again over the runs of an earlier measurement, and prints the same report.' >&2
 	exit 2
 }
 
@@ -18,14 +20,91 @@ die() {
 	exit 1
 }
 
+# decide prints the report of the runs in the file it is given and exits nonzero when a bar is not met: the
+# median and the 95th percentile of each command that has one, over the runs that answered, and a line for each
+# command without a bar. A command with a bar must answer every run of its sample: the plan names what the sample
+# holds, and a command that fails returns fast, so a bar decided on what happened to answer would pass for an
+# index that is not there.
+decide() {
+	python3 - "$1" <<'PY'
+import math
+import sys
+
+# The bars of the plan's acceptance: the median and the 95th percentile that each command must stay under. A
+# command with no bar is reported only.
+bars = {"users": (1.0, 3.0), "where": (1.0, None), "states": (1.0, None), "same": (1.0, None)}
+order = ["where", "users", "states", "same", "land-hash", "gate", "ledger"]
+
+runs: dict[str, list[float]] = {}
+answers: dict[str, list[float]] = {}
+for line in open(sys.argv[1], encoding="utf-8"):
+    label, _name, seconds, status = line.rstrip("\n").split("\t")
+    runs.setdefault(label, []).append(float(seconds))
+    if status == "0":
+        answers.setdefault(label, []).append(float(seconds))
+
+
+def median(values: list[float]) -> float:
+    half = len(values) // 2
+    if len(values) % 2:
+        return values[half]
+    return (values[half - 1] + values[half]) / 2
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    # Nearest rank: the smallest value that at least `fraction` of the runs are at or below.
+    return values[min(len(values) - 1, max(0, math.ceil(fraction * len(values)) - 1))]
+
+
+print("summary\tcommand\truns\tanswered\tmedian_s\tp95_s\tworst_s")
+for label in order + sorted(set(runs) - set(order)):
+    values = sorted(runs.get(label, []))
+    if not values:
+        continue
+    print(
+        f"summary\t{label}\t{len(values)}\t{len(answers.get(label, []))}\t{median(values):.3f}"
+        f"\t{percentile(values, 0.95):.3f}\t{values[-1]:.3f}"
+    )
+
+failed = False
+for label, (median_bar, p95_bar) in bars.items():
+    # A bar is about how long an answer takes, so only the runs that answered are timed. A run that did not
+    # answer is not a slow answer: it is a measurement the acceptance did not get, and the bar fails.
+    values = sorted(answers.get(label, []))
+    tried = len(runs.get(label, []))
+    if len(values) < tried:
+        print(f"bar\t{label}\tanswered\t{len(values)}\tof {tried}\tFAIL")
+        failed = True
+    if not values:
+        continue
+    got = median(values)
+    ok = got < median_bar
+    failed = failed or not ok
+    print(f"bar\t{label}\tmedian\t{got:.3f}\t< {median_bar}\t{'ok' if ok else 'FAIL'}")
+    if p95_bar is None:
+        continue
+    got = percentile(values, 0.95)
+    ok = got < p95_bar
+    failed = failed or not ok
+    print(f"bar\t{label}\tp95\t{got:.3f}\t< {p95_bar}\t{'ok' if ok else 'FAIL'}")
+raise SystemExit(1 if failed else 0)
+PY
+}
+
 index_dsn_file=
 limit=0
 proposer=function:timings
 gate_proposal=
 concepts=
 refresh_landing=false
+bars_only=
 while [ "$#" -gt 0 ]; do
 	case $1 in
+	--bars)
+		[ "$#" -ge 2 ] || usage
+		bars_only=$2
+		shift 2
+		;;
 	--index-dsn-file | --limit | --proposer | --gate-proposal | --concepts)
 		[ "$#" -ge 2 ] || usage
 		case $1 in
@@ -49,6 +128,14 @@ while [ "$#" -gt 0 ]; do
 	*) break ;;
 	esac
 done
+
+# --bars decides the bars again over the runs of an earlier measurement, and runs no command of its own.
+if [ -n "$bars_only" ]; then
+	[ "$#" -eq 0 ] || usage
+	[ -r "$bars_only" ] || die "cannot read the runs $bars_only"
+	decide "$bars_only"
+	exit $?
+fi
 
 declindex_bin=${DECLINDEX_BIN-declindex}
 if $refresh_landing; then
@@ -223,69 +310,4 @@ if [ -n "$concepts" ]; then
 	done <"$concepts"
 fi
 
-python3 - "$runs" <<'PY'
-import math
-import sys
-
-# The bars of the plan's acceptance: the median and the 95th percentile that each command must stay under. A
-# command with no bar is reported only.
-bars = {"users": (1.0, 3.0), "where": (1.0, None), "states": (1.0, None), "same": (1.0, None)}
-order = ["where", "users", "states", "same", "land-hash", "gate", "ledger"]
-
-runs: dict[str, list[float]] = {}
-answers: dict[str, list[float]] = {}
-answered: dict[str, int] = {}
-for line in open(sys.argv[1], encoding="utf-8"):
-    label, _name, seconds, status = line.rstrip("\n").split("\t")
-    runs.setdefault(label, []).append(float(seconds))
-    if status == "0":
-        answers.setdefault(label, []).append(float(seconds))
-    answered[label] = answered.get(label, 0) + (status == "0")
-
-
-def median(values: list[float]) -> float:
-    half = len(values) // 2
-    if len(values) % 2:
-        return values[half]
-    return (values[half - 1] + values[half]) / 2
-
-
-def percentile(values: list[float], fraction: float) -> float:
-    # Nearest rank: the smallest value that at least `fraction` of the runs are at or below.
-    return values[min(len(values) - 1, max(0, math.ceil(fraction * len(values)) - 1))]
-
-
-print("summary\tcommand\truns\tanswered\tmedian_s\tp95_s\tworst_s")
-for label in order + sorted(set(runs) - set(order)):
-    values = sorted(runs.get(label, []))
-    if not values:
-        continue
-    print(
-        f"summary\t{label}\t{len(values)}\t{answered[label]}\t{median(values):.3f}"
-        f"\t{percentile(values, 0.95):.3f}\t{values[-1]:.3f}"
-    )
-
-failed = False
-for label, (median_bar, p95_bar) in bars.items():
-    # A bar is about how long an answer takes, so only the runs that answered count. A command that failed
-    # returns fast, and counting it would let an unreachable index pass every bar.
-    values = sorted(answers.get(label, []))
-    tried = len(runs.get(label, []))
-    if not values:
-        print(f"bar\t{label}\tmedian\t-\t< {median_bar}\tFAIL ({tried} runs, none answered)")
-        failed = True
-        continue
-    if len(values) < tried:
-        print(f"note\t{label}\t{tried - len(values)} of {tried} runs did not answer and are not in the bar")
-    got = median(values)
-    ok = got < median_bar
-    failed = failed or not ok
-    print(f"bar\t{label}\tmedian\t{got:.3f}\t< {median_bar}\t{'ok' if ok else 'FAIL'}")
-    if p95_bar is None:
-        continue
-    got = percentile(values, 0.95)
-    ok = got < p95_bar
-    failed = failed or not ok
-    print(f"bar\t{label}\tp95\t{got:.3f}\t< {p95_bar}\t{'ok' if ok else 'FAIL'}")
-raise SystemExit(1 if failed else 0)
-PY
+decide "$runs"

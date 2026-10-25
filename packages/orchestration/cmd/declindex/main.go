@@ -227,6 +227,9 @@ func (e *env) target() (declindex.Target, error) {
 	case t.DSN == "":
 		return t, &usageError{"no connection string for the index: set DECLINDEX_DSN or pass --index-dsn-file FILE"}
 	}
+	if err := declindex.ValidIndexName(t.Index); err != nil {
+		return t, &usageError{"index: " + err.Error()}
+	}
 	return t, nil
 }
 
@@ -373,8 +376,13 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &unableError{err})
 	}
 	writeWithoutForms(e.stderr, declindex.ClashModules(st.WithoutForms), st.WithoutForms)
+	// The refresh has committed; this count is a round trip of its own, so a database that goes away here asks
+	// for a retry (75) and says nothing about what the refresh read.
 	n, err := e.store.ModuleCount(ctx)
-	if err != nil || n == 0 || st.Unreadable > 0 {
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	if n == 0 || st.Unreadable > 0 {
 		fmt.Fprintf(e.stderr, "declindex: the index is incomplete: %d modules, %d unreadable reference files\n", n, st.Unreadable)
 		return 3
 	}
