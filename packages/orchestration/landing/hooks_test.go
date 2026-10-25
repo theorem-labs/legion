@@ -84,7 +84,7 @@ func TestABareArgvIsAHookWithEveryOtherKeyAtItsDefault(t *testing.T) {
 	if !slices.Equal(hook.Command, []string{"declindex", "refresh"}) || hook.Apply != "" || len(hook.Mounts) != 0 {
 		t.Fatalf("the bare argv hook is %+v", hook)
 	}
-	if err := configured.Validate(declaredMounts()); err != nil {
+	if err := configured.Validate(declaredContainer()); err != nil {
 		t.Fatalf("Validate() of a bare argv hook = %v", err)
 	}
 }
@@ -108,7 +108,7 @@ func TestAConfigurationTheExecutorsCouldNotRunIsRefused(t *testing.T) {
 		"a hook with no command": {Name: "empty"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := PostLanding{Parts: []string{"slice"}, Hooks: []HookConfig{hook}}.Validate(declaredMounts())
+			err := PostLanding{Parts: []string{"slice"}, Hooks: []HookConfig{hook}}.Validate(declaredContainer())
 			if err == nil {
 				t.Fatalf("Validate() accepted %s", name)
 			}
@@ -126,7 +126,7 @@ func TestAConfigurationTheExecutorsCanRunIsAccepted(t *testing.T) {
 		hookConfig("score", ApplyScore, []string{"score.json"}, map[string]MountMode{"graph": ReadOnly}),
 	}}
 	configured.Hooks[1].Inputs = []HookInput{{Name: "cost.json", Command: []string{"/bin/land-cost", "$LAND_COMMIT"}}}
-	if err := configured.Validate(declaredMounts()); err != nil {
+	if err := configured.Validate(declaredContainer()); err != nil {
 		t.Fatalf("Validate() = %v", err)
 	}
 }
@@ -134,4 +134,38 @@ func TestAConfigurationTheExecutorsCanRunIsAccepted(t *testing.T) {
 // unmarshalPostLanding reads a post_landing block as the configuration file holds it.
 func unmarshalPostLanding(body string, into *PostLanding) error {
 	return json.Unmarshal([]byte(body), into)
+}
+
+// declaredContainer is the container the hooks are frozen with: the program's clone and the declared mounts.
+func declaredContainer() Container {
+	return Container{Image: "image@sha256:one", User: "1002:1003", GitDir: "/srv/land/repo.git", Mounts: declaredMounts()}
+}
+
+// Every hook gets the program's clone, which holds LAND_TREE, so a configuration with hooks and no
+// repository.git_dir is refused at load, naming the key, rather than running hooks that cannot read the tree.
+func TestHooksWithoutTheProgramsCloneAreRefused(t *testing.T) {
+	configured := PostLanding{Parts: []string{"slice"}, Hooks: []HookConfig{{Name: "graph", Command: []string{"/bin/graph"}}}}
+	container := declaredContainer()
+	container.GitDir = ""
+	err := configured.Validate(container)
+	if err == nil || !strings.Contains(err.Error(), "repository.git_dir is required to run hooks") {
+		t.Fatalf("Validate() without the clone = %v, want repository.git_dir named", err)
+	}
+	// With no hook there is nothing to run, so the key is not required here.
+	if err := (PostLanding{Parts: []string{"slice"}}).Validate(container); err != nil {
+		t.Fatalf("Validate() with no hook = %v", err)
+	}
+}
+
+// A configuration that declares the program's clone as a named mount is refused: every hook gets it already, and
+// a second mount of one path is refused by docker, so the hook would not start.
+func TestDeclaringTheCloneAsAMountIsRefused(t *testing.T) {
+	for _, clonePath := range []string{"/srv/land/repo.git", "/srv/land/repo.git/", "/srv/land/repo.git/."} {
+		container := declaredContainer()
+		container.Mounts = map[string]Mount{"clone": {Name: "clone", HostPath: clonePath}}
+		err := PostLanding{Parts: []string{"slice"}, Hooks: []HookConfig{{Name: "graph", Command: []string{"/bin/graph"}}}}.Validate(container)
+		if err == nil || !strings.Contains(err.Error(), "every hook gets read-only already") {
+			t.Fatalf("Validate() with the clone declared as %q = %v", clonePath, err)
+		}
+	}
 }

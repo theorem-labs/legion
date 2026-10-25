@@ -140,12 +140,22 @@ func (d HookDefinition) outputCap() int64 {
 	return defaultMaxOutputBytes
 }
 
-// Validate refuses a configuration whose hooks the executors could not run, with the mounts that
-// container.mounts declares. The program checks its own configuration before it starts, because the ledger stores
-// what the program sends and checks none of it.
-func (p PostLanding) Validate(mounts map[string]Mount) error {
+// Validate refuses a configuration whose hooks the executors could not run, against the container section the
+// hooks are frozen with: its declared mounts and its clone. The program checks its own configuration before it
+// starts, because the ledger stores what the program sends and checks none of it.
+func (p PostLanding) Validate(container Container) error {
+	if len(p.Hooks) != 0 && container.GitDir == "" {
+		// Without it a hook would get no clone mount, and LAND_TREE, a worktree inside the clone, would be an
+		// empty path in its container: the hook fails where it reads the landed tree.
+		return fmt.Errorf("repository.git_dir is required to run hooks: every hook gets the program's clone, which holds LAND_TREE")
+	}
+	for name, mount := range container.Mounts {
+		if samePath(mount.HostPath, container.GitDir) {
+			return fmt.Errorf("container.mounts[%q] is the program's clone %s, which every hook gets read-only already; declaring it again is a second mount of one path, which docker refuses", name, container.GitDir)
+		}
+	}
 	for index, hook := range p.Hooks {
-		if err := hook.validate(mounts); err != nil {
+		if err := hook.validate(container.Mounts); err != nil {
 			return fmt.Errorf("post_landing.hooks[%d]: %w", index, err)
 		}
 	}
