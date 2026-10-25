@@ -101,26 +101,25 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 }
 
 type config struct {
-	BatchID        string           `json:"batchId"`
-	Repository     string           `json:"repository"`
-	RepositoryPath string           `json:"repositoryPath"`
-	Base           string           `json:"base"`
-	BaseBranch     string           `json:"baseBranch"`
-	StatePath      string           `json:"statePath"`
-	Members        []landing.Member `json:"members"`
-	Build          []string         `json:"build"`
-	Hasher         []string         `json:"hasher"`
-	Checks         []checkConfig    `json:"checks"`
-	Ledger         ledgerConfig     `json:"ledger"`
-	Toolchain      []string         `json:"toolchain"`
-	Score          scoreConfig      `json:"score"`
-	Event          eventConfig      `json:"event"`
-	ModuleRoots    []string         `json:"moduleRoots"`
-	MaxRounds      int              `json:"maxRounds"`
-	InfraRetries   int              `json:"infraRetries"`
-	Interval       time.Duration    `json:"interval"`
-	GitHub         githubConfig     `json:"github"`
-	Digest         string           `json:"-"`
+	BatchID      string           `json:"batchId"`
+	Repository   repositoryConfig `json:"repository"`
+	Base         string           `json:"base"`
+	BaseBranch   string           `json:"baseBranch"`
+	StatePath    string           `json:"statePath"`
+	Members      []landing.Member `json:"members"`
+	Build        []string         `json:"build"`
+	Hasher       []string         `json:"hasher"`
+	Checks       []checkConfig    `json:"checks"`
+	Ledger       ledgerConfig     `json:"ledger"`
+	Toolchain    []string         `json:"toolchain"`
+	Score        scoreConfig      `json:"score"`
+	Event        eventConfig      `json:"event"`
+	ModuleRoots  []string         `json:"moduleRoots"`
+	MaxRounds    int              `json:"maxRounds"`
+	InfraRetries int              `json:"infraRetries"`
+	Interval     time.Duration    `json:"interval"`
+	GitHub       githubConfig     `json:"github"`
+	Digest       string           `json:"-"`
 }
 
 type checkConfig struct {
@@ -133,6 +132,25 @@ type ledgerConfig struct {
 	Return         []string `json:"return"`
 	Status         []string `json:"status"`
 	MigrationState []string `json:"migrationState"`
+}
+
+// repositoryConfig names the repository the program lands into: Name is its
+// name in the ledger, Path the local checkout or bare clone the program
+// reads, and GitDir the program's bare clone on the build VM (decision 14).
+type repositoryConfig struct {
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	GitDir string `json:"git_dir"`
+}
+
+// UnmarshalJSON refuses the old string form of the repository, whose path was
+// the separate key repositoryPath, with the shape to write instead.
+func (r *repositoryConfig) UnmarshalJSON(body []byte) error {
+	if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 && trimmed[0] == '"' {
+		return fmt.Errorf(`repository must be an object {"name", "path", "git_dir"}, not a string`)
+	}
+	type plain repositoryConfig
+	return json.Unmarshal(body, (*plain)(r))
 }
 
 type githubConfig struct {
@@ -171,38 +189,49 @@ func (c config) runner() (landing.Runner, landing.Input, *landing.JSONStore, err
 	if c.BatchID == "" {
 		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("batchId is required")
 	}
-	if c.Repository == "" || c.RepositoryPath == "" || c.Base == "" || c.BaseBranch == "" || c.StatePath == "" {
-		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("repository, repositoryPath, base, baseBranch, and statePath are required")
+	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" || c.StatePath == "" {
+		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, baseBranch, and statePath are required")
 	}
 	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Check) == 0 || len(c.Ledger.Land) == 0 || len(c.Ledger.Return) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
 		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build, hasher, toolchain, and every ledger command including state are required")
 	}
+	path := c.Repository.Path
 	store := &landing.JSONStore{Path: c.StatePath}
 	runner := landing.Runner{
 		Store:        store,
-		Ledger:       landing.CommandLedger{Directory: c.RepositoryPath, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
-		Builder:      landing.CommandBuilder{RepositoryPath: c.RepositoryPath, Command: c.Build},
-		Hasher:       landing.CommandHasher{Command: c.Hasher, Directory: c.RepositoryPath},
-		Git:          landing.RepositoryGit{Path: c.RepositoryPath},
+		Ledger:       landing.CommandLedger{Directory: path, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
+		Builder:      landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
+		Hasher:       landing.CommandHasher{Command: c.Hasher, Directory: path},
+		Git:          landing.RepositoryGit{Path: path},
 		ModuleRoots:  append([]string(nil), c.ModuleRoots...),
 		MaxRounds:    c.MaxRounds,
 		InfraRetries: c.InfraRetries,
 		ConfigDigest: c.Digest,
-		Toolchain:    commandToolchain(c.RepositoryPath, c.Toolchain),
+		Toolchain:    commandToolchain(path, c.Toolchain),
 	}
 	for _, check := range c.Checks {
-		runner.Checks = append(runner.Checks, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: c.RepositoryPath})
+		runner.Checks = append(runner.Checks, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: path})
 	}
 	if c.GitHub.Remote != "" || c.GitHub.Executable != "" {
-		if len(c.Score.Command) == 0 || len(c.Score.Commit) == 0 || len(c.Score.Status) == 0 || c.Score.Path == "" || len(c.Event.Command) == 0 || len(c.Event.Status) == 0 {
-			return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("score and event commands with durable status checks are required when GitHub publication is configured")
+		runner.GitHub = landing.GitHubCLI{RepositoryPath: path, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
+		// The score and the member event are optional: without them the
+		// program publishes no score status and runs no event, and the
+		// ledger's migration.landed is the record. A partial one is refused.
+		if score := c.Score; len(score.Command) != 0 || len(score.Commit) != 0 || len(score.Status) != 0 || score.Path != "" {
+			if len(score.Command) == 0 || len(score.Commit) == 0 || len(score.Status) == 0 || score.Path == "" {
+				return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("score needs command, commit, status, and path")
+			}
+			runner.Score = landing.CommandScorer{Directory: path, ScoreCommand: score.Command, CommitCommand: score.Commit, StatusCommand: score.Status}
+			runner.ScorePath = score.Path
 		}
-		runner.GitHub = landing.GitHubCLI{RepositoryPath: c.RepositoryPath, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
-		runner.Score = landing.CommandScorer{Directory: c.RepositoryPath, ScoreCommand: c.Score.Command, CommitCommand: c.Score.Commit, StatusCommand: c.Score.Status}
-		runner.ScorePath = c.Score.Path
-		runner.Events = landing.CommandEvents{Directory: c.RepositoryPath, Command: c.Event.Command, StatusCommand: c.Event.Status}
+		if event := c.Event; len(event.Command) != 0 || len(event.Status) != 0 {
+			if len(event.Command) == 0 || len(event.Status) == 0 {
+				return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("event needs command and status")
+			}
+			runner.Events = landing.CommandEvents{Directory: path, Command: event.Command, StatusCommand: event.Status}
+		}
 	}
-	return runner, landing.Input{ID: c.BatchID, Repository: c.Repository, Base: c.Base, BaseBranch: c.BaseBranch, Members: c.Members}, store, nil
+	return runner, landing.Input{ID: c.BatchID, Repository: c.Repository.Name, Base: c.Base, BaseBranch: c.BaseBranch, Members: c.Members}, store, nil
 }
 
 func commandToolchain(directory string, command []string) func(context.Context, landing.Tree) (string, error) {

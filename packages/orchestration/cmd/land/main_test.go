@@ -127,16 +127,15 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 
 	config := filepath.Join(t.TempDir(), "config.json")
 	raw, err := json.Marshal(map[string]any{
-		"batchId":        "batch",
-		"repository":     "owner/repo",
-		"repositoryPath": repo,
-		"base":           base,
-		"baseBranch":     "trunk",
-		"statePath":      filepath.Join(t.TempDir(), "state.json"),
-		"members":        []map[string]any{{"migration": "one", "generation": 1, "head": head}},
-		"build":          []string{"sh", "-c", "exit 0"},
-		"hasher":         []string{"sh", "-c", "exit 0"},
-		"toolchain":      []string{"sh", "-c", "printf tool"},
+		"batchId":    "batch",
+		"repository": map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/theorem/land/repo.git"},
+		"base":       base,
+		"baseBranch": "trunk",
+		"statePath":  filepath.Join(t.TempDir(), "state.json"),
+		"members":    []map[string]any{{"migration": "one", "generation": 1, "head": head}},
+		"build":      []string{"sh", "-c", "exit 0"},
+		"hasher":     []string{"sh", "-c", "exit 0"},
+		"toolchain":  []string{"sh", "-c", "printf tool"},
 		"ledger": map[string]any{
 			"check":          []string{"sh", "-c", "printf '{\"pass\":true}\\n'"},
 			"return":         []string{"sh", "-c", "exit 0"},
