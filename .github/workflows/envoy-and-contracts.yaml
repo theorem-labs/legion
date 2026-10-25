@@ -42,6 +42,8 @@ on:
       - ".github/actions/install-jj/**"
       - "go.work"
       - "go.work.sum"
+      - "packages/orchestration/go.mod"
+      - "packages/orchestration/go.sum"
       - ".omp-pin"
       - ".github/actions/install-omp/**"
       # The Pulumi CLI envoy-smoke's envoy-infra live tests run.
@@ -92,6 +94,8 @@ on:
       - ".github/actions/install-jj/**"
       - "go.work"
       - "go.work.sum"
+      - "packages/orchestration/go.mod"
+      - "packages/orchestration/go.sum"
       - ".omp-pin"
       - ".github/actions/install-omp/**"
       - ".github/actions/install-pulumi/**"
@@ -186,6 +190,8 @@ jobs:
               # the versions envoy compiles with.
               - 'packages/daemon/go.mod'
               - 'packages/daemon/go.sum'
+              - 'packages/orchestration/go.mod'
+              - 'packages/orchestration/go.sum'
               # The daemon's generated body cap: the envoy job runs bun run check:go, the only
               # check that catches a hand-edit of it.
               - 'packages/daemon/internal/dispatch/generated.go'
@@ -235,6 +241,8 @@ jobs:
               - 'go.work.sum'
               - 'packages/daemon/go.mod'
               - 'packages/daemon/go.sum'
+              - 'packages/orchestration/go.mod'
+              - 'packages/orchestration/go.sum'
               - 'scripts/third-party-notices.ts'
               - 'scripts/go-third-party-notices.sh'
               - 'scripts/assemble-third-party-notices.sh'
@@ -250,6 +258,8 @@ jobs:
               # The listener it builds compiles in workspace mode (envoy's note above).
               - 'packages/daemon/go.mod'
               - 'packages/daemon/go.sum'
+              - 'packages/orchestration/go.mod'
+              - 'packages/orchestration/go.sum'
               - 'package.json'
               - 'bun.lock'
               - *bun_toolchain
@@ -366,6 +376,8 @@ jobs:
               - 'go.work.sum'
               - 'packages/envoy/go.mod'
               - 'packages/envoy/go.sum'
+              - 'packages/orchestration/go.mod'
+              - 'packages/orchestration/go.sum'
               - '.github/actions/install-jj/**'
               - 'AGENTS.md'
               - 'README.md'
@@ -402,6 +414,8 @@ jobs:
               - 'packages/daemon/go.sum'
               - 'go.work'
               - 'go.work.sum'
+              - 'packages/orchestration/go.mod'
+              - 'packages/orchestration/go.sum'
               # The editor's source pin and its remaining patches can change document rendering,
               # including the Dark Reader inline-style guard.
               - 'patches/**'
