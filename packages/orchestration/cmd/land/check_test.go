@@ -21,7 +21,7 @@ func checkConfiguration(t *testing.T, repo, base, state string, members []map[st
 		"baseBranch": "trunk", "statePath": state, "members": members,
 		"build":  []string{"sh", "-c", "exit 99"},
 		"hasher": []string{"true"}, "toolchain": []string{"true"},
-		"ledger": map[string]any{"check": []string{"true"}, "land": []string{"true"}, "return": []string{"true"}, "status": []string{"true"}, "migrationState": []string{"true"}},
+		"ledger": map[string]any{"command": []string{"ledger"}, "status": []string{"true"}, "migrationState": []string{"true"}},
 		"checks": checks,
 	})
 }
