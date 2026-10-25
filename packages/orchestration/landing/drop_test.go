@@ -70,9 +70,6 @@ func (l *dropBatchLedger) DeclineBatch(_ context.Context, batch *Batch, reason s
 }
 func (*dropBatchLedger) BeginWithdraw(context.Context, string, string) error { return nil }
 func (*dropBatchLedger) EndWithdraw(context.Context, string, string) error   { return nil }
-func (*dropBatchLedger) EffectDone(context.Context, string, string, string, []byte) error {
-	return nil
-}
 func (*dropBatchLedger) ReadyMembers(context.Context, string) ([]Member, error) {
 	return nil, nil
 }

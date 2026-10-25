@@ -139,20 +139,23 @@ func TestLandBatchLandsTheMembersAndReleasesTheFence(t *testing.T) {
 }
 
 // A landing records each post-landing effect of the batch's record as an intent, the batch shows them pending, and
-// EffectDone finishes them one by one; a repeat succeeds.
+// a done finishes them one by one; a repeat succeeds.
 func TestLandBatchRecordsItsPostLandingEffects(t *testing.T) {
 	ctx := context.Background()
 	batches, calls, _, admitted, _ := admittedBatch(t)
 	admitted.State = landing.Landed
-	admitted.PostLandEffects = []landing.PostLandEffect{{Key: "score", Op: "score"}, {Key: "event/M-1", Op: "event", Member: "M-1"}}
+	admitted.PostLandEffects = []landing.PostLandEffect{
+		{Key: "hook/batch-1/0/slice", Op: landing.OpHook, Index: 0, Part: "slice"},
+		{Key: "event/M-1", Op: landing.OpEvent, Member: "M-1"},
+	}
 	if err := calls.LandBatch(ctx, &admitted, "merged-1"); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(admitted.PendingEffects, []string{"event/M-1", "score"}) {
+	if !slices.Equal(admitted.PendingEffects, []string{"event/M-1", "hook/batch-1/0/slice"}) {
 		t.Fatalf("pending effects after the landing = %q", admitted.PendingEffects)
 	}
 	for range 2 {
-		if err := calls.EffectDone(ctx, "r", "batch-1", "score", []byte(`{"outcome":"scored"}`)); err != nil {
+		if err := calls.Done(ctx, "r", "batch-1", "hook/batch-1/0/slice", []byte(`{"outcome":"exit","exit":0}`), nil, nil, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -220,5 +223,55 @@ func TestBeginWithdrawRecordsTheEffectOnce(t *testing.T) {
 	effects := must(store.BatchEffects(ctx, "r", "batch-1"))
 	if len(effects) != 1 || effects[0].Key != "withdraw/batch-1" {
 		t.Fatalf("the batch's effects are %+v, want one withdraw", effects)
+	}
+}
+
+// An admission whose response was lost replays: the ledger returns the record it stored, and the runner adopts it,
+// so its next save carries the effects that admission froze and never a list rebuilt from a changed configuration.
+func TestAReplayedAdmissionAdoptsTheStoredRecord(t *testing.T) {
+	ctx := context.Background()
+	batches, store := newBatches(t)
+	member := readyMember(t, store, "M-1", "alice", "a.lean", nil)
+	admitting := batch("batch-1", landing.Green)
+	admitting.FrozenMembers, admitting.ActiveMembers = []landing.Member{member}, []landing.Member{member}
+	admitting.Candidate.Commit, admitting.Candidate.Tree = "candidate-1", "tree-1"
+	admitting.PostLandEffects = []landing.PostLandEffect{
+		{Key: "hook/batch-1/0/slice", Op: landing.OpHook, Index: 0, Part: "slice",
+			Definition: &landing.HookDefinition{Command: []string{"/bin/refresh"}, Image: "image@sha256:one", Apply: landing.ApplyNone}},
+	}
+	must(batches.Create(ctx, &admitting))
+	calls := ledgerstore.NewLedger(store, "r")
+	members := []landing.AdmitMember{{
+		Migration: member.Migration, ReadyEvent: member.ReadyEvent, CurrentHashes: map[string]string{}, ChangedPaths: member.Changed,
+	}}
+	before := admitting
+	if err := calls.Admit(ctx, &admitting, members); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retry after a lost response carries a batch rebuilt from a changed configuration, at the version the
+	// first attempt read.
+	retry := before
+	retry.PostLandEffects = []landing.PostLandEffect{
+		{Key: "hook/batch-1/0/all", Op: landing.OpHook, Index: 0, Part: "all",
+			Definition: &landing.HookDefinition{Command: []string{"/bin/score"}, Image: "image@sha256:two", Apply: landing.ApplyScore}},
+	}
+	if err := calls.Admit(ctx, &retry, members); err != nil {
+		t.Fatal(err)
+	}
+	if len(retry.PostLandEffects) != 1 || retry.PostLandEffects[0].Key != "hook/batch-1/0/slice" ||
+		retry.PostLandEffects[0].Definition.Image != "image@sha256:one" {
+		t.Fatalf("the replayed admission left the batch with %+v", retry.PostLandEffects)
+	}
+	if retry.RecordVersion != admitting.RecordVersion || retry.Admission != landing.Admitted {
+		t.Fatalf("the replayed admission is at version %d, admission %q", retry.RecordVersion, retry.Admission)
+	}
+	// The next save succeeds at that version and keeps the admitted effects.
+	if err := batches.Save(ctx, &retry); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := batches.Load(ctx, "batch-1")
+	if err != nil || len(loaded.PostLandEffects) != 1 || loaded.PostLandEffects[0].Key != "hook/batch-1/0/slice" {
+		t.Fatalf("the stored effects after the save are %+v, %v", loaded.PostLandEffects, err)
 	}
 }

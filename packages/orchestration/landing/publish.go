@@ -41,13 +41,6 @@ type GitHub interface {
 	Read(context.Context, string, int) (PullRequest, error)
 }
 
-// Scorer records the configured post-merge score and commits its output through
-// the publishing policy.
-type Scorer interface {
-	Score(context.Context, string, string) (string, error)
-	Commit(context.Context, string, string, string, string) error
-}
-
 // LandingEvent is emitted once per member after its merge is durably recorded.
 type LandingEvent struct {
 	Batch  string
@@ -140,6 +133,10 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 	}
 	batch.PullRequest = pull
 	batch.EscalateTo = r.EscalationsOwner
+	// The hook definitions are frozen here, in the record the ledger stores with the admission, so a configuration
+	// change after it (a reorder of hooks or parts, another image, score ref or escalations owner) changes nothing
+	// for this batch.
+	batch.PostLandEffects = r.postLandEffects(batch)
 	if err := r.Admission.Admit(ctx, &batch, admissionMembers(batch.ActiveMembers)); err != nil {
 		return r.admissionRefused(ctx, &batch, err)
 	}
@@ -270,13 +267,12 @@ func (r Runner) decline(ctx context.Context, batch *Batch, reason string) (Batch
 	return *batch, nil
 }
 
-// land lands every member at GitHub's merged commit in one ledger transaction, which also records each
-// post-landing effect as an intent, and then finishes those effects. A transport error leaves the batch admitted for
-// a later round; a ledger refusal is LandedUnrecorded with that refusal, and the runner stops retrying.
+// land lands every member at GitHub's merged commit in one ledger transaction, which also records each effect that
+// admission froze as an intent, and then does those effects. A transport error leaves the batch admitted for a
+// later round; a ledger refusal is LandedUnrecorded with that refusal, and the runner stops retrying.
 func (r Runner) land(ctx context.Context, batch *Batch) (Batch, error) {
 	record := cloneBatch(*batch)
 	record.State, record.Reason = Landed, ""
-	record.PostLandEffects = r.postLandEffects(record)
 	if err := r.Admission.LandBatch(ctx, &record, batch.PullRequest.MergedCommit); err != nil {
 		var refusal *Refusal
 		if errors.As(err, &refusal) {
@@ -301,64 +297,16 @@ func (r Runner) landedUnrecorded(ctx context.Context, batch *Batch, reason strin
 	return *batch, nil
 }
 
-// postLandEffects are the effects of a landing: the score, when one is configured, and one event per member, when
-// events are published.
+// postLandEffects are the effects of a landing, frozen at admission: one event per member, when events are
+// published, and one hook effect for each (hook, part) of the configuration.
 func (r Runner) postLandEffects(batch Batch) []PostLandEffect {
 	effects := []PostLandEffect{}
-	if r.Score != nil {
-		effects = append(effects, PostLandEffect{Key: "score", Op: "score"})
-	}
 	if r.Events != nil {
 		for _, member := range batch.ActiveMembers {
-			effects = append(effects, PostLandEffect{Key: "event/" + member.Migration, Op: "event", Member: member.Migration})
+			effects = append(effects, PostLandEffect{Key: "event/" + member.Migration, Op: OpEvent, Member: member.Migration})
 		}
 	}
-	return effects
-}
-
-// finishEffects does each post-landing effect of a landed batch that the ledger still lists, and records it done.
-// The batch record is never saved again: the ledger's effect rows are the durable state. An effect that fails stays
-// pending, so the batch stays listed and a later round finishes it.
-func (r Runner) finishEffects(ctx context.Context, batch *Batch) error {
-	commit := batch.PullRequest.MergedCommit
-	var failed []error
-	pending := []string{}
-	for _, key := range batch.PendingEffects {
-		if err := r.finishEffect(ctx, *batch, key, commit); err != nil {
-			failed = append(failed, fmt.Errorf("%s: %w", key, err))
-			pending = append(pending, key)
-			continue
-		}
-		if err := r.Admission.EffectDone(ctx, batch.Repository, batch.ID, key, []byte(`{"outcome":"done"}`)); err != nil {
-			failed = append(failed, fmt.Errorf("record %s done: %w", key, err))
-			pending = append(pending, key)
-		}
-	}
-	batch.PendingEffects = pending
-	if len(failed) != 0 {
-		return fmt.Errorf("%w: %w", ErrEffectsPending, errors.Join(failed...))
-	}
-	return nil
-}
-
-func (r Runner) finishEffect(ctx context.Context, batch Batch, key, commit string) error {
-	switch {
-	case key == "score":
-		if r.Score == nil {
-			return nil
-		}
-		output, err := r.Score.Score(ctx, commit, batch.ID)
-		if err != nil {
-			return err
-		}
-		return r.Score.Commit(ctx, batch.Repository, commit, r.ScorePath, output)
-	case strings.HasPrefix(key, "event/"):
-		if r.Events == nil {
-			return nil
-		}
-		return r.Events.Publish(ctx, LandingEvent{Batch: batch.ID, Member: strings.TrimPrefix(key, "event/"), Commit: commit})
-	}
-	return nil
+	return append(effects, r.hookEffects(batch)...)
 }
 
 func (r Runner) publishingRetryLimit() int {

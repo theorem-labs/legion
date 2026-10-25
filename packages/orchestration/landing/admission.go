@@ -37,9 +37,6 @@ type BatchLedger interface {
 	// EndWithdraw records the withdraw effect done, after GitHub removed and closed the pull request. A repeat is a
 	// success, so a restart that finds the effect already done finishes nothing twice.
 	EndWithdraw(ctx context.Context, repo, batch string) error
-	// EffectDone records a post-landing effect of a landed batch done with its result. A repeat finds it done and
-	// succeeds.
-	EffectDone(ctx context.Context, repo, batch, key string, result []byte) error
 	// ReadyMembers lists the repository's ready migrations, each as the member a batch freezes from it. A successor
 	// batch forms from them, so a returned member joins one only after its owner readies it again.
 	ReadyMembers(ctx context.Context, repo string) ([]Member, error)
@@ -47,11 +44,25 @@ type BatchLedger interface {
 
 // PostLandEffect is one effect that a landing records as an intent in its own transaction, so a crash after the
 // landing cannot lose it: the runner does it after LandBatch and records it done, and a restart finishes every
-// effect still to do. Key names it within its batch, Op is what it does, and Member is the member it is for, or empty.
+// effect still to do. Key names it within its batch, Op is what it does, and Member is the member it is for, or
+// empty, because a hook belongs to the batch. A hook effect also carries the hook's position in the configured
+// list, its part, and the definition that admission froze: everything its executors read, so a configuration
+// change after admission changes nothing for this batch.
 type PostLandEffect struct {
-	Key    string `json:"key"`
-	Op     string `json:"op"`
-	Member string `json:"member,omitempty"`
+	Key        string          `json:"key"`
+	Op         string          `json:"op"`
+	Member     string          `json:"member,omitempty"`
+	Index      int             `json:"index,omitempty"`
+	Part       string          `json:"part,omitempty"`
+	Definition *HookDefinition `json:"definition,omitempty"`
+}
+
+// partPosition is the part's position in post_landing.parts at admission, which orders one hook's effects.
+func (e PostLandEffect) partPosition() int {
+	if e.Definition == nil {
+		return 0
+	}
+	return e.Definition.PartPosition
 }
 
 // AdmitMember is one member of an admission: what the program computed from the candidate. Everything else (the

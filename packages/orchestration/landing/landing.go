@@ -308,22 +308,40 @@ type Runner struct {
 	Hasher       Hasher
 	Git          Git
 	GitHub       GitHub
-	Score        Scorer
 	Events       EventPublisher
-	ScorePath    string
 	Checks       []Checker
 	ModuleRoots  []string
 	MaxRounds    int
 	InfraRetries int
 	ConfigDigest string
+	// Effects is the ledger's log of a landing's effects, which every executor writes through.
+	Effects EffectLog
+	// Containers runs each hook on the build VM, and Trees gives it the landed commit's worktree.
+	Containers ContainerRunner
+	Trees      LandedTrees
+	// Scores is the remote score ref a score apply reads and pushes, and Defects publishes a hook's defect.
+	Scores  ScoreStore
+	Defects DefectPublisher
+	// PostLanding is the configured, ordered list of hooks and the parts they run for, which admission freezes
+	// into the batch's record.
+	PostLanding PostLanding
+	// Container is the image, user and declared mounts that a frozen hook definition copies.
+	Container Container
+	// Librarian is the argv that a contracts apply's deliveries run.
+	Librarian []string
 	// PublishingRetryLimit is the number of failed enqueues and waits after which an admitted batch is withdrawn.
 	PublishingRetryLimit int
 	// PublishingBackoff is the first pause after a failed publishing step, doubled after each failure. Zero is 30
 	// seconds.
 	PublishingBackoff time.Duration
-	// EscalationsOwner is the owner that a landed_unrecorded batch is escalated to.
+	// EscalationsOwner is the owner that every escalation of this program is enqueued for: a landed_unrecorded
+	// batch and each retried or held effect.
 	EscalationsOwner string
-	Toolchain        func(context.Context, Tree) (string, error)
+	// EscalateAfter is the attempt count that escalates a retried effect (default 10), and RetryBackoff the first
+	// wait between two attempts of one effect (default 10 seconds).
+	EscalateAfter int
+	RetryBackoff  time.Duration
+	Toolchain     func(context.Context, Tree) (string, error)
 }
 
 // Run freezes one batch and advances it until it is green or failed.
@@ -1153,4 +1171,20 @@ func cloneBatch(batch Batch) Batch {
 		batch.Receipt = &receipt
 	}
 	return batch
+}
+
+// escalateAfter is the attempt count at which a retried effect is escalated to the escalations owner.
+func (r Runner) escalateAfter() int {
+	if r.EscalateAfter > 0 {
+		return r.EscalateAfter
+	}
+	return 10
+}
+
+// retryBackoff is the first wait between two attempts of one effect, doubled after each further attempt.
+func (r Runner) retryBackoff() time.Duration {
+	if r.RetryBackoff > 0 {
+		return r.RetryBackoff
+	}
+	return 10 * time.Second
 }

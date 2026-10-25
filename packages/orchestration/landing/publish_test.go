@@ -10,15 +10,15 @@ import (
 )
 
 // The ledger admits the batch after the push and the open and before the enqueue; GitHub's merge of the candidate
-// lands it in one ledger call at the merged commit, and the score and each member's event run after the landing as
-// its post-landing effects, each recorded done.
+// lands it in one ledger call at the merged commit, and each member's event runs after the landing as a
+// post-landing effect, recorded done.
 func TestPublishLandsMergedCandidateAfterQueueConfirmation(t *testing.T) {
 	ledger := &ledgerFake{}
-	admission := &batchLedgerFake{ledger: ledger}
+	effects := newEffectLog()
+	admission := &batchLedgerFake{ledger: ledger, effects: effects}
 	github := &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}}
-	score := &scoreFake{output: "score"}
 	events := &eventsFake{}
-	runner := Runner{Store: &storeFake{}, Ledger: ledger, Admission: admission, GitHub: github, Score: score, Events: events}
+	runner := Runner{Store: &storeFake{}, Ledger: ledger, Admission: admission, GitHub: github, Events: events, Effects: effects}
 
 	landed, err := runner.Publish(context.Background(), greenBatch())
 	if err != nil {
@@ -39,11 +39,8 @@ func TestPublishLandsMergedCandidateAfterQueueConfirmation(t *testing.T) {
 	if got, want := events.members, []string{"one"}; !sameStrings(got, want) {
 		t.Fatalf("events = %#v, want %#v", got, want)
 	}
-	if got, want := score.commits, 1; got != want {
-		t.Fatalf("score commits = %d, want %d", got, want)
-	}
-	if !sameStrings(admission.done, []string{"event/one", "score"}) || len(landed.PendingEffects) != 0 {
-		t.Fatalf("effects done %v, pending %v; want both done", admission.done, landed.PendingEffects)
+	if !sameStrings(effects.doneKeys(), []string{"event/one"}) || len(landed.PendingEffects) != 0 {
+		t.Fatalf("effects done %v, pending %v; want the member event done", effects.doneKeys(), landed.PendingEffects)
 	}
 }
 
@@ -220,17 +217,6 @@ func (f *githubFake) Enqueue(context.Context, string, int) error { return f.enqu
 
 func (f *githubFake) Wait(context.Context, string, int, string) (PullRequest, error) {
 	return f.wait, nil
-}
-
-type scoreFake struct {
-	output  string
-	commits int
-}
-
-func (f *scoreFake) Score(context.Context, string, string) (string, error) { return f.output, nil }
-func (f *scoreFake) Commit(context.Context, string, string, string, string) error {
-	f.commits++
-	return nil
 }
 
 type eventsFake struct {

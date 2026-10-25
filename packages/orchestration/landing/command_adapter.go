@@ -220,40 +220,25 @@ func (h CommandHasher) Hashes(ctx context.Context, tree Tree, names []string) (m
 	return hashes, nil
 }
 
-// CommandScorer runs configured score and score-commit commands.
-type CommandScorer struct {
-	Directory     string
-	ScoreCommand  []string
-	CommitCommand []string
-	StatusCommand []string
+// CommandDefects publishes a hook's defect with a configured command: the topic and the message id are in its
+// environment and the message is its standard input.
+type CommandDefects struct {
+	Directory string
+	Command   []string
 }
 
-func (s CommandScorer) Score(ctx context.Context, commit, part string) (string, error) {
-	output, err := runLandingCommand(ctx, s.Directory, s.ScoreCommand, []string{
-		"LAND_COMMIT=" + commit,
-		"LAND_PART=" + part,
-	})
-	if err != nil {
-		return "", fmt.Errorf("run score: %w", err)
+func (d CommandDefects) Publish(ctx context.Context, topic, id string, body []byte) error {
+	if len(d.Command) == 0 {
+		return fmt.Errorf("no defect command is configured")
 	}
-	return strings.TrimSpace(output), nil
-}
-
-func (s CommandScorer) Commit(ctx context.Context, repository, commit, path, output string) error {
-	_, err := runLandingCommand(ctx, s.Directory, s.CommitCommand, []string{
-		"LAND_REPOSITORY=" + repository,
-		"LAND_COMMIT=" + commit,
-		"LAND_SCORE_PATH=" + path,
-		"LAND_SCORE_OUTPUT=" + output,
-	})
-	if err != nil {
-		return fmt.Errorf("commit score: %w", err)
+	process := exec.CommandContext(ctx, d.Command[0], d.Command[1:]...)
+	process.Dir = d.Directory
+	process.Env = append(os.Environ(), "LAND_TOPIC="+topic, "LAND_MESSAGE_ID="+id)
+	process.Stdin = bytes.NewReader(body)
+	if output, err := process.CombinedOutput(); err != nil {
+		return fmt.Errorf("publish the defect: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
-}
-
-func (s CommandScorer) OperationComplete(ctx context.Context, operation Operation) (bool, error) {
-	return commandOperationComplete(ctx, s.Directory, s.StatusCommand, operation)
 }
 
 // CommandEvents publishes configured member events after a durable merge.
