@@ -7,7 +7,7 @@ import (
 
 // The admission fence. While a batch is admitted (batch_members.admitted), the landing program has checked its members
 // against the ledger, and it lands them after GitHub merges its pull request, which cannot be undone. So until
-// LandBatch or DeclineBatch releases the admission, the ledger refuses with batch_admitted every mutation that would
+// LandBatch, ResolveBatch or DeclineBatch releases the admission, the ledger refuses with batch_admitted every mutation that would
 // change what that check read: a change to a member migration; a transfer of a contract that a member changes, whose
 // owner the review rule read; the registration of a name that a member reads; and a landing or an admission that would
 // advance a contract that a member reads, or that would read a contract that a member changes. Each fenced mutation

@@ -61,9 +61,9 @@ func sameJSON(t *testing.T, a, b json.RawMessage) bool {
 	return reflect.DeepEqual(x, y)
 }
 
-// batchSQL runs statement on its own connection. The tests use it for the columns that only the calls of later tasks
-// write (AdmitBatch, LandBatch, DeclineBatch and the effect log), so that SaveBatch and ListActiveBatches can be
-// tested against them now.
+// batchSQL runs statement on its own connection. The tests use it to set the columns and rows that the batch calls
+// write (an admission, a landing, a decline, an effect) without making those calls, so that one test can put batches
+// in every state that SaveBatch and ListActiveBatches meet.
 func batchSQL(t *testing.T, dsn, statement string, args ...any) {
 	t.Helper()
 	ctx := context.Background()
@@ -74,7 +74,8 @@ func batchSQL(t *testing.T, dsn, statement string, args ...any) {
 	}
 }
 
-// setAdmission gives batch id the admission and successor that AdmitBatch, LandBatch or DeclineBatch leaves.
+// setAdmission gives batch id the admission and successor that AdmitBatch, LandBatch or DeclineBatch leaves, without
+// their other writes.
 func setAdmission(t *testing.T, dsn, id, admission, successor string) {
 	t.Helper()
 	batchSQL(t, dsn, `UPDATE batches SET admission = nullif($2, ''), successor = nullif($3, '') WHERE repo = 'r' AND id = $1`,
@@ -459,8 +460,8 @@ func TestListActiveBatchesListsWhatARestartMustFinish(t *testing.T) {
 	if successor := must(s.LoadBatch(ctx, "r", "declined-empty-successor")).Successor; successor != "" {
 		t.Fatalf("a batch stored with an empty successor loads with successor %q", successor)
 	}
-	// No call writes an effect yet: LandBatch and ResolveBatch record a landed batch's effects. The test writes them
-	// directly to check the listing rule for a terminal batch with an effect still to do.
+	// The test writes the effects directly, as LandBatch would record them, to check the listing rule for a terminal
+	// batch with an effect still to do.
 	batchSQL(t, dsn, `INSERT INTO batch_effects (repo, batch, key, op, state) VALUES
 		('r', 'landed-with-effects', 'hook/landed-with-effects/1/score', 'hook', 'intent'),
 		('r', 'landed-with-effects', 'hook/landed-with-effects/0/report', 'hook', 'intent'),

@@ -4,7 +4,8 @@ ALTER TABLE events ADD COLUMN login text NOT NULL DEFAULT session_user;
 
 -- The landing program's durable batch. record is the program's whole batch record, stored as the program sends it;
 -- phase is its state, computed by Postgres on every write. record_version orders every write: a write names the
--- version it read. admission is admitted while the batch's members are fenced, then landed or declined.
+-- version it read. admission is admitted while the batch's members are fenced, then landed or declined. merged_commit
+-- is GitHub's merged commit that a landing or a resolution landed the members at, apart from the candidate commit.
 CREATE TABLE batches (
     repo             text NOT NULL REFERENCES repositories(name),
     id               text NOT NULL,
@@ -13,6 +14,7 @@ CREATE TABLE batches (
     record_version   bigint NOT NULL CHECK (record_version >= 1),
     admission        text CHECK (admission IN ('admitted', 'landed', 'declined')),
     admission_digest text,
+    merged_commit    text,
     decline_digest   text,
     successor        text,
     created_at       timestamptz NOT NULL,

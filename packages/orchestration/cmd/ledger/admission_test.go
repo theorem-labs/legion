@@ -220,7 +220,7 @@ func TestAdmitBatchCommandRefusesWithNothingRecorded(t *testing.T) {
 }
 
 // While a migration is admitted, takeover, a round that would escalate it and the transfer of a contract it changes
-// each exit 1 with batch_admitted and change nothing. After DeclineBatch releases the admission, each succeeds.
+// each exit 1 with batch_admitted and change nothing. After decline-batch releases the admission, each succeeds.
 func TestAdmitBatchCommandFencesTheAdmittedMigration(t *testing.T) {
 	cli := newBatchCLI(t)
 	cli.invoke("repo", "ensure", "r", "1")
@@ -237,9 +237,7 @@ func TestAdmitBatchCommandFencesTheAdmittedMigration(t *testing.T) {
 		cli.refused("batch_admitted", args...)
 		cli.assertUnchanged(admitted, events)
 	}
-	// DeclineBatch releases the admission; the test releases it directly.
-	cli.sql(`UPDATE batch_members SET admitted = false WHERE repo = 'r' AND batch = 'batch-1'`)
-	cli.setAdmission("batch-1", "declined", "")
+	cli.invoke("decline-batch", "--request-file", cli.request(declineFields("batch-1", admitted.RecordVersion, "")))
 	cli.invoke("contract", "transfer", "r", "C", "alice", "bob")
 	var round struct {
 		LandingRounds int    `json:"landing_rounds"`
