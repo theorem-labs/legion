@@ -469,7 +469,9 @@ displacements it reached through each parameter (`analysis.image.memory_paramete
 whose base register still holds an incoming argument register, with the offset from it), so a load
 through another parameter at the same number confirms nothing
 (`no_offset_through_the_named_parameter`). A displacement the decoding cannot trace to a parameter
-(a pointer loaded from memory) confirms as before.
+(a pointer loaded from memory) confirms as before. The rule holds for external functions only: their
+arguments are their C parameters in order, by the calling convention, while the compiler may rewrite
+a static function's signature (drop an unused parameter, so the next one arrives a register earlier).
 
 The hard checks fail the run (exit 1), each with a test that makes it fail alone: a parse error; a
 function of the part's files that the image holds but the graph lacks; a global the part's code

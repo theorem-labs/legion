@@ -313,10 +313,14 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             continue
         displacements = set(offsets[function])
         # The offsets the image reached through each parameter of this function: an access the C
-        # names through one parameter is not confirmed by a load through another one.
+        # names through one parameter is not confirmed by a load through another one. Only an
+        # external function's arguments are its C parameters in order (the calling convention); the
+        # compiler may rewrite a static one's signature (drop an unused parameter, so the next one
+        # arrives a register earlier), and its argument registers then name no C parameter.
         by_parameter: dict[int, set[int]] = collections.defaultdict(set)
-        for index, value in parameters.get(function, ()):
-            by_parameter[index].add(value)
+        if "@" not in function:
+            for index, value in parameters.get(function, ()):
+                by_parameter[index].add(value)
         claimed = {value for values in by_parameter.values() for value in values}
         frame_accesses, frame_addresses = frames.frame_of(analysis["image"], function)
         frame_indexed = frames.indexed_of(analysis["image"], function)
