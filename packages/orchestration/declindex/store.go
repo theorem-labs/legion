@@ -25,7 +25,7 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
-const SchemaVersion = "13"
+const SchemaVersion = "14"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
@@ -83,17 +83,21 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS edges_module ON edges (module);
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated
--- type as printed, and its compiled statement hash.
+-- type as printed, its compiled statement hash, the heads of its explicit binders' types (a JSON array, in order)
+-- and the head of its conclusion (Constant.Binders and Constant.Conclusion).
 CREATE TABLE IF NOT EXISTS consts (
-    name   TEXT NOT NULL,
-    module TEXT NOT NULL,
-    kind   TEXT NOT NULL,
-    type   TEXT NOT NULL,
-    cstmt  TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    module     TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    cstmt      TEXT NOT NULL,
+    binders    TEXT NOT NULL,
+    conclusion TEXT NOT NULL,
     PRIMARY KEY (name, module)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS consts_module ON consts (module);
 CREATE INDEX IF NOT EXISTS consts_cstmt ON consts (cstmt);
+CREATE INDEX IF NOT EXISTS consts_conclusion ON consts (conclusion);
 -- The relation atoms of each constant's statement, by canonical hash: who else states the same fact.
 CREATE TABLE IF NOT EXISTS atoms (name TEXT NOT NULL, module TEXT NOT NULL, atom TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS atoms_atom ON atoms (atom);
@@ -367,10 +371,9 @@ func (s *Store) init(ctx context.Context) error {
 		return err
 	}
 	return s.write(ctx, nil, func() error {
-		if _, err := s.db.ExecContext(ctx, schema); err != nil {
-			return fmt.Errorf("create the index schema: %w", err)
-		}
-		v, err := s.Meta(ctx, "schema")
+		// The version is read again under the lock, and before the schema is created: an older index's tables can
+		// lack a column that one of this schema's indexes names.
+		v, err := s.schemaVersion(ctx)
 		if err != nil {
 			return err
 		}
@@ -384,9 +387,9 @@ func (s *Store) init(ctx context.Context) error {
 					return err
 				}
 			}
-			if _, err := s.db.ExecContext(ctx, schema); err != nil {
-				return err
-			}
+		}
+		if _, err := s.db.ExecContext(ctx, schema); err != nil {
+			return fmt.Errorf("create the index schema: %w", err)
 		}
 		return s.setMeta(ctx, s.db, "schema", SchemaVersion)
 	})

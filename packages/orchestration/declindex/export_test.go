@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -167,6 +168,43 @@ func TestExporterExportsNoMatcher(t *testing.T) {
 		if _, ok := consts[m]; ok {
 			t.Errorf("the matcher %s was exported as a declaration", m)
 		}
+	}
+}
+
+// A toolchain process takes the thread count of the build that runs it (LEAN_NUM_THREADS), so that many of them
+// together keep to the cores that build was given; nothing else of the caller's environment reaches it.
+func TestLeanEnvPassesTheThreadCount(t *testing.T) {
+	l := Lean{Prefix: t.TempDir()}
+	t.Setenv("LEAN_NUM_THREADS", "3")
+	if env := l.env(nil, t.TempDir()); !slices.Contains(env, "LEAN_NUM_THREADS=3") {
+		t.Errorf("env with LEAN_NUM_THREADS=3 set = %v; want it among them", env)
+	}
+	t.Setenv("LEAN_NUM_THREADS", "")
+	for _, v := range l.env(nil, t.TempDir()) {
+		if strings.HasPrefix(v, "LEAN_NUM_THREADS=") {
+			t.Errorf("env with LEAN_NUM_THREADS unset gave %q", v)
+		}
+	}
+}
+
+// A build passes its own options to each `lean` (a package's options, as `-Dname=value`): CompileModule gives them
+// to Lean, so a module that builds only with them compiles here too.
+func TestCompileModulePassesTheCallersLeanArguments(t *testing.T) {
+	l := leanForTest(t)
+	dir := t.TempDir()
+	src := "theorem big : (List.replicate 2000 1).length = 2000 := by decide\n"
+	if err := os.WriteFile(filepath.Join(dir, "Deep.lean"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := CompileModule(ctx, l, nil, dir, "Deep"); err == nil || !strings.Contains(err.Error(), "maximum recursion depth") {
+		t.Fatalf("compile without the option: %v; want Lean's recursion depth error", err)
+	}
+	if err := CompileModule(ctx, l, nil, dir, "Deep", "-DmaxRecDepth=8192"); err != nil {
+		t.Fatalf("compile with -DmaxRecDepth=8192: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "Deep.olean")); err != nil {
+		t.Fatal(err)
 	}
 }
 

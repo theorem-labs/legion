@@ -375,10 +375,14 @@ func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, w compiledRead) e
 			return err
 		}
 	}
-	cb := newBatch(tx, "INSERT OR REPLACE", "consts", 5)
+	cb := newBatch(tx, "INSERT OR REPLACE", "consts (name, module, kind, type, cstmt, binders, conclusion)", 7)
 	ab, fb := newBatch(tx, "INSERT", "atoms", 3), newBatch(tx, "INSERT", "facts", 4)
 	for _, c := range w.consts {
-		if err := cb.add(ctx, c.Name, c.Module, c.Kind, c.Type, c.Hash); err != nil {
+		binders, err := json.Marshal(nonNil(c.Binders))
+		if err != nil {
+			return err
+		}
+		if err := cb.add(ctx, c.Name, c.Module, c.Kind, c.Type, c.Hash, string(binders), c.Conclusion); err != nil {
 			return err
 		}
 		for _, a := range c.Atoms {

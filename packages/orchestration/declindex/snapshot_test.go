@@ -126,7 +126,7 @@ func TestAReaderReadsOneStateOfTheIndexWhileARefreshWritesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The compiled part of one, as a compiled step leaves it: here one constant, of the module that two removes.
-	if _, err := writer.db.ExecContext(ctx, `INSERT INTO consts (name, module, kind, type, cstmt) VALUES ('Gold2.FrameAt', 'Sub.Wrap', 'def', 'Prop', 'hash-one')`); err != nil {
+	if _, err := writer.db.ExecContext(ctx, `INSERT INTO consts (name, module, kind, type, cstmt, binders, conclusion) VALUES ('Gold2.FrameAt', 'Sub.Wrap', 'def', 'Prop', 'hash-one', '[]', '')`); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.setMeta(ctx, writer.db, "compiled_commit", "one"); err != nil {
