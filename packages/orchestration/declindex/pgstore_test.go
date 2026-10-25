@@ -501,7 +501,7 @@ func pgRowVersions(t *testing.T, s *Store) []string {
 	var out []string
 	for _, table := range []string{"consts", "atoms", "facts", "without_forms"} {
 		rows, err := s.pool.Query(context.Background(),
-			`SELECT xmin::text, t::text FROM `+table+` t ORDER BY 2`)
+			`SELECT xmin::text, t::text FROM `+pgx.Identifier{s.index, table}.Sanitize()+` t ORDER BY 2`)
 		if err := eachRow(rows, err, func(r pgx.Rows) error {
 			var xmin, row string
 			if err := r.Scan(&xmin, &row); err != nil {

@@ -109,8 +109,14 @@ func TestTheIndexAndStateFlagsOverrideTheConfigurationKeys(t *testing.T) {
 	if cfg.State != filepath.Join(cwd, "elsewhere") {
 		t.Errorf("--state gave %q, want it resolved against the working directory", cfg.State)
 	}
-	if want := (declindex.Target{Index: "other_idx", Reader: "declindex_ro"}); cfg.Target() != want {
-		t.Errorf("Target() = %+v, want %+v", cfg.Target(), want)
+	// --state also moves the file whose lock guards the tree, which lives in the state directory.
+	got := cfg.Target()
+	if !strings.HasSuffix(got.TreeLock, string(filepath.Separator)+filepath.Join("elsewhere", "tree.lock")) {
+		t.Errorf("Target().TreeLock = %q, want tree.lock in the --state directory", got.TreeLock)
+	}
+	got.TreeLock = ""
+	if want := (declindex.Target{Index: "other_idx", Reader: "declindex_ro"}); got != want {
+		t.Errorf("Target() = %+v, want %+v", got, want)
 	}
 	if _, err := settings(globals{config: config, index: "Idx"}, noEnvironment); !isUsageError(err) {
 		t.Errorf("--index Idx gave %v, want a usage error", err)
