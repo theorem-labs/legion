@@ -1117,3 +1117,44 @@ int fd_case_cmp(const struct fd_case *t, unsigned char c1, unsigned char c2)
 	c1 = fd_lower(t, c1);
 	return c1 - c2;
 }
+
+/* fs/namespace.c mnt_ns_tree_remove: ns_tree_active(ns) is (!RB_EMPTY_NODE(&to_ns_common(ns)->...)),
+ * to_ns_common a _Generic whose associations are all &(__ns)->ns, inside another macro's argument:
+ * the selection is read from to_ns_common's body (the mnt association), not left unconfirmed. */
+struct fd_tree_ns {
+	long pad;
+	struct list_node node;
+};
+struct fd_mnt_ns {
+	long pad[3];
+	struct fd_tree_ns ns;
+};
+struct fd_ipc_ns {
+	struct fd_tree_ns ns;
+};
+#define fd_ns_of(x) _Generic((x), struct fd_ipc_ns *: &(x)->ns, struct fd_mnt_ns *: &(x)->ns)
+#define fd_node_empty(n) ((n)->next == (n))
+#define fd_ns_active(x) (!fd_node_empty(&fd_ns_of(x)->node))
+
+int fd_mnt_active(struct fd_mnt_ns *m)
+{
+	return fd_ns_active(m);
+}
+
+/* A _Generic the facts cannot read: each association a macro pastes together, every association of
+ * one type. The struct accesses it holds cannot be confirmed (generic_unconfirmed). */
+struct fd_la {
+	long pad;
+	long len;
+};
+struct fd_lb {
+	long pad;
+	long len;
+};
+#define fd_len_case(x, kind) struct kind *: ((struct kind *)(void *)(x))->len
+#define fd_len_any(x) _Generic((x), fd_len_case(x, fd_la), fd_len_case(x, fd_lb))
+
+long fd_len_of(struct fd_la *a)
+{
+	return fd_len_any(a);
+}

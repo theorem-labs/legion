@@ -23,7 +23,8 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   member that decays) is marked `address`.
 - **What the compiler removes is left out**, and kept with a reason: `sizeof`/`_Alignof` operands,
   `typeof` and cast types, const scalars, the unselected associations of `_Generic` (their types are
-  read from the macro bodies that write them, a typedef name standing for its type, or, where a
+  read from the macro bodies that write them, also the body of the macro that spells the `_Generic`
+  when another macro's body passes it on, as `ns_tree_active(ns)` does `to_ns_common(ns)`, a typedef name standing for its type, or, where a
   macro pastes them together, the one association with the selection's own type is the selected
   one; a call of the function a `_Generic` selects is a direct call), branches whose condition
   folds to a constant (also through inline helpers whose reachable returns give one value or one

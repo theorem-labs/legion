@@ -519,6 +519,8 @@ class _Extractor:
             cursor.spelling: cursor for cursor in tu.cursor.get_children() if cursor.kind == K.MACRO_DEFINITION
         }
         self.macro_cache: dict[str, tuple[frozenset[str], list[str]] | None] = {}
+        # Per file, where each macro definition of ``macros`` is: start and end offsets, name.
+        self.macro_places: dict[str, list[tuple[int, int, str]]] | None = None
         self.weak_cache: dict[int, bool] = {}
         self.evaluator = _Evaluator(
             {cursor.spelling: cursor for cursor in tu.cursor.get_children()
@@ -962,9 +964,17 @@ class _Extractor:
     def expansion_bodies(
         self, cursor: ci.Cursor, bound: ci.Cursor, limit: int = 256
     ) -> list[tuple[frozenset[str], list[str]]]:
-        """The text of a construct as written, then the bodies of the macros it expands, transitively."""
+        """The text of a construct as written, then the bodies of the macros it expands, transitively.
+        A construct a macro's body spells, as the argument of another macro (fs/namespace.c's
+        ``ns_tree_active(ns)``, whose body holds ``to_ns_common(ns)``), has its tokens in that body;
+        that macro's own body, with its parameters, comes first."""
         seeds = self.written_tokens(cursor, bound)
         bodies: list[tuple[frozenset[str], list[str]]] = [(frozenset(), seeds)]
+        enclosing = self.enclosing_macro(cursor)
+        if enclosing is not None:
+            found = self.macro(enclosing)
+            if found is not None:
+                bodies.append(found)
         queue = [token for token in seeds if _IDENTIFIER.match(token)]
         seen: set[str] = set()
         while queue and len(seen) < limit:
@@ -978,6 +988,33 @@ class _Extractor:
             bodies.append(macro)
             queue.extend(token for token in macro[1] if _IDENTIFIER.match(token) and token not in seen)
         return bodies
+
+    def enclosing_macro(self, cursor: ci.Cursor) -> str | None:
+        """The macro whose definition holds the text of ``cursor``, or None (the last definition of a
+        name only, as ``macros`` keeps). The tokens libclang gives for a construct a macro spells are
+        those of the definition, and each token's location is where it is written."""
+        try:
+            first = next(iter(self.tu.get_tokens(extent=cursor.extent)), None)
+        except RuntimeError as error:
+            raise self.token_error(cursor, error) from error
+        if first is None or first.location.file is None:
+            return None
+        if self.macro_places is None:
+            places: dict[str, list[tuple[int, int, str]]] = collections.defaultdict(list)
+            for name, definition in self.macros.items():
+                where = definition.extent
+                if where.start.file is not None:
+                    places[where.start.file.name].append((where.start.offset, where.end.offset, name))
+            self.macro_places = dict(places)
+        offset = first.location.offset
+        return next(
+            (
+                name
+                for begin, end, name in self.macro_places.get(first.location.file.name, [])
+                if begin <= offset <= end
+            ),
+            None,
+        )
 
     def selected_associations(self, node: ci.Cursor, bound: ci.Cursor) -> set[int] | None:
         """The index of the association ``_Generic`` selects, or None when it cannot be told.

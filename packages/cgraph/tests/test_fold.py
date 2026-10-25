@@ -406,3 +406,39 @@ def test_a_zero_helper_the_image_calls_stays_a_call(fold_facts: dict[str, Any], 
 def test_a_helper_that_changes_its_parameter_does_not_return_it_unchanged(fold_build: dict[str, Any]) -> None:
     """fd_case_cmp: the table load that decides fd_lower's + 32 stays (llvm-objdump: lbu from upper)."""
     assert folded_fields(fold_build, "fd_case_cmp") == {"upper"}
+
+
+def _unevaluated(facts: dict[str, Any], function: str) -> set[tuple[str, str]]:
+    return {
+        (item["unit"]["name"], item["reason"])
+        for item in facts["functions"][function]["events"]["unevaluated"]
+        if item.get("unit")
+    }
+
+
+def test_a_generic_inside_another_macro_s_argument_is_read(fold_facts: dict[str, Any]) -> None:
+    """fd_mnt_active, as mnt_ns_tree_remove's ns_tree_active(ns): fd_ns_of's tokens come from its own
+    definition, where x is a parameter; the mnt association is selected and the ipc one is not code."""
+    events = fold_facts["functions"]["fd_mnt_active"]["events"]
+    assert not any(item.get("generic") for kind in ("accesses", "field_accesses") for item in events[kind])
+    assert ("fd_mnt_ns", "generic_unselected") in _unevaluated(fold_facts, "fd_mnt_active")
+
+
+def test_a_generic_the_facts_cannot_read_leaves_its_struct_accesses_unconfirmed(
+    fold_facts: dict[str, Any], fold_build: dict[str, Any]
+) -> None:
+    """fd_len_of: fd_len_any's associations are pasted by fd_len_case and all read a long, so neither
+    the text nor the selection's type tells them apart. Each struct access is excluded as
+    generic_unconfirmed, and the access check counts them."""
+    events = fold_facts["functions"]["fd_len_of"]["events"]
+    assert {item["unit"]["name"] for item in events["accesses"] if item.get("generic")} == {"fd_la", "fd_lb"}
+    reasons = {
+        (item["target"], item["reason"])
+        for item in fold_build["exclusions"]["items"]
+        if item["function"] == "function:fd_len_of" and item["kind"] == "access"
+    }
+    assert {
+        ("struct:fd_la@src/fold.c", "generic_unconfirmed"),
+        ("struct:fd_lb@src/fold.c", "generic_unconfirmed"),
+    } <= reasons
+    assert fold_build["checks"]["access_layer"]["disagreements"]["generic_unconfirmed"] >= 2
