@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+
 	"github.com/jackc/pgx/v5"
 )
 
