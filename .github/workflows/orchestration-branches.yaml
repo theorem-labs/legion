@@ -48,9 +48,12 @@ concurrency:
 permissions:
   contents: read
 
+# The job names start with orchestration- so that none of them shares a name with a check that main's
+# ruleset requires (pr-and-main.yaml's lint, typecheck and test): a cancelled job here must never
+# read as that check failing.
 jobs:
   # The package selection's test, on a pull request that changes it.
-  selection:
+  orchestration-selection:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -67,7 +70,7 @@ jobs:
 
   # Runs no repository code: it reads the branch's pull requests and runs, and cancels this run when a
   # pull request that can merge already tests the branch.
-  decide:
+  orchestration-decide:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -102,9 +105,9 @@ jobs:
             exit 1
           fi
 
-  test:
-    needs: decide
-    if: needs.decide.outputs.pull_request == ''
+  orchestration-test:
+    needs: orchestration-decide
+    if: needs.orchestration-decide.outputs.pull_request == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -152,7 +155,7 @@ jobs:
       - name: Select the packages the push can break
         id: select
         env:
-          BASE: ${{ needs.decide.outputs.base }}
+          BASE: ${{ needs.orchestration-decide.outputs.base }}
         run: |
           selected=$(.github/scripts/orchestration_packages.py "$BASE" "$GITHUB_SHA")
           printf 'Since %s:\n%s\n' "${BASE:-the branch start}" "${selected:-(none)}"
