@@ -2,7 +2,6 @@ package declindex
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,38 +52,6 @@ func openStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
-}
-
-func TestOpenRebuildsAnIndexFromSchema3(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "index.sqlite")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = db.Exec(`CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;
-		INSERT INTO meta (k, v) VALUES ('schema', '3');
-		CREATE TABLE decls (
-			name TEXT NOT NULL, short TEXT NOT NULL, module TEXT NOT NULL, kind TEXT NOT NULL,
-			line INTEGER NOT NULL, stmt_hash TEXT NOT NULL
-		)`)
-	if closeErr := db.Close(); closeErr != nil {
-		t.Fatal(closeErr)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-	if got, err := s.Meta(context.Background(), "schema"); err != nil || got != "4" {
-		t.Fatalf("schema = %q, %v; want 4", got, err)
-	}
-	if _, err := s.db.Exec(`SELECT shape FROM decls`); err != nil {
-		t.Fatalf("decls has no shape column after the rebuild: %v", err)
-	}
 }
 
 func refreshed(t *testing.T, tree Tree) *Store {

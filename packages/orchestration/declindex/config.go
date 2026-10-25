@@ -215,6 +215,16 @@ func isInside(root, path string) bool {
 // ErrNoDB is returned when no index path is configured.
 var ErrNoDB = errors.New("no index file: set db in the configuration or pass --db")
 
+// OpenReadOnlyConfig opens the index that c names read-only (OpenReadOnly), with scope the reads of its caller
+// besides the index. A program that only reads the index (graph checks) opens it through this one call, and needs
+// no knowledge of where or how the index is kept.
+func OpenReadOnlyConfig(ctx context.Context, c Config, scope ReadScope) (*Store, error) {
+	if c.DB == "" {
+		return nil, ErrNoDB
+	}
+	return OpenReadOnly(ctx, c.DB, scope)
+}
+
 // TreeSpec is the configuration's Tree.
 func (c Config) TreeSpec() Tree {
 	roots := Roots{}

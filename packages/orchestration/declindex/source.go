@@ -304,6 +304,33 @@ func normalize(s string) string {
 	return out.String()
 }
 
+// stripComments drops `--` line comments and nested `/- -/` block comments (docstrings included) and keeps the rest
+// as written, each literal whole (literalEnd), so that a comment marker inside a string stays.
+func stripComments(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	n := len(s)
+	for i := 0; i < n; {
+		switch {
+		case strings.HasPrefix(s[i:], "--"):
+			i = skipLineComment(s, i, n)
+			continue
+		case strings.HasPrefix(s[i:], "/-"):
+			i = skipBlockComment(s, i, n)
+			continue
+		}
+		j, ok := literalEnd(s, i, n)
+		if !ok {
+			_, size := utf8.DecodeRuneInString(s[i:])
+			j = i + size
+		}
+		j = min(j, n)
+		out.WriteString(s[i:j])
+		i = j
+	}
+	return out.String()
+}
+
 // declKind is the last command keyword in text[a:end], each keyword not part of a longer name.
 func declKind(text string, a, end int) string {
 	kind := "other"
@@ -829,7 +856,7 @@ func sourceDeclKeyword(text string, start, end int) (string, int, bool) {
 			for _, kind := range keywords {
 				keywordEnd := i + len(kind)
 				if keywordEnd <= end && strings.HasPrefix(text[i:], kind) && wordBoundaryBefore(text, i, true) &&
-					(keywordEnd >= end || wordBoundaryAfterDot(text, keywordEnd, end)) {
+					wordBoundaryAfter(text, keywordEnd, end, true) {
 					return kind, keywordEnd, true
 				}
 			}
