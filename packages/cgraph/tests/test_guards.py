@@ -7,6 +7,7 @@ import itertools
 from pathlib import Path
 from typing import Any
 
+import pytest
 from conftest import FIXTURE
 
 from cgraph import clangfacts, commands, config, expressions, link
@@ -1510,27 +1511,32 @@ def test_the_flow_rules_survive_exits_op_assignments_and_asm_goto(tmp_path: Path
 NOT_KEPT = """
     int probe(int k);
     void negated_cast(int n) { int x; x = n; if (!(unsigned char)x) { if (x) warn(); } kept(); }
+    void bare_cast(int n) { int x; x = n; if ((unsigned char)x) kept(); else { if (x) warn(); } }
     void bool_cast(unsigned char n) { unsigned char x; x = n; if ((_Bool)x == 1) { if (x == 2) warn(); } kept(); }
     void float_trip(int n) { int x; x = n; if ((int)(float)x == 16777216) { if (x == 16777217) warn(); } kept(); }
     void volatile_step(void) { volatile int stop = 1; for (;; stop = probe(0)) { if (stop) break; note(); } }
 """
 
 
+@pytest.mark.parametrize(
+    ("function", "callee"),
+    [
+        ("negated_cast", "warn"),
+        ("bare_cast", "warn"),
+        ("bool_cast", "warn"),
+        ("float_trip", "warn"),
+        ("volatile_step", "probe"),
+    ],
+)
 def test_a_conversion_that_loses_values_and_a_volatile_loop_keep_the_code_the_compiler_keeps(
-    tmp_path: Path,
+    tmp_path: Path, function: str, callee: str
 ) -> None:
-    """More counterexamples: `!(unsigned char)x` holds for x = 256, `(_Bool)x == 1` holds for x = 2, and
-    `(int)(float)x == 16777216` holds for x = 16777217, so each `warn()` is compiled; a volatile loop
-    condition cannot take the initializer's value, so the step's `probe(0)` is compiled."""
+    """More counterexamples, each compiled by clang-21 -O2: `!(unsigned char)x` and a bare
+    `(unsigned char)x` test hold or fail for x = 256 whatever x's other bits are, `(_Bool)x == 1` holds
+    for x = 2, and `(int)(float)x == 16777216` holds for x = 16777217, so each `warn()` stays; a volatile
+    loop condition cannot take the initializer's value, so the step's `probe(0)` stays."""
     facts = facts_of(tmp_path, NOT_KEPT)
-
-    def callees(function: str) -> set[str]:
-        return {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
-
-    assert "warn" in callees("negated_cast")
-    assert "warn" in callees("bool_cast")
-    assert "warn" in callees("float_trip")
-    assert "probe" in callees("volatile_step")
+    assert callee in {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
 
 
 ASM_LIVE = """
@@ -1547,10 +1553,14 @@ ASM_LIVE = """
 """
 
 
-def test_an_asm_goto_s_label_is_code_and_a_volatile_parameter_keeps_its_reads(tmp_path: Path) -> None:
-    """A label only an `asm goto` jumps to is compiled (libclang gives the statement no LABEL_REF, so
-    its tokens name the label), and a volatile parameter's reads may differ at a fold, so `vol(0)`
-    keeps `warn` (clang-21 -O2 emits both calls)."""
+def test_an_asm_goto_s_label_is_code(tmp_path: Path) -> None:
+    """A label only an `asm goto` jumps to is compiled: libclang gives the statement no LABEL_REF, so its
+    tokens name the label (clang-21 -O2 emits `call note`)."""
     facts = facts_of(tmp_path, ASM_LIVE)
     assert "note" in {call["callee"] for call in facts["functions"]["asm_live"]["events"]["calls"]}
+
+
+def test_a_volatile_parameter_keeps_its_reads_at_a_fold(tmp_path: Path) -> None:
+    """A volatile parameter's two reads may differ, so `vol(0)` keeps `warn` (clang-21 -O2 emits it)."""
+    facts = facts_of(tmp_path, ASM_LIVE)
     assert "warn" in {call["callee"] for call in fold(facts, "vol_zero", "vol").calls}
