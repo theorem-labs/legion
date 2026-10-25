@@ -112,7 +112,7 @@ func TestConfigReadsTheIndexItsStateAndItsReaderRole(t *testing.T) {
 	// The target names the file whose lock guards the tree, in the state directory, outside the tree.
 	want := Target{DSN: c.DSN, Index: "machcsl", Reader: "declindex_ro",
 		TreeLock: filepath.Join(resolved(t, filepath.Dir(config)), "state", "tree.lock")}
-	got, err := c.Target()
+	got, err := c.TreeTarget()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,8 +168,12 @@ func TestTargetRefusesAConfigurationWhoseStateCannotBeResolved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Target(); err == nil {
-		t.Fatal("a state directory inside the tree gave a target")
+	if _, err := c.TreeTarget(); err == nil {
+		t.Fatal("a state directory inside the tree gave a target with no lock of the tree")
+	}
+	// A command that reads the index alone needs no tree and no state: it has a target.
+	if got := c.Target(); got.Index != "idx" || got.TreeLock != "" {
+		t.Fatalf("Target() = %+v; want the index alone, with no tree lock", got)
 	}
 }
 

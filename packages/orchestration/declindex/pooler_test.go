@@ -403,3 +403,33 @@ func TestALandingDoesNotSkipAnIndexThatOwesACompiledPart(t *testing.T) {
 		t.Errorf("the index after the landing refresh: %v", err)
 	}
 }
+
+// An owner's pod has the index and no tree: it reads the index alone, so it must not need the configured tree or
+// the state directory to exist on its machine. Only a command that reads or writes the tree (refresh, gate,
+// ledger) resolves the state directory, whose file guards that tree.
+func TestAnIndexOnlyReaderNeedsNoTreeOnItsMachine(t *testing.T) {
+	ctx := context.Background()
+	target := indexTarget(t)
+	s := openAt(t, target)
+	if _, err := s.Refresh(ctx, goldenTree(t), RefreshOptions{Commit: "c0ffee"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The configuration of a pod: the index and its connection string, and a tree that is not on this machine.
+	c := Config{Index: target.Index, DSN: target.DSN, Tree: filepath.Join(t.TempDir(), "no-tree-here"),
+		State: filepath.Join(t.TempDir(), "no-state-here")}
+	r, err := OpenReadOnlyConfig(ctx, c, IndexOnly)
+	if err != nil {
+		t.Fatalf("a reader of the index alone, on a machine without the tree: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+	if found, err := r.Resolve(ctx, "Gold.Frame"); err != nil || len(found) == 0 {
+		t.Fatalf("resolve through an index-only reader: %+v, %v", found, err)
+	}
+	// The same configuration cannot open a reader of the tree: that one needs the tree's lock.
+	if _, err := OpenReadOnlyConfig(ctx, c, IndexAndTree); err == nil {
+		t.Error("a reader of the tree opened on a machine without the tree")
+	}
+}

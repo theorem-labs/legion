@@ -163,14 +163,21 @@ func (c Config) GateRegistryDir() (string, error) {
 // whose lock guards the indexed tree on this machine. The lock file is in the state directory, which is outside
 // the tree; a configuration whose state cannot be resolved names no lock, and a command that writes the tree
 // resolves the state anyway (StateDir).
-func (c Config) Target() (Target, error) {
-	t := Target{DSN: c.DSN, Index: c.Index, Reader: c.Reader}
+func (c Config) Target() Target {
+	return Target{DSN: c.DSN, Index: c.Index, Reader: c.Reader}
+}
+
+// TreeTarget is the index of a command that also reads or writes the indexed tree: the target above, and the file
+// whose lock guards that tree on this machine, in the state directory, which is outside the tree. A state
+// directory this configuration cannot resolve is an error, not a reason to guard the tree with nothing: a refresh
+// under it would check out and build while a gate reads the tree. A command that reads the index alone (a query,
+// land-hash, a pod with no tree) takes Target instead, and needs no tree.
+func (c Config) TreeTarget() (Target, error) {
 	state, err := c.StateDir()
 	if err != nil {
-		// A state directory this configuration cannot resolve is an error, not a reason to guard the tree
-		// with nothing: a refresh under it would check out and build while a gate reads the tree.
 		return Target{}, err
 	}
+	t := c.Target()
 	t.TreeLock = filepath.Join(state, "tree.lock")
 	return t, nil
 }
@@ -274,9 +281,13 @@ var ErrDBRemoved = errors.New("db: was removed: the index is a Postgres schema; 
 // besides the index. A program that only reads the index (graph checks) opens it through this one call, and needs
 // no knowledge of where or how the index is kept.
 func OpenReadOnlyConfig(ctx context.Context, c Config, scope ReadScope) (*Store, error) {
-	t, err := c.Target()
-	if err != nil {
-		return nil, err
+	t := c.Target()
+	if scope == IndexAndTree {
+		// A reader of the tree holds its lock, so its state directory must resolve.
+		var err error
+		if t, err = c.TreeTarget(); err != nil {
+			return nil, err
+		}
 	}
 	switch {
 	case t.Index == "":

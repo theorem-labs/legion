@@ -66,10 +66,7 @@ func (f landingFixture) refreshAt(t *testing.T, commit string) result {
 func assertIndexCommit(t *testing.T, config, want string) {
 	t.Helper()
 	cfg := indexConfig(t, config)
-	tgt, err := cfg.Target()
-	if err != nil {
-		t.Fatal(err)
-	}
+	tgt := cfg.Target()
 	s, err := declindex.Open(context.Background(), tgt)
 	if err != nil {
 		t.Fatal(err)
@@ -148,10 +145,7 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 			t.Fatalf("tree HEAD %s, want landed commit %s", got, f.second)
 		}
 		cfg := indexConfig(t, f.config)
-		tgt, err := cfg.Target()
-		if err != nil {
-			t.Fatal(err)
-		}
+		tgt := cfg.Target()
 		s, err := declindex.Open(context.Background(), tgt)
 		if err != nil {
 			t.Fatal(err)

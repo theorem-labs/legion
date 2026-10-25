@@ -61,7 +61,7 @@ func openFixture(t *testing.T) (cfg declindex.Config, tree string) {
 		t.Fatal(err)
 	}
 	cfg.DSN = indextest.DSN(t)
-	target, err := cfg.Target()
+	target, err := cfg.TreeTarget()
 	if err != nil {
 		t.Fatal(err)
 	}

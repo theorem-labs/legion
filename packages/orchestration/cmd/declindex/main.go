@@ -220,9 +220,19 @@ func indexDSN(file string, getenv func(string) string) (string, error) {
 // target is the index a command opens. A command that opens the index without a schema name or a connection
 // string is a usage error, as a missing db: was before it (P-1).
 func (e *env) target() (declindex.Target, error) {
-	t, err := e.cfg.Target()
-	if err != nil {
-		return declindex.Target{}, &usageError{err.Error()}
+	return e.targetFor(false)
+}
+
+// targetFor is the index a command opens; withTree also names the file whose lock guards the indexed tree, for a
+// command that reads or writes the tree (refresh, gate, ledger). A command that reads the index alone needs no
+// tree on this machine, so it does not resolve the state directory: an owner's pod has the index and no tree.
+func (e *env) targetFor(withTree bool) (declindex.Target, error) {
+	t := e.cfg.Target()
+	if withTree {
+		var err error
+		if t, err = e.cfg.TreeTarget(); err != nil {
+			return declindex.Target{}, &usageError{err.Error()}
+		}
 	}
 	switch {
 	case t.Index == "":
@@ -236,20 +246,22 @@ func (e *env) target() (declindex.Target, error) {
 	return t, nil
 }
 
+// open opens the index to write it: only refresh and the schema rebuild do, and both read and change the tree,
+// so the target names the tree's lock.
 func (e *env) open(ctx context.Context) error {
-	return e.openWith(ctx, false, func(t declindex.Target) (*declindex.Store, error) { return declindex.Open(ctx, t) })
+	return e.openWith(ctx, true, false, func(t declindex.Target) (*declindex.Store, error) { return declindex.Open(ctx, t) })
 }
 
 // openReadOnly opens the index for one snapshot of it, until close, and writes nothing (declindex.OpenReadOnly).
 // scope is what the command reads besides the index.
 func (e *env) openReadOnly(ctx context.Context, scope declindex.ReadScope, needIndex bool) error {
-	return e.openWith(ctx, needIndex, func(t declindex.Target) (*declindex.Store, error) {
+	return e.openWith(ctx, scope == declindex.IndexAndTree, needIndex, func(t declindex.Target) (*declindex.Store, error) {
 		return declindex.OpenReadOnly(ctx, t, scope)
 	})
 }
 
-func (e *env) openWith(ctx context.Context, needIndex bool, open func(declindex.Target) (*declindex.Store, error)) error {
-	t, err := e.target()
+func (e *env) openWith(ctx context.Context, withTree, needIndex bool, open func(declindex.Target) (*declindex.Store, error)) error {
+	t, err := e.targetFor(withTree)
 	if err != nil {
 		return err
 	}

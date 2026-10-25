@@ -106,7 +106,7 @@ func OpenGate(ctx context.Context, cfg declindex.Config, opts Options) (_ *Gate,
 		return nil, err
 	}
 	// The gate also reads the tree: its HEAD, its registry's commit and its build.
-	target, err := cfg.Target()
+	target, err := cfg.TreeTarget()
 	if err != nil {
 		return nil, err
 	}
