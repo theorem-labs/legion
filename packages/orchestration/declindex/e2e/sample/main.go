@@ -98,17 +98,32 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 
 // draw gives the sample: `random` declarations that setseed and random() pick, so that one seed gives one sample
 // of one index, then the `used` declarations that most statements use, each name once and in that order.
+//
+// The whole draw is one read-only transaction that names the index's schema first: the shared server pools
+// transactions on every route, so a startup parameter would be refused, and the seed of setseed, which is a
+// session's, would reach the random() of another backend.
 func draw(ctx context.Context, dsn, schema string, seed float64, random, used int) ([]string, error) {
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
-	cfg.RuntimeParams["search_path"] = pgx.Identifier{schema}.Sanitize()
+	delete(cfg.RuntimeParams, "search_path")
+	if cfg.DefaultQueryExecMode == pgx.QueryExecModeCacheStatement {
+		cfg.DefaultQueryExecMode = pgx.QueryExecModeExec
+	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, "SET LOCAL search_path = "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		return nil, err
+	}
 
 	var names []string
 	seen := map[string]bool{}
@@ -131,11 +146,11 @@ func draw(ctx context.Context, dsn, schema string, seed float64, random, used in
 	}
 
 	if random > 0 {
-		if _, err := conn.Exec(ctx, "SELECT setseed($1)", seed); err != nil {
+		if _, err := tx.Exec(ctx, "SELECT setseed($1)", seed); err != nil {
 			return nil, err
 		}
 		drawn := len(names)
-		if err := add(conn.Query(ctx,
+		if err := add(tx.Query(ctx,
 			`SELECT name FROM (SELECT DISTINCT name FROM decls) d ORDER BY random() LIMIT $1`, random)); err != nil {
 			return nil, err
 		}
@@ -146,7 +161,7 @@ func draw(ctx context.Context, dsn, schema string, seed float64, random, used in
 	if used > 0 {
 		// edges.owner is the declaration that a used constant belongs to, and edges.stmt marks a use in the
 		// user's statement: these are the declarations that most statements use.
-		if err := add(conn.Query(ctx,
+		if err := add(tx.Query(ctx,
 			`SELECT owner FROM edges WHERE stmt AND owner <> '' GROUP BY owner ORDER BY count(*) DESC, owner LIMIT $1`,
 			used)); err != nil {
 			return nil, err
