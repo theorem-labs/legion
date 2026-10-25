@@ -19,44 +19,44 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
-const SchemaVersion = "14"
+const SchemaVersion = "15"
 
-// schema is the index's tables. Every text column that a range scan or an ordered read compares is COLLATE "C":
-// the index's answers order and group names by their bytes, as Lean's own name order does, whatever collation the
-// server's database was created with.
+// schema is the index's tables. Every text column is COLLATE "C": the index's answers order and group names by
+// bytes, as Lean's own name order does, whatever collation the server's database was created with. The hashes,
+// kinds and blobs do not use a range scan now, but have the same collation so any future comparison is byte order.
 const schema = `
-CREATE TABLE meta (k text COLLATE "C" PRIMARY KEY, v text NOT NULL);
-CREATE TABLE sources (path text COLLATE "C" PRIMARY KEY, blob text NOT NULL);
+CREATE TABLE meta (k text COLLATE "C" PRIMARY KEY, v text COLLATE "C" NOT NULL);
+CREATE TABLE sources (path text COLLATE "C" PRIMARY KEY, blob text COLLATE "C" NOT NULL);
 -- One row for each module whose reference file the index read. ilean_key and olean_key identify the build output
 -- it was read from (Lake's content hash, or size and mtime without one).
-CREATE TABLE modules (rel text COLLATE "C" PRIMARY KEY, module text COLLATE "C" NOT NULL, ilean_key text NOT NULL, olean_key text NOT NULL DEFAULT '');
+CREATE TABLE modules (rel text COLLATE "C" PRIMARY KEY, module text COLLATE "C" NOT NULL, ilean_key text COLLATE "C" NOT NULL, olean_key text COLLATE "C" NOT NULL DEFAULT '');
 CREATE INDEX modules_module ON modules (module);
 -- The modules that each module the index read imports directly, from its reference file.
 CREATE TABLE imports (module text COLLATE "C" NOT NULL, imported text COLLATE "C" NOT NULL);
 CREATE INDEX imports_module ON imports (module);
 CREATE INDEX imports_imported ON imports (imported);
 -- A declaration is its module and its name: two modules that are never imported together can declare one name.
-CREATE TABLE decls (name text COLLATE "C" NOT NULL, short text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, kind text NOT NULL, line integer NOT NULL, stmt_hash text NOT NULL);
+CREATE TABLE decls (name text COLLATE "C" NOT NULL, short text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, kind text COLLATE "C" NOT NULL, line integer NOT NULL, stmt_hash text COLLATE "C" NOT NULL);
 CREATE INDEX decls_name ON decls (name);
 CREATE INDEX decls_short ON decls (short);
 CREATE INDEX decls_module ON decls (module);
 -- One use of a constant: target and tmodule are its name and the module that Lean recorded for it; module, line,
 -- col and parent are where the use is.
-CREATE TABLE uses (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, line integer NOT NULL, col integer NOT NULL, parent text COLLATE "C" NOT NULL, cls text NOT NULL);
+CREATE TABLE uses (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, line integer NOT NULL, col integer NOT NULL, parent text COLLATE "C" NOT NULL, cls text COLLATE "C" NOT NULL);
 CREATE INDEX uses_target ON uses (target);
 CREATE INDEX uses_module ON uses (module);
 -- target, tmodule: the used constant as Lean recorded it; dst, module: the user. owner, owner_module: the declaration
 -- that the used constant belongs to (ownerResolver), resolved when the row is written and again when it changes;
 -- by_closure: the index's imports decided that resolution: it went through the import closure of tmodule, or found
 -- no declaration of the constant's names, so that a change of tmodule's closure can move the owner.
-CREATE TABLE edges (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, dst text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, stmt boolean NOT NULL, kind text NOT NULL, owner text COLLATE "C" NOT NULL, owner_module text COLLATE "C" NOT NULL, by_closure boolean NOT NULL);
+CREATE TABLE edges (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, dst text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, stmt boolean NOT NULL, kind text COLLATE "C" NOT NULL, owner text COLLATE "C" NOT NULL, owner_module text COLLATE "C" NOT NULL, by_closure boolean NOT NULL);
 CREATE INDEX edges_module ON edges (module);
 CREATE INDEX edges_owner ON edges (owner_module, owner);
 CREATE INDEX edges_target ON edges (target);
 CREATE INDEX edges_closure ON edges (tmodule) WHERE by_closure;
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated
 -- type as printed, and its compiled statement hash.
-CREATE TABLE consts (name text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, kind text NOT NULL, type text NOT NULL, cstmt text NOT NULL, PRIMARY KEY (name, module));
+CREATE TABLE consts (name text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, kind text COLLATE "C" NOT NULL, type text COLLATE "C" NOT NULL, cstmt text COLLATE "C" NOT NULL, PRIMARY KEY (name, module));
 CREATE INDEX consts_module ON consts (module);
 CREATE INDEX consts_cstmt ON consts (cstmt);
 -- The relation atoms of each constant's statement, by canonical hash: who else states the same fact.
@@ -75,7 +75,7 @@ CREATE INDEX facts_module ON facts (module);
 CREATE TABLE without_forms (module text COLLATE "C" NOT NULL, name text COLLATE "C" NOT NULL, declarer text COLLATE "C" NOT NULL, forms boolean NOT NULL, PRIMARY KEY (module, name, forms, declarer));
 -- Each refresh that moved the index to another commit: landed, the commit it read, and previous, the commit it
 -- replaced ('' for the first). The post-landing registry check of a landing compares those two commits.
-CREATE TABLE landings (landed text COLLATE "C" PRIMARY KEY, previous text NOT NULL);
+CREATE TABLE landings (landed text COLLATE "C" PRIMARY KEY, previous text COLLATE "C" NOT NULL);
 `
 
 // Store is an open index: a pool to the index's database, whose connections resolve every unqualified name in the
@@ -182,9 +182,10 @@ func OpenReadOnly(ctx context.Context, t Target, scope ReadScope) (*Store, error
 	snapshot, err := conn.BeginTx(context.WithoutCancel(ctx), pgx.TxOptions{AccessMode: pgx.ReadOnly, IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		if shared {
-			unlock(ctx, conn, t.Index, false)
+			releaseLock(ctx, conn, t.Index, false)
+		} else {
+			conn.Release()
 		}
-		conn.Release()
 		pool.Close()
 		return nil, fmt.Errorf("open the index %q read-only: %w", t.Index, err)
 	}
@@ -192,9 +193,10 @@ func OpenReadOnly(ctx context.Context, t Target, scope ReadScope) (*Store, error
 	s.release = func() {
 		_ = snapshot.Rollback(context.WithoutCancel(ctx))
 		if shared {
-			unlock(context.WithoutCancel(ctx), conn, t.Index, false)
+			releaseLock(context.WithoutCancel(ctx), conn, t.Index, false)
+		} else {
+			conn.Release()
 		}
-		conn.Release()
 	}
 	version, err := s.schemaVersion(ctx)
 	if err != nil {
@@ -338,8 +340,7 @@ func (s *Store) lockRefresh(ctx context.Context) (func(), error) {
 	s.refresh = conn
 	return func() {
 		s.refresh = nil
-		unlock(ctx, conn, s.index, true)
-		conn.Release()
+		releaseLock(ctx, conn, s.index, true)
 	}, nil
 }
 

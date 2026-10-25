@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -412,4 +413,50 @@ func TestAnUnreachableDatabaseIsReportedAsUnreachable(t *testing.T) {
 	} else if Unreachable(err) {
 		t.Errorf("the missing file %v was reported as an unreachable database, so a command would exit 75, not 3", err)
 	}
+}
+
+// A landing writes no row of a module it did not read, in the compiled tables as in the reference ones. The
+// fixture's compiled part needs the Lean toolchain, so this test runs where the exporter tests do. The rows of
+// the module the landing re-reads, and of the modules a changed definition reaches, are the exceptions the plan
+// allows: this fixture changes nothing, so a second refresh that reads the same build writes nothing at all.
+func TestASecondRefreshWritesNoCompiledRow(t *testing.T) {
+	tree, co := compiledTree(t)
+	ctx := context.Background()
+	s, _ := pgIndex(t)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
+		t.Fatal(err)
+	}
+	before := pgRowVersions(t, s)
+	if len(before) == 0 {
+		t.Fatal("the index holds no compiled row: the test cannot tell")
+	}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: compiledWith(co)}); err != nil {
+		t.Fatal(err)
+	}
+	if after := pgRowVersions(t, s); !slices.Equal(before, after) {
+		t.Errorf("a refresh that re-read nothing rewrote compiled rows.\nbefore:\n%s\nafter:\n%s",
+			strings.Join(before, "\n"), strings.Join(after, "\n"))
+	}
+}
+
+// pgRowVersions gives every row of the compiled tables with the transaction that wrote it, sorted: a row that a
+// refresh rewrites gets another xmin, also when its values do not change.
+func pgRowVersions(t *testing.T, s *Store) []string {
+	t.Helper()
+	var out []string
+	for _, table := range []string{"consts", "atoms", "facts", "without_forms"} {
+		rows, err := s.pool.Query(context.Background(),
+			`SELECT xmin::text, t::text FROM `+table+` t ORDER BY 2`)
+		if err := eachRow(rows, err, func(r pgx.Rows) error {
+			var xmin, row string
+			if err := r.Scan(&xmin, &row); err != nil {
+				return err
+			}
+			out = append(out, table+" "+xmin+" "+row)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return out
 }

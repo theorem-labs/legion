@@ -157,13 +157,30 @@ func lock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool)
 	return nil
 }
 
-// unlock gives back a lock that lock took. A connection that dropped meanwhile has given it up already, so the
-// error is not worth reporting.
-func unlock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool) {
+// unlock gives back a lock that lock took. Postgres returns false when this session did not hold it. A failed
+// unlock leaves the session uncertain, so its caller must close that physical connection instead of returning it
+// to the pool.
+func unlock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool) error {
 	k1, k2 := lockKeys(index)
 	q := `SELECT pg_advisory_unlock_shared($1, $2)`
 	if exclusive {
 		q = `SELECT pg_advisory_unlock($1, $2)`
 	}
-	_, _ = conn.Exec(context.WithoutCancel(ctx), q, k1, k2)
+	var released bool
+	if err := conn.QueryRow(context.WithoutCancel(ctx), q, k1, k2).Scan(&released); err != nil {
+		return fmt.Errorf("release the lock of index %q: %w", index, err)
+	}
+	if !released {
+		return fmt.Errorf("release the lock of index %q: this connection did not hold it", index)
+	}
+	return nil
+}
+
+// releaseLock gives back the lock and returns a clean connection to the pool, or closes a connection whose lock
+// state could not be proved clean. Closing ends the Postgres session, which releases every session advisory lock.
+func releaseLock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool) {
+	if err := unlock(ctx, conn, index, exclusive); err != nil {
+		_ = conn.Conn().Close(context.WithoutCancel(ctx))
+	}
+	conn.Release()
 }
