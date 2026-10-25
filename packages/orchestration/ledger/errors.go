@@ -34,6 +34,8 @@ const (
 	ReasonReadyChanged       = "ready_changed"        // an admitted member was readied again after the caller read it
 	ReasonBatchConflict      = "batch_conflict"       // two members of one batch change, or read and change, one contract
 	ReasonBatchAdmitted      = "batch_admitted"       // an admitted batch relies on the migration or contract
+	ReasonEffectDone         = "effect_done"          // another executor already finished the effect
+	ReasonContractConflict   = "contract_conflict"    // another landing registered the contract with another owner or hash
 	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.
 	ReasonStatementUnreviewed = "statement_unreviewed"
 )

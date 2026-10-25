@@ -49,8 +49,8 @@ func TestResolveBatchCommandLandsAnUnrecordedBatch(t *testing.T) {
 			t.Fatalf("migration %s after resolve-batch: %s at %q", id, state, commit)
 		}
 	}
-	want := []cliEffect{{Key: "hook/batch-1/0/report", Op: "hook", State: "intent", Result: map[string]any{"commit": "merged-9"}}}
-	if effects := cli.effects("batch-1"); !reflect.DeepEqual(effects, want) {
+	want := []cliEffectRow{{Key: "hook/batch-1/0/report", Op: "hook", State: "intent", Result: map[string]any{"commit": "merged-9"}}}
+	if effects := cli.effectRows("batch-1"); !reflect.DeepEqual(effects, want) {
 		t.Fatalf("effects = %+v, want %+v", effects, want)
 	}
 	cli.invoke("contract", "transfer", "r", "C", "alice", "bob")

@@ -13,21 +13,21 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// cliEffect is one effect as the batch_effects table holds it, with its result.
-type cliEffect struct {
+// cliEffectRow is one effect as the batch_effects table holds it, with its result.
+type cliEffectRow struct {
 	Key, Member, Op, State string
 	Result                 map[string]any
 }
 
-// effects reads the effects of batch id, by key, from the table that the landing commands write.
-func (cli batchCLI) effects(id string) []cliEffect {
+// effectRows reads the effects of batch id, by key, from the table that the landing commands write.
+func (cli batchCLI) effectRows(id string) []cliEffectRow {
 	cli.t.Helper()
 	var rows []string
 	cli.queryRows(&rows, `SELECT json_build_object('Key', key, 'Member', member, 'Op', op, 'State', state, 'Result', result)::text
 		FROM batch_effects WHERE repo = 'r' AND batch = $1 ORDER BY key`, id)
-	effects := []cliEffect{}
+	effects := []cliEffectRow{}
 	for _, row := range rows {
-		var effect cliEffect
+		var effect cliEffectRow
 		cli.decode(row, &effect)
 		effects = append(effects, effect)
 	}
@@ -96,8 +96,8 @@ func TestLandBatchCommandLandsTheAdmittedMembers(t *testing.T) {
 	if members := cli.members("batch-1"); !slices.Equal(members, []string{"M-1:false", "M-2:false"}) {
 		t.Fatalf("members after land-batch = %q", members)
 	}
-	want := []cliEffect{{Key: "hook/batch-1/0/report", Op: "hook", State: "intent", Result: map[string]any{"commit": "merged-1"}}}
-	if effects := cli.effects("batch-1"); !reflect.DeepEqual(effects, want) {
+	want := []cliEffectRow{{Key: "hook/batch-1/0/report", Op: "hook", State: "intent", Result: map[string]any{"commit": "merged-1"}}}
+	if effects := cli.effectRows("batch-1"); !reflect.DeepEqual(effects, want) {
 		t.Fatalf("effects = %+v, want %+v", effects, want)
 	}
 	if active := cli.active(); !slices.Equal(active, []string{"batch-1"}) {
@@ -161,7 +161,7 @@ func TestLandBatchCommandSurvivesAKillAfterTheCommit(t *testing.T) {
 
 	var stored cliBatch
 	cli.decode(cli.invoke("batch", "r", "batch-1"), &stored)
-	if stored.Admission != "landed" || stored.MergedCommit != "merged-1" || len(cli.effects("batch-1")) != 1 {
+	if stored.Admission != "landed" || stored.MergedCommit != "merged-1" || len(cli.effectRows("batch-1")) != 1 {
 		t.Fatalf("after the kill the batch is %+v", stored)
 	}
 	events := len(cli.events(""))

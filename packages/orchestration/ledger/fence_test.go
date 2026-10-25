@@ -60,8 +60,8 @@ func (f fenceFixture) land(id string, changes map[string]string) error {
 	return err
 }
 
-// ledgerSnapshot is everything a fenced mutation could change.
-type ledgerSnapshot struct {
+// fenceSnapshot is everything a fenced mutation could change.
+type fenceSnapshot struct {
 	Status    ledger.Status
 	Ready     []ledger.ReadyRecord
 	Contracts []ledger.Contract
@@ -70,10 +70,10 @@ type ledgerSnapshot struct {
 	Events    int
 }
 
-func (f fenceFixture) snapshot(t *testing.T) ledgerSnapshot {
+func (f fenceFixture) snapshot(t *testing.T) fenceSnapshot {
 	t.Helper()
 	ctx := context.Background()
-	return ledgerSnapshot{
+	return fenceSnapshot{
 		Status:    must(f.s.Status(ctx, "r")),
 		Ready:     must(f.s.ReadyMigrations(ctx, "r")),
 		Contracts: must(f.s.Contracts(ctx, "r")),

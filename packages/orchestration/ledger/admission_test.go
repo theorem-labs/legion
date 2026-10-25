@@ -502,7 +502,7 @@ func TestAdmitBatchLandedUnrecordedEnqueuesItsEscalation(t *testing.T) {
 	}
 }
 
-func databaseDeadlocks(t *testing.T, conn *pgx.Conn) int64 {
+func deadlocksNow(t *testing.T, conn *pgx.Conn) int64 {
 	t.Helper()
 	var deadlocks int64
 	if err := conn.QueryRow(context.Background(), `SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()`).
@@ -527,7 +527,7 @@ func TestConcurrentAdmissionsInOppositeOrdersAdmitOne(t *testing.T) {
 	}
 	observer := must(pgx.Connect(ctx, dsn))
 	defer observer.Close(ctx)
-	deadlocksBefore := databaseDeadlocks(t, observer)
+	deadlocksBefore := deadlocksNow(t, observer)
 
 	racers := openStoreWithPool(t, dsn, "admission_race", 2)
 	holder := must(observer.Begin(ctx))
@@ -567,7 +567,7 @@ func TestConcurrentAdmissionsInOppositeOrdersAdmitOne(t *testing.T) {
 		t.Fatalf("neither admission succeeded: %v", results)
 	}
 	wantRefusal(t, results[loser], ledger.ReasonBatchAdmitted)
-	if deadlocks := databaseDeadlocks(t, observer); deadlocks != deadlocksBefore {
+	if deadlocks := deadlocksNow(t, observer); deadlocks != deadlocksBefore {
 		t.Fatalf("the admissions met %d deadlocks", deadlocks-deadlocksBefore)
 	}
 	if admitted := must(s.LoadBatch(ctx, "r", winner)); admitted.Admission != "admitted" || len(batchMembers(t, dsn, winner)) != 2 {
