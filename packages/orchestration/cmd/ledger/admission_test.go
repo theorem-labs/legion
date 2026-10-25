@@ -189,6 +189,21 @@ func TestAdmitBatchCommandRefusesWithNothingRecorded(t *testing.T) {
 				t.Fatalf("refusal %+v, want member %q, other %q and reasons %q", refusal, test.member, test.other, test.kinds)
 			}
 			cli.assertUnchanged(created, events)
+			// Without --json, the refusal on stderr names the member, and for a member that Check refuses, its reasons.
+			code, _, stderr := cli.call("admit-batch", "--request-file", cli.request(admitFields("batch-1", 1, test.members...)))
+			want := []string{"refused (" + test.reason + ")", test.member}
+			if test.kinds != nil {
+				want = append(want, "member "+test.member+": ")
+				for _, kind := range test.kinds {
+					want = append(want, kind+": ")
+				}
+			}
+			for _, part := range want {
+				if code != 1 || !strings.Contains(stderr, part) {
+					t.Fatalf("text refusal: code=%d stderr=%q, want exit 1 with %q", code, stderr, part)
+				}
+			}
+			cli.assertUnchanged(created, events)
 			if members := cli.members("batch-1"); len(members) != 0 {
 				t.Fatalf("a refused admission recorded members %q", members)
 			}

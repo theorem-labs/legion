@@ -6,13 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net/url"
 	"reflect"
 	"slices"
-	"strconv"
+	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -279,7 +277,8 @@ func TestAdmitBatchRefusesAnInBatchContractConflict(t *testing.T) {
 }
 
 // A member that Check refuses is named with every reason Check gives for the same candidate, and the admission records
-// nothing. The refusal's reason is the first of them.
+// nothing. The refusal's reason is the first of them, and its message names the member and every reason, so that the
+// text form tells an operator which member to drop.
 func TestAdmitBatchNamesAMemberThatCheckRefusesWithItsReasons(t *testing.T) {
 	ctx := context.Background()
 	s, dsn := newStoreDSN(t)
@@ -322,6 +321,14 @@ func TestAdmitBatchNamesAMemberThatCheckRefusesWithItsReasons(t *testing.T) {
 			if !slices.Equal(kinds, test.kinds) {
 				t.Fatalf("reasons %q, want %q", kinds, test.kinds)
 			}
+			if !strings.HasPrefix(refusal.Message, "member M-2: ") {
+				t.Fatalf("refusal message %q does not name the member", refusal.Message)
+			}
+			for _, violation := range refusal.Violations {
+				if !strings.Contains(refusal.Message, violation.Kind+": "+violation.Message) {
+					t.Fatalf("refusal message %q does not give %s", refusal.Message, violation.Kind)
+				}
+			}
 		})
 	}
 }
@@ -346,8 +353,9 @@ func TestAdmitBatchComparesTheRecordVersion(t *testing.T) {
 	}
 }
 
-// admissionDigest is the digest the plan defines: SHA-256 over the canonical JSON of the base, the candidate commit and
-// tree, and each member in order with its migration, ready event, sorted changed paths and sorted current hashes.
+// admissionDigest is the digest that AdmitBatch stores: SHA-256 over the canonical JSON of the base, the candidate
+// commit and tree, and each member in order with its migration, ready event, sorted changed paths and sorted current
+// hashes.
 func admissionDigest(t *testing.T, request ledger.AdmitRequest) string {
 	t.Helper()
 	type member struct {
@@ -469,36 +477,28 @@ func TestAdmitBatchSurvivesARestart(t *testing.T) {
 	}
 }
 
-// openStoreAs opens another ledger on dsn whose connections carry application_name and whose pool holds up to size
-// connections.
-func openStoreAs(t *testing.T, dsn, application string, size int) *ledger.Store {
-	t.Helper()
-	named := must(url.Parse(dsn))
-	query := named.Query()
-	query.Set("application_name", application)
-	query.Set("pool_max_conns", strconv.Itoa(size))
-	named.RawQuery = query.Encode()
-	return must(ledger.Open(context.Background(), named.String()))
-}
-
-// waitForNoSessions waits until no database session named application remains. A session that has ended has flushed
-// its statistics, so pg_stat_database counts what it did.
-func waitForNoSessions(t *testing.T, conn *pgx.Conn, application string) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		var n int64
-		if err := conn.QueryRow(context.Background(), `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND application_name = $1`, application).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		if n == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d sessions of %s remain", n, application)
-		}
-		time.Sleep(10 * time.Millisecond)
+// AdmitBatch writes the caller's record, so it too can leave a batch landed_unrecorded. Like every write of a batch
+// row, it then enqueues landing:<id> for the record's escalate_to in its own transaction, and a retry of the same
+// request replays without enqueuing it again.
+func TestAdmitBatchLandedUnrecordedEnqueuesItsEscalation(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	member := readyMember(t, s, "M-1", "alice", "a.lean", nil, nil)
+	createBatch(t, s, "batch-1", batchRecord("checked"))
+	request := admitRequest("batch-1", 1, member)
+	request.Record = unrecordedRecord(escalationOwner)
+	admitted := must(s.AdmitBatch(ctx, request))
+	if admitted.Phase != ledger.PhaseLandedUnrecorded {
+		t.Fatalf("admitted batch = %+v", admitted)
+	}
+	if item := must(s.Item(ctx, "r", "landing:batch-1")); item.Owner != escalationOwner || item.State != "open" {
+		t.Fatalf("escalation item = %+v", item)
+	}
+	if replayed := must(s.AdmitBatch(ctx, request)); !reflect.DeepEqual(replayed, admitted) {
+		t.Fatalf("the retry returned %+v, want the stored %+v", replayed, admitted)
+	}
+	if got := eventKinds(t, s, "landing:batch-1"); !slices.Equal(got, []string{"item.enqueued"}) {
+		t.Fatalf("escalation item events = %q, want one item.enqueued", got)
 	}
 }
 
@@ -529,7 +529,7 @@ func TestConcurrentAdmissionsInOppositeOrdersAdmitOne(t *testing.T) {
 	defer observer.Close(ctx)
 	deadlocksBefore := databaseDeadlocks(t, observer)
 
-	racers := openStoreAs(t, dsn, "admission_race", 2)
+	racers := openStoreWithPool(t, dsn, "admission_race", 2)
 	holder := must(observer.Begin(ctx))
 	must(holder.Exec(ctx, `SELECT 1 FROM repositories WHERE name = 'r' FOR UPDATE`))
 	requests := map[string]ledger.AdmitRequest{
@@ -557,7 +557,7 @@ func TestConcurrentAdmissionsInOppositeOrdersAdmitOne(t *testing.T) {
 	}
 	wait.Wait()
 	racers.Close()
-	waitForNoSessions(t, observer, "admission_race")
+	waitForNoBackends(t, observer, "admission_race")
 
 	winner, loser := "batch-1", "batch-2"
 	if results["batch-1"] != nil {

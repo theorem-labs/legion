@@ -161,7 +161,7 @@ func TestConcurrentCreatesStoreOneBatch(t *testing.T) {
 	ctx := context.Background()
 	_, dsn := newStoreDSN(t)
 	const creators = 8
-	s := openStoreWithPool(t, dsn, creators)
+	s := openStoreWithPool(t, dsn, "batch_creators", creators)
 	conn := must(pgx.Connect(ctx, dsn))
 	defer conn.Close(ctx)
 	holder := must(conn.Begin(ctx))
@@ -356,7 +356,7 @@ func TestConcurrentSavesFromOneVersionCommitOnce(t *testing.T) {
 	ctx := context.Background()
 	_, dsn := newStoreDSN(t)
 	const writers = 12
-	s := openStoreWithPool(t, dsn, writers)
+	s := openStoreWithPool(t, dsn, "batch_writers", writers)
 	created := createBatch(t, s, "batch-1", batchRecord("frozen"))
 	conn := must(pgx.Connect(ctx, dsn))
 	defer conn.Close(ctx)
@@ -398,12 +398,14 @@ func TestConcurrentSavesFromOneVersionCommitOnce(t *testing.T) {
 	}
 }
 
-// openStoreWithPool opens another ledger on dsn whose pool holds up to size connections, so that size calls can each
-// wait on a lock at once, whatever the number of CPUs sets the default pool size to.
-func openStoreWithPool(t *testing.T, dsn string, size int) *ledger.Store {
+// openStoreWithPool opens another ledger on dsn whose connections carry application_name and whose pool holds up to
+// size connections, so that size calls can each wait on a lock at once, whatever the number of CPUs sets the default
+// pool size to. waitForNoBackends finds its sessions by that name.
+func openStoreWithPool(t *testing.T, dsn, application string, size int) *ledger.Store {
 	t.Helper()
 	sized := must(url.Parse(dsn))
 	query := sized.Query()
+	query.Set("application_name", application)
 	query.Set("pool_max_conns", strconv.Itoa(size))
 	sized.RawQuery = query.Encode()
 	s := must(ledger.Open(context.Background(), sized.String()))
@@ -636,21 +638,22 @@ func waitForKill(t *testing.T, child *exec.Cmd) {
 	}
 }
 
-// waitForNoBackends waits until no database session of the killed child remains, so its transaction has ended.
-func waitForNoBackends(t *testing.T, conn *pgx.Conn) {
+// waitForNoBackends waits until no database session named application remains: a killed child's transaction has
+// ended, and a closed store's sessions have flushed their statistics, so pg_stat_database counts what they did.
+func waitForNoBackends(t *testing.T, conn *pgx.Conn, application string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var n int64
 		if err := conn.QueryRow(context.Background(), `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND application_name = 'crash_child'`).Scan(&n); err != nil {
+			WHERE datname = current_database() AND application_name = $1`, application).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d sessions of the killed child remain", n)
+			t.Fatalf("%d sessions of %s remain", n, application)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -725,7 +728,7 @@ func TestSaveBatchLandedUnrecordedKilledBeforeTheCommitLeavesNothing(t *testing.
 	if err := holder.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	waitForNoBackends(t, watcher)
+	waitForNoBackends(t, watcher, "crash_child")
 
 	assertBatchUnchanged(t, s, before, events)
 	var notFound *ledger.NotFoundError

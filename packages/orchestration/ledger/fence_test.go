@@ -2,9 +2,13 @@ package ledger_test
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"slices"
+	"sync"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
@@ -262,6 +266,65 @@ func TestFenceLeavesRetryAndReplaysToTheirOwnRules(t *testing.T) {
 	}
 	if after := f.snapshot(t); !reflect.DeepEqual(after, before) {
 		t.Fatalf("the retry or the replay changed the ledger:\n got %+v\nwant %+v", after, before)
+	}
+}
+
+// A registration of a name and an admission whose member reads that name, started together on two connections: exactly
+// one commits and the other is refused and changes nothing. A registration has no contract row to lock, so only the
+// admission's FOR UPDATE on the repository row, against the registration's FOR SHARE, orders the two. The test holds
+// the repository's event lock, which every call takes after its checks and before it commits, until both calls wait on
+// a lock: so their checks overlap whenever their row locks let them.
+func TestRegistrationRacingAnAdmissionCommitsOne(t *testing.T) {
+	ctx := context.Background()
+	s, dsn := newStoreDSN(t)
+	member := readyMember(t, s, "M-1", "alice", "a.lean", map[string]string{"X": "x1"}, nil)
+	created := createBatch(t, s, "batch-1", batchRecord("checked"))
+
+	racers := openStoreWithPool(t, dsn, "registration_race", 2)
+	holder := must(pgx.Connect(ctx, dsn))
+	defer holder.Close(ctx)
+	must(holder.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended('r', 0))`))
+	var wait sync.WaitGroup
+	var admitErr, registerErr error
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		_, admitErr = racers.AdmitBatch(ctx, admitRequest("batch-1", 1, member))
+	}()
+	go func() {
+		defer wait.Done()
+		_, registerErr = racers.RegisterContract(ctx, "r", "X", "bob", "x9", false)
+	}()
+	watcher := must(pgx.Connect(ctx, dsn))
+	defer watcher.Close(ctx)
+	waitForBlockedConnections(t, watcher, 2)
+	must(holder.Exec(ctx, `SELECT pg_advisory_unlock(hashtextextended('r', 0))`))
+	wait.Wait()
+
+	var refusal *ledger.Refusal
+	switch {
+	case admitErr == nil && registerErr == nil:
+		t.Fatalf("both the admission and the registration committed")
+	case admitErr == nil:
+		if !errors.As(registerErr, &refusal) || refusal.Reason != ledger.ReasonBatchAdmitted {
+			t.Fatalf("the registration after the admission: %v, want batch_admitted", registerErr)
+		}
+		var notFound *ledger.NotFoundError
+		if _, err := s.Contract(ctx, "r", "X"); !errors.As(err, &notFound) {
+			t.Fatalf("the refused registration left contract X: %v", err)
+		}
+	case registerErr == nil:
+		if !errors.As(admitErr, &refusal) || refusal.Reason != ledger.ReasonStaleRead {
+			t.Fatalf("the admission after the registration: %v, want stale_read", admitErr)
+		}
+		if after := must(s.LoadBatch(ctx, "r", "batch-1")); !reflect.DeepEqual(after, created) {
+			t.Fatalf("the refused admission changed the batch: %+v", after)
+		}
+		if members := batchMembers(t, dsn, "batch-1"); len(members) != 0 {
+			t.Fatalf("the refused admission recorded members %+v", members)
+		}
+	default:
+		t.Fatalf("both calls were refused: admission %v, registration %v", admitErr, registerErr)
 	}
 }
 

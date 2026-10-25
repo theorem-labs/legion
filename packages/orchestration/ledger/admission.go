@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -232,6 +234,11 @@ func admitMembers(ctx context.Context, tx pgx.Tx, repository Repository, req Adm
 			if !errors.As(err, &refusal) {
 				return nil, err
 			}
+			reasons := make([]string, len(violations))
+			for k, v := range violations {
+				reasons[k] = fmt.Sprintf("%s: %s", v.Kind, v.Message)
+			}
+			refusal.Message = fmt.Sprintf("member %s: %s", m.ID, strings.Join(reasons, "; "))
 			refusal.Violations = violations
 			return nil, named(refusal)
 		}
