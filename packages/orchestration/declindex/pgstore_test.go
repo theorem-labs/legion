@@ -415,6 +415,50 @@ func TestAnUnreachableDatabaseIsReportedAsUnreachable(t *testing.T) {
 	}
 }
 
+// A refresh holds one connection for its lock and its writes, and reads the index on another, so a pool of one
+// connection would wait for a connection the refresh itself holds. A connection string that asks for one is
+// raised to two.
+func TestARefreshRunsWithAConnectionStringOfOneConnection(t *testing.T) {
+	dsn := indextest.DSN(t) + "&pool_max_conns=1"
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	s, err := Open(ctx, Target{DSN: dsn, Index: "idx"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if _, err := s.Refresh(ctx, pgEmptyTree(t), RefreshOptions{Commit: "c0ffee"}); err != nil {
+		t.Fatalf("refresh with pool_max_conns=1: %v", err)
+	}
+	if _, err := s.Refresh(ctx, pgEmptyTree(t), RefreshOptions{Commit: "beef"}); err != nil {
+		t.Fatalf("second refresh with pool_max_conns=1: %v", err)
+	}
+}
+
+// A session that the server ends under a reader (an idle transaction or session that ran past its timeout, a
+// shutdown, a cancelled session) never answered the question, so the command retries (exit 75) rather than
+// reporting the index unable to answer (exit 3). An answer that says the query is wrong is not that.
+func TestASessionTheServerEndsIsAnUnreachableDatabase(t *testing.T) {
+	for _, c := range []struct {
+		code string
+		want bool
+		what string
+	}{
+		{"25P03", true, "the transaction idled past idle_in_transaction_session_timeout"},
+		{"25P04", true, "the transaction ran past transaction_timeout"},
+		{"57P05", true, "the session idled past idle_session_timeout"},
+		{"57P01", true, "the server shut down"},
+		{"08006", true, "the connection failed"},
+		{"42601", false, "the statement has a syntax error"},
+		{"42P01", false, "the table is not there"},
+	} {
+		err := error(&pgconn.PgError{Code: c.code, Message: c.what, Severity: "FATAL"})
+		if got := Unreachable(err); got != c.want {
+			t.Errorf("SQLSTATE %s (%s): Unreachable %v, want %v", c.code, c.what, got, c.want)
+		}
+	}
+}
+
 // A landing writes no row of a module it did not read, in the compiled tables as in the reference ones. The
 // fixture's compiled part needs the Lean toolchain, so this test runs where the exporter tests do. The rows of
 // the module the landing re-reads, and of the modules a changed definition reaches, are the exceptions the plan

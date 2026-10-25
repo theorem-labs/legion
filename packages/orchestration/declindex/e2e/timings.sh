@@ -233,10 +233,13 @@ bars = {"users": (1.0, 3.0), "where": (1.0, None), "states": (1.0, None), "same"
 order = ["where", "users", "states", "same", "land-hash", "gate", "ledger"]
 
 runs: dict[str, list[float]] = {}
+answers: dict[str, list[float]] = {}
 answered: dict[str, int] = {}
 for line in open(sys.argv[1], encoding="utf-8"):
     label, _name, seconds, status = line.rstrip("\n").split("\t")
     runs.setdefault(label, []).append(float(seconds))
+    if status == "0":
+        answers.setdefault(label, []).append(float(seconds))
     answered[label] = answered.get(label, 0) + (status == "0")
 
 
@@ -264,14 +267,16 @@ for label in order + sorted(set(runs) - set(order)):
 
 failed = False
 for label, (median_bar, p95_bar) in bars.items():
-    values = sorted(runs.get(label, []))
+    # A bar is about how long an answer takes, so only the runs that answered count. A command that failed
+    # returns fast, and counting it would let an unreachable index pass every bar.
+    values = sorted(answers.get(label, []))
+    tried = len(runs.get(label, []))
     if not values:
-        print(f"bar\t{label}\tmedian\t-\t< {median_bar}\tFAIL (no run)")
+        print(f"bar\t{label}\tmedian\t-\t< {median_bar}\tFAIL ({tried} runs, none answered)")
         failed = True
         continue
-    if not answered[label]:
-        # The bar still holds, but the reader must know that it timed refusals: no run of it answered.
-        print(f"note\t{label}\tno run answered, so the bar measured the refusal path")
+    if len(values) < tried:
+        print(f"note\t{label}\t{tried - len(values)} of {tried} runs did not answer and are not in the bar")
     got = median(values)
     ok = got < median_bar
     failed = failed or not ok

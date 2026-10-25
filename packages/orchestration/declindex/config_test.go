@@ -219,6 +219,19 @@ func TestAStateInsideTheTreeIsRefused(t *testing.T) {
 	if _, err := c.StateDir(); err == nil || !strings.Contains(err.Error(), "outside the tree") {
 		t.Fatalf("a state directory that is a symlink into the tree gave %v", err)
 	}
+	// The tree itself is as wrong a place for the exporter's build as a directory inside it.
+	c.State = tree
+	if _, err := c.StateDir(); err == nil || !strings.Contains(err.Error(), "outside the tree") {
+		t.Fatalf("a state directory that is the tree gave %v", err)
+	}
+	treeLink := filepath.Join(filepath.Dir(config), "tree-link")
+	if err := os.Symlink(tree, treeLink); err != nil {
+		t.Fatal(err)
+	}
+	c.State = treeLink
+	if _, err := c.StateDir(); err == nil || !strings.Contains(err.Error(), "outside the tree") {
+		t.Fatalf("a state directory that is a symlink to the tree gave %v", err)
+	}
 }
 
 // The exporter and the forms module of a configuration are below its state directory (P-8).

@@ -100,8 +100,18 @@ func Unreachable(err error) bool {
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		// Class 08 is a connection exception; 57P01 to 57P03 are the server ending or refusing the session.
-		return strings.HasPrefix(pgErr.Code, "08") || pgErr.Code == "57P01" || pgErr.Code == "57P02" || pgErr.Code == "57P03"
+		// Class 08 is a connection exception. The rest are the server ending the session under it: 57P01 to
+		// 57P03 shut down, cancel or refuse it; 25P03 and 25P04 end a transaction that idled or ran too long,
+		// and 57P05 an idle session. Each ends the connection, so the question was never answered.
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"):
+			return true
+		case pgErr.Code == "57P01", pgErr.Code == "57P02", pgErr.Code == "57P03", pgErr.Code == "57P05":
+			return true
+		case pgErr.Code == "25P03", pgErr.Code == "25P04":
+			return true
+		}
+		return false
 	}
 	return false
 }
@@ -131,6 +141,11 @@ func openPool(ctx context.Context, t Target) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("read the index's connection string: %w", err)
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{t.Index}.Sanitize()
+	// A refresh holds one connection for its whole run, for its advisory lock and its writes, and reads the
+	// index on another. A pool of one would deadlock: the refresh would wait for a connection it holds itself.
+	if cfg.MaxConns < 2 {
+		cfg.MaxConns = 2
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to the index %q: %w", t.Index, err)

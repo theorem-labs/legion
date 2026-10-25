@@ -190,7 +190,10 @@ func (c Config) StateDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if isInside(tree, state) {
+	// The state holds the exporter's build and the forms module, which a gate writes: the tree itself is as
+	// wrong a place for them as a directory inside it, so equality is refused too (isInside allows it, which
+	// the registry, a strict subdirectory of the tree, relies on).
+	if state == tree || isInside(tree, state) {
 		return "", fmt.Errorf("the index state %s must be outside the tree %s", state, tree)
 	}
 	return state, nil

@@ -19,7 +19,7 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
-const SchemaVersion = "15"
+const SchemaVersion = "16"
 
 // schema is the index's tables. Every text column is COLLATE "C": the index's answers order and group names by
 // bytes, as Lean's own name order does, whatever collation the server's database was created with. The hashes,
@@ -51,7 +51,10 @@ CREATE INDEX uses_module ON uses (module);
 -- no declaration of the constant's names, so that a change of tmodule's closure can move the owner.
 CREATE TABLE edges (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, dst text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, stmt boolean NOT NULL, kind text COLLATE "C" NOT NULL, owner text COLLATE "C" NOT NULL, owner_module text COLLATE "C" NOT NULL, by_closure boolean NOT NULL);
 CREATE INDEX edges_module ON edges (module);
-CREATE INDEX edges_owner ON edges (owner_module, owner);
+-- edges_owner carries every column the reach walk reads, so that the walk of a declaration that a large part of
+-- the tree uses reads the index alone: it visits a row for each edge out of its closure, and the heap of this
+-- table is 1.1 GB for the copy's 5.0 million edges.
+CREATE INDEX edges_owner ON edges (owner_module, owner) INCLUDE (dst, module, stmt, kind);
 CREATE INDEX edges_target ON edges (target);
 CREATE INDEX edges_closure ON edges (tmodule) WHERE by_closure;
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated
