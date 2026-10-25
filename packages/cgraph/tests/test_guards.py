@@ -1564,3 +1564,89 @@ def test_a_volatile_parameter_keeps_its_reads_at_a_fold(tmp_path: Path) -> None:
     """A volatile parameter's two reads may differ, so `vol(0)` keeps `warn` (clang-21 -O2 emits it)."""
     facts = facts_of(tmp_path, ASM_LIVE)
     assert "warn" in {call["callee"] for call in fold(facts, "vol_zero", "vol").calls}
+
+
+CONVERTED_CONSTANTS = """
+    void unsigned_constant(long n) { long x; x = n; if (x == (unsigned int)-1) { if (x > 0) warn(); } kept(); }
+    void signed_constant(long n) { long x; x = n; if (x == (int)0xffffffffu) { if (x < 0) warn(); } kept(); }
+    void sign_flip(int n) { int x; x = n; if ((unsigned int)x == 4294967295u) { if (x < 0) warn(); } kept(); }
+    void wide_kept(int n) { int x; x = n; if ((long)x == 5) { if (x != 5) warn(); } kept(); }
+    static inline void bypass(int x)
+    {
+        asm goto("j %l0" :::: hit);
+        if (x)
+            return;
+    hit:
+        warn();
+    }
+    void bypass_one(void) { bypass(1); }
+"""
+
+
+@pytest.mark.parametrize("function", ["unsigned_constant", "signed_constant", "sign_flip"])
+def test_a_branch_value_keeps_the_conversions_of_both_operands(tmp_path: Path, function: str) -> None:
+    """`x == (unsigned int)-1` holds for x = 4294967295, `x == (int)0xffffffffu` for x = -1, and
+    `(unsigned int)x == 4294967295u` for x = -1, so each `warn()` stays (clang-21 -O2 emits `tail
+    warn`); `(long)x == 5` keeps x's value, so x is 5 there."""
+    facts = facts_of(tmp_path, CONVERTED_CONSTANTS)
+    assert "warn" in {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+    assert "warn" not in {call["callee"] for call in facts["functions"]["wide_kept"]["events"]["calls"]}
+
+
+def test_an_asm_goto_s_way_into_its_label_is_under_no_guard_it_skips(tmp_path: Path) -> None:
+    """`asm goto("j %l0" :::: hit)` jumps past `if (x) return;`, so `bypass(1)` reaches warn()."""
+    facts = facts_of(tmp_path, CONVERTED_CONSTANTS)
+    assert "warn" in {call["callee"] for call in fold(facts, "bypass_one", "bypass").calls}
+
+
+MORE_VOLATILE = """
+    static inline int fetch(int flag)
+    {
+        if (flag)
+            goto err;
+        asm goto("" :::: err);
+        return 0;
+    err:
+        warn();
+        return -1;
+    }
+    int fetch_zero(void) { return fetch(0); }
+    void vol_init(void) { volatile int x = 0; if (x) warn(); kept(); }
+    void vol_store(void) { volatile int x; x = 0; if (x) warn(); kept(); }
+    static inline int ret_vol(void) { volatile int x = 0; return x; }
+    void vol_helper(void) { if (ret_vol()) warn(); kept(); }
+    extern int counter;
+    void note_value(int v);
+    void asm_back(void)
+    {
+        int x = 0;
+    again:
+        note_value(x);
+        x = counter;
+        asm goto("" :::: again);
+        kept();
+    }
+"""
+
+
+def test_an_asm_goto_way_reaches_a_label_a_guarded_goto_also_reaches(tmp_path: Path) -> None:
+    """`if (flag) goto err; asm goto("" :::: err);`: fetch(0) still reaches err through the asm, so
+    warn() is compiled (clang-21 -O2 emits it as the asm's indirect target)."""
+    facts = facts_of(tmp_path, MORE_VOLATILE)
+    assert "warn" in {call["callee"] for call in fold(facts, "fetch_zero", "fetch").calls}
+
+
+def test_an_asm_goto_to_an_earlier_label_jumps_back(tmp_path: Path) -> None:
+    """`again: note_value(x); x = counter; asm goto("" :::: again);`: the second pass reads the store, so
+    its read of `counter` is compiled."""
+    facts = facts_of(tmp_path, MORE_VOLATILE)
+    accesses = facts["functions"]["asm_back"]["events"]["accesses"]
+    assert "counter" in {item["unit"]["name"] for item in accesses if item["unit"]["kind"] == "global"}
+
+
+@pytest.mark.parametrize("function", ["vol_init", "vol_store", "vol_helper"])
+def test_a_volatile_local_is_read_each_time(tmp_path: Path, function: str) -> None:
+    """A volatile local's read may give any value, so `if (x) warn();` is compiled after `x = 0` (clang-21
+    -O2: sw zero; lw; beqz; call warn), also through an inline helper that returns it."""
+    facts = facts_of(tmp_path, MORE_VOLATILE)
+    assert "warn" in {call["callee"] for call in facts["functions"][function]["events"]["calls"]}

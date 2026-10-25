@@ -1583,9 +1583,10 @@ def _ruled_out(way: list[dict[str, Any]], values: list[dict[str, Any] | None]) -
 
 
 def _kept_value(node: ci.Cursor) -> ci.Cursor | None:
-    """The expression under conversions that keep every integer value: the same type, or an integer
-    type at least as wide that is not _Bool. ``(long)x`` is ``x``; ``(unsigned char)x``, ``(_Bool)x``
-    and a float round trip are not, and yield None."""
+    """The expression under conversions that keep every integer value: the same type, an integer type
+    of the same signedness at least as wide, or a signed one wider than an unsigned one, never _Bool.
+    ``(long)x`` is ``x``; ``(unsigned char)x``, ``(unsigned int)x`` of an int, ``(_Bool)x`` and a float
+    round trip are not, and yield None."""
     inner = _strip_parens(node)
     while inner.kind in (K.UNEXPOSED_EXPR, K.CSTYLE_CAST_EXPR):
         below = _operand(inner)
@@ -1594,7 +1595,11 @@ def _kept_value(node: ci.Cursor) -> ci.Cursor | None:
         below = _strip_parens(below)
         if inner.type.get_canonical().spelling != below.type.get_canonical().spelling:
             outer, under = _integer_type(inner.type), _integer_type(below.type)
-            if outer is None or under is None or outer.get("b") or outer["w"] < under["w"]:
+            if outer is None or under is None or outer.get("b"):
+                return None
+            same_sign = bool(outer["s"]) == bool(under["s"]) and outer["w"] >= under["w"]
+            widened = outer["s"] and not under["s"] and outer["w"] > under["w"]
+            if not (same_sign or widened):
                 return None
         inner = below
     return inner
@@ -2405,8 +2410,10 @@ class _Evaluator:
     def local(self, variable: ci.Cursor, depth: int) -> int | None:
         """A local's value when every value stored in it (its initializer and each plain assignment)
         evaluates to one value, and nothing else writes it or takes its address. A read before every
-        store reads an indeterminate value, so the stores decide."""
+        store reads an indeterminate value, so the stores decide. A volatile one has no value."""
         key = variable.hash
+        if variable.type.is_volatile_qualified():
+            return None
         if key in self.locals:
             return self.locals[key]
         self.locals[key] = None
@@ -2865,6 +2872,9 @@ class _Evaluator:
             function = variable.semantic_parent
             if key in holding or depth > _EXPRESSION_DEPTH or function is None or function.kind != K.FUNCTION_DECL:
                 return None
+            if variable.type.is_volatile_qualified():
+                # Each read of a volatile variable may give another value.
+                return None
             first: dict[str, Any] | None = None
             if variable.kind == K.PARM_DECL:
                 if key not in positions:
@@ -2892,6 +2902,8 @@ class _Evaluator:
         combined = writes.combined.get(key, [])
         typed = _integer_type(variable.type)
         if key in writes.opaque or len(combined) > _COMBINED_LIMIT or (combined and typed is None):
+            return None
+        if variable.type.is_volatile_qualified():
             return None
         sources: list[dict[str, Any] | None] = [first] if first is not None else []
         initializer = libclang.var_initializer(variable) if variable.kind == K.VAR_DECL else None
@@ -3678,10 +3690,10 @@ class _FunctionWalk:
         if node.kind == K.BINARY_OPERATOR and len(operands) == 2 and libclang.binary_kind(node) in _EQUALITY:
             # The condition is v == c (or v != c): equal where it holds.
             equal = libclang.binary_kind(node) == _EQUALITY[0]
-            left, right = (_kept_value(operand) for operand in operands)
+            kept = [_kept_value(operand) for operand in operands]
             mine = [
-                side
-                for side in (left, right)
+                at
+                for at, side in enumerate(kept)
                 if side is not None
                 and side.kind == K.DECL_REF_EXPR
                 and side.referenced is not None
@@ -3689,9 +3701,9 @@ class _FunctionWalk:
             ]
             if len(mine) != 1:
                 return None
-            other = right if mine[0] is left else left
-            if other is None:
-                return None
+            # The other operand as the comparison converts it (x == (unsigned int)-1 compares with
+            # 4294967295 where x is a long): its value in the comparison's type, which x's value keeps.
+            other = operands[1 - mine[0]]
             constant = 0 if _is_null(other) else self.x.evaluator.evaluate(other)
         elif node.kind == K.DECL_REF_EXPR and node.referenced is not None and node.referenced.hash == variable.hash:
             equal = False  # a bare v holds where v != 0
@@ -5653,14 +5665,17 @@ class _FunctionWalk:
                 # A goto in code, a label whose address is taken (&&label), or an asm goto: the label
                 # is code. libclang shows an asm goto's labels only as its tokens.
                 self.goto_targets.update(child.spelling for child in children if child.kind == K.LABEL_REF)
-                if kind == K.ASM_STMT:
-                    self.goto_targets.update(self.asm_labels(node))
                 way = (
                     None if self.conditional or kind != K.GOTO_STMT else [self.guard_table[i] for i in self.guard_stack]
                 )
                 for child in children:
                     if child.kind == K.LABEL_REF:
                         self.goto_guards[child.spelling].append(way)
+                if kind == K.ASM_STMT:
+                    # An asm goto's way into its labels: under no guard the code can state.
+                    for label in self.asm_labels(node):
+                        self.goto_targets.add(label)
+                        self.goto_guards[label].append(None)
             elif kind == K.DECL_REF_EXPR and _is_local(node.referenced) and node.hash not in self.stores:
                 if self.conditional or node.referenced.hash in self.self_stored:
                     self.decided_reads[node.referenced.hash] += 1
