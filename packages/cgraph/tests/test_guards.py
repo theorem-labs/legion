@@ -1666,6 +1666,13 @@ def test_an_asm_goto_back_to_a_guarded_label_reaches_it(tmp_path: Path) -> None:
     assert "warn" in {call["callee"] for call in fold(facts, "back_one", "back").calls}
 
 
+def test_a_loop_whose_counter_is_volatile_is_entered(tmp_path: Path) -> None:
+    """`volatile int i; for (i = 8; i < 8; i++) warn();`: the condition reads i again, so the body is
+    compiled (clang-21 -O2: sw; lw; bge; call warn)."""
+    facts = facts_of(tmp_path, "void counted(void) { volatile int i; for (i = 8; i < 8; i++) warn(); kept(); }")
+    assert "warn" in {call["callee"] for call in facts["functions"]["counted"]["events"]["calls"]}
+
+
 @pytest.mark.parametrize("function", ["vol_init", "vol_store", "vol_helper"])
 def test_a_volatile_local_is_read_each_time(tmp_path: Path, function: str) -> None:
     """A volatile local's read may give any value, so `if (x) warn();` is compiled after `x = 0` (clang-21

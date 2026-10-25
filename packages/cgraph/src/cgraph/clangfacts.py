@@ -3991,6 +3991,9 @@ class _FunctionWalk:
             return False
 
         def entry(variable: ci.Cursor, reference: ci.Cursor, depth: int) -> dict[str, Any] | None:
+            if variable.type.is_volatile_qualified():
+                # `volatile int i; for (i = 8; i < 8; …)`: the condition reads i again.
+                return None
             if variable.hash in firsts:
                 return self.x.evaluator.expression(firsts[variable.hash], self.flowed, depth + 1)
             return self.flowed(variable, reference, depth)
