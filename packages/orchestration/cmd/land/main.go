@@ -589,7 +589,7 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 	// The trees are scanned first: their candidate names the generated
 	// instance names that no declaration may keep, and each member's
 	// evidence must use the same set as the trees.
-	lines, ambiguous, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
+	lines, ambiguous, _, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
 	if err != nil {
 		return err
 	}
@@ -672,16 +672,17 @@ func collectEvidence(ctx context.Context, repository, base string, members []bla
 // collectTreeLines groups, by each name the report mentions, the declarations
 // of the base and candidate trees that carry it. It also returns the round's
 // ambiguous generated instance names, which it has resolved in both trees and
-// which every scan of the round must use.
-func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, blame.InstanceNames, error) {
+// which every scan of the round must use, and the qualified names of the
+// fields that a structure or class of either tree declares.
+func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, blame.InstanceNames, map[string]struct{}, error) {
 	git := landing.RepositoryGit{}
 	baseDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(base))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read declarations at base: %w", err)
+		return nil, nil, nil, fmt.Errorf("read declarations at base: %w", err)
 	}
 	candidateDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(candidate))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
+		return nil, nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
 	}
 	ambiguous := blame.AmbiguousInstanceNames(candidateDeclarations)
 	blame.ResolveInstanceNames(candidateDeclarations, ambiguous)
@@ -699,7 +700,15 @@ func collectTreeLines(ctx context.Context, repository string, base, candidate bl
 			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}
 	}
-	return declarations, ambiguous, nil
+	fields := make(map[string]struct{})
+	for _, tree := range [][]blame.Declaration{baseDeclarations, candidateDeclarations} {
+		for _, declaration := range tree {
+			for _, field := range declaration.Fields {
+				fields[declaration.Name+"."+field] = struct{}{}
+			}
+		}
+	}
+	return declarations, ambiguous, fields, nil
 }
 
 func confirmAttributions(ctx context.Context, repository, base string, members []blame.Member, modules []string, attributions []blame.Attribution, command string) ([]blame.Attribution, error) {
