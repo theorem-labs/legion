@@ -266,8 +266,8 @@ jobs:
         run: .github/scripts/tests-scope-action.test.sh
 
       # No step gated on `other` compiles or reads a file of packages/orchestration but its go.mod
-      # and go.sum, which select `other` themselves; the two gated tests that do scan the whole
-      # tree are covered by the lint job's own run of the same checkers
+      # and go.sum, which select `other` themselves; the one gated test that does scan the whole
+      # tree (check-plugin-names.test.sh) is covered by the lint job's own run of the same checker
       # (.github/scripts/tests-scope.sh says how).
       - name: Setup Bun
         if: steps.scope.outputs.other == 'true'
