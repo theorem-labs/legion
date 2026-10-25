@@ -197,28 +197,31 @@ type Finding struct {
 	Kind        blame.Kind `json:"kind,omitempty"`
 	Line        int        `json:"line,omitempty"`
 	Col         int        `json:"col,omitempty"`
+	Note        string     `json:"note,omitempty"` // an unattributed finding: why SelectFor named nobody ("no evidence" or Pick's note)
 }
 
 // Refusal is one member a check returns, with the finding and evidence.
 type Refusal struct {
-	Member      string `json:"member"`
-	Declaration string `json:"declaration,omitempty"`
-	Path        string `json:"path"`
-	Line        int    `json:"line,omitempty"`
-	Strength    int    `json:"strength,omitempty"`
-	Evidence    string `json:"evidence,omitempty"`
-	Reason      string `json:"reason"`
+	Member      string     `json:"member"`
+	Declaration string     `json:"declaration,omitempty"`
+	Kind        blame.Kind `json:"kind,omitempty"`
+	Path        string     `json:"path"`
+	Line        int        `json:"line,omitempty"`
+	Strength    int        `json:"strength,omitempty"`
+	Evidence    string     `json:"evidence,omitempty"`
+	Reason      string     `json:"reason"`
 }
 
 // Flag is one flagged finding attributed to one member. A flag returns no
 // member; it is carried in the receipt and the member's landing event.
 type Flag struct {
-	Check       string `json:"check"`
-	Member      string `json:"member"`
-	Declaration string `json:"declaration"`
-	Path        string `json:"path"`
-	Line        int    `json:"line"`
-	Reason      string `json:"reason"`
+	Check       string     `json:"check"`
+	Member      string     `json:"member"`
+	Declaration string     `json:"declaration"`
+	Kind        blame.Kind `json:"kind,omitempty"`
+	Path        string     `json:"path"`
+	Line        int        `json:"line"`
+	Reason      string     `json:"reason"`
 }
 
 // CheckUnableError is a check that could not decide (a graph check's exit
@@ -1164,18 +1167,19 @@ func (r Runner) evaluateChecks(ctx context.Context, batch *Batch, every bool) ([
 				if note == "" {
 					note = "no evidence"
 				}
+				finding.Note = note
 				verdict.Unattributed = append(verdict.Unattributed, finding)
 				unattributed = append(unattributed, fmt.Sprintf("%s at %s:%d: %s", finding.Declaration, finding.Path, finding.Line, note))
 				continue
 			}
 			for _, row := range selection.Members {
 				if finding.Verdict == VerdictFlag {
-					verdict.Flags = append(verdict.Flags, Flag{Check: name, Member: row.Member, Declaration: finding.Declaration, Path: finding.Path, Line: finding.Line, Reason: finding.Reason})
+					verdict.Flags = append(verdict.Flags, Flag{Check: name, Member: row.Member, Declaration: finding.Declaration, Kind: finding.Kind, Path: finding.Path, Line: finding.Line, Reason: finding.Reason})
 					continue
 				}
 				rule, _, _ := strings.Cut(finding.Reason, ":")
 				addCulprit(checkCulprits, row.Member, fmt.Sprintf("check %s: %s %s (%s)", name, rule, finding.Declaration, row.Label))
-				verdict.Refused = append(verdict.Refused, Refusal{Member: row.Member, Declaration: finding.Declaration, Path: finding.Path, Line: finding.Line, Strength: row.Strength, Evidence: row.Label, Reason: finding.Reason})
+				verdict.Refused = append(verdict.Refused, Refusal{Member: row.Member, Declaration: finding.Declaration, Kind: finding.Kind, Path: finding.Path, Line: finding.Line, Strength: row.Strength, Evidence: row.Label, Reason: finding.Reason})
 			}
 		}
 		switch {

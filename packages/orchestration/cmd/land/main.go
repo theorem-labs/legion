@@ -42,13 +42,15 @@ func (e usageError) Unwrap() error { return e.error }
 
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return usageError{fmt.Errorf("usage: land <run|serve|status|blame|check>")}
+		return usageError{fmt.Errorf("usage: land <run|serve|status|blame|check|replay>")}
 	}
 	switch args[0] {
 	case "blame":
 		return runBlame(ctx, args[1:], output)
 	case "check":
 		return runCheck(ctx, args[1:], output)
+	case "replay":
+		return runReplayCommand(ctx, args[1:], output)
 	case "run", "serve", "status":
 		return runBatchCommand(ctx, args[0], args[1:], output)
 	default:

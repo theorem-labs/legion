@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -52,10 +53,12 @@ type Name struct {
 	Kind  Kind
 }
 
-// Block is one diagnostic block associated with a module.
+// Block is one diagnostic block associated with a module. Line is the
+// 1-based line of Path that the error names.
 type Block struct {
 	Module  string
 	Path    string
+	Line    int
 	Message string
 }
 
@@ -67,7 +70,7 @@ type Report struct {
 
 var (
 	buildingRE     = regexp.MustCompile(`^✖ \[[0-9]+/[0-9]+\] (?:Building|Running|Compiling) (\S+)`)
-	errorRE        = regexp.MustCompile(`^error: (?:\./)?([^:\s]+\.lean):[0-9]+:[0-9]+: ?(.*)$`)
+	errorRE        = regexp.MustCompile(`^error: (?:\./)?([^:\s]+\.lean):([0-9]+):[0-9]+: ?(.*)$`)
 	importRE       = regexp.MustCompile(`\bimport (\S+) failed`)
 	blockEndRE     = regexp.MustCompile(`^(?:error:|warning:|info:|trace:|✔|✖|⚠|\[|-- build round|Build completed|Some required|Some builds)`)
 	identifier     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.'!?-]*$`)
@@ -126,11 +129,12 @@ func Parse(log string, roots []string) Report {
 			flush()
 			module := moduleOfPath(match[1])
 			addRed(module)
-			for _, importMatch := range importRE.FindAllStringSubmatch(match[2], -1) {
+			for _, importMatch := range importRE.FindAllStringSubmatch(match[3], -1) {
 				addRed(importMatch[1])
 			}
 			if underRoots(module, rootSet) {
-				current = &Block{Module: module, Path: match[1], Message: match[2]}
+				line, _ := strconv.Atoi(match[2])
+				current = &Block{Module: module, Path: match[1], Line: line, Message: match[3]}
 			}
 			continue
 		}

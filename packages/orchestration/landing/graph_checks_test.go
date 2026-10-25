@@ -119,7 +119,7 @@ func TestGraphCheckRefusalListsTheMemberAndItsEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Refusal{{Member: "culprit", Declaration: "Lib.helper", Path: "Lib/Use.lean", Line: 4, Strength: 3, Evidence: "privatised",
+	want := []Refusal{{Member: "culprit", Declaration: "Lib.helper", Kind: blame.Unknown, Path: "Lib/Use.lean", Line: 4, Strength: 3, Evidence: "privatised",
 		Reason: "N1: Lib/Core.lean no longer declares Lib.helper publicly"}}
 	if len(verdicts) != 1 || verdicts[0].Verdict != "fail" || !reflect.DeepEqual(verdicts[0].Refused, want) {
 		t.Fatalf("verdicts = %+v", verdicts)
@@ -144,7 +144,7 @@ func TestGraphCheckFlagsReturnNoMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := checkVerdict(batch, "statements")
-	want := []Flag{{Check: "statements", Member: "editor", Declaration: "Lib.size", Path: "Lib/Use.lean", Line: 9,
+	want := []Flag{{Check: "statements", Member: "editor", Declaration: "Lib.size", Kind: blame.Changed, Path: "Lib/Use.lean", Line: 9,
 		Reason: "S1: the statement of Lib.size changed in Lib/Core.lean"}}
 	if len(batch.Dropped) != 0 || len(ledger.returned) != 0 || v.Verdict != "flag" || !reflect.DeepEqual(v.Flags, want) || len(builder.trees) != 1 {
 		t.Fatalf("dropped %v, verdict %+v, builds %d", batch.Dropped, v, len(builder.trees))
