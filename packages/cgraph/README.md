@@ -59,8 +59,12 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   at the top of the loop), a store from which control reaches no read (`transport_add_class_device`'s
   `error = sysfs_create_group(...)`, read only past `return 0;` at a label only an earlier goto
   reaches; a constant condition without a call reads no local, and an `if` whose branches hold only
-  such stores and conditions the walk decides has no effect), and arguments to a parameter the callee
-  never reads in compiled code),
+  such stores and conditions the walk decides has no effect), a store of what the lvalue holds already
+  (`L = E`, where `E` is `L` itself, an inline helper that returns its parameter given it, or a local
+  nothing writes but its initializer, `L` again, with nothing between that may change `L`:
+  `hide_si_addr_tag_bits`' `arch_untagged_si_addr`, `io_remap_pfn_range_prepare`'s `orig_pfn`), and
+  a switch whose condition and cases have no effect besides such stores, and arguments to a parameter
+  the callee never reads in compiled code),
   of which only the parts with an effect are code (`psi_sched_switch(..., !task_on_rq_queued(prev)
   || p->x)` keeps the `READ_ONCE` and drops the read of `p->x`; the last statement of `({ ... })` is
   its value). The initializer of a static local is data, an edge of that local in

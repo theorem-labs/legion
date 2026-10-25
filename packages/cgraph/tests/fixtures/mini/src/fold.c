@@ -851,3 +851,75 @@ err_remove:
 		t->remove(b);
 	return error;
 }
+
+/* kernel/signal.c hide_si_addr_tag_bits: switch (siginfo_layout(ksig->sig, ksig->info.si_code)) { case
+ * SIL_FAULT...: ksig->info.si_addr = arch_untagged_si_addr(ksig->info.si_addr, ...); break; ... },
+ * where riscv's arch_untagged_si_addr returns addr: the store keeps what is there, so the switch and
+ * siginfo_layout's table read are not code (llvm-objdump: ret). */
+struct fd_siginfo {
+	int code;
+	union {
+		void *addr;
+		long band;
+	};
+};
+struct fd_ksig {
+	int sig;
+	struct fd_siginfo info;
+};
+
+static inline void *fd_untagged(void *addr, unsigned long sig)
+{
+	return addr;
+}
+
+static inline int fd_layout(int sig, int code)
+{
+	return code > 0 && code < 4 ? code - 1 : sig;
+}
+
+void fd_hide_tag(struct fd_ksig *k)
+{
+	switch (fd_layout(k->sig, k->info.code)) {
+	case 1:
+		k->info.addr = fd_untagged(k->info.addr, k->sig);
+		break;
+	default:
+		break;
+	}
+}
+
+/* mm/internal.h io_remap_pfn_range_prepare: orig_pfn = action->remap.start_pfn; ...;
+ * action->remap.start_pfn = io_remap_pfn_range_pfn(orig_pfn, size), which returns its pfn: the
+ * store keeps what is there (llvm-objdump: tail obj_free, no load of pfn or prot). */
+struct fd_remap {
+	unsigned long pfn;
+	unsigned long size;
+	unsigned long prot;
+};
+
+static inline unsigned long fd_remap_pfn(unsigned long pfn, unsigned long size)
+{
+	return pfn;
+}
+
+void fd_remap_prepare(struct fd_remap *r)
+{
+	const unsigned long orig_pfn = r->pfn;
+	const unsigned long orig_prot = r->prot;
+	const unsigned long pfn = fd_remap_pfn(orig_pfn, r->size);
+
+	r->pfn = pfn;
+	r->prot = (orig_prot);
+	obj_free(r);
+}
+
+/* The same where a store between changes the field: the stores are code. */
+void fd_remap_changed(struct fd_remap *r)
+{
+	const unsigned long orig_pfn = r->pfn;
+
+	r->pfn = 0;
+	obj_free(r);
+	r->pfn = fd_remap_pfn(orig_pfn, r->size);
+}

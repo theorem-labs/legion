@@ -478,6 +478,7 @@ class _Extractor:
         self.returned_bits: dict[str, int | None] = {}
         self.cancel_cache: dict[tuple[str, int, int], bool] = {}
         self.stored_cache: dict[str, tuple[frozenset[int], dict[int, frozenset[int]]]] = {}
+        self.returned_parameters: dict[str, int | None] = {}  # the parameter each helper returns unchanged
         self.null_helpers: set[str] = set()  # the helpers whose every return is a null pointer
         self.nullable_helpers: set[str] = set()  # the helpers that return a null pointer or an address
         self.texts: dict[Path, bytes] = {}
@@ -975,6 +976,30 @@ class _Extractor:
             }
         canonical = self.typedefs.get(base)
         return _normal_type(canonical + "*" * stars) if canonical is not None else name
+
+    def returned_parameter(self, callee: ci.Cursor | None) -> int | None:
+        """The parameter an inline function without effect returns unchanged on every return (riscv's
+        arch_untagged_si_addr: ``return addr;``), by position, or None."""
+        if callee is None or callee.kind != K.FUNCTION_DECL or not self.inline_function(callee.spelling):
+            return None
+        name = callee.spelling
+        if name in self.returned_parameters:
+            return self.returned_parameters[name]
+        self.returned_parameters[name] = None
+        definition = self.evaluator.definitions.get(name)
+        if definition is None or self.is_weak(definition) or not self.function_effect_free(name):
+            return None
+        positions = {parameter.hash: index for index, parameter in enumerate(definition.get_arguments() or [])}
+        found: set[int | None] = set()
+        for node in definition.walk_preorder():
+            if node.kind == K.RETURN_STMT:
+                values = _children(node)
+                returned = _bare(values[0]) if values else None
+                referenced = returned.referenced if returned is not None and returned.kind == K.DECL_REF_EXPR else None
+                found.add(positions.get(referenced.hash) if referenced is not None else None)
+        position = found.pop() if len(found) == 1 else None
+        self.returned_parameters[name] = position
+        return position
 
     def ignored_parameters(self, callee: ci.Cursor | None) -> frozenset[int]:
         """The parameters a function of the unit never reads in code that is compiled, by position:
@@ -2027,6 +2052,18 @@ def _jumps_out(node: ci.Cursor, enclosing: int, live: _Live | None = None) -> bo
     if live is not None:
         children = live(node, children)
     return any(_jumps_out(child, inner, live) for child in children)
+
+
+def _leaves_switch(node: ci.Cursor, loops: int, live: _Live) -> bool:
+    """Control may leave a switch's body ``node`` other than by its end or a break of that switch: a
+    return, a goto, a label, or a continue no loop inside takes."""
+    kind = node.kind
+    if kind in (K.RETURN_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT, K.LABEL_STMT) or (
+        kind == K.CONTINUE_STMT and loops == 0
+    ):
+        return True
+    inner = loops + 1 if kind in _LOOPS else loops
+    return any(_leaves_switch(child, inner, live) for child in live(node, _children(node)))
 
 
 def _stored_variable(target: ci.Cursor) -> ci.Cursor | None:
@@ -3154,6 +3191,7 @@ class _FunctionWalk:
         self.uncompiled_stores: set[int] = set()
         # The locals whose reads, being walked, only give a value stored back into them.
         self.self_stored: set[int] = set()
+        self.self_stores: dict[int, bool] = {}  # per plain assignment: it stores what is there already
         self.subtractions = False  # a subtraction of two locals or parameters is code
         self.local_stores: dict[int, list[ci.Cursor]] | None = None
         self.same_outcomes: set[int] = set()  # the ifs whose two outcomes give the same, without effect
@@ -3494,7 +3532,11 @@ class _FunctionWalk:
         """A statement of a block, not an expression, that is not code beyond what its parts do
         besides computing values: an if whose branches have no effect, a loop without effect, or an
         if whose two outcomes agree."""
-        if self.x.branches_without_effect(statement, self.dead_variables) or self.if_without_effect(statement):
+        if (
+            self.x.branches_without_effect(statement, self.dead_variables)
+            or self.if_without_effect(statement)
+            or self.switch_without_effect(statement)
+        ):
             return True
         if statement.kind in _LOOPS:
             return self.x.loop_without_effect(
@@ -3504,6 +3546,134 @@ class _FunctionWalk:
             self.same_outcomes.add(statement.hash)
             return True
         return False
+
+    def access_path(self, node: ci.Cursor) -> tuple[int, tuple[str, ...]] | None:
+        """The local or parameter an lvalue is reached from and the members on the way, each marked
+        ``->`` or ``.`` and ``|u`` in a union (``ksig->info.si_addr``: ksig, ``('->info', '.si_addr|u')``),
+        or None for another lvalue or a volatile one."""
+        node = _bare(node)
+        if node.type.is_volatile_qualified():
+            return None
+        members: list[str] = []
+        while node.kind == K.MEMBER_REF_EXPR and node.referenced is not None and node.referenced.kind == K.FIELD_DECL:
+            children = _children(node)
+            if not children:
+                return None
+            base = _bare(children[0])
+            arrow = base.type.get_canonical().kind == TK.POINTER
+            parent = node.referenced.semantic_parent
+            union = "|u" if parent is not None and parent.kind == K.UNION_DECL else ""
+            members.append(f"{'->' if arrow else '.'}{node.referenced.spelling}{union}")
+            node = base
+        if node.kind != K.DECL_REF_EXPR or not _is_local(node.referenced):
+            return None
+        return node.referenced.hash, tuple(reversed(members))
+
+    @staticmethod
+    def paths_overlap(first: tuple[str, ...], second: tuple[str, ...]) -> bool:
+        """Two member paths from one root reach overlapping memory: one is a prefix of the other, or
+        they part at members of a union."""
+        for left, right in zip(first, second, strict=False):
+            if left != right:
+                return left.endswith("|u") or right.endswith("|u")
+        return True
+
+    def untouched(self, path: tuple[int, tuple[str, ...]], start: int, end: int) -> bool:
+        """Nothing between the offsets ``start`` and ``end`` may change the memory ``path`` reaches: no
+        call with an effect, no asm that stays, no store into it or into a variable on the way, and no
+        store through another pointer."""
+        for node in self.cursor.walk_preorder():
+            offset = node.extent.start.offset
+            if not start < offset < end:
+                continue
+            if node.kind == K.CALL_EXPR:
+                callee = node.referenced
+                if callee is None or callee.kind != K.FUNCTION_DECL:
+                    return False
+                if callee.spelling not in _VALUE_BUILTINS and not self.x.function_effect_free(callee.spelling):
+                    return False
+            elif node.kind == K.ASM_STMT and not self.x.asm_removable(node):
+                return False
+            target = _store_target(node)
+            if target is None:
+                continue
+            stored = self.access_path(target)
+            if stored is None:
+                return False
+            if stored[0] == path[0]:
+                if self.paths_overlap(stored[1], path[1]):
+                    return False
+            elif any(member.startswith("->") for member in stored[1]) or stored[0] in self.address_taken:
+                return False
+        return True
+
+    def own_value(self, value: ci.Cursor, path: tuple[int, tuple[str, ...]], end: int, depth: int = 0) -> bool:
+        """``value`` is what the memory ``path`` reaches holds at the offset ``end``: that lvalue
+        itself, a call of an inline helper that returns its parameter unchanged given such a value
+        (arch_untagged_si_addr), or a local nothing writes but its initializer, which is such a value,
+        where nothing between the initializer and ``end`` touches that memory (io_remap_pfn_range_prepare's
+        ``orig_pfn = action->remap.start_pfn``)."""
+        node = _bare(value)
+        while (
+            node.kind == K.CSTYLE_CAST_EXPR
+            and _children(node)
+            and node.type.get_canonical() == _bare(_children(node)[-1]).type.get_canonical()
+        ):
+            node = _bare(_children(node)[-1])
+        if self.access_path(node) == path:
+            return True
+        if depth > 4:
+            return False
+        if node.kind == K.CALL_EXPR:
+            position = self.x.returned_parameter(node.referenced)
+            arguments = list(node.get_arguments() or [])
+            return (
+                position is not None
+                and position < len(arguments)
+                and all(self.x.effect_free(argument, self.dead_variables) for argument in arguments)
+                and self.own_value(arguments[position], path, end, depth + 1)
+            )
+        variable = node.referenced if node.kind == K.DECL_REF_EXPR else None
+        if variable is None or variable.kind != K.VAR_DECL or not _is_local(variable):
+            return False
+        uses = self.local_uses()
+        if uses["assigned"][variable.hash] or uses["written"][variable.hash] or variable.hash in self.address_taken:
+            return False
+        initializer = libclang.var_initializer(variable)
+        if initializer is None:
+            return False
+        start = initializer.extent.end.offset
+        return self.untouched(path, start, end) and self.own_value(initializer, path, end, depth + 1)
+
+    def self_store(self, node: ci.Cursor) -> bool:
+        """``L = E`` where ``E`` has no effect and is what ``L`` holds already (``own_value``):
+        hide_si_addr_tag_bits' ``ksig->info.si_addr = arch_untagged_si_addr(ksig->info.si_addr, ...)``,
+        which returns its first argument on riscv. The store and the reads for it are not code."""
+        if node.kind != K.BINARY_OPERATOR or not _is_plain_assignment(node):
+            return False
+        if node.hash in self.self_stores:
+            return self.self_stores[node.hash]
+        target, value = _children(node)
+        path = self.access_path(target)
+        result = (
+            path is not None
+            and self.x.effect_free(value, self.dead_variables)
+            and self.own_value(value, path, node.extent.start.offset)
+        )
+        self.self_stores[node.hash] = result
+        return result
+
+    def switch_without_effect(self, statement: ci.Cursor) -> bool:
+        """A switch whose condition and cases have no effect (its self stores aside) and that control
+        leaves only by its end or a break: hide_si_addr_tag_bits' switch on siginfo_layout(...)."""
+        children = _children(statement)
+        if statement.kind != K.SWITCH_STMT or len(children) < 2:
+            return False
+        body = children[-1]
+        if not self.x.effect_free(children[0], self.dead_variables) or _leaves_switch(body, 0, self.held_live):
+            return False
+        skip = self.overwritten | {node.hash for node in body.walk_preorder() if self.self_store(node)}
+        return self.x.effect_free(body, self.dead_variables, live=self.held_live, skip=frozenset(skip))
 
     def same_store(self, statement: ci.Cursor) -> bool:
         """``if (c) v = a; else v = b;`` where ``a`` and ``b`` have no effect and are one value as the
@@ -4416,6 +4586,18 @@ class _FunctionWalk:
                     self.discard(statement, children[0], statement_index, generic, reason)
                 else:
                     self.walk(statement, children[0], statement_index, None, generic)
+            return
+        if self.self_store(node):
+            # L = E where E is what L holds (hide_si_addr_tag_bits' ksig->info.si_addr =
+            # arch_untagged_si_addr(ksig->info.si_addr, ...)): neither the store nor its reads are code.
+            self.walk(node, parent, index, reason, generic)
+            return
+        if self.switch_without_effect(node):
+            # A switch without effect (hide_si_addr_tag_bits' on siginfo_layout(...)): only what its
+            # condition does besides is code.
+            self.discard(children[0], node, 0, generic, reason)
+            for child_index, child in enumerate(children[1:], 1):
+                self.walk(child, node, child_index, reason, generic)
             return
         if kind == K.IF_STMT and (
             node.hash in self.same_outcomes
@@ -5932,6 +6114,7 @@ class _FunctionWalk:
                 kind.is_expression()
                 or self.x.branches_without_effect(node, self.dead_variables)
                 or self.if_without_effect(node)
+                or self.switch_without_effect(node)
                 or (
                     kind in _LOOPS
                     and (

@@ -333,3 +333,14 @@ def test_a_store_control_cannot_carry_to_a_read_is_not_code(
     """fd_add_class (llvm-objdump): box_size, then remove, never stats or enc: error = 0 reaches only
     return 0. In fd_add_class_kept a goto after the store takes its value, t->code, to return error."""
     assert folded_fields(fold_build, function) == fields
+
+
+@pytest.mark.parametrize(
+    ("function", "fields"),
+    [("fd_hide_tag", set()), ("fd_remap_prepare", set()), ("fd_remap_changed", {"pfn"})],
+)
+def test_a_store_of_what_is_there_is_not_code(fold_build: dict[str, Any], function: str, fields: set[str]) -> None:
+    """fd_hide_tag: ret; fd_remap_prepare: j obj_free (llvm-objdump). Each store keeps what the field
+    holds, so it, its reads and the switch around it are gone. fd_remap_changed stores 0 between, so
+    its loads and stores of pfn stay."""
+    assert folded_fields(fold_build, function) == fields
