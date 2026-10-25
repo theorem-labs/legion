@@ -19,7 +19,7 @@ source "$script_dir/test-lib.sh"
 
 repo="$work/repo"
 module="$repo/packages/orchestration"
-mkdir -p "$module/lib/testdata" "$module/app" "$module/cli" "$module/tool" "$repo/docs" "$repo/packages/other"
+mkdir -p "$module/lib/sub" "$module/user" "$module/lib/testdata" "$module/app" "$module/cli" "$module/tool" "$repo/docs" "$repo/packages/other"
 git -C "$repo" init -q
 git -C "$repo" config user.email test@example.invalid
 git -C "$repo" config user.name Test
@@ -29,6 +29,8 @@ printf 'fixture\n' > "$module/lib/testdata/input.txt"
 printf 'package app\n\nimport "example.com/orch/lib"\n\nfunc Value() int { return lib.Value() }\n' > "$module/app/app.go"
 printf 'package cli\n' > "$module/cli/cli.go"
 printf 'package cli\n\nimport "testing"\n\nfunc TestBuild(t *testing.T) { _ = "../app" }\n' > "$module/cli/cli_test.go"
+printf 'package sub\n\nfunc Value() int { return 2 }\n' > "$module/lib/sub/sub.go"
+printf 'package user\n\nimport "example.com/orch/lib/sub"\n\nfunc Value() int { return sub.Value() }\n' > "$module/user/user.go"
 printf 'package tool\n' > "$module/tool/tool.go"
 printf 'package tool\n\nimport (\n\t"path/filepath"\n\t"testing"\n)\n\nfunc TestBuild(t *testing.T) { _ = filepath.Join("..", "cli") }\n' > "$module/tool/tool_test.go"
 printf 'docs\n' > "$repo/docs/readme.md"
@@ -48,15 +50,21 @@ commit() {
 
 selected() { (cd "$repo" && "$select_script" "$1" "$2" | tr '\n' ' ' | sed 's/ $//'); }
 
-all="example.com/orch/app example.com/orch/cli example.com/orch/lib example.com/orch/tool"
+all="example.com/orch/app example.com/orch/cli example.com/orch/lib example.com/orch/lib/sub example.com/orch/tool example.com/orch/user"
 
 head=$(commit docs/readme.md more)
 check "a change outside the module selects nothing" "$(is "$(selected "$base" "$head")" "")"
 
 base=$head
 head=$(commit packages/orchestration/lib/lib.go '// more')
+lib_users="example.com/orch/app example.com/orch/cli example.com/orch/lib example.com/orch/tool"
 check "a change to lib selects lib, app (imports it), cli (its test builds ../app) and tool" \
-  "$(is "$(selected "$base" "$head")" "$all")"
+  "$(is "$(selected "$base" "$head")" "$lib_users")"
+
+base=$head
+head=$(commit packages/orchestration/lib/sub/sub.go '// more')
+check "a change to lib/sub selects lib/sub and user, not lib above it" \
+  "$(is "$(selected "$base" "$head")" "example.com/orch/lib/sub example.com/orch/user")"
 
 base=$head
 head=$(commit packages/orchestration/app/app.go '// more')
@@ -74,7 +82,7 @@ check "a change to tool selects tool alone" "$(is "$(selected "$base" "$head")" 
 
 base=$head
 head=$(commit packages/orchestration/lib/testdata/input.txt more)
-check "a testdata change selects its package and its dependents" "$(is "$(selected "$base" "$head")" "$all")"
+check "a testdata change selects its package and its dependents" "$(is "$(selected "$base" "$head")" "$lib_users")"
 
 base=$head
 head=$(commit packages/orchestration/go.mod '// more')
@@ -96,8 +104,16 @@ base=$head
 git -C "$repo" rm -rq packages/orchestration/lib
 git -C "$repo" commit -qm "delete lib"
 head=$(git -C "$repo" rev-parse HEAD)
-remaining="example.com/orch/app example.com/orch/cli example.com/orch/tool"
+remaining="example.com/orch/app example.com/orch/cli example.com/orch/tool example.com/orch/user"
 check "deleting a package selects every remaining package, its importers included" \
+  "$(is "$(selected "$base" "$head")" "$remaining")"
+git -C "$repo" reset -q --hard "$base"
+
+git -C "$repo" rm -rq packages/orchestration/lib/sub
+git -C "$repo" commit -qm "delete lib/sub"
+head=$(git -C "$repo" rev-parse HEAD)
+remaining="example.com/orch/app example.com/orch/cli example.com/orch/lib example.com/orch/tool example.com/orch/user"
+check "deleting a nested package selects every remaining package, its importer outside it included" \
   "$(is "$(selected "$base" "$head")" "$remaining")"
 git -C "$repo" reset -q --hard "$base"
 

@@ -6,8 +6,8 @@ Usage: .github/scripts/orchestration_packages.py <base> <head>
 Run from the repository root. It prints one import path per line, sorted, and nothing when the
 commits change no package. It prints every package of the module when it cannot tell what changed:
 an empty base, a base that is not an ancestor of head (a force push), a changed file inside the
-module that belongs to no package at head (a deleted or moved package, whose old importers it cannot
-name), or a change to what the module builds against (its go.mod or go.sum, the root go.work or
+module that belongs to no package at head, or a Go file whose directory holds no package at head (a
+deleted or moved package, nested or not, whose old importers it cannot name), or a change to what the module builds against (its go.mod or go.sum, the root go.work or
 go.work.sum, any other workspace module's go.mod or go.sum) or to the workflow, this script or its
 test.
 
@@ -115,6 +115,10 @@ def select(base: str, head: str) -> list[str]:
     by_dir = {str(Path(package["Dir"]).resolve()): package["ImportPath"] for package in listed}
     root = MODULE_DIR.resolve()
     inside = [path for path in changed if path.startswith(f"{MODULE_DIR.as_posix()}/")]
+    # A Go file belongs to the package of its own directory. When that directory holds no package at
+    # head, the package was deleted or moved, and its old importers cannot be named from head.
+    if any(path.endswith(".go") and str(Path(path).resolve().parent) not in by_dir for path in inside):
+        return sorted(every)
     owners = [owner(path, by_dir, root) for path in inside]
     if None in owners:
         return sorted(every)
