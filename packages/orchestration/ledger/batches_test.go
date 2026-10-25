@@ -517,7 +517,7 @@ func TestBatchSurvivesARestartAtEveryLandingPhase(t *testing.T) {
 	store := s
 	for _, record := range []json.RawMessage{
 		batchRecord("checked"), batchRecord("building"), batchRecord("blaming"), batchRecord("green"),
-		batchRecord("publishing"), nil, batchRecord("publishing", "pullRequest", map[string]any{"number": 7}),
+		batchRecord("publishing"), nil, batchRecord("publishing", "pull_request", map[string]any{"number": 7}),
 		unrecordedRecord(escalationOwner),
 	} {
 		if record == nil {

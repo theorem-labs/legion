@@ -276,9 +276,11 @@ func contractConflict(m Migration, ready ReadyRecord, earlier Migration, earlier
 
 // loadReady reads the ready record of migration id, and reports whether it has one: it is open and readied.
 func loadReady(ctx context.Context, q querier, repo, id string) (ReadyRecord, bool, error) {
-	rows, err := q.Query(ctx, `SELECT id, owner, generation, ready_event, ready_at, ready_records
-		FROM migrations
-		WHERE repo = $1 AND id = $2 AND state = 'open' AND ready_event IS NOT NULL`, repo, id)
+	rows, err := q.Query(ctx, `SELECT m.id, m.owner, m.generation, m.ready_event, m.ready_at, m.ready_records,
+			coalesce((SELECT array_agg(r.name ORDER BY r.name) FROM migration_reads r
+				WHERE r.repo = m.repo AND r.migration = m.id), '{}')
+		FROM migrations m
+		WHERE m.repo = $1 AND m.id = $2 AND m.state = 'open' AND m.ready_event IS NOT NULL`, repo, id)
 	if err != nil {
 		return ReadyRecord{}, false, err
 	}

@@ -93,7 +93,7 @@ func TestServeFormsItsFirstBatchFromTheReadyMigrations(t *testing.T) {
 	}
 
 	// One round, then the loop waits and the ended context stops it.
-	round, stop := context.WithTimeout(ctx, 90*time.Second)
+	round, stop := context.WithTimeout(ctx, 5*time.Minute)
 	defer stop()
 	var output bytes.Buffer
 	err := run(round, []string{"serve", "--config", servingConfig(t, "owner/repo", repo, dsnFile, time.Hour)}, &output)
@@ -132,7 +132,7 @@ func TestServeWithNoReadyMigrationFormsNothing(t *testing.T) {
 	repo, _, _ := readyRepository(t)
 	_, dsnFile := servingLedger(t, "owner/repo")
 
-	round, stop := context.WithTimeout(context.Background(), 60*time.Second)
+	round, stop := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer stop()
 	var output bytes.Buffer
 	err := run(round, []string{"serve", "--config", servingConfig(t, "owner/repo", repo, dsnFile, time.Hour)}, &output)

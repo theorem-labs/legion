@@ -22,6 +22,33 @@ import (
 // path while callers may keep a distinct repository identity in batch records.
 type RepositoryGit struct {
 	Path string
+	// FetchURL is where owners push their heads, from which FetchHead fetches a head by its SHA. Empty means the
+	// repository's path.
+	FetchURL string
+}
+
+// FetchHead brings commit sha into the repository from FetchURL, by the SHA itself, so a head that no ref of the
+// source names still arrives. A head already present needs no fetch.
+func (g RepositoryGit) FetchHead(ctx context.Context, repository, sha string) error {
+	path := g.path(repository)
+	if _, err := repositoryGit(ctx, path, "cat-file", "-e", sha+"^{commit}"); err == nil {
+		return nil
+	}
+	if _, err := repositoryGit(ctx, path, "fetch", "--quiet", "--no-tags", g.fetchURL(repository), sha); err != nil {
+		return fmt.Errorf("fetch %s: %w", sha, err)
+	}
+	if _, err := repositoryGit(ctx, path, "cat-file", "-e", sha+"^{commit}"); err != nil {
+		return fmt.Errorf("fetch %s: the commit did not arrive: %w", sha, err)
+	}
+	return nil
+}
+
+// fetchURL is where heads are fetched from: FetchURL, or the repository's path when it is empty.
+func (g RepositoryGit) fetchURL(repository string) string {
+	if g.FetchURL != "" {
+		return g.FetchURL
+	}
+	return g.path(repository)
 }
 
 // Resolve freezes a ref as an immutable commit ID.

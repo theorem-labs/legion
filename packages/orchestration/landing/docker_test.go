@@ -65,15 +65,6 @@ func newDockerFixture(t *testing.T, files map[string]string) dockerFixture {
 	return dockerFixture{docker: d, repo: repo, commit: gitIn(t, repo, "rev-parse", "HEAD"), tree: gitIn(t, repo, "rev-parse", "HEAD^{tree}")}
 }
 
-func gitIn(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	output, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
-	}
-	return strings.TrimSpace(string(output))
-}
-
 func writeFixture(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

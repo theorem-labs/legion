@@ -141,7 +141,9 @@ func (l *Ledger) EndWithdraw(ctx context.Context, repo, batch string) error {
 }
 
 // ReadyMembers lists the repository's ready migrations, in the order their ready records were published, each as the
-// member a batch freezes from it.
+// member a batch freezes from it. The member carries everything the program's checks read before admission: the
+// statement records of the ready record, so a reviewed or compatibility-proved change is not refused as
+// unreviewed, and the declared read names, from which the full check's current hashes are built.
 func (l *Ledger) ReadyMembers(ctx context.Context, repo string) ([]landing.Member, error) {
 	records, err := l.ledger.ReadyMigrations(ctx, repo)
 	if err != nil {
@@ -149,14 +151,22 @@ func (l *Ledger) ReadyMembers(ctx context.Context, repo string) ([]landing.Membe
 	}
 	members := make([]landing.Member, 0, len(records))
 	for _, record := range records {
+		reviews := make([]landing.Review, 0, len(record.Reviews))
+		for _, review := range record.Reviews {
+			reviews = append(reviews, landing.Review{Contract: review.Contract, Reviewer: review.Reviewer, Head: review.Head})
+		}
 		members = append(members, landing.Member{
-			Migration:        record.ID,
-			Generation:       record.Generation,
-			Head:             record.Head,
-			ReadyEvent:       record.ReadyEvent,
-			ChangedContracts: record.ChangedContracts,
-			ApprovedPinned:   record.ApprovedPinned,
-			Upstream:         record.Upstream,
+			Migration:          record.ID,
+			Generation:         record.Generation,
+			Head:               record.Head,
+			ReadyEvent:         record.ReadyEvent,
+			ReadNames:          record.Reads,
+			ChangedContracts:   record.ChangedContracts,
+			Reviews:            reviews,
+			ReviewedHead:       record.ReviewedHead,
+			CompatibilityProof: record.CompatibilityProof,
+			ApprovedPinned:     record.ApprovedPinned,
+			Upstream:           record.Upstream,
 		})
 	}
 	return members, nil

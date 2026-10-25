@@ -413,7 +413,7 @@ type Batch struct {
 	CheckPolicyDigest string               `json:"checkPolicyDigest"`
 	Checks            []CheckVerdict       `json:"checks"`
 	ChecksKey         string               `json:"checksKey"`
-	PullRequest       PullRequest          `json:"pullRequest"`
+	PullRequest       PullRequest          `json:"pull_request"`
 	Receipt           *Receipt             `json:"receipt"`
 }
 
@@ -483,9 +483,11 @@ type BatchStore interface {
 
 // Runner owns the dependencies and policy for one batch run.
 type Runner struct {
-	Store        BatchStore
-	Ledger       Ledger
-	Admission    BatchLedger
+	Store     BatchStore
+	Ledger    Ledger
+	Admission BatchLedger
+	// Heads fetches each ready member's head before a serving program forms a batch from it.
+	Heads        Heads
 	Builder      Builder
 	Hasher       Hasher
 	Git          Git

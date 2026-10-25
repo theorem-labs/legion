@@ -108,7 +108,7 @@ func TestReadConfigRepositoryObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readConfig(object) error = %v", err)
 	}
-	if want := (repositoryConfig{Name: "owner/repo", Path: "/srv/repo.git", GitDir: "/srv/land/repo.git"}); cfg.Repository != want {
+	if want := (repositoryConfig{Name: "owner/repo", Path: "/srv/repo.git", GitDir: "/srv/land/repo.git", FetchURL: "https://example.invalid/repo.git"}); cfg.Repository != want {
 		t.Fatalf("repository = %+v, want %+v", cfg.Repository, want)
 	}
 
