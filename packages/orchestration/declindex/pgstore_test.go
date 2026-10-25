@@ -347,7 +347,7 @@ func TestTheReaderRoleReadsARebuiltIndexAndCannotWriteIt(t *testing.T) {
 	if n != 1 {
 		t.Errorf("the reader counted %d modules, not 1", n)
 	}
-	pool, err := openPool(ctx, readerTarget)
+	pool, err := openPool(ctx, readerTarget, true)
 	if err != nil {
 		t.Fatal(err)
 	}

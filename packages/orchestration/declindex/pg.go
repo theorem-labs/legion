@@ -127,9 +127,20 @@ func unreachable(conn *pgx.Conn, err error) error {
 }
 
 // openPool connects to the index's database. Every statement of the store is unqualified and resolved by the
-// connection's search_path, which names the index's schema alone, so that one connection string serves every
-// index of a server.
-func openPool(ctx context.Context, t Target) (*pgxpool.Pool, error) {
+// search_path, which names the index's schema alone, so that one connection string serves every index of a
+// server. How the search_path is set depends on the route:
+//
+// A writer (session) holds one connection for its whole run, for its advisory lock and its writes, so it needs a
+// route that keeps a session: the VM's Cloud SQL Auth Proxy, or the server itself. It names its schema once for
+// each connection.
+//
+// A reader may go through a transaction pooler, which gives each transaction another server connection: the
+// owners' pods read the shared server that way. Such a pooler refuses a connection that asks for a startup
+// parameter it does not carry ("unsupported startup parameter: search_path", SQLSTATE 08P01), and a SET of a
+// session would reach another client's transaction. So a reader sends no parameter of its own and names its
+// schema inside its own transaction (OpenReadOnly), and it prepares no statement by name, because the named
+// statement would live on a server connection that the next transaction does not get.
+func openPool(ctx context.Context, t Target, session bool) (*pgxpool.Pool, error) {
 	if err := ValidIndexName(t.Index); err != nil {
 		return nil, err
 	}
@@ -140,7 +151,17 @@ func openPool(ctx context.Context, t Target) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read the index's connection string: %w", err)
 	}
-	cfg.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{t.Index}.Sanitize()
+	if session {
+		schema := pgx.Identifier{t.Index}.Sanitize()
+		cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			_, err := conn.Exec(ctx, "SET search_path = "+schema)
+			return err
+		}
+	} else if cfg.ConnConfig.DefaultQueryExecMode == pgx.QueryExecModeCacheStatement {
+		// The driver's default caches prepared statements by name. A connection string that names another
+		// mode keeps it, for a pooler that does carry prepared statements.
+		cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+	}
 	// A refresh holds one connection for its whole run, for its advisory lock and its writes, and reads the
 	// index on another. A pool of one would deadlock: the refresh would wait for a connection it holds itself.
 	if cfg.MaxConns < 2 {

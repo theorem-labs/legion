@@ -128,7 +128,7 @@ func (s *Store) forget() {
 // schema version, so that the next refresh fills it from nothing. Only a refresh and the tests open an index so;
 // every other command opens it read-only.
 func Open(ctx context.Context, t Target) (*Store, error) {
-	pool, err := openPool(ctx, t)
+	pool, err := openPool(ctx, t, true)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +169,7 @@ const (
 // reads. A reader of the index alone holds no lock: a refresh can commit while it reads, and the reader goes on
 // reading the state its snapshot began with.
 func OpenReadOnly(ctx context.Context, t Target, scope ReadScope) (*Store, error) {
-	pool, err := openPool(ctx, t)
+	pool, err := openPool(ctx, t, false)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +190,19 @@ func OpenReadOnly(ctx context.Context, t Target, scope ReadScope) (*Store, error
 	// The snapshot lives until Close, not until ctx ends; its first read below begins it.
 	snapshot, err := conn.BeginTx(context.WithoutCancel(ctx), pgx.TxOptions{AccessMode: pgx.ReadOnly, IsoLevel: pgx.RepeatableRead})
 	if err != nil {
+		if shared {
+			releaseLock(ctx, conn, t.Index, false)
+		} else {
+			conn.Release()
+		}
+		pool.Close()
+		return nil, fmt.Errorf("open the index %q read-only: %w", t.Index, err)
+	}
+	// The schema is named here, not in the connection: a transaction pooler gives each transaction another
+	// server connection, and refuses a startup parameter it does not carry. SET LOCAL lives with this
+	// transaction, so it reaches no other client of that connection.
+	if _, err := snapshot.Exec(ctx, "SET LOCAL search_path = "+pgx.Identifier{t.Index}.Sanitize()); err != nil {
+		_ = snapshot.Rollback(context.WithoutCancel(ctx))
 		if shared {
 			releaseLock(ctx, conn, t.Index, false)
 		} else {
