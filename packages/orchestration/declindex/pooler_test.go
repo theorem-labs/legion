@@ -3,6 +3,7 @@ package declindex
 import (
 	"context"
 	"encoding/binary"
+	"github.com/jackc/pgx/v5"
 	"io"
 	"net"
 	"net/url"
@@ -136,5 +137,56 @@ func TestAReaderAnswersThroughAPoolerThatCarriesNoStartupParameter(t *testing.T)
 	}
 	if a.Reach.StatementsChanged == 0 {
 		t.Errorf("reach of Gold.Frame through a pooler: %+v", a.Reach.ReachCounts)
+	}
+}
+
+// A write names the index's schema in its own transaction, so that it writes the index whatever the session it
+// runs on holds: a route that pools transactions gives a transaction a backend that never saw what the session
+// set, and a refresh that wrote the reference part on one backend and the compiled part on another wrote the
+// second into no schema at all ("relation \"consts\" does not exist").
+func TestAWriteNamesTheIndexSchemaInItsOwnTransaction(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	unlock, err := s.lockRefresh(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	// The session loses the schema it named, as it does when another backend answers.
+	if _, err := s.refresh.Exec(ctx, `SET search_path = pg_catalog`); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := s.writeTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT current_setting('search_path')`).Scan(&got)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got != `"idx"` && got != "idx" {
+		t.Errorf("a write transaction read the schema %q, want the index's own", got)
+	}
+}
+
+// The refresh lock is a session's: a route that pools transactions holds it on a backend that the next
+// transaction does not get, so the refresh would write with no lock, and nothing would stop a second refresh.
+// Every write reads the backend again and refuses when it changed.
+func TestAWriteRefusesABackendThatDoesNotHoldTheLock(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	unlock, err := s.lockRefresh(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	s.refreshBackend++ // the backend that answers is not the one that took the lock
+	err = s.writeTx(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `SELECT 1`)
+		return err
+	})
+	if err == nil {
+		t.Fatal("a write on a backend that holds no lock was allowed")
+	}
+	if !strings.Contains(err.Error(), "not one session") {
+		t.Errorf("the refusal does not say what is wrong: %v", err)
 	}
 }

@@ -101,6 +101,10 @@ type Store struct {
 	// refresh is the connection that holds the index's lock while a refresh or a schema rebuild runs: its advisory
 	// lock, and its write transactions, live and die with it (writeTx).
 	refresh *pgxpool.Conn
+	// refreshBackend is the server backend that took the refresh lock. Every write reads the backend again:
+	// a route that pools transactions would give the next one another backend, which holds neither the lock
+	// nor the schema the session named (sameBackend).
+	refreshBackend uint32
 
 	// mu guards derived, and serialises the reads of a store that two goroutines share: one connection runs one
 	// query at a time.
@@ -180,8 +184,9 @@ func OpenReadOnly(ctx context.Context, t Target, scope ReadScope) (*Store, error
 		return nil, fmt.Errorf("open the index %q read-only: %w", t.Index, err)
 	}
 	shared := scope == IndexAndTree
+	var locked uint32
 	if shared {
-		if err := lock(ctx, conn, t.Index, false); err != nil {
+		if locked, err = lock(ctx, conn, t.Index, false); err != nil {
 			conn.Release()
 			pool.Close()
 			return nil, err
@@ -212,6 +217,16 @@ func OpenReadOnly(ctx context.Context, t Target, scope ReadScope) (*Store, error
 		return nil, fmt.Errorf("open the index %q read-only: %w", t.Index, err)
 	}
 	s.q = snapshot
+	// A reader of the tree holds the index's lock, which is its session's: if another backend answers this
+	// transaction, the lock is not here, and a refresh could check out and build another commit while it reads.
+	if shared {
+		if err := sameBackend(ctx, snapshot, t.Index, locked); err != nil {
+			_ = snapshot.Rollback(context.WithoutCancel(ctx))
+			releaseLock(ctx, conn, t.Index, false)
+			pool.Close()
+			return nil, err
+		}
+	}
 	s.release = func() {
 		_ = snapshot.Rollback(context.WithoutCancel(ctx))
 		if shared {
@@ -355,13 +370,14 @@ func (s *Store) lockRefresh(ctx context.Context) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to the index %q: %w", s.index, err)
 	}
-	if err := lock(ctx, conn, s.index, true); err != nil {
+	pid, err := lock(ctx, conn, s.index, true)
+	if err != nil {
 		conn.Release()
 		return nil, err
 	}
-	s.refresh = conn
+	s.refresh, s.refreshBackend = conn, pid
 	return func() {
-		s.refresh = nil
+		s.refresh, s.refreshBackend = nil, 0
 		releaseLock(ctx, conn, s.index, true)
 	}, nil
 }
@@ -369,6 +385,10 @@ func (s *Store) lockRefresh(ctx context.Context) (func(), error) {
 // writeTx runs f in one transaction of the index on the connection that holds its lock, and commits it when f
 // succeeds. Every write of the index runs so: a writer holds the lock, and a lost connection takes the lock and
 // the transaction with it.
+//
+// The transaction names the index's schema itself and reads the backend that answers it. A route that pools
+// transactions would give it a backend that holds neither the lock nor the schema the session named: then the
+// write would go to no schema, and nothing would hold a second refresh back.
 func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
 	conn := s.refresh
 	if conn == nil {
@@ -379,6 +399,12 @@ func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
 		return unreachable(conn.Conn(), err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, "SET LOCAL search_path = "+pgx.Identifier{s.index}.Sanitize()); err != nil {
+		return unreachable(conn.Conn(), err)
+	}
+	if err := sameBackend(ctx, tx, s.index, s.refreshBackend); err != nil {
+		return unreachable(conn.Conn(), err)
+	}
 	if err := f(tx); err != nil {
 		return unreachable(conn.Conn(), err)
 	}

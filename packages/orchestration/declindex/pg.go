@@ -177,7 +177,11 @@ func openPool(ctx context.Context, t Target, session bool) (*pgxpool.Pool, error
 // lock takes the index's advisory lock on conn, exclusive for a refresh and shared for a reader of the tree, and
 // waits for it until ctx ends (pgx cancels the waiting statement). The lock lives with the connection: a
 // connection that drops gives it up, with any transaction it carried.
-func lock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool) error {
+//
+// It gives the server backend that holds the lock. A route that pools transactions hands the next transaction
+// another backend, which holds neither the lock nor what the session set, so every user of the lock reads the
+// backend again before it acts (sameBackend).
+func lock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool) (uint32, error) {
 	k1, k2 := lockKeys(index)
 	q := `SELECT pg_advisory_lock_shared($1, $2)`
 	if exclusive {
@@ -186,9 +190,37 @@ func lock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool)
 	if _, err := conn.Exec(ctx, q, k1, k2); err != nil {
 		// A wait that ctx ended is that, whatever the driver made of the cancelled statement.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("wait for the lock of index %q: %w", index, ctxErr)
+			return 0, fmt.Errorf("wait for the lock of index %q: %w", index, ctxErr)
 		}
-		return fmt.Errorf("wait for the lock of index %q: %w", index, err)
+		return 0, fmt.Errorf("wait for the lock of index %q: %w", index, err)
+	}
+	pid, err := backendPID(ctx, conn)
+	if err != nil {
+		return 0, fmt.Errorf("the lock of index %q: %w", index, err)
+	}
+	return pid, nil
+}
+
+// backendPID is the server backend that answers on q now.
+func backendPID(ctx context.Context, q querier) (uint32, error) {
+	var pid uint32
+	err := q.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid)
+	return pid, err
+}
+
+// sameBackend refuses to go on when the backend that answers is not the one that took the index's lock: the
+// connection went through something that pools transactions, so the lock is held by a backend this command no
+// longer has, and what the session set (its schema) is not there either. A refresh, a gate and a ledger check
+// must reach the server over a route that keeps a session, such as the build machine's Cloud SQL Auth Proxy.
+func sameBackend(ctx context.Context, q querier, index string, locked uint32) error {
+	pid, err := backendPID(ctx, q)
+	if err != nil {
+		return err
+	}
+	if pid != locked {
+		return fmt.Errorf("the connection to index %q is not one session: the server backend changed from %d to %d, "+
+			"so the index's lock is no longer held; a refresh, a gate and a ledger check need a route that keeps a "+
+			"session, not one that pools transactions", index, locked, pid)
 	}
 	return nil
 }
