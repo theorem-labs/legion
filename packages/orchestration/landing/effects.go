@@ -502,8 +502,9 @@ func hookMounts(definition HookDefinition) []Mount {
 	for _, mount := range definition.Mounts {
 		// A named mount at the clone's own path would be a second mount of one destination, which docker
 		// refuses ("Duplicate mount point"), so the hook would not start at all. The configuration is refused
-		// at load, and a definition frozen before that check keeps the clone, read-only.
-		if mount.HostPath == definition.GitDir {
+		// at load, and a definition frozen before that check keeps the clone, read-only. Docker cleans a
+		// destination before it compares it, so "/srv/repo.git/" is the same mount point as "/srv/repo.git".
+		if samePath(mount.HostPath, definition.GitDir) {
 			continue
 		}
 		mounts = append(mounts, mount)

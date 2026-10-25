@@ -150,7 +150,7 @@ func (p PostLanding) Validate(container Container) error {
 		return fmt.Errorf("repository.git_dir is required to run hooks: every hook gets the program's clone, which holds LAND_TREE")
 	}
 	for name, mount := range container.Mounts {
-		if mount.HostPath == container.GitDir {
+		if samePath(mount.HostPath, container.GitDir) {
 			return fmt.Errorf("container.mounts[%q] is the program's clone %s, which every hook gets read-only already; declaring it again is a second mount of one path, which docker refuses", name, container.GitDir)
 		}
 	}

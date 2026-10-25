@@ -2,6 +2,7 @@ package landing
 
 import (
 	"context"
+	"path"
 	"time"
 )
 
@@ -83,4 +84,11 @@ type ContainerRunner interface {
 type LandedTrees interface {
 	LandedTree(ctx context.Context, gitDir, commit string) (string, error)
 	RemoveLandedTree(ctx context.Context, gitDir, commit string) error
+}
+
+// samePath reports whether two host paths are one mount point, as docker
+// compares them: it cleans a destination (a trailing slash, "." and "..")
+// before it refuses a duplicate.
+func samePath(a, b string) bool {
+	return a != "" && b != "" && path.Clean(a) == path.Clean(b)
 }

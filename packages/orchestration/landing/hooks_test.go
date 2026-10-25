@@ -160,10 +160,12 @@ func TestHooksWithoutTheProgramsCloneAreRefused(t *testing.T) {
 // A configuration that declares the program's clone as a named mount is refused: every hook gets it already, and
 // a second mount of one path is refused by docker, so the hook would not start.
 func TestDeclaringTheCloneAsAMountIsRefused(t *testing.T) {
-	container := declaredContainer()
-	container.Mounts = map[string]Mount{"clone": {Name: "clone", HostPath: container.GitDir}}
-	err := PostLanding{Parts: []string{"slice"}, Hooks: []HookConfig{{Name: "graph", Command: []string{"/bin/graph"}}}}.Validate(container)
-	if err == nil || !strings.Contains(err.Error(), "every hook gets read-only already") {
-		t.Fatalf("Validate() with the clone declared = %v", err)
+	for _, clonePath := range []string{"/srv/land/repo.git", "/srv/land/repo.git/", "/srv/land/repo.git/."} {
+		container := declaredContainer()
+		container.Mounts = map[string]Mount{"clone": {Name: "clone", HostPath: clonePath}}
+		err := PostLanding{Parts: []string{"slice"}, Hooks: []HookConfig{{Name: "graph", Command: []string{"/bin/graph"}}}}.Validate(container)
+		if err == nil || !strings.Contains(err.Error(), "every hook gets read-only already") {
+			t.Fatalf("Validate() with the clone declared as %q = %v", clonePath, err)
+		}
 	}
 }

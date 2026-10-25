@@ -116,15 +116,18 @@ func TestTheLandedTreeIsMadeInTheFrozenClone(t *testing.T) {
 // A hook definition frozen with a named mount at the clone's own path keeps one mount of it, read-only: two
 // mounts of one destination are refused by docker, so the hook would not start at all.
 func TestAMountAtTheClonePathIsNotMountedTwice(t *testing.T) {
-	definition := HookDefinition{GitDir: "/srv/land/repo.git", Mounts: []Mount{
-		{Name: "clone", HostPath: "/srv/land/repo.git", Mode: ReadWrite},
-		{Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly},
-	}}
 	want := []Mount{
 		{Name: "git_dir", HostPath: "/srv/land/repo.git", Mode: ReadOnly},
 		{Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly},
 	}
-	if got := hookMounts(definition); !slices.Equal(got, want) {
-		t.Fatalf("hookMounts() = %+v, want %+v", got, want)
+	// Docker cleans a destination before it compares it, so each of these names the clone's own mount point.
+	for _, clonePath := range []string{"/srv/land/repo.git", "/srv/land/repo.git/", "/srv/land/repo.git/.", "/srv/land/x/../repo.git"} {
+		definition := HookDefinition{GitDir: "/srv/land/repo.git", Mounts: []Mount{
+			{Name: "clone", HostPath: clonePath, Mode: ReadWrite},
+			{Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly},
+		}}
+		if got := hookMounts(definition); !slices.Equal(got, want) {
+			t.Fatalf("hookMounts() with the clone as %q = %+v, want %+v", clonePath, got, want)
+		}
 	}
 }
