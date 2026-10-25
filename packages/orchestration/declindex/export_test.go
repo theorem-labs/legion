@@ -187,6 +187,27 @@ func TestLeanEnvPassesTheThreadCount(t *testing.T) {
 	}
 }
 
+// A build passes its own options to each `lean` (a package's options, as `-Dname=value`): CompileModule gives them
+// to Lean, so a module that builds only with them compiles here too.
+func TestCompileModulePassesTheCallersLeanArguments(t *testing.T) {
+	l := leanForTest(t)
+	dir := t.TempDir()
+	src := "theorem big : (List.replicate 2000 1).length = 2000 := by decide\n"
+	if err := os.WriteFile(filepath.Join(dir, "Deep.lean"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := CompileModule(ctx, l, nil, dir, "Deep"); err == nil || !strings.Contains(err.Error(), "maximum recursion depth") {
+		t.Fatalf("compile without the option: %v; want Lean's recursion depth error", err)
+	}
+	if err := CompileModule(ctx, l, nil, dir, "Deep", "-DmaxRecDepth=8192"); err != nil {
+		t.Fatalf("compile with -DmaxRecDepth=8192: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "Deep.olean")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestExporterHashesACopyAsTheOriginal(t *testing.T) {
 	consts := exportFixture(t)
 	orig := consts["Fx.SpAligned"]

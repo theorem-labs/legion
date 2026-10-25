@@ -190,11 +190,12 @@ func linker(l Lean, cc string) string {
 
 // CompileModule compiles the one file root/rel.lean to root/rel.olean and root/rel.ilean, against the modules
 // of searchPath (and root), as `lean` does for one module of a build. Lean runs in root with root as its home and
-// the minimal environment of Lean.env.
-func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel string) error {
+// the minimal environment of Lean.env. args go to `lean` before the file: the options the build passes to each
+// module (`-Dname=value`, `--load-dynlib=...`), so a module compiles here as it does there.
+func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel string, args ...string) error {
 	base := filepath.Join(root, filepath.FromSlash(rel))
-	return run(ctx, root, l.env(append([]string{root}, searchPath...), root), l.bin("lean"), "-R", root,
-		"-o", base+".olean", "-i", base+".ilean", base+".lean")
+	argv := slices.Concat([]string{"-R", root, "-o", base + ".olean", "-i", base + ".ilean"}, args, []string{base + ".lean"})
+	return run(ctx, root, l.env(append([]string{root}, searchPath...), root), l.bin("lean"), argv...)
 }
 
 // confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path
