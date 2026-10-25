@@ -582,3 +582,25 @@ func TestARestartFinishesTheEffectsOfALandedBatch(t *testing.T) {
 		t.Fatalf("after the restart: pending %q, applied %q", resumed.PendingEffects, effects.applied)
 	}
 }
+
+// An effect whose op this program has no rule for is never dropped silently: it is escalated at once and held for
+// an operator, and the batch stays listed behind it.
+func TestAnEffectWithAnUnknownOpIsHeldForAnOperator(t *testing.T) {
+	ctx := context.Background()
+	runner, effects, _, batch := landedHooks(t,
+		[]HookConfig{hookConfig("refresh", "", nil, nil)}, []string{"slice"}, exits(0, nil))
+	effects.create("kick/batch", "kick", "", "", map[string]any{"commit": "merged"})
+
+	if err := runner.finishEffects(ctx, &batch); !errors.Is(err, ErrEffectsPending) {
+		t.Fatalf("finishEffects() error = %v, want the unknown effect pending", err)
+	}
+	if got, want := effects.escalations, []string{"landing:batch:kick/batch@1 escalations"}; !slices.Equal(got, want) {
+		t.Fatalf("escalations = %q, want %q", got, want)
+	}
+	if !effects.effects["kick/batch"].Held {
+		t.Fatal("the unknown effect is not held")
+	}
+	if !slices.Equal(batch.PendingEffects, []string{"kick/batch"}) {
+		t.Fatalf("the batch's pending effects are %q", batch.PendingEffects)
+	}
+}

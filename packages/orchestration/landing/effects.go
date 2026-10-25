@@ -127,52 +127,60 @@ func (r Runner) finishEffects(ctx context.Context, batch *Batch) error {
 	if r.Effects == nil {
 		return fmt.Errorf("an effect log is required to finish the effects of batch %q", batch.ID)
 	}
-	stored, err := r.effectsByKey(ctx, *batch)
+	commit := batch.PullRequest.MergedCommit
+	stop := r.dispatchEffects(ctx, *batch, commit)
+	// The batch's pending keys are the ledger's, whether or not an effect stopped the round.
+	if err := r.closeEffects(ctx, batch, commit); err != nil && stop == nil {
+		return err
+	}
+	return stop
+}
+
+// dispatchEffects walks the batch's effects in the frozen order and stops at the first one that is not done.
+func (r Runner) dispatchEffects(ctx context.Context, batch Batch, commit string) error {
+	stored, err := r.effectsByKey(ctx, batch)
 	if err != nil {
 		return err
 	}
-	commit := batch.PullRequest.MergedCommit
 	for _, effect := range batch.PostLandEffects {
 		if effect.Op != OpEvent {
 			continue
 		}
-		if err := r.dispatch(ctx, *batch, effect, stored, commit); err != nil {
+		if err := r.dispatch(ctx, batch, effect, stored, commit); err != nil {
 			return err
 		}
 	}
 	for _, effect := range hookOrder(batch.PostLandEffects) {
-		if err := r.dispatch(ctx, *batch, effect, stored, commit); err != nil {
+		if err := r.dispatch(ctx, batch, effect, stored, commit); err != nil {
 			return err
 		}
-		stored, err = r.effectsByKey(ctx, *batch)
+		stored, err = r.effectsByKey(ctx, batch)
 		if err != nil {
 			return err
 		}
 		for _, follow := range childEffects(stored, effect.Key, batch.ID, effect.Index, effect.Part) {
-			if err := r.dispatch(ctx, *batch, follow, stored, commit); err != nil {
+			if err := r.dispatch(ctx, batch, follow, stored, commit); err != nil {
 				return err
 			}
-			if follow.Op == OpApply {
-				// A contracts apply creates one librarian intent per near pair, which this hook's deliveries
-				// run before the next hook.
-				if stored, err = r.effectsByKey(ctx, *batch); err != nil {
-					return err
+			if follow.Op != OpApply {
+				continue
+			}
+			// A contracts apply creates one librarian intent per near pair, which this hook's deliveries run
+			// before the next hook.
+			if stored, err = r.effectsByKey(ctx, batch); err != nil {
+				return err
+			}
+			for _, delivery := range childEffects(stored, effect.Key, batch.ID, effect.Index, effect.Part) {
+				if delivery.Op != OpLibrarian {
+					continue
 				}
-				for _, delivery := range childEffects(stored, effect.Key, batch.ID, effect.Index, effect.Part) {
-					if delivery.Op != OpLibrarian {
-						continue
-					}
-					if err := r.dispatch(ctx, *batch, delivery, stored, commit); err != nil {
-						return err
-					}
+				if err := r.dispatch(ctx, batch, delivery, stored, commit); err != nil {
+					return err
 				}
 			}
 		}
 	}
-	if err := r.closeEffects(ctx, batch, commit); err != nil {
-		return err
-	}
-	return nil
+	return r.unknownEffects(ctx, batch, commit)
 }
 
 // effectsByKey reads the batch's effects from the ledger and fills the batch's pending keys from them, so the
@@ -187,6 +195,30 @@ func (r Runner) effectsByKey(ctx context.Context, batch Batch) (map[string]Effec
 		stored[effect.Key] = effect
 	}
 	return stored, nil
+}
+
+// unknownEffects holds every intent the executor has no rule for: an op this program does not know would be
+// dropped silently otherwise, and the batch would stay listed for ever. Its deterministic attempt escalates it and
+// holds it for an operator.
+func (r Runner) unknownEffects(ctx context.Context, batch Batch, commit string) error {
+	stored, err := r.effectsByKey(ctx, batch)
+	if err != nil {
+		return err
+	}
+	for _, key := range slices.Sorted(effectKeys(stored)) {
+		effect := stored[key]
+		switch effect.Op {
+		case OpHook, OpApply, OpPublish, OpLibrarian, OpEvent, OpWithdraw:
+			continue
+		}
+		if effect.State == EffectDone || effect.Held {
+			continue
+		}
+		if err := r.dispatch(ctx, batch, PostLandEffect{Key: key, Op: effect.Op}, stored, commit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // closeEffects leaves the batch with the keys the ledger still lists as pending, removes the landed commit's
