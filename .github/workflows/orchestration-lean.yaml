@@ -42,6 +42,8 @@ jobs:
       LEAN_FORK_COMMIT: d71bb0c6d04adbb8e94adfdf8c0e3291bfeea831
       # The Lean tests skip without lake; here a missing toolchain fails them instead.
       DECLINDEX_REQUIRE_LEAN: "1"
+      # graphcheck compiles the candidate's changed modules, so its rule tests need the toolchain too.
+      GRAPHCHECK_REQUIRE_LEAN: "1"
       # The gate compiles proposals only in the Landlock and seccomp sandbox; here its tests must run, not skip.
       DECLINDEX_REQUIRE_SANDBOX: "1"
       # The gate's own Lean tests compile untrusted proposal source, so they run only where this is set: in a
@@ -78,8 +80,8 @@ jobs:
           lean_version="$(lean --version)"
           printf '%s\n' "$lean_version"
           grep --fixed-strings "$LEAN_FORK_COMMIT" <<<"$lean_version"
-      - name: Test the declaration index and the similarity gate with Lean
+      - name: Test the declaration index, the similarity gate and the graph checks with Lean
         working-directory: packages/orchestration
         run: |
           lean --version
-          go test -count=1 ./declindex/... ./conceptgate/... ./cmd/declindex/...
+          go test -count=1 ./declindex/... ./conceptgate/... ./cmd/declindex/... ./graphcheck/... ./cmd/graphcheck/...

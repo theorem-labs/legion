@@ -1,0 +1,237 @@
+package graphcheck_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/graphcheck"
+	"github.com/sjawhar/legion/orchestration/graphcheck/graphchecktest"
+	"github.com/sjawhar/legion/orchestration/landing"
+	"github.com/sjawhar/legion/orchestration/landing/blame"
+)
+
+// open opens the fixture's candidate and index and closes them when the test ends.
+func open(t *testing.T, f *graphchecktest.Fixture, tree string) (*graphcheck.Candidate, *declindex.Store) {
+	t.Helper()
+	c, idx, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, tree)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = c.Close()
+		_ = idx.Close()
+	})
+	return c, idx
+}
+
+func names(t *testing.T, f *graphchecktest.Fixture, tree string) []landing.Finding {
+	t.Helper()
+	c, idx := open(t, f, tree)
+	hits, err := graphcheck.Names(context.Background(), c, idx, f.Cfg)
+	if err != nil {
+		t.Fatalf("Names: %v", err)
+	}
+	return hits
+}
+
+func find(hits []landing.Finding, verdict string, kind blame.Kind, decl, path, rule string) (landing.Finding, bool) {
+	for _, h := range hits {
+		if h.Verdict == verdict && h.Kind == kind && h.Declaration == decl && h.Path == path && strings.HasPrefix(h.Reason, rule+":") {
+			return h, true
+		}
+	}
+	return landing.Finding{}, false
+}
+
+func ruleHits(hits []landing.Finding, rule string) []landing.Finding {
+	var out []landing.Finding
+	for _, h := range hits {
+		if strings.HasPrefix(h.Reason, rule+":") {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+func TestNamesRefusesAPrivatisedDeclarationThatAnUnchangedModuleUses(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Core.lean", "def helper", "private def helper")
+	hits := names(t, f, tree)
+	h, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Use.lean", "N1")
+	if !ok || h.Line != 5 || h.Col != 36 {
+		t.Fatalf("no N1 refusal at Lib/Use.lean:5:36 in %v", hits)
+	}
+	if want := "N1: Lib/Core.lean no longer declares Lib.Core.helper publicly; 3 uses in 2 unchanged modules, first here"; h.Reason != want {
+		t.Fatalf("reason %q, want %q", h.Reason, want)
+	}
+	if _, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Open.lean", "N1"); !ok {
+		t.Fatalf("no N1 refusal of the use through open in Lib/Open.lean in %v", hits)
+	}
+}
+
+func TestNamesRefusesARemovedFieldThatAProjectionNames(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Core.lean", "  val : Nat", "  value : Nat")
+	h, ok := find(names(t, f, tree), landing.VerdictRefuse, blame.Field, "Lib.Core.Box.val", "Lib/Use.lean", "N1")
+	if !ok || h.Line != 8 {
+		t.Fatal("no N1 field refusal at Lib/Use.lean:8")
+	}
+	if want := "N1: structure Lib.Core.Box in Lib/Core.lean no longer has field val"; !strings.HasPrefix(h.Reason, want) {
+		t.Fatalf("reason %q, want prefix %q", h.Reason, want)
+	}
+}
+
+// The fixture's Make.ilean records `{ val := 1 }` as a use of Lib.Core.Box.val.
+func TestNamesRefusesARemovedFieldThatAStructureInstanceNames(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Core.lean", "  val : Nat", "  value : Nat")
+	if h, ok := find(names(t, f, tree), landing.VerdictRefuse, blame.Field, "Lib.Core.Box.val", "Lib/Make.lean", "N1"); !ok || h.Line != 5 {
+		t.Fatal("no N1 field refusal at Lib/Make.lean:5")
+	}
+}
+
+func TestNamesFlagsARemovalWhoseShortNameIsDeclaredElsewhere(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Core.lean":  {"def helper", "def helper2"},
+		"Lib/Other.lean": {"", "namespace Lib.Core.Alt\ndef helper (n : Nat) : Nat := n\nend Lib.Core.Alt\n"},
+		"Lib.lean":       {"import Lib.Open", "import Lib.Open\nimport Lib.Other"},
+	})
+	hits := names(t, f, tree)
+	if _, ok := find(hits, landing.VerdictFlag, blame.Unknown, "Lib.Core.helper", "Lib/Open.lean", "N1"); !ok {
+		t.Fatalf("no N1 flag at Lib/Open.lean in %v", hits)
+	}
+	if _, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Open.lean", "N1"); ok {
+		t.Fatal("N1 refuses a use that may resolve to Lib.Core.Alt.helper")
+	}
+}
+
+// A private declaration is invisible to other modules, so its short name makes no removal uncertain.
+func TestNamesRefusesARemovalWhoseShortNameOnlyAPrivateDeclarationHas(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Core.lean":  {"def helper", "def helper2"},
+		"Lib/Other.lean": {"", "namespace Lib.Core.Alt\nprivate def helper (n : Nat) : Nat := n\nend Lib.Core.Alt\n"},
+		"Lib.lean":       {"import Lib.Open", "import Lib.Open\nimport Lib.Other"},
+	})
+	if _, ok := find(names(t, f, tree), landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Open.lean", "N1"); !ok {
+		t.Fatal("no N1 refusal at Lib/Open.lean")
+	}
+}
+
+func TestNamesFlagsARemovedFieldOfAStructureThatExtends(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Core.lean", "structure Box where\n  val : Nat", "structure Base where\n  val : Nat\n\nstructure Box extends Base where\n  value : Nat")
+	hits := names(t, f, tree)
+	if _, ok := find(hits, landing.VerdictFlag, blame.Field, "Lib.Core.Box.val", "Lib/Use.lean", "N1"); !ok {
+		t.Fatalf("no N1 field flag at Lib/Use.lean in %v", hits)
+	}
+	if _, ok := find(hits, landing.VerdictRefuse, blame.Field, "Lib.Core.Box.val", "Lib/Use.lean", "N1"); ok {
+		t.Fatal("N1 refuses a field a parent structure may still give")
+	}
+}
+
+func TestNamesRefusesASecondDeclarationInABuiltModule(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/New.lean": {"", "namespace Lib.Core\ndef helper (n : Nat) : Nat := n\nend Lib.Core\n"},
+		"Lib.lean":     {"import Lib.Open", "import Lib.Open\nimport Lib.New"},
+	})
+	h, ok := find(names(t, f, tree), landing.VerdictRefuse, blame.Added, "Lib.Core.helper", "Lib/New.lean", "N2")
+	if !ok || h.Line != 2 || h.Col != 1 {
+		t.Fatal("no N2 refusal at Lib/New.lean:2:1")
+	}
+	if want := "N2: Lib.Core.helper is also declared in Lib/Core.lean:3; both modules are built"; h.Reason != want {
+		t.Fatalf("reason %q, want %q", h.Reason, want)
+	}
+}
+
+func TestNamesIgnoresASecondDeclarationNoBuildReaches(t *testing.T) {
+	f := graphchecktest.New(t)
+	f.Cfg.RootNewModules = false
+	tree := f.Edit(t, "Lib/New.lean", "", "namespace Lib.Core\ndef helper (n : Nat) : Nat := n\nend Lib.Core\n")
+	if _, ok := find(names(t, f, tree), landing.VerdictRefuse, blame.Added, "Lib.Core.helper", "Lib/New.lean", "N2"); ok {
+		t.Fatal("N2 refuses a module no build root reaches")
+	}
+}
+
+// A module that the build roots no longer import is not built: N1 says nothing about its uses.
+func TestNamesIgnoresAUseInAModuleTheBuildNoLongerReaches(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Core.lean": {"def helper", "private def helper"},
+		"Lib.lean":      {"import Lib.Open\n", ""},
+	})
+	for _, h := range names(t, f, tree) {
+		if h.Path == "Lib/Open.lean" {
+			t.Fatalf("finding %+v in a module no build root imports", h)
+		}
+	}
+}
+
+func TestNamesIgnoresADeclarationMovedToAnotherFile(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Core.lean":  {"def helper (n : Nat) : Nat := n + 1\n", ""},
+		"Lib/Core2.lean": {"", "namespace Lib.Core\ndef helper (n : Nat) : Nat := n + 1\nend Lib.Core\n"},
+	})
+	for _, h := range names(t, f, tree) {
+		if h.Declaration == "Lib.Core.helper" && h.Verdict == landing.VerdictRefuse {
+			t.Fatalf("refusal %+v of a moved declaration", h)
+		}
+	}
+}
+
+func TestNamesRefusesTheUsesOfADeletedFile(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Core.lean", "", "")
+	h, ok := find(names(t, f, tree), landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Use.lean", "N1")
+	if !ok || h.Line != 5 {
+		t.Fatal("no N1 refusal at Lib/Use.lean:5")
+	}
+	if !strings.HasPrefix(h.Reason, "N1: Lib/Core.lean no longer declares Lib.Core.helper;") {
+		t.Fatalf("reason %q", h.Reason)
+	}
+}
+
+func TestNamesIsUnableWhenTheIndexIsOfAnotherTree(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Core.lean", "def size", "def size2")
+	var unable *graphcheck.UnableError
+	if _, _, err := graphcheck.Open(context.Background(), f.Cfg, f.HeadOf(t, tree), tree); !errors.As(err, &unable) {
+		t.Fatalf("Open = %v, want *UnableError", err)
+	}
+}
+
+func TestNamesAcceptsAnIndexOfAnotherCommitWithTheSameTree(t *testing.T) {
+	f := graphchecktest.New(t)
+	c, idx, err := graphcheck.Open(context.Background(), f.Cfg, f.SameTreeCommit(t), f.BaseTree(t))
+	if err != nil {
+		t.Fatalf("Open = %v, want the index of the same tree accepted", err)
+	}
+	_ = c.Close()
+	_ = idx.Close()
+}
+
+func TestNamesIsUnableWhenTheIndexIsIncomplete(t *testing.T) {
+	f := graphchecktest.NewWithUnreadableModule(t) // golden/Lib/Make.ilean truncated before the refresh
+	var unable *graphcheck.UnableError
+	if _, _, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, f.BaseTree(t)); !errors.As(err, &unable) {
+		t.Fatalf("Open = %v, want *UnableError", err)
+	}
+}
+
+func TestNamesIsUnableForACommitTheRepositoryLacks(t *testing.T) {
+	f := graphchecktest.New(t)
+	var unable *graphcheck.UnableError
+	missing := strings.Repeat("ab", 20)
+	if _, _, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, missing); !errors.As(err, &unable) {
+		t.Fatalf("Open with an unknown tree = %v, want *UnableError", err)
+	}
+	if _, _, err := graphcheck.Open(context.Background(), f.Cfg, missing, f.BaseTree(t)); !errors.As(err, &unable) {
+		t.Fatalf("Open with an unknown base = %v, want *UnableError", err)
+	}
+}
