@@ -725,3 +725,53 @@ void fd_prefetch(struct fd_queue *q)
 	__builtin_prefetch(curr);
 	__builtin_prefetch(&curr->sl);
 }
+
+/* kernel/rcu/tree_exp.h rcu_report_exp_cpu_mult: for_each_leaf_node_cpu_mask(rnp, cpu, mask) is
+ * for (WARN_ON_ONCE(!rcu_is_leaf_node(rnp)), cpu = rcu_find_next_bit(rnp, 0, mask); cpu <=
+ * rnp->grphi; cpu = rcu_find_next_bit(rnp, cpu + 1 - rnp->grplo, mask)), whose body only continues
+ * without NO_HZ_FULL: only the init's WARN is code (llvm-objdump: lw level; ebreak; j obj_free). */
+struct fd_leaf {
+	int level;
+	int lo;
+	int hi;
+};
+
+static inline int fd_next_bit(struct fd_leaf *r, int off, unsigned long mask)
+{
+	return r->lo + off + (int)(mask & 1);
+}
+
+void fd_report_leaves(struct fd_leaf *r, unsigned long mask, struct box *b)
+{
+	int cpu;
+
+	for (({ if (r->level) __asm__ volatile("ebreak"); 0; }), cpu = fd_next_bit(r, 0, mask); cpu <= r->hi;
+	     cpu = fd_next_bit(r, cpu + 1 - r->lo, mask))
+		if (!0 || cpu)
+			continue;
+	obj_free(b);
+}
+
+/* The same loop where the next bit is found as find_next_bit does: small_const_nbits(size), a
+ * __builtin_constant_p of the constant size, chooses the inline path, otherwise a call. The image
+ * decides; here it has only the init's WARN (llvm-objdump: lw level; ebreak; j obj_free). */
+static inline int fd_find_bit(unsigned long mask, unsigned int size, int off)
+{
+	if (__builtin_constant_p(size) && size <= 64)
+		return __builtin_ctzl((mask >> (off & 63)) | (1UL << 63)) + off;
+	__asm__ volatile("" ::: "memory");
+	return off;
+}
+
+#define fd_leaf_next(r, off, mask) ((r)->lo + fd_find_bit((mask), 64, (off)))
+
+void fd_report_leaves_image(struct fd_leaf *r, unsigned long mask, struct box *b)
+{
+	int cpu;
+
+	for (({ if (r->level) __asm__ volatile("ebreak"); 0; }), cpu = fd_leaf_next(r, 0, mask); cpu <= r->hi;
+	     cpu = fd_leaf_next(r, cpu + 1 - r->lo, mask))
+		if (!0 || cpu)
+			continue;
+	obj_free(b);
+}

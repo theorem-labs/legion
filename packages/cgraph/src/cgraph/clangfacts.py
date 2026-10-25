@@ -1182,7 +1182,12 @@ class _Extractor:
         return children
 
     def loop_without_effect(
-        self, loop: ci.Cursor, function: ci.Cursor, dead: frozenset[int], image: bool = False
+        self,
+        loop: ci.Cursor,
+        function: ci.Cursor,
+        dead: frozenset[int],
+        image: bool = False,
+        past_init: bool = False,
     ) -> bool:
         """A loop that has no effect: it may be assumed to end (not a constant controlling
         expression), control leaves it only by its end (no return or goto in a part it reaches, as
@@ -1190,10 +1195,27 @@ class _Extractor:
         locals nothing outside it reads. flush_all_rcu_sheaves' ``list_for_each_entry(s,
         &slab_caches, list) { if (!cache_has_sheaves(s)) continue; ... }`` with CONFIG_SLUB_TINY
         stores only its cursor; the compiler removes the whole loop. With ``image``, effects under a
-        choice the image makes do not count (rcu_report_exp_cpu_mult's for_each_leaf_node_cpu_mask,
-        whose cpumask_next is find_next_bit's small_const_nbits path or a call)."""
+        choice the image makes do not count. With ``past_init``, those of a ``for`` header's init do
+        not either, which runs once before the loop (rcu_report_exp_cpu_mult's
+        for_each_leaf_node_cpu_mask, whose init is WARN_ON_ONCE(!rcu_is_leaf_node(rnp)), ...)."""
         if loop.kind not in _LOOPS or self.loop_may_not_end(loop) or _jumps_out(loop, 0, self.live_children):
             return False
+        parts = [loop]
+        if past_init:
+            init = self.loop_init(loop)
+            if init is None:
+                return False
+            parts = [child for child in _children(loop) if child.hash != init.hash]
+        locals_ = self.loop_locals(loop, function)
+        if locals_ is None:
+            return False
+        declared = {node.hash for node in _effect_nodes(loop) if node.kind == K.VAR_DECL and _is_local(node)}
+        own = locals_ | declared | dead
+        return all(self._effect_free(part, own, inlined=True, image=image) for part in parts)
+
+    def loop_locals(self, loop: ci.Cursor, function: ci.Cursor) -> set[int] | None:
+        """The locals a loop stores, where nothing outside the loop reads them; None where something
+        does."""
         stored: set[int] = set()
         for node in _effect_nodes(loop, self.live_children):
             target = _store_target(node) if not self.unchanging(node) else None
@@ -1201,9 +1223,18 @@ class _Extractor:
             if variable is not None and _is_local(variable):
                 stored.add(variable.hash)
         declared = {node.hash for node in _effect_nodes(loop) if node.kind == K.VAR_DECL and _is_local(node)}
-        return self._effect_free(loop, stored | declared | dead, inlined=True, image=image) and not _referenced_outside(
-            function, loop, stored - declared
-        )
+        return None if _referenced_outside(function, loop, stored - declared) else stored
+
+    @staticmethod
+    def loop_init(loop: ci.Cursor) -> ci.Cursor | None:
+        """The init part of a ``for`` header, or None."""
+        if loop.kind != K.FOR_STMT:
+            return None
+        header = _children(loop)[:-1]
+        roles = _FunctionWalk.header_roles(header)
+        if roles is None:
+            return None
+        return next((part for part, role in zip(header, roles, strict=True) if role == "init"), None)
 
     def outcome(self, statements: list[ci.Cursor], dead: frozenset[int], falls_off: bool) -> tuple[int | None] | None:
         """What running ``statements`` gives, where they have no effect and end in a return: the
@@ -3353,7 +3384,9 @@ class _FunctionWalk:
         if self.x.branches_without_effect(statement, self.dead_variables):
             return True
         if statement.kind in _LOOPS:
-            return self.x.loop_without_effect(statement, self.cursor, self.dead_variables)
+            return self.x.loop_without_effect(
+                statement, self.cursor, self.dead_variables
+            ) or self.x.loop_without_effect(statement, self.cursor, self.dead_variables, past_init=True)
         if self.same_outcome(statement, block, index):
             self.same_outcomes.add(statement.hash)
             return True
@@ -4277,6 +4310,23 @@ class _FunctionWalk:
             # A loop without effect (flush_all_rcu_sheaves' list walk with CONFIG_SLUB_TINY): none
             # of it is code.
             self.walk(node, parent, index, reason, generic)
+            return
+        if kind in _LOOPS and self.x.loop_without_effect(node, self.cursor, self.dead_variables, past_init=True):
+            # A loop whose only effects are in its init, which runs once (rcu_report_exp_cpu_mult's
+            # for_each_leaf_node_cpu_mask, whose init is WARN_ON_ONCE(...), cpu = rcu_find_next_bit(...)):
+            # only those are code, and the locals the loop stores are not read.
+            init = self.x.loop_init(node)
+            assert init is not None
+            unread = self.x.loop_locals(node, self.cursor) or set()
+            dead, self.dead_variables = self.dead_variables, self.dead_variables | unread
+            try:
+                for child_index, child in enumerate(children):
+                    if child.hash == init.hash:
+                        self.discard(child, node, child_index, generic, reason)
+                    else:
+                        self.walk(child, node, child_index, reason, generic)
+            finally:
+                self.dead_variables = dead
             return
         if kind == K.BINARY_OPERATOR and len(children) == 2:
             operator = libclang.binary_kind(node)
@@ -5755,7 +5805,13 @@ class _FunctionWalk:
             and (
                 kind.is_expression()
                 or self.x.branches_without_effect(node, self.dead_variables)
-                or (kind in _LOOPS and self.x.loop_without_effect(node, self.cursor, self.dead_variables))
+                or (
+                    kind in _LOOPS
+                    and (
+                        self.x.loop_without_effect(node, self.cursor, self.dead_variables)
+                        or self.x.loop_without_effect(node, self.cursor, self.dead_variables, past_init=True)
+                    )
+                )
             )
         ):
             # An expression statement, or a statement without effect (an if whose branches have no
@@ -6204,11 +6260,19 @@ class _FunctionWalk:
                     case_guard is None
                     and not self.conditional
                     and child.kind in _LOOPS
-                    and not self.x.loop_without_effect(child, self.cursor, self.dead_variables)
-                    and self.x.loop_without_effect(child, self.cursor, self.dead_variables, image=True)
+                    and not self.statement_without_effect(child, node, child_index)
+                    and (
+                        self.x.loop_without_effect(child, self.cursor, self.dead_variables, image=True)
+                        or self.x.loop_without_effect(
+                            child, self.cursor, self.dead_variables, image=True, past_init=True
+                        )
+                    )
                 ):
-                    # A loop whose only effects are where the image makes a choice: the image decides
-                    # whether any of it is compiled (rcu_report_exp_cpu_mult's leaf-CPU loop).
+                    # A loop whose only effects are where the image makes a choice, or in its init:
+                    # the image decides whether the loop is compiled, and so whether the init's
+                    # values are used (rcu_report_exp_cpu_mult's for_each_leaf_node_cpu_mask, whose
+                    # find_next_bit is small_const_nbits' path or a call). The init's effects, which
+                    # are compiled either way, are left to the image with it.
                     self.conditional += 1
                     try:
                         self.walk(child, node, child_index, None, generic)

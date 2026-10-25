@@ -297,3 +297,22 @@ def test_a_prefetched_address_is_left_to_the_image(fold_build: dict[str, Any]) -
     assert {(item["field"], bool(item.get("conditional"))) for item in accesses} == {("curr", True), ("sl", True)}
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert "function:fd_prefetch" not in {entry["function"] for entry in offsets["misses"]}
+
+
+def test_a_loop_whose_only_effects_are_in_its_init_keeps_only_those(fold_build: dict[str, Any]) -> None:
+    """fd_report_leaves: lw level; bnez ebreak; j obj_free (llvm-objdump): the init's WARN stays, the
+    loop and the locals its init stores go."""
+    assert folded_fields(fold_build, "fd_report_leaves") == {"level"}
+
+
+def test_a_loop_past_its_init_whose_effects_the_image_decides_is_left_to_the_image(fold_build: dict[str, Any]) -> None:
+    """fd_report_leaves_image (llvm-objdump: lw level; ebreak; j obj_free): every field is the image's
+    to decide, and none misses."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_report_leaves_image"]
+    assert {(item["field"], bool(item.get("conditional"))) for item in accesses} == {
+        ("level", True),
+        ("lo", True),
+        ("hi", True),
+    }
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert "function:fd_report_leaves_image" not in {entry["function"] for entry in offsets["misses"]}

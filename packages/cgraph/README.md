@@ -51,7 +51,8 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   without an effect (`rcutree_online_cpu`'s `return 0` before `tick_dep_clear(); return 0;`), a loop
   that may be assumed to end, that control leaves only by its end (not `__aggregate_find`'s list walk,
   which returns its cursor), and that stores only to locals nothing after it reads
-  (`flush_all_rcu_sheaves`' list walk with `CONFIG_SLUB_TINY`), stores to a local or a parameter
+  (`flush_all_rcu_sheaves`' list walk with `CONFIG_SLUB_TINY`; where only the `for` header's init has
+  an effect, only that effect is code: `for_each_leaf_node_cpu_mask`'s `WARN_ON_ONCE`), stores to a local or a parameter
   that compiled code never reads, such as `local_lock`'s `__tl` or a struct whose address only dead
   code takes, a store every read sees stored again first (`ipi_mux_send_mask`'s `icpu`, stored again
   at the top of the loop), and arguments to a parameter the callee never reads in compiled code),
@@ -293,7 +294,9 @@ These rules follow what the machine code shows, each only where it shows it:
   A discarded value whose only effects are where the image makes a choice (`cpumask_empty`'s
   `find_first_bit`, after `bitmap_empty`'s `__builtin_constant_p` test returns, in `vmstat_cpu_dead`)
   is `conditional`: the image decides whether it is compiled. So is a loop of such effects only
-  (`rcu_report_exp_cpu_mult`'s `for_each_leaf_node_cpu_mask` without `NO_HZ_FULL`), and so are the
+  (`rcu_report_exp_cpu_mult`'s `for_each_leaf_node_cpu_mask` without `NO_HZ_FULL`, whose
+  `find_next_bit` is `small_const_nbits`' path or a call), with its `for` header's init, whose effects
+  are left to the image with it, and so are the
   operands of `__builtin_prefetch`, a hint rv64 without Zicbop emits nothing for
   (`task_sched_runtime`'s `prefetch_curr_exec_start`).
   `&v` of a local passed to a parameter an inline callee only stores through (`range->end = end`),
