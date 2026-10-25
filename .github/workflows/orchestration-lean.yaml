@@ -80,8 +80,8 @@ jobs:
           lean_version="$(lean --version)"
           printf '%s\n' "$lean_version"
           grep --fixed-strings "$LEAN_FORK_COMMIT" <<<"$lean_version"
-      - name: Test the declaration index, the similarity gate and the graph checks with Lean
+      - name: Test the declaration index, the similarity gate, the container image and the graph checks with Lean
         working-directory: packages/orchestration
         run: |
           lean --version
-          go test -count=1 ./declindex/... ./conceptgate/... ./cmd/declindex/... ./graphcheck/... ./cmd/graphcheck/...
+          go test -count=1 ./declindex/... ./conceptgate/... ./cmd/declindex/... ./internal/testdocker/... ./graphcheck/... ./cmd/graphcheck/...
