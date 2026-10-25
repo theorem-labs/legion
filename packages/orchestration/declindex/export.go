@@ -336,9 +336,11 @@ type Constant struct {
 	Facts     []Fact   `json:"f"`
 	Truncated bool     `json:"tr"`
 	// Binders are the heads of the types of the constant's explicit binders, in order, and Conclusion the head of its
-	// type past every binder. A head is the constant applied at the top of a type, past the type's own binders and
-	// its default value's or tactic's annotation, as Lean prints its full name; empty when it is not a constant (a
-	// variable, a sort). They are read from the elaborated type, which every reader of it gets alike.
+	// type past every binder. A head is the constant at the bottom of the application at the top of a type, past the
+	// type's own binders, its default value's or tactic's annotation and any metadata, as Lean prints its full name;
+	// empty when it is not a constant (a variable, a sort). They and Type are read from the elaborated type of the
+	// module's own declaration, also where Lean merged two modules' declarations of one theorem, so a module gives
+	// the same row whichever modules are read with it.
 	Binders    []string `json:"b"`
 	Conclusion string   `json:"c"`
 }
