@@ -190,11 +190,12 @@ func linker(l Lean, cc string) string {
 
 // CompileModule compiles the one file root/rel.lean to root/rel.olean and root/rel.ilean, against the modules
 // of searchPath (and root), as `lean` does for one module of a build. Lean runs in root with root as its home and
-// the minimal environment of Lean.env.
-func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel string) error {
+// the minimal environment of Lean.env. args go to `lean` before the file: the options the build passes to each
+// module (`-Dname=value`, `--load-dynlib=...`), so a module compiles here as it does there.
+func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel string, args ...string) error {
 	base := filepath.Join(root, filepath.FromSlash(rel))
-	return run(ctx, root, l.env(append([]string{root}, searchPath...), root), l.bin("lean"), "-R", root,
-		"-o", base+".olean", "-i", base+".ilean", base+".lean")
+	argv := slices.Concat([]string{"-R", root, "-o", base + ".olean", "-i", base + ".ilean"}, args, []string{base + ".lean"})
+	return run(ctx, root, l.env(append([]string{root}, searchPath...), root), l.bin("lean"), argv...)
 }
 
 // confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path
@@ -336,9 +337,11 @@ type Constant struct {
 	Facts     []Fact   `json:"f"`
 	Truncated bool     `json:"tr"`
 	// Binders are the heads of the types of the constant's explicit binders, in order, and Conclusion the head of its
-	// type past every binder. A head is the constant applied at the top of a type, past the type's own binders and
-	// its default value's or tactic's annotation, as Lean prints its full name; empty when it is not a constant (a
-	// variable, a sort). They are read from the elaborated type, which every reader of it gets alike.
+	// type past every binder. A head is the constant at the bottom of the application at the top of a type, past the
+	// type's own binders, its default value's or tactic's annotation and any metadata, as Lean prints its full name;
+	// empty when it is not a constant (a variable, a sort). They and Type are read from the elaborated type of the
+	// module's own declaration, also where Lean merged two modules' declarations of one theorem, so a module gives
+	// the same row whichever modules are read with it.
 	Binders    []string `json:"b"`
 	Conclusion string   `json:"c"`
 }

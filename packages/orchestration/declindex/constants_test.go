@@ -176,3 +176,103 @@ func TestAModuleCompiledInScratchGivesTheRowsTheIndexHolds(t *testing.T) {
 		}
 	}
 }
+
+// compileSource writes src as the module mod of dir and compiles it there with Lean.
+func compileSource(t *testing.T, l Lean, dir, mod, src string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, mod+".lean"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompileModule(context.Background(), l, nil, dir, mod); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Two modules that declare one theorem, one with its hypothesis explicit and one with it implicit, import together:
+// Lean merges the two, since it compares their types without binder annotations, and keeps one of them. Each module's
+// row still gives its own type and binders, so a module reads the same whether the exporter reads it alone, with the
+// other, or as the index holds it.
+func TestAMergedTheoremKeepsItsOwnModulesBinders(t *testing.T) {
+	ctx := context.Background()
+	l := leanForTest(t)
+	dir := t.TempDir()
+	compileSource(t, l, dir, "A", "theorem dup (h : True) : True := h\n")
+	compileSource(t, l, dir, "B", "theorem dup {h : True} : True := h\n")
+	x := &Exporter{Lean: l, Bin: exporterForTest(t, l), SearchPath: []string{dir}, Jobs: 1}
+	roots := []string{"A", "B"}
+	var alone []Constant
+	for _, mod := range roots {
+		cs, err := x.Run(ctx, Manifest{Modules: []string{mod}, Roots: roots, Types: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		alone = append(alone, cs...)
+	}
+	alone = byModuleAndName(alone)
+	if len(alone) != 2 || !reflect.DeepEqual(alone[0].Binders, []string{"True"}) || !reflect.DeepEqual(alone[1].Binders, []string{}) {
+		t.Fatalf("A.dup and B.dup read alone = %+v; want binders [True] and []", alone)
+	}
+	together, err := x.Run(ctx, Manifest{Modules: roots, Roots: roots, Types: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := byModuleAndName(together); !reflect.DeepEqual(got, alone) {
+		t.Errorf("read together:\n%+v\nread alone:\n%+v", got, alone)
+	}
+	s := openStore(t)
+	tree := Tree{Source: dir, Lib: dir, Roots: Roots{"A": true, "B": true}}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: goldenCommit, Compiled: compiledWith(&CompiledOptions{Exporter: x, Dir: t.TempDir()})}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompiledCommit(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	held, err := s.ConstantsIn(ctx, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(held, alone) {
+		t.Errorf("the index holds:\n%+v\nread alone:\n%+v", held, alone)
+	}
+}
+
+// Metadata that an elaborator puts on a partly applied constant, inside an application, hides no head: the head is
+// the constant at the bottom of the application, past metadata anywhere on the way.
+func TestMetadataInsideAnApplicationHidesNoHead(t *testing.T) {
+	ctx := context.Background()
+	l := leanForTest(t)
+	dir := t.TempDir()
+	compileSource(t, l, dir, "Annotated", "import Lean\nopen Lean Elab Term\n"+
+		"elab \"annotatedEq\" : term => do\n"+
+		"  let e ← elabTerm (← `(Eq (0 : Nat))) none\n"+
+		"  return mkMData (KVMap.empty.setBool `annotated true) e\n"+
+		"theorem plainConclusion : (0 : Nat) = 0 := rfl\n"+
+		"theorem annotatedConclusion : annotatedEq 0 := rfl\n"+
+		"theorem annotatedBinder (h : annotatedEq 0) : True := trivial\n")
+	x := &Exporter{Lean: l, Bin: exporterForTest(t, l), SearchPath: []string{dir}, Jobs: 1}
+	cs, err := x.Run(ctx, Manifest{Modules: []string{"Annotated"}, Roots: []string{"Annotated"}, Types: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Constant{}
+	for _, c := range cs {
+		got[c.Name] = c
+	}
+	for name, want := range map[string]struct {
+		binders    []string
+		conclusion string
+	}{
+		"plainConclusion":     {[]string{}, "Eq"},
+		"annotatedConclusion": {[]string{}, "Eq"},
+		"annotatedBinder":     {[]string{"Eq"}, "True"},
+	} {
+		c, ok := got[name]
+		if !ok {
+			t.Errorf("the exporter gave no constant %s", name)
+			continue
+		}
+		if !reflect.DeepEqual(c.Binders, want.binders) || c.Conclusion != want.conclusion {
+			t.Errorf("%s (%s): binders %q, conclusion %q; want %q, %q", name, c.Type, c.Binders, c.Conclusion, want.binders, want.conclusion)
+		}
+	}
+}

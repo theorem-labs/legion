@@ -73,10 +73,20 @@ func (s *Store) declsWhere(ctx context.Context, column string, values []string) 
 // target is the name, or begins with the name and a dot (a field, a constructor, an equation lemma) or a slash (a
 // name a macro made). The range is from the name and a dot to the name and the character after a slash, which are
 // the only two characters between them, so one index range holds both and nothing else. A graph check compares the
-// targets themselves, so this read does not resolve which declaration a target belongs to, as usersOf does.
+// targets themselves, so this read does not resolve which declaration a target belongs to, as usersOf does. A name
+// that is itself a part of another name asked for (Box.val beside Box) is not read again: the other's range holds
+// its uses, so each use comes as many times as the index records it, whatever keys overlap.
 func (s *Store) UsesOf(ctx context.Context, names []string) ([]Use, error) {
+	keys := distinct(names)
+	asked := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		asked[k] = true
+	}
 	var out []Use
-	for _, name := range distinct(names) {
+	for _, name := range keys {
+		if partOfAnother(name, asked) {
+			continue
+		}
 		rows, err := s.q.QueryContext(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
 			WHERE target = ? OR (target >= ? AND target < ?)`, name, name+".", name+"0")
 		err = eachRow(rows, err, func(r *sql.Rows) error {
@@ -93,6 +103,16 @@ func (s *Store) UsesOf(ctx context.Context, names []string) ([]Use, error) {
 	}
 	sortUses(out)
 	return out, nil
+}
+
+// partOfAnother reports whether name begins with one of names and a dot or a slash: that name's uses range holds it.
+func partOfAnother(name string, names map[string]bool) bool {
+	for i := range len(name) {
+		if (name[i] == '.' || name[i] == '/') && names[name[:i]] {
+			return true
+		}
+	}
+	return false
 }
 
 // Imports maps every module the index read to the modules that it imports directly, sorted; a module that imports

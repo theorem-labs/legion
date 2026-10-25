@@ -46,14 +46,21 @@ def kindOf : ConstantInfo → String
   | .defnInfo _ => "def" | .thmInfo _ => "theorem" | .inductInfo _ => "inductive" | .ctorInfo _ => "ctor"
   | .axiomInfo _ => "axiom" | .opaqueInfo _ => "opaque" | .recInfo _ => "rec" | .quotInfo _ => "quot"
 
-/-- The constant at the head of `e` past its own binders and its type annotations (`optParam`, `autoParam`,
-`outParam`), as Lean prints its full name; empty when the head is not a constant (a variable, a sort). -/
+/-- The constant at the bottom of the application `e`, past metadata anywhere on its spine (an elaborator can put
+metadata on a partly applied constant); empty when there is none. -/
+partial def appHead (e : Expr) : String :=
+  match e.consumeMData with
+  | .app f _ => appHead f
+  | .const n _ => n.toString
+  | _ => ""
+
+/-- The constant at the head of `e` past its own binders, its type annotations (`optParam`, `autoParam`,
+`outParam`) and metadata, as Lean prints its full name; empty when the head is not a constant (a variable, a
+sort). -/
 partial def headOf (e : Expr) : String :=
   match e.cleanupAnnotations with
   | .forallE _ _ b _ => headOf b
-  | e => match e.getAppFn.cleanupAnnotations with
-    | .const n _ => n.toString
-    | _ => ""
+  | e => appHead e
 
 /-- The heads (`headOf`) of the types of a type's explicit binders, in order, and the head of its conclusion: the
 type past all its binders. Read from the elaborated type, not from how its source writes it. -/
@@ -126,9 +133,12 @@ partial def identify (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Nam
 end
 
 /-- One JSON line for the constant `c` of the target module `m`. `ids` holds the identities that the hashes count
-references by (`identify`), `base` the module of a constant that Lean does not merge. -/
+references by (`identify`), `base` the module of a constant that Lean does not merge. `ci` is the environment's
+constant `c`, which the hashes read; `own` is the one that `m` itself declares. They differ for a theorem that two
+modules declare and Lean merges, since it compares types without binder annotations: the printed type and the
+heads are `own`'s, so a module gives the same row whichever modules are read with it. -/
 def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Name) (types : Bool) (m : Name)
-    (c : Name) (ci : ConstantInfo) : StateRefT St MetaM Json := do
+    (c : Name) (ci own : ConstantInfo) : StateRefT St MetaM Json := do
   let env ← getEnv
   let exprs := statementExprs env ci
   let mut w : Walk := {}
@@ -154,10 +164,10 @@ def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Na
     let s := (atomHash env moduleOf a).hex
     if !atoms.contains s then atoms := atoms.push s
   let ty ← if types then
-      try pure (truncate (toString (← ppExpr ci.type)))
-      catch _ => pure (truncate (toString ci.type))
+      try pure (truncate (toString (← ppExpr own.type)))
+      catch _ => pure (truncate (toString own.type))
     else pure ""
-  let (binders, conclusion) := headsOf ci.type
+  let (binders, conclusion) := headsOf own.type
   let mut fields : List (String × Json) := [
     ("n", toJson c.toString), ("m", toJson m.toString), ("k", toJson (kindOf ci)), ("t", toJson ty),
     ("h", toJson h.hex), ("a", toJson atoms),
@@ -217,10 +227,11 @@ def main (args : List String) : IO UInt32 := do
     for ms in manifest.modules do
       let m := toName ms
       let some idx := env.getModuleIdx? m | throwError "module {m} is not loaded"
-      for c in env.header.moduleData[idx.toNat]!.constNames do
+      for own in env.header.moduleData[idx.toNat]!.constants do
+        let c := own.name
         let some ci := env.find? c | continue
         if auxiliary env c ci then continue
-        let j ← record cfg ids base manifest.types m c ci
+        let j ← record cfg ids base manifest.types m c ci own
         out.putStrLn j.compress
         n := n + 1
     return n
