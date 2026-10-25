@@ -33,11 +33,12 @@ on:
       - "bun.lock"
       - "patches/**"
       - "skills/**"
+      # docs/site/generators/legion-config.sh renders these examples into the config reference.
+      - "deploy/kubernetes/**"
       - "scripts/third-party-notices.ts"
       - ".github/workflows/docs.yaml"
       - ".github/scripts/check-private-names.sh"
   pull_request:
-    # The same list: GitHub Actions reads no YAML anchor in a workflow file.
     paths:
       - "docs/site/**"
       - "packages/daemon/**"
@@ -53,6 +54,7 @@ on:
       - "bun.lock"
       - "patches/**"
       - "skills/**"
+      - "deploy/kubernetes/**"
       - "scripts/third-party-notices.ts"
       - ".github/workflows/docs.yaml"
       - ".github/scripts/check-private-names.sh"
