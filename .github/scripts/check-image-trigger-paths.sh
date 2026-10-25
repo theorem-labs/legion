@@ -496,10 +496,6 @@ def classify_run_step(step: dict) -> list[tuple[str, bool]]:
 NON_BUILDING_ACTIONS = {
     "actions/attest-build-provenance",
     "actions/cache",
-    # The same action's restore-only and save-only entry points, which a workflow uses when its
-    # cache is written on one event and only read on another.
-    "actions/cache/restore",
-    "actions/cache/save",
     "actions/checkout",
     "actions/configure-pages",
     "actions/deploy-pages",
