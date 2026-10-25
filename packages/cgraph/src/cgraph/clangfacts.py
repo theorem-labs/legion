@@ -25,7 +25,7 @@ import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, ClassVar, TypeVar
+from typing import Any, ClassVar, TypeVar, cast
 
 import clang.cindex as ci
 from clang.cindex import CursorKind as K
@@ -471,7 +471,8 @@ class _Extractor:
             self.ignored_parameters,
         )  # fmt: skip
         self.ignored_cache: dict[str, tuple[frozenset[int], int | None]] = {}
-        self.condition_cache: dict[str, tuple[list[list[dict[str, Any]]], int | None]] = {}
+        self.condition_cache: dict[str, tuple[list[list[list[dict[str, Any]]] | None], int | None]] = {}
+        self.foldable_cache: dict[str, bool] = {}
         self.returned: dict[str, _Address | None] = {}
         self.returned_bits: dict[str, int | None] = {}
         self.cancel_cache: dict[tuple[str, int, int], bool] = {}
@@ -1001,11 +1002,11 @@ class _Extractor:
         self.ignored_cache[name] = (result, self.horizon(start))
         return result
 
-    def parameter_conditions(self, callee: ci.Cursor | None) -> list[list[dict[str, Any]]]:
-        """Per parameter of an inline function of the unit, the guards (on its parameters) under which
-        compiled code reads it (``_FunctionWalk.read_condition``): pte_clear's mm reaches only
+    def parameter_reads(self, callee: ci.Cursor | None) -> list[list[list[dict[str, Any]]] | None]:
+        """Per parameter of a function of the unit, the guards each read of it in compiled code is under
+        (``_FunctionWalk.read_ways``), or None where one read is under none: pte_clear's mm reaches only
         __set_pte_at's ``if (pte_present(pteval) && …) flush_icache_pte(mm, pteval)``."""
-        if callee is None or callee.kind != K.FUNCTION_DECL or not self.inline_function(callee.spelling):
+        if callee is None or callee.kind != K.FUNCTION_DECL:
             return []
         name = callee.spelling
         cached = self.reuse(self.condition_cache, name)
@@ -1020,9 +1021,38 @@ class _Extractor:
             walk = self.analysis(definition)
         finally:
             self.nesting -= 1
-        result = [walk.read_condition(parameter) for parameter in definition.get_arguments() or []]
+        result = [walk.read_ways(parameter) for parameter in definition.get_arguments() or []]
         self.condition_cache[name] = (result, self.horizon(start))
         return result
+
+    def foldable(self, expression: ci.Cursor, depth: int = 0) -> bool:
+        """Every function the expression calls is a builtin or an inline function of the unit whose
+        body calls only such functions too: the compiler sees all of it at the call, so a value the
+        evaluator decides is one it folds. A call of another function stays (device_add's
+        device_create_file, which the image calls though sysfs_create_file is a stub)."""
+        for node in _effect_nodes(expression, self.live_children):
+            if node.kind != K.CALL_EXPR:
+                continue
+            callee = node.referenced
+            if callee is None or callee.kind != K.FUNCTION_DECL:
+                return False
+            name = callee.spelling
+            if name.startswith("__builtin_"):
+                continue
+            if name not in self.foldable_cache:
+                definition = self.evaluator.definitions.get(name)
+                self.foldable_cache[name] = False
+                body = _function_body(definition) if definition is not None else None
+                self.foldable_cache[name] = bool(
+                    body is not None
+                    and depth < _EFFECT_DEPTH
+                    and self.inline_function(name)
+                    and not self.is_weak(definition)
+                    and self.foldable(body, depth + 1)
+                )
+            if not self.foldable_cache[name]:
+                return False
+        return True
 
     def stored_parameters(self, callee: ci.Cursor | None) -> tuple[frozenset[int], dict[int, frozenset[int]]]:
         """An inline function's parameters that compiled code only stores through (``r->end = end``:
@@ -1539,6 +1569,31 @@ def _type_selection(node: ci.Cursor) -> set[int] | None:
     return matches if len(matches) == 1 else None
 
 
+def _ruled_out(way: list[dict[str, Any]], values: list[dict[str, Any] | None]) -> bool:
+    """One of the guards a read is under is decided against by these argument values (link._decision's
+    rule: a ``u`` guard where its expression is decided, a plain one where its truth is not ``v``; an
+    ``image`` guard leaves the read to the image)."""
+    for guard in way:
+        truth = expressions.truth(expressions.substitute(guard["e"], values))
+        if truth is None or guard.get("image"):
+            continue
+        if "u" in guard or bool(truth) != guard["v"]:
+            return True
+    return False
+
+
+def _continues(body: ci.Cursor) -> bool:
+    """A ``continue`` of the loop whose body this is (not one of a loop inside it)."""
+    pending = [body]
+    while pending:
+        node = pending.pop()
+        if node.kind == K.CONTINUE_STMT:
+            return True
+        if node.kind not in _LOOPS:
+            pending.extend(_children(node))
+    return False
+
+
 def _generic_callee(call: ci.Cursor) -> ci.Cursor | None:
     """The function a call through ``_Generic(x, a: f, b: g)(…)`` calls, where the selection's type
     names one association (``_type_selection``): seqlock.h's ``__seqprop(s, preemptible)(s)``."""
@@ -1570,6 +1625,8 @@ _ASSIGN = 22
 _ZEROING = (3, 17)
 # CXBinaryOperatorKind EQ and NE.
 _EQUALITY = (15, 16)
+# CXBinaryOperatorKind LAnd and LOr.
+_SHORT_CIRCUITS = (20, 21)
 # CXBinaryOperatorKind Shl.
 _SHIFT_LEFT = 8
 
@@ -2031,6 +2088,11 @@ _TRANSFERS = (K.RETURN_STMT, K.BREAK_STMT, K.CONTINUE_STMT)
 _CHOOSING = (K.BINARY_OPERATOR, K.UNARY_OPERATOR, K.CALL_EXPR, K.CONDITIONAL_OPERATOR, K.DECL_REF_EXPR)
 # A template's value where no path returns (each calls a noreturn function).
 _NEVER: Any = object()
+# A variable's value in program order (``_FunctionWalk.value_at``): it cannot be traced there, the
+# statement does not write it, or no path leaves the statement by its end.
+_UNTRACED: Any = object()
+_UNWRITTEN: Any = object()
+_ENDS: Any = object()
 
 
 @dataclass(frozen=True)
@@ -2957,12 +3019,16 @@ class _FunctionWalk:
         self.loops: list[_Place] = []
         self.once_loops: list[tuple[_Place, int, ci.Cursor]] = []  # loops that run at most once, on a variable
         self.backward = False  # the function jumps back (a goto to an earlier label, a computed goto)
+        self.gotos: dict[str, list[ci.Cursor]] = collections.defaultdict(list)  # per label, its gotos
+        self.label_values: dict[tuple[int, int], Any] = {}  # per variable and label, its value there
         # Guards: the conditions on the parameters under which the code being walked is compiled.
         self.guard_table: list[dict[str, Any]] = []
         self.guard_ids: dict[str, int] = {}
         self.guard_stack: list[int] = []
         self.case_guards: dict[int, tuple[dict[str, Any], bool]] = {}
         self.holding: set[int] = set()  # the variables whose values are being stated (a cycle is unknown)
+        self.guarding: set[int] = set()  # the variables whose stores' conditions are being stated
+        self.written_in: dict[int, frozenset[int]] = {}  # per node, the variables its subtree writes
         self.positions: dict[str, Any] | None = None
         # Per label, the guards each goto in code reached it under (None: under a choice the image
         # makes, or a label whose address is taken), in the order the walk met them.
@@ -2984,6 +3050,19 @@ class _FunctionWalk:
     def read_guard(self, variable: ci.Cursor) -> list[int]:
         """``read_condition``'s guards as indexes into the function's table."""
         return [self.guard_id(guard["e"], guard["v"]) for guard in self.read_condition(variable)]
+
+    def read_ways(self, variable: ci.Cursor) -> list[list[dict[str, Any]]] | None:
+        """The guards each read of the variable in compiled code is under; None where a read is under
+        none or where the image decides, or the variable may be read another way (its address, a
+        cleanup)."""
+        found = self.read_guards.get(variable.hash, [])
+        if (
+            any(not read for read in found)
+            or variable.hash in self.address_taken
+            or any(child.kind == K.UNEXPOSED_ATTR for child in variable.get_children())
+        ):
+            return None
+        return [[self.guard_table[index] for index in read] for read in found if read is not None]
 
     def read_condition(self, variable: ci.Cursor) -> list[dict[str, Any]]:
         """The guards under which some read of the variable in compiled code is: those every read is
@@ -3213,13 +3292,23 @@ class _FunctionWalk:
         assignments write may hold its first value (the argument, or the initializer; a local read
         before every store reads an indeterminate value) or any value assigned, and one that ``|=``,
         ``&=`` or ``^=`` change also what each makes of those (dequeue_entity's ``action |=
-        DO_DETACH``): a choice, decided only where every choice agrees. A pointer set once whose
-        value cannot be stated is named instead (``symbol``)."""
+        DO_DETACH``): a choice, decided only where every choice agrees. A store in a branch a constant
+        condition rules out gives nothing, and one under conditions on the parameters gives its value
+        only where they hold (``store_guard``: __folio_add_rmap's ``nr_pmdmapped = nr_pages`` under
+        ``level == PGTABLE_LEVEL_PMD``). A pointer set once whose value cannot be stated is named
+        instead (``symbol``)."""
         key = variable.hash
-        if key in self.holding or depth > _EXPRESSION_DEPTH:
+        if depth > _EXPRESSION_DEPTH or (variable.kind == K.VAR_DECL and not _is_local(variable)):
+            # A static local keeps its value between calls (__ONCE_LITE_IF's __already_done): unknown.
             return None
         uses = self.local_uses()
         index = self.parameters.get(key) if variable.kind == K.PARM_DECL else None
+        if key in self.holding:
+            # The parameter in the condition of its own store (alloc_pages_node_noprof's ``if (nid ==
+            # NUMA_NO_NODE) nid = numa_mem_id();``): before every store it holds the argument.
+            if key in self.guarding and index is not None and self.assigned_after(variable, reference):
+                return {"p": index}
+            return None
         combined = self.combined(variable, uses["written"][key])
         if combined is None:
             if index is None or uses["assigned"][key] or not self.escapes_after(variable, reference):
@@ -3228,29 +3317,77 @@ class _FunctionWalk:
         evaluator = self.x.evaluator
         self.holding.add(key)
         try:
-            values: list[dict[str, Any] | None] = [{"p": index}] if index is not None else []
+            first: dict[str, Any] | None = {"p": index} if index is not None else None
+            values: list[dict[str, Any] | None] = [first] if first is not None else []
             initializer = libclang.var_initializer(variable) if index is None else None
             if initializer is not None:
-                values.append(evaluator.expression(initializer, self.held, depth + 1))
+                first = evaluator.expression(initializer, self.held, depth + 1)
+                values.append(first)
             if combined or not self.assigned_after(variable, reference):
                 # set_pageblock_migratetype's migratetype < MIGRATE_PCPTYPES before migratetype =
                 # MIGRATE_UNMOVABLE: only the first value reaches the reference.
-                values += [
-                    evaluator.expression(definition, self.held, depth + 1)
-                    for definition, _ in self.definitions.get(key, [])
-                ]
-            operands = [(operator, evaluator.expression(value, self.held, depth + 1)) for operator, value in combined]
+                for definition, _ in self.definitions.get(key, []):
+                    if self.dead_store(definition):
+                        continue
+                    stored = evaluator.expression(definition, self.held, depth + 1)
+                    guard = self.store_guard(variable, definition) if first is not None else None
+                    if stored is None and guard is None:
+                        values.append(None)
+                    else:
+                        values.append(stored if guard is None else {"op": "?:", "a": [guard, stored, first]})
+            operands = [
+                (operator, evaluator.expression(value, self.held, depth + 1), self.store_guard(variable, value))
+                for operator, value in combined
+                if not self.dead_store(value)
+            ]
         finally:
             self.holding.discard(key)
-        if not values or any(value is None for value in values) or any(operand is None for _, operand in operands):
+        if not values or any(value is None for value in values):
+            return self.symbol(variable)
+        if any(operand is None and guard is None for _, operand, guard in operands):
             return self.symbol(variable)
         choice = values[0]
         for value in values[1:]:
             choice = {"op": "?:", "a": [None, choice, value]}
         typed = _integer_type(variable.type) or {}
-        for operator, operand in operands:
-            choice = {"op": "?:", "a": [None, choice, {"op": operator, "a": [choice, operand], **typed}]}
+        for operator, operand, guard in operands:
+            changed: dict[str, Any] = {"op": operator, "a": [choice, operand], **typed}
+            if guard is not None:
+                # folio_pte_batch_flags' any_writable |= pte_write(pte) under flags & FPB_MERGE_WRITE.
+                changed = {"op": "?:", "a": [guard, changed, choice]}
+            choice = {"op": "?:", "a": [None, choice, changed]}
         return choice
+
+    def store_guard(self, variable: ci.Cursor, value: ci.Cursor) -> dict[str, Any] | None:
+        """The condition on the parameters the store of ``value`` into ``variable`` runs under: those of
+        the ``if``s, ``?:``s and switch cases around it that name a parameter, as one expression, or
+        None. A branch a label is in, where a goto may enter, gives none."""
+        terms: list[dict[str, Any]] = []
+        node = self.parents.get(value.hash)
+        self.guarding.add(variable.hash)
+        try:
+            while node is not None and node.hash != self.cursor.hash:
+                parent = self.parents.get(node.hash)
+                if parent is None:
+                    break
+                parts = _children(parent)
+                entered = self.has_label(node)
+                branch = parent.kind in (K.IF_STMT, K.CONDITIONAL_OPERATOR) and len(parts) >= 2
+                if branch and not entered and node.hash != parts[0].hash:
+                    guard = self.guard_expression(parts[0])
+                    if guard is not None:
+                        terms.append({"e": guard, "v": node.hash == parts[1].hash})
+                case = self.case_guards.get(node.hash) if parent.kind == K.COMPOUND_STMT and not entered else None
+                if case is not None and case[0] is not None:
+                    terms.append({"e": case[0], "v": case[1]})
+                step = (self.header_parts(parent) or {}).get("step") if parent.kind == K.FOR_STMT else None
+                if step is not None and node.hash == step.hash:
+                    # kuid_root_in_ns's ns = ns->parent runs only where the first pass falls through.
+                    terms += [{"e": term, "v": False} for term in self.step_terms(parent) or []]
+                node = parent
+        finally:
+            self.guarding.discard(variable.hash)
+        return _any_way([terms]) if terms else None
 
     def combined(self, variable: ci.Cursor, written: int) -> list[tuple[str, ci.Cursor]] | None:
         """The ``|=``, ``&=`` and ``^=`` the function makes to a variable, where those are its
@@ -3352,17 +3489,30 @@ class _FunctionWalk:
         return expression if expressions.mentions_parameter(expression) else None
 
     def flowed(self, variable: ci.Cursor, reference: ci.Cursor, depth: int) -> dict[str, Any] | None:
-        """The values a local may hold at ``reference`` on live paths: the store every path to it
-        passes and the stores that can still come after that one (copy_creds' ``ret =
-        create_user_ns(new); if (ret < 0)``), or, without such a store, its initial value and each store
-        outside a branch a constant condition rules out (dma_direct_alloc's ``remap = true`` under
-        PageHighMem). A local whose address is taken only after the reference, outside any loop, keeps
-        these values there (mlock_pte_range's ``ptl``); any other one is stated as ``held`` states it."""
+        """The values a local may hold at ``reference`` on live paths: as the statements before it in
+        program order give it (``value_at``: alloc_pages_node_noprof's ``if (nid == NUMA_NO_NODE) nid =
+        numa_mem_id();``), or else the store every path to it passes and the stores that can still come
+        after that one (copy_creds' ``ret = create_user_ns(new); if (ret < 0)``), or, without such a
+        store, its initial value and each store outside a branch a constant condition rules out
+        (dma_direct_alloc's ``remap = true`` under PageHighMem). A local whose address is taken only
+        after the reference, outside any loop, keeps these values there (mlock_pte_range's ``ptl``); any
+        other one is stated as ``held`` states it."""
         key = variable.hash
         writes = self.x.evaluator.stores_in(self.cursor)
         if variable.kind == K.VAR_DECL and not _is_local(variable):
             # A static local keeps its value between calls.
             return None
+        written = key in writes.stores or key in writes.combined or key in writes.opaque
+        if (
+            written
+            and variable.kind in (K.VAR_DECL, K.PARM_DECL)
+            and key not in self.holding
+            and depth <= _EXPRESSION_DEPTH
+            and not (key in writes.opaque and not self.escapes_after(variable, reference))
+        ):
+            found = self.value_at(variable, reference, depth)
+            if found is not _UNTRACED:
+                return cast("dict[str, Any] | None", found)
         if (
             variable.kind != K.VAR_DECL
             or key in self.holding
@@ -3378,10 +3528,12 @@ class _FunctionWalk:
             value, keep = dominating
             others = [other for other, place in definitions if other.hash != value.hash and keep(other, place)]
             sources = [value, *(other for other in others if not self.dead_store(other))]
+        elif key not in writes.opaque:
+            # held skips the stores a constant rules out and puts each other under its conditions on
+            # the parameters (__folio_add_rmap's nr_pmdmapped = nr_pages under level == PMD).
+            return self.held(variable, reference, depth)
         else:
             live = [other for other, _ in definitions if not self.dead_store(other)]
-            if len(live) == len(definitions) and key not in writes.opaque:
-                return self.held(variable, reference, depth)
             initializer = libclang.var_initializer(variable)
             # A read before every store reads an indeterminate value: without an initial value, the
             # live stores decide (shrink_folio_list's writeout: res = swap_writeout()'s 0).
@@ -3399,6 +3551,244 @@ class _FunctionWalk:
         for value in stated[1:]:
             choice = {"op": "?:", "a": [None, choice, value]}
         return choice
+
+    def value_at(self, variable: ci.Cursor, reference: ci.Cursor, depth: int) -> Any:
+        """The variable's value at ``reference``, following the statements before it in program order
+        back to the store that reaches it: a plain assignment as a statement, the declaration's
+        initializer, a parameter's argument at the function's start, and an ``if`` whose branches end
+        with different values as the choice its condition makes (``cond ? then : else``; a branch that
+        always exits gives none). ``_UNTRACED`` where the way back passes a loop, a label, a case, a
+        statement that writes the variable otherwise, or the function jumps back."""
+        if self.backward or depth > _EXPRESSION_DEPTH:
+            return _UNTRACED
+        self.local_uses()
+        node = reference
+        while True:
+            parent = self.parents.get(node.hash)
+            if parent is None:
+                return _UNTRACED
+            parts = _children(parent)
+            if parent.kind in (K.IF_STMT, K.SWITCH_STMT) and parts and parts[0].hash == node.hash:
+                return _UNTRACED if self.writes(node, variable) else self.value_before(variable, parent, depth)
+            # A statement in a block, a branch of an if, or a label's statement: as control enters it.
+            branch = parent.kind == K.IF_STMT and parts and parts[0].hash != node.hash
+            if parent.kind in (K.COMPOUND_STMT, K.LABEL_STMT) or branch:
+                return _UNTRACED if self.writes(node, variable) else self.value_before(variable, node, depth)
+            if parent.kind in (*_LOOPS, *_ENTRIES, K.SWITCH_STMT, K.StmtExpr, K.FUNCTION_DECL):
+                return _UNTRACED
+            node = parent
+
+    def value_before(self, variable: ci.Cursor, statement: ci.Cursor, depth: int) -> Any:
+        """The variable's value where control enters ``statement`` (``value_at``)."""
+        node = statement
+        while True:
+            parent = self.parents.get(node.hash)
+            if parent is None:
+                return _UNTRACED
+            if parent.kind == K.COMPOUND_STMT:
+                siblings = _children(parent)
+                index = next((at for at, sibling in enumerate(siblings) if sibling.hash == node.hash), None)
+                if index is None:
+                    return _UNTRACED
+                for sibling in reversed(siblings[:index]):
+                    if sibling.kind in _ENTRIES or sibling.hash in self.label_holders:
+                        return _UNTRACED
+                    found = self.statement_value(variable, sibling, depth)
+                    if found is not _UNWRITTEN:
+                        return found
+                node = parent
+                continue
+            if parent.kind == K.FUNCTION_DECL:
+                index = self.parameters.get(variable.hash) if variable.kind == K.PARM_DECL else None
+                return {"p": index} if index is not None else _UNTRACED
+            parts = _children(parent)
+            if parent.kind == K.IF_STMT and parts and node.hash != parts[0].hash:
+                if self.writes(parts[0], variable):
+                    return _UNTRACED
+                named = self.branch_value(variable, parts[0], node.hash == parts[1].hash)
+                if named is not None:
+                    return named
+                node = parent
+                continue
+            if parent.kind == K.LABEL_STMT:
+                return self.label_value(variable, parent, depth)
+            return _UNTRACED
+
+    def branch_value(self, variable: ci.Cursor, condition: ci.Cursor, taken: bool) -> dict[str, Any] | None:
+        """The one value the variable holds in a branch of an ``if`` whose condition names it: ``!v``
+        and ``v == c`` where taken, ``v`` and ``v != c`` where not, give ``c`` (0 for a bare ``v``),
+        through ``!`` and ``__builtin_expect``: alloc_workqueue_attrs_noprof's ``if (!attrs) goto
+        fail;``. None for another condition."""
+        typed = _integer_type(variable.type)
+        node = _strip(condition)
+        negated = False
+        while True:
+            if node.kind == K.UNARY_OPERATOR and libclang.unary_kind(node) == libclang.LOGICAL_NOT and _children(node):
+                negated = not negated
+                node = _strip(_children(node)[0])
+            elif node.kind == K.CALL_EXPR and node.spelling == "__builtin_expect" and list(node.get_arguments()):
+                node = _strip(next(iter(node.get_arguments())))
+            else:
+                break
+        operands = _children(node)
+        constant: int | None = 0
+        if node.kind == K.BINARY_OPERATOR and len(operands) == 2 and libclang.binary_kind(node) in _EQUALITY:
+            # The condition is v == c (or v != c): equal where it holds.
+            equal = libclang.binary_kind(node) == _EQUALITY[0]
+            left, right = (_strip(operand) for operand in operands)
+            mine = [
+                side
+                for side in (left, right)
+                if side.kind == K.DECL_REF_EXPR
+                and side.referenced is not None
+                and side.referenced.hash == variable.hash
+            ]
+            if len(mine) != 1:
+                return None
+            other = right if mine[0] is left else left
+            constant = 0 if _is_null(other) else self.x.evaluator.evaluate(other)
+        elif node.kind == K.DECL_REF_EXPR and node.referenced is not None and node.referenced.hash == variable.hash:
+            equal = False  # a bare v holds where v != 0
+        else:
+            return None
+        # The condition holds as written where taken; ! reverses it.
+        fixed = equal != negated if taken else equal == negated
+        if typed is None or constant is None or not fixed:
+            return None
+        return {"c": constant, **typed}
+
+    def label_value(self, variable: ci.Cursor, label: ci.Cursor, depth: int) -> Any:
+        """The variable's value where control enters the statement of ``label`` (and of the labels
+        around it, ``a: b: stmt``): a choice among what each goto to them brings (``value_at`` the goto;
+        a goto a constant rules out brings nothing) and what falling into the first one brings, unless
+        the statement before it exits (timer_of_init's out_fail, which every goto enters before
+        ``flags |= TIMER_OF_IRQ``). ``_UNTRACED`` where a label's address is taken or a way is."""
+        key = (variable.hash, label.hash)
+        if key in self.label_values:
+            return self.label_values[key]
+        self.label_values[key] = _UNTRACED  # a way back to the label itself: untraced
+        top, names = label, [label.spelling]
+        while (above := self.parents.get(top.hash)) is not None and above.kind == K.LABEL_STMT:
+            top = above
+            names.append(top.spelling)
+        holder = self.parents.get(top.hash)
+        if self.gotos.get("*") or holder is None or holder.kind != K.COMPOUND_STMT:
+            return _UNTRACED
+        siblings = _children(holder)
+        index = next((at for at, sibling in enumerate(siblings) if sibling.hash == top.hash), 0)
+        ways: list[Any] = []
+        if index == 0 or not self.x.evaluator.exits(siblings[index - 1]):
+            ways.append(self.value_before(variable, top, depth + 1))
+        for name in names:
+            ways += [
+                self.value_at(variable, goto, depth + 1)
+                for goto in self.gotos.get(name, [])
+                if not self.dead_store(goto)
+            ]
+        found: Any = _UNTRACED
+        if ways and all(way is not _UNTRACED for way in ways):
+            found = ways[0]
+            for way in ways[1:]:
+                found = {"op": "?:", "a": [None, found, way]}
+        self.label_values[key] = found
+        return found
+
+    def statement_value(self, variable: ci.Cursor, statement: ci.Cursor, depth: int) -> Any:
+        """The variable's value where control leaves ``statement`` by its end, ``_UNWRITTEN`` where the
+        statement does not write it, ``_ENDS`` where control never leaves it by its end."""
+        if not self.writes(statement, variable):
+            return _UNWRITTEN
+        parts = _children(statement)
+        target = _strip(parts[0]) if len(parts) == 2 else None
+        if (
+            statement.kind == K.COMPOUND_ASSIGNMENT_OPERATOR
+            and target is not None
+            and target.kind == K.DECL_REF_EXPR
+            and target.referenced is not None
+            and target.referenced.hash == variable.hash
+        ):
+            # timer_of_init's flags |= TIMER_OF_BASE: the operator on the value before it.
+            operator = next(
+                (op for op, value in self.x.evaluator.stores_in(self.cursor).combined.get(variable.hash, [])
+                 if value.hash == parts[1].hash),
+                None,
+            )  # fmt: skip
+            if operator is None or self.writes(parts[1], variable):
+                return _UNTRACED
+            before = self.value_before(variable, statement, depth + 1)
+            if before is _UNTRACED:
+                return _UNTRACED
+            operand = self.x.evaluator.expression(parts[1], self.flowed, depth + 1)
+            return {"op": operator, "a": [before, operand], **(_integer_type(variable.type) or {})}
+        if statement.kind == K.DECL_STMT:
+            declared = next((part for part in parts if part.hash == variable.hash), None)
+            initializer = libclang.var_initializer(declared) if declared is not None else None
+            if initializer is None or self.writes(initializer, variable):
+                return _UNTRACED
+            return self.x.evaluator.expression(initializer, self.flowed, depth + 1)
+        if _is_plain_assignment(statement) and len(parts) == 2 and self.assigns(statement, variable):
+            if self.writes(parts[1], variable):
+                return _UNTRACED
+            return self.x.evaluator.expression(parts[1], self.flowed, depth + 1)
+        if statement.kind != K.IF_STMT or len(parts) < 2 or self.writes(parts[0], variable):
+            return _UNTRACED
+        arms = [self.branch_end(variable, branch, statement, depth) for branch in (parts[1], (parts[2:] or [None])[0])]
+        if any(arm is _UNTRACED for arm in arms):
+            return _UNTRACED
+        then, otherwise = arms
+        if then is _ENDS or otherwise is _ENDS:
+            return otherwise if then is _ENDS else then
+        condition = self.x.evaluator.expression(parts[0], self.flowed, depth + 1, truth=True)
+        return {"op": "?:", "a": [condition, then, otherwise]}
+
+    def branch_end(self, variable: ci.Cursor, branch: ci.Cursor | None, statement: ci.Cursor, depth: int) -> Any:
+        """The variable's value at the end of one branch of the ``if`` ``statement`` (``value_at``)."""
+        if branch is not None and self.x.evaluator.exits(branch):
+            return _ENDS
+        if branch is None or not self.writes(branch, variable):
+            return self.value_before(variable, statement, depth)
+        if branch.kind != K.COMPOUND_STMT:
+            found = self.statement_value(variable, branch, depth)
+            return _UNTRACED if found is _UNWRITTEN else found
+        for inner in reversed(_children(branch)):
+            if inner.kind in _ENTRIES or inner.hash in self.label_holders:
+                return _UNTRACED
+            found = self.statement_value(variable, inner, depth)
+            if found is not _UNWRITTEN:
+                return found
+        return _UNTRACED
+
+    def writes(self, node: ci.Cursor, variable: ci.Cursor) -> bool:
+        """``node`` stores into the variable (a declaration's initializer, an assignment, ``op=``,
+        ``++``, also into a member or element of it), takes its address, or names it in an asm."""
+        key = node.hash
+        if key not in self.written_in:
+            found = set()
+            for part in node.walk_preorder():
+                target: ci.Cursor | None = None
+                if part.kind == K.VAR_DECL:
+                    found.add(part.hash)
+                elif part.kind == K.ASM_STMT:
+                    found.update(
+                        ref.referenced.hash
+                        for ref in part.walk_preorder()
+                        if ref.kind == K.DECL_REF_EXPR and ref.referenced is not None
+                    )
+                elif part.kind in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR):
+                    target = _store_target(part) if libclang.is_assignment(part) else None
+                elif part.kind == K.UNARY_OPERATOR and (libclang.is_increment(part) or libclang.is_address_of(part)):
+                    target = _children(part)[0] if _children(part) else None
+                bare = _strip(target) if target is not None else None
+                while bare is not None and bare.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR) and _children(bare):
+                    # s.m = v, a[i] = v: a store into the local (not one through a pointer).
+                    base = _strip(_children(bare)[0])
+                    if base.type.get_canonical().kind == TK.POINTER:
+                        break
+                    bare = base
+                if bare is not None and bare.kind == K.DECL_REF_EXPR and bare.referenced is not None:
+                    found.add(bare.referenced.hash)
+            self.written_in[key] = frozenset(found)
+        return variable.hash in self.written_in[key]
 
     def dead_store(self, store: ci.Cursor) -> bool:
         """The store is in a branch of an ``if`` whose condition a constant rules it out of."""
@@ -3433,6 +3823,74 @@ class _FunctionWalk:
             return False
         branch = parts[1] if value else (parts[2] if len(parts) > 2 else None)
         return branch is not None and self.x.evaluator.exits(branch)
+
+    def header_parts(self, loop: ci.Cursor) -> dict[str, ci.Cursor] | None:
+        """A ``for`` header's parts by where each starts between the header's two semicolons: libclang
+        leaves absent parts out, so ``for (;; ns = ns->parent)`` gives one child, its step. None where
+        the header's text cannot be read (a loop a macro writes)."""
+        parts = _children(loop)
+        if loop.kind != K.FOR_STMT or not parts:
+            return None
+        body = parts[-1]
+        semicolons: list[int] = []
+        depth = 0
+        try:
+            tokens = list(loop.get_tokens())
+        except RuntimeError:
+            return None
+        for token in tokens:
+            if token.extent.start.offset >= body.extent.start.offset:
+                break
+            if token.spelling == "(":
+                depth += 1
+            elif token.spelling == ")":
+                depth -= 1
+            elif token.spelling == ";" and depth == 1:
+                semicolons.append(token.extent.start.offset)
+        if len(semicolons) != 2:
+            return None
+        found: dict[str, ci.Cursor] = {}
+        for part in parts[:-1]:
+            at = part.extent.start.offset
+            found["init" if at < semicolons[0] else "condition" if at < semicolons[1] else "step"] = part
+        return found
+
+    def step_terms(self, loop: ci.Cursor) -> list[dict[str, Any]] | None:
+        """What keeps a ``for`` from its step: the step runs only after a first pass that falls through,
+        so each ``if (c) <exit>`` at the top of the body before any label gives ``c`` as the variables
+        stand before the loop (the init's value, else the value before the loop statement; one the body
+        or the condition writes is unknown). None where the body continues, which goes to the step."""
+        parts = self.header_parts(loop)
+        if not parts or "step" not in parts:
+            return None
+        body = _children(loop)[-1]
+        if _continues(body):
+            return None
+        initial, condition = parts.get("init"), parts.get("condition")
+
+        def first(variable: ci.Cursor, reference: ci.Cursor, depth: int) -> dict[str, Any] | None:
+            if not self.writes(loop, variable):
+                return self.flowed(variable, reference, depth)
+            if self.writes(body, variable) or (condition is not None and self.writes(condition, variable)):
+                return None
+            if initial is not None and self.writes(initial, variable):
+                found = self.statement_value(variable, initial, depth)
+                return None if found in (_UNTRACED, _UNWRITTEN, _ENDS) else found
+            found = self.value_before(variable, loop, depth)
+            return None if found is _UNTRACED else found
+
+        terms = []
+        for statement in _children(body) if body.kind == K.COMPOUND_STMT else [body]:
+            if statement.kind in _ENTRIES or statement.hash in self.label_holders:
+                break
+            branches = _children(statement)
+            if statement.kind == K.IF_STMT and len(branches) == 2 and self.x.evaluator.exits(branches[1]):
+                term = self.x.evaluator.expression(branches[0], first, truth=True)
+                if term is not None and (expressions.mentions_parameter(term) or expressions.truth(term) is not None):
+                    terms.append(term)
+            elif self.x.evaluator.exits(statement):
+                return [{"c": 1}]
+        return terms
 
     def never_entered(self, loop: ci.Cursor) -> bool:
         """A ``for`` whose condition, which stores nothing, is false for the values its init gives the
@@ -3597,6 +4055,15 @@ class _FunctionWalk:
         (psi_sched_switch(..., !task_on_rq_queued(prev) || prev->se.sched_delayed): the READ_ONCE
         in task_on_rq_queued stays, and the read of the right operand of || goes). In ({ ... }) the
         statements before the value are code and the value is discarded."""
+        parts = _children(node)
+        if node.kind == K.BINARY_OPERATOR and len(parts) == 2:
+            operator = libclang.binary_kind(node)
+            left = self.x.evaluator.evaluate(parts[0], truth=True) if operator in _SHORT_CIRCUITS else None
+            if left is not None and bool(left) == (operator == libclang.LOGICAL_OR):
+                # The left operand decides: the right one is never computed.
+                self.discard(parts[0], node, 0, generic, reason)
+                self.walk(parts[1], node, 1, "dead_branch", generic)
+                return
         if self.x.effect_free(node, self.dead_variables):
             self.walk(node, parent, index, reason, generic)
             return
@@ -4242,10 +4709,15 @@ class _FunctionWalk:
                     self.loops.append(loop)
             elif kind == K.INDIRECT_GOTO_STMT:
                 self.backward = True
+            elif kind == K.ADDR_LABEL_EXPR:
+                # &&label (_THIS_IP_): a computed goto may enter the label.
+                self.gotos["*"] += [child for child in operands if child.kind == K.LABEL_REF]
             elif kind == K.GOTO_STMT:
                 label = next((child.referenced for child in operands if child.kind == K.LABEL_REF), None)
                 at, to = _place(node), _place(label) if label is not None else None
                 self.backward = self.backward or at is None or to is None or at[0] != to[0] or to[1] <= at[1]
+                if label is not None:
+                    self.gotos[label.spelling].append(node)
             target = local(operands[0]) if operands else None
             if target is None:
                 continue
@@ -4562,8 +5034,9 @@ class _FunctionWalk:
                 # sb->s_writers.rw_sem + level - 1: the steps of parameters a caller may pass constants.
                 item["index"] = _index_terms(address)
         # The value the argument passes, where it is a constant or depends on the caller's parameters:
-        # the guards of a folded callee are decided by it (link._bind).
-        value = self.x.evaluator.expression(expression, self.held)
+        # the guards of a folded callee are decided by it (link._bind). Each variable is as the stores
+        # before the call give it (``flowed``).
+        value = self.x.evaluator.expression(expression, self.flowed)
         if expressions.stated(value):
             item["expr"] = value
         return item
@@ -5323,7 +5796,12 @@ class _FunctionWalk:
             value = self.decided(condition)
             if value is not None:
                 live = 1 if value else 2
-                self.walk(condition, node, 0, reason, generic)
+                if self.x.foldable(condition):
+                    # vfs_fileattr_set's current_user_ns() != &init_user_ns: the compiler folds a
+                    # condition of inline code, so only its effects are computed.
+                    self.discard(condition, node, 0, generic)
+                else:
+                    self.walk(condition, node, 0, reason, generic)
                 for child_index, child in enumerate(children[1:], 1):
                     self.walk(child, node, child_index, None if child_index == live else "dead_branch", generic)
                 return
@@ -5378,7 +5856,13 @@ class _FunctionWalk:
             if compared is not None and addressed:
                 # pagetable_pte_ctor's mm != &init_mm: the compiler folds it where the caller passes
                 # a constant (alloc_pte_late's NULL) or &init_mm itself, and forms &init_mm only where not.
-                self.walk(children[1 - addressed[0]], node, 1 - addressed[0], reason, generic)
+                other = children[1 - addressed[0]]
+                if self.x.effect_free(other, self.dead_variables):
+                    # Neither operand is computed where the comparison is folded (kuid_root_in_ns'
+                    # ns == &init_user_ns, ns being current_user_ns()).
+                    self.walk_guarded((compared, None), other, node, 1 - addressed[0], reason, generic)
+                else:
+                    self.walk(other, node, 1 - addressed[0], reason, generic)
                 self.walk_guarded((compared, None), children[addressed[0]], node, addressed[0], reason, generic)
                 return
             if operator in (libclang.LOGICAL_AND, libclang.LOGICAL_OR):
@@ -5439,6 +5923,24 @@ class _FunctionWalk:
             for child_index, child in enumerate(children):
                 role = roles[child_index] if child_index < len(roles) else "body"
                 self.walk(child, node, child_index, None if role in ("init", "condition") else "dead_branch", generic)
+            return
+        if kind == K.FOR_STMT and reason is None and (terms := self.step_terms(node)):
+            # kuid_root_in_ns's for (;; ns = ns->parent) { …; if (ns == &init_user_ns) break; }: the
+            # step runs only where the first pass falls through its exits.
+            step = (self.header_parts(node) or {}).get("step")
+            for child_index, child in enumerate(children):
+                if step is None or child.hash != step.hash:
+                    self.walk(child, node, child_index, None, generic)
+                elif any(expressions.truth(term) == 1 for term in terms):
+                    self.walk(child, node, child_index, "dead_branch", generic)
+                else:
+                    open_terms = [term for term in terms if expressions.mentions_parameter(term)]
+                    for term in open_terms:
+                        self.push_guard(term, False)
+                    try:
+                        self.walk(child, node, child_index, None, generic)
+                    finally:
+                        del self.guard_stack[len(self.guard_stack) - len(open_terms) :]
             return
         if kind == K.SWITCH_STMT and len(children) == 2 and reason is None:
             # A value clang folds (switch (sizeof(x)), switch (_NSIG_WORDS)). The evaluator's helper
@@ -5633,32 +6135,27 @@ class _FunctionWalk:
     def walk_read(
         self, call: ci.Cursor, child: ci.Cursor, index: int, position: int | None, reason: str | None, generic: bool
     ) -> None:
-        """Walk an argument the callee reads. Where the callee is inline and reads the parameter only
-        under guards on its parameters (``parameter_conditions``), an argument without effect is
-        computed only where the call's arguments leave those guards open: none where they decide
-        against them (__set_fixmap's pte_clear(&init_mm, …)), under them restated where they still
-        name the caller's parameters."""
-        conditions = self.x.parameter_conditions(call.referenced) if reason is None and position is not None else []
-        condition = conditions[position] if position is not None and position < len(conditions) else []
-        if not condition or not self.x.effect_free(child, self.dead_variables):
+        """Walk an argument the callee reads. Where every read of the parameter in the callee's compiled
+        code is under a guard the call's arguments decide against (``parameter_reads``: __set_fixmap's
+        pte_clear(&init_mm, …), kuid_root_in_ns's ns, which current_user_ns() makes &init_user_ns), an
+        argument without effect is not computed where the callee is inline, and is left to the image
+        (``conditional``) where it is not."""
+        reads = self.x.parameter_reads(call.referenced) if reason is None and position is not None else []
+        ways = reads[position] if position is not None and position < len(reads) else None
+        if not ways or not self.x.effect_free(child, self.dead_variables):
             self.walk(child, call, index, reason, generic)
             return
-        values = [self.x.evaluator.expression(argument, self.held) for argument in call.get_arguments() or []]
-        open_guards: list[tuple[dict[str, Any], bool]] = []
-        for guard in condition:
-            expression = expressions.substitute(guard["e"], values)
-            truth = expressions.truth(expression)
-            if truth is not None and bool(truth) != guard["v"]:
-                self.discard(child, call, index, generic, "ignored_argument")
-                return
-            if truth is None and expression is not None and expressions.mentions_parameter(expression):
-                open_guards.append((expression, guard["v"]))
-        for expression, value in open_guards:
-            self.push_guard(expression, value)
-        try:
+        values = [self.x.evaluator.expression(argument, self.flowed) for argument in call.get_arguments() or []]
+        if not all(_ruled_out(way, values) for way in ways):
             self.walk(child, call, index, reason, generic)
-        finally:
-            del self.guard_stack[len(self.guard_stack) - len(open_guards) :]
+        elif call.referenced is not None and self.x.inline_function(call.referenced.spelling):
+            self.discard(child, call, index, generic, "ignored_argument")
+        else:
+            self.conditional += 1
+            try:
+                self.walk(child, call, index, reason, generic)
+            finally:
+                self.conditional -= 1
 
     def mark_cancelled(self, argument: ci.Cursor, callee: str, position: int) -> None:
         """An argument ``&p->m`` at a parameter the callee takes back with container_of

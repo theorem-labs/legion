@@ -200,11 +200,14 @@ def mentions_parameter(expression: Expression | None) -> bool:
 
 def canonical(expression: Expression | None) -> Expression | None:
     """The expression as one value the facts name (a constant, a parameter, a variable's one value,
-    an operation on those), without the casts that keep a type, and a choice whose sides are all that
-    value as it; None where it may be one of several values or one the facts cannot name."""
+    an operation on those), without the casts that keep a type, a choice whose sides are all that
+    value as it, and a ``?:`` whose condition is decided as the side it takes; None where it may be one
+    of several values or one the facts cannot name."""
     if expression is None or "op" not in expression:
         return expression
     raw = expression["a"]
+    if expression["op"] == "?:" and raw[0] is not None and (decided := truth(raw[0])) is not None:
+        return canonical(raw[1] if decided else raw[2])
     operands = [canonical(operand) for operand in raw]
     if expression["op"] == "?:" and raw[0] is None:
         return operands[1] if operands[1] is not None and operands[1] == operands[2] else None

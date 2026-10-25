@@ -275,11 +275,11 @@ These rules follow what the machine code shows, each only where it shows it:
   guard decides against becomes `unevaluated` with reason `constant_argument` (an exclusion), or
   `conditional` for a guard with `image`; other events are dropped, and the guards still open carry
   up to the next fold.
-- An argument without effect to an inline function of the unit that reads the parameter only under
-  guards on its parameters is computed only where the call's arguments leave those guards open: none
-  where they decide against them (__set_fixmap's `pte_clear(&init_mm, …)`, whose mm reaches only
-  `__set_pte_at`'s flush under `pte_present(__pte(0))`), under them restated where they still name the
-  caller's parameters.
+- An argument without effect to a function of the unit that reads the parameter, in compiled code,
+  only under guards the call's arguments decide against is not computed where the callee is inline
+  (__set_fixmap's `pte_clear(&init_mm, …)`, whose mm reaches only `__set_pte_at`'s flush under
+  `pte_present(__pte(0))`), and is `conditional` where it is not, as the image decides where it
+  inlines it (cap_inode_getsecurity's `kuid_root_in_ns(kuid, current_user_ns())`).
 - A call whose value nothing uses (a discarded value that has an effect, such as an argument the
   callee ignores) is marked `value_unused`; the facts give the callee a second event set,
   `value_unused`, from its walk with each return's value discarded, and link folds that set there:
@@ -304,14 +304,26 @@ These rules follow what the machine code shows, each only where it shows it:
   `cancelled_by`, the helper, and a helper's returned member address (`returned`, `dl_rq_of_se`'s
   `&rq->dl`) is dropped at a call marked `result_cancelled`, whose value the caller takes back the
   same way (`rq_of_dl_rq(dl_rq_of_se(dl_se))`).
-- A condition the walk decides takes each local as the stores that reach it on live paths hold it: the
-  store every path to the use passes (copy_creds' `ret = create_user_ns(new); if (ret < 0) goto
-  error_put;` with the stub's -EINVAL), or the initial value and the stores outside a branch a constant
-  condition rules out (dma_direct_alloc's `remap`, WARN_ONCE's `__ret_once`); a local whose address is
-  taken counts only where that happens after the use, outside any loop (mlock_pte_range's `ptl`). The
-  value of `({ …; v; })` is its last statement's. A decided `if` whose taken branch exits ends its
-  block, and a `for` whose condition is false for the values its init gives (`for (i = 8; i <
-  KMALLOC_MIN_SIZE; …)` with KMALLOC_MIN_SIZE 8) has no compiled body or step.
+- A condition the walk decides takes each local as the statements before it in program order give it:
+  a plain assignment, `op=` on the value before it (timer_of_init's `flags |= TIMER_OF_IRQ`), an
+  `if` whose branches end with different values as `cond ? then : else`, a branch whose condition
+  names the local's value (`if (!attrs) goto fail;`), and at a label a choice among what each goto to
+  it brings and what falling into it brings (a goto a constant rules out brings nothing, and a label
+  whose address is taken is untraced). Where that order cannot be followed (a loop, a case, a jump
+  back), a local takes the store every path to the use passes (copy_creds' `ret =
+  create_user_ns(new)`), or its initial value and each store a constant does not rule out, a store
+  under conditions on the parameters giving its value only where they hold (`__folio_add_rmap`'s
+  `nr_pmdmapped = nr_pages` under `level == PGTABLE_LEVEL_PMD`, `folio_pte_batch_flags`'
+  `any_writable |= …` under `flags & FPB_MERGE_WRITE`); a static local is unknown. A local whose
+  address is taken counts only where that happens after the use, outside any loop (mlock_pte_range's
+  `ptl`). The value of `({ …; v; })` is its last statement's. A decided condition whose calls are all
+  of builtins and inline functions of the unit is folded with its branch, so only its effects are
+  code (vfs_fileattr_set's `current_user_ns() != &init_user_ns`); a call of another function stays.
+  A decided `if` whose taken branch exits ends its block, a `for` whose condition is false for the
+  values its init gives (`for (i = 8; i < KMALLOC_MIN_SIZE; …)` with KMALLOC_MIN_SIZE 8) has no
+  compiled body or step, and a `for` step runs only where the first pass falls through the body's
+  leading `if (c) <exit>`s (kuid_root_in_ns's `ns = ns->parent` after `if (ns == &init_user_ns)
+  break;`).
 - A call through a member of a struct passed by value (rht_head_hashfn's `params.obj_hashfn(…)`) is a
   `parameter_calls` item with that `member`; at the fold whose arguments make the member a function of
   the unit (simple_xattr_params' simple_xattr_obj_hashfn) that function is one the code passes, called

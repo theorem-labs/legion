@@ -101,7 +101,8 @@ def test_a_local_that_keeps_its_initializer_stands_for_it(tmp_path: Path) -> Non
 
 
 def test_a_parameter_the_function_writes_holds_the_argument_or_what_it_writes(tmp_path: Path) -> None:
-    """With 4 the parameter holds 4 or 0, neither 5; with -1 it may hold 0."""
+    """`if (nid == -1) nid = 0;` runs only for -1: with 4 the parameter holds 4, with 5 it holds 5, and
+    with -1 it holds 0."""
     facts = facts_of(
         tmp_path,
         """
@@ -117,8 +118,8 @@ def test_a_parameter_the_function_writes_holds_the_argument_or_what_it_writes(tm
         }
         """,
     )
-    assert compiled(facts, "alloc", [constant(4)]) == {"other", "kept"}
-    assert compiled(facts, "alloc", [constant(5)]) == {"late", "other", "kept"}
+    assert compiled(facts, "alloc", [constant(4)]) == {"kept"}
+    assert compiled(facts, "alloc", [constant(5)]) == {"late", "kept"}
     assert compiled(facts, "alloc", [constant(-1)]) == {"other", "kept"}
 
 
@@ -523,7 +524,8 @@ def test_a_helper_s_value_follows_the_arguments_its_call_passes(tmp_path: Path) 
 
 def test_a_helper_whose_returns_are_several_constants_compares_as_each(tmp_path: Path) -> None:
     """softleaf_is_device_exclusive(entry): softleaf_type returns SOFTLEAF_NONE, SOFTLEAF_SWAP or
-    SOFTLEAF_MARKER without CONFIG_DEVICE_PRIVATE, never SOFTLEAF_DEVICE_EXCLUSIVE."""
+    SOFTLEAF_MARKER without CONFIG_DEVICE_PRIVATE, never SOFTLEAF_DEVICE_EXCLUSIVE: the branch is dead,
+    and the inline is_device, whose value decides it, is folded with it."""
     facts = facts_of(
         tmp_path,
         """
@@ -548,9 +550,9 @@ def test_a_helper_whose_returns_are_several_constants_compares_as_each(tmp_path:
         void copy(unsigned long v) { if (is_device(v)) other(); if (is_swap(v)) note(); kept(); }
         """,
     )
-    assert {call["callee"] for call in facts["functions"]["copy"]["events"]["calls"]} == {
-        "is_device", "is_swap", "note", "kept",
-    }  # fmt: skip
+    calls = {call["callee"] for call in facts["functions"]["copy"]["events"]["calls"]}
+    assert calls == {"is_swap", "note", "kept"}
+    assert "is_device" in {item.get("call") for item in facts["functions"]["copy"]["events"]["unevaluated"]}
 
 
 def test_a_helper_s_value_on_its_parameters_guards_the_code_it_decides(tmp_path: Path) -> None:
@@ -1185,3 +1187,241 @@ def test_a_label_a_live_goto_targets_is_code_under_a_label_no_live_goto_targets(
         """,
     )
     assert "err" in {call["callee"] for call in facts["functions"]["nested"]["events"]["calls"]}
+
+
+GUARDED_STORES = """
+    int level_pages(void); int probe(int i);
+    static inline void mod(int pmd) { if (pmd) warn(); kept(); }
+    static inline void add(int level, int k)
+    {
+        int pmd = 0;
+        switch (level) {
+        case 0:
+            note();
+            break;
+        case 1:
+            if (k)
+                pmd = level_pages();
+            break;
+        }
+        mod(pmd);
+    }
+    void add_pte(int k) { add(0, k); }
+    void add_pmd(int k) { add(1, k); }
+    static inline void batch(unsigned int flags, int n)
+    {
+        _Bool w = 0;
+        for (int i = 0; i < n; i++)
+            if (flags & 4)
+                w |= probe(i);
+        if (w)
+            warn();
+        kept();
+    }
+    void batch_plain(int n) { batch(1, n); }
+    void batch_merge(int n) { batch(4, n); }
+"""
+
+
+def test_a_store_under_guards_the_arguments_decide_against_gives_no_value(tmp_path: Path) -> None:
+    """__folio_add_rmap: `nr_pmdmapped = 0;` and `nr_pmdmapped = nr_pages;` only under `case
+    PGTABLE_LEVEL_PMD:` and `if (level == PGTABLE_LEVEL_PMD)`, and folio_add_anon_rmap_ptes passes
+    PGTABLE_LEVEL_PTE, so __folio_mod_stat's `if (nr_pmdmapped)` is false; folio_pte_batch_flags:
+    `any_writable |= pte_write(pte)` only under `if (flags & FPB_MERGE_WRITE)`, which folio_pte_batch's
+    flags 0 rules out (llvm-objdump: no __mod_node_page_state, no pte_mkwrite)."""
+    facts = facts_of(tmp_path, GUARDED_STORES)
+
+    def callees(*chain: str) -> set[str]:
+        return {call["callee"] for call in fold(facts, *chain).calls}
+
+    assert "warn" not in callees("add_pte", "add", "mod")
+    assert "warn" in callees("add_pmd", "add", "mod")
+    assert "warn" not in callees("batch_plain", "batch")
+    assert "warn" in callees("batch_merge", "batch")
+
+
+IN_ORDER = """
+    static inline int numa_id(void) { return 0; }
+    static inline void offline(int node) { if (node == 0) return; warn(); }
+    static inline void alloc_node(int nid) { if (nid == -1) nid = numa_id(); offline(nid); kept(); }
+    static inline void alloc_some(int nid, int k) { if (nid == -1 && k) nid = numa_id(); offline(nid); kept(); }
+    void dev_alloc(void) { alloc_node(-1); }
+    void dev_alloc_some(int k) { alloc_some(-1, k); }
+"""
+
+
+def test_a_store_an_if_makes_gives_its_value_where_the_condition_holds(tmp_path: Path) -> None:
+    """alloc_pages_node_noprof: `if (nid == NUMA_NO_NODE) nid = numa_mem_id();` and dma_direct's
+    dev_to_node gives NUMA_NO_NODE, so warn_if_node_offline sees node 0, which is online (llvm-objdump
+    of __dma_direct_alloc_pages: no _printk, no dump_stack)."""
+    facts = facts_of(tmp_path, IN_ORDER)
+
+    def callees(*chain: str) -> set[str]:
+        return {call["callee"] for call in fold(facts, *chain).calls}
+
+    assert "warn" not in callees("dev_alloc", "alloc_node", "offline")
+    assert "warn" in callees("dev_alloc_some", "alloc_some", "offline")
+
+
+NAMESPACES = """
+    struct ns { struct ns *parent; int level; };
+    extern struct ns init_ns;
+    static inline struct ns *current_ns(void) { return &init_ns; }
+    static inline int from_id(struct ns *ns, int id) { return id; }
+    int stub_file(void) { return 0; }
+    void fileattr(void) { if (__builtin_expect(!!(current_ns() != &init_ns), 0)) warn(); kept(); }
+    void dev_add(void) { if (stub_file()) warn(); kept(); }
+    static int root_in(int id, struct ns *ns)
+    {
+        for (;; ns = ns->parent) {
+            if (from_id(ns, id) == 0)
+                return 1;
+            if (ns == &init_ns)
+                break;
+        }
+        return 0;
+    }
+    int getsec(int id) { return root_in(id, current_ns()); }
+    int getsec_given(int id, struct ns *ns) { return root_in(id, ns); }
+"""
+
+
+def test_a_decided_condition_of_inline_code_is_not_computed(tmp_path: Path) -> None:
+    """vfs_fileattr_set: `if (current_user_ns() != &init_user_ns)`, current_user_ns() being `return
+    &init_user_ns;` without CONFIG_USER_NS: the compiler folds it and forms no &init_user_ns. A call of
+    a function that is not inline stays where its value decides the branch (device_add's
+    device_create_file, which the image calls)."""
+    facts = facts_of(tmp_path, NAMESPACES)
+    events = facts["functions"]["fileattr"]["events"]
+    assert ({call["callee"] for call in events["calls"]}, events["accesses"]) == ({"kept"}, [])
+    assert {call["callee"] for call in facts["functions"]["dev_add"]["events"]["calls"]} == {"stub_file", "kept"}
+
+
+def test_a_loop_step_runs_only_where_the_first_pass_falls_through(tmp_path: Path) -> None:
+    """kuid_root_in_ns: `for (;; ns = ns->parent) { …; if (ns == &init_user_ns) break; }`, which
+    cap_inode_getsecurity enters with current_user_ns(), &init_user_ns: the first pass breaks, so
+    ns->parent is never read (llvm-objdump: no load at user_namespace+0xc0, no init_user_ns)."""
+    facts = facts_of(tmp_path, NAMESPACES)
+
+    def read(*chain: str) -> tuple[set[str], set[str]]:
+        found = fold(facts, *chain)
+        fields = {item["field"] for item in found.field_accesses}
+        names = {item["unit"]["name"] for item in found.accesses if item["unit"]["kind"] == "global"}
+        return fields, names
+
+    assert read("getsec", "root_in") == (set(), set())
+    assert "parent" in read("getsec_given", "root_in")[0]
+    # The argument, current_ns()'s &init_ns, is read by no compiled code of root_in at this call; root_in
+    # is no inline function, so where the image inlines it decides.
+    (current,) = [call for call in facts["functions"]["getsec"]["events"]["calls"] if call["callee"] == "current_ns"]
+    assert current.get("conditional") is True
+
+
+AT_LABEL = """
+    int base_init(void); int irq_init(void); void irq_exit(void); void base_exit(void);
+    int init(unsigned int want)
+    {
+        int ret = -22;
+        int flags = 0;
+        if (want & 1) {
+            ret = base_init();
+            if (ret)
+                goto out_fail;
+            flags |= 1;
+        }
+        if (want & 4) {
+            ret = irq_init();
+            if (ret)
+                goto out_fail;
+            flags |= 4;
+        }
+        return ret;
+    out_fail:
+        if (flags & 4)
+            irq_exit();
+        if (flags & 1)
+            base_exit();
+        return ret;
+    }
+"""
+
+
+def test_a_label_holds_what_each_goto_to_it_brings(tmp_path: Path) -> None:
+    """timer_of_init: `flags |= TIMER_OF_IRQ` comes after the last `goto out_fail`, so at out_fail
+    `flags & TIMER_OF_IRQ` is 0 (llvm-objdump: no call of timer_of_irq_exit's free_irq)."""
+    facts = facts_of(tmp_path, AT_LABEL)
+    calls = {call["callee"] for call in facts["functions"]["init"]["events"]["calls"]}
+    assert "irq_exit" not in calls
+    assert "base_exit" in calls
+
+
+BRANCH_VALUE = """
+    struct attrs { long *mask; };
+    void *zalloc(unsigned long size); void free_obj(void *p); void note_ip(void *ip);
+    static inline _Bool mask_alloc(long **mask) { return 1; }
+    static inline void free_attrs(struct attrs *attrs) { if (attrs) free_obj(attrs); }
+    struct attrs *alloc_attrs(void)
+    {
+        struct attrs *attrs;
+        attrs = zalloc(sizeof(*attrs));
+        if (!attrs)
+            goto fail;
+        if (!mask_alloc(&attrs->mask))
+            goto fail;
+        return attrs;
+    fail:
+        free_attrs(attrs);
+        return 0;
+    }
+    struct attrs *alloc_attrs_live(_Bool (*really)(long **))
+    {
+        struct attrs *attrs;
+        attrs = zalloc(sizeof(*attrs));
+        if (!attrs)
+            goto fail;
+        if (!really(&attrs->mask))
+            goto fail;
+        return attrs;
+    fail:
+        free_attrs(attrs);
+        return 0;
+    }
+    struct attrs *alloc_attrs_kept(void)
+    {
+        struct attrs *attrs;
+        attrs = zalloc(sizeof(*attrs));
+        if (attrs)
+            goto keep;
+        return 0;
+    keep:
+        free_attrs(attrs);
+        return attrs;
+    }
+    struct attrs *alloc_attrs_entered(void)
+    {
+        struct attrs *attrs;
+        void *back = &&fail;
+        attrs = zalloc(sizeof(*attrs));
+        if (!attrs)
+            goto fail;
+        if (!mask_alloc(&attrs->mask))
+            goto fail;
+        note_ip(back);
+        return attrs;
+    fail:
+        free_attrs(attrs);
+        return 0;
+    }
+"""
+
+
+def test_a_branch_a_condition_on_a_local_selects_holds_the_value_the_condition_names(tmp_path: Path) -> None:
+    """alloc_workqueue_attrs_noprof: `if (!attrs) goto fail;`, and alloc_cpumask_var's stub returns true,
+    so at fail attrs is NULL and free_workqueue_attrs' `if (attrs)` is false (llvm-objdump: no kfree)."""
+    facts = facts_of(tmp_path, BRANCH_VALUE)
+    assert "free_obj" not in {call["callee"] for call in fold(facts, "alloc_attrs", "free_attrs").calls}
+    assert "free_obj" in {call["callee"] for call in fold(facts, "alloc_attrs_live", "free_attrs").calls}
+    # `if (attrs) goto keep;`: at keep attrs is not NULL, and not known.
+    assert "free_obj" in {call["callee"] for call in fold(facts, "alloc_attrs_kept", "free_attrs").calls}
+    # &&fail: a computed goto may enter fail with any attrs.
+    assert "free_obj" in {call["callee"] for call in fold(facts, "alloc_attrs_entered", "free_attrs").calls}
