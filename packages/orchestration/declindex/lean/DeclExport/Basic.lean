@@ -68,6 +68,22 @@ def abstractedProofComponent (s : String) : Bool :=
   (rest.head?.any Char.isDigit) && (rest.getLast?.any Char.isDigit) &&
     rest.all (fun c => c.isDigit || c == '_') && !((rest.zip rest.tail).any fun (a, b) => a == '_' && b == '_')
 
+-- The forms that the pinned toolchain writes (on the indexed project: `_proof_1`, and `_proof_1_3` in recursive
+-- declarations), the older form, and names that only start the same way. The exporter does not build when one fails.
+#guard abstractedProofComponent "_proof_1"
+#guard abstractedProofComponent "_proof_12"
+#guard abstractedProofComponent "_proof_1_3"
+#guard abstractedProofComponent "_proof_1_3_2"
+#guard abstractedProofComponent "proof_2"
+#guard !abstractedProofComponent "_proof_left"
+#guard !abstractedProofComponent "_proof_"
+#guard !abstractedProofComponent "_proof_1_"
+#guard !abstractedProofComponent "_proof__1"
+#guard !abstractedProofComponent "_proof_1a"
+#guard !abstractedProofComponent "proof_wanted"
+#guard !abstractedProofComponent "match_1"
+#guard !abstractedProofComponent "_simp_1"
+
 /-- Whether `n`, whose constant is `ci`, is an auxiliary definition that elaboration made: a matcher, or a theorem
 that holds a proof abstracted out of a body (`abstractedProofComponent`, `X._proof_1`). A constant of another kind,
 or with another last name component, is a declaration like any other, also when its name starts the same way: the
