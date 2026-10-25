@@ -59,6 +59,12 @@ type Hasher interface {
 	Hashes(context.Context, Tree, []string) (map[string]string, error)
 }
 
+// Commit is the shape of one commit in the repository: the tree it holds and its parents, in their order.
+type Commit struct {
+	Tree    string
+	Parents []string
+}
+
 // Git creates candidate commits and exposes declaration evidence.
 type Git interface {
 	Resolve(context.Context, string, string) (string, error)
@@ -67,6 +73,12 @@ type Git interface {
 	ChangeSet(context.Context, string, string, Member) (gitx.Change, error)
 	DeclarationEvidence(context.Context, string, string, Member) (blame.Evidence, error)
 	TreeDeclarations(context.Context, string, Tree) ([]blame.Declaration, error)
+	// ReadCommit reads a commit's tree and parents.
+	ReadCommit(context.Context, string, string) (Commit, error)
+	// MergeTree merges two commits without a working copy and is the tree the merge writes. A conflict is an error.
+	MergeTree(context.Context, string, string, string) (string, error)
+	// Ancestor reports whether the first commit is an ancestor of the second.
+	Ancestor(context.Context, string, string, string) (bool, error)
 }
 
 // Checker reports paths that a configured policy rejects in a candidate tree.
@@ -128,6 +140,9 @@ type Member struct {
 	LedgerKey        string            `json:"ledgerKey"`
 	ChangedContracts map[string]string `json:"changedContracts"`
 	ApprovedPinned   []string          `json:"approvedPinned"`
+	// Upstream is the commit that an upstream sync carries, from the member's ready record, and is empty for an
+	// ordinary migration. The program verifies the member's head against it before the ledger checks the member.
+	Upstream string `json:"upstream"`
 }
 
 // DroppedMember records why a frozen member left the candidate.
@@ -422,7 +437,20 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 		if batch.State.terminal() {
 			return *batch, nil
 		}
-		returned, err := r.checkLedger(ctx, batch)
+		returned, err := r.checkUpstream(ctx, batch)
+		if err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
+			return r.fail(ctx, batch, "upstream")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
+		}
+		if returned {
+			continue
+		}
+		returned, err = r.checkLedger(ctx, batch)
 		if err != nil {
 			if r.reloaded(ctx, batch, err) {
 				return *batch, nil

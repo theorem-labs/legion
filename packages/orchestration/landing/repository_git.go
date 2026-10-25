@@ -3,6 +3,7 @@ package landing
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os/exec"
@@ -66,6 +67,55 @@ func (g RepositoryGit) ChangeSet(ctx context.Context, repository, base string, m
 		return gitx.Change{}, fmt.Errorf("read change set: %w", err)
 	}
 	return change, nil
+}
+
+// ReadCommit reads a commit's tree and its parents, in their order, from the commit object itself.
+func (g RepositoryGit) ReadCommit(ctx context.Context, repository, commit string) (Commit, error) {
+	body, err := repositoryGit(ctx, g.path(repository), "cat-file", "commit", commit)
+	if err != nil {
+		return Commit{}, fmt.Errorf("read commit %q: %w", commit, err)
+	}
+	var read Commit
+	for _, line := range strings.Split(body, "\n") {
+		name, value, found := strings.Cut(line, " ")
+		if !found {
+			break
+		}
+		switch name {
+		case "tree":
+			read.Tree = value
+		case "parent":
+			read.Parents = append(read.Parents, value)
+		}
+	}
+	if read.Tree == "" {
+		return Commit{}, fmt.Errorf("read commit %q: it names no tree", commit)
+	}
+	return read, nil
+}
+
+// MergeTree merges two commits without a working copy and is the tree the merge writes. A merge that conflicts is
+// an error, as is a merge git cannot make.
+func (g RepositoryGit) MergeTree(ctx context.Context, repository, left, right string) (string, error) {
+	tree, err := repositoryGit(ctx, g.path(repository), "merge-tree", "--write-tree", "--no-messages", left, right)
+	if err != nil {
+		return "", fmt.Errorf("merge %q with %q: %w", left, right, err)
+	}
+	return tree, nil
+}
+
+// Ancestor reports whether commit is an ancestor of descendant.
+func (g RepositoryGit) Ancestor(ctx context.Context, repository, commit, descendant string) (bool, error) {
+	command := exec.CommandContext(ctx, "git", "-C", g.path(repository), "merge-base", "--is-ancestor", commit, descendant)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("check whether %q is behind %q: %w: %s", commit, descendant, err, strings.TrimSpace(string(output)))
 }
 
 // DeclarationEvidence indexes a member's changed Lean declarations from its

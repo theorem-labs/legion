@@ -156,6 +156,7 @@ func (l *Ledger) ReadyMembers(ctx context.Context, repo string) ([]landing.Membe
 			ReadyEvent:       record.ReadyEvent,
 			ChangedContracts: record.ChangedContracts,
 			ApprovedPinned:   record.ApprovedPinned,
+			Upstream:         record.Upstream,
 		})
 	}
 	return members, nil

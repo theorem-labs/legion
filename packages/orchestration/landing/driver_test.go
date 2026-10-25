@@ -2,6 +2,7 @@ package landing
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -231,6 +232,7 @@ func member(id string) Member {
 type ledgerFake struct {
 	refusals map[string]string
 	returned []returned
+	checked  []string
 	landed   []string
 	commits  map[string]string
 }
@@ -241,6 +243,7 @@ type returned struct {
 }
 
 func (f *ledgerFake) Check(_ context.Context, _ string, migration string, _ int64, _ []string, _ map[string]string) (CheckResult, error) {
+	f.checked = append(f.checked, migration)
 	return CheckResult{Reason: f.refusals[migration]}, nil
 }
 
@@ -306,11 +309,17 @@ type gitFake struct {
 	changes     map[string]gitx.Change
 	evidence    map[string]blame.Evidence
 	conflicts   map[string]bool
+	commits     map[string]Commit
+	merges      map[string]string
+	ancestors   map[string]bool
 	changeBases []string
 }
 
 func newGitFake() *gitFake {
-	return &gitFake{changes: map[string]gitx.Change{}, evidence: map[string]blame.Evidence{}, conflicts: map[string]bool{}}
+	return &gitFake{
+		changes: map[string]gitx.Change{}, evidence: map[string]blame.Evidence{}, conflicts: map[string]bool{},
+		commits: map[string]Commit{}, merges: map[string]string{}, ancestors: map[string]bool{},
+	}
 }
 
 func (f *gitFake) Resolve(_ context.Context, _ string, rev string) (string, error) {
@@ -354,6 +363,28 @@ func (f *gitFake) DeclarationEvidence(_ context.Context, _ string, _ string, mem
 
 func (f *gitFake) TreeDeclarations(context.Context, string, Tree) ([]blame.Declaration, error) {
 	return nil, nil
+}
+
+// ReadCommit reports the shape the fake holds for a commit. An unknown commit is no commit, as it is for git.
+func (f *gitFake) ReadCommit(_ context.Context, _ string, commit string) (Commit, error) {
+	held, found := f.commits[commit]
+	if !found {
+		return Commit{}, fmt.Errorf("unknown commit %q", commit)
+	}
+	return held, nil
+}
+
+// MergeTree merges two commits. A pair the fake holds no tree for conflicts, as git reports a conflict.
+func (f *gitFake) MergeTree(_ context.Context, _ string, left, right string) (string, error) {
+	tree, found := f.merges[left+" "+right]
+	if !found {
+		return "", fmt.Errorf("merge of %q and %q conflicts", left, right)
+	}
+	return tree, nil
+}
+
+func (f *gitFake) Ancestor(_ context.Context, _ string, commit, descendant string) (bool, error) {
+	return f.ancestors[commit+" "+descendant], nil
 }
 
 type storeFake struct {
