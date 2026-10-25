@@ -73,28 +73,31 @@ func EnrichFromDiff(evidence *Evidence, diff string, beforeOwners, afterOwners m
 	}
 }
 
-// bodies returns the body code of each declaration in a file, its body lines
-// without comments joined with single spaces, reading the file's owners on
-// first use. A declaration with no body line has an empty body.
+// bodies returns the body code of each declaration in a file, reading the
+// file's owners on first use. A body is its non-blank body lines without
+// comments, joined with newlines, with the indentation kept and trailing
+// whitespace dropped: Lean reads indentation, so re-indenting a line of a
+// `do` block or a tactic block changes the declaration. A declaration with no
+// body line has an empty body.
 func bodies(cache map[string]map[DeclarationID]string, owners map[string][]LineOwner, file string) map[DeclarationID]string {
 	if found, ok := cache[file]; ok {
 		return found
 	}
-	texts := map[DeclarationID][]byte{}
+	texts := map[DeclarationID][]string{}
 	for _, line := range owners[file] {
 		if line.Owner.Name == "" {
 			continue
 		}
 		id := line.Owner.ID()
 		text := texts[id]
-		if !line.IsSignature {
-			text = appendFields(text, line.code)
+		if code := strings.TrimRight(line.code, " \t"); !line.IsSignature && strings.TrimSpace(code) != "" {
+			text = append(text, code)
 		}
 		texts[id] = text
 	}
 	out := make(map[DeclarationID]string, len(texts))
 	for id, text := range texts {
-		out[id] = string(text)
+		out[id] = strings.Join(text, "\n")
 	}
 	cache[file] = out
 	return out

@@ -241,6 +241,47 @@ func TestDeclarationEvidenceRecordsAnonymousInstances(t *testing.T) {
 	wantEvidence(t, gone, blame.Name{Value: "Alpha.instReprPoint", Kind: blame.Unknown}, 0, "")
 }
 
+// Lean reads indentation, so a body edit that only re-indents a line is a
+// change: here the line moves into the `if`, and `f false` changes from 1 to
+// 0. The declaration's body is compared with its indentation kept.
+func TestDeclarationEvidenceReadsIndentationOnlyBodyEdits(t *testing.T) {
+	const file = "Alpha.lean"
+	base := "def f (b : Bool) : Nat := Id.run do\n" +
+		"  let mut x := 0\n" +
+		"  if b then\n" +
+		"    x := 1\n" +
+		"  x := x + 1\n" +
+		"  return x\n"
+	member := strings.Replace(base, "\n  x := x + 1\n", "\n    x := x + 1\n", 1)
+	evidence := memberEvidence(t, map[string]string{file: base}, map[string]string{file: member})
+
+	wantEvidence(t, evidence, blame.Name{Value: "f", Kind: blame.Changed}, 2, "edited")
+	wantEvidence(t, evidence, blame.Name{Value: "f", Kind: blame.Weak}, 2, "edited")
+	wantEvidence(t, evidence, blame.Name{Value: "f", Kind: blame.Unknown}, 1, "edited")
+}
+
+// An anonymous instance whose generated name the scanner cannot compute
+// exactly is recorded by position, never under a name Lean gives another
+// instance. Here the member adds an instance between two that Lean names
+// Alpha.instInhabitedPoint and Alpha.instInhabitedPoint_1; the name
+// Alpha.instInhabitedPoint_1 belongs to the instance the member leaves alone,
+// so it must carry no evidence.
+func TestDeclarationEvidenceNeverBlamesAnInstanceForItsNeighboursName(t *testing.T) {
+	const file = "Alpha.lean"
+	base := "namespace Alpha\n" +
+		"instance : Inhabited Point := ⟨⟨0⟩⟩\n" +
+		"instance : Inhabited Point := ⟨⟨2⟩⟩\n" +
+		"end Alpha\n"
+	member := strings.Replace(base, "instance : Inhabited Point := ⟨⟨2⟩⟩\n", "instance : Inhabited (Point → Point) := ⟨id⟩\ninstance : Inhabited Point := ⟨⟨2⟩⟩\n", 1)
+	evidence := memberEvidence(t, map[string]string{file: base}, map[string]string{file: member})
+
+	for _, name := range []string{"Alpha.instInhabitedPoint", "Alpha.instInhabitedPoint_1", "Alpha.instInhabitedPoint_2", "Alpha.instInhabitedForallPoint"} {
+		for _, kind := range []blame.Kind{blame.Changed, blame.Unknown, blame.Added, blame.Weak} {
+			wantEvidence(t, evidence, blame.Name{Value: name, Kind: kind}, 0, "")
+		}
+	}
+}
+
 // A `namespace` line inside a block comment opens no namespace, so removing
 // the comment closes none.
 func TestDeclarationEvidenceIgnoresNamespaceInComment(t *testing.T) {
