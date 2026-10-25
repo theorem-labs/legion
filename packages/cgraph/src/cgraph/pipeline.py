@@ -4,8 +4,11 @@ the owners and their topics, the measures, and the report."""
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
+import importlib.metadata
 import os
+import subprocess
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -22,6 +25,58 @@ from .errors import InputError, WorkerDied
 from .image import Image
 
 VERSION = "cgraph/1"
+
+
+def _checkout(directory: Path) -> tuple[str | None, bool | None]:
+    """The commit of the checkout ``directory`` lies in, and whether that checkout has changes to
+    it. Both are None where there is no checkout to read: an installed copy, or no git."""
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=60, check=False
+        )
+        if head.returncode != 0 or not head.stdout.strip():
+            return None, None
+        changes = subprocess.run(
+            ["git", "-C", str(directory), "status", "--porcelain", "--", str(directory)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if changes.returncode != 0:
+            return head.stdout.strip(), None
+        return head.stdout.strip(), bool(changes.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+
+
+@functools.cache
+def _tool_record() -> dict[str, Any]:
+    """What made these outputs, read as the run starts: the output format, the installed version of
+    the package, the SHA-256 of its modules, and the commit of the checkout they come from with
+    whether that checkout had changes.
+
+    Two runs of one tool give one record, so the outputs keep their bytes. The digest holds where
+    there is no checkout to name (an installed copy), and tells two builds of one commit apart when
+    one of them ran from a changed tree.
+    """
+    directory = Path(__file__).parent
+    hashed = hashlib.sha256()
+    for path in sorted(directory.glob("*.py")):
+        hashed.update(path.name.encode())
+        hashed.update(path.read_bytes())
+    try:
+        version = importlib.metadata.version("cgraph")
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    commit, modified = _checkout(directory)
+    return {
+        "format": VERSION,
+        "version": version,
+        "code": hashed.hexdigest(),
+        "commit": commit,
+        "modified": modified,
+    }
 
 
 @dataclass
@@ -188,7 +243,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
     try:
         contracts = ContractGraph.load(inputs.contract_graph, config.contract_function_prefix)
         recorded = {
-            "tool": VERSION,
+            "tool": _tool_record(),
             "c_sources": sources_digest(facts, contents),
             "image": _sha256(inputs.image),
             "system_map": _sha256(inputs.system_map),
@@ -247,6 +302,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
     }
     build_document = {
         "format": "cgraph/build/v1",
+        "tool": _tool_record(),
         "part": part,
         "passes": passes,
         "parsed": parsed_sources,

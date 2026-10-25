@@ -15,6 +15,13 @@ A run that does not write its outputs leaves `--out` as it found it: every outpu
 temporary file of the directory, and the replacement of the directory's files is all or nothing,
 whatever fails in the middle of it. A run that does not finish leaves no directory of its own either.
 
+`build.json` and `graph.json` record the tool that made them under `tool`: the output format, the
+package's installed version, the SHA-256 of every module of the package, and the commit of the
+checkout it ran from with whether that checkout had changes (both `null` where it runs from an
+installed copy with no checkout to read). The same tool at the same commit gives the same record, so
+the outputs keep their bytes; a build from a changed checkout says `"modified": true` instead of
+claiming the commit alone, and the digest tells two such builds apart.
+
 ## Sources
 
 - **The C source**, parsed with libclang per translation unit, with the flags of a compilation

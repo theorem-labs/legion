@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
+import re
 import shutil
+import subprocess
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
@@ -126,6 +129,45 @@ def test_incremental_build_after_a_change_to_one_file_equals_a_full_build(copy: 
         and edge["access"] == "write"
         for edge in graph["edges"]
     )
+
+
+def test_the_outputs_record_the_tool_that_made_them(copy: Path, tmp_path: Path) -> None:
+    """A reader of build.json must be able to tell which code made a graph: the output format, the
+    package's version, the digest of its modules, and the checkout it ran from."""
+    out = tmp_path / "out"
+    assert cli_build(copy, out) == 0
+
+    tool = read(out, "build.json")["tool"]
+
+    assert tool["format"] == pipeline.VERSION
+    assert tool["version"] == importlib.metadata.version("cgraph")
+    assert re.fullmatch(r"[0-9a-f]{64}", tool["code"])
+    assert tool["commit"] is None or re.fullmatch(r"[0-9a-f]{40}", tool["commit"])
+    assert tool["modified"] in (True, False, None)
+    # The graph carries the same record, so an output kept without its build document names its tool.
+    assert read(out, "graph.json")["inputs"]["tool"] == tool
+
+
+def test_the_tool_record_names_the_commit_of_its_checkout_and_whether_it_changed(tmp_path: Path) -> None:
+    """A build from a checkout with changes says so instead of claiming the commit alone."""
+    checkout = tmp_path / "checkout"
+    (checkout / "src").mkdir(parents=True)
+    source = checkout / "src" / "module.py"
+    source.write_text("value = 1\n")
+    for arguments in (
+        ["init", "--initial-branch=main"],
+        ["add", "src/module.py"],
+        ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "first"],
+    ):
+        subprocess.run(["git", "-C", str(checkout), *arguments], check=True, capture_output=True)
+
+    assert pipeline._checkout(tmp_path) == (None, None)
+    commit, modified = pipeline._checkout(checkout / "src")
+    assert re.fullmatch(r"[0-9a-f]{40}", commit or "") and modified is False
+
+    source.write_text("value = 2\n")
+
+    assert pipeline._checkout(checkout / "src") == (commit, True)
 
 
 def test_a_header_change_reparses_every_unit_that_includes_it(copy: Path, tmp_path: Path) -> None:
@@ -258,6 +300,7 @@ def test_cli_json_and_build_document_list_sorted_translation_units(
     assert first["reused"] == []
     assert read(out, "build.json") == {
         "format": "cgraph/build/v1",
+        "tool": pipeline._tool_record(),
         "part": "both",
         "passes": True,
         "parsed": ["src/bags.c", "src/store.c"],
