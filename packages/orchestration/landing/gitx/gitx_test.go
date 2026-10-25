@@ -30,6 +30,33 @@ func TestCandidateDropsConflicts(t *testing.T) {
 	}
 }
 
+// A candidate commit is the program's own object: it builds in a repository
+// and a home with no git identity. user.useConfigOnly makes git refuse the
+// identity it would otherwise guess from the host name, as it does on a host
+// whose name has no domain.
+func TestCandidateNeedsNoGitIdentity(t *testing.T) {
+	repo := newRepository(t)
+	base := repo.commit("value", "base\n")
+	first := repo.branch(base, "other", "first\n")
+	run(t, repo.path, "config", "--unset", "user.name")
+	run(t, repo.path, "config", "--unset", "user.email")
+	run(t, repo.path, "config", "user.useConfigOnly", "true")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	for _, name := range []string{"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"} {
+		t.Setenv(name, "")
+		os.Unsetenv(name)
+	}
+	result, err := Candidate(context.Background(), repo.path, base, []Member{{ID: "one", Head: first}})
+	if err != nil {
+		t.Fatalf("Candidate() error = %v", err)
+	}
+	if got := repo.contents(result.Commit, "other"); got != "first\n" {
+		t.Fatalf("candidate contents = %q, want the member's file", got)
+	}
+}
+
 func TestCandidateDropsCarrierOfRejectedMember(t *testing.T) {
 	repo := newRepository(t)
 	base := repo.commit("value", "base\n")

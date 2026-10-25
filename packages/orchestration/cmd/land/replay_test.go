@@ -300,3 +300,36 @@ func TestLandReplayClassifiesTheMisses(t *testing.T) {
 		})
 	}
 }
+
+// The recorded program joins the reasons of one kick with "; ": a name kick
+// that also had a red build ("ident:X; red", "clash; red") is still a name
+// kick, and its row names the name and every reason.
+func TestLandReplayReadsCombinedKickReasons(t *testing.T) {
+	repo, base, heads := scratchRepository(t, map[string]string{"culprit": "-def gone := 0", "clasher": "+def extra := 1", "red": "+def other := 2"})
+	dir := t.TempDir()
+	writeFile(t, dir, "build-round-1.log", "")
+	manifest := writeManifest(t, dir, replay.Manifest{Repository: repo, Base: base,
+		Members: []replay.Member{{ID: "culprit", Head: heads["culprit"]}, {ID: "clasher", Head: heads["clasher"]}, {ID: "red", Head: heads["red"]}},
+		BuildRounds: []replay.BuildRound{{Round: 1, Log: "build-round-1.log", RecordedKicks: []replay.Kick{
+			{Member: "culprit", Reason: "ident:Alpha.gone; red"},
+			{Member: "clasher", Reason: "clash; red"},
+			{Member: "red", Reason: "red"},
+		}}}})
+	got := runReplay(t, manifest, replayConfig(t, repo))
+	if got.err != nil {
+		t.Fatalf("replay: %v", got.err)
+	}
+	if kick, found := row(got.rows, "1", "culprit", "recorded"); !found || kick[3] != "ident; red" || kick[4] != "Alpha.gone" {
+		t.Fatalf("rows = %q, want culprit's kick as reasons \"ident; red\" and name Alpha.gone", got.rows)
+	}
+	if kick, found := row(got.rows, "1", "clasher", "recorded"); !found || kick[3] != "clash; red" || kick[4] != "" {
+		t.Fatalf("rows = %q, want clasher's kick as reasons \"clash; red\" and no name", got.rows)
+	}
+	var kicked []string
+	for _, kick := range got.summary[0].RecordedNameKicks {
+		kicked = append(kicked, kick.Member)
+	}
+	if !reflect.DeepEqual(kicked, []string{"culprit", "clasher"}) {
+		t.Fatalf("recorded name kicks = %v, want culprit and clasher", kicked)
+	}
+}
