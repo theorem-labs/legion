@@ -96,7 +96,7 @@ func TestAReaderReadsOneStateOfTheIndexWhileARefreshWritesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The compiled part of one, as a compiled step leaves it: here one constant, of the module that two removes.
-	execIndex(t, writer, `INSERT INTO consts (name, module, kind, type, cstmt) VALUES ('Gold2.FrameAt', 'Sub.Wrap', 'def', 'Prop', 'hash-one')`)
+	execIndex(t, writer, `INSERT INTO consts (name, module, kind, type, cstmt, binders, conclusion) VALUES ('Gold2.FrameAt', 'Sub.Wrap', 'def', 'Prop', 'hash-one', '[]', '')`)
 	setIndexMeta(t, writer, "compiled_commit", "one")
 	old, err := OpenReadOnly(ctx, tg, IndexOnly)
 	if err != nil {

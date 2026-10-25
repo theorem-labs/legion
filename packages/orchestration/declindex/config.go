@@ -266,6 +266,20 @@ func isInside(root, path string) bool {
 // ErrDBRemoved refuses the key db: and the flag --db, which named the SQLite file the index was.
 var ErrDBRemoved = errors.New("db: was removed: the index is a Postgres schema; set index: and pass DECLINDEX_DSN or --index-dsn-file")
 
+// OpenReadOnlyConfig opens the index that c names read-only (OpenReadOnly), with scope the reads of its caller
+// besides the index. A program that only reads the index (graph checks) opens it through this one call, and needs
+// no knowledge of where or how the index is kept.
+func OpenReadOnlyConfig(ctx context.Context, c Config, scope ReadScope) (*Store, error) {
+	t := c.Target()
+	switch {
+	case t.Index == "":
+		return nil, errors.New("index: is required: the index is a schema of a Postgres database")
+	case t.DSN == "":
+		return nil, errors.New("no connection string for the index: set DECLINDEX_DSN or pass the configuration one")
+	}
+	return OpenReadOnly(ctx, t, scope)
+}
+
 // TreeSpec is the configuration's Tree.
 func (c Config) TreeSpec() Tree {
 	roots := Roots{}

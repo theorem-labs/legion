@@ -362,7 +362,12 @@ func (s *Store) writeCompiled(ctx context.Context, tx pgx.Tx, w compiledRead) er
 	constRows := make([][]any, 0, len(w.consts))
 	at := make(map[declRef]int, len(w.consts))
 	for _, c := range w.consts {
-		row := []any{c.Name, c.Module, c.Kind, c.Type, c.Hash}
+		// binders is a JSON array, as the graph checks read it back (ConstantsIn).
+		binders, err := json.Marshal(nonNil(c.Binders))
+		if err != nil {
+			return err
+		}
+		row := []any{c.Name, c.Module, c.Kind, c.Type, c.Hash, string(binders), c.Conclusion}
 		if i, ok := at[(declRef{c.Module, c.Name})]; ok {
 			constRows[i] = row
 			continue
@@ -399,7 +404,7 @@ func (s *Store) writeCompiled(ctx context.Context, tx pgx.Tx, w compiledRead) er
 		cols  []string
 		rows  pgx.CopyFromSource
 	}{
-		{"consts", []string{"name", "module", "kind", "type", "cstmt"}, pgx.CopyFromRows(constRows)},
+		{"consts", []string{"name", "module", "kind", "type", "cstmt", "binders", "conclusion"}, pgx.CopyFromRows(constRows)},
 		{"atoms", []string{"name", "module", "atom"}, copyFrom(func(yield func([]any) bool) {
 			for _, c := range w.consts {
 				for _, a := range c.Atoms {

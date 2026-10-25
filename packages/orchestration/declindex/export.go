@@ -50,9 +50,10 @@ func FindLean(ctx context.Context, dir, prefix string) (Lean, error) {
 }
 
 // env is the whole environment of a toolchain process: the toolchain first on a system PATH, its root
-// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, and HOME and TMPDIR at home. Nothing else of
-// the caller's environment (credentials, tokens) reaches Lean, and a module that a proposal compiles sees its own
-// directory as home.
+// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, HOME and TMPDIR at home, and the thread count
+// of the build that runs it (LEAN_NUM_THREADS), so that many toolchain processes together keep to the cores that
+// build was given. Nothing else of the caller's environment (credentials, tokens) reaches Lean, and a module that a
+// proposal compiles sees its own directory as home.
 func (l Lean) env(searchPath []string, home string) []string {
 	env := []string{
 		"LEAN_SYSROOT=" + l.Prefix,
@@ -61,8 +62,10 @@ func (l Lean) env(searchPath []string, home string) []string {
 		"HOME=" + home,
 		"TMPDIR=" + home,
 	}
-	if v := os.Getenv("LANG"); v != "" {
-		env = append(env, "LANG="+v)
+	for _, name := range []string{"LANG", "LEAN_NUM_THREADS"} {
+		if v := os.Getenv(name); v != "" {
+			env = append(env, name+"="+v)
+		}
 	}
 	return env
 }
@@ -185,11 +188,12 @@ func linker(l Lean, cc string) string {
 
 // CompileModule compiles the one file root/rel.lean to root/rel.olean and root/rel.ilean, against the modules
 // of searchPath (and root), as `lean` does for one module of a build. Lean runs in root with root as its home and
-// the minimal environment of Lean.env.
-func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel string) error {
+// the minimal environment of Lean.env. args go to `lean` before the file: the options the build passes to each
+// module (`-Dname=value`, `--load-dynlib=...`), so a module compiles here as it does there.
+func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel string, args ...string) error {
 	base := filepath.Join(root, filepath.FromSlash(rel))
-	return run(ctx, root, l.env(append([]string{root}, searchPath...), root), l.bin("lean"), "-R", root,
-		"-o", base+".olean", "-i", base+".ilean", base+".lean")
+	argv := slices.Concat([]string{"-R", root, "-o", base + ".olean", "-i", base + ".ilean"}, args, []string{base + ".lean"})
+	return run(ctx, root, l.env(append([]string{root}, searchPath...), root), l.bin("lean"), argv...)
 }
 
 // ErrSourceFailed says that Lean ran on an untrusted source and reported errors in it: the source's failure, not
@@ -303,6 +307,15 @@ type Constant struct {
 	Atoms     []string `json:"a"`
 	Facts     []Fact   `json:"f"`
 	Truncated bool     `json:"tr"`
+	// Binders are the heads of the types of the constant's explicit binders, in order, and Conclusion the head of its
+	// type past every binder and every `let` or `have` among them. A head is the constant at the bottom of the
+	// application at the top of a type, past the type's own binders, metadata and type annotations (a default
+	// value's or tactic's, also where metadata sits inside the annotation), as Lean prints its full name; empty when
+	// it is not a constant (a variable, a sort, a lambda). They and Type are read from the elaborated type of the
+	// module's own declaration, also where Lean merged two modules' declarations of one theorem, so a module gives
+	// the same row whichever modules are read with it.
+	Binders    []string `json:"b"`
+	Conclusion string   `json:"c"`
 }
 
 // Exporter runs the built exporter over compiled modules.

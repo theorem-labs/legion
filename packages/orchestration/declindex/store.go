@@ -20,7 +20,9 @@ import (
 // SchemaVersion changes whenever what an index holds changes: a table, a column, a meta key that a reader needs, or
 // how a stored value is computed (a statement hash). An index of another version is rebuilt from nothing (Open), and
 // OpenReadOnly refuses it.
-const SchemaVersion = "15"
+// 17: the Postgres schema of 15 with the graph checks' consts columns of main's 14 (binders, conclusion). 16 was
+// a head of this branch with another edges index, whose indexes must be rebuilt too.
+const SchemaVersion = "17"
 
 // schema is the index's tables. Every text column is COLLATE "C": the index's answers order and group names by
 // bytes, as Lean's own name order does, whatever collation the server's database was created with. The hashes,
@@ -60,10 +62,12 @@ CREATE INDEX edges_owner ON edges (owner_module, owner);
 CREATE INDEX edges_target ON edges (target);
 CREATE INDEX edges_closure ON edges (tmodule) WHERE by_closure;
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated
--- type as printed, and its compiled statement hash.
-CREATE TABLE consts (name text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, kind text COLLATE "C" NOT NULL, type text COLLATE "C" NOT NULL, cstmt text COLLATE "C" NOT NULL, PRIMARY KEY (name, module));
+-- type as printed, its compiled statement hash, the heads of its explicit binders' types (a JSON array, in order)
+-- and the head of its conclusion (Constant.Binders and Constant.Conclusion).
+CREATE TABLE consts (name text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, kind text COLLATE "C" NOT NULL, type text COLLATE "C" NOT NULL, cstmt text COLLATE "C" NOT NULL, binders text COLLATE "C" NOT NULL, conclusion text COLLATE "C" NOT NULL, PRIMARY KEY (name, module));
 CREATE INDEX consts_module ON consts (module);
 CREATE INDEX consts_cstmt ON consts (cstmt);
+CREATE INDEX consts_conclusion ON consts (conclusion);
 -- The relation atoms of each constant's statement, by canonical hash: who else states the same fact.
 CREATE TABLE atoms (name text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, atom text COLLATE "C" NOT NULL);
 CREATE INDEX atoms_atom ON atoms (atom);

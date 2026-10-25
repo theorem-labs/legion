@@ -496,6 +496,9 @@ def classify_run_step(step: dict) -> list[tuple[str, bool]]:
 NON_BUILDING_ACTIONS = {
     "actions/attest-build-provenance",
     "actions/cache",
+    # The split restore and save halves of actions/cache: they move a cache, they build nothing.
+    "actions/cache/restore",
+    "actions/cache/save",
     "actions/checkout",
     "actions/configure-pages",
     "actions/deploy-pages",

@@ -611,3 +611,40 @@ func TestRefreshRecordsEachLandingWithItsPreviousCommit(t *testing.T) {
 		t.Fatalf("an unrecorded landing: recorded %v, %v", ok, err)
 	}
 }
+
+// An index of an older schema has no consts.binders or consts.conclusion column. Open reads its version before it
+// creates this schema over it, since the index on consts.conclusion cannot be made on its consts table, and
+// rebuilds the schema from nothing. An older schema cannot be written through the store, so the test makes one
+// from this one with SQL.
+func TestOpenRebuildsAnIndexOfAnOlderSchema(t *testing.T) {
+	ctx := context.Background()
+	target := indexTarget(t)
+	s := openAt(t, target)
+	tree := goldenTree(t)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP INDEX consts_conclusion`,
+		`ALTER TABLE consts DROP COLUMN conclusion`,
+		`ALTER TABLE consts DROP COLUMN binders`,
+	} {
+		execIndex(t, s, statement)
+	}
+	setIndexMeta(t, s, "schema", "13")
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rebuilt := openAt(t, target)
+	if version, err := rebuilt.Meta(ctx, "schema"); err != nil || version != SchemaVersion {
+		t.Fatalf("schema after the rebuild = %q, %v; want %q", version, err, SchemaVersion)
+	}
+	if _, err := rebuilt.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	writeConstants(t, rebuilt, []string{"Golden"}, []Constant{{Name: "Gold.frame_al", Module: "Golden", Kind: "theorem",
+		Hash: "h", Binders: []string{"Gold.Frame"}, Conclusion: "Gold.Aligned"}})
+	if got, err := rebuilt.ConstantsConcluding(ctx, []string{"Gold.Aligned"}); err != nil || len(got) != 1 {
+		t.Fatalf("ConstantsConcluding after the rebuild = %+v, %v; want one row", got, err)
+	}
+}

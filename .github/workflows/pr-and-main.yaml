@@ -189,6 +189,19 @@ jobs:
         run: go vet ./...
         working-directory: packages/orchestration
 
+      # Every workspace module's dependency graph, resolved and verified against go.work.sum and
+      # each module's go.sum, with nothing compiled. This runs on every pull request, with no path
+      # filter, because envoy-and-contracts.yaml no longer starts its Go jobs for a diff that only
+      # touches go.work.sum: a wrong hash fails here in seconds instead of an hour of tests, and a
+      # missing one shows up as a manifest the resolution rewrote. The envoy module's test graph is
+      # the one that reads the workspace checksum file, so it is the reason this step exists.
+      - name: Verify every workspace module's dependencies against the checksums
+        run: |
+          for module in packages/daemon packages/envoy packages/orchestration; do
+            (cd "$module" && go list -deps -test ./... > /dev/null)
+          done
+          git diff --exit-code -- go.work.sum packages/daemon/go.sum packages/envoy/go.sum packages/orchestration/go.sum
+
 
   test:
     runs-on: ubuntu-24.04
