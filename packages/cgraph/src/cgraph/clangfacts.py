@@ -1751,15 +1751,16 @@ def _is_inline(definition: ci.Cursor) -> bool:
 
 
 def _is_noinline(definition: ci.Cursor) -> bool:
-    """A definition marked ``noinline`` (the kernel's ``noinline``, ``__attribute__((noinline))``): the
-    compiler calls it, so its returns do not fold into the caller's code."""
-    body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
-    end = body.extent.start.offset if body is not None else None
-    for token in definition.get_tokens():
-        if end is not None and token.extent.start.offset >= end:
-            break
-        if token.spelling in ("noinline", "__noinline__", "__noinline"):
-            return True
+    """A function marked ``noinline`` on any declaration, also through a macro (the kernel's
+    ``noinline``, a ``NEVER_INLINE``): libclang gives each declaration the attributes it inherits, as
+    an attribute cursor whose first token is the attribute's name. The compiler calls such a function,
+    so its returns do not fold into the caller's code."""
+    for declaration in (definition, definition.canonical):
+        for child in declaration.get_children():
+            if child.kind.is_attribute():
+                first = next(iter(child.get_tokens()), None)
+                if first is not None and first.spelling in ("noinline", "__noinline__"):
+                    return True
     return False
 
 
@@ -6202,9 +6203,10 @@ class _FunctionWalk:
                     self.walk_guarded(case_guard, child, node, child_index, None, generic)
                 else:
                     self.walk(child, node, child_index, None, generic)
-                if dead and self.holds_live_label(child) and not self.x.evaluator.exits(child):
-                    # goto L; if (0) { L: warn(); } kept();: control entered at L falls out of the
-                    # statement, so what follows it is code again.
+                if dead and self.holds_live_label(child):
+                    # goto L; if (0) { L: warn(); } kept();: control entered at L may fall out of the
+                    # statement, whatever its normal entry does (`if (1) return; else { L: … }`), so
+                    # what follows it is code again.
                     dead = False
                 elif not dead and (self.x.evaluator.exits(child) or self.decided_exit(child)):
                     dead = True

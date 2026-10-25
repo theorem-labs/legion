@@ -82,3 +82,28 @@ def test_a_noinline_callee_s_value_is_not_its_template_at_a_fold(tmp_path: Path)
 
 def test_a_noinline_callee_s_value_is_not_its_template(tmp_path: Path) -> None:
     assert "warn" in compiled(facts_of(tmp_path, CASES), "tw")
+
+
+ROUND_SIX = """
+    #define NEVER_INLINE __attribute__((noinline))
+    void exit_else(void) { goto L; if (1) return; else { L: warn(); } kept(); }
+    static int half(int x);
+    static __attribute__((noinline)) int half(int x);
+    static int half(int x) { return x / 2; }
+    void declared_noinline(void) { if (half(4) == 7) warn(); kept(); }
+    NEVER_INLINE static int third(int x) { return x / 3; }
+    void macro_noinline(void) { if (third(3) == 7) warn(); kept(); }
+"""
+
+
+def test_code_after_an_exit_statement_a_goto_enters_is_code(tmp_path: Path) -> None:
+    """`goto L; if (1) return; else { L: warn(); } kept();`: entry at L falls out to kept."""
+    assert {"warn", "kept"} <= compiled(facts_of(tmp_path, ROUND_SIX), "exit_else")
+
+
+def test_a_noinline_an_earlier_declaration_or_a_macro_writes_is_called(tmp_path: Path) -> None:
+    """noinline on an earlier declaration, or written by a NEVER_INLINE macro: clang calls the function
+    and keeps `call warn` after the comparison."""
+    facts = facts_of(tmp_path, ROUND_SIX)
+    assert "warn" in compiled(facts, "declared_noinline")
+    assert "warn" in compiled(facts, "macro_noinline")
