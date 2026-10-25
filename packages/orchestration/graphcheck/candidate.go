@@ -287,7 +287,7 @@ func (c *Candidate) compile(ctx context.Context, idx *declindex.Store) error {
 		c.closure()
 		return nil
 	}
-	c.lean, err = declindex.FindLean(ctx, c.icfg.Tree, c.icfg.Lean.Toolchain)
+	c.lean, err = leanToolchain(ctx, c.icfg)
 	if err != nil {
 		return unable("the index's tree selects no Lean toolchain: %v", err)
 	}
@@ -743,7 +743,7 @@ func (c *Candidate) export(ctx context.Context) error {
 		return nil
 	}
 	if c.lean.Prefix == "" {
-		l, err := declindex.FindLean(ctx, c.icfg.Tree, c.icfg.Lean.Toolchain)
+		l, err := leanToolchain(ctx, c.icfg)
 		if err != nil {
 			return unable("the index's tree selects no Lean toolchain: %v", err)
 		}
