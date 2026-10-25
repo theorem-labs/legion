@@ -3,7 +3,7 @@ package declindex
 import (
 	"cmp"
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"maps"
 	"path"
@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Found is one declaration that a name resolves to.
@@ -31,8 +33,8 @@ func (f Found) At() string { return f.Path + ":" + strconv.Itoa(f.Line) }
 func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 	short := q[strings.LastIndexByte(q, '.')+1:]
 	var out []Found
-	rows, err := s.q.QueryContext(ctx, foundSelect+` WHERE d.short = ?`, short)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, foundSelect+` WHERE d.short = $1`, short)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
@@ -58,7 +60,8 @@ func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 // declarationsNamed gives the declarations of each of the full names in names, by name.
 func (s *Store) declarationsNamed(ctx context.Context, names []string) (map[string][]Found, error) {
 	out := make(map[string][]Found, len(names))
-	err := eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, names, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, foundSelect+` WHERE d.name = ANY($1)`, names)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
@@ -145,9 +148,9 @@ func (s *Store) usersOf(ctx context.Context, d declRef) ([]useRow, error) {
 		u      useRow
 	}
 	var rs []recorded
-	rows, err := s.q.QueryContext(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
-		WHERE target = ? OR (target >= ? AND target < ?)`, d.name, d.name+".", d.name+"/")
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
+		WHERE target = $1 OR (target >= $2 AND target < $3)`, d.name, d.name+".", d.name+"/")
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var x recorded
 		if err := r.Scan(&x.target.name, &x.target.module, &x.u.module, &x.u.line, &x.u.col, &x.u.parent, &x.u.class); err != nil {
 			return err
@@ -192,8 +195,8 @@ func (s *Store) modulePaths(ctx context.Context) (map[string]string, error) {
 		return s.derived.paths, nil
 	}
 	out := map[string]string{}
-	rows, err := s.q.QueryContext(ctx, `SELECT module, rel FROM modules`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT module, rel FROM modules`)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var m, rel string
 		if err := r.Scan(&m, &rel); err != nil {
 			return err
@@ -216,8 +219,8 @@ func (s *Store) ModuleAt(ctx context.Context, file string) (string, error) {
 		return "", nil
 	}
 	var m string
-	err := s.q.QueryRowContext(ctx, `SELECT module FROM modules WHERE rel = ?`, rel).Scan(&m)
-	if err == sql.ErrNoRows {
+	err := s.q.QueryRow(ctx, `SELECT module FROM modules WHERE rel = $1`, rel).Scan(&m)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
 	return m, err

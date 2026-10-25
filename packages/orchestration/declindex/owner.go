@@ -3,9 +3,10 @@ package declindex
 import (
 	"cmp"
 	"context"
-	"database/sql"
 	"maps"
 	"slices"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // declRef names a declaration, or a constant that a use records: its module and its full name. Two modules that are
@@ -19,7 +20,7 @@ func (r declRef) compare(o declRef) int {
 // declaring maps each name to the modules that declare it, each list sorted and without repeats.
 type declaring map[string][]string
 
-func (d declaring) add(r *sql.Rows) error {
+func (d declaring) add(r pgx.Rows) error {
 	var n, m string
 	if err := r.Scan(&n, &m); err != nil {
 		return err
@@ -39,7 +40,7 @@ func (d declaring) sorted() declaring {
 // allDeclaring reads every declaration of the index.
 func allDeclaring(ctx context.Context, q querier) (declaring, error) {
 	d := declaring{}
-	rows, err := q.QueryContext(ctx, `SELECT name, module FROM decls`)
+	rows, err := q.Query(ctx, `SELECT name, module FROM decls`)
 	if err := eachRow(rows, err, d.add); err != nil {
 		return nil, err
 	}
@@ -56,7 +57,8 @@ func declaringPrefixes(ctx context.Context, q querier, names []string) (declarin
 		}
 	}
 	d := declaring{}
-	if err := eachRowIn(ctx, q, `SELECT name, module FROM decls WHERE name IN`, slices.Sorted(maps.Keys(cands)), d.add); err != nil {
+	rows, err := q.Query(ctx, `SELECT name, module FROM decls WHERE name = ANY($1)`, slices.Sorted(maps.Keys(cands)))
+	if err := eachRow(rows, err, d.add); err != nil {
 		return nil, err
 	}
 	return d.sorted(), nil
@@ -67,8 +69,8 @@ type importGraph map[string][]string
 
 func loadImports(ctx context.Context, q querier) (importGraph, error) {
 	g := importGraph{}
-	rows, err := q.QueryContext(ctx, `SELECT module, imported FROM imports`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := q.Query(ctx, `SELECT module, imported FROM imports`)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var m, i string
 		if err := r.Scan(&m, &i); err != nil {
 			return err
@@ -454,8 +456,8 @@ func exportGroups(ctx context.Context, q querier, modules, base []string, loads 
 		return plan, err
 	}
 	rule := &loadRule{ctx: ctx, axioms: map[string]map[string]bool{}, loads: loads, loaded: map[[2]string]bool{}}
-	rows, err := q.QueryContext(ctx, `SELECT name, module FROM decls WHERE kind = 'axiom'`)
-	if err := eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := q.Query(ctx, `SELECT name, module FROM decls WHERE kind = 'axiom'`)
+	if err := eachRow(rows, err, func(r pgx.Rows) error {
 		var n, m string
 		if err := r.Scan(&n, &m); err != nil {
 			return err

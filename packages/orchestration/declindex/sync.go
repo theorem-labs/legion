@@ -116,13 +116,6 @@ func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string
 	if indexErrors != "0" {
 		return "", nil
 	}
-	graph, err := s.Meta(ctx, "graph")
-	if err != nil {
-		return "", err
-	}
-	if graph == "" || graphToken(s.path+".graph") != graph {
-		return "", nil
-	}
 	if compiled {
 		at, err := s.Meta(ctx, "compiled_commit")
 		if err != nil {

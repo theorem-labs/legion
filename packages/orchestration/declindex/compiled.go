@@ -3,7 +3,6 @@ package declindex
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
@@ -103,7 +104,7 @@ func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, ext
 // SameCompiled lists the declarations (generated constants counted as their declaration) whose compiled
 // statement hash is hash: exact restatements.
 func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) {
-	return s.distinctOwners(ctx, `SELECT name, module FROM consts WHERE cstmt = ? ORDER BY name, module`, hash)
+	return s.distinctOwners(ctx, `SELECT name, module FROM consts WHERE cstmt = $1 ORDER BY name, module`, hash)
 }
 
 // FormsClash is why the compiled step reads Module without the registry's forms: its imports declare Name in
@@ -123,8 +124,8 @@ type FormsClash struct {
 // registry's forms: none when every module was read with them.
 func (s *Store) WithoutForms(ctx context.Context) ([]FormsClash, error) {
 	out := []FormsClash{}
-	rows, err := s.q.QueryContext(ctx, `SELECT module, name, declarer, forms FROM without_forms ORDER BY module, name, declarer`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT module, name, declarer, forms FROM without_forms ORDER BY module, name, declarer`)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var module, name, declarer string
 		var forms bool
 		if err := r.Scan(&module, &name, &declarer, &forms); err != nil {
@@ -223,7 +224,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			// Nothing was read with the new exporter or forms: the compiled part is not complete for commit.
 			return 0, 0, nil
 		}
-		return 0, 0, s.write(ctx, log, func() error { return s.setMeta(ctx, s.db, "compiled_commit", commit) })
+		return 0, 0, s.writeTx(ctx, func(tx pgx.Tx) error { return setMeta(ctx, tx, "compiled_commit", commit) })
 	}
 	sort.Strings(todo)
 	before, err := s.defHashes(ctx, todo)
@@ -241,7 +242,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	logf(log, "index: %d compiled modules read, %d constants, %s", len(todo), len(consts), time.Since(t0).Round(time.Millisecond))
 	var again []string
 	if !full {
-		again, err = s.reachedModules(changedDefs(before, consts), todo)
+		again, err = s.reachedModules(ctx, changedDefs(before, consts), todo)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -259,8 +260,8 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			logf(log, "index: %d modules re-matched, reached from changed definitions", len(again))
 		}
 	}
-	// The exporter ran without the write lock; only the write of what it read holds it.
-	if err := s.writeTx(ctx, log, func(tx *sql.Tx) error {
+	// The exporter ran outside the write transaction; only the write of what it read is in one.
+	if err := s.writeTx(ctx, func(tx pgx.Tx) error {
 		return s.writeCompiled(ctx, tx, compiledRead{read: todo, rematched: again, oleanKeys: keys, consts: consts,
 			withoutForms: withoutForms, digest: digest, commit: commit})
 	}); err != nil {
@@ -369,62 +370,100 @@ type compiledRead struct {
 // writeCompiled replaces the compiled rows of the modules read (read, and rematched) with consts and their clashes
 // with the forms, records the .olean key now of each module of read, and the digest and the commit that the
 // compiled part is of.
-func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, w compiledRead) error {
-	for _, mod := range slices.Concat(w.read, w.rematched) {
-		if err := deleteCompiled(ctx, tx, mod); err != nil {
-			return err
-		}
-	}
-	cb := newBatch(tx, "INSERT OR REPLACE", "consts", 5)
-	ab, fb := newBatch(tx, "INSERT", "atoms", 3), newBatch(tx, "INSERT", "facts", 4)
-	for _, c := range w.consts {
-		if err := cb.add(ctx, c.Name, c.Module, c.Kind, c.Type, c.Hash); err != nil {
-			return err
-		}
-		for _, a := range c.Atoms {
-			if err := ab.add(ctx, c.Name, c.Module, a); err != nil {
-				return err
-			}
-		}
-		for _, f := range c.Facts {
-			if err := fb.add(ctx, c.Name, c.Module, f.Concept, f.How); err != nil {
-				return err
-			}
-		}
-	}
-	wb := newBatch(tx, "INSERT OR REPLACE", "without_forms", 4)
-	for _, c := range w.withoutForms {
-		for _, d := range c.DeclaredIn {
-			if err := wb.add(ctx, c.Module, c.Name, d, false); err != nil {
-				return err
-			}
-		}
-		for _, d := range c.FormsDeclaredIn {
-			if err := wb.add(ctx, c.Module, c.Name, d, true); err != nil {
-				return err
-			}
-		}
-	}
-	for _, b := range []*batch{cb, ab, fb, wb} {
-		if err := b.flush(ctx); err != nil {
-			return err
-		}
-	}
-	for _, mod := range w.read {
-		if _, err := tx.ExecContext(ctx, `UPDATE modules SET olean_key = ? WHERE module = ?`, w.oleanKeys[mod], mod); err != nil {
-			return err
-		}
-	}
-	if err := s.setMeta(ctx, tx, "compiled", w.digest); err != nil {
+func (s *Store) writeCompiled(ctx context.Context, tx pgx.Tx, w compiledRead) error {
+	if err := deleteCompiled(ctx, tx, slices.Concat(w.read, w.rematched)); err != nil {
 		return err
 	}
-	return s.setMeta(ctx, tx, "compiled_commit", w.commit)
+	// consts has (name, module) as its primary key, and a copy cannot replace a row, so the last row of a pair
+	// wins here as INSERT OR REPLACE did; atoms and facts have no key, and keep every row of every constant.
+	constRows := make([][]any, 0, len(w.consts))
+	at := make(map[declRef]int, len(w.consts))
+	for _, c := range w.consts {
+		row := []any{c.Name, c.Module, c.Kind, c.Type, c.Hash}
+		if i, ok := at[(declRef{c.Module, c.Name})]; ok {
+			constRows[i] = row
+			continue
+		}
+		at[declRef{c.Module, c.Name}] = len(constRows)
+		constRows = append(constRows, row)
+	}
+	// without_forms has (module, name, forms, declarer) as its primary key: one row for each of them.
+	type clash struct {
+		module, name, declarer string
+		forms                  bool
+	}
+	formRows := make([][]any, 0, len(w.withoutForms))
+	written := map[clash]bool{}
+	add := func(c clash) {
+		if written[c] {
+			return
+		}
+		written[c] = true
+		formRows = append(formRows, []any{c.module, c.name, c.declarer, c.forms})
+	}
+	for _, c := range w.withoutForms {
+		for _, d := range c.DeclaredIn {
+			add(clash{c.Module, c.Name, d, false})
+		}
+		for _, d := range c.FormsDeclaredIn {
+			add(clash{c.Module, c.Name, d, true})
+		}
+	}
+	// Each source below holds one row at a time: a project's compiled part is millions of rows.
+	atoms, facts := make([]any, 3), make([]any, 4)
+	for _, c := range []struct {
+		table string
+		cols  []string
+		rows  pgx.CopyFromSource
+	}{
+		{"consts", []string{"name", "module", "kind", "type", "cstmt"}, pgx.CopyFromRows(constRows)},
+		{"atoms", []string{"name", "module", "atom"}, copyFrom(func(yield func([]any) bool) {
+			for _, c := range w.consts {
+				for _, a := range c.Atoms {
+					atoms[0], atoms[1], atoms[2] = c.Name, c.Module, a
+					if !yield(atoms) {
+						return
+					}
+				}
+			}
+		})},
+		{"facts", []string{"name", "module", "concept", "how"}, copyFrom(func(yield func([]any) bool) {
+			for _, c := range w.consts {
+				for _, f := range c.Facts {
+					facts[0], facts[1], facts[2], facts[3] = c.Name, c.Module, f.Concept, f.How
+					if !yield(facts) {
+						return
+					}
+				}
+			}
+		})},
+		{"without_forms", []string{"module", "name", "declarer", "forms"}, pgx.CopyFromRows(formRows)},
+	} {
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{c.table}, c.cols, c.rows); err != nil {
+			return fmt.Errorf("write the index's %s: %w", c.table, err)
+		}
+	}
+	if len(w.read) > 0 {
+		keys := make([]string, len(w.read))
+		for i, mod := range w.read {
+			keys[i] = w.oleanKeys[mod]
+		}
+		if _, err := tx.Exec(ctx, `UPDATE modules SET olean_key = k.key
+			FROM unnest($1::text[], $2::text[]) AS k(module, key) WHERE modules.module = k.module`, w.read, keys); err != nil {
+			return err
+		}
+	}
+	if err := setMeta(ctx, tx, "compiled", w.digest); err != nil {
+		return err
+	}
+	return setMeta(ctx, tx, "compiled_commit", w.commit)
 }
 
 // defHashes are the compiled hashes of the definitions of the modules, before they are read again.
 func (s *Store) defHashes(ctx context.Context, modules []string) (map[declRef]string, error) {
 	out := map[declRef]string{}
-	err := eachRowIn(ctx, s.q, `SELECT name, module, cstmt FROM consts WHERE kind = 'def' AND module IN`, modules, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT name, module, cstmt FROM consts WHERE kind = 'def' AND module = ANY($1)`, modules)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var d declRef
 		var h string
 		if err := r.Scan(&d.name, &d.module, &h); err != nil {
@@ -480,16 +519,16 @@ type Compiled struct {
 // Constant reads the compiled constant name of module.
 func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, error) {
 	c := Compiled{Name: name, Module: module}
-	err := s.q.QueryRowContext(ctx, `SELECT kind, type, cstmt FROM consts WHERE name = ? AND module = ?`, name, module).
+	err := s.q.QueryRow(ctx, `SELECT kind, type, cstmt FROM consts WHERE name = $1 AND module = $2`, name, module).
 		Scan(&c.Kind, &c.Type, &c.Hash)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return c, &NotFoundError{Name: name}
 	}
 	if err != nil {
 		return c, err
 	}
-	rows, err := s.q.QueryContext(ctx, `SELECT atom FROM atoms WHERE name = ? AND module = ? ORDER BY atom`, name, module)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT atom FROM atoms WHERE name = $1 AND module = $2 ORDER BY atom`, name, module)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var a string
 		if err := r.Scan(&a); err != nil {
 			return err
@@ -500,8 +539,8 @@ func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, er
 	if err != nil {
 		return c, err
 	}
-	rows, err = s.q.QueryContext(ctx, `SELECT concept, how FROM facts WHERE name = ? AND module = ? ORDER BY concept, how`, name, module)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err = s.q.Query(ctx, `SELECT concept, how FROM facts WHERE name = $1 AND module = $2 ORDER BY concept, how`, name, module)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var f Fact
 		if err := r.Scan(&f.Concept, &f.How); err != nil {
 			return err
@@ -522,9 +561,9 @@ func (s *Store) DeclarationParts(ctx context.Context, module string, names []str
 	var consts []declRef
 	for _, n := range names {
 		decls[declRef{module, n}] = true
-		rows, err := s.q.QueryContext(ctx, `SELECT name FROM consts WHERE module = ? AND
-			(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, module, n, n+".", n+"/")
-		err = eachRow(rows, err, func(r *sql.Rows) error {
+		rows, err := s.q.Query(ctx, `SELECT name FROM consts WHERE module = $1 AND
+			(name = $2 OR (name >= $3 AND name < $4)) ORDER BY name`, module, n, n+".", n+"/")
+		err = eachRow(rows, err, func(r pgx.Rows) error {
 			c := declRef{module: module}
 			if err := r.Scan(&c.name); err != nil {
 				return err
@@ -596,7 +635,8 @@ func (s *Store) owners(ctx context.Context, consts []declRef) (map[declRef]Found
 		}
 	}
 	found := map[declRef]Found{}
-	err = eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, slices.Sorted(maps.Keys(declared)), func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, foundSelect+` WHERE d.name = ANY($1)`, slices.Sorted(maps.Keys(declared)))
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
@@ -625,8 +665,8 @@ func (s *Store) owners(ctx context.Context, consts []declRef) (map[declRef]Found
 // owners), each once, in the order of its first constant.
 func (s *Store) distinctOwners(ctx context.Context, query string, args ...any) ([]Found, error) {
 	var consts []declRef
-	rows, err := s.q.QueryContext(ctx, query, args...)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, query, args...)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var c declRef
 		if err := r.Scan(&c.name, &c.module); err != nil {
 			return err
@@ -669,8 +709,8 @@ type Stating struct {
 func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	type row struct{ name, module, how string }
 	var rs []row
-	rows, err := s.q.QueryContext(ctx, `SELECT name, module, how FROM facts WHERE concept = ? ORDER BY module, name, how`, concept)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT name, module, how FROM facts WHERE concept = $1 ORDER BY module, name, how`, concept)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var x row
 		if err := r.Scan(&x.name, &x.module, &x.how); err != nil {
 			return err
@@ -705,7 +745,7 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 // that Resolve gave: who else states one of its facts in the same form.
 func (s *Store) SameAtoms(ctx context.Context, d Found) ([]Found, error) {
 	found, err := s.distinctOwners(ctx, `SELECT DISTINCT b.name, b.module FROM atoms a JOIN atoms b ON b.atom = a.atom
-		WHERE a.name = ? AND a.module = ? AND NOT (b.name = a.name AND b.module = a.module)`, d.Name, d.Module)
+		WHERE a.name = $1 AND a.module = $2 AND NOT (b.name = a.name AND b.module = a.module)`, d.Name, d.Module)
 	if err != nil {
 		return nil, err
 	}

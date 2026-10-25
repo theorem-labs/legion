@@ -554,37 +554,3 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 	}
 	return md, err
 }
-
-// batch inserts rows into one table many at a time, with the statement verb INSERT or INSERT OR REPLACE.
-type batch struct {
-	tx          *sql.Tx
-	verb, table string
-	cols        int
-	args        []any
-}
-
-const batchRows = 400
-
-func newBatch(tx *sql.Tx, verb, table string, cols int) *batch {
-	return &batch{tx: tx, verb: verb, table: table, cols: cols}
-}
-
-func (b *batch) add(ctx context.Context, vals ...any) error {
-	b.args = append(b.args, vals...)
-	if len(b.args) >= batchRows*b.cols {
-		return b.flush(ctx)
-	}
-	return nil
-}
-
-func (b *batch) flush(ctx context.Context) error {
-	if len(b.args) == 0 {
-		return nil
-	}
-	n := len(b.args) / b.cols
-	row := "(" + placeholders(b.cols) + ")"
-	q := b.verb + " INTO " + b.table + " VALUES " + strings.TrimSuffix(strings.Repeat(row+",", n), ",")
-	_, err := b.tx.ExecContext(ctx, q, b.args...)
-	b.args = b.args[:0]
-	return err
-}

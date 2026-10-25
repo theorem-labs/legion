@@ -233,11 +233,7 @@ func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) 
 	if err != nil {
 		return nil, err
 	}
-	db, err := resolveIndex(c.DB)
-	if err != nil {
-		return nil, err
-	}
-	state := filepath.Dir(db)
+	state := filepath.Dir(c.DB)
 	bin, err := BuildExporter(ctx, l, c.Lean.CC, filepath.Join(state, "exporter"))
 	if err != nil {
 		return nil, err
