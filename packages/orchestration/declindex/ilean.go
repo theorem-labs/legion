@@ -32,8 +32,6 @@ type Decl struct {
 	Line int // 1-based
 	// StmtHash is StatementHash of its statement, empty when the source file is missing.
 	StmtHash string
-	// Shape is the declaration's SourceShapes entry, which a renamed copy shares; empty without a statement hash.
-	Shape string
 }
 
 // Use is one reference that elaboration recorded to a declaration of the roots.
@@ -61,18 +59,9 @@ type ModuleData struct {
 	Imports []string
 	Decls   []Decl
 	Uses    []Use
-	// heads are the source heads of the declarations that have a statement hash (SourceHeads), each with its
-	// declaration's name: a head is joined to a declaration by its line.
-	heads []declHead
 	// Stale counts the declarations whose recorded position does not hold their name in the source: the source is
 	// newer than the reference file. Their statement hashes are left empty.
 	Stale int
-}
-
-// declHead is one source head of the declaration name.
-type declHead struct {
-	name string
-	head SourceHead
 }
 
 type ileanFile struct {
@@ -197,9 +186,6 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 		}
 		md.Decls = append(md.Decls, d)
 	}
-	if src != nil {
-		md.joinSourceFacts(src)
-	}
 	for key, ref := range f.References {
 		var k referenceKey
 		if err := json.Unmarshal([]byte(key), &k); err != nil {
@@ -229,31 +215,6 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 	}
 	sortUses(md.Uses)
 	return md, nil
-}
-
-// joinSourceFacts gives each declaration that has a statement hash its shape, and the module the source heads of
-// those declarations, joined by line: SourceShapes, SourceHeads and the reference file all give a declaration's first
-// line, its doc comment and attributes included. A declaration without a statement hash has no trusted position in
-// the source (Stale), so its line may hold another declaration.
-func (md *ModuleData) joinSourceFacts(src []byte) {
-	shapes := map[int]string{}
-	for _, s := range SourceShapes(src) {
-		shapes[s.Line] = s.Shape
-	}
-	byLine := map[int][]string{}
-	for i := range md.Decls {
-		d := &md.Decls[i]
-		if d.StmtHash == "" {
-			continue
-		}
-		d.Shape = shapes[d.Line]
-		byLine[d.Line] = append(byLine[d.Line], d.Name)
-	}
-	for _, h := range SourceHeads(src) {
-		for _, name := range byLine[h.Line] {
-			md.heads = append(md.heads, declHead{name: name, head: h})
-		}
-	}
 }
 
 func sortUses(us []Use) {

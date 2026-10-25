@@ -41,17 +41,12 @@ func (s *Store) DeclsShort(ctx context.Context, shorts []string) ([]Decl, error)
 	return s.declsWhere(ctx, "short", shorts)
 }
 
-// DeclsWithShape gives the declarations whose shape (Decl.Shape) is one of shapes: renamed copies of a statement.
-func (s *Store) DeclsWithShape(ctx context.Context, shapes []string) ([]Decl, error) {
-	return s.declsWhere(ctx, "shape", shapes)
-}
-
 // declColumns are the columns of a Decl, in the order scanDecl reads them.
-const declColumns = `name, short, module, kind, line, stmt_hash, shape`
+const declColumns = `name, short, module, kind, line, stmt_hash`
 
 func scanDecl(r *sql.Rows, out *[]Decl) error {
 	var d Decl
-	if err := r.Scan(&d.Name, &d.Short, &d.Module, &d.Kind, &d.Line, &d.StmtHash, &d.Shape); err != nil {
+	if err := r.Scan(&d.Name, &d.Short, &d.Module, &d.Kind, &d.Line, &d.StmtHash); err != nil {
 		return err
 	}
 	*out = append(*out, d)
@@ -116,91 +111,6 @@ func (s *Store) Imports(ctx context.Context) (map[string][]string, error) {
 			list = append(list, imported.String)
 		}
 		out[module] = list
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// Head is one type head that a declaration's source writes (SourceHeads), as the index keeps it: Role is binder or
-// conclusion, Head the name that ResolveHead gave it against every declaration of the index (a declared full name,
-// else the name as written), and Line the declaration's line.
-type Head struct {
-	Name, Module, Role, Head string
-	Line                     int
-}
-
-// Heads gives the heads of role (of any role when role is empty) that resolved to one of heads.
-func (s *Store) Heads(ctx context.Context, role string, heads []string) ([]Head, error) {
-	return s.headsWhere(ctx, "head", role, heads)
-}
-
-// HeadsOf gives every head of the named declarations.
-func (s *Store) HeadsOf(ctx context.Context, names []string) ([]Head, error) {
-	return s.headsWhere(ctx, "name", "", names)
-}
-
-// headsWhere gives the heads of role (any when empty) whose column (a heads column this file names) is one of values,
-// sorted by name, module, role, head and line.
-func (s *Store) headsWhere(ctx context.Context, column, role string, values []string) ([]Head, error) {
-	var out []Head
-	for chunk := range slices.Chunk(distinct(values), maxInParams) {
-		query := `SELECT name, module, role, head, line FROM heads WHERE ` + column + ` IN (` + placeholders(len(chunk)) + `)`
-		args := anys(chunk)
-		if role != "" {
-			query += ` AND role = ?`
-			args = append(args, role)
-		}
-		rows, err := s.q.QueryContext(ctx, query, args...)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			var h Head
-			if err := r.Scan(&h.Name, &h.Module, &h.Role, &h.Head, &h.Line); err != nil {
-				return err
-			}
-			out = append(out, h)
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	slices.SortFunc(out, func(a, b Head) int {
-		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Module, b.Module), cmp.Compare(a.Role, b.Role),
-			cmp.Compare(a.Head, b.Head), cmp.Compare(a.Line, b.Line))
-	})
-	return out, nil
-}
-
-// declaredBy gives the names that modules declare, as the index holds them: a refresh compares them with what the
-// modules declare after it (headModulesToResolve).
-func declaredBy(ctx context.Context, q querier, modules []string) (map[string]bool, error) {
-	out := map[string]bool{}
-	err := eachRowIn(ctx, q, `SELECT name FROM decls WHERE module IN`, modules, func(r *sql.Rows) error {
-		var name string
-		if err := r.Scan(&name); err != nil {
-			return err
-		}
-		out[name] = true
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// headsByModule maps each module that holds a head to the distinct heads it holds.
-func headsByModule(ctx context.Context, q querier) (map[string][]string, error) {
-	out := map[string][]string{}
-	rows, err := q.QueryContext(ctx, `SELECT DISTINCT module, head FROM heads`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var module, head string
-		if err := r.Scan(&module, &head); err != nil {
-			return err
-		}
-		out[module] = append(out[module], head)
 		return nil
 	})
 	if err != nil {
