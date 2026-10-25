@@ -1,0 +1,49 @@
+# A one-unit program whose kept load reads another parameter at the displacement of a field the
+# compiler removed. The field-offset confirmation test reads it; nothing else does.
+[inputs]
+c_tree = "."
+image = "image/decoy.elf"
+system_map = "image/System.map"
+
+[parts.one]
+files = ["src/g.c"]
+
+[c]
+flags = ["-nostdinc", "--target=riscv64-unknown-elf", "-march=rv64imac", "-mabi=lp64", "-std=gnu2x",
+         "-ffreestanding", "-mcmodel=medany"]
+kit_types = []
+value_types = []
+lock_types = []
+lock_type_words = []
+percpu_globals = []
+percpu_structs = []
+membership_witness_macros = []
+base_type_min_containers = 2
+
+[c.calls]
+unlock = "unlock"
+lock = "^(?!.*unlock)(?:.*lock)"
+allocate = "alloc"
+free = "free"
+
+[c.membership]
+list = []
+hash = []
+
+[c.cleanup]
+class_type = "^class_(.+)_t$"
+destructor = "class_{name}_destructor"
+attribute_macros = {}
+
+[checks]
+min_call_agreement = 1.0
+min_access_agreement = 1.0
+# The only field access of this program is one the compiler removed: it is a miss, by design.
+min_field_offsets = 0.0
+
+[image]
+arch = "riscv64"
+percpu_sections = []
+
+[topics]
+prefix = "notifications.example."

@@ -258,6 +258,16 @@ def _register_relative(
     return None
 
 
+def _first_match(
+    alternates: list[int], size: int, item: dict[str, Any], displacements: set[int], constants: list[int]
+) -> str | None:
+    """How the machine code reaches the field at one of the offsets the access may have, if it does."""
+    return next(
+        (found for offset in alternates if (found := _register_relative(offset, size, item, displacements, constants))),
+        None,
+    )
+
+
 def structure(graph: dict[str, Any]) -> dict[str, Any]:
     """Embeddings against clang's record layout, memberships against their C site, field offsets against the image."""
     analysis = graph["analysis"]
@@ -270,6 +280,8 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
         if any(item.get("source") == "c" and item.get("line", 0) > 0 for item in edge["provenance"])
     ]
     offsets, constants = analysis["image"]["memory_offsets"], analysis["image"]["addi_constants"]
+    # The offsets each function's image code reached through a parameter, as (position, offset).
+    parameters = analysis["image"].get("memory_parameters", {})
     global_offsets: dict[str, set[int]] = collections.defaultdict(set)
     # Each function's image addresses into each global, by every name of the global.
     image_offsets: dict[str, dict[str, set[int]]] = collections.defaultdict(lambda: collections.defaultdict(set))
@@ -300,6 +312,12 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
         if function not in offsets:
             continue
         displacements = set(offsets[function])
+        # The offsets the image reached through each parameter of this function: an access the C
+        # names through one parameter is not confirmed by a load through another one.
+        by_parameter: dict[int, set[int]] = collections.defaultdict(set)
+        for index, value in parameters.get(function, ()):
+            by_parameter[index].add(value)
+        claimed = {value for values in by_parameter.values() for value in values}
         frame_accesses, frame_addresses = frames.frame_of(analysis["image"], function)
         frame_indexed = frames.indexed_of(analysis["image"], function)
         for item in fields:
@@ -328,17 +346,22 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 alternates.append(item["index_displacement"])
             if base in ("global", "container_of") and item.get("offset", -1) >= 0:
                 alternates.append(item["offset"])
-            register = next(
-                (
-                    found
-                    for candidate_offset in alternates
-                    if (
-                        found := _register_relative(
-                            candidate_offset, size, item, displacements, constants.get(function, [])
-                        )
-                    )
-                ),
-                None,
+            # Only the displacements that can be this access's own: those the image reached through
+            # the parameter the C names, and those it reached through no parameter at all (a base
+            # the decoding could not trace, which confirms as it did before).
+            parameter = item.get("param")
+            through = (
+                displacements
+                if parameter is None or not claimed
+                else {
+                    value for value in displacements if value in by_parameter.get(parameter, ()) or value not in claimed
+                }
+            )
+            register = _first_match(alternates, size, item, through, constants.get(function, []))
+            # Whether only a load through another parameter carries the offset: the item is a miss,
+            # and the reason says so.
+            wrong_base = register is None and _first_match(
+                alternates, size, item, displacements, constants.get(function, [])
             )
             if "frame_slot" in item:
                 # A field of a local object the frame holds at the object's slot (frames.py).
@@ -357,7 +380,7 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             elif item.get("address") and any(
                 candidate <= value < candidate + item.get("element_size", 0)
                 for candidate in alternates
-                for value in displacements
+                for value in through
             ):
                 # An array member's decayed address (info = same->info) is folded into the accesses
                 # the code makes through it: the first element's bytes.
@@ -381,7 +404,7 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
             ):
                 method = "global_object_narrower_access"
             elif base == "pointer" and any(
-                _register_relative(own - step, size, item, displacements, [])
+                _register_relative(own - step, size, item, through, [])
                 or (item.get("address") and own - step in constants.get(function, []))
                 for own in [item["offset"] if item.get("offset", -1) >= 0 else offset]
                 for step in struct_sizes.get(item["struct"], ())
@@ -390,6 +413,9 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 # A loop walking an array (for (i = table; …; i++) i->data) whose code keeps i + 1 in a
                 # register and steps it by the element's size: the field is that size before it.
                 method = "next_element_displacement"
+            elif wrong_base:
+                # The image reaches the offset only through another parameter: no confirmation.
+                method = "no_offset_through_the_named_parameter"
             elif offset >= 2048:
                 method = "no_match_beyond_12_bit_displacement"
             else:
@@ -452,6 +478,7 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 function: {
                     "memory_offsets": offsets[function],
                     "addi_constants": constants.get(function, []),
+                    **({"memory_parameters": parameters[function]} if parameters.get(function) else {}),
                 }
                 for function in sorted({item["function"] for item in candidates if not item["matched"]})
             },

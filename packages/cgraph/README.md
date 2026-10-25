@@ -457,6 +457,13 @@ ahead (`next_element_displacement`: its offset less the struct's size, where the
 register by that size, so the code keeps `i + 1`). Accesses to objects on the stack or in registers,
 and functions whose machine code makes no memory access, are counted apart.
 
+A displacement confirms a field only through the base the C names. The image records which
+displacements it reached through each parameter (`analysis.image.memory_parameters`: a load or store
+whose base register still holds an incoming argument register, with the offset from it), so a load
+through another parameter at the same number confirms nothing
+(`no_offset_through_the_named_parameter`). A displacement the decoding cannot trace to a parameter
+(a pointer loaded from memory) confirms as before.
+
 The hard checks fail the run (exit 1), each with a test that makes it fail alone: a parse error; a
 function of the part's files that the image holds but the graph lacks; a global the part's code
 addresses but the graph lacks; a node or edge without provenance; an embedding without a layout; a

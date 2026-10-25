@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from capstone import CS_ARCH_RISCV, CS_MODE_RISCV64, CS_MODE_RISCVC, CS_OP_IMM, CS_OP_MEM, CS_OP_REG, Cs
-from capstone.riscv_const import RISCV_REG_ZERO
+from capstone.riscv_const import RISCV_REG_A0, RISCV_REG_ZERO
 from elftools.common.exceptions import ELFError
 from elftools.elf.constants import SH_FLAGS
 from elftools.elf.elffile import ELFFile
@@ -50,6 +50,8 @@ _DISPLACEMENT_REACH = 2048
 # a0 and a1.
 _DEFAULT_ARGUMENTS = 8
 _DEFAULT_RESULTS = 2
+# The registers a0..a7 carry the arguments, in that order.
+_ARGUMENT_REGISTERS = tuple(range(RISCV_REG_A0, RISCV_REG_A0 + 8))
 # The operations that form an address without reading it; a load or store through it names the
 # object at the address it reads.
 _ADDRESS_OPERATIONS = frozenset({"addi_address", "indexed_address"})
@@ -90,7 +92,9 @@ class _State:
     displacement: ``(kind, value, origin)``); registers every path into a block gives a known
     address (``choices``) or a known number (``numbers``), but not the same one: the value on each
     path, or one of a few the code chose (a truth value, the bits of a mask); and registers holding
-    one of several known addresses plus an unknown index (``spread``)."""
+    one of several known addresses plus an unknown index (``spread``); and registers holding an
+    incoming argument register plus a constant (``parameters``: the parameter's position and that
+    constant), which tell whose object a load or store through such a register reads."""
 
     values: dict[int, int] = field(default_factory=dict)
     relative: dict[int, int] = field(default_factory=dict)
@@ -101,6 +105,7 @@ class _State:
     choices: dict[int, frozenset[int]] = field(default_factory=dict)
     numbers: dict[int, frozenset[int]] = field(default_factory=dict)
     spread: dict[int, frozenset[int]] = field(default_factory=dict)
+    parameters: dict[int, tuple[int, int]] = field(default_factory=dict)
 
     def copy(self) -> _State:
         return _State(
@@ -113,6 +118,7 @@ class _State:
             dict(self.choices),
             dict(self.numbers),
             dict(self.spread),
+            dict(self.parameters),
         )
 
     def forget(self, register: int) -> None:
@@ -123,6 +129,7 @@ class _State:
         self.choices.pop(register, None)
         self.numbers.pop(register, None)
         self.spread.pop(register, None)
+        self.parameters.pop(register, None)
         self.constants.discard(register)
 
     def meet(self, other: _State) -> _State:
@@ -157,6 +164,7 @@ class _State:
             per_path(self.possible, other.possible, candidates),
             per_path(self.possible_numbers, other.possible_numbers, candidates),
             same(self.spread, other.spread),
+            same(self.parameters, other.parameters),
         )
 
     def address(self, register: int) -> int | None:
@@ -588,6 +596,32 @@ def _relative_value(
     return None
 
 
+def _parameter_base(instruction: Any, operands: list[Any], state: _State) -> tuple[int, tuple[int, int]] | None:
+    """A register that becomes an incoming argument register plus a constant: ``mv`` of such a
+    register, ``addi`` of one, or an ``add`` of one and a register holding a constant. The value is
+    the parameter's position and the constant, as ``_relative_value`` gives the constant alone."""
+    mnemonic = instruction.mnemonic
+    kinds = [operand.type for operand in operands]
+    held = state.parameters
+    if mnemonic in ("add", "c.add") and kinds and all(kind == CS_OP_REG for kind in kinds):
+        registers = [operand.reg for operand in operands]
+        left, right = (registers[1], registers[2]) if len(registers) == 3 else (registers[0], registers[1])
+        for constant, base in ((left, right), (right, left)):
+            if constant in state.values and base in held and abs(state.values[constant]) < _OFFSET_LIMIT:
+                index, bias = held[base]
+                return registers[0], (index, bias + state.values[constant])
+        return None
+    if mnemonic in ("addi", "addiw") and kinds == [CS_OP_REG, CS_OP_REG, CS_OP_IMM] and operands[1].reg in held:
+        index, bias = held[operands[1].reg]
+        return operands[0].reg, (index, bias + operands[2].imm)
+    if mnemonic in ("c.addi", "c.addiw") and kinds == [CS_OP_REG, CS_OP_IMM] and operands[0].reg in held:
+        index, bias = held[operands[0].reg]
+        return operands[0].reg, (index, bias + operands[1].imm)
+    if mnemonic in ("mv", "c.mv") and kinds == [CS_OP_REG, CS_OP_REG] and operands[1].reg in held:
+        return operands[0].reg, held[operands[1].reg]
+    return None
+
+
 @dataclass(frozen=True)
 class Symbol:
     address: int
@@ -605,6 +639,10 @@ class FunctionFacts:
     function_addresses: list[dict[str, Any]] = field(default_factory=list)
     outside: list[dict[str, Any]] = field(default_factory=list)
     memory_offsets: set[int] = field(default_factory=set)
+    # Each load or store whose base register still holds an incoming argument register, as (the
+    # position of that parameter; the offset from it, the same number memory_offsets holds). A base
+    # the decoding cannot trace to a parameter (a pointer loaded from memory) is in neither.
+    memory_parameters: set[tuple[int, int]] = field(default_factory=set)
     addi_constants: set[int] = field(default_factory=set)
     exclusions: list[dict[str, Any]] = field(default_factory=list)
     # The frame: each load or store through sp, s0 or a register holding a frame address, as (offset
@@ -621,7 +659,7 @@ class FunctionFacts:
 _RECORD_FIELDS = ("calls", "globals", "function_addresses", "outside", "exclusions")
 _NUMBER_FIELDS = ("memory_offsets", "addi_constants", "frame_addresses")
 # Sets of integer tuples, by their length.
-_TUPLE_FIELDS = {"frame_accesses": 2, "frame_arguments": 3, "frame_indexed": 2}
+_TUPLE_FIELDS = {"frame_accesses": 2, "frame_arguments": 3, "frame_indexed": 2, "memory_parameters": 2}
 
 
 def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts | None:
@@ -654,6 +692,7 @@ def _facts_from_cache(value: dict[str, Any]) -> FunctionFacts | None:
         function_addresses=function_addresses,
         outside=outside,
         memory_offsets=set(memory_offsets),
+        memory_parameters=tuples["memory_parameters"],
         addi_constants=set(addi_constants),
         exclusions=exclusions,
         frame_accesses=tuples["frame_accesses"],
@@ -670,6 +709,7 @@ def _facts_for_cache(facts: FunctionFacts) -> dict[str, Any]:
         "function_addresses": facts.function_addresses,
         "outside": facts.outside,
         "memory_offsets": sorted(facts.memory_offsets),
+        "memory_parameters": [list(item) for item in sorted(facts.memory_parameters)],
         "addi_constants": sorted(facts.addi_constants),
         "exclusions": facts.exclusions,
         "frame_accesses": [list(item) for item in sorted(facts.frame_accesses)],
@@ -1136,9 +1176,10 @@ class Image:
         roots = _roots(patches)
         frame = _frame(self.decoder, instructions, successors, patches)
         self.frame_rooted, self.frame_formed = frame.rooted, bool(frame.addresses)
-        states = self._block_states(instructions, successors, roots=roots)
+        taken = self.arity.get(address, _DEFAULT_ARGUMENTS)
+        states = self._block_states(instructions, successors, roots=roots, parameters=taken)
         before = dict(states)
-        first = dict(self._block_states(instructions, successors, _retreating(successors), roots))
+        first = dict(self._block_states(instructions, successors, _retreating(successors), roots, taken))
         returned = {f"a{position}" for position in range(self.results.get(address, _DEFAULT_RESULTS))}
         for index, state in states:
             instruction = instructions[index]
@@ -1304,6 +1345,7 @@ class Image:
         successors: list[list[int]],
         ignored: frozenset[tuple[int, int]] = frozenset(),
         roots: tuple[int, ...] = (0,),
+        parameters: int = 0,
     ) -> list[tuple[int, _State]]:
         """Each instruction's index with the register state before it, from a forward must-analysis
         over the function's basic blocks: a register holds a value at a block's start only when every
@@ -1311,7 +1353,8 @@ class Image:
         a join is followed, and one formed on only one path is not. Blocks no instruction leads to are
         reached through an indirect jump (a jump table): they start from the state those jumps leave.
         The ``ignored`` edges (a loop's back edges) carry no state: then a loop's head holds what the
-        loop enters with, the state of its first pass. The ``roots`` start with no register known:
+        loop enters with, the state of its first pass. The ``roots`` start with the first
+        ``parameters`` argument registers holding the parameters of this function and nothing else:
         the function's entry, and a replacement the image may patch over it (``_roots``)."""
         if not instructions:
             return []
@@ -1327,7 +1370,9 @@ class Image:
                 for position, start in enumerate(starts)}  # fmt: skip
         entry: dict[int, _State | None] = {start: None for start in starts}
         for root in roots:
-            entry[root] = _State()
+            entry[root] = _State(
+                parameters={register: (index, 0) for index, register in enumerate(_ARGUMENT_REGISTERS[:parameters])}
+            )
         indirect: list[_State] = []
 
         def settle(pending: list[int]) -> None:
@@ -1537,6 +1582,11 @@ class Image:
                 if self.decoder.reg_name(base) not in rooted:
                     # A frame slot's displacement is the frame's (frame_accesses), no field offset.
                     facts.memory_offsets.add(displacement)
+                    if base in state.parameters:
+                        # The base still holds an incoming argument: the field is that far into
+                        # whatever that parameter points at, and into nothing else.
+                        index, bias = state.parameters[base]
+                        facts.memory_parameters.add((index, bias + displacement))
                 if self.decoder.reg_name(base) == "tp":
                     if self.rules.thread_pointer:
                         facts.globals.append(
@@ -1603,10 +1653,19 @@ class Image:
                     self._call(function, instruction.address, target, tail, facts)
         if mnemonic in {"jal", "c.jal"} or (mnemonic in {"jalr", "c.jalr"} and _links(self.decoder, operands)):
             # A call may change every caller-saved register.
-            for register in (*values, *relative, *anchored, *state.choices, *state.numbers, *state.spread):
+            for register in (
+                *values,
+                *relative,
+                *anchored,
+                *state.choices,
+                *state.numbers,
+                *state.spread,
+                *state.parameters,
+            ):
                 name = self.decoder.reg_name(register)
                 if name == "ra" or name.startswith(("a", "t")):
                     state.forget(register)
+        parameter = _parameter_base(instruction, operands, state)
         derived = _relative_value(instruction, operands, values, relative)
         indexed = _anchored_value(instruction, operands, state, self.section_of)
         chosen = _chosen_value(instruction, operands, state)
@@ -1674,6 +1733,9 @@ class Image:
                 # The code formed "a base plus a constant": the offset of the field it addresses,
                 # which an index added after it would lose (not of the frame, which _frame keeps).
                 facts.memory_offsets.add(derived[1])
+        if parameter is not None and parameter[0] not in values and parameter[0] not in anchored:
+            # The register holds an incoming argument plus a constant, and no address of its own.
+            state.parameters[parameter[0]] = parameter[1]
         self._frame_slot(instruction, operands, state)
 
     def _frame_slot(self, instruction: Any, operands: list[Any], state: _State) -> None:

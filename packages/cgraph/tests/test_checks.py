@@ -10,9 +10,14 @@ from typing import Any
 import pytest
 from conftest import read
 
-from cgraph import checks, cli, config, jsonio
+from cgraph import checks, cli, config, jsonio, pipeline
+from cgraph.image import Image
 
 Documents = dict[str, Any]
+
+# A compiled program whose kept load reads another parameter at the displacement of a field the
+# compiler removed (tests/fixtures/decoy).
+DECOY = Path(__file__).parent / "fixtures" / "decoy"
 
 
 @pytest.fixture(scope="module")
@@ -326,3 +331,99 @@ def test_field_offset_misses_keep_all_fields_and_image_evidence_once_per_functio
         }
     ]
     assert offsets["image_evidence"] == {"function:box_new": {"memory_offsets": [4], "addi_constants": [8]}}
+
+
+def _field_graph(item: dict[str, Any], image: dict[str, Any]) -> dict[str, Any]:
+    """One function with one field access, and the image facts the check reads for it."""
+    return {
+        "nodes": [{"id": "function:read_mark", "kind": "function", "part": True, "image_addresses": ["0x11158"]}],
+        "edges": [],
+        "analysis": {
+            "field_accesses": {"function:read_mark": [item]},
+            "image": {"addi_constants": {}, "globals": [], **image},
+            "excluded_embedding_bases": [],
+        },
+    }
+
+
+_MARK = {
+    "struct": "slot",
+    "field": "mark",
+    "offset": 192,
+    "displacement": 192,
+    "param": 0,
+    "base": "pointer",
+    "size": 8,
+    "bitfield": False,
+}
+
+
+def test_a_displacement_the_image_reaches_through_another_parameter_confirms_no_field() -> None:
+    """The C names `s->mark` through the first parameter; the image's only load of 192 is through
+    the second. The displacement alone is no confirmation."""
+    graph = _field_graph(
+        _MARK,
+        {"memory_offsets": {"function:read_mark": [192]}, "memory_parameters": {"function:read_mark": [[1, 192]]}},
+    )
+
+    offsets = checks.structure(graph)["field_offsets"]
+
+    assert offsets["candidates"] == 1 and offsets["matched"] == 0
+    assert offsets["misses"][0]["method"] == "no_offset_through_the_named_parameter"
+    assert offsets["image_evidence"]["function:read_mark"]["memory_parameters"] == [[1, 192]]
+
+
+def test_a_displacement_the_image_reaches_through_the_same_parameter_confirms_the_field() -> None:
+    graph = _field_graph(
+        _MARK,
+        {"memory_offsets": {"function:read_mark": [192]}, "memory_parameters": {"function:read_mark": [[0, 192]]}},
+    )
+
+    offsets = checks.structure(graph)["field_offsets"]
+
+    assert offsets["matched"] == 1 and offsets["by_method"] == {"memory_displacement": 1}
+
+
+def test_a_displacement_the_image_reaches_through_no_parameter_confirms_the_field() -> None:
+    """A base the decoder cannot trace to a parameter (a pointer loaded from memory) keeps its
+    displacement as evidence: only a load through another parameter is refused."""
+    graph = _field_graph(
+        _MARK,
+        {"memory_offsets": {"function:read_mark": [192]}, "memory_parameters": {"function:read_mark": [[1, 40]]}},
+    )
+
+    offsets = checks.structure(graph)["field_offsets"]
+
+    assert offsets["matched"] == 1
+
+
+def test_the_compiled_decoy_program_confirms_no_field_through_the_wrong_parameter(tmp_path: Path) -> None:
+    """The whole way: build tests/fixtures/decoy, then hold its field accesses against the facts of
+    its own image. The C names `slot.mark` at 192 through the first parameter of two functions, and
+    each image function's only load reads the second parameter at 192.
+
+    A build takes ``analysis.image.memory_parameters`` from the same image facts (link.py writes it
+    beside ``memory_offsets``); the test reads them from the compiled image itself.
+    """
+    loaded = config.load(DECOY / "cgraph.toml")
+    pipeline.run(loaded, "one", tmp_path / "out")
+    graph = read(tmp_path / "out", "graph.json")
+    image = Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image)
+    try:
+        symbols = {f"function:{name}": image.functions[name][0] for name in ("read_mark", "root")}
+        image.arity = {symbol.address: 3 for symbol in symbols.values()}
+        parameters = {
+            identity: sorted([list(item) for item in image.facts(symbol).memory_parameters])
+            for identity, symbol in symbols.items()
+        }
+    finally:
+        image.close()
+    assert parameters == {"function:read_mark": [[1, 192]], "function:root": [[1, 192]]}
+    # Without the bases the displacement alone confirms both accesses, which is the hole.
+    assert checks.structure(graph)["field_offsets"]["matched"] == 2
+
+    graph["analysis"]["image"]["memory_parameters"] = parameters
+    offsets = checks.structure(graph)["field_offsets"]
+
+    assert offsets["candidates"] == 2 and offsets["matched"] == 0
+    assert offsets["by_method"] == {"no_offset_through_the_named_parameter": 2}

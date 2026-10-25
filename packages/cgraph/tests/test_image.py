@@ -15,11 +15,30 @@ from cgraph.errors import InputError
 from cgraph.image import FunctionFacts, Image, code_symbol, read_system_map, resolve_sized, source_name
 from cgraph.imagecache import ImageCache
 
+# A program whose kept load reads another parameter at the displacement of a field the compiler
+# removed (tests/fixtures/decoy).
+DECOY = Path(__file__).parent / "fixtures" / "decoy"
+
 
 @pytest.fixture(scope="module")
 def image() -> Image:
     loaded = config.load(FIXTURE / "cgraph.toml")
     return Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image)
+
+
+def test_a_load_records_which_parameter_its_base_holds() -> None:
+    """``read_mark`` is `(s->mark - s->mark) + other[24] + n`: the image keeps only `ld a0, 0xc0(a1)`,
+    the second parameter's, so 192 is that parameter's offset and no other's."""
+    loaded = config.load(DECOY / "cgraph.toml")
+    image = Image(loaded.inputs.image, loaded.inputs.system_map, loaded.image)
+    try:
+        (symbol,) = image.functions["read_mark"]
+        image.arity = {symbol.address: 3}
+        facts = image.facts(symbol)
+    finally:
+        image.close()
+    assert 192 in facts.memory_offsets
+    assert facts.memory_parameters == {(1, 192)}
 
 
 def test_malformed_system_map_names_its_line(tmp_path: Path) -> None:
