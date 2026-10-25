@@ -1,0 +1,135 @@
+name: orchestration-branches
+
+# One shared check for a push to a long-lived orchestration branch (orchestration-landing, the ledger
+# branches): gofmt, go vet and go test on the packages of packages/orchestration that the push can
+# break, so the agents that share a branch read one result instead of each running the suite after
+# every peer's push. Read it with:
+#   gh run list -R theorem-labs/legion --branch <branch> --workflow orchestration-branches --limit 1
+#
+# A branch with an open pull request is tested by pr-and-main.yaml on that pull request, so here its
+# run tests nothing and is cancelled, which no reader takes for a pass.
+on:
+  push:
+    branches:
+      - "orchestration-*"
+    paths:
+      - "packages/orchestration/**"
+      - ".github/workflows/orchestration-branches.yaml"
+      - ".github/scripts/orchestration_packages.py"
+      - ".github/scripts/orchestration_packages.test.sh"
+
+# A newer push to the branch cancels the older run. The next run then tests every change since the
+# branch's last passing run, so a cancelled push is never left untested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs no repository code: it reads the branch's pull requests and runs, and cancels this run when a
+  # pull request already tests the branch.
+  decide:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      pull-requests: read
+    outputs:
+      pull_request: ${{ steps.decide.outputs.pull_request }}
+      base: ${{ steps.decide.outputs.base }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          pull_request=$(gh pr list -R "$REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          base=$(gh run list -R "$REPOSITORY" --workflow "$WORKFLOW" --branch "$BRANCH" --status success --limit 1 --json headSha --jq '.[0].headSha // empty')
+          echo "pull_request=$pull_request" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [ -n "$pull_request" ]; then
+            echo "::notice::Pull request #$pull_request tests this branch (pr-and-main.yaml); this run is cancelled."
+            gh run cancel -R "$REPOSITORY" "$GITHUB_RUN_ID"
+          fi
+
+  test:
+    needs: decide
+    if: needs.decide.outputs.pull_request == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        # postgres:17 (17.11 when pinned), by its multi-platform index digest.
+        image: mirror.gcr.io/library/postgres:17@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      LEGION_TEST_PG_DSN: postgres://postgres:ci@localhost:5432/postgres?sslmode=disable
+    steps:
+      # The whole history without file contents: the package selection reads which files changed
+      # since the last passing run, which needs commits and trees only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: packages/orchestration/go.mod
+          cache-dependency-path: packages/orchestration/go.sum
+
+      - name: Check Go formatting
+        run: |
+          unformatted=$(gofmt -l packages/orchestration)
+          if [ -n "$unformatted" ]; then
+            printf 'gofmt would change:\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Test the package selection
+        run: .github/scripts/orchestration_packages.test.sh
+
+      # Every package changed since the branch's last passing run, and every package whose build or
+      # tests depend on one of them; the whole module on a branch's first run.
+      - name: Select the packages the push can break
+        id: select
+        env:
+          BASE: ${{ needs.decide.outputs.base }}
+        run: |
+          selected=$(.github/scripts/orchestration_packages.py "$BASE" "$GITHUB_SHA")
+          printf 'Since %s:\n%s\n' "${BASE:-the branch start}" "${selected:-(none)}"
+          {
+            echo 'packages<<EOF'
+            echo "$selected"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Vet the selected packages
+        if: steps.select.outputs.packages != ''
+        working-directory: packages/orchestration
+        env:
+          PACKAGES: ${{ steps.select.outputs.packages }}
+        run: |
+          mapfile -t packages <<<"$PACKAGES"
+          go vet "${packages[@]}"
+
+      - name: Test the selected packages
+        if: steps.select.outputs.packages != ''
+        working-directory: packages/orchestration
+        env:
+          PACKAGES: ${{ steps.select.outputs.packages }}
+        run: |
+          mapfile -t packages <<<"$PACKAGES"
+          go test -count=1 "${packages[@]}"
