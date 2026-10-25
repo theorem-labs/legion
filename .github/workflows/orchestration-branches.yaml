@@ -5,7 +5,7 @@ name: orchestration-branches
 # break, so the agents that share a branch read one result instead of each running the suite after
 # every peer's push. Read it with:
 #   gh run list -R theorem-labs/legion --branch <branch> --workflow orchestration-branches \
-#     --limit 1 --json headSha,status,conclusion,url
+#     --event push --limit 1 --json headSha,status,conclusion,url
 # The run is about your tree only when its headSha is `git rev-parse origin/<branch>`: a push outside
 # the paths below starts no run, and a newer push cancels an older run.
 #
@@ -87,7 +87,9 @@ jobs:
         run: |
           pull_request=$(gh pr list -R "$REPOSITORY" --head "$BRANCH" --state open --json number,mergeable \
             --jq '[.[] | select(.mergeable != "CONFLICTING")][0].number // empty')
-          base=$(gh run list -R "$REPOSITORY" --workflow "$WORKFLOW" --branch "$BRANCH" --status success --limit 1 --json headSha --jq '.[0].headSha // empty')
+          # The last push run that passed. A pull_request run tests only the selection, never a base.
+          base=$(gh run list -R "$REPOSITORY" --workflow "$WORKFLOW" --branch "$BRANCH" --event push --status success \
+            --limit 1 --json headSha --jq '.[0].headSha // empty')
           echo "pull_request=$pull_request" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
           if [ -n "$pull_request" ]; then
