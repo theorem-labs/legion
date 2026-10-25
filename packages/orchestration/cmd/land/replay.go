@@ -325,11 +325,11 @@ func (r *replayer) round(ctx context.Context, index int) (RoundSummary, error) {
 		}
 	}
 	for _, kick := range r.manifest.BuildRounds[index].RecordedKicks {
-		reason, name, _ := strings.Cut(kick.Reason, ":")
-		if err := r.row(number, kick.Member, "recorded", reason, name, "", "", ""); err != nil {
+		reasons, name, nameKick := parseKick(kick.Reason)
+		if err := r.row(number, kick.Member, "recorded", reasons, name, "", "", ""); err != nil {
 			return RoundSummary{}, err
 		}
-		if reason != "ident" && reason != "clash" && reason != "unprune" {
+		if !nameKick {
 			continue
 		}
 		summary.RecordedNameKicks = append(summary.RecordedNameKicks, kick)
@@ -340,6 +340,25 @@ func (r *replayer) round(ctx context.Context, index int) (RoundSummary, error) {
 		}
 	}
 	return summary, nil
+}
+
+// parseKick reads a recorded kick's reason. The recorded program joins one
+// kick's reasons with "; ", and a reason may carry a name after a colon
+// ("ident:X; red"). It returns the reasons without their names, joined the
+// same way, the first name, and whether one reason is a name error (ident,
+// clash or unprune).
+func parseKick(reason string) (string, string, bool) {
+	var kinds []string
+	name, nameKick := "", false
+	for _, part := range strings.Split(reason, ";") {
+		kind, value, _ := strings.Cut(strings.TrimSpace(part), ":")
+		kinds = append(kinds, kind)
+		if name == "" {
+			name = value
+		}
+		nameKick = nameKick || kind == "ident" || kind == "clash" || kind == "unprune"
+	}
+	return strings.Join(kinds, "; "), name, nameKick
 }
 
 // refusalOutcome is explained-by-log when the recorded log of this build round
