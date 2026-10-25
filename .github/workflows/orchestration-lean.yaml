@@ -86,18 +86,26 @@ jobs:
           tar -xzf elan-x86_64-unknown-linux-gnu.tar.gz
           ./elan-init -y --no-modify-path --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      # Saved on every miss, a pull request's included: a pull request that has to build Lean can
-      # read its own copy on its next run, and the copy on main is what every other pull request
-      # restores.
+      # Restore and save are separate steps: the combined actions/cache saves only in its post step
+      # at job end, so a pull-request run that a newer push cancels would lose a finished build.
+      # The save runs directly after the build, on every miss, a pull request's included: a pull
+      # request that has to build Lean can read its own copy on its next run, and the copy on main
+      # is what every other pull request restores.
       - name: Restore Lean stage2
         id: lean-stage2
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: lean4/build/release/stage2
           key: lean4-${{ env.LEAN_FORK_COMMIT }}-stage2-${{ runner.os }}-${{ runner.arch }}
       - name: Build Lean stage2
         if: steps.lean-stage2.outputs.cache-hit != 'true'
         run: packages/orchestration/declindex/e2e/build-lean.sh "$LEAN_FORK_REPOSITORY" "$LEAN_FORK_COMMIT" lean4
+      - name: Save Lean stage2
+        if: steps.lean-stage2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: lean4/build/release/stage2
+          key: ${{ steps.lean-stage2.outputs.cache-primary-key }}
       - name: Link tree Lean toolchain
         run: |
           elan toolchain link tree-lean lean4/build/release/stage2
