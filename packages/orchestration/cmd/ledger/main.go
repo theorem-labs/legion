@@ -457,6 +457,12 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		value, err := s.LandBatch(ctx, request)
 		return value, true, err
+	case "resolve-batch":
+		if len(args) != 3 {
+			return nil, true, usagef("resolve-batch <repo> <id> <merged-commit>")
+		}
+		value, err := s.ResolveBatch(ctx, args[0], args[1], args[2])
+		return value, true, err
 	case "batch":
 		if len(args) != 2 {
 			return nil, true, usagef("batch <repo> <id>")

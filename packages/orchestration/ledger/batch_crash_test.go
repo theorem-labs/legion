@@ -64,6 +64,28 @@ func batchCrashes() []batchCrash {
 				t.Fatalf("M-1 after the landing is %+v", m)
 			}
 		},
+	}, {
+		call: "resolve",
+		fixture: func(t *testing.T) (*ledger.Store, string) {
+			f := unrecordedLanding(t, map[string]any{"number": 7})
+			return f.s, f.dsn
+		},
+		run: func(s *ledger.Store) (ledger.Batch, error) {
+			return s.ResolveBatch(ctx, "r", "batch-1", "merged-9")
+		},
+		last:    "batch.resolved",
+		written: []string{"migrations", "contracts", "batch_members", "batches", "batch_effects"},
+		state: func(t *testing.T, s *ledger.Store, dsn string) landingState {
+			return readLandingState(t, s, dsn, "batch-1", "M-1", "M-2")
+		},
+		committed: func(t *testing.T, s *ledger.Store, dsn string, batch ledger.Batch) {
+			if batch.Phase != ledger.PhaseLanded || batch.MergedCommit != "merged-9" || len(batch.PendingEffects) != 2 {
+				t.Fatalf("the batch after the resolution is %+v", batch)
+			}
+			if m := must(s.Migration(ctx, "r", "M-2")); m.State != ledger.StateLanded || m.LandedCommit != "merged-9" {
+				t.Fatalf("M-2 after the resolution is %+v", m)
+			}
+		},
 	}}
 }
 

@@ -55,6 +55,43 @@ func (s *Store) LandBatch(ctx context.Context, req LandBatchRequest) (Batch, err
 	return landed, nil
 }
 
+// ResolveBatch is an operator's resolution of a batch that GitHub merged and the ledger did not land
+// (landed_unrecorded), after the escalation's cause is fixed. The operator sends no record, so the ledger derives it
+// from the stored one: state landed, reason "resolved by operator", and pull_request.merged_commit mergedCommit, with
+// every other field kept. In one transaction, after the batch lock order, it does with that record at the stored
+// version what LandBatch does (landBatch), and appends batch.resolved, whose login is the operator's. A repeat with
+// the same merged commit returns the stored batch. The ledger checks neither the stored phase nor an earlier merged
+// commit: the operator resolves the batch that the escalation item names.
+func (s *Store) ResolveBatch(ctx context.Context, repo, id, mergedCommit string) (Batch, error) {
+	var resolved Batch
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, true); err != nil {
+			return err
+		}
+		stored, err := loadBatch(ctx, tx, repo, id, true)
+		if err != nil {
+			return err
+		}
+		if stored.Admission == admissionLanded && stored.MergedCommit == mergedCommit {
+			resolved = stored
+			return nil
+		}
+		var record json.RawMessage
+		if err := tx.QueryRow(ctx, `SELECT record || jsonb_build_object('state', $3::text, 'reason', 'resolved by operator',
+				'pull_request', CASE jsonb_typeof(record -> 'pull_request') WHEN 'object' THEN record -> 'pull_request'
+					ELSE '{}'::jsonb END || jsonb_build_object('merged_commit', $4::text))
+			FROM batches WHERE repo = $1 AND id = $2`, repo, id, PhaseLanded, mergedCommit).Scan(&record); err != nil {
+			return err
+		}
+		resolved, err = landBatch(ctx, tx, stored, mergedCommit, record, "batch.resolved")
+		return err
+	})
+	if err != nil {
+		return Batch{}, err
+	}
+	return resolved, nil
+}
+
 // batchMember is one frozen member of a batch, in position order.
 type batchMember struct {
 	migration  string
