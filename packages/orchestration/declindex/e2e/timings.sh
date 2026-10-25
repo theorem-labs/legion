@@ -6,7 +6,7 @@
 set -eu
 
 usage() {
-	printf '%s\n' 'usage: timings.sh [--index-dsn-file FILE] [--limit N] [--proposer OWNER] [--gate-proposal FILE] CONFIG SAMPLE' >&2
+	printf '%s\n' 'usage: timings.sh [--index-dsn-file FILE] [--limit N] [--concepts FILE] [--proposer OWNER] [--gate-proposal FILE] CONFIG SAMPLE' >&2
 	printf '%s\n' '       timings.sh [--index-dsn-file FILE] --refresh-landing CONFIG' >&2
 	printf '%s\n' 'SAMPLE is one declaration name for each line; write one with go run ./declindex/e2e/sample.' >&2
 	printf '%s\n' 'The landed commit of --refresh-landing is TIMINGS_LAND_COMMIT. DECLINDEX_BIN overrides the command.' >&2
@@ -22,16 +22,18 @@ index_dsn_file=
 limit=0
 proposer=function:timings
 gate_proposal=
+concepts=
 refresh_landing=false
 while [ "$#" -gt 0 ]; do
 	case $1 in
-	--index-dsn-file | --limit | --proposer | --gate-proposal)
+	--index-dsn-file | --limit | --proposer | --gate-proposal | --concepts)
 		[ "$#" -ge 2 ] || usage
 		case $1 in
 		--index-dsn-file) index_dsn_file=$2 ;;
 		--limit) limit=$2 ;;
 		--proposer) proposer=$2 ;;
 		--gate-proposal) gate_proposal=$2 ;;
+		--concepts) concepts=$2 ;;
 		esac
 		shift 2
 		;;
@@ -178,7 +180,9 @@ while IFS= read -r name; do
 	i=$((i + 1))
 	run where "$name" "$declindex_bin" --index-dsn-file "$dsn_file" --config "$cfg" where "$name"
 	run users "$name" "$declindex_bin" --index-dsn-file "$dsn_file" --config "$cfg" users "$name"
-	run states "$name" "$declindex_bin" --index-dsn-file "$dsn_file" --config "$cfg" states "$name"
+	if [ -z "$concepts" ]; then
+		run states "$name" "$declindex_bin" --index-dsn-file "$dsn_file" --config "$cfg" states "$name"
+	fi
 	run same "$name" "$declindex_bin" --index-dsn-file "$dsn_file" --config "$cfg" same "$name"
 	run land-hash "$name" env LAND_TREE="$land_tree" LAND_GIT_DIR="$land_git_dir" LAND_NAMES="$(printf '["%s"]' "$name")" \
 		"$declindex_bin" --index-dsn-file "$dsn_file" --config "$cfg" land-hash
@@ -207,6 +211,17 @@ PY
 	run ledger "$name" "$declindex_bin" --index-dsn-file "$dsn_file" --config "$cfg" \
 		ledger --contracts-file "$contracts" --emit "$work/operations.jsonl"
 done <"$names"
+
+# `states` answers for a registered concept, which a sample of declarations need not hold: with --concepts it is
+# timed over those names instead, so that its bar measures the walk and not a name that the registry does not have.
+if [ -n "$concepts" ]; then
+	while IFS= read -r concept; do
+		case $concept in
+		'' | '#'*) continue ;;
+		esac
+		run states "$concept" "$declindex_bin" --index-dsn-file "$dsn_file" --config "$cfg" states "$concept"
+	done <"$concepts"
+fi
 
 python3 - "$runs" <<'PY'
 import math
@@ -254,6 +269,9 @@ for label, (median_bar, p95_bar) in bars.items():
         print(f"bar\t{label}\tmedian\t-\t< {median_bar}\tFAIL (no run)")
         failed = True
         continue
+    if not answered[label]:
+        # The bar still holds, but the reader must know that it timed refusals: no run of it answered.
+        print(f"note\t{label}\tno run answered, so the bar measured the refusal path")
     got = median(values)
     ok = got < median_bar
     failed = failed or not ok

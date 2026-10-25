@@ -130,7 +130,7 @@ packages/orchestration/declindex/e2e/timings.sh \
   /path/to/declindex.yaml sample.txt
 ```
 
-`--limit N` measures the sample's first N declarations, for a quick run. Without `--gate-proposal FILE` the driver writes a fresh proposal for each declaration, so that the gate does its whole work; with it, every gate run reads that one proposal. `--proposer OWNER` names the gate's proposer. `DECLINDEX_DSN` in the environment replaces `--index-dsn-file`, and `DECLINDEX_BIN` the command on `PATH`.
+`--limit N` measures the sample's first N declarations, for a quick run. `states` answers for a registered concept, which a sample of declarations need not hold: `--concepts FILE` times `states` over those names instead, one for each line, and without it the driver prints a `note` line whenever no run of a command under a bar answered, so that nobody reads a bar that timed only refusals. Without `--gate-proposal FILE` the driver writes a fresh proposal for each declaration, so that the gate does its whole work; with it, every gate run reads that one proposal. `--proposer OWNER` names the gate's proposer. `DECLINDEX_DSN` in the environment replaces `--index-dsn-file`, and `DECLINDEX_BIN` the command on `PATH`.
 
 The refresh bar is a mode of its own: it times a refresh to an already landed commit that changes one module and no definition, and holds the index's own work, which the refresh reports as `elapsed_ns` and which excludes the fetch, the checkout and the build, under 30 s.
 
