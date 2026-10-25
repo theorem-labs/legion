@@ -145,11 +145,13 @@ func TestCommandUsageAndConfigurationErrorsAreExitTwo(t *testing.T) {
 	}
 }
 
-// Every rule group runs on the fixture and prints lines that land reads.
+// Every rule group runs on the fixture and prints lines that land reads. The batch builds: a batch that breaks an
+// unchanged module is the other tests' subject, and a rule has nothing to say once Lean refuses the module it
+// would read.
 func TestEveryRuleGroupPrintsParseableLines(t *testing.T) {
 	f := graphchecktest.New(t)
 	tree := f.EditMany(t, map[string][2]string{
-		"Lib/Core.lean":        {"def size : Nat := 3", "def size : Nat := 4"},
+		"Lib/Core.lean":        {"def size : Nat := 3", "def size : Nat := 3\n\ndef twice : Nat := 6"},
 		"Lib/Copy.lean":        {"", "namespace Lib.Copy\n\nstructure PortCopy where\n  id : Nat\n\nend Lib.Copy\n"},
 		"Lib/Drv/LinkDrv.lean": {"", "import Lib.Spec.LinkSpec\nimport Lib.Iface\n\nopen Lib.Spec Lib.Iface\n\ntheorem keeps (h : SIZE_OK) (p : Port) : True := trivial\n"},
 	})
@@ -160,6 +162,7 @@ func TestEveryRuleGroupPrintsParseableLines(t *testing.T) {
 			t.Fatalf("%s: exit %d, stderr %q", rule, r.code, r.stderr)
 		}
 		hits := parseLines(t, r.stdout)
+		t.Logf("%s printed %d line(s):\n%s", rule, len(hits), r.stdout)
 		if rule != "names" && len(hits) == 0 {
 			t.Fatalf("%s printed no finding", rule)
 		}

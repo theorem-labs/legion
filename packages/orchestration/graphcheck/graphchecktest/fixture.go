@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -57,24 +58,38 @@ producers:
   binder_files: ['Lib/Drv/**/*.lean']
 `
 
+// Variant changes the fixture project before its base is built: Lakefile is appended to lakefile.toml, and
+// Files are written (path relative to the project -> text), replacing a file of that path.
+type Variant struct {
+	Lakefile string
+	Files    map[string]string
+}
+
 // New builds the fixture.
 func New(t testing.TB) *Fixture {
 	t.Helper()
-	return build(t, nil, true)
+	return NewVariant(t, Variant{})
+}
+
+// NewVariant builds the fixture from the project that v changes. Its base build is cached by the digest of the
+// changed project's own sources.
+func NewVariant(t testing.TB, v Variant) *Fixture {
+	t.Helper()
+	return build(t, v, nil, true)
 }
 
 // NewWithoutCompiledPart builds the fixture with an index read from the reference files alone (lean.export off),
 // as a corpus index is: it holds no compiled constant, no type and no compiled statement hash.
 func NewWithoutCompiledPart(t testing.TB) *Fixture {
 	t.Helper()
-	return build(t, nil, false)
+	return build(t, Variant{}, nil, false)
 }
 
 // NewWithUnreadableModule builds the fixture with Lib/Make.ilean truncated before the refresh, so the index
 // records an unreadable module and is incomplete.
 func NewWithUnreadableModule(t testing.TB) *Fixture {
 	t.Helper()
-	return build(t, func(lib string) {
+	return build(t, Variant{}, func(lib string) {
 		path := filepath.Join(lib, "Lib", "Make.ilean")
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -104,27 +119,25 @@ func RequireLean(t testing.TB) declindex.Lean {
 	return lean
 }
 
-func build(t testing.TB, damage func(lib string), compiled bool) *Fixture {
+func build(t testing.TB, v Variant, damage func(lib string), compiled bool) *Fixture {
 	t.Helper()
 	lean := RequireLean(t)
-	built := baseLib(t, lean)
+	outputs, root := baseBuild(t, lean, v)
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "repo")
-	if err := copyTree(Testdata(t), repo, skipBuildFiles); err != nil {
-		t.Fatal(err)
-	}
+	writeProject(t, repo, v)
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "fixture@example.invalid")
 	git(t, repo, "config", "user.name", "Fixture")
-	appendFile(t, filepath.Join(repo, ".git", "info", "exclude"), ".lake/\n")
+	appendFile(t, filepath.Join(repo, ".git", "info", "exclude"), ".lake/\nlake-manifest.json\n")
 	git(t, repo, "add", "-A")
 	git(t, repo, "commit", "-qm", "base")
 	base := git(t, repo, "rev-parse", "HEAD")
 
-	lib := filepath.Join(repo, ".lake", "build", "lib", "lean")
-	if err := copyTree(built, lib, nil); err != nil {
+	if err := copyOutputs(outputs, repo, root); err != nil {
 		t.Fatal(err)
 	}
+	lib := filepath.Join(repo, ".lake", "build", "lib", "lean")
 	if damage != nil {
 		damage(lib)
 	}
@@ -135,7 +148,7 @@ func build(t testing.TB, damage func(lib string), compiled bool) *Fixture {
 	}
 	options := declindex.RefreshOptions{Commit: base, Jobs: 2}
 	if compiled {
-		options.Compiled = compiledPart(t, lean, lib, dir)
+		options.Compiled = compiledPart(t, lean, repo, dir)
 	}
 	if _, err := store.Refresh(context.Background(), declindex.Tree{Source: repo, Lib: lib, Roots: declindex.Roots{"Lib": true}},
 		options); err != nil {
@@ -155,42 +168,79 @@ func build(t testing.TB, damage func(lib string), compiled bool) *Fixture {
 }
 
 // compiledPart reads the base build's types and compiled statement hashes into the index, as a production
-// refresh does: S2, L1 and P1 compare the candidate's compiled constants with them.
-func compiledPart(t testing.TB, lean declindex.Lean, lib, scratch string) func(context.Context) (*declindex.CompiledOptions, error) {
+// refresh does: S2, L1 and P1 compare the candidate's compiled constants with them. Its search path is Lake's
+// own, so a project with a second package is read as the build reads it.
+func compiledPart(t testing.TB, lean declindex.Lean, repo, scratch string) func(context.Context) (*declindex.CompiledOptions, error) {
 	return func(ctx context.Context) (*declindex.CompiledOptions, error) {
 		bin, err := declindex.BuildExporter(ctx, lean, "", filepath.Join(cacheDir(t), "exporter"))
 		if err != nil {
 			return nil, err
 		}
 		return &declindex.CompiledOptions{
-			Exporter: &declindex.Exporter{Lean: lean, Bin: bin, SearchPath: []string{lib}, Jobs: 2, ScratchDir: scratch},
+			Exporter: &declindex.Exporter{Lean: lean, Bin: bin, SearchPath: leanPath(t, lean, repo), Jobs: 2, ScratchDir: scratch},
 		}, nil
 	}
+}
+
+// leanPath is the search path Lake gives `lean` in the project, as graphcheck reads it.
+func leanPath(t testing.TB, lean declindex.Lean, repo string) []string {
+	t.Helper()
+	cmd := exec.Command(filepath.Join(lean.Prefix, "bin", "lake"), "env", "printenv", "LEAN_PATH")
+	cmd.Dir = repo
+	home, _ := os.UserHomeDir()
+	cmd.Env = []string{"PATH=" + filepath.Join(lean.Prefix, "bin") + ":/usr/bin:/bin", "LEAN_SYSROOT=" + lean.Prefix, "HOME=" + home}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("lake env in %s: %v", repo, err)
+	}
+	return filepath.SplitList(strings.TrimSpace(string(out)))
 }
 
 // skipBuildFiles drops the entries of testdata/lean that are not the Lean project: the committed reference files
 // of the golden test, and the script that writes them.
 func skipBuildFiles(rel string) bool { return rel == "golden" || rel == "build.sh" }
 
-// baseLib builds the fixture project once for each toolchain and set of fixture sources, and gives the built
-// library directory (.lake/build/lib/lean) that every fixture copies. The build lands in its cache directory by
-// one rename, so parallel test binaries never read a half-written one.
-func baseLib(t testing.TB, lean declindex.Lean) string {
+// writeProject writes the fixture project that v changes into dir.
+func writeProject(t testing.TB, dir string, v Variant) {
 	t.Helper()
-	src := Testdata(t)
-	dir := filepath.Join(cacheDir(t), "base", fixtureDigest(t, src, lean.Prefix))
-	lib := filepath.Join(dir, "lean")
-	if _, err := os.Stat(lib); err == nil {
-		return lib
+	if err := copyTree(Testdata(t), dir, skipBuildFiles); err != nil {
+		t.Fatal(err)
 	}
-	work, err := os.MkdirTemp(filepath.Dir(dir), "build-")
+	if v.Lakefile != "" {
+		appendFile(t, filepath.Join(dir, "lakefile.toml"), v.Lakefile)
+	}
+	for rel, text := range v.Files {
+		write(t, filepath.Join(dir, filepath.FromSlash(rel)), text)
+	}
+}
+
+// isBuildOutput reports whether a path relative to the project is one Lake wrote: below a .lake directory of the
+// project or of a dependency inside it, or the root's lake-manifest.json.
+func isBuildOutput(rel string) bool {
+	if rel == "lake-manifest.json" {
+		return true
+	}
+	return slices.Contains(strings.Split(rel, string(filepath.Separator)), ".lake")
+}
+
+// baseBuild builds the project that v changes once for each toolchain and set of project sources, and gives the
+// cached directory of every build output Lake wrote (at the paths relative to the project) and the absolute
+// directory the project was built in, which Lake's setup files name. The build lands in its cache directory by one
+// rename, so parallel test binaries never read a half-written one.
+func baseBuild(t testing.TB, lean declindex.Lean, v Variant) (outputs, root string) {
+	t.Helper()
+	cache := filepath.Join(cacheDir(t), "base")
+	work, err := os.MkdirTemp(cache, "build-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(work)
 	project := filepath.Join(work, "project")
-	if err := copyTree(src, project, skipBuildFiles); err != nil {
-		t.Fatal(err)
+	writeProject(t, project, v)
+	dir := filepath.Join(cache, fixtureDigest(t, project, lean.Prefix))
+	outputs = filepath.Join(dir, "outputs")
+	if raw, err := os.ReadFile(filepath.Join(dir, "root")); err == nil {
+		return outputs, string(raw)
 	}
 	cmd := exec.Command(filepath.Join(lean.Prefix, "bin", "lake"), "build")
 	cmd.Dir = project
@@ -201,15 +251,79 @@ func baseLib(t testing.TB, lean declindex.Lean) string {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("lake build in %s: %v\n%s", project, err, out)
 	}
-	if err := os.Rename(filepath.Join(project, ".lake", "build", "lib", "lean"), filepath.Join(work, "lean")); err != nil {
+	err = filepath.WalkDir(project, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(project, path)
+		if err != nil || !isBuildOutput(rel) {
+			return err
+		}
+		return copyEntry(path, filepath.Join(work, "outputs", rel), entry, nil)
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(work, dir); err != nil && !os.IsExist(err) {
-		if _, statErr := os.Stat(lib); statErr != nil {
+	write(t, filepath.Join(work, "root"), project)
+	if err := os.RemoveAll(project); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(work, dir); err != nil {
+		raw, statErr := os.ReadFile(filepath.Join(dir, "root"))
+		if statErr != nil {
 			t.Fatalf("install the fixture build: %v", err)
 		}
+		return outputs, string(raw)
 	}
-	return lib
+	return outputs, project
+}
+
+// copyOutputs copies the cached build outputs into the repository at the same paths. Lake's JSON files (the
+// setup files and the manifest) name the directory the project was built in, root; they name repo instead.
+func copyOutputs(outputs, repo, root string) error {
+	return filepath.WalkDir(outputs, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(outputs, path)
+		if err != nil {
+			return err
+		}
+		var rewrite func([]byte) []byte
+		if strings.HasSuffix(rel, ".json") {
+			rewrite = func(raw []byte) []byte { return bytes.ReplaceAll(raw, []byte(root), []byte(repo)) }
+		}
+		return copyEntry(path, filepath.Join(repo, rel), entry, rewrite)
+	})
+}
+
+// copyEntry copies one file, keeping its mode, or one symbolic link as a link.
+func copyEntry(src, dst string, entry fs.DirEntry, rewrite func([]byte) []byte) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if entry.Type()&fs.ModeSymlink != 0 {
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(target, dst)
+	}
+	info, err := entry.Info()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if rewrite != nil {
+		raw = rewrite(raw)
+	}
+	return os.WriteFile(dst, raw, info.Mode().Perm())
 }
 
 // cacheDir holds what the fixture builds once: the base build and the exporter.
@@ -226,11 +340,12 @@ func cacheDir(t testing.TB) string {
 	return dir
 }
 
-// fixtureDigest names one build: the toolchain and every source file of the project.
+// fixtureDigest names one build: the layout of the cached build, the toolchain and every source file of the
+// project.
 func fixtureDigest(t testing.TB, src, prefix string) string {
 	t.Helper()
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00", prefix)
+	fmt.Fprintf(h, "outputs-v2\x00%s\x00", prefix)
 	var files []string
 	err := filepath.WalkDir(src, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
@@ -240,7 +355,7 @@ func fixtureDigest(t testing.TB, src, prefix string) string {
 		if err != nil {
 			return err
 		}
-		if top, _, _ := strings.Cut(rel, string(filepath.Separator)); skipBuildFiles(top) {
+		if isBuildOutput(rel) {
 			return nil
 		}
 		files = append(files, rel)

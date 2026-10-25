@@ -82,6 +82,9 @@ type Module struct {
 	// Errors are the errors of a failed compile, and Output the whole compile output that blame.Parse reads.
 	Errors []LeanError
 	Output string
+	// Unchanged is a module the batch does not change that is compiled all the same: one between a changed module
+	// and a module that imports it, whose base build is stale, or one N1 asks Lean about (Confirm).
+	Unchanged bool
 }
 
 // Candidate is the candidate tree against its base. The base's facts come from the declaration index; the
@@ -93,11 +96,13 @@ type Candidate struct {
 	// Changes are sorted by path.
 	Changes []Change
 
-	repo     string
-	cfg      Config
-	icfg     declindex.Config
-	lean     declindex.Lean
-	scratch  string
+	repo    string
+	cfg     Config
+	icfg    declindex.Config
+	lean    declindex.Lean
+	scratch string
+	// leanPath is the search path Lake gives `lean` in the index's tree (lakeLeanPath); the scratch goes first.
+	leanPath []string
 	byPath   map[string]*Change
 	byModule map[string]*Change
 	text     map[string]string  // path -> candidate text, for added and modified files
@@ -109,6 +114,11 @@ type Candidate struct {
 	exportOnce              sync.Once
 	constants, baseConstant map[string][]declindex.Constant // module -> constants
 	exportErr               error
+
+	// lake holds the base build's setup files, read once: the options and plugins Lake gave each module (lake.go).
+	lakeOnce sync.Once
+	lake     *lakeState
+	lakeErr  error
 }
 
 // Open checks the index against the base (D5), reads the candidate's changes, and compiles the changed modules that
@@ -284,14 +294,9 @@ func (c *Candidate) compile(ctx context.Context, idx *declindex.Store) error {
 		changed = append(changed, m)
 	}
 	if len(changed) == 0 {
-		c.closure()
-		return nil
+		return c.closure()
 	}
-	c.lean, err = leanToolchain(ctx, c.icfg)
-	if err != nil {
-		return unable("the index's tree selects no Lean toolchain: %v", err)
-	}
-	if c.scratch, err = os.MkdirTemp("", "graphcheck-"); err != nil {
+	if err := c.ensureScratch(ctx); err != nil {
 		return err
 	}
 	files := make([]string, 0, len(changed))
@@ -318,11 +323,183 @@ func (c *Candidate) compile(ctx context.Context, idx *declindex.Store) error {
 			m.Errors = []LeanError{{File: m.Path, Line: 1, Col: 1, Message: h.err}}
 		}
 	}
-	c.closure()
-	if err := c.linkBase(); err != nil {
+	if err := c.closure(); err != nil {
 		return err
 	}
-	return c.compileBuilt(ctx, changed)
+	var targets []string
+	for _, m := range changed {
+		if c.built[m.Module] {
+			targets = append(targets, m.Module)
+		}
+	}
+	stale, err := c.addUnchanged(ctx, c.intermediates(targets))
+	if err != nil {
+		return err
+	}
+	return c.compileBuilt(ctx, append(changed, stale...))
+}
+
+// ensureScratch readies the scratch library once: the toolchain the tree names, the search path Lake gives `lean`
+// in the tree, a fresh directory outside every tree, and links to the base build's outputs.
+func (c *Candidate) ensureScratch(ctx context.Context) error {
+	if c.scratch != "" {
+		return nil
+	}
+	lean, err := leanToolchain(ctx, c.icfg)
+	if err != nil {
+		return unable("the index's tree selects no Lean toolchain: %v", err)
+	}
+	c.lean = lean
+	if c.leanPath, err = lakeLeanPath(ctx, lean, c.icfg); err != nil {
+		return err
+	}
+	if c.scratch, err = os.MkdirTemp("", "graphcheck-"); err != nil {
+		return err
+	}
+	if err := c.linkBase(); err != nil {
+		return unable("the base build's library %s cannot be read: %v", c.icfg.Lib, err)
+	}
+	return nil
+}
+
+// lakeLeanPath is the search path Lake gives `lean` for the tree's modules: every package's library directory,
+// path dependencies included, in Lake's order (`lake env printenv LEAN_PATH`), then the index configuration's
+// lean.search_path. It is read from Lake, never guessed from a directory layout, so a module that imports another
+// package of the project compiles here as it does in the build.
+func lakeLeanPath(ctx context.Context, lean declindex.Lean, icfg declindex.Config) ([]string, error) {
+	cmd := exec.CommandContext(ctx, filepath.Join(lean.Prefix, "bin", "lake"), "env", "printenv", "LEAN_PATH")
+	cmd.Dir = icfg.Tree
+	home, _ := os.UserHomeDir()
+	cmd.Env = []string{"PATH=" + filepath.Join(lean.Prefix, "bin") + ":/usr/bin:/bin", "LEAN_SYSROOT=" + lean.Prefix, "HOME=" + home}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, unable("lake env in %s gives no search path: %v: %s", icfg.Tree, err, strings.TrimSpace(stderr.String()))
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, dir := range append(filepath.SplitList(strings.TrimSpace(stdout.String())), icfg.Lean.SearchPath...) {
+		if dir != "" && !seen[dir] {
+			seen[dir] = true
+			out = append(out, dir)
+		}
+	}
+	return out, nil
+}
+
+// intermediates are the unchanged built modules that lie between a changed module and a target: the target imports
+// them, directly or not, and they import a changed module. Their base .olean was elaborated against the base's
+// version of that changed module, so a target compiled against it could fail where the build, which rebuilds them,
+// succeeds. They are compiled again from their unchanged text.
+func (c *Candidate) intermediates(targets []string) []string {
+	up := map[string]bool{}
+	stack := slices.Clone(targets)
+	for len(stack) > 0 {
+		m := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, imp := range c.graph[m] {
+			if !up[imp] {
+				up[imp] = true
+				stack = append(stack, imp)
+			}
+		}
+	}
+	reverse := c.reverseGraph()
+	down := map[string]bool{}
+	for name, m := range c.modules {
+		if m.Unchanged {
+			continue
+		}
+		for importer := range c.importersOf(name, reverse) {
+			down[importer] = true
+		}
+	}
+	var out []string
+	for m := range up {
+		if down[m] && c.modules[m] == nil && c.built[m] {
+			out = append(out, m)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// addUnchanged readies unchanged modules for a compile in the scratch directory: their text from the candidate
+// tree, their imports from the index, and the base build's outputs of them taken out of the scratch, so that the
+// compile writes fresh files and never writes through a link into the base build.
+func (c *Candidate) addUnchanged(ctx context.Context, names []string) ([]*Module, error) {
+	var out []*Module
+	var specs []string
+	for _, name := range names {
+		if c.modules[name] != nil {
+			continue
+		}
+		path := c.PathOf(name)
+		m := &Module{Change: Change{Path: path, Module: name, Status: Modified}, Imports: c.graph[name], Unchanged: true}
+		out = append(out, m)
+		specs = append(specs, c.Tree+":"+path)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	cat, err := startCatFile(c.repo)
+	if err != nil {
+		return nil, err
+	}
+	texts, err := cat.read(specs)
+	_ = cat.close()
+	if err != nil {
+		return nil, unable("read the unchanged modules to compile: %v", err)
+	}
+	for i, m := range out {
+		if err := c.unlinkOutputs(m.Path); err != nil {
+			return nil, err
+		}
+		target := filepath.Join(c.scratch, filepath.FromSlash(m.Path))
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(target, []byte(texts[i]), 0o644); err != nil {
+			return nil, err
+		}
+		c.text[m.Path] = texts[i]
+		c.modules[m.Module] = m
+	}
+	return out, nil
+}
+
+// unlinkOutputs removes the links linkBase made to one module's base outputs.
+func (c *Candidate) unlinkOutputs(path string) error {
+	base := filepath.Join(c.scratch, filepath.FromSlash(strings.TrimSuffix(path, ".lean")))
+	links, err := filepath.Glob(base + ".*")
+	if err != nil {
+		return err
+	}
+	for _, link := range links {
+		if info, err := os.Lstat(link); err == nil && info.Mode()&fs.ModeSymlink != 0 {
+			if err := os.Remove(link); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Confirm compiles unchanged built modules against the candidate, with every unchanged module between them and a
+// changed module compiled again too, so that Lean says whether they still build. Their modules' State says.
+func (c *Candidate) Confirm(ctx context.Context, names []string) error {
+	if err := c.ensureScratch(ctx); err != nil {
+		return err
+	}
+	added, err := c.addUnchanged(ctx, names)
+	if err != nil {
+		return err
+	}
+	more, err := c.addUnchanged(ctx, c.intermediates(names))
+	if err != nil {
+		return err
+	}
+	return c.compileBuilt(ctx, append(added, more...))
 }
 
 // linkBase fills the scratch with the base build's outputs, so that it is a complete library of the candidate.
@@ -366,7 +543,7 @@ func moduleOfOutput(rel string) string {
 
 // closure computes the modules the build builds: the closure of build_roots over the candidate's import graph,
 // with each added module a root too when root_new_modules is set.
-func (c *Candidate) closure() {
+func (c *Candidate) closure() error {
 	roots := normalNames(c.cfg.BuildRoots)
 	for _, ch := range c.Changes {
 		if ch.Status == Added && c.cfg.RootNewModules {
@@ -385,6 +562,7 @@ func (c *Candidate) closure() {
 		c.built[module] = true
 		stack = append(stack, imported...)
 	}
+	return nil
 }
 
 type header struct {
@@ -454,7 +632,7 @@ func (c *Candidate) compileBuilt(ctx context.Context, changed []*Module) error {
 		jobs = runtime.NumCPU()
 	}
 	jobs = min(jobs, 48)
-	searchPath := append([]string{c.icfg.Lib}, c.icfg.Lean.SearchPath...)
+	searchPath := c.leanPath
 	roots := declindex.Roots{}
 	for _, r := range c.icfg.Roots {
 		roots[r] = true
@@ -572,11 +750,16 @@ func (c *Candidate) closureFailed(deps []string) bool {
 // leanMessageRE is the first line of one of Lean's messages: `<file>:<line>:<col>: <severity>: <text>`.
 var leanMessageRE = regexp.MustCompile(`^(.+?\.lean):(\d+):(\d+): (error|warning|info)(?:\([^)]*\))?: ?(.*)$`)
 
-// compileOne compiles one module with declindex.CompileModule and reads its reference file, or keeps Lean's
-// output for C1 (compile.go), which turns it into findings or into the reason the check cannot decide.
+// compileOne compiles one module with declindex.CompileModule, under the options and plugins Lake gave it in the
+// base build, and reads its reference file, or keeps Lean's output for C1 (compile.go), which turns it into
+// findings or into the reason the check cannot decide.
 func (c *Candidate) compileOne(ctx context.Context, m *Module, searchPath []string, roots declindex.Roots) error {
 	rel := strings.TrimSuffix(m.Path, ".lean")
-	err := declindex.CompileModule(ctx, c.lean, searchPath, c.scratch, rel)
+	args, err := c.leanArgs(m)
+	if err != nil {
+		return err
+	}
+	err = declindex.CompileModule(ctx, c.lean, searchPath, c.scratch, rel, args...)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -742,27 +925,16 @@ func (c *Candidate) export(ctx context.Context) error {
 	if len(compiled) == 0 && len(before) == 0 {
 		return nil
 	}
-	if c.lean.Prefix == "" {
-		l, err := leanToolchain(ctx, c.icfg)
-		if err != nil {
-			return unable("the index's tree selects no Lean toolchain: %v", err)
-		}
-		c.lean = l
-	}
-	if c.scratch == "" {
-		dir, err := os.MkdirTemp("", "graphcheck-")
-		if err != nil {
-			return err
-		}
-		c.scratch = dir
+	if err := c.ensureScratch(ctx); err != nil {
+		return err
 	}
 	for _, side := range []struct {
 		modules    []string
 		searchPath []string
 		into       map[string][]declindex.Constant
 	}{
-		{compiled, append([]string{c.scratch, c.icfg.Lib}, c.icfg.Lean.SearchPath...), c.constants},
-		{before, append([]string{c.icfg.Lib}, c.icfg.Lean.SearchPath...), c.baseConstant},
+		{compiled, append([]string{c.scratch}, c.leanPath...), c.constants},
+		{before, c.leanPath, c.baseConstant},
 	} {
 		if len(side.modules) == 0 {
 			continue

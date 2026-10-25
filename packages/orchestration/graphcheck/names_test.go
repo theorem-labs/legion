@@ -93,7 +93,9 @@ func TestNamesRefusesARemovedFieldThatAStructureInstanceNames(t *testing.T) {
 	}
 }
 
-func TestNamesFlagsARemovalWhoseShortNameIsDeclaredElsewhere(t *testing.T) {
+// Another declaration has the removed name's last component, but Lean decides: Lib/Open.lean opens only Lib.Core, so
+// its `helper` resolves to nothing, the module does not compile, and N1 refuses it.
+func TestNamesRefusesWhatLeanConfirmsDespiteAShortNameElsewhere(t *testing.T) {
 	f := graphchecktest.New(t)
 	tree := f.EditMany(t, map[string][2]string{
 		"Lib/Core.lean":  {"def helper", "def helper2"},
@@ -101,11 +103,8 @@ func TestNamesFlagsARemovalWhoseShortNameIsDeclaredElsewhere(t *testing.T) {
 		"Lib.lean":       {"import Lib.Open", "import Lib.Open\nimport Lib.Other"},
 	})
 	hits := names(t, f, tree)
-	if _, ok := find(hits, landing.VerdictFlag, blame.Unknown, "Lib.Core.helper", "Lib/Open.lean", "N1"); !ok {
-		t.Fatalf("no N1 flag at Lib/Open.lean in %v", hits)
-	}
-	if _, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Open.lean", "N1"); ok {
-		t.Fatal("N1 refuses a use that may resolve to Lib.Core.Alt.helper")
+	if _, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Open.lean", "N1"); !ok {
+		t.Fatalf("no N1 refusal at Lib/Open.lean in %v", hits)
 	}
 }
 
@@ -122,15 +121,15 @@ func TestNamesRefusesARemovalWhoseShortNameOnlyAPrivateDeclarationHas(t *testing
 	}
 }
 
-func TestNamesFlagsARemovedFieldOfAStructureThatExtends(t *testing.T) {
+// A field a parent structure now gives still resolves: Lean compiles Lib/Use.lean's `b.val`, so N1 says nothing
+// there.
+func TestNamesSaysNothingOfAFieldAParentStillGives(t *testing.T) {
 	f := graphchecktest.New(t)
 	tree := f.Edit(t, "Lib/Core.lean", "structure Box where\n  val : Nat", "structure Base where\n  val : Nat\n\nstructure Box extends Base where\n  value : Nat")
-	hits := names(t, f, tree)
-	if _, ok := find(hits, landing.VerdictFlag, blame.Field, "Lib.Core.Box.val", "Lib/Use.lean", "N1"); !ok {
-		t.Fatalf("no N1 field flag at Lib/Use.lean in %v", hits)
-	}
-	if _, ok := find(hits, landing.VerdictRefuse, blame.Field, "Lib.Core.Box.val", "Lib/Use.lean", "N1"); ok {
-		t.Fatal("N1 refuses a field a parent structure may still give")
+	for _, h := range names(t, f, tree) {
+		if h.Path == "Lib/Use.lean" && h.Declaration == "Lib.Core.Box.val" {
+			t.Fatalf("finding %+v for a field the parent structure gives", h)
+		}
 	}
 }
 
@@ -172,16 +171,30 @@ func TestNamesIgnoresAUseInAModuleTheBuildNoLongerReaches(t *testing.T) {
 	}
 }
 
-func TestNamesIgnoresADeclarationMovedToAnotherFile(t *testing.T) {
+// A declaration moved into a module its users reach through their imports is not removed for them.
+func TestNamesIgnoresADeclarationMovedWhereItsUsersReachIt(t *testing.T) {
 	f := graphchecktest.New(t)
 	tree := f.EditMany(t, map[string][2]string{
-		"Lib/Core.lean":  {"def helper (n : Nat) : Nat := n + 1\n", ""},
+		"Lib/Core.lean":  {"namespace Lib.Core\n\ndef helper (n : Nat) : Nat := n + 1\n", "import Lib.Core2\n\nnamespace Lib.Core\n"},
 		"Lib/Core2.lean": {"", "namespace Lib.Core\ndef helper (n : Nat) : Nat := n + 1\nend Lib.Core\n"},
 	})
 	for _, h := range names(t, f, tree) {
-		if h.Declaration == "Lib.Core.helper" && h.Verdict == landing.VerdictRefuse {
-			t.Fatalf("refusal %+v of a moved declaration", h)
+		if h.Declaration == "Lib.Core.helper" {
+			t.Fatalf("finding %+v of a moved declaration its users still reach", h)
 		}
+	}
+}
+
+// A declaration moved into a module that its users do not import is gone for them: Lean fails them, and N1
+// refuses.
+func TestNamesRefusesADeclarationMovedWhereItsUsersCannotReachIt(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Core.lean":     {"def helper (n : Nat) : Nat := n + 1\n", ""},
+		"Lib/Separate.lean": {"", "namespace Lib.Core\ndef helper (n : Nat) : Nat := n + 1\nend Lib.Core\n"},
+	})
+	if _, ok := find(names(t, f, tree), landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Use.lean", "N1"); !ok {
+		t.Fatal("no N1 refusal at Lib/Use.lean for a declaration moved out of its reach")
 	}
 }
 

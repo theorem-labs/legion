@@ -64,8 +64,10 @@ type nameState struct {
 	structures      map[string][]string
 	candidateConsts map[string]map[string]bool
 	removed         []*removal
-	// reverse maps each module of the candidate to the modules that import it directly, read once for N2.
-	reverse map[string][]string
+	// reverse maps each module of the candidate to the modules that import it directly, read once for N2, and
+	// closures each user module to its candidate import closure, for N1.
+	reverse  map[string][]string
+	closures map[string]map[string]bool
 }
 
 // located is one declaration of a compiled candidate module.
@@ -130,7 +132,7 @@ func readNames(ctx context.Context, c *Candidate, idx *declindex.Store) (*nameSt
 		return nil, err
 	}
 	n := &nameState{c: c, idx: idx, paths: map[string]string{}, modules: map[string]string{},
-		baseDecls: map[string][]declindex.Decl{}, public: map[string][]located{},
+		baseDecls: map[string][]declindex.Decl{}, public: map[string][]located{}, closures: map[string]map[string]bool{},
 		private: map[string]bool{}, unchanged: map[string][]declindex.Decl{}}
 	for module, file := range paths {
 		n.paths[normalName(module)] = file
@@ -220,15 +222,10 @@ func (n *nameState) askUnchanged(ctx context.Context, names []string) error {
 	return nil
 }
 
-// declared reports whether the candidate declares the name publicly: in a compiled changed module, or in an
-// unchanged module of the base.
-func (n *nameState) declared(name string) bool {
-	return len(n.public[name]) != 0 || len(n.unchanged[name]) != 0
-}
-
-// findRemovals lists the names the compiled candidate no longer declares. Only a deleted file and a module that
-// compiled say anything: a module whose compile failed is C1's, and a changed module the build does not build has
-// no built user to break.
+// findRemovals lists the names a changed module's compiled output no longer declares. Only a deleted file and a
+// module that compiled say anything: a module whose compile failed is C1's, and a changed module the build does
+// not build has no built user to break. A name another module declares now is still listed: whether a user reaches
+// that module is the user's own import closure's question (removedUses).
 func (n *nameState) findRemovals(ctx context.Context) error {
 	files := make([]string, 0, len(n.baseDecls))
 	for file := range n.baseDecls {
@@ -240,14 +237,21 @@ func (n *nameState) findRemovals(ctx context.Context) error {
 		if ch == nil {
 			continue
 		}
+		here := map[string]bool{}
 		if ch.Status != Deleted {
-			if m := n.c.Module(ch.Module); m == nil || m.State != Compiled {
+			m := n.c.Module(ch.Module)
+			if m == nil || m.State != Compiled {
 				continue
+			}
+			for _, d := range m.Data.Decls {
+				if name, isPrivate := unmangle(d.Name, m.Module); !isPrivate {
+					here[name] = true
+				}
 			}
 		}
 		for _, d := range n.baseDecls[file] {
 			name, isPrivate := unmangle(d.Name, d.Module)
-			if isPrivate || n.declared(name) {
+			if isPrivate || here[name] {
 				continue
 			}
 			n.removed = append(n.removed, &removal{Name: name, Target: d.Name, Path: file, Module: d.Module,
@@ -265,29 +269,43 @@ func (n *nameState) findRemovals(ctx context.Context) error {
 	return n.addDoubts(ctx)
 }
 
-// keepCompiledConstants drops a removal that a compiled candidate module still has as a constant. The reference
-// file records no declaration range for a constant that a command macro or `deriving` makes, so only the exporter
-// tells such a constant from a removed one. It runs only when there is a removal to check.
+// keepCompiledConstants drops a removal that its own module, compiled, still has as a constant. The reference file
+// records no declaration range for a constant that a command macro or `deriving` makes, so only the exporter tells
+// such a constant from a removed one. It runs only when there is a removal to check.
 func (n *nameState) keepCompiledConstants(ctx context.Context) error {
 	if len(n.removed) == 0 {
+		return nil
+	}
+	if err := n.loadCandidateConsts(ctx); err != nil {
+		return err
+	}
+	n.removed = slices.DeleteFunc(n.removed, func(r *removal) bool {
+		ch := n.c.Change(r.Path)
+		return ch != nil && n.candidateConsts[ch.Module][r.Name]
+	})
+	return nil
+}
+
+// loadCandidateConsts reads, once, the exporter's constants of every compiled changed module, by module, private
+// names unmangled out.
+func (n *nameState) loadCandidateConsts(ctx context.Context) error {
+	if n.candidateConsts != nil {
 		return nil
 	}
 	candidate, _, err := n.c.Constants(ctx)
 	if err != nil {
 		return err
 	}
-	have := map[string]bool{}
+	n.candidateConsts = make(map[string]map[string]bool, len(candidate))
 	for module, constants := range candidate {
-		if !n.c.Built(module) {
-			continue
-		}
+		names := make(map[string]bool, len(constants))
 		for _, k := range constants {
 			if name, isPrivate := unmangle(k.Name, module); !isPrivate {
-				have[name] = true
+				names[name] = true
 			}
 		}
+		n.candidateConsts[module] = names
 	}
-	n.removed = slices.DeleteFunc(n.removed, func(r *removal) bool { return have[r.Name] })
 	return nil
 }
 
@@ -458,17 +476,22 @@ func startsUpper(s string) bool {
 	return s != "" && unicode.IsUpper(firstRune(s))
 }
 
-// removedUses runs N1: a built module whose file no changes uses a name the candidate removed. A changed module
-// that uses one no longer compiles, and C1 refuses it through Lean's own error.
+// removedUses runs N1: a built module whose file no changes uses a name its own import closure no longer declares.
+// A recorded base use is evidence, not proof: a use inside a tactic that has a fallback leaves a module that still
+// builds. So every module N1 would refuse is compiled against the candidate first (Candidate.Confirm), and Lean
+// decides: a module that compiles gives no finding, one that fails is refused, and one Lean could not compile (a
+// changed module it needs failed) is flagged. A changed module that uses a removed name is C1's.
 func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) {
 	if len(n.removed) == 0 {
 		return nil, nil
 	}
 	byTarget := map[string]*removal{}
 	targets := make([]string, 0, len(n.removed))
+	var names []string
 	for _, r := range n.removed {
 		byTarget[r.Target] = r
 		targets = append(targets, r.Target)
+		names = append(names, r.Name)
 	}
 	uses, err := n.idx.UsesOf(ctx, targets)
 	if err != nil {
@@ -476,62 +499,124 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 	}
 	// A use of a name below a removed one (an equation lemma of a removed definition) fails with it, unless the
 	// candidate declares that name itself.
-	var below []string
 	for _, u := range uses {
 		if _, ok := byTarget[u.Target]; !ok {
-			below = append(below, normalName(u.Target))
+			names = append(names, normalName(u.Target))
 		}
 	}
-	if err := n.askUnchanged(ctx, below); err != nil {
+	if err := n.askUnchanged(ctx, names); err != nil {
 		return nil, err
 	}
 	type group struct {
-		r     *removal
-		first declindex.Use
-		count int
+		r      *removal
+		module string
+		first  declindex.Use
+		count  int
 	}
 	groups := map[[2]string]*group{}
 	var order [][2]string
-	counts := map[*removal][2]int{} // uses and modules
 	for _, u := range uses {
 		r := owner(byTarget, u.Target)
 		if r == nil {
-			continue
-		}
-		if u.Target != r.Target && n.declared(normalName(u.Target)) {
 			continue
 		}
 		module := normalName(u.Module)
 		if !n.c.Built(module) || n.c.ChangeOfModule(module) != nil {
 			continue
 		}
+		if n.reachable(normalName(u.Target), module) || (u.Target != r.Target && n.reachable(r.Name, module)) {
+			continue
+		}
 		key := [2]string{r.Target, module}
 		g, ok := groups[key]
 		if !ok {
-			g = &group{r: r, first: u}
+			g = &group{r: r, module: module, first: u}
 			groups[key] = g
 			order = append(order, key)
-			c := counts[r]
-			counts[r] = [2]int{c[0], c[1] + 1}
 		} else if u.Line < g.first.Line || (u.Line == g.first.Line && u.Col < g.first.Col) {
 			g.first = u
 		}
 		g.count++
-		c := counts[r]
-		counts[r] = [2]int{c[0] + 1, c[1]}
 	}
+	if len(order) == 0 {
+		return nil, nil
+	}
+	users := map[string]bool{}
+	for _, key := range order {
+		users[key[1]] = true
+	}
+	if err := n.c.Confirm(ctx, slices.Sorted(maps.Keys(users))); err != nil {
+		return nil, err
+	}
+	counts := map[*removal][2]int{} // uses and modules of the groups kept
+	order = slices.DeleteFunc(order, func(key [2]string) bool {
+		if m := n.c.Module(key[1]); m != nil && m.State == Compiled {
+			return true
+		}
+		g := groups[key]
+		c := counts[g.r]
+		counts[g.r] = [2]int{c[0] + g.count, c[1] + 1}
+		return false
+	})
 	var out []landing.Finding
 	for _, key := range order {
 		g := groups[key]
 		r := g.r
 		c := counts[r]
+		verdict, doubt := landing.VerdictRefuse, ""
+		if m := n.c.Module(g.module); m == nil || m.State != Failed {
+			verdict, doubt = landing.VerdictFlag, "; Lean could not compile this module against the candidate to confirm"+r.doubt()
+		}
 		out = append(out, landing.Finding{
-			Path: n.fileOf(normalName(g.first.Module)), Line: max(g.first.Line, 1), Col: max(g.first.Col, 1),
-			Verdict: r.verdict(), Declaration: r.Name, Kind: r.kind(),
+			Path: n.fileOf(g.module), Line: max(g.first.Line, 1), Col: max(g.first.Col, 1),
+			Verdict: verdict, Declaration: r.Name, Kind: r.kind(),
 			Reason: fmt.Sprintf("N1: %s; %s in %s, first here%s", r.what(), plural(c[0], "use"),
-				plural(c[1], "unchanged module"), r.doubt())})
+				plural(c[1], "unchanged module"), doubt)})
 	}
 	return out, nil
+}
+
+// reachable reports whether a user module's candidate import closure, the user included, holds a public
+// declaration of the name: in a compiled changed module (a declaration or a compiled constant) or in an unchanged
+// module of the base. A field never moves away from its structure, so a removed field is never reachable.
+func (n *nameState) reachable(name, user string) bool {
+	closure := n.importClosure(user)
+	for _, l := range n.public[name] {
+		if closure[l.Module] {
+			return true
+		}
+	}
+	for module, constants := range n.candidateConsts {
+		if constants[name] && closure[module] {
+			return true
+		}
+	}
+	for _, d := range n.unchanged[name] {
+		if closure[normalName(d.Module)] {
+			return true
+		}
+	}
+	return false
+}
+
+// importClosure is the set of modules a module imports in the candidate, directly or not, itself included.
+func (n *nameState) importClosure(module string) map[string]bool {
+	if closure, ok := n.closures[module]; ok {
+		return closure
+	}
+	closure := map[string]bool{}
+	stack := []string{module}
+	for len(stack) > 0 {
+		m := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if closure[m] {
+			continue
+		}
+		closure[m] = true
+		stack = append(stack, n.c.graph[m]...)
+	}
+	n.closures[module] = closure
+	return closure
 }
 
 // owner is the removal whose target is the use's target or the longest one it lies below.
@@ -585,6 +670,16 @@ func (n *nameState) duplicates(ctx context.Context) ([]landing.Finding, error) {
 	if err := n.askUnchanged(ctx, asked); err != nil {
 		return nil, err
 	}
+	var fresh []string
+	for _, name := range asked {
+		if slices.ContainsFunc(byName[name], func(o occurrence) bool { return o.new }) {
+			fresh = append(fresh, name)
+		}
+	}
+	generated, err := n.generatedOwners(ctx, fresh)
+	if err != nil {
+		return nil, err
+	}
 	clashing := map[string]bool{}
 	var out []landing.Finding
 	for _, name := range asked {
@@ -593,6 +688,10 @@ func (n *nameState) duplicates(ctx context.Context) ([]landing.Finding, error) {
 			if module := normalName(d.Module); n.c.Built(module) {
 				occurrences = append(occurrences, occurrence{module: module, path: n.fileOf(module), line: d.Line})
 			}
+		}
+		for _, d := range generated[name] {
+			module := normalName(d.Module)
+			occurrences = append(occurrences, occurrence{module: module, path: n.fileOf(module), line: d.Line})
 		}
 		if len(occurrences) < 2 {
 			continue
@@ -616,6 +715,54 @@ func (n *nameState) duplicates(ctx context.Context) ([]landing.Finding, error) {
 					Verdict: landing.VerdictRefuse, Kind: blame.Added, Declaration: name,
 					Reason: fmt.Sprintf("N2: %s is also declared in %s:%d; a built module imports both", name, other.path, other.line)})
 				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// generatedOwners finds, for each new name, the built unchanged declarations that Lean compiled it from: a
+// structure's constructor or field, an equation lemma. No module's declarations hold those names, only the index's
+// compiled constants do (DeclarationParts), so a new declaration of one is caught there. An index without its
+// compiled part answers nothing: such a collision is then a miss, never a false refusal.
+func (n *nameState) generatedOwners(ctx context.Context, names []string) (map[string][]declindex.Decl, error) {
+	var prefixes []string
+	for _, name := range names {
+		for p := name; strings.Contains(p, "."); {
+			p = p[:strings.LastIndexByte(p, '.')]
+			prefixes = append(prefixes, p)
+		}
+	}
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	if err := n.askUnchanged(ctx, prefixes); err != nil {
+		return nil, err
+	}
+	parts := map[[2]string]map[string]bool{} // (module, declaration) -> its compiled constants
+	out := map[string][]declindex.Decl{}
+	for _, name := range names {
+		for p := name; strings.Contains(p, "."); {
+			p = p[:strings.LastIndexByte(p, '.')]
+			for _, d := range n.unchanged[p] {
+				module := normalName(d.Module)
+				if !n.c.Built(module) {
+					continue
+				}
+				key := [2]string{d.Module, d.Name}
+				if parts[key] == nil {
+					list, err := n.idx.DeclarationParts(ctx, d.Module, []string{d.Name})
+					if err != nil {
+						return nil, err
+					}
+					parts[key] = map[string]bool{}
+					for _, part := range list {
+						parts[key][normalName(part)] = true
+					}
+				}
+				if parts[key][name] {
+					out[name] = append(out[name], d)
+				}
 			}
 		}
 	}
