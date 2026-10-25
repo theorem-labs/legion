@@ -179,6 +179,6 @@ The final stderr line counts contracts, registrations, contract defects, gone, u
 
 ## Baseline measurements
 
-The following baseline measurements describe the indexed project, not acceptance evidence for this change: 52,529 modules, 545,934 declarations, 9,686,627 uses, 4,389,369 edges, and 789,877 compiled constants. The initial refresh took 15 minutes 43 seconds; an unchanged update took 2.2 seconds; a one-module compiled update took 3.4 seconds. Process-inclusive query times were 0.014 seconds for `where`, 0.2 seconds median and 0.67 seconds worst for `users`, 0.34 seconds for `states`, 0.11 seconds for `same`, and about 5 seconds for `gate`.
+The measurements of an index on a Postgres server belong with the acceptance run that takes them: `e2e/timings.sh` runs each command of a sample of declarations under `/usr/bin/time` and prints the median, 95th percentile and worst of each ([e2e/README.md](e2e/README.md)).
 
 Acceptance records live with the acceptance runs, not in this repository.
