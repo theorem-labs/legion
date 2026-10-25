@@ -36,8 +36,8 @@ func TestSameNamedDeclarationsOfTwoModulesAreAnsweredApart(t *testing.T) {
 		}
 	}
 	config := filepath.Join(dir, "index.yaml")
-	body := "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, UseA, UseB]\n"
-	writeTestFile(t, config, body)
+	body := "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, UseA, UseB]\n"
+	writeIndexConfig(t, config, body)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}
@@ -90,7 +90,7 @@ func TestSameNamedDeclarationsOfTwoModulesAreAnsweredApart(t *testing.T) {
 		}
 	}
 
-	writeTestFile(t, config, body+"lean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, body+"lean:\n  export: true\n  jobs: 1\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh with the compiled part: %+v", r)
 	}
@@ -310,7 +310,7 @@ func TestTwoModulesThatEachDeclareAnUnderscoreNameAreReadApart(t *testing.T) {
 		}
 	}
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B]\nlean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B]\nlean:\n  export: true\n  jobs: 1\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 || !strings.Contains(r.errOut, "2 of 2 module groups") {
 		t.Fatalf("refresh with the compiled part: want exit 0 after two exporter groups, got %+v", r)
 	}
@@ -346,7 +346,7 @@ func TestStatesCountsEachDeclarationByItsModuleAndName(t *testing.T) {
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: A.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh with the compiled part: %+v", r)
 	}

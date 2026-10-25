@@ -26,9 +26,7 @@ func gateFixture(t *testing.T) (string, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config, append(body, []byte("registry: registry\n")...), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body)+"registry: registry\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
 	git(t, tree, "commit", "-qm", "fixture")
@@ -92,10 +90,7 @@ func TestGateRejectsInTreeStateAndEscapedRegistry(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		body = []byte(strings.Replace(string(body), "db: state/index.sqlite", "db: tree/.declindex/index.sqlite", 1))
-		if err := os.WriteFile(config, body, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, config, strings.Replace(string(body), "state: state", "state: tree/.declindex", 1))
 		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
 		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "outside the tree") {
 			t.Fatalf("in-tree state: %+v", r)
@@ -117,10 +112,7 @@ func TestGateRejectsInTreeStateAndEscapedRegistry(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		body = []byte(strings.Replace(string(body), "registry: registry", "registry: ../outside-registry", 1))
-		if err := os.WriteFile(config, body, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, config, strings.Replace(string(body), "registry: registry", "registry: ../outside-registry", 1))
 		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
 		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "registry") {
 			t.Fatalf("escaped registry: %+v", r)
@@ -158,7 +150,7 @@ func TestGateIsUnableOnATreeThatIsNotAGitWorkTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, config, string(body)+"registry: registry\n")
+	writeIndexConfig(t, config, string(body)+"registry: registry\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}
@@ -200,10 +192,7 @@ func TestGatePrintsCanonicalAdditionPathAfterSnapshotCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := filepath.Join(dir, "index.yaml")
-	body := "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n"
-	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
 	git(t, tree, "commit", "-qm", "fixture")
@@ -261,7 +250,7 @@ func TestGatePrintsTheAdditionPathOfATreeBelowTheRepositoryRoot(t *testing.T) {
 	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
 	writeTestFile(t, filepath.Join(repo, "README"), "a repository whose Lean project is below its root\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: repo/proj\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, "tree: repo/proj\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, repo, "init", "-q")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
@@ -313,7 +302,7 @@ func leanGateFixture(t *testing.T, concepts map[string]string) (dir, tree, confi
 		writeTestFile(t, filepath.Join(tree, "registry", "concepts", name), body)
 	}
 	config = filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
 	git(t, tree, "commit", "-qm", "fixture")

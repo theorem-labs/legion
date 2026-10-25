@@ -86,10 +86,8 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := filepath.Join(dir, "index.yaml")
-	body := "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nrepo: r\ncontracts:\n  paths: [NoSuch/**]\n  kinds: [def]\nlibrarian:\n  - " + librarian + "\nlean:\n  export: true\n  jobs: 1\n"
-	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	body := "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nrepo: r\ncontracts:\n  paths: [NoSuch/**]\n  kinds: [def]\nlibrarian:\n  - " + librarian + "\nlean:\n  export: true\n  jobs: 1\n"
+	writeIndexConfig(t, config, body)
 
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
@@ -123,16 +121,17 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 	if result := invoke(t, "--config", config, "refresh"); result.code != 0 {
 		t.Fatalf("refresh additions: %+v", result)
 	}
-	if err := os.WriteFile(config, []byte(strings.Replace(body, "tree: tree\n", "tree: tree-link\n", 1)), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, strings.Replace(body, "tree: tree\n", "tree: tree-link\n", 1))
 
 	contracts := filepath.Join(dir, "contracts.json")
 	if err := os.WriteFile(contracts, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// The landing hook mounts the index directory read-only; the recheck works in the temporary directory.
+	// The landing hook mounts the state directory read-only; the recheck works in the temporary directory.
 	state := filepath.Join(dir, "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(state, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +276,7 @@ func leanRegistryTree(t *testing.T, roots ...string) (config, tree string, lean 
 		t.Fatal(err)
 	}
 	config = filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: ["+strings.Join(append([]string{"Fixture"}, roots...), ", ")+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: ["+strings.Join(append([]string{"Fixture"}, roots...), ", ")+
 		"]\nregistry: registry\nrepo: r\ncontracts:\n  paths: [NoSuch/**]\n  kinds: [def]\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")

@@ -2,17 +2,18 @@
 set -eu
 
 usage() {
-	printf '%s\n' 'usage: ledger-join.sh <cfg> <repo> <contract> <owner> <dsn-file>' >&2
+	printf '%s\n' 'usage: ledger-join.sh <cfg> <repo> <contract> <owner> <ledger-dsn-file> <index-dsn-file>' >&2
 	exit 2
 }
 
-[ "$#" -eq 5 ] || usage
+[ "$#" -eq 6 ] || usage
 
 cfg=$1
 repo=$2
 contract=$3
 owner=$4
 dsn_file=$5
+index_dsn_file=$6
 declindex_bin=${DECLINDEX_BIN-declindex}
 ledger_bin=${LEDGER_BIN-ledger}
 candidate=${JOIN_CANDIDATE_COMMIT-}
@@ -50,22 +51,31 @@ status_c_file=$(mktemp "${TMPDIR:-/tmp}/ledger-join.status-c.XXXXXX")
 check_file=$(mktemp "${TMPDIR:-/tmp}/ledger-join.check.XXXXXX")
 trap 'rm -f "$hash_file" "$status_a_file" "$contract_file" "$status_c_file" "$check_file"' EXIT HUP INT TERM
 
-tree=$(python3 - "$cfg" <<'PY'
+# The index is one schema of a Postgres database: the configuration names the schema and the driver passes the
+# connection string, which never lives in the tree.
+cfg_values=$(python3 - "$cfg" <<'PY'
 import os
 import sys
 
 cfg = os.path.abspath(sys.argv[1])
+values = {}
 for line in open(cfg, encoding="utf-8"):
-    if line.lstrip().startswith("tree:"):
-        value = line.split(":", 1)[1].strip().strip("'\"")
-        if not value:
-            break
-        print(value if os.path.isabs(value) else os.path.normpath(os.path.join(os.path.dirname(cfg), value)))
-        break
-else:
+    key, sep, rest = line.partition(":")
+    if not sep or key.strip() != key or key not in ("tree", "index"):
+        continue
+    values[key] = rest.strip().strip("'\"")
+tree = values.get("tree")
+if not tree:
     raise SystemExit("ledger-join.sh: configuration has no tree")
+if not values.get("index"):
+    raise SystemExit("ledger-join.sh: configuration has no index")
+print(tree if os.path.isabs(tree) else os.path.normpath(os.path.join(os.path.dirname(cfg), tree)))
+print(values["index"])
 PY
 )
+tree=$(printf '%s\n' "$cfg_values" | sed -n '1p')
+index=$(printf '%s\n' "$cfg_values" | sed -n '2p')
+printf 'index: %s\n' "$index"
 
 base=$(git -C "$tree" rev-parse HEAD)
 git -C "$tree" merge-base --is-ancestor "$base" "$candidate"
@@ -73,10 +83,10 @@ git -C "$tree" merge-base --is-ancestor "$base" "$candidate"
 "$ledger_bin" --dsn-file "$dsn_file" repo ensure "$repo" 3
 
 printf '%s\n' 'Step 1: register the selected contracts'
-"$declindex_bin" --config "$cfg" ledger --dsn-file "$dsn_file"
+"$declindex_bin" --index-dsn-file "$index_dsn_file" --config "$cfg" ledger --dsn-file "$dsn_file"
 
 printf '%s\n' 'Step 2: open join-a at the base statement hash'
-"$declindex_bin" --config "$cfg" hash "$contract" > "$hash_file"
+"$declindex_bin" --index-dsn-file "$index_dsn_file" --config "$cfg" hash "$contract" > "$hash_file"
 IFS="$(printf '\t')" read -r got_contract base_hash location < "$hash_file"
 if [ "$got_contract" != "$contract" ] || [ -z "$base_hash" ] || [ -z "$location" ]; then
 	printf '%s\n' 'ledger-join.sh: declindex hash did not return one name, hash, and path:line row' >&2

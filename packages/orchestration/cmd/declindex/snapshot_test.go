@@ -19,9 +19,9 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
-// A read command reads one snapshot of the index until it closes the index, and a refresh's write waits for the
-// readers that hold one. The command writes its output only after it has closed the index, so output that nobody
-// reads (a pager left open) does not hold up a refresh.
+// A read command reads one snapshot of the index until it closes the index. The command writes its output only after
+// it has closed the index, so output that nobody reads (a pager left open) holds no snapshot and does not hold up a
+// refresh.
 func TestAQueryClosesTheIndexBeforeItWritesItsOutput(t *testing.T) {
 	config := fixture(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
@@ -34,13 +34,13 @@ func TestAQueryClosesTheIndexBeforeItWritesItsOutput(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			var o, e bytes.Buffer
-			code := run(ctx, []string{"--config", config, "refresh"}, func(string) string { return "" }, &o, &e)
+			code := run(ctx, withIndexDSN([]string{"--config", config, "refresh"}), func(string) string { return "" }, &o, &e)
 			refresh = result{code, o.String(), e.String()}
 		})
 		return len(p), nil
 	})
 	var errOut bytes.Buffer
-	if code := run(context.Background(), []string{"--config", config, "where", "Gold.Frame"}, func(string) string { return "" }, out, &errOut); code != 0 {
+	if code := run(context.Background(), withIndexDSN([]string{"--config", config, "where", "Gold.Frame"}), func(string) string { return "" }, out, &errOut); code != 0 {
 		t.Fatalf("where exited %d: %s", code, errOut.String())
 	}
 	if refresh.code != 0 {
@@ -76,7 +76,7 @@ func TestReadersOfTheCompiledPartRefuseAnIndexBetweenItsTwoParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nrepo: r\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nrepo: r\n"+
 		"contracts:\n  paths: [NoSuch/**]\n  kinds: [def]\nlibrarian:\n  - "+librarian+"\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
@@ -95,11 +95,8 @@ func TestReadersOfTheCompiledPartRefuseAnIndexBetweenItsTwoParts(t *testing.T) {
 	git(t, tree, "commit", "-qm", "add a concept")
 	second := git(t, tree, "rev-parse", "HEAD")
 	// The refresh of the second commit writes its reference part and stops before its compiled part.
-	cfg, err := declindex.LoadConfig(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := declindex.Open(cfg.DB)
+	cfg := indexConfig(t, config)
+	s, err := declindex.Open(ctx, cfg.Target())
 	if err != nil {
 		t.Fatal(err)
 	}

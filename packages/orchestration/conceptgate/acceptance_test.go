@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/internal/indextest"
 )
 
 // A librarian concept with forms and no stored source states its fact through its forms; the index need not
@@ -17,7 +18,7 @@ func TestFormsKeepsUndeclaredConceptsForms(t *testing.T) {
 	if err != nil || len(defects) != 0 {
 		t.Fatalf("load: %v %v", err, defects)
 	}
-	s, err := declindex.Open(filepath.Join(t.TempDir(), "index.sqlite"))
+	s, err := declindex.Open(context.Background(), declindex.Target{DSN: indextest.DSN(t), Index: "idx"})
 	if err != nil {
 		t.Fatal(err)
 	}
