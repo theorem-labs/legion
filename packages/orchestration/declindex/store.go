@@ -47,7 +47,8 @@ CREATE INDEX uses_target ON uses (target);
 CREATE INDEX uses_module ON uses (module);
 -- target, tmodule: the used constant as Lean recorded it; dst, module: the user. owner, owner_module: the declaration
 -- that the used constant belongs to (ownerResolver), resolved when the row is written and again when it changes;
--- by_closure: that resolution went through the import closure of tmodule.
+-- by_closure: the index's imports decided that resolution: it went through the import closure of tmodule, or found
+-- no declaration of the constant's names, so that a change of tmodule's closure can move the owner.
 CREATE TABLE edges (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, dst text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, stmt boolean NOT NULL, kind text NOT NULL, owner text COLLATE "C" NOT NULL, owner_module text COLLATE "C" NOT NULL, by_closure boolean NOT NULL);
 CREATE INDEX edges_module ON edges (module);
 CREATE INDEX edges_owner ON edges (owner_module, owner);
