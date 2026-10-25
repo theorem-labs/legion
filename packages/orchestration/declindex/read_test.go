@@ -143,6 +143,27 @@ func TestUsesOfGivesTheUsesOfANameAMacroMade(t *testing.T) {
 	}
 }
 
+// A key whose uses another key's already holds (Gold.Box.val, a part of Gold.Box) adds no row a second time, in
+// either order: UsesOf gives a recorded use as many times as the index records it, not once for each key that holds it.
+func TestUsesOfGivesEachUseOnceForOverlappingKeys(t *testing.T) {
+	s := refreshedGolden(t)
+	ctx := context.Background()
+	box, err := s.UsesOf(ctx, []string{"Gold.Box"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	val, err := s.UsesOf(ctx, []string{"Gold.Box.val"})
+	if err != nil || len(val) == 0 {
+		t.Fatalf("UsesOf(Gold.Box.val) = %+v, %v; want its uses", val, err)
+	}
+	for _, keys := range [][]string{{"Gold.Box", "Gold.Box.val"}, {"Gold.Box.val", "Gold.Box"}} {
+		got, err := s.UsesOf(ctx, keys)
+		if err != nil || !reflect.DeepEqual(got, box) {
+			t.Errorf("UsesOf(%v) = %d rows, %v; want the %d rows of UsesOf(Gold.Box)", keys, len(got), err, len(box))
+		}
+	}
+}
+
 // Imports gives every module the index read, with the modules its reference file says it imports directly: none for
 // Golden.
 func TestImportsGivesEachModulesDirectImports(t *testing.T) {
