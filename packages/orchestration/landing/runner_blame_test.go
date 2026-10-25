@@ -29,6 +29,11 @@ func (b fileBuilder) Build(ctx context.Context, tree blame.Tree, _ []string) (bl
 	return blame.BuildResult{Output: b.log}, nil
 }
 
+func (b fileBuilder) BuildKept(ctx context.Context, tree Tree) (KeptBuild, error) {
+	result, err := b.Build(ctx, tree, nil)
+	return KeptBuild{Result: result, Release: noRelease}, err
+}
+
 // Six old members restate the base's own `def Shared := 0`, and one member
 // adds a second Shared in another file. The runner reads the base and
 // candidate declarations through the real Git adapter, drops the

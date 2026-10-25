@@ -230,6 +230,8 @@ func member(id string) Member {
 
 type ledgerFake struct {
 	refusals map[string]string
+	checks   []CheckRequest
+	rounds   []RoundRequest
 	returned []returned
 	landed   []string
 	commits  map[string]string
@@ -240,9 +242,26 @@ type returned struct {
 	reason    string
 }
 
-func (f *ledgerFake) Check(_ context.Context, _ string, migration string, _ int64, _ []string, _ map[string]string) (CheckResult, error) {
-	return CheckResult{Reason: f.refusals[migration]}, nil
+// Check refuses a member named in refusals, with that reason as its
+// violation's kind, and passes every other member.
+func (f *ledgerFake) Check(_ context.Context, request CheckRequest) (CheckResult, error) {
+	f.checks = append(f.checks, request)
+	if reason := f.refusals[request.Migration]; reason != "" {
+		return CheckResult{Outcome: CheckRefused, Violations: []Violation{{Kind: reason}}}, nil
+	}
+	return passed(request), nil
 }
+
+// passed is the ledger's result for a member with no violation: a deferred
+// check is incomplete, a full one passes.
+func passed(request CheckRequest) CheckResult {
+	if request.DeferReads {
+		return CheckResult{Outcome: CheckIncomplete}
+	}
+	return CheckResult{Outcome: CheckPass}
+}
+
+func (f *ledgerFake) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
 
 func (f *ledgerFake) Land(_ context.Context, request LandRequest) error {
 	f.landed = append(f.landed, request.Migration)
@@ -253,12 +272,15 @@ func (f *ledgerFake) Land(_ context.Context, request LandRequest) error {
 	return nil
 }
 
-func (f *ledgerFake) ReturnMember(_ context.Context, _ string, migration string, _ int64, reason string) error {
-	f.returned = append(f.returned, returned{migration: migration, reason: reason})
+func (f *ledgerFake) ReturnMember(_ context.Context, round RoundRequest) error {
+	f.rounds = append(f.rounds, round)
+	f.returned = append(f.returned, returned{migration: round.ID, reason: round.Reason})
 	return nil
 }
 
 // MigrationState reports what Land recorded, as the real ledger does.
+func (f *ledgerFake) Escalate(context.Context, string, string, string) error { return nil }
+
 func (f *ledgerFake) MigrationState(_ context.Context, _ string, migration string) (string, string, error) {
 	if commit, landed := f.commits[migration]; landed {
 		return "landed", commit, nil
@@ -280,10 +302,21 @@ func (f *builderFake) Build(_ context.Context, tree blame.Tree, _ []string) (bla
 	return f.results[string(tree)], nil
 }
 
+func (f *builderFake) BuildKept(ctx context.Context, tree Tree) (KeptBuild, error) {
+	result, err := f.Build(ctx, tree, nil)
+	return KeptBuild{Result: result, Release: noRelease}, err
+}
+
 type hasherFake struct{}
 
-func (hasherFake) Hashes(context.Context, Tree, []string) (map[string]string, error) {
-	return nil, nil
+// Hashes gives every name one hash at every tree, declared nowhere: no
+// statement changes.
+func (hasherFake) Hashes(_ context.Context, input HashInput) (map[string]StatementHash, error) {
+	hashes := make(map[string]StatementHash, len(input.Names))
+	for _, name := range input.Names {
+		hashes[name] = StatementHash{Hash: "hash"}
+	}
+	return hashes, nil
 }
 
 type checkerFake struct {
@@ -295,9 +328,9 @@ type checkerFake struct {
 
 func (f checkerFake) Name() string { return f.name }
 
-func (f checkerFake) Check(_ context.Context, tree Tree) ([]Finding, error) {
+func (f checkerFake) Check(_ context.Context, in CheckInput) ([]Finding, error) {
 	if f.findingsByTree != nil {
-		return f.findingsByTree[tree], f.err
+		return f.findingsByTree[in.Tree], f.err
 	}
 	return f.findings, f.err
 }
@@ -348,7 +381,7 @@ func (f *gitFake) ChangeSet(_ context.Context, _ string, base string, member Mem
 	return f.changes[member.Migration], nil
 }
 
-func (f *gitFake) DeclarationEvidence(_ context.Context, _ string, _ string, member Member) (blame.Evidence, error) {
+func (f *gitFake) DeclarationEvidence(_ context.Context, _ string, _ string, member Member, _ blame.InstanceNames) (blame.Evidence, error) {
 	return f.evidence[member.Migration], nil
 }
 

@@ -61,13 +61,13 @@ func TestReviewMergedBatchRemainsReconciliableAfterLedgerFailure(t *testing.T) {
 // retrying it.
 func TestReviewLandingRefusalIsLandedUnrecorded(t *testing.T) {
 	ledger := &ledgerFake{}
-	admission := &batchLedgerFake{ledger: ledger, landErr: &Refusal{Reason: "stale_batch", Message: "moved"}}
+	admission := &batchLedgerFake{ledger: ledger, landErr: &LedgerRefusal{Reason: "stale_batch", Message: "moved"}}
 	runner := Runner{
-		Store:            &MemoryStore{},
-		Ledger:           ledger,
-		Admission:        admission,
-		GitHub:           &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
-		EscalationsOwner: "landing-operator",
+		Store:      &MemoryStore{},
+		Ledger:     ledger,
+		Admission:  admission,
+		GitHub:     &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+		EscalateTo: "landing-operator",
 	}
 	batch, err := runner.Publish(context.Background(), greenBatch())
 	if err != nil {
@@ -108,8 +108,8 @@ type flakyLedger struct {
 	landCalls int
 }
 
-func (f *flakyLedger) Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error) {
-	return CheckResult{}, nil
+func (f *flakyLedger) Check(_ context.Context, request CheckRequest) (CheckResult, error) {
+	return passed(request), nil
 }
 func (f *flakyLedger) Land(context.Context, LandRequest) error {
 	f.landCalls++
@@ -118,7 +118,11 @@ func (f *flakyLedger) Land(context.Context, LandRequest) error {
 	}
 	return nil
 }
-func (f *flakyLedger) ReturnMember(context.Context, string, string, int64, string) error { return nil }
+func (f *flakyLedger) ReturnMember(context.Context, RoundRequest) error { return nil }
+
+func (f *flakyLedger) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
+
+func (f *flakyLedger) Escalate(context.Context, string, string, string) error { return nil }
 
 func (f *flakyLedger) MigrationState(context.Context, string, string) (string, string, error) {
 	return "open", "", nil

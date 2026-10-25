@@ -127,19 +127,18 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 
 	config := filepath.Join(t.TempDir(), "config.json")
 	raw, err := json.Marshal(map[string]any{
-		"batchId":    "batch",
-		"repository": map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/theorem/land/repo.git"},
-		"base":       base,
-		"baseBranch": "trunk",
-		"statePath":  filepath.Join(t.TempDir(), "state.json"),
-		"members":    []map[string]any{{"migration": "one", "generation": 1, "head": head}},
-		"build":      []string{"sh", "-c", "exit 0"},
-		"hasher":     []string{"sh", "-c", "exit 0"},
-		"toolchain":  []string{"sh", "-c", "printf tool"},
+		"batchId":     "batch",
+		"repository":  map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/srv/land/repo.git"},
+		"base":        base,
+		"baseBranch":  "trunk",
+		"statePath":   filepath.Join(t.TempDir(), "state.json"),
+		"members":     []map[string]any{{"migration": "one", "generation": 1, "head": head}},
+		"build":       []string{"sh", "-c", "exit 0"},
+		"hasher":      []string{"sh", "-c", "exit 0"},
+		"toolchain":   []string{"sh", "-c", "printf tool"},
+		"escalations": map[string]any{"owner": "steward"},
 		"ledger": map[string]any{
-			"check":          []string{"sh", "-c", "printf '{\"pass\":true}\\n'"},
-			"return":         []string{"sh", "-c", "exit 0"},
-			"land":           []string{"sh", "-c", "exit 0"},
+			"command":        []string{"sh", "-c", fakeLedger, "ledger"},
 			"status":         []string{"sh", "-c", "printf '{\"complete\":false}\\n'"},
 			"migrationState": []string{"sh", "-c", "printf '{\"state\":\"open\"}\\n'"},
 		},
@@ -162,6 +161,42 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 	}
 	if got := output.String(); !strings.Contains(got, `"id":"batch"`) {
 		t.Fatalf("status output = %q, want stored batch", got)
+	}
+}
+
+// fakeLedger answers the ledger CLI's contract list with no contracts and its
+// check with no violations: incomplete for a deferred check (exit 5), pass for
+// a full one.
+const fakeLedger = `case "$1" in
+contract) echo '[]' ;;
+check)
+	if grep -q '"defer_reads":true' "$3"; then
+		echo '{"outcome":"incomplete","violations":[]}'
+		exit 5
+	fi
+	echo '{"outcome":"pass","violations":[]}' ;;
+*) exit 2 ;;
+esac`
+
+// The escalations owner is required: an escalation enqueued for an empty owner
+// wakes nobody.
+func TestConfigRequiresEscalateTo(t *testing.T) {
+	cfg := publicationConfig(t)
+	cfg.Escalations.Owner = ""
+	if _, err := cfg.program(context.Background()); err == nil || !strings.Contains(err.Error(), "escalations.owner is required") {
+		t.Fatalf("program() error = %v, want escalations.owner required", err)
+	}
+}
+
+// The per-operation ledger commands are removed: a configuration that still
+// names one is refused with the key to set instead.
+func TestConfigRefusesRemovedLedgerCommands(t *testing.T) {
+	for _, key := range []string{"check", "land", "return"} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		write(t, path, `{"ledger": {"`+key+`": ["true"]}}`)
+		if _, err := readConfig(path); err == nil || !strings.Contains(err.Error(), "ledger."+key+" is removed; set ledger.command") {
+			t.Fatalf("readConfig() with ledger.%s error = %v, want it refused", key, err)
+		}
 	}
 }
 

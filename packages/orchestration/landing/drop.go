@@ -42,7 +42,26 @@ func (r Runner) reloaded(ctx context.Context, batch *Batch, err error) bool {
 //     the other members go to. The runner never saves the batch again.
 //
 // An admission conflict leaves the stored batch as it was and returns ErrAdmissionConflict.
-func (r Runner) dropMembers(ctx context.Context, batch *Batch, drops map[string]string) error {
+// drop is why a member leaves the active set: the reason it records, and the detail its ledger round carries.
+type drop struct {
+	reason, detail string
+}
+
+// dropMember drops one member with a reason and the detail its round carries.
+func (r Runner) dropMember(ctx context.Context, batch *Batch, migration, reason, detail string) error {
+	return r.dropDetailed(ctx, batch, map[string]drop{migration: {reason: reason, detail: detail}})
+}
+
+// dropMembers drops each member (migration to reason) with no detail.
+func (r Runner) dropMembers(ctx context.Context, batch *Batch, reasons map[string]string) error {
+	drops := make(map[string]drop, len(reasons))
+	for migration, reason := range reasons {
+		drops[migration] = drop{reason: reason}
+	}
+	return r.dropDetailed(ctx, batch, drops)
+}
+
+func (r Runner) dropDetailed(ctx context.Context, batch *Batch, drops map[string]drop) error {
 	if len(drops) == 0 {
 		return nil
 	}
@@ -59,10 +78,14 @@ func (r Runner) dropMembers(ctx context.Context, batch *Batch, drops map[string]
 	}
 	sort.Strings(ids)
 	if batch.Admission == Admitted {
-		return r.declineBatch(ctx, batch, declineReason, ids, drops)
+		reasons := make(map[string]string, len(drops))
+		for id, why := range drops {
+			reasons[id] = why.reason
+		}
+		return r.declineBatch(ctx, batch, declineReason, ids, reasons)
 	}
 	for _, id := range ids {
-		if err := r.returnMember(ctx, batch, id, drops[id]); err != nil {
+		if err := r.returnMember(ctx, batch, id, drops[id].reason, drops[id].detail); err != nil {
 			return err
 		}
 	}
@@ -98,7 +121,7 @@ func (r Runner) declineBatch(ctx context.Context, batch *Batch, reason string, i
 	successor := successorID(record.ID)
 	record.State, record.Reason, record.Successor = Declined, reason, successor
 	if err := r.Admission.DeclineBatch(ctx, &record, reason, returns, successor); err != nil {
-		var refusal *Refusal
+		var refusal *LedgerRefusal
 		if errors.As(err, &refusal) && refusal.BatchConflict() {
 			return fmt.Errorf("decline batch %q: %w: %w", batch.ID, ErrAdmissionConflict, err)
 		}
@@ -111,7 +134,7 @@ func (r Runner) declineBatch(ctx context.Context, batch *Batch, reason string, i
 // returnMember removes an active member and records the intent to return it in one save, so the current key changes
 // before the ledger hears of it. A stale_generation or not_open refusal completes the drop with that reason; a
 // batch_admitted refusal restores the member and returns ErrAdmissionConflict.
-func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reason string) error {
+func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reason, detail string) error {
 	member, found := findMember(batch.ActiveMembers, migration)
 	if !found {
 		return nil
@@ -119,12 +142,13 @@ func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reaso
 	key := "return/" + migration
 	before := cloneBatch(*batch)
 	removeMember(batch, migration, reason)
-	batch.startOperation(Operation{Key: key, Kind: "return", Batch: batch.ID, Repository: batch.Repository, Member: migration, Generation: member.Generation, Reason: reason})
+	operation := Operation{Key: key, Kind: "return", Batch: batch.ID, Repository: batch.Repository, Member: migration, Generation: member.Generation, Reason: reason, Detail: detail}
+	batch.startOperation(operation)
 	if err := r.Store.Save(ctx, batch); err != nil {
 		return fmt.Errorf("record return intent for %q: %w", migration, err)
 	}
-	if err := r.Ledger.ReturnMember(ctx, batch.Repository, member.Migration, member.Generation, reason); err != nil {
-		var refusal *Refusal
+	if err := r.Ledger.ReturnMember(ctx, roundRequest(operation, member)); err != nil {
+		var refusal *LedgerRefusal
 		if !errors.As(err, &refusal) {
 			return fmt.Errorf("return %q: %w", migration, err)
 		}

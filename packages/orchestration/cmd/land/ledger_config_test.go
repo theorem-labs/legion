@@ -16,8 +16,8 @@ import (
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
-// writeConfig writes cfg as the JSON configuration file that the program reads and returns its path.
-func writeConfig(t *testing.T, cfg config) string {
+// writeConfigFile writes cfg as the JSON configuration file that the program reads and returns its path.
+func writeConfigFile(t *testing.T, cfg config) string {
 	t.Helper()
 	body, err := json.Marshal(cfg)
 	if err != nil {
@@ -35,7 +35,7 @@ func TestServeRefusesAnEmptyEscalationsOwner(t *testing.T) {
 		cfg := publicationConfig(t)
 		cfg.Escalations.Owner = owner
 		var output bytes.Buffer
-		err := run(context.Background(), []string{"serve", "--config", writeConfig(t, cfg)}, &output)
+		err := run(context.Background(), []string{"serve", "--config", writeConfigFile(t, cfg)}, &output)
 		if err == nil || !strings.Contains(err.Error(), "escalations.owner") {
 			t.Fatalf("serve with escalations.owner %q: error = %v, want it refused at start", owner, err)
 		}
@@ -46,7 +46,7 @@ func TestServeRefusesAnEmptyEscalationsOwner(t *testing.T) {
 }
 
 // The configuration's escalations.owner and publishing.retry_limit are decoded and reach the runner.
-func TestConfigurationFillsEscalationsOwnerAndRetryLimit(t *testing.T) {
+func TestConfigurationFillsEscalateToAndRetryLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	write(t, path, `{"escalations": {"owner": "landing-operator"}, "publishing": {"retry_limit": 7}, "ledger": {"dsn_file": "/run/ledger.dsn"}}`)
 	cfg, err := readConfig(path)
@@ -62,8 +62,8 @@ func TestConfigurationFillsEscalationsOwnerAndRetryLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("program() error = %v", err)
 	}
-	if built.runner.EscalationsOwner != "landing-operator" || built.runner.PublishingRetryLimit != 7 {
-		t.Fatalf("runner escalations owner %q, retry limit %d", built.runner.EscalationsOwner, built.runner.PublishingRetryLimit)
+	if built.runner.EscalateTo != "landing-operator" || built.runner.PublishingRetryLimit != 7 {
+		t.Fatalf("runner escalations owner %q, retry limit %d", built.runner.EscalateTo, built.runner.PublishingRetryLimit)
 	}
 }
 
@@ -118,7 +118,7 @@ func TestLedgerDSNFileOpensTheLedgerBackedStore(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	if err := run(ctx, []string{"status", "--config", writeConfig(t, cfg)}, &output); err != nil {
+	if err := run(ctx, []string{"status", "--config", writeConfigFile(t, cfg)}, &output); err != nil {
 		t.Fatalf("status error = %v", err)
 	}
 	if !strings.Contains(output.String(), `"id":"batch-1"`) {

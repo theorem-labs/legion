@@ -25,7 +25,7 @@ func TestRepositoryGitIndexesMemberDeclarations(t *testing.T) {
 	gitRun(t, repo, "commit", "-qm", "member")
 	head := gitRun(t, repo, "rev-parse", "HEAD")
 
-	evidence, err := (RepositoryGit{}).DeclarationEvidence(context.Background(), repo, base, Member{Migration: "one", Head: head})
+	evidence, err := (RepositoryGit{}).DeclarationEvidence(context.Background(), repo, base, Member{Migration: "one", Head: head}, nil)
 	if err != nil {
 		t.Fatalf("DeclarationEvidence() error = %v", err)
 	}
