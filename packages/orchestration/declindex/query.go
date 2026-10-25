@@ -132,29 +132,50 @@ type AnswerOptions struct {
 	FileKinds []string
 }
 
+// useRow is what the index holds about the uses of one constant by one declaration. With lines it is one use,
+// at line and col; without them it is every use of that constant by that declaration in that class, and n counts
+// them: an answer that prints counts reads a row for each (constant, user, class) instead of one for each use,
+// which for a declaration that a whole tree uses is megabytes instead of hundreds of them.
 type useRow struct {
 	module        string
+	path          string
 	line, col     int
 	parent, class string
+	n             int
 }
 
 // usersOf gives the uses of the declaration d and of its generated parts: the constants Lean made from it that its
 // module never declares (a structure's fields and constructor, equation lemmas). A use of `h.wp` is recorded as
 // `X.wp`; it is a use of X. Each recorded constant counts for the declaration it belongs to (ownerResolver.owner),
-// so a use of another module's declaration of d's name is not d's.
-func (s *Store) usersOf(ctx context.Context, d declRef) ([]useRow, error) {
+// so a use of another module's declaration of d's name is not d's. The owner of a constant does not depend on
+// where it is used, so the rows may be grouped before they cross the network, and lines asks for each use.
+func (s *Store) usersOf(ctx context.Context, d declRef, lines bool) ([]useRow, error) {
 	type recorded struct {
 		target declRef
 		u      useRow
 	}
 	var rs []recorded
-	rows, err := s.q.Query(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
-		WHERE target = $1 OR (target >= $2 AND target < $3)`, d.name, d.name+".", d.name+"/")
+	query := `SELECT u.target, u.tmodule, u.module, COALESCE(m.rel, ''), u.parent, u.cls, count(*)
+		FROM uses u LEFT JOIN modules m ON m.module = u.module
+		WHERE u.target = $1 OR (u.target >= $2 AND u.target < $3)
+		GROUP BY u.target, u.tmodule, u.module, m.rel, u.parent, u.cls`
+	if lines {
+		query = `SELECT u.target, u.tmodule, u.module, COALESCE(m.rel, ''), u.parent, u.cls, 1, u.line, u.col
+			FROM uses u LEFT JOIN modules m ON m.module = u.module
+			WHERE u.target = $1 OR (u.target >= $2 AND u.target < $3)`
+	}
+	rows, err := s.q.Query(ctx, query, d.name, d.name+".", d.name+"/")
 	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var x recorded
-		if err := r.Scan(&x.target.name, &x.target.module, &x.u.module, &x.u.line, &x.u.col, &x.u.parent, &x.u.class); err != nil {
+		var rel string
+		out := []any{&x.target.name, &x.target.module, &x.u.module, &rel, &x.u.parent, &x.u.class, &x.u.n}
+		if lines {
+			out = append(out, &x.u.line, &x.u.col)
+		}
+		if err := r.Scan(out...); err != nil {
 			return err
 		}
+		x.u.path = sourcePath(rel, x.u.module)
 		rs = append(rs, x)
 		return nil
 	})
@@ -255,13 +276,9 @@ func dirOf(p string) string {
 
 // Answer answers about the declaration d, one that Resolve gave.
 func (s *Store) Answer(ctx context.Context, d Found, opt AnswerOptions) (Answer, error) {
-	paths, err := s.modulePaths(ctx)
-	if err != nil {
-		return Answer{}, err
-	}
 	ref := declRef{d.Module, d.Name}
 	a := Answer{Declaration: d.Name, Module: d.Module, Kind: d.Kind, At: d.At(), StmtHash: d.StmtHash}
-	uses, err := s.usersOf(ctx, ref)
+	uses, err := s.usersOf(ctx, ref, opt.Lines)
 	if err != nil {
 		return a, err
 	}
@@ -276,24 +293,23 @@ func (s *Store) Answer(ctx context.Context, d Found, opt AnswerOptions) (Answer,
 		if (declRef{u.module, u.parent}) == ref {
 			continue
 		}
-		p := pathOf(paths, u.module)
-		a.Direct.Uses++
+		a.Direct.Uses += u.n
 		if u.parent != "" {
 			parents[declRef{u.module, u.parent}] = true
 		}
 		switch u.class {
 		case "stmt":
-			a.Direct.StmtUses++
+			a.Direct.StmtUses += u.n
 		case "proof":
-			a.Direct.ProofUses++
+			a.Direct.ProofUses += u.n
 		}
-		d := dirOf(p)
+		d := dirOf(u.path)
 		if a.Direct.ByDirectory[d] == nil {
 			a.Direct.ByDirectory[d] = map[string]int{}
 		}
-		a.Direct.ByDirectory[d][fileKind(p, opt.FileKinds)+" "+u.class]++
+		a.Direct.ByDirectory[d][fileKind(u.path, opt.FileKinds)+" "+u.class] += u.n
 		if opt.Lines {
-			lines = append(lines, line{p, u})
+			lines = append(lines, line{u.path, u})
 		}
 	}
 	a.Direct.Declarations = len(parents)

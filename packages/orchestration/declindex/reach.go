@@ -99,13 +99,17 @@ func (s *Store) walk(ctx context.Context, root declRef) (map[declRef]bool, map[d
 }
 
 // closureCounts reads in one query the statements that a change to root changes and the proofs at the edge of
-// that closure, each counted by the module that declares it. The database walks the edges breadth first: the
-// recursive term expands a declaration only when a change reaches it, so a declaration that only edges which do
-// not propagate reach stays at the edge, and the answer crosses the network as two counts for each module
-// instead of every edge of every level. A declaration that one edge reaches with a change and another without is
-// reached, as it is in the walk, where any propagating use of a pair propagates.
-func (s *Store) closureCounts(ctx context.Context, root declRef) (map[string]int, map[string]int, error) {
-	changed, proofs := map[string]int{}, map[string]int{}
+// that closure, each counted by the module that declares it, with that module's source path. The database walks
+// the edges breadth first: the recursive term expands a declaration only when a change reaches it, so a
+// declaration that only edges which do not propagate reach stays at the edge, and the answer crosses the network
+// as two counts for each module instead of every edge of every level. A declaration that one edge reaches with a
+// change and another without is reached, as it is in the walk, where any propagating use of a pair propagates.
+//
+// The path comes with the counts, so that an answer over a slow link does not also read the path of every module
+// the index holds (modulePaths): one declaration of the copy's tree reaches 49,000 of its 52,548 modules, and a
+// rare one reaches none.
+func (s *Store) closureCounts(ctx context.Context, root declRef) (map[string]int, map[string]int, map[string]string, error) {
+	changed, proofs, paths := map[string]int{}, map[string]int{}, map[string]string{}
 	rows, err := s.q.Query(ctx, `
 		WITH RECURSIVE walk (module, name, expand) AS (
 				SELECT $1::text COLLATE "C", $2::text COLLATE "C", true
@@ -116,16 +120,17 @@ func (s *Store) closureCounts(ctx context.Context, root declRef) (map[string]int
 		), reached (module, name, changed) AS (
 			SELECT module, name, bool_or(expand) FROM walk GROUP BY module, name
 		)
-		SELECT module, count(*) FILTER (WHERE changed), count(*) FILTER (WHERE NOT changed)
-		  FROM reached
-		 WHERE module <> $1 OR name <> $2
-		 GROUP BY module`, root.module, root.name)
+		SELECT r.module, COALESCE(m.rel, ''), count(*) FILTER (WHERE r.changed), count(*) FILTER (WHERE NOT r.changed)
+		  FROM reached r LEFT JOIN modules m ON m.module = r.module
+		 WHERE r.module <> $1 OR r.name <> $2
+		 GROUP BY r.module, m.rel`, root.module, root.name)
 	err = eachRow(rows, err, func(r pgx.Rows) error {
-		var module string
+		var module, rel string
 		var reached, atEdge int
-		if err := r.Scan(&module, &reached, &atEdge); err != nil {
+		if err := r.Scan(&module, &rel, &reached, &atEdge); err != nil {
 			return err
 		}
+		paths[module] = sourcePath(rel, module)
 		if reached > 0 {
 			changed[module] = reached
 		}
@@ -135,9 +140,9 @@ func (s *Store) closureCounts(ctx context.Context, root declRef) (map[string]int
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return changed, proofs, nil
+	return changed, proofs, paths, nil
 }
 
 // perModule counts the declarations of a set by the module that declares each.
@@ -176,16 +181,16 @@ func counts(paths map[string]string, changed, proofs map[string]int) ReachCounts
 // the database counts them in one query; why also needs the chain by which each directory was reached, which is
 // the walk's own order.
 func (s *Store) reach(ctx context.Context, root declRef, why bool) (Reach, error) {
-	paths, err := s.modulePaths(ctx)
-	if err != nil {
-		return Reach{}, err
-	}
 	if !why {
-		changed, proofs, err := s.closureCounts(ctx, root)
+		changed, proofs, paths, err := s.closureCounts(ctx, root)
 		if err != nil {
 			return Reach{}, err
 		}
 		return Reach{ReachCounts: counts(paths, changed, proofs)}, nil
+	}
+	paths, err := s.modulePaths(ctx)
+	if err != nil {
+		return Reach{}, err
 	}
 	changed, reprove, via, err := s.walk(ctx, root)
 	if err != nil {
@@ -245,7 +250,7 @@ func (s *Store) reachedModules(ctx context.Context, defs []declRef, skip []strin
 	}
 	var out []string
 	for _, d := range defs {
-		changed, _, err := s.closureCounts(ctx, d)
+		changed, _, _, err := s.closureCounts(ctx, d)
 		if err != nil {
 			return nil, err
 		}

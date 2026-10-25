@@ -119,7 +119,7 @@ func TestTheIndexOrdersNamesByTheirBytes(t *testing.T) {
 	if len(inRange) != 1 || inRange[0] != "A.b" {
 		t.Errorf("the range of A's generated parts holds %v, not [A.b]", inRange)
 	}
-	uses, err := s.usersOf(ctx, declRef{"M", "A"})
+	uses, err := s.usersOf(ctx, declRef{"M", "A"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
