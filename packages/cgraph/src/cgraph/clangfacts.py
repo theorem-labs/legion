@@ -6190,7 +6190,11 @@ class _FunctionWalk:
                     self.walk_guarded(case_guard, child, node, child_index, None, generic)
                 else:
                     self.walk(child, node, child_index, None, generic)
-                if not dead and (self.x.evaluator.exits(child) or self.decided_exit(child)):
+                if dead and self.holds_live_label(child) and not self.x.evaluator.exits(child):
+                    # goto L; if (0) { L: warn(); } kept();: control entered at L falls out of the
+                    # statement, so what follows it is code again.
+                    dead = False
+                elif not dead and (self.x.evaluator.exits(child) or self.decided_exit(child)):
                     dead = True
                 elif not dead and _exits_under_builtin(child, self.x.evaluator):
                     self.conditional += 1

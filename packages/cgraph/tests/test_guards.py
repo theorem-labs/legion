@@ -1751,3 +1751,19 @@ def test_a_macro_that_writes_both_a_label_and_an_asm_goto_to_it_keeps_the_label_
     offset: the backward way is still a way in, and macro_back(1) keeps warn (clang-21 -O2 emits it)."""
     facts = facts_of(tmp_path, MACRO_ASM)
     assert "warn" in {call["callee"] for call in fold(facts, "macro_back_one", "macro_back").calls}
+
+
+def test_control_a_goto_brings_into_an_unreached_branch_falls_out_of_it(tmp_path: Path) -> None:
+    """`goto L; if (0) { L: warn(); } kept();` and the same one block deeper: the goto enters at L, and
+    control falls out to kept() (clang-21 -O2 emits both calls)."""
+    facts = facts_of(
+        tmp_path,
+        """
+        void fall_out(void) { goto L; if (0) { L: warn(); } kept(); }
+        void nested_out(void) { goto L; { if (0) { L: warn(); } note(); } kept(); }
+        """,
+    )
+    for function in ("fall_out", "nested_out"):
+        calls = {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+        assert {"warn", "kept"} <= calls, function
+    assert "note" in {call["callee"] for call in facts["functions"]["nested_out"]["events"]["calls"]}

@@ -1804,6 +1804,9 @@ def _image_analysis(
 ) -> dict[str, Any]:
     calls, globals_, addresses, outside = [], [], [], []
     offsets: dict[str, list[int]] = {}
+    # Per function, the (parameter index, offset) pairs of the loads and stores whose base register
+    # still holds that incoming argument (image.py), for the field check's base (checks.py).
+    memory_parameters: dict[str, list[list[int]]] = {}
     constants: dict[str, list[int]] = {}
     frame_accesses: dict[str, list[list[int]]] = {}
     frame_addresses: dict[str, list[int]] = {}
@@ -1821,6 +1824,9 @@ def _image_analysis(
             ]
             outside += [{**item, "function": identity} for item in fact.outside]
         offsets[identity] = sorted({value for fact in facts for value in fact.memory_offsets})
+        memory_parameters[identity] = [
+            list(item) for item in sorted({item for fact in facts for item in getattr(fact, "memory_parameters", ())})
+        ]
         constants[identity] = sorted({value for fact in facts for value in fact.addi_constants})
         if any(item.get("object") for item in field_accesses.get(identity, [])):
             # The frame of a function with a local object's fields (frames.py); each copy's own.
@@ -1847,6 +1853,7 @@ def _image_analysis(
         "function_addresses": unique(addresses),
         "outside_sized_symbols": unique(outside),
         "memory_offsets": offsets,
+        "memory_parameters": memory_parameters,
         "addi_constants": constants,
         "sized_symbol_names": linker.image.sized_object_names,
         "globals_by_function": image_globals,
