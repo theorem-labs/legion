@@ -3,6 +3,7 @@ the owners and their topics, the measures, and the report."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import tempfile
@@ -73,21 +74,54 @@ def _signatures(facts: dict[str, dict[str, Any]], image: Image) -> tuple[dict[in
 
 
 def _write_outputs(out: Path, rendered: dict[str, str]) -> None:
-    """Write every output to a distinct temporary file before replacing any prior output."""
-    temporary_paths: list[tuple[Path, Path]] = []
+    """Replace every output, or none of them.
+
+    Each output is written to a temporary file of the output directory. Each destination is then
+    moved aside and replaced, so a failure anywhere in the replacement moves every destination that
+    was replaced back, removes every temporary file, and removes the directories the run itself
+    made. A run that does not finish leaves the directory it found, byte for byte.
+    """
+    made = [path for path in (out, *out.parents) if not path.exists()]
+    staged: list[tuple[Path, Path]] = []
+    # The file each destination held, moved aside under a temporary name of its own.
+    spare: list[Path] = []
+    # Each destination that was replaced, with that file (None where there was no destination).
+    replaced: list[tuple[Path, Path | None]] = []
     try:
         out.mkdir(parents=True, exist_ok=True)
         for name, contents in rendered.items():
             descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=out)
-            temporary = Path(temporary_name)
-            temporary_paths.append((temporary, out / name))
+            staged.append((Path(temporary_name), out / name))
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 stream.write(contents)
-        for temporary, destination in temporary_paths:
+        for temporary, destination in staged:
+            previous = None
+            if os.path.lexists(destination):
+                descriptor, previous_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".old", dir=out)
+                os.close(descriptor)
+                previous = Path(previous_name)
+                spare.append(previous)
+                # A destination that is no file (a directory an earlier run left) does not move
+                # here: the replacement stops before this output, and the rollback puts the
+                # outputs replaced before it back.
+                os.replace(destination, previous)
             os.replace(temporary, destination)
+            replaced.append((destination, previous))
+        for previous in spare:
+            previous.unlink(missing_ok=True)
     except BaseException:
-        for temporary, _ in temporary_paths:
-            temporary.unlink(missing_ok=True)
+        for destination, previous in reversed(replaced):
+            with contextlib.suppress(OSError):
+                if previous is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    os.replace(previous, destination)
+        for path in [temporary for temporary, _ in staged] + spare:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+        for path in made:
+            with contextlib.suppress(OSError):
+                path.rmdir()
         raise
 
 

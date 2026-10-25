@@ -11,6 +11,10 @@ uv run cgraph build --config cgraph.toml --part slice --out out/slice --cache ca
 Exit status: 0 built and every hard check passes; 1 a hard check failed (the outputs are still
 written); 2 a usage or configuration error; 3 an input cannot be read.
 
+A run that does not write its outputs leaves `--out` as it found it: every output is written to a
+temporary file of the directory, and the replacement of the directory's files is all or nothing,
+whatever fails in the middle of it. A run that does not finish leaves no directory of its own either.
+
 ## Sources
 
 - **The C source**, parsed with libclang per translation unit, with the flags of a compilation

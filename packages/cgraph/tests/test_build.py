@@ -41,6 +41,15 @@ def output_bytes(out: Path) -> dict[str, bytes]:
     return {str(path.relative_to(out)): path.read_bytes() for path in sorted(out.rglob("*")) if path.is_file()}
 
 
+def output_digests(out: Path) -> dict[str, str]:
+    """The SHA-256 of every file the output directory holds, by its path in it."""
+    return {
+        str(path.relative_to(out)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(out.rglob("*"))
+        if path.is_file()
+    }
+
+
 def stable_output_bytes(out: Path) -> dict[str, bytes]:
     return {name: (out / name).read_bytes() for name in STABLE_OUTPUTS}
 
@@ -166,6 +175,37 @@ def test_cli_exit_status_preserves_existing_outputs_on_unable_runs(copy: Path, t
     (copy / "image" / "System.map").unlink()
     assert cli.main(["build", "--config", str(copy / "cgraph.toml"), "--part", "store", "--out", str(out)]) == 3
     assert output_bytes(out) == before
+
+
+def test_a_failure_in_the_middle_of_replacing_the_outputs_leaves_every_output(copy: Path, tmp_path: Path) -> None:
+    """A directory where ``checks.json`` belongs makes the replacement of that output fail after
+    ``graph.json`` has been replaced: the run must give 3 with every file of ``--out`` as it was."""
+    out = tmp_path / "out"
+    assert cli_build(copy, out) == 0
+    blocked = out / "checks.json"
+    blocked.unlink()
+    blocked.mkdir()
+    (blocked / "keep").write_text("keep\n")
+    before = output_digests(out)
+
+    assert cli.main(cli_arguments(copy, out, part="both")) == 3
+
+    assert output_digests(out) == before
+
+
+def test_a_failure_before_the_outputs_are_replaced_removes_the_directory_it_made(
+    copy: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that cannot write its outputs leaves no directory of its own behind."""
+    out = tmp_path / "made" / "out"
+
+    def refuse(*_arguments: object, **_keywords: object) -> tuple[int, str]:
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(pipeline.tempfile, "mkstemp", refuse)
+    assert cli_build(copy, out) == 3
+
+    assert not out.exists() and not out.parent.exists()
 
 
 def test_json_summary_omits_hard_check_items(
