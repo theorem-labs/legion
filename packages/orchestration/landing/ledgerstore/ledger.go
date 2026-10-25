@@ -118,6 +118,27 @@ func (l *Ledger) BeginWithdraw(ctx context.Context, repo, batch string) error {
 	return nil
 }
 
+// ReadyMembers lists the repository's ready migrations, in the order their ready records were published, each as the
+// member a batch freezes from it.
+func (l *Ledger) ReadyMembers(ctx context.Context, repo string) ([]landing.Member, error) {
+	records, err := l.ledger.ReadyMigrations(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	members := make([]landing.Member, 0, len(records))
+	for _, record := range records {
+		members = append(members, landing.Member{
+			Migration:        record.ID,
+			Generation:       record.Generation,
+			Head:             record.Head,
+			ReadyEvent:       record.ReadyEvent,
+			ChangedContracts: record.ChangedContracts,
+			ApprovedPinned:   record.ApprovedPinned,
+		})
+	}
+	return members, nil
+}
+
 // apply puts the ledger's version and admission on the runner's batch, so its next save names them.
 func apply(batch *landing.Batch, stored ledger.Batch) {
 	batch.SchemaVersion = landing.BatchSchemaVersion

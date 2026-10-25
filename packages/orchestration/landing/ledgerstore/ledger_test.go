@@ -30,6 +30,13 @@ func readyMember(t *testing.T, store *ledger.Store, id, owner, write string, rea
 	}
 }
 
+// openRequest opens migration id for owner with one declared write.
+func openRequest(id, owner, write string) ledger.OpenRequest {
+	return ledger.OpenRequest{
+		Repo: "r", ID: id, Owner: owner, BaseCommit: "base-1", Branch: "mig/" + id, Writes: []string{write},
+	}
+}
+
 // admittedBatch is batch-1 with M-1 admitted, and the member it holds.
 func admittedBatch(t *testing.T) (*ledgerstore.Batches, *ledgerstore.Ledger, *ledger.Store, landing.Batch, landing.Member) {
 	t.Helper()
