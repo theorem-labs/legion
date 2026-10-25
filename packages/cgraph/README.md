@@ -475,8 +475,9 @@ any output; and call agreement (|both| / |either|), state access agreement, and 
 
 ## Incremental builds
 
-With `--cache`, each unit's facts are kept under a key of the code that makes them (`clangfacts.py`
-and every module of the package it imports, directly or through another), the vocabulary, the unit's
+With `--cache`, each unit's facts are kept under a key of the code that makes them (every module the
+extraction runs: `clangfacts` and, at any depth, what it imports, so a module added to the extractor
+is covered too), the vocabulary, the unit's
 arguments, the contents of every file it included, and whether each file a header search of the unit
 may reach exists. The last covers a header that appears only when it is added: every `#include` and
 `__has_include` of the unit's files gives one probe per search directory, and a spelling a macro
@@ -489,8 +490,8 @@ bytes as a full build.
 
 The same directory keeps each image function's decoded facts under `image/`. An entry's key covers
 the image, `System.map`, the `[image]` table, the decoder's source and the capstone and pyelftools
-versions, the function's symbol, its own result registers, and the parameter count of each function
-it calls or jumps to directly: the only C facts its decoding reads. A change to another function's
+versions, the function's symbol, its own result registers, and the parameter count of each copy it
+calls or jumps to directly: the only C facts its decoding reads. A change to another function's
 signature leaves the entry in use. An entry that cannot be read or is malformed stops the run with
 exit status 3 and names the cache directory to remove.
 

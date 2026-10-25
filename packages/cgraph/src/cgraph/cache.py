@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import functools
 import hashlib
@@ -15,7 +16,6 @@ from typing import Any, TextIO
 
 import clang.cindex as cindex
 
-from . import clangfacts, config, errors, expressions, jsonio, libclang
 from .errors import CacheError
 
 
@@ -32,8 +32,22 @@ def tool_digest(cindex_bytes: bytes, library_bytes: bytes, python_version: str, 
     return _digest([cindex_bytes, library_bytes, python_version.encode(), machine.encode()])
 
 
-# Every module of the package whose code makes a unit's facts: clangfacts and what it imports.
-TOOL_MODULES = (clangfacts, config, errors, expressions, jsonio, libclang)
+def _extractor_sources() -> list[Path]:
+    """Every module of this package that extracting a unit's facts runs: ``clangfacts`` and, at any
+    depth, what it imports. The content of each of them can change a fact, and a module added to the
+    extractor is covered without a change here."""
+    directory = Path(__file__).parent
+    found: dict[str, Path] = {}
+    pending = ["clangfacts"]
+    while pending:
+        name = pending.pop()
+        if name in found:
+            continue
+        found[name] = directory.joinpath(*name.split(".")).with_suffix(".py")
+        for node in ast.walk(ast.parse(found[name].read_bytes())):
+            if isinstance(node, ast.ImportFrom) and node.level == 1:
+                pending += [alias.name for alias in node.names] if node.module is None else [node.module]
+    return [found[name] for name in sorted(found)]
 
 
 @functools.cache
@@ -44,7 +58,7 @@ def _tool_digest() -> str:
         raise RuntimeError("libclang did not disclose its bindings and library paths")
     return _digest(
         [
-            *(Path(module.__file__ or "").read_bytes() for module in TOOL_MODULES),
+            *(part for path in _extractor_sources() for part in (path.name.encode(), path.read_bytes())),
             tool_digest(
                 Path(bindings).read_bytes(), Path(library).read_bytes(), sys.version, platform.machine()
             ).encode(),
