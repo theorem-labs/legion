@@ -68,7 +68,7 @@ func attribute(t *testing.T, repo, base string, heads map[string]string, candida
 	evidence := make(map[string]blame.Evidence, len(heads))
 	for name, head := range heads {
 		member := Member{Migration: name, Head: head}
-		memberEvidence, err := git.DeclarationEvidence(context.Background(), repo, base, member)
+		memberEvidence, err := git.DeclarationEvidence(context.Background(), repo, base, member, nil)
 		if err != nil {
 			t.Fatalf("DeclarationEvidence(%s) error = %v", name, err)
 		}

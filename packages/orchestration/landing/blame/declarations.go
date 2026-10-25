@@ -18,7 +18,81 @@ type Declaration struct {
 	Text      string
 	Private   bool
 	Protected bool
+	// Generated is set when Name is the name Lean generates for an
+	// anonymous instance, computed from its signature alone. Lean numbers a
+	// repeated name by what the whole namespace holds, so such a name is
+	// Lean's only while no other file of the namespace generates it, which
+	// AmbiguousInstanceNames decides over a whole tree.
+	Generated bool
 }
+
+// InstanceNames is a set of generated instance names.
+type InstanceNames map[string]struct{}
+
+// AmbiguousInstanceNames returns the generated instance names that more than
+// one file of declarations generates. Lean gives such a name to one of those
+// instances and numbers the rest, and a scan of one file cannot tell which,
+// so no declaration may keep it. Build it once per round over the candidate
+// tree, and use that one set for every scan of the round, so that the base
+// tree, the candidate tree and each member's evidence name a declaration
+// alike.
+func AmbiguousInstanceNames(declarations []Declaration) InstanceNames {
+	files := make(map[string]string, len(declarations))
+	ambiguous := InstanceNames{}
+	for _, declaration := range declarations {
+		if !declaration.Generated {
+			continue
+		}
+		switch first, found := files[declaration.Name]; {
+		case !found:
+			files[declaration.Name] = declaration.File
+		case first != declaration.File:
+			ambiguous[declaration.Name] = struct{}{}
+		}
+	}
+	return ambiguous
+}
+
+// ResolveInstanceNames renames in place every declaration whose generated
+// name is ambiguous, giving it the positional name its file's scan would have
+// given it. Declarations of one file must keep their source order.
+func ResolveInstanceNames(declarations []Declaration, ambiguous InstanceNames) {
+	positions := map[string]int{}
+	for index, declaration := range declarations {
+		if !declaration.Generated && !isPositionalInstanceName(declaration.Name) {
+			continue
+		}
+		positions[declaration.File]++
+		if _, found := ambiguous[declaration.Name]; !found || !declaration.Generated {
+			continue
+		}
+		namespace, _ := splitLastComponent(declaration.Name)
+		declarations[index].Name = positionalInstanceName(namespace, positions[declaration.File])
+		declarations[index].Generated = false
+	}
+}
+
+// positionalInstanceName is the name of the nth anonymous instance of a file,
+// in a namespace. `<anon-instance>` is not a Lean identifier, so the name
+// never equals one Lean generates.
+func positionalInstanceName(namespace string, position int) string {
+	return qualifyIn(namespace, anonymousInstanceMarker+strconv.Itoa(position))
+}
+
+func isPositionalInstanceName(name string) bool {
+	return strings.Contains(name, anonymousInstanceMarker)
+}
+
+// splitLastComponent splits a qualified name into its namespace and its last
+// component.
+func splitLastComponent(name string) (string, string) {
+	if dot := strings.LastIndex(name, "."); dot >= 0 {
+		return name[:dot], name[dot+1:]
+	}
+	return "", name
+}
+
+const anonymousInstanceMarker = "<anon-instance>#"
 
 // DeclarationID identifies a declaration in one Lean source file.
 type DeclarationID struct {
@@ -92,9 +166,13 @@ type scanned struct {
 // string literals that span lines, modifiers written on their own line above a
 // declaration, and the declaration whose signature or body it is in.
 type scanner struct {
-	file   string
-	scopes []scope
-	depth  int
+	// ambiguous holds the generated instance names that no declaration may
+	// keep, because more than one file of the round's candidate tree
+	// generates them.
+	ambiguous InstanceNames
+	file      string
+	scopes    []scope
+	depth     int
 	// declarations holds the declarations read so far, in source order.
 	// While inDeclaration is set the scanner is in the signature or body of
 	// the last one, and while inSignature is also set its signature is still
@@ -145,9 +223,12 @@ type scanner struct {
 }
 
 // ScanDeclarations returns every declaration in one Lean source file, each with
-// its fully qualified name and its whole signature.
-func ScanDeclarations(file, source string) []Declaration {
-	s := scanner{file: file}
+// its fully qualified name and its whole signature. ambiguous holds the
+// generated instance names that no declaration may keep, from
+// AmbiguousInstanceNames over the round's candidate tree; it is nil for a
+// scan that has no tree to compare with, such as a single file's.
+func ScanDeclarations(file, source string, ambiguous InstanceNames) []Declaration {
+	s := scanner{file: file, ambiguous: ambiguous}
 	for line := range strings.SplitSeq(source, "\n") {
 		s.scan(line)
 	}
@@ -545,13 +626,10 @@ type anonymousInstance struct {
 // such a name never equals a name Lean generates, and a diagnostic that names
 // a generated instance finds no declaration rather than the wrong one.
 //
-// The scanner reads one file, so it cannot see the rest of the namespace:
-// when two files of one namespace generate the same name, Lean numbers the
-// later one and the scanner gives both the unnumbered name. On the round-177
-// base that is 8 names over 19 of the 1,712 anonymous instances, all of the
-// form instDecidable<Predicate> or instPersistent<Predicate>. Closing it
-// needs the whole project, which neither the evidence step (a member's
-// changed files) nor one tree scan gives a declaration in isolation.
+// A name that more than one file of the round's candidate tree generates is
+// in ambiguous, and no declaration keeps it: Lean gives it to one of those
+// instances and numbers the rest, and a scan of one file cannot tell which.
+// AmbiguousInstanceNames builds that set over a whole tree.
 func (s *scanner) nameAnonymousInstances() {
 	taken := map[string]int{}
 	for index, declaration := range s.declarations {
@@ -566,10 +644,13 @@ func (s *scanner) nameAnonymousInstances() {
 	}
 	for position, instance := range s.anonymousInstances {
 		name := qualifyIn(instance.prefix, instance.name)
-		if !instance.computed || taken[name] != 1 {
-			name = qualifyIn(instance.prefix, "<anon-instance>#"+strconv.Itoa(position+1))
+		_, shared := s.ambiguous[name]
+		if !instance.computed || shared || taken[name] != 1 {
+			s.declarations[instance.index].Name = positionalInstanceName(instance.prefix, position+1)
+			continue
 		}
 		s.declarations[instance.index].Name = name
+		s.declarations[instance.index].Generated = true
 	}
 }
 
@@ -1070,9 +1151,11 @@ type LineOwner struct {
 	code, namespace string
 }
 
-// ScanLineOwners returns one LineOwner per source line, in order.
-func ScanLineOwners(file, source string) []LineOwner {
-	s := scanner{file: file}
+// ScanLineOwners returns one LineOwner per source line, in order. ambiguous
+// is the round's set of generated instance names that no declaration may
+// keep, as for ScanDeclarations.
+func ScanLineOwners(file, source string, ambiguous InstanceNames) []LineOwner {
+	s := scanner{file: file, ambiguous: ambiguous}
 	lines := strings.Split(source, "\n")
 	owners := make([]LineOwner, len(lines))
 	// owned holds, for each line, 1 + the index of its owner in

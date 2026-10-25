@@ -64,7 +64,7 @@ type Git interface {
 	Candidate(context.Context, string, string, []Member) (gitx.Result, error)
 	Rebuild(context.Context, string, string, []Member, map[string]struct{}) (gitx.Result, error)
 	ChangeSet(context.Context, string, string, Member) (gitx.Change, error)
-	DeclarationEvidence(context.Context, string, string, Member) (blame.Evidence, error)
+	DeclarationEvidence(context.Context, string, string, Member, blame.InstanceNames) (blame.Evidence, error)
 	TreeDeclarations(context.Context, string, Tree) ([]blame.Declaration, error)
 }
 
@@ -751,22 +751,25 @@ func (r Runner) blame(ctx context.Context, batch *Batch, output string) (bool, m
 	if !baseResult.Green {
 		return true, nil, nil
 	}
+	report := blame.Parse(output, r.ModuleRoots)
+	// The round's trees are scanned first: their candidate names the
+	// generated instance names that no declaration may keep, and a member's
+	// evidence must use the same set as the trees.
+	lines, ambiguous, err := r.declarationLines(ctx, batch, Tree(base.Tree), report)
+	if err != nil {
+		return false, nil, err
+	}
 	evidence := make(map[string]blame.Evidence, len(batch.ActiveMembers))
 	for _, member := range batch.ActiveMembers {
 		comparisonBase := member.ComparisonBase
 		if comparisonBase == "" {
 			comparisonBase = batch.Base
 		}
-		memberEvidence, err := r.Git.DeclarationEvidence(ctx, batch.Repository, comparisonBase, member)
+		memberEvidence, err := r.Git.DeclarationEvidence(ctx, batch.Repository, comparisonBase, member, ambiguous)
 		if err != nil {
 			return false, nil, fmt.Errorf("read declaration evidence for %q: %w", member.Migration, err)
 		}
 		evidence[member.Migration] = memberEvidence
-	}
-	report := blame.Parse(output, r.ModuleRoots)
-	lines, err := r.declarationLines(ctx, batch, Tree(base.Tree), report)
-	if err != nil {
-		return false, nil, err
 	}
 	attributions := blame.IdentifyDetailed(report, evidence, lines)
 	suspects := make(map[string][]string)
@@ -812,15 +815,22 @@ func (r Runner) blame(ctx context.Context, batch *Batch, output string) (bool, m
 	return false, culprits, nil
 }
 
-func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, report blame.Report) (map[string]blame.TreeDeclarations, error) {
+// declarationLines reads the base and candidate trees and groups, by each
+// name the report mentions, the declarations that carry it. It also returns
+// the round's ambiguous generated instance names, which it has resolved in
+// both trees.
+func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, report blame.Report) (map[string]blame.TreeDeclarations, blame.InstanceNames, error) {
 	baseDeclarations, err := r.Git.TreeDeclarations(ctx, batch.Repository, base)
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at base: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at base: %w", err)
 	}
 	candidateDeclarations, err := r.Git.TreeDeclarations(ctx, batch.Repository, Tree(batch.Candidate.Tree))
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at candidate: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
 	}
+	ambiguous := blame.AmbiguousInstanceNames(candidateDeclarations)
+	blame.ResolveInstanceNames(candidateDeclarations, ambiguous)
+	blame.ResolveInstanceNames(baseDeclarations, ambiguous)
 	names := make(map[string]struct{})
 	for _, block := range report.Blocks {
 		for _, name := range blame.Names(block.Message) {
@@ -834,7 +844,7 @@ func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, r
 			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}
 	}
-	return declarations, nil
+	return declarations, ambiguous, nil
 }
 
 func (r Runner) receipt(ctx context.Context, batch Batch, output string) (Receipt, error) {
