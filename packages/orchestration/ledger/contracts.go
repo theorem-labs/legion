@@ -52,7 +52,8 @@ func loadContract(ctx context.Context, q querier, repo, name string, lock rowLoc
 	return c, err
 }
 
-// RegisterContract records a new contract at version one. Its first hash is the one that later changes compare.
+// RegisterContract records a new contract at version one. Its first hash is the one that later changes compare. A name
+// that an admitted member reads is refused with batch_admitted, because its admission checked that read as no contract.
 func (s *Store) RegisterContract(ctx context.Context, repo, name, owner, hash string, pinned bool) (Contract, error) {
 	if err := checkContractArgs(name, owner, hash); err != nil {
 		return Contract{}, err
@@ -62,23 +63,41 @@ func (s *Store) RegisterContract(ctx context.Context, repo, name, owner, hash st
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		var err error
-		c, err = scanContract(tx.QueryRow(ctx, `INSERT INTO contracts (repo, name, owner, statement_hash, pinned)
-			VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING
-			RETURNING `+contractColumns, repo, name, owner, hash, pinned))
-		if errors.Is(err, pgx.ErrNoRows) {
-			return refuse(ReasonExists, "contract %s already exists", name)
-		}
-		if err != nil {
+		if err := fenceContract(ctx, tx, repo, name, true); err != nil {
 			return err
 		}
-		return event(ctx, tx, repo, "contract.registered", name, owner, map[string]any{
-			"statement_hash": hash,
-			"version":        c.Version,
-			"pinned":         pinned,
-		})
+		var inserted bool
+		var err error
+		if c, inserted, err = insertContract(ctx, tx, repo, name, owner, hash, pinned); err != nil {
+			return err
+		}
+		if !inserted {
+			return refuse(ReasonExists, "contract %s already exists", name)
+		}
+		return contractRegistered(ctx, tx, repo, c, nil)
 	})
 	return c, err
+}
+
+// insertContract records a new contract at version one inside tx, which already holds the repository's row lock. It
+// appends no event. When the name is already registered, it writes nothing and returns false.
+func insertContract(ctx context.Context, tx pgx.Tx, repo, name, owner, hash string, pinned bool) (Contract, bool, error) {
+	c, err := scanContract(tx.QueryRow(ctx, `INSERT INTO contracts (repo, name, owner, statement_hash, pinned)
+		VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING
+		RETURNING `+contractColumns, repo, name, owner, hash, pinned))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Contract{}, false, nil
+	}
+	return c, err == nil, err
+}
+
+// contractRegistered appends contract.registered for c, whose data holds the registration and the fields of extra.
+func contractRegistered(ctx context.Context, tx pgx.Tx, repo string, c Contract, extra map[string]any) error {
+	data := map[string]any{"statement_hash": c.StatementHash, "version": c.Version, "pinned": c.Pinned}
+	for field, value := range extra {
+		data[field] = value
+	}
+	return event(ctx, tx, repo, "contract.registered", c.Name, c.Owner, data)
 }
 
 // Contract reads one contract's current owner, hash and version.
@@ -128,15 +147,22 @@ func (s *Store) Contracts(ctx context.Context, repo string) ([]Contract, error) 
 	return contracts, nil
 }
 
-// TransferContract moves a contract to a new owner without changing its statement or version.
+// TransferContract moves a contract to a new owner without changing its statement or version. A contract that an
+// admitted member changes is refused with batch_admitted, because its admission's review rule checked the owner.
 func (s *Store) TransferContract(ctx context.Context, repo, name, fromOwner, toOwner string) (Contract, error) {
 	if strings.TrimSpace(name) == "" || strings.TrimSpace(fromOwner) == "" || strings.TrimSpace(toOwner) == "" {
 		return Contract{}, invalid("a contract transfer needs a name, current owner and new owner")
 	}
 	var c Contract
 	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
 		current, err := loadContract(ctx, tx, repo, name, updateLock)
 		if err != nil {
+			return err
+		}
+		if err := fenceContract(ctx, tx, repo, name, false); err != nil {
 			return err
 		}
 		if current.Owner != fromOwner {
@@ -327,51 +353,13 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 			return refusalForViolation(v.violations[0])
 		}
 		names := make([]string, 0, len(v.changed))
+		advances := make([]contractAdvance, 0, len(v.changed))
 		for _, current := range v.changed {
-			name := current.Name
-			names = append(names, name)
-			lastChange := v.cleared[name]
-			advanced, err := scanContract(tx.QueryRow(ctx, `UPDATE contracts SET statement_hash = $3, version = version + 1,
-				last_change = $4, updated_at = clock_timestamp() WHERE repo = $1 AND name = $2
-				RETURNING `+contractColumns, req.Repo, name, req.ChangedContracts[name], lastChange))
-			if err != nil {
-				return err
-			}
-			if err := event(ctx, tx, req.Repo, "contract.advanced", name, migration.Owner, map[string]any{
-				"from_hash": current.StatementHash,
-				"to_hash":   advanced.StatementHash,
-				"version":   advanced.Version,
-			}); err != nil {
-				return err
-			}
-			rows, err := tx.Query(ctx, `UPDATE agreements SET state = 'stale', staled_at = clock_timestamp()
-				WHERE repo = $1 AND state = 'agreed' AND EXISTS (
-					SELECT 1 FROM agreement_reads
-					WHERE agreement_reads.repo = agreements.repo
-						AND agreement_reads.agreement = agreements.id
-						AND contract = $2 AND version < $3
-				) RETURNING id`, req.Repo, name, advanced.Version)
-			if err != nil {
-				return err
-			}
-			ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-			if err != nil {
-				return err
-			}
-			for _, agreement := range ids {
-				if err := event(ctx, tx, req.Repo, "agreement.staled", agreement, "", map[string]any{
-					"contract": name,
-					"version":  advanced.Version,
-				}); err != nil {
-					return err
-				}
-			}
+			names = append(names, current.Name)
+			advances = append(advances, contractAdvance{current: current, hash: req.ChangedContracts[current.Name],
+				lastChange: v.cleared[current.Name]})
 		}
-		if _, err := tx.Exec(ctx, `UPDATE migrations SET state = $3, closed_at = clock_timestamp(),
-			close_reason = NULL, landed_commit = $4 WHERE repo = $1 AND id = $2`, req.Repo, req.Migration, StateLanded, req.Commit); err != nil {
-			return err
-		}
-		if err := event(ctx, tx, req.Repo, "migration.landed", req.Migration, migration.Owner, map[string]any{
+		if err := landMigration(ctx, tx, req.Repo, migration, advances, req.Commit, map[string]any{
 			"generation":          req.Generation,
 			"commit":              req.Commit,
 			"contracts":           names,
@@ -387,4 +375,61 @@ func (s *Store) Land(ctx context.Context, req LandRequest) (Migration, error) {
 		return err
 	})
 	return landed, err
+}
+
+// contractAdvance is one changed contract of a landing: the contract as the landing read it under its lock, its new
+// statement hash, and the record that cleared the change, which becomes its last_change.
+type contractAdvance struct {
+	current    Contract
+	hash       string
+	lastChange LastChange
+}
+
+// landMigration makes the writes of a landing that its caller has locked and decided, in Land's order: each advance
+// with its contract.advanced event and the agreements that it makes stale, each with agreement.staled; then the
+// migration closed as landed at commit, and migration.landed with data. Land and the batch landings share it.
+func landMigration(ctx context.Context, tx pgx.Tx, repo string, migration Migration, advances []contractAdvance, commit string, data map[string]any) error {
+	for _, change := range advances {
+		name := change.current.Name
+		advanced, err := scanContract(tx.QueryRow(ctx, `UPDATE contracts SET statement_hash = $3, version = version + 1,
+			last_change = $4, updated_at = clock_timestamp() WHERE repo = $1 AND name = $2
+			RETURNING `+contractColumns, repo, name, change.hash, change.lastChange))
+		if err != nil {
+			return err
+		}
+		if err := event(ctx, tx, repo, "contract.advanced", name, migration.Owner, map[string]any{
+			"from_hash": change.current.StatementHash,
+			"to_hash":   advanced.StatementHash,
+			"version":   advanced.Version,
+		}); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `UPDATE agreements SET state = 'stale', staled_at = clock_timestamp()
+			WHERE repo = $1 AND state = 'agreed' AND EXISTS (
+				SELECT 1 FROM agreement_reads
+				WHERE agreement_reads.repo = agreements.repo
+					AND agreement_reads.agreement = agreements.id
+					AND contract = $2 AND version < $3
+			) RETURNING id`, repo, name, advanced.Version)
+		if err != nil {
+			return err
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		for _, agreement := range ids {
+			if err := event(ctx, tx, repo, "agreement.staled", agreement, "", map[string]any{
+				"contract": name,
+				"version":  advanced.Version,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE migrations SET state = $3, closed_at = clock_timestamp(),
+		close_reason = NULL, landed_commit = $4 WHERE repo = $1 AND id = $2`, repo, migration.ID, StateLanded, commit); err != nil {
+		return err
+	}
+	return event(ctx, tx, repo, "migration.landed", migration.ID, migration.Owner, data)
 }

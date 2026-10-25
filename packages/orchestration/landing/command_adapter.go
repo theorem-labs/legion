@@ -17,168 +17,6 @@ import (
 	"github.com/sjawhar/legion/orchestration/landing/blame"
 )
 
-// CommandLedger runs the ledger CLI. Command is its argv before the command,
-// for example ["ledger", "--dsn-file", "/path/to/dsn"]. Check, Land and
-// ReturnMember write their request as JSON to a fresh 0600 file and run check,
-// land or round with --request-file; the ledger decodes it with unknown fields
-// refused, so a renamed field fails rather than being dropped. Contracts runs
-// contract list. StatusCommand and MigrationStateCommand are configured
-// commands that receive LAND_* variables.
-type CommandLedger struct {
-	Directory             string
-	Command               []string
-	StatusCommand         []string
-	MigrationStateCommand []string
-}
-
-// Check runs the ledger's check. Exit 0 is a pass, exit 1 a refusal and exit 5
-// an incomplete deferred check, each with the result on stdout; any other exit
-// is an error.
-func (l CommandLedger) Check(ctx context.Context, request CheckRequest) (CheckResult, error) {
-	stdout, code, err := l.requestCommand(ctx, "check", request)
-	if err != nil && code != 1 && code != 5 {
-		return CheckResult{}, fmt.Errorf("run ledger check: %w", err)
-	}
-	var result CheckResult
-	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
-		return CheckResult{}, fmt.Errorf("decode ledger check: %w", err)
-	}
-	want := map[int]string{0: CheckPass, 1: CheckRefused, 5: CheckIncomplete}[code]
-	if result.Outcome != want {
-		return CheckResult{}, fmt.Errorf("ledger check exited %d with outcome %q", code, result.Outcome)
-	}
-	return result, nil
-}
-
-// Land runs the ledger's land with the full check's request.
-func (l CommandLedger) Land(ctx context.Context, request LandRequest) error {
-	if _, _, err := l.requestCommand(ctx, "land", request); err != nil {
-		return fmt.Errorf("run ledger land: %w", err)
-	}
-	return nil
-}
-
-// ReturnMember records the member's failed landing round.
-func (l CommandLedger) ReturnMember(ctx context.Context, request RoundRequest) error {
-	if _, _, err := l.requestCommand(ctx, "round", request); err != nil {
-		return fmt.Errorf("run ledger round: %w", err)
-	}
-	return nil
-}
-
-// Contracts lists the repository's registered contracts. contract list is a
-// read command, so it prints JSON without --json.
-func (l CommandLedger) Contracts(ctx context.Context, repository string) ([]Contract, error) {
-	stdout, _, err := l.run(ctx, "contract", "list", repository)
-	if err != nil {
-		return nil, fmt.Errorf("run ledger contract list: %w", err)
-	}
-	var contracts []Contract
-	if err := json.Unmarshal([]byte(stdout), &contracts); err != nil {
-		return nil, fmt.Errorf("decode ledger contract list: %w", err)
-	}
-	return contracts, nil
-}
-
-// Escalate enqueues the item for the owner with the ledger's enqueue.
-func (l CommandLedger) Escalate(ctx context.Context, repository, item, owner string) error {
-	if _, _, err := l.run(ctx, "enqueue", repository, item, owner); err != nil {
-		return fmt.Errorf("run ledger enqueue: %w", err)
-	}
-	return nil
-}
-
-func (l CommandLedger) requestCommand(ctx context.Context, command string, request any) (string, int, error) {
-	body, err := json.Marshal(request)
-	if err != nil {
-		return "", -1, fmt.Errorf("encode %s request: %w", command, err)
-	}
-	file, err := os.CreateTemp("", "land-"+command+"-*.json")
-	if err != nil {
-		return "", -1, fmt.Errorf("create %s request file: %w", command, err)
-	}
-	defer os.Remove(file.Name())
-	if _, err := file.Write(body); err != nil {
-		file.Close()
-		return "", -1, fmt.Errorf("write %s request file: %w", command, err)
-	}
-	if err := file.Close(); err != nil {
-		return "", -1, fmt.Errorf("write %s request file: %w", command, err)
-	}
-	return l.run(ctx, command, "--request-file", file.Name())
-}
-
-// run runs the ledger CLI and returns its stdout and exit code. A nonzero exit
-// is an error that carries stderr.
-func (l CommandLedger) run(ctx context.Context, args ...string) (string, int, error) {
-	if len(l.Command) == 0 {
-		return "", -1, fmt.Errorf("ledger command is empty")
-	}
-	argv := append(append([]string(nil), l.Command[1:]...), args...)
-	process := exec.CommandContext(ctx, l.Command[0], argv...)
-	process.Dir = l.Directory
-	var stdout, stderr bytes.Buffer
-	process.Stdout, process.Stderr = &stdout, &stderr
-	if err := process.Run(); err != nil {
-		code := -1
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			code = exit.ExitCode()
-		}
-		return stdout.String(), code, commandFailure{err: err, output: stderr.String() + stdout.String()}
-	}
-	return stdout.String(), 0, nil
-}
-
-func (l CommandLedger) OperationComplete(ctx context.Context, operation Operation) (bool, error) {
-	if len(l.StatusCommand) == 0 {
-		return false, nil
-	}
-	output, err := runLandingCommand(ctx, l.Directory, l.StatusCommand, []string{
-		"LAND_OPERATION=" + operation.Key,
-		"LAND_OPERATION_KIND=" + operation.Kind,
-		"LAND_BATCH=" + operation.Batch,
-		"LAND_REPOSITORY=" + operation.Repository,
-		"LAND_MEMBER=" + operation.Member,
-		fmt.Sprintf("LAND_GENERATION=%d", operation.Generation),
-		"LAND_COMMIT=" + operation.Commit,
-	})
-	if err != nil {
-		return false, fmt.Errorf("read operation status: %w", err)
-	}
-	var wire struct {
-		Complete *bool `json:"complete"`
-	}
-	if err := json.Unmarshal([]byte(output), &wire); err != nil || wire.Complete == nil {
-		if err != nil {
-			return false, fmt.Errorf("decode operation status: %w", err)
-		}
-		return false, fmt.Errorf("decode operation status: missing complete decision")
-	}
-	return *wire.Complete, nil
-}
-
-func (l CommandLedger) MigrationState(ctx context.Context, repository, migration string) (string, string, error) {
-	output, err := runLandingCommand(ctx, l.Directory, l.MigrationStateCommand, []string{
-		"LAND_REPOSITORY=" + repository,
-		"LAND_MIGRATION=" + migration,
-	})
-	if err != nil {
-		return "", "", fmt.Errorf("read migration state: %w", err)
-	}
-	var wire struct {
-		State        string `json:"state"`
-		LandedCommit string `json:"landedCommit"`
-	}
-	if err := json.Unmarshal([]byte(output), &wire); err != nil || wire.State == "" {
-		if err != nil {
-			return "", "", fmt.Errorf("decode migration state: %w", err)
-		}
-		return "", "", fmt.Errorf("decode migration state: missing state")
-	}
-	return wire.State, wire.LandedCommit, nil
-}
-
 // CommandBuilder archives an immutable tree into a temporary directory and runs
 // the configured build command there.
 type CommandBuilder struct {
@@ -344,40 +182,25 @@ func parseStatementHashes(output string, names []string) (map[string]StatementHa
 	return hashes, nil
 }
 
-// CommandScorer runs configured score and score-commit commands.
-type CommandScorer struct {
-	Directory     string
-	ScoreCommand  []string
-	CommitCommand []string
-	StatusCommand []string
+// CommandDefects publishes a hook's defect with a configured command: the topic and the message id are in its
+// environment and the message is its standard input.
+type CommandDefects struct {
+	Directory string
+	Command   []string
 }
 
-func (s CommandScorer) Score(ctx context.Context, commit, part string) (string, error) {
-	output, err := runLandingCommand(ctx, s.Directory, s.ScoreCommand, []string{
-		"LAND_COMMIT=" + commit,
-		"LAND_PART=" + part,
-	})
-	if err != nil {
-		return "", fmt.Errorf("run score: %w", err)
+func (d CommandDefects) Publish(ctx context.Context, topic, id string, body []byte) error {
+	if len(d.Command) == 0 {
+		return fmt.Errorf("no defect command is configured")
 	}
-	return strings.TrimSpace(output), nil
-}
-
-func (s CommandScorer) Commit(ctx context.Context, repository, commit, path, output string) error {
-	_, err := runLandingCommand(ctx, s.Directory, s.CommitCommand, []string{
-		"LAND_REPOSITORY=" + repository,
-		"LAND_COMMIT=" + commit,
-		"LAND_SCORE_PATH=" + path,
-		"LAND_SCORE_OUTPUT=" + output,
-	})
-	if err != nil {
-		return fmt.Errorf("commit score: %w", err)
+	process := exec.CommandContext(ctx, d.Command[0], d.Command[1:]...)
+	process.Dir = d.Directory
+	process.Env = append(os.Environ(), "LAND_TOPIC="+topic, "LAND_MESSAGE_ID="+id)
+	process.Stdin = bytes.NewReader(body)
+	if output, err := process.CombinedOutput(); err != nil {
+		return fmt.Errorf("publish the defect: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
-}
-
-func (s CommandScorer) OperationComplete(ctx context.Context, operation Operation) (bool, error) {
-	return commandOperationComplete(ctx, s.Directory, s.StatusCommand, operation)
 }
 
 // CommandEvents publishes configured member events after a durable merge.

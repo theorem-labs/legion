@@ -1,5 +1,6 @@
 // Package ledger is the orchestration ledger: work-item leases, migrations and their change locks, the contract
-// ledger and an append-only event log, all in Postgres. Every operation runs in one transaction.
+// ledger, the landing program's batches and an append-only event log, all in Postgres. Every operation runs in one
+// transaction.
 package ledger
 
 import (
@@ -28,6 +29,7 @@ var schemaTables = []string{
 	"repositories", "work_items", "migrations", "migration_writes", "migration_reads",
 	"contracts", "agreements", "agreement_reads", "events",
 	"ready_keys", "round_keys", "owner_refusals",
+	"batches", "batch_members", "batch_effects", "batch_effect_outputs",
 }
 
 // Store is a connection pool to one ledger database.

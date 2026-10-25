@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// Push forces the queue branch to the candidate, because a rebuilt candidate replaces the one the branch held.
 func TestGitHubCLIPushesCandidateBranchOnly(t *testing.T) {
 	executor := &commandExecutorFake{}
 	client := GitHubCLI{RepositoryPath: "/repo", Remote: "origin", Executor: executor}
@@ -16,7 +17,7 @@ func TestGitHubCLIPushesCandidateBranchOnly(t *testing.T) {
 	if got, want := executor.calls[0].name, "git"; got != want {
 		t.Fatalf("program = %q, want %q", got, want)
 	}
-	if got, want := executor.calls[0].args, []string{"-C", "/repo", "push", "origin", "candidate:refs/heads/land/batch"}; !sameStrings(got, want) {
+	if got, want := executor.calls[0].args, []string{"-C", "/repo", "push", "origin", "+candidate:refs/heads/land/batch"}; !sameStrings(got, want) {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
 }

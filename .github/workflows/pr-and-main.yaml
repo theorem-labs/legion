@@ -189,6 +189,11 @@ jobs:
         run: go vet ./...
         working-directory: packages/orchestration
 
+      # Only the end-to-end driver builds with ledgertesthold, so vet compiles its hold files here.
+      - name: Vet the orchestration ledger's ledgertesthold build
+        run: go vet -tags ledgertesthold ./...
+        working-directory: packages/orchestration
+
 
   test:
     runs-on: ubuntu-24.04

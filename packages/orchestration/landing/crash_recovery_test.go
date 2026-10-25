@@ -27,7 +27,7 @@ func (s *crashStore) wrote() {
 	}
 }
 
-func (s *crashStore) Create(ctx context.Context, batch Batch) (bool, error) {
+func (s *crashStore) Create(ctx context.Context, batch *Batch) (bool, error) {
 	created, err := s.MemoryStore.Create(ctx, batch)
 	if err == nil && created {
 		s.wrote()
@@ -35,7 +35,7 @@ func (s *crashStore) Create(ctx context.Context, batch Batch) (bool, error) {
 	return created, err
 }
 
-func (s *crashStore) Save(ctx context.Context, batch Batch) error {
+func (s *crashStore) Save(ctx context.Context, batch *Batch) error {
 	if err := s.MemoryStore.Save(ctx, batch); err != nil {
 		return err
 	}
@@ -233,9 +233,10 @@ func runAndPublishUntilCrash(runner Runner, input Input) (crashed bool) {
 func TestPublishRecoveryAtEveryCrashBoundaryLandsTheSurvivorOnce(t *testing.T) {
 	for _, scenario := range recoveryScenarios() {
 		t.Run(scenario.name, func(t *testing.T) {
-			runner, _ := scenario.runner()
+			runner, ledger := scenario.runner()
 			counter := &crashStore{}
 			runner.Store = counter
+			runner.Admission = &batchLedgerFake{ledger: ledger, store: counter}
 			runner.GitHub = &mergingGitHub{}
 			if runAndPublishUntilCrash(runner, recoveryInput()) {
 				t.Fatal("uninterrupted run crashed")
@@ -245,6 +246,7 @@ func TestPublishRecoveryAtEveryCrashBoundaryLandsTheSurvivorOnce(t *testing.T) {
 					runner, ledger := scenario.runner()
 					store := &crashStore{crashAt: crashAt}
 					runner.Store = store
+					runner.Admission = &batchLedgerFake{ledger: ledger, store: store}
 					github := &mergingGitHub{}
 					runner.GitHub = github
 					if !runAndPublishUntilCrash(runner, recoveryInput()) {
@@ -300,8 +302,8 @@ func TestFrozenRecoveryChecksSurvivorOnTheRebuiltCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if got := resumed[0]; got.State != Failed || len(got.ActiveMembers) != 0 {
-		t.Fatalf("resumed = %q with %v, want failed with no members", got.State, batchMemberNames(got.ActiveMembers))
+	if got := resumed[0]; got.State != Empty || len(got.ActiveMembers) != 0 {
+		t.Fatalf("resumed = %q with %v, want empty with no members", got.State, batchMemberNames(got.ActiveMembers))
 	}
 	if !ledgerReturned(ledger, "keep") {
 		t.Fatalf("refused survivor not returned: %v", ledger.returned)

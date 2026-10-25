@@ -27,7 +27,7 @@ func TestRestartFromEveryPreGreenTransitionMatchesUninterruptedRun(t *testing.T)
 				ActiveMembers: []Member{member("one")},
 				State:         state,
 			}
-			if err := store.Save(context.Background(), batch); err != nil {
+			if err := store.Save(context.Background(), &batch); err != nil {
 				t.Fatal(err)
 			}
 
@@ -60,7 +60,7 @@ func TestRestartContinuesPublishingWithoutLandingMemberTwice(t *testing.T) {
 	batch := greenBatchFor(runner)
 	batch.State = Publishing
 	batch.Branch = "land/batch"
-	if err := store.Save(context.Background(), batch); err != nil {
+	if err := store.Save(context.Background(), &batch); err != nil {
 		t.Fatal(err)
 	}
 

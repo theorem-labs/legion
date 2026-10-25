@@ -203,6 +203,9 @@ type verdict struct {
 // Check and Land both call it, so one candidate gets the same violations, in the same order, from both. lock is the row
 // lock it takes on each contract the migration read: shareLock for a check, updateLock for a landing. DeferReads skips
 // only the comparison of the caller's read hashes and the landed commit; every rule that needs only the ledger runs.
+// AdmitBatch checks each member through it too, so admission refuses exactly what Check reports. After the
+// migration's own rules comes the admission fence: the migration while a batch admits it, and each changed contract
+// that an admitted member reads.
 func evaluate(ctx context.Context, tx pgx.Tx, m Migration, req CheckRequest, lock rowLock) (verdict, error) {
 	var v verdict
 	if precondition, ok := candidatePrecondition(req); ok {
@@ -213,6 +216,11 @@ func evaluate(ctx context.Context, tx pgx.Tx, m Migration, req CheckRequest, loc
 		return verdict{}, err
 	}
 	v.violations = append(v.violations, violations...)
+	fenced, err := fenceViolations(ctx, tx, req.Repo, m.ID, sortedNames(req.ChangedContracts))
+	if err != nil {
+		return verdict{}, err
+	}
+	v.violations = append(v.violations, fenced...)
 	contracts, stale, err := readFence(ctx, tx, req.Repo, m, lock)
 	if err != nil {
 		return verdict{}, err
