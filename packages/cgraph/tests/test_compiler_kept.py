@@ -224,3 +224,24 @@ def test_a_small_function_that_calls_a_large_inline_one_is_called(tmp_path: Path
 def test_a_variadic_stub_that_never_starts_its_list_still_folds(tmp_path: Path) -> None:
     """A variadic stub with no va_start is inlined: `stub_variadic(...)` is 0, so warn is not code."""
     assert "warn" not in compiled(facts_of(tmp_path, WRAPPED), "sv")
+
+
+MODELLED = """
+    void s(int i);
+    static void inner(int x) { s(x); s(x + 1); s(x + 2); s(x + 3); }
+    static int stat_wrap(int x) { inner(x); inner(x + 1); inner(x + 2); inner(x + 3); return x * 2; }
+    void pa(void) { if (stat_wrap(1) == 6) warn(); kept(); }
+    void pb(void) { if (stat_wrap(3) == 6) warn(); kept(); }
+    static int leaf(int x) { s(x); s(x + 1); s(x + 2); s(x + 3); return x; }
+    static int outer(int x) { leaf(x); leaf(x + 1); leaf(x + 2); return x * 2; }
+    void la(void) { if (outer(1) == 6) warn(); kept(); }
+    void lb(void) { if (outer(3) == 6) warn(); kept(); }
+"""
+
+
+@pytest.mark.parametrize("function", ["pa", "la"])
+def test_a_wrapper_around_small_static_helpers_is_called(tmp_path: Path, function: str) -> None:
+    """clang inlines bottom-up: a small static helper goes into its caller first, and the caller, now
+    large, is called (clang-21 -O2: call stat_wrap; call warn). Its value is the image's to settle, so
+    warn() stays, as `conditional`."""
+    assert "warn" in compiled(facts_of(tmp_path, MODELLED), function)

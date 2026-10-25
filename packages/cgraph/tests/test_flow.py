@@ -905,10 +905,13 @@ def test_a_folded_callee_s_field_is_that_far_from_the_register_a_call_returns(fc
 
 
 def test_a_constant_helper_result_and_an_unwritten_static_decide_branches(fct_facts: dict[str, Any]) -> None:
-    """fct_init_always always returns 0 (its -12 is under a false test); fct_never_set is always 0."""
-    assert "x" not in {field for field, *_ in _fields_of(fct_facts, "fct_alloc_object")}
+    """fct_never_set is always 0, so fct_maybe_use reads no x. fct_init_always always returns 0, but
+    only the inliner model says the compiler folds that body into fct_alloc_object, so the image
+    settles its branch: the x it stores there is ``conditional``."""
     assert "x" not in {field for field, *_ in _fields_of(fct_facts, "fct_maybe_use")}
     assert "fct_cur" in {call["callee"] for call in fact_events(fct_facts, "fct_maybe_use")["calls"]}
+    fields = fact_events(fct_facts, "fct_alloc_object")["field_accesses"]
+    assert [item.get("conditional") for item in fields if item["field"] == "x"] == [True]
 
 
 def test_gnu_conditional_with_an_omitted_middle_is_no_conversion_of_its_last_operand(fct_facts: dict[str, Any]) -> None:

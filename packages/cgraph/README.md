@@ -280,6 +280,15 @@ These rules follow what the machine code shows, each only where it shows it:
   (__set_fixmap's `pte_clear(&init_mm, …)`, whose mm reaches only `__set_pte_at`'s flush under
   `pte_present(__pte(0))`), and is `conditional` where it is not, as the image decides where it
   inlines it (cap_inode_getsecurity's `kuid_root_in_ns(kuid, current_user_ns())`).
+- A call's value is its callee's returns only where the compiler folds that body into the caller
+  (`_Evaluator.folds_into`): a function declared `inline`, a static one the unit calls once, or one
+  whose body is small enough that clang -O2 inlines it (`_small_body`, weighed bottom-up with the
+  inline bodies it calls); never one marked `noinline`, `optnone`, `noipa`, `naked` or `cold`, weak,
+  or a caller of `va_start`. The last route is a model of clang's inliner, not a rule of the language,
+  so what it decides is left to the image: the events carry a guard with `inlined`, the callee's name,
+  and are `conditional`. A reader that takes `e`, `v`, `u` and `image` needs no change; `inlined`
+  names who decided, so a `conditional` event can be told from one a `__builtin_constant_p` choice
+  made.
 - A call whose value nothing uses (a discarded value that has an effect, such as an argument the
   callee ignores) is marked `value_unused`; the facts give the callee a second event set,
   `value_unused`, from its walk with each return's value discarded, and link folds that set there:
