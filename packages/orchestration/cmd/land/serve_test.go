@@ -92,14 +92,10 @@ func TestServeFormsItsFirstBatchFromTheReadyMigrations(t *testing.T) {
 		}
 	}
 
-	// One round, then the loop waits and the ended context stops it.
-	round, stop := context.WithTimeout(ctx, 5*time.Minute)
-	defer stop()
-	var output bytes.Buffer
-	err := run(round, []string{"serve", "--config", servingConfig(t, "owner/repo", repo, dsnFile, time.Hour)}, &output)
-	if err == nil || !strings.Contains(err.Error(), "context") {
-		t.Fatalf("serve() error = %v, want the ended context, and never a configured batch", err)
-	}
+	// The first round's line is the event: its build and hasher run in containers, so it waits for that line, not
+	// for a fixed time.
+	output := serveInBackground(t, servingConfig(t, "owner/repo", repo, dsnFile, time.Hour))
+	line := firstRound(t, output, 10*time.Minute)
 	var batches []struct {
 		ID            string `json:"id"`
 		Base          string `json:"base"`
@@ -109,8 +105,8 @@ func TestServeFormsItsFirstBatchFromTheReadyMigrations(t *testing.T) {
 			ReadyEvent int64  `json:"ready_event"`
 		} `json:"frozenMembers"`
 	}
-	if err := json.Unmarshal(output.Bytes(), &batches); err != nil {
-		t.Fatalf("decode the serve output %q: %v", output.String(), err)
+	if err := json.Unmarshal(line, &batches); err != nil {
+		t.Fatalf("decode the serve output %q: %v", line, err)
 	}
 	if len(batches) != 1 || batches[0].Base != base || len(batches[0].FrozenMembers) != 2 {
 		t.Fatalf("serve formed %+v, want one batch at the branch tip with two members", batches)
@@ -132,15 +128,9 @@ func TestServeWithNoReadyMigrationFormsNothing(t *testing.T) {
 	repo, _, _ := readyRepository(t)
 	_, dsnFile := servingLedger(t, "owner/repo")
 
-	round, stop := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer stop()
-	var output bytes.Buffer
-	err := run(round, []string{"serve", "--config", servingConfig(t, "owner/repo", repo, dsnFile, time.Hour)}, &output)
-	if err == nil || !strings.Contains(err.Error(), "context") {
-		t.Fatalf("serve() error = %v, want the ended context", err)
-	}
-	if strings.TrimSpace(output.String()) != "[]" {
-		t.Fatalf("serve wrote %q, want no batch", output.String())
+	output := serveInBackground(t, servingConfig(t, "owner/repo", repo, dsnFile, time.Hour))
+	if line := firstRound(t, output, 10*time.Minute); string(line) != "[]" {
+		t.Fatalf("serve wrote %q, want no batch", line)
 	}
 }
 
