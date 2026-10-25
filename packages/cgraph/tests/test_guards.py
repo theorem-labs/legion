@@ -1463,3 +1463,45 @@ def test_a_value_the_compiler_keeps_is_not_taken_from_a_narrowing_cast_a_volatil
     assert "warn" in callees("volatile_test")
     assert "note" in callees("in_body_goto")
     assert "note" in {call["callee"] for call in fold(facts, "body_goto", "guarded_goto").calls}
+
+
+SECOND_REVIEW = """
+    int both_exit(int c, int d)
+    {
+        int x;
+        x = 0;
+        if (d)
+            goto out;
+        if (c) { x = 1; return 1; } else { x = 2; return 2; }
+    out:
+        if (x)
+            warn();
+        return 0;
+    }
+    static inline void masked(unsigned int mode) { mode &= 7; if (!mode) mode = 4; if (mode & 4) warn(); kept(); }
+    void masked_eight(void) { masked(8); }
+    int asm_goto(int n)
+    {
+        int x = n;
+        asm goto("" :::: hit);
+        x = 0;
+    hit:
+        if (x)
+            warn();
+        return 0;
+    }
+"""
+
+
+def test_the_flow_rules_survive_exits_op_assignments_and_asm_goto(tmp_path: Path) -> None:
+    """Probes from the lane's second review: both arms exit before a label (extract raised a TypeError);
+    `mode &= 7; if (!mode) mode = 4;` makes mode 4 for 8, so `warn` stays; an asm goto enters `hit` with
+    x = n, which libclang shows no label for, so `warn` stays."""
+    facts = facts_of(tmp_path, SECOND_REVIEW)
+
+    def callees(function: str) -> set[str]:
+        return {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+
+    assert "warn" in callees("both_exit")
+    assert "warn" in {call["callee"] for call in fold(facts, "masked_eight", "masked").calls}
+    assert "warn" in callees("asm_goto")
