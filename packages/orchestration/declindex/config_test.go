@@ -109,7 +109,9 @@ func TestConfigReadsTheIndexItsStateAndItsReaderRole(t *testing.T) {
 		t.Fatalf("the configuration file set a connection string: %q", c.DSN)
 	}
 	c.DSN = "postgres://example.invalid/declindex"
-	want := Target{DSN: c.DSN, Index: "machcsl", Reader: "declindex_ro"}
+	// The target names the file whose lock guards the tree, in the state directory, outside the tree.
+	want := Target{DSN: c.DSN, Index: "machcsl", Reader: "declindex_ro",
+		TreeLock: filepath.Join(resolved(t, filepath.Dir(config)), "state", "tree.lock")}
 	if got := c.Target(); got != want {
 		t.Fatalf("Target() = %+v, want %+v", got, want)
 	}

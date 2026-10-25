@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/legion/orchestration/internal/indextest"
 )
@@ -167,26 +168,52 @@ func TestAWriteNamesTheIndexSchemaInItsOwnTransaction(t *testing.T) {
 	}
 }
 
-// The refresh lock is a session's: a route that pools transactions holds it on a backend that the next
-// transaction does not get, so the refresh would write with no lock, and nothing would stop a second refresh.
-// Every write reads the backend again and refuses when it changed.
-func TestAWriteRefusesABackendThatDoesNotHoldTheLock(t *testing.T) {
+// Every route to the shared server pools transactions, so a lock of the server lives only as long as the
+// transaction that took it: each write transaction takes the index's lock itself, and a second writer waits for
+// the first transaction to commit, whatever connection or machine it came from.
+func TestAWriteTransactionHoldsTheIndexLockUntilItCommits(t *testing.T) {
 	ctx := context.Background()
-	s := openStore(t)
-	unlock, err := s.lockRefresh(ctx)
+	target := indexTarget(t)
+	first, second := openAt(t, target), openAt(t, target)
+	unlock, err := first.lockRefresh(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unlock()
-	s.refreshBackend++ // the backend that answers is not the one that took the lock
-	err = s.writeTx(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `SELECT 1`)
-		return err
-	})
-	if err == nil {
-		t.Fatal("a write on a backend that holds no lock was allowed")
+	// The second writer takes no tree lock of its own (a refresh on another machine), so only the index's
+	// lock holds it back.
+	conn, err := second.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "not one session") {
-		t.Errorf("the refusal does not say what is wrong: %v", err)
+	defer conn.Release()
+	second.refresh = conn
+	waiting := make(chan error, 1)
+	started := make(chan struct{})
+	if err := first.writeTx(ctx, func(pgx.Tx) error {
+		go func() {
+			close(started)
+			waiting <- second.writeTx(ctx, func(tx pgx.Tx) error {
+				_, err := tx.Exec(ctx, `SELECT 1`)
+				return err
+			})
+		}()
+		<-started
+		select {
+		case err := <-waiting:
+			t.Errorf("a second write ran while the first transaction held the index's lock: %v", err)
+		case <-time.After(300 * time.Millisecond):
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-waiting:
+		if err != nil {
+			t.Fatalf("the second write after the first committed: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second write did not run after the first transaction committed")
 	}
 }

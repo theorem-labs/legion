@@ -50,7 +50,7 @@ func goldenTree(t *testing.T) Tree {
 // schema idx in it.
 func indexTarget(t *testing.T) Target {
 	t.Helper()
-	return Target{DSN: indextest.DSN(t), Index: "idx"}
+	return Target{DSN: indextest.DSN(t), Index: "idx", TreeLock: filepath.Join(t.TempDir(), "tree.lock")}
 }
 
 // openAt opens the index tg, which Open creates when the database holds none.
@@ -67,6 +67,34 @@ func openAt(t *testing.T, tg Target) *Store {
 func openStore(t *testing.T) *Store {
 	t.Helper()
 	return openAt(t, indexTarget(t))
+}
+
+// execIndex runs one statement in the index's schema, for a test that writes rows no refresh would write. No
+// connection of the store names a schema of its own, so the statement runs in a transaction that names it.
+func execIndex(t *testing.T, s *Store, sql string, args ...any) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, namedSchema(s.index)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, sql, args...); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setIndexMeta writes one of the index's own values, for a test that puts the index in a state a refresh would
+// not leave (another schema version, another compiled commit).
+func setIndexMeta(t *testing.T, s *Store, k, v string) {
+	t.Helper()
+	execIndex(t, s, `INSERT INTO meta (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, k, v)
 }
 
 func refreshed(t *testing.T, tree Tree) *Store {
@@ -516,9 +544,7 @@ func TestOpenRebuildsAnOlderSchemaOnlyUnderTheIndexLock(t *testing.T) {
 			t.Fatal(err)
 		}
 		if tg == older {
-			if err := setMeta(ctx, s.pool, "schema", "3"); err != nil {
-				t.Fatal(err)
-			}
+			setIndexMeta(t, s, "schema", "3")
 		}
 		if err := s.Close(); err != nil {
 			t.Fatal(err)

@@ -96,7 +96,7 @@ func TestRefreshKeysSourcesRelativeToASubdirectoryTree(t *testing.T) {
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "base"}); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT path, blob FROM sources`)
+	rows, err := s.pool.Query(ctx, `SELECT path, blob FROM idx.sources`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestRefreshStoresSourcesAndTheReplacedCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got string
-	if err := s.pool.QueryRow(ctx, `SELECT blob FROM sources WHERE path = 'Golden.lean'`).Scan(&got); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT blob FROM idx.sources WHERE path = 'Golden.lean'`).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	if want := gitIn(t, tree.Source, "hash-object", "--", "Golden.lean"); got != want {
@@ -165,15 +165,9 @@ func TestOpenRebuildsAnOlderSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO sources (path, blob) VALUES ('Root.lean', 'deadbeef')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := setMeta(ctx, s.pool, "built", "now"); err != nil {
-		t.Fatal(err)
-	}
-	if err := setMeta(ctx, s.pool, "schema", "2"); err != nil {
-		t.Fatal(err)
-	}
+	execIndex(t, s, `INSERT INTO sources (path, blob) VALUES ('Root.lean', 'deadbeef')`)
+	setIndexMeta(t, s, "built", "now")
+	setIndexMeta(t, s, "schema", "2")
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +183,7 @@ func TestOpenRebuildsAnOlderSchema(t *testing.T) {
 		t.Fatalf("built = %q, %v; want empty after rebuild", got, err)
 	}
 	var sources int
-	if err := rebuilt.pool.QueryRow(ctx, `SELECT COUNT(*) FROM sources`).Scan(&sources); err != nil {
+	if err := rebuilt.pool.QueryRow(ctx, `SELECT COUNT(*) FROM idx.sources`).Scan(&sources); err != nil {
 		t.Fatal(err)
 	}
 	if sources != 0 {
@@ -217,9 +211,7 @@ func TestAnIndexOfThePreviousSchemaIsRebuiltByTheNextRefresh(t *testing.T) {
 		`DELETE FROM meta WHERE k IN ('compiled_commit', 'source_prefix')`,
 		`UPDATE meta SET v = '3' WHERE k = 'schema'`,
 	} {
-		if _, err := s.pool.Exec(ctx, statement); err != nil {
-			t.Fatal(err)
-		}
+		execIndex(t, s, statement)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)

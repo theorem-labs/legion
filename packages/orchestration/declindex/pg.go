@@ -7,13 +7,17 @@ import (
 	"hash/fnv"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sys/unix"
 )
 
 // Target is where one index lives: a Postgres database, and a schema of it that holds this index alone. Many
@@ -28,6 +32,10 @@ type Target struct {
 	// Reader is the read-only role that Open grants USAGE on the schema and SELECT on its tables; empty grants
 	// nothing.
 	Reader string
+	// TreeLock is the file whose flock guards the indexed tree on its machine (lockTree): a refresh holds it
+	// exclusive for its whole run, and a reader of the tree (IndexAndTree) shared. It is in the index's state
+	// directory, outside the tree. Empty guards nothing, for a caller that runs alone.
+	TreeLock string
 }
 
 // indexNamePattern is what a schema name of an index may be: lower-case, so that no quoted name differs from an
@@ -74,7 +82,10 @@ func Unreachable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, errUnreachable) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+	// A connection the driver has already closed, a half-read answer, a closed socket: the question never
+	// reached the server, or its answer never came back.
+	if errors.Is(err, errUnreachable) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, pgconn.ErrConnClosed) {
 		return true
 	}
 	var connErr *pgconn.ConnectError
@@ -128,19 +139,16 @@ func unreachable(conn *pgx.Conn, err error) error {
 
 // openPool connects to the index's database. Every statement of the store is unqualified and resolved by the
 // search_path, which names the index's schema alone, so that one connection string serves every index of a
-// server. How the search_path is set depends on the route:
+// server.
 //
-// A writer (session) holds one connection for its whole run, for its advisory lock and its writes, so it needs a
-// route that keeps a session: the VM's Cloud SQL Auth Proxy, or the server itself. It names its schema once for
-// each connection.
-//
-// A reader may go through a transaction pooler, which gives each transaction another server connection: the
-// owners' pods read the shared server that way. Such a pooler refuses a connection that asks for a startup
-// parameter it does not carry ("unsupported startup parameter: search_path", SQLSTATE 08P01), and a SET of a
-// session would reach another client's transaction. So a reader sends no parameter of its own and names its
-// schema inside its own transaction (OpenReadOnly), and it prepares no statement by name, because the named
-// statement would live on a server connection that the next transaction does not get.
-func openPool(ctx context.Context, t Target, session bool) (*pgxpool.Pool, error) {
+// No connection keeps state of its own between transactions. The shared server pools transactions on every
+// route it offers (Cloud SQL's managed connection pooling, behind the Auth Proxy too): each transaction may get
+// another server backend, a startup parameter it does not carry is refused ("unsupported startup parameter:
+// search_path", SQLSTATE 08P01), and a session's SET would reach another client. So the store names its schema
+// inside each transaction (SET LOCAL search_path), takes its lock inside the transaction that writes
+// (pg_advisory_xact_lock), and prepares no statement by name, because a named statement would live on a backend
+// that the next transaction does not get.
+func openPool(ctx context.Context, t Target) (*pgxpool.Pool, error) {
 	if err := ValidIndexName(t.Index); err != nil {
 		return nil, err
 	}
@@ -151,19 +159,15 @@ func openPool(ctx context.Context, t Target, session bool) (*pgxpool.Pool, error
 	if err != nil {
 		return nil, fmt.Errorf("read the index's connection string: %w", err)
 	}
-	if session {
-		schema := pgx.Identifier{t.Index}.Sanitize()
-		cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-			_, err := conn.Exec(ctx, "SET search_path = "+schema)
-			return err
-		}
-	} else if cfg.ConnConfig.DefaultQueryExecMode == pgx.QueryExecModeCacheStatement {
+	// A connection string may carry its own search_path; a pooler refuses it, and the store names its own.
+	delete(cfg.ConnConfig.RuntimeParams, "search_path")
+	if cfg.ConnConfig.DefaultQueryExecMode == pgx.QueryExecModeCacheStatement {
 		// The driver's default caches prepared statements by name. A connection string that names another
 		// mode keeps it, for a pooler that does carry prepared statements.
 		cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
 	}
-	// A refresh holds one connection for its whole run, for its advisory lock and its writes, and reads the
-	// index on another. A pool of one would deadlock: the refresh would wait for a connection it holds itself.
+	// A refresh holds one connection for its writes and reads the index on another. A pool of one would
+	// deadlock: the refresh would wait for a connection it holds itself.
 	if cfg.MaxConns < 2 {
 		cfg.MaxConns = 2
 	}
@@ -174,81 +178,64 @@ func openPool(ctx context.Context, t Target, session bool) (*pgxpool.Pool, error
 	return pool, nil
 }
 
-// lock takes the index's advisory lock on conn, exclusive for a refresh and shared for a reader of the tree, and
-// waits for it until ctx ends (pgx cancels the waiting statement). The lock lives with the connection: a
-// connection that drops gives it up, with any transaction it carried.
-//
-// It gives the server backend that holds the lock. A route that pools transactions hands the next transaction
-// another backend, which holds neither the lock nor what the session set, so every user of the lock reads the
-// backend again before it acts (sameBackend).
-func lock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool) (uint32, error) {
+// namedSchema is the statement that begins every transaction of the store: it names the index's schema for that
+// transaction alone.
+func namedSchema(index string) string {
+	return "SET LOCAL search_path = " + pgx.Identifier{index}.Sanitize()
+}
+
+// xactLock takes the index's advisory lock for the rest of tx, exclusive, and waits for it until ctx ends (pgx
+// cancels the waiting statement). The lock lives with the transaction, as everything on a pooled route must:
+// two transactions that write one index run one after the other, and the commit or the rollback gives it back.
+func xactLock(ctx context.Context, tx pgx.Tx, index string) error {
 	k1, k2 := lockKeys(index)
-	q := `SELECT pg_advisory_lock_shared($1, $2)`
-	if exclusive {
-		q = `SELECT pg_advisory_lock($1, $2)`
-	}
-	if _, err := conn.Exec(ctx, q, k1, k2); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, k1, k2); err != nil {
 		// A wait that ctx ended is that, whatever the driver made of the cancelled statement.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return 0, fmt.Errorf("wait for the lock of index %q: %w", index, ctxErr)
+			return fmt.Errorf("wait for the lock of index %q: %w", index, ctxErr)
 		}
-		return 0, fmt.Errorf("wait for the lock of index %q: %w", index, err)
-	}
-	pid, err := backendPID(ctx, conn)
-	if err != nil {
-		return 0, fmt.Errorf("the lock of index %q: %w", index, err)
-	}
-	return pid, nil
-}
-
-// backendPID is the server backend that answers on q now.
-func backendPID(ctx context.Context, q querier) (uint32, error) {
-	var pid uint32
-	err := q.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid)
-	return pid, err
-}
-
-// sameBackend refuses to go on when the backend that answers is not the one that took the index's lock: the
-// connection went through something that pools transactions, so the lock is held by a backend this command no
-// longer has, and what the session set (its schema) is not there either. A refresh, a gate and a ledger check
-// must reach the server over a route that keeps a session, such as the build machine's Cloud SQL Auth Proxy.
-func sameBackend(ctx context.Context, q querier, index string, locked uint32) error {
-	pid, err := backendPID(ctx, q)
-	if err != nil {
-		return err
-	}
-	if pid != locked {
-		return fmt.Errorf("the connection to index %q is not one session: the server backend changed from %d to %d, "+
-			"so the index's lock is no longer held; a refresh, a gate and a ledger check need a route that keeps a "+
-			"session, not one that pools transactions", index, locked, pid)
+		return fmt.Errorf("wait for the lock of index %q: %w", index, err)
 	}
 	return nil
 }
 
-// unlock gives back a lock that lock took. Postgres returns false when this session did not hold it. A failed
-// unlock leaves the session uncertain, so its caller must close that physical connection instead of returning it
-// to the pool.
-func unlock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool) error {
-	k1, k2 := lockKeys(index)
-	q := `SELECT pg_advisory_unlock_shared($1, $2)`
+// lockTree takes the flock on path, exclusive (creating the file) or shared, and waits for it until ctx ends: a
+// blocking flock would not notice a signal. It guards the indexed tree on the machine that holds it, which no
+// database lock can: a refresh fetches, checks out and builds the tree and then reads it, and a gate and a ledger
+// check read the tree too, each for a whole run that is many transactions long. A shared lock opens the file
+// read-only when it is there, so that it works in a read-only state directory, and creates it otherwise.
+func lockTree(ctx context.Context, path string, exclusive bool) (func(), error) {
+	flag, how := os.O_RDONLY, unix.LOCK_SH
 	if exclusive {
-		q = `SELECT pg_advisory_unlock($1, $2)`
+		flag, how = os.O_CREATE|os.O_RDWR, unix.LOCK_EX
 	}
-	var released bool
-	if err := conn.QueryRow(context.WithoutCancel(ctx), q, k1, k2).Scan(&released); err != nil {
-		return fmt.Errorf("release the lock of index %q: %w", index, err)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("the lock of the indexed tree: %w", err)
 	}
-	if !released {
-		return fmt.Errorf("release the lock of index %q: this connection did not hold it", index)
+	f, err := os.OpenFile(path, flag, 0o644)
+	if !exclusive && errors.Is(err, os.ErrNotExist) {
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	}
-	return nil
-}
-
-// releaseLock gives back the lock and returns a clean connection to the pool, or closes a connection whose lock
-// state could not be proved clean. Closing ends the Postgres session, which releases every session advisory lock.
-func releaseLock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool) {
-	if err := unlock(ctx, conn, index, exclusive); err != nil {
-		_ = conn.Conn().Close(context.WithoutCancel(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("the lock of the indexed tree: %w", err)
 	}
-	conn.Release()
+	for wait := time.Millisecond; ; wait = min(2*wait, 250*time.Millisecond) {
+		err := unix.Flock(int(f.Fd()), how|unix.LOCK_NB)
+		if err == nil {
+			return func() {
+				_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+				_ = f.Close()
+			}, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EINTR) {
+			_ = f.Close()
+			return nil, fmt.Errorf("the lock of the indexed tree %s: %w", path, err)
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, fmt.Errorf("wait for the lock of the indexed tree %s: %w", path, ctx.Err())
+		case <-time.After(wait):
+		}
+	}
 }

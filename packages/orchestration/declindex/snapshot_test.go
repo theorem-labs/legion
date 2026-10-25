@@ -96,12 +96,8 @@ func TestAReaderReadsOneStateOfTheIndexWhileARefreshWritesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The compiled part of one, as a compiled step leaves it: here one constant, of the module that two removes.
-	if _, err := writer.pool.Exec(ctx, `INSERT INTO consts (name, module, kind, type, cstmt) VALUES ('Gold2.FrameAt', 'Sub.Wrap', 'def', 'Prop', 'hash-one')`); err != nil {
-		t.Fatal(err)
-	}
-	if err := setMeta(ctx, writer.pool, "compiled_commit", "one"); err != nil {
-		t.Fatal(err)
-	}
+	execIndex(t, writer, `INSERT INTO consts (name, module, kind, type, cstmt) VALUES ('Gold2.FrameAt', 'Sub.Wrap', 'def', 'Prop', 'hash-one')`)
+	setIndexMeta(t, writer, "compiled_commit", "one")
 	old, err := OpenReadOnly(ctx, tg, IndexOnly)
 	if err != nil {
 		t.Fatal(err)
@@ -166,9 +162,7 @@ func TestCompiledCommitRefusesAnIndexWhoseTwoPartsAreOfDifferentCommits(t *testi
 	s := refreshed(t, goldenTree(t))
 	check := func(compiled string, required bool, want string) {
 		t.Helper()
-		if err := setMeta(ctx, s.pool, "compiled_commit", compiled); err != nil {
-			t.Fatal(err)
-		}
+		setIndexMeta(t, s, "compiled_commit", compiled)
 		got, err := s.CompiledCommit(ctx, required)
 		switch {
 		case want == "" && err == nil:

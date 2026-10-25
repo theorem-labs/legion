@@ -20,7 +20,7 @@ import (
 // pgIndex opens an index of a database of its own, closed when the test ends.
 func pgIndex(t *testing.T) (*Store, Target) {
 	t.Helper()
-	target := Target{DSN: indextest.DSN(t), Index: "idx"}
+	target := Target{DSN: indextest.DSN(t), Index: "idx", TreeLock: filepath.Join(t.TempDir(), "tree.lock")}
 	s, err := Open(context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
@@ -75,22 +75,16 @@ func pgWrite(t *testing.T, s *Store, f func(pgx.Tx) error) {
 func TestTheIndexOrdersNamesByTheirBytes(t *testing.T) {
 	s, _ := pgIndex(t)
 	ctx := context.Background()
-	if _, err := s.pool.Exec(ctx, `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
-		VALUES ('A', 'A', 'M', 'theorem', 1, 'h')`); err != nil {
-		t.Fatal(err)
-	}
+	execIndex(t, s, `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
+		VALUES ('A', 'A', 'M', 'theorem', 1, 'h')`)
 	for _, name := range []string{"Ab", "A_b", "A/b", "A.b", "A"} {
-		if _, err := s.pool.Exec(ctx, `INSERT INTO uses (target, tmodule, module, line, col, parent, cls)
-			VALUES ($1, 'M', 'U', 1, 1, 'User', 'proof')`, name); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := s.pool.Exec(ctx, `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
-			VALUES ($1, $1, 'U', 'theorem', 1, 'h')`, name); err != nil {
-			t.Fatal(err)
-		}
+		execIndex(t, s, `INSERT INTO uses (target, tmodule, module, line, col, parent, cls)
+			VALUES ($1, 'M', 'U', 1, 1, 'User', 'proof')`, name)
+		execIndex(t, s, `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
+			VALUES ($1, $1, 'U', 'theorem', 1, 'h')`, name)
 	}
 	var order []string
-	rows, err := s.pool.Query(ctx, `SELECT name FROM decls WHERE module = 'U' ORDER BY name`)
+	rows, err := s.pool.Query(ctx, `SELECT name FROM idx.decls WHERE module = 'U' ORDER BY name`)
 	if err := eachRow(rows, err, func(r pgx.Rows) error {
 		var n string
 		if err := r.Scan(&n); err != nil {
@@ -105,7 +99,7 @@ func TestTheIndexOrdersNamesByTheirBytes(t *testing.T) {
 		t.Errorf("the index ordered the names %v, not %v", order, want)
 	}
 	var inRange []string
-	rows, err = s.pool.Query(ctx, `SELECT target FROM uses WHERE target >= 'A.' AND target < 'A/' ORDER BY target`)
+	rows, err = s.pool.Query(ctx, `SELECT target FROM idx.uses WHERE target >= 'A.' AND target < 'A/' ORDER BY target`)
 	if err := eachRow(rows, err, func(r pgx.Rows) error {
 		var n string
 		if err := r.Scan(&n); err != nil {
@@ -320,9 +314,7 @@ func TestTheReaderRoleReadsARebuiltIndexAndCannotWriteIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// An index of another schema version: the next Open rebuilds it from nothing, and grants its reads again.
-	if err := setMeta(ctx, s.pool, "schema", "13"); err != nil {
-		t.Fatal(err)
-	}
+	setIndexMeta(t, s, "schema", "13")
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -331,9 +323,7 @@ func TestTheReaderRoleReadsARebuiltIndexAndCannotWriteIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = rebuilt.Close() }()
-	if _, err := rebuilt.pool.Exec(ctx, `INSERT INTO modules (rel, module, ilean_key) VALUES ('Gold', 'Gold', 'k')`); err != nil {
-		t.Fatal(err)
-	}
+	execIndex(t, rebuilt, `INSERT INTO modules (rel, module, ilean_key) VALUES ('Gold', 'Gold', 'k')`)
 	readerTarget := Target{DSN: readerDSN, Index: "idx"}
 	reader, err := OpenReadOnly(ctx, readerTarget, IndexOnly)
 	if err != nil {
@@ -347,12 +337,12 @@ func TestTheReaderRoleReadsARebuiltIndexAndCannotWriteIt(t *testing.T) {
 	if n != 1 {
 		t.Errorf("the reader counted %d modules, not 1", n)
 	}
-	pool, err := openPool(ctx, readerTarget, true)
+	pool, err := openPool(ctx, readerTarget)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	_, err = pool.Exec(ctx, `INSERT INTO meta (k, v) VALUES ('commit', 'beef')`)
+	_, err = pool.Exec(ctx, `INSERT INTO idx.meta (k, v) VALUES ('commit', 'beef')`)
 	if err == nil {
 		t.Fatal("the reader role wrote the index")
 	}
@@ -367,9 +357,7 @@ func TestTheReaderRoleReadsARebuiltIndexAndCannotWriteIt(t *testing.T) {
 func TestAReaderOfAnotherSchemaVersionIsRefused(t *testing.T) {
 	s, target := pgIndex(t)
 	ctx := context.Background()
-	if err := setMeta(ctx, s.pool, "schema", "13"); err != nil {
-		t.Fatal(err)
-	}
+	setIndexMeta(t, s, "schema", "13")
 	_, err := OpenReadOnly(ctx, target, IndexOnly)
 	if err == nil {
 		t.Fatal("a reader read an index of another schema version")

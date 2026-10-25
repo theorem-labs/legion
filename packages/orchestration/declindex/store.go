@@ -87,31 +87,30 @@ CREATE TABLE landings (landed text COLLATE "C" PRIMARY KEY, previous text COLLAT
 // reads rows from. meta and landings hold a handful of rows that no plan turns on.
 var analyzed = []string{"sources", "modules", "imports", "decls", "uses", "edges", "consts", "atoms", "facts", "without_forms"}
 
-// Store is an open index: a pool to the index's database, whose connections resolve every unqualified name in the
-// index's schema.
+// Store is an open index: a pool to the index's database. Every statement is unqualified and runs in a
+// transaction that names the index's schema first (namedSchema), since no connection keeps a schema of its own.
 type Store struct {
 	pool *pgxpool.Pool
 	// index is the schema that holds this index, and the name every message of the store gives it.
 	index string
-	// q is what every read of the store goes through: the pool, or for a store opened read-only its snapshot.
+	// treeLock is the file whose flock guards the indexed tree (Target.TreeLock); empty guards nothing.
+	treeLock string
+	// q is what every read of the store goes through: for a writable store a transaction for each read
+	// (poolReader), for a store opened read-only its snapshot.
 	q querier
-	// release ends what a store opened read-only holds: its snapshot, its shared hold on the index's lock, and
-	// the connection that carries both.
+	// release ends what a store opened read-only holds: its snapshot, the connection that carries it, and its
+	// shared hold on the tree.
 	release func()
-	// refresh is the connection that holds the index's lock while a refresh or a schema rebuild runs: its advisory
-	// lock, and its write transactions, live and die with it (writeTx).
+	// refresh is the connection that a refresh or a schema rebuild writes on, while it holds the tree's lock.
+	// Each write transaction on it takes the index's lock for itself (writeTx).
 	refresh *pgxpool.Conn
-	// refreshBackend is the server backend that took the refresh lock. Every write reads the backend again:
-	// a route that pools transactions would give the next one another backend, which holds neither the lock
-	// nor the schema the session named (sameBackend).
-	refreshBackend uint32
 
 	// mu guards derived, and serialises the reads of a store that two goroutines share: one connection runs one
 	// query at a time.
 	mu      sync.Mutex
 	derived derived
 
-	// afterRefreshLock is a test hook. Refresh runs it once it holds the index's lock, before the landed sync.
+	// afterRefreshLock is a test hook. Refresh runs it once it holds the tree's lock, before the landed sync.
 	afterRefreshLock func(context.Context) error
 }
 
@@ -132,12 +131,12 @@ func (s *Store) forget() {
 // schema version, so that the next refresh fills it from nothing. Only a refresh and the tests open an index so;
 // every other command opens it read-only.
 func Open(ctx context.Context, t Target) (*Store, error) {
-	pool, err := openPool(ctx, t, true)
+	pool, err := openPool(ctx, t)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{pool: pool, index: t.Index}
-	s.q = pool
+	s := &Store{pool: pool, index: t.Index, treeLock: t.TreeLock}
+	s.q = poolReader{pool: pool, index: t.Index}
 	if err := s.init(ctx, t.Reader); err != nil {
 		pool.Close()
 		return nil, err
@@ -154,8 +153,8 @@ const (
 	// state of the index while a refresh writes the next. land-hash reads so.
 	IndexOnly ReadScope = iota
 	// IndexAndTree also reads the configured tree (its HEAD, its commits or its build), which a refresh's sync
-	// checks out and builds, so it holds the index's lock shared: it waits for the whole refresh, and a refresh
-	// waits for it. The ledger and the gate read so.
+	// checks out and builds, so it holds the tree's lock shared (Target.TreeLock): it waits for the whole
+	// refresh, and a refresh waits for it. The ledger and the gate read so.
 	IndexAndTree
 )
 
@@ -164,76 +163,52 @@ const (
 // queries likewise.
 //
 // The store reads one state of the index for its whole life: one repeatable-read transaction, begun here and ended
-// by Close, carries every read. So a command never sees a refresh's write half done, nor rows of two refreshes. A
-// refresh writes the reference part and the compiled part in two transactions; a reader between them reads the
-// compiled part of the commit before, which its readers refuse (CompiledCommit).
+// by Close, carries every read, and names the index's schema first. So a command never sees a refresh's write half
+// done, nor rows of two refreshes. A refresh writes the reference part and the compiled part in two transactions;
+// a reader between them reads the compiled part of the commit before, which its readers refuse (CompiledCommit).
 //
-// A reader of the tree (IndexAndTree) also holds the index's advisory lock shared, on the same connection and
-// before its transaction begins, so that no refresh checks out or builds another commit of the tree while it
-// reads. A reader of the index alone holds no lock: a refresh can commit while it reads, and the reader goes on
-// reading the state its snapshot began with.
+// A reader of the tree (IndexAndTree) also holds the tree's lock shared, from before its transaction begins until
+// Close, so that no refresh checks out or builds another commit of the tree while it reads. A reader of the index
+// alone holds no lock: a refresh can commit while it reads, and the reader goes on reading the state its snapshot
+// began with.
 func OpenReadOnly(ctx context.Context, t Target, scope ReadScope) (*Store, error) {
-	pool, err := openPool(ctx, t, false)
+	unlockTree := func() {}
+	if scope == IndexAndTree && t.TreeLock != "" {
+		var err error
+		if unlockTree, err = lockTree(ctx, t.TreeLock, false); err != nil {
+			return nil, err
+		}
+	}
+	pool, err := openPool(ctx, t)
 	if err != nil {
+		unlockTree()
 		return nil, err
 	}
-	s := &Store{pool: pool, index: t.Index}
+	fail := func(err error) (*Store, error) {
+		pool.Close()
+		unlockTree()
+		return nil, fmt.Errorf("open the index %q read-only: %w", t.Index, err)
+	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("open the index %q read-only: %w", t.Index, err)
+		return fail(err)
 	}
-	shared := scope == IndexAndTree
-	var locked uint32
-	if shared {
-		if locked, err = lock(ctx, conn, t.Index, false); err != nil {
-			conn.Release()
-			pool.Close()
-			return nil, err
-		}
-	}
-	// The snapshot lives until Close, not until ctx ends; its first read below begins it.
+	// The snapshot lives until Close, not until ctx ends.
 	snapshot, err := conn.BeginTx(context.WithoutCancel(ctx), pgx.TxOptions{AccessMode: pgx.ReadOnly, IsoLevel: pgx.RepeatableRead})
 	if err != nil {
-		if shared {
-			releaseLock(ctx, conn, t.Index, false)
-		} else {
-			conn.Release()
-		}
-		pool.Close()
-		return nil, fmt.Errorf("open the index %q read-only: %w", t.Index, err)
+		conn.Release()
+		return fail(err)
 	}
-	// The schema is named here, not in the connection: a transaction pooler gives each transaction another
-	// server connection, and refuses a startup parameter it does not carry. SET LOCAL lives with this
-	// transaction, so it reaches no other client of that connection.
-	if _, err := snapshot.Exec(ctx, "SET LOCAL search_path = "+pgx.Identifier{t.Index}.Sanitize()); err != nil {
+	if _, err := snapshot.Exec(ctx, namedSchema(t.Index)); err != nil {
 		_ = snapshot.Rollback(context.WithoutCancel(ctx))
-		if shared {
-			releaseLock(ctx, conn, t.Index, false)
-		} else {
-			conn.Release()
-		}
-		pool.Close()
-		return nil, fmt.Errorf("open the index %q read-only: %w", t.Index, err)
+		conn.Release()
+		return fail(err)
 	}
-	s.q = snapshot
-	// A reader of the tree holds the index's lock, which is its session's: if another backend answers this
-	// transaction, the lock is not here, and a refresh could check out and build another commit while it reads.
-	if shared {
-		if err := sameBackend(ctx, snapshot, t.Index, locked); err != nil {
-			_ = snapshot.Rollback(context.WithoutCancel(ctx))
-			releaseLock(ctx, conn, t.Index, false)
-			pool.Close()
-			return nil, err
-		}
-	}
+	s := &Store{pool: pool, index: t.Index, treeLock: t.TreeLock, q: snapshot}
 	s.release = func() {
 		_ = snapshot.Rollback(context.WithoutCancel(ctx))
-		if shared {
-			releaseLock(context.WithoutCancel(ctx), conn, t.Index, false)
-		} else {
-			conn.Release()
-		}
+		conn.Release()
+		unlockTree()
 	}
 	version, err := s.schemaVersion(ctx)
 	if err != nil {
@@ -251,9 +226,9 @@ func OpenReadOnly(ctx context.Context, t Target, scope ReadScope) (*Store, error
 	return s, nil
 }
 
-// init makes the index's schema, or rebuilds an index of another schema version, under the index's lock: two
-// Opens of one index never build it at once, and no refresh writes it while it is rebuilt. An index of this
-// version needs no write, so Open of it takes no lock.
+// init makes the index's schema, or rebuilds an index of another schema version, in one transaction that holds
+// the index's lock: two Opens of one index never build it at once, and no refresh writes it while it is rebuilt.
+// An index of this version needs no write, so Open of it writes nothing.
 func (s *Store) init(ctx context.Context, reader string) error {
 	if err := s.createSchema(ctx); err != nil {
 		return err
@@ -262,28 +237,33 @@ func (s *Store) init(ctx context.Context, reader string) error {
 	if err != nil || version == SchemaVersion {
 		return err
 	}
-	unlock, err := s.lockRefresh(ctx)
+	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("connect to the index %q: %w", s.index, err)
 	}
-	defer unlock()
-	// Another process's Open may have rebuilt it while this one waited for the lock.
-	if version, err = s.schemaVersion(ctx); err != nil || version == SchemaVersion {
-		return err
-	}
+	s.refresh = conn
+	defer func() {
+		s.refresh = nil
+		conn.Release()
+	}()
 	name := pgx.Identifier{s.index}.Sanitize()
-	// One statement, so one implicit transaction: an index is of its old version or of the new one, never of
-	// half of it.
-	if _, err := s.refresh.Exec(ctx, `DROP SCHEMA `+name+` CASCADE; CREATE SCHEMA `+name+`;`+schema); err != nil {
-		return fmt.Errorf("create the schema of index %q: %w", s.index, err)
-	}
-	if reader != "" {
-		role := pgx.Identifier{reader}.Sanitize()
-		if _, err := s.refresh.Exec(ctx, `GRANT USAGE ON SCHEMA `+name+` TO `+role+`; GRANT SELECT ON ALL TABLES IN SCHEMA `+name+` TO `+role); err != nil {
-			return fmt.Errorf("grant %s the reads of index %q: %w", reader, s.index, err)
+	return s.writeTx(ctx, func(tx pgx.Tx) error {
+		// Another process's Open may have rebuilt it while this one waited for the lock.
+		if version, err := schemaVersionIn(ctx, tx, s.index); err != nil || version == SchemaVersion {
+			return err
 		}
-	}
-	return setMeta(ctx, s.refresh, "schema", SchemaVersion)
+		// The transaction named the schema by its name, so the tables below go into the schema made again.
+		if _, err := tx.Exec(ctx, `DROP SCHEMA `+name+` CASCADE; CREATE SCHEMA `+name+`;`+schema); err != nil {
+			return fmt.Errorf("create the schema of index %q: %w", s.index, err)
+		}
+		if reader != "" {
+			role := pgx.Identifier{reader}.Sanitize()
+			if _, err := tx.Exec(ctx, `GRANT USAGE ON SCHEMA `+name+` TO `+role+`; GRANT SELECT ON ALL TABLES IN SCHEMA `+name+` TO `+role); err != nil {
+				return fmt.Errorf("grant %s the reads of index %q: %w", reader, s.index, err)
+			}
+		}
+		return setMeta(ctx, tx, "schema", SchemaVersion)
+	})
 }
 
 // createSchema makes the index's schema when the database has none. Two Opens of a new index can run CREATE
@@ -303,14 +283,26 @@ func (s *Store) createSchema(ctx context.Context) error {
 
 // schemaVersion is the index's schema version, empty for a schema that holds no index: one no refresh ever wrote.
 func (s *Store) schemaVersion(ctx context.Context) (string, error) {
-	var meta *string
-	if err := s.q.QueryRow(ctx, `SELECT to_regclass('meta')::text`).Scan(&meta); err != nil {
+	return schemaVersionIn(ctx, s.q, s.index)
+}
+
+// schemaVersionIn reads the schema version of index with every name qualified, so that it never reads another
+// schema's meta: Open decides on it whether to drop and rebuild the index.
+func schemaVersionIn(ctx context.Context, q querier, index string) (string, error) {
+	meta := pgx.Identifier{index, "meta"}.Sanitize()
+	var found *string
+	if err := q.QueryRow(ctx, `SELECT to_regclass($1)::text`, meta).Scan(&found); err != nil {
 		return "", err
 	}
-	if meta == nil {
+	if found == nil {
 		return "", nil
 	}
-	return s.Meta(ctx, "schema")
+	var v string
+	err := q.QueryRow(ctx, `SELECT v FROM `+meta+` WHERE k = 'schema'`).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return v, err
 }
 
 // Close closes the index: it ends a read-only store's snapshot, gives back its shared hold on the index's lock,
@@ -359,36 +351,38 @@ func (s *Store) CheckComplete(ctx context.Context) error {
 	return nil
 }
 
-// lockRefresh takes the index's advisory lock exclusive, on a connection of its own, so that two refreshes never
-// interleave, and gives the release of both. It waits for the lock until ctx ends.
+// lockRefresh takes the tree's lock exclusive (Target.TreeLock), so that two refreshes never interleave and no
+// reader of the tree reads while a refresh syncs, builds and reads it, and gives a connection to write on. It
+// waits for the lock until ctx ends, and gives the release of both.
 //
-// The whole refresh runs on that connection: its lock, and the two transactions that write the index. If the
-// connection drops, the server gives up its lock and rolls back its open transaction together, so a refresh that
-// loses its connection has written nothing and holds nothing.
+// The tree's lock is the machine's, not the server's: every route to the shared server pools transactions, so no
+// lock of the server outlives the transaction that takes it. Each write transaction therefore takes the index's
+// lock for itself (writeTx); a refresh from another machine is held back by that lock, one transaction at a time.
 func (s *Store) lockRefresh(ctx context.Context) (func(), error) {
+	unlockTree := func() {}
+	if s.treeLock != "" {
+		var err error
+		if unlockTree, err = lockTree(ctx, s.treeLock, true); err != nil {
+			return nil, err
+		}
+	}
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
+		unlockTree()
 		return nil, fmt.Errorf("connect to the index %q: %w", s.index, err)
 	}
-	pid, err := lock(ctx, conn, s.index, true)
-	if err != nil {
-		conn.Release()
-		return nil, err
-	}
-	s.refresh, s.refreshBackend = conn, pid
+	s.refresh = conn
 	return func() {
-		s.refresh, s.refreshBackend = nil, 0
-		releaseLock(ctx, conn, s.index, true)
+		s.refresh = nil
+		conn.Release()
+		unlockTree()
 	}, nil
 }
 
-// writeTx runs f in one transaction of the index on the connection that holds its lock, and commits it when f
-// succeeds. Every write of the index runs so: a writer holds the lock, and a lost connection takes the lock and
-// the transaction with it.
-//
-// The transaction names the index's schema itself and reads the backend that answers it. A route that pools
-// transactions would give it a backend that holds neither the lock nor the schema the session named: then the
-// write would go to no schema, and nothing would hold a second refresh back.
+// writeTx runs f in one transaction of the index and commits it when f succeeds. Every write of the index runs
+// so. The transaction names the index's schema and takes the index's lock before f runs (xactLock), so that two
+// transactions that write one index run one after the other wherever they come from, and a lost connection
+// rolls the transaction back with its lock.
 func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
 	conn := s.refresh
 	if conn == nil {
@@ -399,10 +393,10 @@ func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
 		return unreachable(conn.Conn(), err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if _, err := tx.Exec(ctx, "SET LOCAL search_path = "+pgx.Identifier{s.index}.Sanitize()); err != nil {
+	if _, err := tx.Exec(ctx, namedSchema(s.index)); err != nil {
 		return unreachable(conn.Conn(), err)
 	}
-	if err := sameBackend(ctx, tx, s.index, s.refreshBackend); err != nil {
+	if err := xactLock(ctx, tx, s.index); err != nil {
 		return unreachable(conn.Conn(), err)
 	}
 	if err := f(tx); err != nil {
@@ -411,18 +405,22 @@ func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
 	return unreachable(conn.Conn(), tx.Commit(ctx))
 }
 
-// analyze reads the statistics of the tables a refresh wrote, on the connection that holds the refresh lock:
-// COPY leaves none, so the planner would read a declaration's reach with the wrong plan until autovacuum's nap
-// ended, and the post-landing hooks and the owners' first queries run before that. VACUUM cannot run in a
-// transaction block, so this is one statement of its own, after the writes commit. It does not truncate: a
-// reader that opened after the commit holds the tables a landing emptied rows of, and VACUUM would wait five
-// seconds for each of them to give the lock back.
+// analyze reads the statistics of the tables a refresh wrote: COPY leaves none, so the planner would read a
+// declaration's reach with the wrong plan until autovacuum's nap ended, and the post-landing hooks and the owners'
+// first queries run before that. VACUUM cannot run in a transaction block, so it is one statement of its own,
+// after the writes commit, with every table named with its schema, since no transaction names it. It does not
+// truncate: a reader that opened after the commit holds the tables a landing emptied rows of, and VACUUM would
+// wait five seconds for each of them to give the lock back.
 func (s *Store) analyze(ctx context.Context) error {
 	conn := s.refresh
 	if conn == nil {
 		return fmt.Errorf("analyze the index %q outside its refresh lock", s.index)
 	}
-	_, err := conn.Exec(ctx, "VACUUM (ANALYZE, TRUNCATE false) "+strings.Join(analyzed, ", "))
+	tables := make([]string, len(analyzed))
+	for i, t := range analyzed {
+		tables[i] = pgx.Identifier{s.index, t}.Sanitize()
+	}
+	_, err := conn.Exec(ctx, "VACUUM (ANALYZE, TRUNCATE false) "+strings.Join(tables, ", "))
 	return unreachable(conn.Conn(), err)
 }
 

@@ -159,9 +159,16 @@ func (c Config) GateRegistryDir() (string, error) {
 	return pathInside(c.Tree, c.Registry)
 }
 
-// Target is the index this configuration names: its schema, its connection string and its reader role.
+// Target is the index this configuration names: its schema, its connection string, its reader role and the file
+// whose lock guards the indexed tree on this machine. The lock file is in the state directory, which is outside
+// the tree; a configuration whose state cannot be resolved names no lock, and a command that writes the tree
+// resolves the state anyway (StateDir).
 func (c Config) Target() Target {
-	return Target{DSN: c.DSN, Index: c.Index, Reader: c.Reader}
+	t := Target{DSN: c.DSN, Index: c.Index, Reader: c.Reader}
+	if state, err := c.StateDir(); err == nil {
+		t.TreeLock = filepath.Join(state, "tree.lock")
+	}
+	return t
 }
 
 // StateDir resolves the local directory that holds this index's exporter build and forms module: the configured
