@@ -59,7 +59,7 @@ func effectCommand(ctx context.Context, s *ledger.Store, command string, args []
 		if len(flags) != 3 {
 			return nil, usageOf(effectAttemptUsage)
 		}
-		threshold, err := canonicalInteger("--escalate-after", flags["--escalate-after"][0])
+		threshold, err := integer(flags["--escalate-after"][0])
 		if err != nil {
 			return nil, err
 		}

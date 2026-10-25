@@ -7,23 +7,139 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
+// readyRequest is one submission of head for migration id: its key names the migration and the head, so two
+// submissions of different heads are two submissions, and a repeat of the same head is a retry.
 func readyRequest(id string, generation int64, head string) ledger.ReadyRequest {
-	return ledger.ReadyRequest{
-		Repo:               "r",
-		ID:                 id,
-		Generation:         generation,
-		Head:               head,
-		ChangedContracts:   map[string]string{"A.contract": "hash-2", "B.contract": "hash-3"},
-		CompatibilityProof: "A.compatibility",
-		ReviewedHead:       head,
-		Reviews: []ledger.Review{
-			{Contract: "A.contract", Reviewer: "alice", Head: head},
-			{Contract: "B.contract", Reviewer: "bob", Head: head},
-		},
-		ApprovedPinned: []string{"A.contract", "B.contract"},
+	return ledger.ReadyRequest{Repo: "r", ID: id, Generation: generation, Key: id + "/" + head, StatementRecords: ledger.StatementRecords{Head: head, ChangedContracts: map[string]string{"A.contract": "hash-2", "B.contract": "hash-3"}, CompatibilityProof: "A.compatibility", ReviewedHead: head, Reviews: []ledger.Review{
+		{Contract: "A.contract", Reviewer: "alice", Head: head},
+		{Contract: "B.contract", Reviewer: "bob", Head: head},
+	}, ApprovedPinned: []string{"A.contract", "B.contract"}}}
+}
+
+func readyEventCount(t *testing.T, s *ledger.Store, id string) int {
+	t.Helper()
+	count := 0
+	for _, event := range must(s.Events(context.Background(), "r", 0, id)) {
+		if event.Kind == "migration.ready" {
+			count++
+		}
+	}
+	return count
+}
+
+// TestReadyRetryOfAConsumedSubmissionPublishesNothing catches a retried ready that publishes again a candidate the
+// landing program already returned. The owner's ready for H1 with key k1 commits but its answer is lost; the landing
+// program takes H1 and returns it, which clears the record; the owner retries k1. The retry returns the record k1
+// stored and appends nothing, so ready-list stays empty. A retry with another body replays too, because the key alone
+// names the submission. A new key publishes H1 again (control).
+func TestReadyRetryOfAConsumedSubmissionPublishesNothing(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+	submission := readyRequest("M-1", 1, "H1")
+	submission.Key = "k1"
+	first := must(s.Ready(ctx, submission))
+	must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "H1 build failed",
+		Key: "round-1", ReadyEvent: first.ReadyEvent}))
+
+	retry := must(s.Ready(ctx, submission))
+	if !reflect.DeepEqual(retry, first) {
+		t.Fatalf("retry of k1 = %+v, want the record k1 stored: %+v", retry, first)
+	}
+	other := submission
+	other.Head, other.ReviewedHead = "H9", "H9"
+	if replay := must(s.Ready(ctx, other)); !reflect.DeepEqual(replay, first) {
+		t.Fatalf("k1 with another head = %+v, want the record k1 stored: %+v", replay, first)
+	}
+	if records := must(s.ReadyMigrations(ctx, "r")); len(records) != 0 {
+		t.Fatalf("a retry of a consumed submission published it again: %+v", records)
+	}
+	if n := readyEventCount(t, s, "M-1"); n != 1 {
+		t.Fatalf("%d migration.ready events, want only the first submission's", n)
+	}
+
+	submission.Key = "k2"
+	again := must(s.Ready(ctx, submission))
+	records := must(s.ReadyMigrations(ctx, "r"))
+	if len(records) != 1 || records[0].ReadyEvent != again.ReadyEvent || again.ReadyEvent == first.ReadyEvent {
+		t.Fatalf("a new key did not publish H1 again: %+v, record %+v", records, again)
+	}
+}
+
+// TestReadyConcurrentRetryWithSameKeyPublishesOnce catches a retry that reads ready_keys before the first call
+// commits: the retry waits for the first call's lock and then replays it, instead of publishing a second time or
+// failing on the key.
+func TestReadyConcurrentRetryWithSameKeyPublishesOnce(t *testing.T) {
+	s, dsn := newStoreDSN(t)
+	ctx := context.Background()
+	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+	request := readyRequest("M-1", 1, "H1")
+
+	locker := must(pgx.Connect(ctx, dsn))
+	defer locker.Close(ctx)
+	observer := must(pgx.Connect(ctx, dsn))
+	defer observer.Close(ctx)
+	lock := must(locker.Begin(ctx))
+	locked := true
+	defer func() {
+		if locked {
+			_ = lock.Rollback(ctx)
+		}
+	}()
+	// The first call stops at its event append, inside its transaction, until this lock is released.
+	must(lock.Exec(ctx, `LOCK TABLE events IN SHARE MODE`))
+
+	type answer struct {
+		record ledger.ReadyRecord
+		err    error
+	}
+	first := make(chan answer, 1)
+	go func() {
+		record, err := s.Ready(ctx, request)
+		first <- answer{record, err}
+	}()
+	waitForBlockedConnections(t, observer, 1)
+	retry := make(chan answer, 1)
+	go func() {
+		record, err := s.Ready(ctx, request)
+		retry <- answer{record, err}
+	}()
+	waitForBlockedConnections(t, observer, 2)
+
+	if err := lock.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	a, b := <-first, <-retry
+	if a.err != nil || b.err != nil {
+		t.Fatalf("first: %v, concurrent retry: %v", a.err, b.err)
+	}
+	if !reflect.DeepEqual(a.record, b.record) {
+		t.Fatalf("concurrent retry = %+v, want the first call's record %+v", b.record, a.record)
+	}
+	if n := readyEventCount(t, s, "M-1"); n != 1 {
+		t.Fatalf("concurrent retry appended %d migration.ready events, want 1", n)
+	}
+}
+
+func TestReadyRequiresKey(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+	request := readyRequest("M-1", 1, "H1")
+	request.Key = ""
+	_, err := s.Ready(ctx, request)
+	var invalid *ledger.InvalidError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("empty key: want invalid input, got %v", err)
+	}
+	if records := must(s.ReadyMigrations(ctx, "r")); len(records) != 0 || readyEventCount(t, s, "M-1") != 0 {
+		t.Fatalf("a ready without a key was recorded: %+v", records)
 	}
 }
 
@@ -107,7 +223,7 @@ func TestReadyRefusesClosedStaleAndEscalatedMigrations(t *testing.T) {
 		s := newStore(t)
 		must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
 		for _, key := range []string{"round-1", "round-2", "round-3"} {
-			must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: key}))
+			must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: key, ReadyEvent: unreadyEvent}))
 		}
 		_, err := s.Ready(ctx, readyRequest("M-1", 1, "head"))
 		wantRefusal(t, err, ledger.ReasonEscalated)
@@ -160,7 +276,10 @@ func TestReadyClearsWhenMigrationMovesOn(t *testing.T) {
 		}, "migration.extended"},
 		{"abandon", func(t *testing.T, s *ledger.Store) { must(s.Abandon(ctx, "r", "M-1", 1, "stopped")) }, "migration.abandoned"},
 		{"round", func(t *testing.T, s *ledger.Store) {
-			must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: "round-1"}))
+			ready := must(s.ReadyMigrations(ctx, "r"))
+			must(s.RecordRound(ctx, ledger.RoundRequest{
+				Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: "round-1", ReadyEvent: ready[0].ReadyEvent,
+			}))
 		}, "migration.round_failed"},
 	}
 	for _, test := range tests {

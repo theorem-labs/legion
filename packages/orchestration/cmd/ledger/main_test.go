@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -108,7 +107,7 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 		t.Fatalf("clean check: %v %q", err, check)
 	}
 	invoke("takeover", "r", "M-1", "bob", "1")
-	invoke("round", "r", "M-1", "2", "failed", "--key", "round-1")
+	invoke("round", "r", "M-1", "2", "failed", "--key", "round-1", "--ready-event", "1099511627776")
 	roundStatus := invoke("--json", "status", "r")
 	var openStatus struct {
 		Migrations []struct {
@@ -194,124 +193,6 @@ func TestEveryLedgerSubcommandRoundTrips(t *testing.T) {
 	}
 }
 
-// enqueue, owners, a supervised claim and release-holder round-trip through the command line: the
-// owner is the exact node id, the stored item and its item.enqueued event say so, and the exit codes
-// are 0 for an enqueue or a repeat, 1 for an item another owner holds, and 2 for usage errors.
-func TestOwnerCommandsRoundTrip(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
-	invoke := func(args ...string) string {
-		t.Helper()
-		code, out, errOut := call(args...)
-		if code != 0 {
-			t.Fatalf("%v exited %d: %s", args, code, errOut)
-		}
-		return out
-	}
-	invoke("repo", "ensure", "r", "3")
-	invoke("enqueue", "r", "item-1", "function:get_mountpoint")
-	invoke("enqueue", "r", "item-1", "function:get_mountpoint")
-	invoke("enqueue", "r", "item-2", "struct:mount")
-
-	var item struct {
-		Owner string `json:"owner"`
-		State string `json:"state"`
-	}
-	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &item); err != nil ||
-		item.Owner != "function:get_mountpoint" || item.State != "open" {
-		t.Fatalf("enqueued item: %v %+v", err, item)
-	}
-	var log []struct {
-		Kind    string `json:"kind"`
-		Subject string `json:"subject"`
-		Data    struct {
-			Owner string `json:"owner"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(invoke("--json", "events", "r", "0", "item-1")), &log); err != nil {
-		t.Fatal(err)
-	}
-	enqueued := 0
-	for _, e := range log {
-		if e.Kind == "item.enqueued" {
-			enqueued++
-			if e.Data.Owner != "function:get_mountpoint" {
-				t.Fatalf("enqueue event: %+v", e)
-			}
-		}
-	}
-	if enqueued != 1 {
-		t.Fatalf("%d item.enqueued events for item-1, want 1: %+v", enqueued, log)
-	}
-
-	var owners []struct {
-		Owner   string           `json:"owner"`
-		Refusal *json.RawMessage `json:"refusal"`
-	}
-	if err := json.Unmarshal([]byte(invoke("--json", "owners", "r")), &owners); err != nil ||
-		len(owners) != 2 || owners[0].Owner != "function:get_mountpoint" || owners[1].Owner != "struct:mount" ||
-		owners[0].Refusal != nil || owners[1].Refusal != nil {
-		t.Fatalf("open owners: %v %+v", err, owners)
-	}
-
-	if code, out, _ := call("--json", "enqueue", "r", "item-1", "struct:mount"); code != 1 || !strings.Contains(out, `"reason":"exists"`) {
-		t.Fatalf("enqueue for another owner: code %d output %q", code, out)
-	}
-	for _, usage := range [][]string{{"enqueue", "r", "item-1"}, {"enqueue", "r", "", "struct:mount"}, {"owners"}, {"release-holder", "r", "x"}} {
-		if code, _, _ := call(usage...); code != 2 {
-			t.Fatalf("%v exited %d, want 2", usage, code)
-		}
-	}
-
-	invoke("claim", "r", "item-1", "function:get_mountpoint", "0")
-	var held struct {
-		Holder    string     `json:"holder"`
-		ExpiresAt *time.Time `json:"expires_at"`
-	}
-	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &held); err != nil ||
-		held.Holder != "function:get_mountpoint" || held.ExpiresAt != nil {
-		t.Fatalf("supervised claim: %v %+v", err, held)
-	}
-	var freed []struct {
-		ID         string `json:"id"`
-		Generation int64  `json:"generation"`
-	}
-	if err := json.Unmarshal([]byte(invoke("--json", "release-holder", "r", "function:get_mountpoint", "pane gone")), &freed); err != nil ||
-		len(freed) != 1 || freed[0].ID != "item-1" || freed[0].Generation != 1 {
-		t.Fatalf("released holder: %v %+v", err, freed)
-	}
-	if code, _, _ := call("complete", "r", "item-1", "function:get_mountpoint", "1", "late"); code != 1 {
-		t.Fatalf("late result exited %d, want the refusal's 1", code)
-	}
-	var after struct {
-		Holder string `json:"holder"`
-	}
-	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &after); err != nil || after.Holder != "" {
-		t.Fatalf("item after release-holder: %v %+v", err, after)
-	}
-	invoke("claim", "r", "item-2", "struct:mount", "0")
-	invoke("complete", "r", "item-2", "struct:mount", "1", "done")
-	owners = nil
-	if err := json.Unmarshal([]byte(invoke("--json", "owners", "r")), &owners); err != nil ||
-		len(owners) != 1 || owners[0].Owner != "function:get_mountpoint" || owners[0].Refusal != nil {
-		t.Fatalf("open owners after a completion: %v %+v", err, owners)
-	}
-	if code, _, _ := call("--json", "enqueue", "r", "item-2", "struct:mount"); code != 1 {
-		t.Fatalf("enqueue of a done item exited %d, want 1", code)
-	}
-}
-
 func TestCommandExitCodes(t *testing.T) {
 	dsn := testpg.Database(t, "ledger_command")
 	getenv := func(key string) string {
@@ -386,57 +267,6 @@ func TestCheckRefusalExitsOneWithJSONResult(t *testing.T) {
 	}
 	if result.Pass || len(result.Violations) != 1 || result.Violations[0].Kind != "undeclared_write" {
 		t.Fatalf("refused check result: %+v", result)
-	}
-}
-
-func TestDeferredCheckExitsFiveAndRequestFilesRejectUnknownFields(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
-	if code, _, stderr := call("repo", "ensure", "r", "0"); code != 0 {
-		t.Fatalf("ensure: code=%d stderr=%q", code, stderr)
-	}
-	if code, _, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean", "--read", "C=hash-1"); code != 0 {
-		t.Fatalf("open: code=%d stderr=%q", code, stderr)
-	}
-	assertIncomplete := func(code int, stdout, stderr string) {
-		t.Helper()
-		var result struct {
-			Outcome  string   `json:"outcome"`
-			Pass     bool     `json:"pass"`
-			Deferred []string `json:"deferred"`
-		}
-		if err := json.Unmarshal([]byte(stdout), &result); err != nil || code != 5 || result.Outcome != "incomplete" ||
-			result.Pass || !slices.Equal(result.Deferred, []string{"C"}) {
-			t.Fatalf("deferred check: code=%d result=%+v stdout=%q stderr=%q err=%v", code, result, stdout, stderr, err)
-		}
-	}
-	code, stdout, stderr := call("--json", "check", "r", "M-1", "1", "--commit", "candidate", "--path", "a.lean", "--defer-reads")
-	assertIncomplete(code, stdout, stderr)
-
-	request := filepath.Join(t.TempDir(), "check.json")
-	if err := os.WriteFile(request, []byte(`{"repo":"r","id":"M-1","generation":1,"commit":"candidate","changed":["a.lean"],"defer_reads":true}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	code, stdout, stderr = call("--json", "check", "--request-file", request)
-	assertIncomplete(code, stdout, stderr)
-
-	unknown := filepath.Join(t.TempDir(), "unknown.json")
-	if err := os.WriteFile(unknown, []byte(`{"repo":"r","id":"M-1","generation":1,"commit":"candidate","changed":["a.lean"],"unknown":true}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if code, _, stderr := call("check", "--request-file", unknown); code != 2 || !strings.Contains(stderr, "unknown field") {
-		t.Fatalf("unknown request field: code=%d stderr=%q", code, stderr)
 	}
 }
 
@@ -586,7 +416,7 @@ func TestJSONRequestFilesPreserveEqualsNamesAndHashes(t *testing.T) {
 	invoke("open", "--request-file", openFile)
 	extendFile := writeRequest("extend.json", `{"repo":"r","id":"M-1","generation":1,"writes":["b=c.lean"],"reads":{}}`)
 	invoke("extend", "--request-file", extendFile)
-	checkFile := writeRequest("check.json", `{"repo":"r","id":"M-1","generation":1,"commit":"candidate","changed":["a=b.lean","b=c.lean"],"current":{"A=B":"h=1"}}`)
+	checkFile := writeRequest("check.json", `{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a=b.lean","b=c.lean"],"current":{"A=B":"h=1"}}`)
 	check := invoke("--json", "check", "--request-file", checkFile)
 	var checked struct {
 		Pass bool `json:"pass"`
@@ -906,7 +736,7 @@ func TestStatementRecordsRoundTripThroughRequestFiles(t *testing.T) {
 		{"a review at another head", `"head":"h=ead","reviewed_head":"other"`, false, "statement_unreviewed"},
 		{"a review with no head", `"reviewed_head":"h=ead"`, false, "invalid_candidate"},
 	} {
-		check := writeRequest(fmt.Sprintf("check-%d.json", i), `{"repo":"r","id":"M-1","generation":1,"commit":"candidate","changed":["a.lean"],`+
+		check := writeRequest(fmt.Sprintf("check-%d.json", i), `{"repo":"r","migration":"M-1","generation":1,"commit":"candidate","changed_paths":["a.lean"],`+
 			`"current":{"A=B":"h=1","X":"x"},"changed_contracts":{"A=B":"h=2"},`+test.records+`}`)
 		code, stdout, stderr := call("--json", "check", "--request-file", check)
 		if test.pass {

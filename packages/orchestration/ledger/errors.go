@@ -5,37 +5,34 @@ import "fmt"
 // Refusal reasons. A refusal means the ledger is consistent and the request was declined; the caller decides what
 // to do next.
 const (
-	ReasonOverlap            = "overlap"              // the write set overlaps another open migration's
-	ReasonStaleGeneration    = "stale_generation"     // the caller's generation is not the current one
-	ReasonNotHolder          = "not_holder"           // the item is held by someone else
-	ReasonLeaseHeld          = "lease_held"           // the item has a live lease
-	ReasonLeaseExpired       = "lease_expired"        // the caller's lease ended
-	ReasonSupervisedLease    = "supervised_lease"     // the lease has no end: its supervisor frees it
-	ReasonDone               = "done"                 // the item already has a result
-	ReasonNotOpen            = "not_open"             // the migration has landed or been abandoned
-	ReasonExists             = "exists"               // a migration with that name already exists
-	ReasonBelowLimit         = "below_limit"          // the migration has not used up its landing rounds
-	ReasonNotEscalated       = "not_escalated"        // retry of a migration that is not escalated
-	ReasonImportConflict     = "import_conflict"      // a pilot record disagrees with the ledger's copy
-	ReasonNotOwner           = "not_owner"            // the caller does not own the contract
-	ReasonStaleRead          = "stale_read"           // a recorded contract hash is no longer current
-	ReasonUnverifiedRead     = "unverified_read"      // the caller did not supply a current hash for a declared read
-	ReasonStaleVersion       = "stale_version"        // an agreement did not read the current contract version
-	ReasonPinned             = "pinned"               // a person must approve the pinned contract's change
-	ReasonEscalated          = "escalated"            // the migration awaits a steward's decision
-	ReasonInvalidCandidate   = "invalid_candidate"    // candidate metadata cannot describe a complete landing
-	ReasonRoundKeyConflict   = "round_key_conflict"   // a repeated round key has a different generation, reason, or batch
-	ReasonUndeclaredWrite    = "undeclared_write"     // the candidate writes a path outside the migration lock
-	ReasonUndeclaredContract = "undeclared_contract"  // the migration did not declare the changed contract as a read
-	ReasonUpstreamNotAllowed = "upstream_not_allowed" // only the configured upstream owner may record provenance
-	ReasonRefusalConflict    = "refusal_conflict"     // the owner's work revision already has a refusal with another reason
-	ReasonStaleBatch         = "stale_batch"          // the batch is at another record version than the caller read
-	ReasonNotReady           = "not_ready"            // an admitted member has no ready record: it is not open, or it moved on
-	ReasonReadyChanged       = "ready_changed"        // an admitted member was readied again after the caller read it
-	ReasonBatchConflict      = "batch_conflict"       // two members of one batch change, or read and change, one contract
-	ReasonBatchAdmitted      = "batch_admitted"       // an admitted batch relies on the migration or contract
-	ReasonEffectDone         = "effect_done"          // another executor already finished the effect
-	ReasonContractConflict   = "contract_conflict"    // another landing registered the contract with another owner or hash
+	ReasonOverlap            = "overlap"             // the write set overlaps another open migration's
+	ReasonStaleGeneration    = "stale_generation"    // the caller's generation is not the current one
+	ReasonNotHolder          = "not_holder"          // the item is held by someone else
+	ReasonLeaseHeld          = "lease_held"          // the item has a live lease
+	ReasonLeaseExpired       = "lease_expired"       // the caller's lease ended
+	ReasonSupervisedLease    = "supervised_lease"    // the lease has no end: its supervisor frees it
+	ReasonDone               = "done"                // the item already has a result
+	ReasonNotOpen            = "not_open"            // the migration has landed or been abandoned
+	ReasonExists             = "exists"              // a migration with that name already exists
+	ReasonBelowLimit         = "below_limit"         // the migration has not used up its landing rounds
+	ReasonNotEscalated       = "not_escalated"       // retry of a migration that is not escalated
+	ReasonImportConflict     = "import_conflict"     // a pilot record disagrees with the ledger's copy
+	ReasonNotOwner           = "not_owner"           // the caller does not own the contract
+	ReasonStaleRead          = "stale_read"          // a recorded contract hash is no longer current
+	ReasonUnverifiedRead     = "unverified_read"     // the caller did not supply a current hash for a declared read
+	ReasonStaleVersion       = "stale_version"       // an agreement did not read the current contract version
+	ReasonPinned             = "pinned"              // a person must approve the pinned contract's change
+	ReasonEscalated          = "escalated"           // the migration awaits a steward's decision
+	ReasonInvalidCandidate   = "invalid_candidate"   // candidate metadata cannot describe a complete landing
+	ReasonUndeclaredWrite    = "undeclared_write"    // the candidate writes a path outside the migration lock
+	ReasonUndeclaredContract = "undeclared_contract" // the migration did not declare the changed contract as a read
+	ReasonStaleBatch         = "stale_batch"         // the batch is at another record version than the caller read
+	ReasonNotReady           = "not_ready"           // an admitted member has no ready record: it is not open, or it moved on
+	ReasonReadyChanged       = "ready_changed"       // an admitted member was readied again after the caller read it
+	ReasonBatchConflict      = "batch_conflict"      // two members of one batch change, or read and change, one contract
+	ReasonBatchAdmitted      = "batch_admitted"      // an admitted batch relies on the migration or contract
+	ReasonEffectDone         = "effect_done"         // another executor already finished the effect
+	ReasonContractConflict   = "contract_conflict"   // another landing registered the contract with another owner or hash
 	// A statement change has neither a compatibility proof nor an agent's review at the head that lands.
 	ReasonStatementUnreviewed = "statement_unreviewed"
 )

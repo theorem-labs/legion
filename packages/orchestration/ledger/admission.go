@@ -193,25 +193,18 @@ func admitMembers(ctx context.Context, tx pgx.Tx, repository Repository, req Adm
 				return nil, refusal
 			}
 		}
-		candidate := CheckRequest{
-			Repo: req.Repo, ID: m.ID, Generation: ready.Generation, Commit: req.CandidateCommit,
-			Changed: member.ChangedPaths, Current: member.CurrentHashes, ApprovedPinned: ready.ApprovedPinned,
-			ChangedContracts: ready.ChangedContracts, Head: ready.Head, CompatibilityProof: ready.CompatibilityProof,
-			ReviewedHead: ready.ReviewedHead, Reviews: ready.Reviews, Upstream: ready.Upstream,
-		}
-		var violations []Violation
-		if precondition, ok := candidatePrecondition(candidate); ok {
-			violations = append(violations, precondition)
-		}
-		cleaned, err := cleanCheckRequest(candidate)
+		cleaned, err := cleanCandidate(CheckRequest{LandRequest: LandRequest{
+			Repo: req.Repo, Migration: m.ID, Generation: ready.Generation, Commit: req.CandidateCommit,
+			ChangedPaths: member.ChangedPaths, Current: member.CurrentHashes, StatementRecords: ready.StatementRecords,
+		}})
 		if err != nil {
 			return nil, err
 		}
-		checked, err := candidateViolations(ctx, tx, repository, m, cleaned)
+		checked, err := evaluate(ctx, tx, m, cleaned, updateLock)
 		if err != nil {
 			return nil, err
 		}
-		if violations = append(violations, checked...); len(violations) > 0 {
+		if violations := checked.violations; len(violations) > 0 {
 			err := refusalForViolation(violations[0])
 			var refusal *Refusal
 			if !errors.As(err, &refusal) {
@@ -283,8 +276,7 @@ func contractConflict(m Migration, ready ReadyRecord, earlier Migration, earlier
 
 // loadReady reads the ready record of migration id, and reports whether it has one: it is open and readied.
 func loadReady(ctx context.Context, q querier, repo, id string) (ReadyRecord, bool, error) {
-	rows, err := q.Query(ctx, `SELECT id, owner, generation, ready_head, ready_event, ready_at,
-			ready_changed_contracts, ready_records
+	rows, err := q.Query(ctx, `SELECT id, owner, generation, ready_event, ready_at, ready_records
 		FROM migrations
 		WHERE repo = $1 AND id = $2 AND state = 'open' AND ready_event IS NOT NULL`, repo, id)
 	if err != nil {

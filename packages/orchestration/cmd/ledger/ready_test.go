@@ -1,17 +1,14 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
 type readyListRecord struct {
@@ -34,36 +31,20 @@ type readyListRecord struct {
 }
 
 func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_ready_command")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string, string) {
-		t.Helper()
-		var out, err bytes.Buffer
-		code := run(context.Background(), args, getenv, &out, &err)
-		return code, out.String(), err.String()
-	}
+	call := ledgerCommand(t)
 	invoke := func(args ...string) string {
 		t.Helper()
-		code, out, stderr := call(args...)
-		if code != 0 {
-			t.Fatalf("%v exited %d: %s", args, code, stderr)
-		}
-		return out
+		return mustRun(t, call, args...)
 	}
 
 	invoke("repo", "ensure", "r", "0")
 	invoke("open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
 	invoke("open", "r", "M-file", "bob", "base", "branch", "--write", "b.lean")
-	invoke("ready", "r", "M-flag", "1", "--head", "head-flag", "--changed-contract", "C.flag=hash-flag",
+	invoke("ready", "r", "M-flag", "1", "--key", "k-flag", "--head", "head-flag", "--changed-contract", "C.flag=hash-flag",
 		"--compatibility-proof", "C.compat", "--reviewed-head", "head-flag", "--review", "C.flag=alice@head-flag",
 		"--approved-pinned", "C.flag")
 
-	request := `{"repo":"r","id":"M-file","generation":1,"head":"head@file","changed_contracts":{"C@file":"hash=from-file"},"compatibility_proof":"C@compat","reviewed_head":"head@file","reviews":[{"contract":"C@file","reviewer":"alice=reviewer","head":"head@file"}],"approved_pinned":["C@file"]}`
+	request := `{"repo":"r","id":"M-file","generation":1,"key":"k-file","head":"head@file","changed_contracts":{"C@file":"hash=from-file"},"compatibility_proof":"C@compat","reviewed_head":"head@file","reviews":[{"contract":"C@file","reviewer":"alice=reviewer","head":"head@file"}],"approved_pinned":["C@file"]}`
 	file := filepath.Join(t.TempDir(), "ready.json")
 	if err := os.WriteFile(file, []byte(request), 0o600); err != nil {
 		t.Fatal(err)
@@ -102,33 +83,186 @@ func TestReadyCommandRoundTripsFlagAndRequestFileForms(t *testing.T) {
 	}
 }
 
-func TestReadyFlagsRejectNamesContainingDelimiters(t *testing.T) {
-	dsn := testpg.Database(t, "ledger_ready_delimiters")
-	getenv := func(key string) string {
-		if key == "LEDGER_DSN" {
-			return dsn
-		}
-		return ""
-	}
-	call := func(args ...string) (int, string) {
+// TestReadyRecordsPrintEmptyCollectionsInBothForms catches a ready record whose absent lists and maps print as null,
+// and a record whose shape depends on the input form. A ready with only a head, through flags or a request file,
+// prints {} for changed_contracts and [] for reviews and approved_pinned in ready, ready-list and its migration.ready
+// event, and a landing with no review prints [] for reviews in its migration.landed event.
+func TestReadyRecordsPrintEmptyCollectionsInBothForms(t *testing.T) {
+	call := ledgerCommand(t)
+	invoke := func(args ...string) string {
 		t.Helper()
-		var out, err bytes.Buffer
-		return run(context.Background(), args, getenv, &out, &err), err.String()
+		return mustRun(t, call, args...)
 	}
-	if code, stderr := call("repo", "ensure", "r", "0"); code != 0 {
-		t.Fatalf("ensure: code=%d stderr=%q", code, stderr)
+	empty := func(what, output string, fields map[string]json.RawMessage) {
+		t.Helper()
+		for field, want := range map[string]string{"changed_contracts": "{}", "reviews": "[]", "approved_pinned": "[]"} {
+			if got := string(fields[field]); got != want {
+				t.Fatalf("%s prints %s = %s, want %s: %s", what, field, got, want, output)
+			}
+		}
 	}
-	if code, stderr := call("open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean"); code != 0 {
-		t.Fatalf("open: code=%d stderr=%q", code, stderr)
+	invoke("repo", "ensure", "r", "0")
+	invoke("open", "r", "M-flag", "alice", "base", "branch", "--write", "a.lean")
+	invoke("open", "r", "M-file", "bob", "base", "branch", "--write", "b.lean")
+	file := filepath.Join(t.TempDir(), "ready.json")
+	if err := os.WriteFile(file, []byte(`{"repo":"r","id":"M-file","generation":1,"key":"k-file","head":"head-file"}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	for _, args := range [][]string{
-		{"ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C@name=hash"},
-		{"ready", "r", "M-1", "1", "--head", "head", "--changed-contract", "C=name=hash"},
-		{"ready", "r", "M-1", "1", "--head", "head", "--review", "C@name=alice@head"},
-		{"ready", "r", "M-1", "1", "--head", "head", "--approved-pinned", "C@name"},
+		{"--json", "ready", "r", "M-flag", "1", "--key", "k-flag", "--head", "head-flag"},
+		{"--json", "ready", "--request-file", file},
 	} {
-		if code, stderr := call(args...); code != 2 || !strings.Contains(stderr, "request-file") {
+		output := invoke(args...)
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(output), &fields); err != nil {
+			t.Fatal(err)
+		}
+		empty(strings.Join(args, " "), output, fields)
+	}
+	output := invoke("--json", "ready-list", "r")
+	var listed []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(output), &listed); err != nil || len(listed) != 2 {
+		t.Fatalf("ready-list: %v %s", err, output)
+	}
+	for _, fields := range listed {
+		empty("ready-list", output, fields)
+	}
+	for _, id := range []string{"M-flag", "M-file"} {
+		output := invoke("--json", "events", "r", "0", id)
+		var events []struct {
+			Kind string                     `json:"kind"`
+			Data map[string]json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(output), &events); err != nil {
+			t.Fatal(err)
+		}
+		ready := 0
+		for _, event := range events {
+			if event.Kind == "migration.ready" {
+				ready++
+				empty("migration.ready of "+id, output, event.Data)
+			}
+		}
+		if ready != 1 {
+			t.Fatalf("%d migration.ready events for %s: %s", ready, id, output)
+		}
+	}
+
+	invoke("land", "--repo", "r", "--migration", "M-flag", "--generation", "1", "--commit", "commit-1", "--path", "a.lean")
+	output = invoke("--json", "events", "r", "0", "M-flag")
+	var events []struct {
+		Kind string                     `json:"kind"`
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(output), &events); err != nil {
+		t.Fatal(err)
+	}
+	landed := events[len(events)-1]
+	if landed.Kind != "migration.landed" || string(landed.Data["reviews"]) != "[]" || string(landed.Data["contracts"]) != "[]" {
+		t.Fatalf("migration.landed event with no review: %s", output)
+	}
+}
+
+// A flag value that cannot be split one way is a usage error that points to the request file, as it is for check and
+// land: a second = in a changed contract, and an @ in a review's contract name. A name with @ in a changed contract or
+// an approved pinned contract splits one way, so ready takes it, as check and land do.
+func TestReadyFlagsRejectAmbiguousDelimiters(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+	for _, args := range [][]string{
+		{"ready", "r", "M-1", "1", "--key", "k1", "--head", "head", "--changed-contract", "C=name=hash"},
+		{"ready", "r", "M-1", "1", "--key", "k1", "--head", "head", "--review", "C@name=alice@head"},
+	} {
+		if code, _, stderr := call(args...); code != 2 || !strings.Contains(stderr, "request-file") {
 			t.Fatalf("%v: code=%d stderr=%q; want delimiter usage refusal", args, code, stderr)
 		}
+	}
+	if code, _, stderr := call("ready", "r", "M-1", "1", "--key", "k1", "--head", "head", "--changed-contract", "C@name=hash",
+		"--approved-pinned", "C@name"); code != 0 {
+		t.Fatalf("names with @: code=%d stderr=%q; want them taken as check and land take them", code, stderr)
+	}
+}
+
+// ready without --head is a usage error that names the flag, through flags, as before this change.
+func TestReadyWithoutHeadNamesTheFlag(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+	if code, _, stderr := call("--json", "ready", "r", "M-1", "1", "--key", "k1"); code != 2 || !strings.Contains(stderr, "ready needs --head") {
+		t.Fatalf("ready without --head: code=%d stderr=%q", code, stderr)
+	}
+}
+
+// ready without --key is a usage error that names the flag, and records nothing.
+func TestReadyWithoutKeyNamesTheFlag(t *testing.T) {
+	call := ledgerCommand(t)
+	mustExit(t, call, 0, "repo", "ensure", "r", "0")
+	mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+	if code, _, stderr := call("--json", "ready", "r", "M-1", "1", "--head", "H1"); code != 2 || !strings.Contains(stderr, "ready needs --key") {
+		t.Fatalf("ready without --key: code=%d stderr=%q", code, stderr)
+	}
+	if listed := mustRun(t, call, "--json", "ready-list", "r"); listed != "[]\n" {
+		t.Fatalf("ready without --key was recorded: %s", listed)
+	}
+}
+
+// The retry of a submission the landing program already returned publishes nothing, through flags and through a
+// request file: ready H1 with key k1, a round for its event, ready H1 with k1 again. ready-list stays empty, and only
+// one migration.ready event exists. ready H1 with k2 publishes it again (control).
+func TestReadyCommandRetryOfAConsumedSubmissionPublishesNothing(t *testing.T) {
+	for _, form := range []string{"flags", "request file"} {
+		t.Run(form, func(t *testing.T) {
+			call := ledgerCommand(t)
+			mustExit(t, call, 0, "repo", "ensure", "r", "0")
+			mustExit(t, call, 0, "open", "r", "M-1", "alice", "base", "branch", "--write", "a.lean")
+			ready := func(key string) []string {
+				if form == "flags" {
+					return []string{"--json", "ready", "r", "M-1", "1", "--key", key, "--head", "H1"}
+				}
+				file := filepath.Join(t.TempDir(), key+".json")
+				body := `{"repo":"r","id":"M-1","generation":1,"key":"` + key + `","head":"H1"}`
+				if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return []string{"--json", "ready", "--request-file", file}
+			}
+			var first readyListRecord
+			if err := json.Unmarshal([]byte(mustRun(t, call, ready("k1")...)), &first); err != nil || first.ReadyEvent == 0 {
+				t.Fatalf("first ready: %v %+v", err, first)
+			}
+			mustRun(t, call, "--json", "round", "r", "M-1", "1", "H1 build failed", "--key", "round-1",
+				"--ready-event", strconv.FormatInt(first.ReadyEvent, 10))
+
+			var retry readyListRecord
+			if err := json.Unmarshal([]byte(mustRun(t, call, ready("k1")...)), &retry); err != nil || !reflect.DeepEqual(retry, first) {
+				t.Fatalf("retry of k1: %v %+v, want the record k1 stored %+v", err, retry, first)
+			}
+			if listed := mustRun(t, call, "--json", "ready-list", "r"); listed != "[]\n" {
+				t.Fatalf("the retry published the consumed submission again: %s", listed)
+			}
+			var events []struct {
+				Kind string `json:"kind"`
+			}
+			if err := json.Unmarshal([]byte(mustRun(t, call, "--json", "events", "r", "0", "M-1")), &events); err != nil {
+				t.Fatal(err)
+			}
+			readyEvents := 0
+			for _, event := range events {
+				if event.Kind == "migration.ready" {
+					readyEvents++
+				}
+			}
+			if readyEvents != 1 {
+				t.Fatalf("%d migration.ready events, want 1", readyEvents)
+			}
+
+			mustRun(t, call, ready("k2")...)
+			var listed []readyListRecord
+			if err := json.Unmarshal([]byte(mustRun(t, call, "--json", "ready-list", "r")), &listed); err != nil ||
+				len(listed) != 1 || listed[0].Head != "H1" || listed[0].ReadyEvent == first.ReadyEvent {
+				t.Fatalf("a new key did not publish H1 again: %v %+v", err, listed)
+			}
+		})
 	}
 }

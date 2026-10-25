@@ -24,6 +24,8 @@ const cliEscalationOwner = "steward:landing"
 type batchCLI struct {
 	t   *testing.T
 	dsn string
+	// readies counts each migration's ready submissions, so every one takes its own key.
+	readies map[string]int
 }
 
 type cliBatch struct {
@@ -47,7 +49,7 @@ type cliCreated struct {
 
 func newBatchCLI(t *testing.T) batchCLI {
 	t.Helper()
-	cli := batchCLI{t: t, dsn: testpg.Database(t, "ledger_batches")}
+	cli := batchCLI{t: t, dsn: testpg.Database(t, "ledger_batches"), readies: map[string]int{}}
 	cli.invoke("repo", "ensure", "r", "3")
 	return cli
 }

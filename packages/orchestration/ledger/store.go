@@ -1,11 +1,6 @@
 // Package ledger is the orchestration ledger: work-item leases, migrations and their change locks, the contract
 // ledger, the landing program's batches and an append-only event log, all in Postgres. Every operation runs in one
 // transaction.
-//
-// The ledger trusts its callers. Every check it makes runs in this Go API, and its callers' database logins can
-// rewrite any row with raw SQL, which no check here stops. No protection against a forged write or a bypass is built
-// until one is seen. Each event names the database login whose session appended it (Event.Login), so the log shows
-// which login made each write.
 package ledger
 
 import (
@@ -59,7 +54,10 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 	return v, err
 }
 
-// migrate applies schema/NNNN_*.sql files in order, each once, under an advisory lock so concurrent starts agree.
+// migrate applies schema/NNNN_*.sql files in order, each once, under an advisory lock so concurrent starts agree. A
+// version is applied when schema_versions records it, so a recorded version must name this binary's file for that
+// number: a database that another file set migrated (an earlier build's 0003) is refused here, by name, rather than
+// failing later on a missing column.
 func (s *Store) migrate(ctx context.Context) error {
 	files, err := fs.Glob(schemaFS, "schema/*.sql")
 	if err != nil {
@@ -74,17 +72,34 @@ func (s *Store) migrate(ctx context.Context) error {
 			version integer PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 			return err
 		}
+		rows, err := tx.Query(ctx, `SELECT version, name FROM schema_versions`)
+		if err != nil {
+			return err
+		}
+		applied := map[int]string{}
+		for rows.Next() {
+			var version int
+			var name string
+			if err := rows.Scan(&version, &name); err != nil {
+				rows.Close()
+				return err
+			}
+			applied[version] = name
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 		for _, f := range files {
 			base := strings.TrimPrefix(f, "schema/")
 			n, err := strconv.Atoi(strings.SplitN(base, "_", 2)[0])
 			if err != nil {
 				return fmt.Errorf("schema file %s: name must start with a version number", base)
 			}
-			var done bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_versions WHERE version = $1)`, n).Scan(&done); err != nil {
-				return err
-			}
-			if done {
+			if name, done := applied[n]; done {
+				if name != base {
+					return fmt.Errorf("schema %d is %s, this binary has %s; recreate the database", n, name, base)
+				}
 				continue
 			}
 			sql, err := schemaFS.ReadFile(f)
@@ -118,14 +133,14 @@ func (s *Store) tx(ctx context.Context, fn func(pgx.Tx) error) error {
 // lockRepo takes the repository's row lock, which serialises every change to its migrations' locks, and returns
 // the repository. A missing repository is NotFoundError.
 func lockRepo(ctx context.Context, tx pgx.Tx, name string, forUpdate bool) (Repository, error) {
-	q := `SELECT name, max_landing_rounds, coalesce(upstream_owner, ''), created_at FROM repositories WHERE name = $1`
+	q := `SELECT name, max_landing_rounds, created_at FROM repositories WHERE name = $1`
 	if forUpdate {
 		q += ` FOR UPDATE`
 	} else {
 		q += ` FOR SHARE`
 	}
 	var c Repository
-	err := tx.QueryRow(ctx, q, name).Scan(&c.Name, &c.MaxLandingRounds, &c.UpstreamOwner, &c.CreatedAt)
+	err := tx.QueryRow(ctx, q, name).Scan(&c.Name, &c.MaxLandingRounds, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, &NotFoundError{What: "repository", ID: name}
 	}

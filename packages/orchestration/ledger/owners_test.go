@@ -3,7 +3,9 @@ package ledger_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +20,7 @@ func TestSupervisedLeaseNeverExpires(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	lease := must(s.Claim(ctx, "r", "item", "function:get_mountpoint", 0))
-	if !lease.ExpiresAt.IsZero() {
+	if lease.ExpiresAt != nil {
 		t.Fatalf("supervised lease has an end: %+v", lease)
 	}
 	if expired := must(s.Expire(ctx, "r")); len(expired) != 0 {
@@ -40,6 +42,71 @@ func TestSupervisedLeaseNeverExpires(t *testing.T) {
 	if err := s.Complete(ctx, "r", "item", "function:get_mountpoint", lease.Generation, "proved"); err != nil {
 		t.Fatalf("complete under a supervised lease: %v", err)
 	}
+}
+
+// HasOpenWork is true exactly while the owner has an open item: not before its first enqueue, not after its last
+// item is done, and not because another owner has work. An empty owner is invalid input.
+func TestHasOpenWorkFollowsTheOwnersOpenItems(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	const owner, other = "struct:mount", "struct:state"
+	hasWork := func(step string, want bool) {
+		t.Helper()
+		if got := must(s.HasOpenWork(ctx, "r", owner)); got != want {
+			t.Fatalf("%s: HasOpenWork = %t, want %t", step, got, want)
+		}
+	}
+	hasWork("before any enqueue", false)
+	if err := s.Enqueue(ctx, "r", "other-item", other); err != nil {
+		t.Fatal(err)
+	}
+	hasWork("after another owner's enqueue", false)
+	if err := s.Enqueue(ctx, "r", "item", owner); err != nil {
+		t.Fatal(err)
+	}
+	hasWork("after its enqueue", true)
+	lease := must(s.Claim(ctx, "r", "item", owner, 0))
+	hasWork("while its item is held", true)
+	if err := s.Complete(ctx, "r", "item", owner, lease.Generation, "proved"); err != nil {
+		t.Fatal(err)
+	}
+	hasWork("after its only item is done", false)
+	var invalid *ledger.InvalidError
+	if _, err := s.HasOpenWork(ctx, "r", " "); !errors.As(err, &invalid) {
+		t.Fatalf("blank owner: %v, want invalid input", err)
+	}
+}
+
+// EnsureRepo creates a repository with its landing-round limit and updates the limit. A new repository or a new limit
+// appends one repository.configured event with the limit; a call that changes nothing appends none.
+func TestEnsureRepoRecordsEachLimitChangeOnce(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	type configured struct {
+		MaxLandingRounds int `json:"max_landing_rounds"`
+	}
+	var seen []configured
+	step := func(name string, repository ledger.Repository, rounds int, events ...configured) {
+		t.Helper()
+		if repository.Name != "u" || repository.MaxLandingRounds != rounds {
+			t.Fatalf("%s: repository %+v, want %d rounds", name, repository, rounds)
+		}
+		seen = append(seen, events...)
+		var got []configured
+		for _, event := range must(s.Events(ctx, "u", 0, "u")) {
+			var data configured
+			if err := json.Unmarshal(event.Data, &data); err != nil || event.Kind != "repository.configured" {
+				t.Fatalf("%s: event %+v: %v", name, event, err)
+			}
+			got = append(got, data)
+		}
+		if !slices.Equal(got, seen) {
+			t.Fatalf("%s: repository.configured events %+v, want %+v", name, got, seen)
+		}
+	}
+	step("create", must(s.EnsureRepo(ctx, "u", 2)), 2, configured{2})
+	step("the same limit again", must(s.EnsureRepo(ctx, "u", 2)), 2)
+	step("a new limit", must(s.EnsureRepo(ctx, "u", 3)), 3, configured{3})
 }
 
 // ReleaseHolder frees, in one transaction, every lease of the stopped holder at its current
@@ -123,6 +190,108 @@ func TestOpenOwnersListsEachOwnerWithOpenWorkOnce(t *testing.T) {
 	}
 	if got := must(s.OpenOwners(ctx, "r")); !slices.Equal(got, []string{"function:a_b", "struct:mount"}) {
 		t.Fatalf("open owners = %v", got)
+	}
+}
+
+// queued is the open item id of owner as Enqueue leaves it: no holder, generation 0, no lease end.
+func queued(id, owner string) ledger.Item {
+	return ledger.Item{ID: id, Owner: owner, State: "open"}
+}
+
+// assertOpenItems reads owner's open items in repository r and compares them with want, field by field.
+func assertOpenItems(t *testing.T, s *ledger.Store, owner string, want ...ledger.Item) {
+	t.Helper()
+	got := must(s.OpenItems(context.Background(), "r", owner))
+	gotJSON, wantJSON := must(json.Marshal(got)), must(json.Marshal(want))
+	if got == nil || len(got) != len(want) {
+		t.Fatalf("open items of %s = %s, want %s", owner, gotJSON, wantJSON)
+	}
+	for i := range want {
+		g, w := got[i], want[i]
+		if g.ID != w.ID || g.Owner != w.Owner || g.State != w.State || g.Holder != w.Holder || g.Generation != w.Generation ||
+			g.Result != w.Result || (g.ExpiresAt == nil) != (w.ExpiresAt == nil) ||
+			(g.ExpiresAt != nil && !g.ExpiresAt.Equal(*w.ExpiresAt)) {
+			t.Fatalf("open item %d of %s differs: got %s, want %s", i, owner, gotJSON, wantJSON)
+		}
+	}
+}
+
+// OpenItems lists one owner's open items in repository r in enqueue order, whatever their ids: none of another
+// owner's, none of another repository's, and no completed item. Each shows its holder and generation, and its lease
+// end only for a fixed-end lease. An owner with no items has an empty list.
+func TestOpenItemsListsOneOwnersOpenItemsInEnqueueOrder(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	const owner, other, holder = "struct:mount", "function:get_mountpoint", "session-1"
+	assertOpenItems(t, s, owner)
+	must(s.EnsureRepo(ctx, "elsewhere", 3))
+	if err := s.Enqueue(ctx, "elsewhere", "e", owner); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct{ id, owner string }{{"c", owner}, {"x", other}, {"a", owner}, {"y", other}, {"b", owner}, {"d", owner}} {
+		if err := s.Enqueue(ctx, "r", item.id, item.owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertOpenItems(t, s, owner, queued("c", owner), queued("a", owner), queued("b", owner), queued("d", owner))
+
+	released := must(s.Claim(ctx, "r", "c", holder, time.Minute))
+	if err := s.Release(ctx, "r", "c", holder, released.Generation); err != nil {
+		t.Fatal(err)
+	}
+	must(s.Claim(ctx, "r", "a", holder, 0))
+	first := must(s.Claim(ctx, "r", "b", holder, time.Minute))
+	if err := s.Release(ctx, "r", "b", holder, first.Generation); err != nil {
+		t.Fatal(err)
+	}
+	fixed := must(s.Claim(ctx, "r", "b", holder, time.Hour))
+	done := must(s.Claim(ctx, "r", "d", holder, 0))
+	if err := s.Complete(ctx, "r", "d", holder, done.Generation, "proved"); err != nil {
+		t.Fatal(err)
+	}
+
+	free := queued("c", owner)
+	free.Generation = 1
+	supervised := queued("a", owner)
+	supervised.Holder, supervised.Generation = holder, 1
+	leased := queued("b", owner)
+	leased.Holder, leased.Generation, leased.ExpiresAt = holder, 2, fixed.ExpiresAt
+	assertOpenItems(t, s, owner, free, supervised, leased)
+	assertOpenItems(t, s, other, queued("x", other), queued("y", other))
+	assertOpenItems(t, s, "global:nobody")
+}
+
+// Items enqueued at the same time are listed by id.
+func TestOpenItemsBreaksEnqueueTimeTiesByID(t *testing.T) {
+	s, dsn := newStoreDSN(t)
+	ctx := context.Background()
+	const owner = "struct:mount"
+	for _, id := range []string{"z2", "z1"} {
+		if err := s.Enqueue(ctx, "r", id, owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertOpenItems(t, s, owner, queued("z2", owner), queued("z1", owner))
+	db := must(pgx.Connect(ctx, dsn))
+	defer db.Close(ctx)
+	must(db.Exec(ctx, `UPDATE work_items SET created_at = (SELECT created_at FROM work_items WHERE repo = 'r' AND id = 'z2')
+		WHERE repo = 'r' AND id = 'z1'`))
+	assertOpenItems(t, s, owner, queued("z1", owner), queued("z2", owner))
+}
+
+// An empty owner is invalid input, and a repository that does not exist is not found.
+func TestOpenItemsRefusesAnEmptyOwnerAndAMissingRepository(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	for _, owner := range []string{"", "  "} {
+		var invalid *ledger.InvalidError
+		if _, err := s.OpenItems(ctx, "r", owner); !errors.As(err, &invalid) || !strings.Contains(err.Error(), "empty owner") {
+			t.Fatalf("open items of owner %q: want invalid input naming the empty owner, got %v", owner, err)
+		}
+	}
+	var notFound *ledger.NotFoundError
+	if _, err := s.OpenItems(ctx, "missing", "struct:mount"); !errors.As(err, &notFound) || notFound.What != "repository" {
+		t.Fatalf("open items in a missing repository: want not found, got %v", err)
 	}
 }
 

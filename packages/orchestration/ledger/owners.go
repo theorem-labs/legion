@@ -3,7 +3,6 @@ package ledger
 import (
 	"context"
 	"errors"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +13,85 @@ import (
 // holds any more: a new item, a lease given up, a fixed-end lease that ran out, and a stopped
 // holder's leases freed.
 var reopeningKinds = []string{"item.enqueued", "item.released", "item.expired", "item.holder_stopped"}
+
+// Enqueue creates an open work item for owner. Repeating an open enqueue for the same owner is
+// idempotent; an existing item belongs to one owner for its whole history.
+func (s *Store) Enqueue(ctx context.Context, repo, id, owner string) error {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(owner) == "" {
+		return invalid("an enqueued item needs an id and an owner")
+	}
+	return s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		return enqueueItem(ctx, tx, repo, id, owner)
+	})
+}
+
+// enqueueItem is Enqueue inside tx, which already holds the repository's row lock: it creates the open item id for
+// owner and appends item.enqueued, returns with nothing appended when that item is already open for owner, and
+// refuses (ReasonExists) an item that another owner has or that is done.
+func enqueueItem(ctx context.Context, tx pgx.Tx, repo, id, owner string) error {
+	var existingOwner, state string
+	err := tx.QueryRow(ctx, `INSERT INTO work_items (repo, id, owner) VALUES ($1, $2, $3)
+		ON CONFLICT DO NOTHING RETURNING owner, state`, repo, id, owner).Scan(&existingOwner, &state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT owner, state FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`,
+			repo, id).Scan(&existingOwner, &state); err != nil {
+			return err
+		}
+		if existingOwner == owner && state == "open" {
+			return nil
+		}
+		return refuse(ReasonExists, "item %s already belongs to owner %s in state %s", id, existingOwner, state)
+	}
+	if err != nil {
+		return err
+	}
+	return event(ctx, tx, repo, "item.enqueued", id, owner, map[string]any{"owner": owner})
+}
+
+// HasOpenWork reports whether owner names at least one open item in repository.
+func (s *Store) HasOpenWork(ctx context.Context, repo, owner string) (bool, error) {
+	if strings.TrimSpace(owner) == "" {
+		return false, invalid("empty owner")
+	}
+	var open bool
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM work_items WHERE repo = $1 AND owner = $2 AND state = 'open'
+		)`, repo, owner).Scan(&open)
+	})
+	return open, err
+}
+
+// OwnerWorkRevision is the newest durable queue-change event of owner. Leasing an item does not
+// change its work, while enqueueing and completing one do; callers use the revision to distinguish
+// new work from the same work that exhausted a retry budget.
+func (s *Store) OwnerWorkRevision(ctx context.Context, repo, owner string) (int64, error) {
+	if strings.TrimSpace(owner) == "" {
+		return 0, invalid("empty owner")
+	}
+	var revision int64
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, ownerWorkRevisionQuery("$2"), repo, owner).Scan(&revision)
+	})
+	return revision, err
+}
+
+// ownerWorkRevisionQuery selects OwnerWorkRevision, zero for an owner with no work, of the owner that the SQL
+// expression owner names in repository $1: a parameter, or a column of an enclosing query.
+func ownerWorkRevisionQuery(owner string) string {
+	return `SELECT coalesce(max(e.id), 0)
+		FROM events e JOIN work_items item ON item.repo = e.repo AND item.id = e.subject
+		WHERE e.repo = $1 AND item.owner = ` + owner + ` AND e.kind IN ('item.enqueued', 'item.completed')`
+}
 
 // OpenOwners lists, in order and once each, the owners that open items in repo name.
 func (s *Store) OpenOwners(ctx context.Context, repo string) ([]string, error) {
@@ -37,6 +115,37 @@ func (s *Store) OpenOwners(ctx context.Context, repo string) ([]string, error) {
 	return owners, err
 }
 
+// OpenItems lists owner's open items in repo, in enqueue order (created_at, then id), each as Item reads it: its
+// holder and generation, and its lease end only for a fixed-end lease. An owner with no open items has an empty list;
+// an empty owner is invalid input.
+func (s *Store) OpenItems(ctx context.Context, repo, owner string) ([]Item, error) {
+	if strings.TrimSpace(owner) == "" {
+		return nil, invalid("empty owner")
+	}
+	items := []Item{}
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT id, owner, state, coalesce(holder, ''), generation, lease_expires_at
+			FROM work_items WHERE repo = $1 AND owner = $2 AND state = 'open' ORDER BY created_at, id`, repo, owner)
+		if err != nil {
+			return err
+		}
+		read, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Item, error) {
+			var it Item
+			err := row.Scan(&it.ID, &it.Owner, &it.State, &it.Holder, &it.Generation, &it.ExpiresAt)
+			return it, err
+		})
+		if err != nil {
+			return err
+		}
+		items = append(items[:0], read...)
+		return nil
+	})
+	return items, err
+}
+
 // OwnerRefusal is why the supervisor declined to start owner for the work at Revision, the owner's
 // OwnerWorkRevision when it declined.
 type OwnerRefusal struct {
@@ -46,11 +155,11 @@ type OwnerRefusal struct {
 	At       time.Time `json:"at"`
 }
 
-// RecordOwnerRefused records, once per owner and work revision, that the supervisor will not start
-// owner for the work at revision, and appends one owner.refused event. A repeat with the same reason
-// returns the stored refusal and appends nothing; one with another reason is refused
-// (ReasonRefusalConflict) and changes nothing. A revision below 1, or newer than the owner's
-// OwnerWorkRevision, refuses no work that exists, so it is invalid input.
+// RecordOwnerRefused records that the supervisor will not start owner for the work at revision, and appends one
+// owner.refused event. A repeat with the same reason returns the stored refusal and appends nothing; one with another
+// reason replaces the stored reason and appends one event with it, so OwnerRefusals shows the latest reason. A revision
+// below 1 is invalid input. A refusal at a revision that is not the owner's current work revision is recorded, but
+// OwnerRefusals never lists it.
 func (s *Store) RecordOwnerRefused(ctx context.Context, repo, owner string, revision int64, reason string) (OwnerRefusal, error) {
 	switch {
 	case strings.TrimSpace(owner) == "":
@@ -65,30 +174,15 @@ func (s *Store) RecordOwnerRefused(ctx context.Context, repo, owner string, revi
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		var current int64
-		if err := tx.QueryRow(ctx, ownerWorkRevisionQuery("$2"), repo, owner).Scan(&current); err != nil {
-			return err
-		}
-		if revision > current {
-			return invalid("refusal revision %d of owner %s is newer than its work revision %d", revision, owner, current)
-		}
-		// The revision column holds the canonical decimal form, so text equality is integer equality.
-		stored := strconv.FormatInt(revision, 10)
+		// ON CONFLICT waits for a concurrent insert of this row to commit. A stored refusal with the same reason is
+		// left as it is, and under read committed the next statement's snapshot sees it.
 		err := tx.QueryRow(ctx, `INSERT INTO owner_refusals (repo, owner, revision, reason) VALUES ($1, $2, $3, $4)
-			ON CONFLICT DO NOTHING RETURNING at`, repo, owner, stored, reason).Scan(&refusal.At)
+			ON CONFLICT (repo, owner, revision) DO UPDATE SET reason = EXCLUDED.reason, at = clock_timestamp()
+			WHERE owner_refusals.reason <> EXCLUDED.reason
+			RETURNING at`, repo, owner, revision, reason).Scan(&refusal.At)
 		if errors.Is(err, pgx.ErrNoRows) {
-			// ON CONFLICT waited for a concurrent insert of this row to commit, and under read committed the next
-			// statement's snapshot sees the committed row.
-			var storedReason string
-			if err := tx.QueryRow(ctx, `SELECT reason, at FROM owner_refusals WHERE repo = $1 AND owner = $2 AND revision = $3`,
-				repo, owner, stored).Scan(&storedReason, &refusal.At); err != nil {
-				return err
-			}
-			if storedReason != reason {
-				return refuse(ReasonRefusalConflict, "owner %s is already refused at work revision %d for another reason: %s",
-					owner, revision, storedReason)
-			}
-			return nil
+			return tx.QueryRow(ctx, `SELECT at FROM owner_refusals WHERE repo = $1 AND owner = $2 AND revision = $3`,
+				repo, owner, revision).Scan(&refusal.At)
 		}
 		if err != nil {
 			return err
@@ -103,18 +197,20 @@ func (s *Store) RecordOwnerRefused(ctx context.Context, repo, owner string, revi
 	return refusal, nil
 }
 
-// OwnerRefusals lists, by owner, each owner's refusal at its current OwnerWorkRevision. A refusal of
-// work that has changed since is not listed: the supervisor will try that owner again.
+// OwnerRefusals lists, by owner, the refusal of each owner with open work at its current
+// OwnerWorkRevision: the owners OpenOwners lists, and no others. A refusal of work that has changed
+// since is not listed, because the supervisor will try that owner again; nor is the refusal of an
+// owner whose work is all done, because nothing is left to start it for.
 func (s *Store) OwnerRefusals(ctx context.Context, repo string) ([]OwnerRefusal, error) {
 	refusals := []OwnerRefusal{}
 	err := s.tx(ctx, func(tx pgx.Tx) error {
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT r.owner, r.revision::bigint, r.reason, r.at
-			FROM (SELECT DISTINCT owner FROM owner_refusals WHERE repo = $1) o
+		rows, err := tx.Query(ctx, `SELECT r.owner, r.revision, r.reason, r.at
+			FROM (SELECT DISTINCT owner FROM work_items WHERE repo = $1 AND state = 'open' AND owner <> '') o
 			CROSS JOIN LATERAL (`+ownerWorkRevisionQuery("o.owner")+`) AS work(revision)
-			JOIN owner_refusals r ON r.repo = $1 AND r.owner = o.owner AND r.revision = work.revision::text
+			JOIN owner_refusals r ON r.repo = $1 AND r.owner = o.owner AND r.revision = work.revision
 			ORDER BY r.owner`, repo)
 		if err != nil {
 			return err
@@ -131,14 +227,6 @@ func (s *Store) OwnerRefusals(ctx context.Context, repo string) ([]OwnerRefusal,
 		return nil
 	})
 	return refusals, err
-}
-
-// LatestEventID is the id of repo's newest event, or zero when it has none: the cursor a reader of
-// OwnerWakes starts from to see only what happens next.
-func (s *Store) LatestEventID(ctx context.Context, repo string) (int64, error) {
-	var id int64
-	err := s.pool.QueryRow(ctx, `SELECT coalesce(max(id), 0) FROM events WHERE repo = $1`, repo).Scan(&id)
-	return id, err
 }
 
 // OwnerWakes reads, in one snapshot, the owners of the items that the events after cursor reopened
@@ -159,35 +247,3 @@ func (s *Store) OwnerWakes(ctx context.Context, repo string, cursor int64) ([]st
 		), '{}') FROM upto`, repo, cursor, reopeningKinds).Scan(&last, &owners)
 	return owners, last, err
 }
-
-// Listener is one connection listening on EventsChannel. A notification names the repository whose
-// events changed and carries nothing else: a reader reads the events themselves (OwnerWakes), so a
-// notification that is lost delays work rather than losing it.
-type Listener struct {
-	conn *pgx.Conn
-}
-
-// Listen opens a connection of its own and listens on EventsChannel.
-func Listen(ctx context.Context, dsn string) (*Listener, error) {
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{EventsChannel}.Sanitize()); err != nil {
-		_ = conn.Close(ctx)
-		return nil, err
-	}
-	return &Listener{conn: conn}, nil
-}
-
-// Wait returns the repository of the next notification, or ctx's error once ctx ends first.
-func (l *Listener) Wait(ctx context.Context) (string, error) {
-	n, err := l.conn.WaitForNotification(ctx)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(n.Payload), nil
-}
-
-// Close ends the listening connection.
-func (l *Listener) Close(ctx context.Context) error { return l.conn.Close(ctx) }

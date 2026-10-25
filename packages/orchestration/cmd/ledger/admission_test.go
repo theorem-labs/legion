@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -33,12 +34,20 @@ func (cli batchCLI) ready(id, write string, reads map[string]string, flags ...st
 	var record struct {
 		ReadyEvent int64 `json:"ready_event"`
 	}
-	cli.decode(cli.invoke(append([]string{"--json", "ready", "r", id, "1", "--head", "head-" + id}, flags...)...), &record)
+	// Each submission takes its own key, so a second ready of one migration publishes a new record.
+	key := "ready-" + id + "-" + strconv.Itoa(cli.readies[id])
+	cli.readies[id]++
+	cli.decode(cli.invoke(append([]string{"--json", "ready", "r", id, "1", "--head", "head-" + id, "--key", key}, flags...)...), &record)
 	current := map[string]string{}
 	for name, hash := range reads {
 		current[name] = hash
 	}
 	return map[string]any{"migration": id, "ready_event": record.ReadyEvent, "current_hashes": current, "changed_paths": []string{write}}
+}
+
+// readyEvent is the ready event of the member that ready built, as the round flag takes it.
+func readyEvent(member map[string]any) string {
+	return strconv.FormatInt(member["ready_event"].(int64), 10)
 }
 
 // admitFields is the admit-batch request of batch id, read at version, for members in that order.
@@ -231,7 +240,7 @@ func TestAdmitBatchCommandFencesTheAdmittedMigration(t *testing.T) {
 	events := len(cli.events(""))
 	for _, args := range [][]string{
 		{"takeover", "r", "M-1", "bob", "1"},
-		{"round", "r", "M-1", "1", "build failed", "--key", "round-1"},
+		{"round", "r", "M-1", "1", "build failed", "--key", "round-1", "--ready-event", readyEvent(member)},
 		{"contract", "transfer", "r", "C", "alice", "bob"},
 	} {
 		cli.refused("batch_admitted", args...)
@@ -243,7 +252,7 @@ func TestAdmitBatchCommandFencesTheAdmittedMigration(t *testing.T) {
 		LandingRounds int    `json:"landing_rounds"`
 		Escalated     string `json:"escalated_at"`
 	}
-	cli.decode(cli.invoke("--json", "round", "r", "M-1", "1", "build failed", "--key", "round-1"), &round)
+	cli.decode(cli.invoke("--json", "round", "r", "M-1", "1", "build failed", "--key", "round-1", "--ready-event", readyEvent(member)), &round)
 	if round.LandingRounds != 1 || round.Escalated == "" {
 		t.Fatalf("the round after the release = %+v, want one escalated round", round)
 	}

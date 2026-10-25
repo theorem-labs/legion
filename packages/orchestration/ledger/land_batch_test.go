@@ -168,8 +168,8 @@ func TestLandBatchLandsEveryMemberInPositionOrder(t *testing.T) {
 		}
 	}
 	c := must(f.s.Contract(ctx, "r", "C"))
-	review := json.RawMessage(`{"review":{"contract":"C","reviewer":"alice","head":"head-M-1"}}`)
-	if c.StatementHash != "c2" || c.Version != 2 || !sameJSON(t, json.RawMessage(c.LastChange), review) {
+	review := &ledger.Review{Contract: "C", Reviewer: "alice", Head: "head-M-1"}
+	if c.StatementHash != "c2" || c.Version != 2 || c.LastChange == nil || !reflect.DeepEqual(c.LastChange.Review, review) {
 		t.Fatalf("contract C after the landing: %+v", c)
 	}
 	if stale := must(f.s.StaleAgreements(ctx, "r")); len(stale) != 1 || stale[0].ID != "A-1" {

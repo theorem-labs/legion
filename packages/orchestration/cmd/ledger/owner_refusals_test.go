@@ -139,7 +139,8 @@ func (cli ownerRefusalCLI) assertOwners(want ...cliOwnerLine) {
 }
 
 // refuse-owner records one refusal per owner and revision, a repeat appends nothing, another reason at that revision
-// exits 1 with refusal_conflict, and owners shows each owner's refusal only while its work is the refused work.
+// replaces the stored one with one more event, and owners shows each owner's refusal only while its work is the refused
+// work.
 func TestRefuseOwnerCommandRecordsOneRefusalPerRevision(t *testing.T) {
 	cli := newOwnerRefusalCLI(t)
 	const refused, other = "function:get_mountpoint", "struct:mount"
@@ -159,27 +160,26 @@ func TestRefuseOwnerCommandRecordsOneRefusalPerRevision(t *testing.T) {
 	}
 	cli.assertOwners(cliOwnerLine{Owner: refused, Refusal: &first}, cliOwnerLine{Owner: other})
 
-	code, stdout, stderr := cli.call("--json", "refuse-owner", "r", refused, strconv.FormatInt(revision, 10), "owner id outside the accepted forms")
-	if code != 1 || !strings.Contains(stdout, `"reason":"refusal_conflict"`) {
-		t.Fatalf("conflicting refusal: code=%d stdout=%q stderr=%q, want exit 1 with refusal_conflict", code, stdout, stderr)
+	latest := cli.refuse(refused, revision, "owner id outside the accepted forms")
+	if latest.Revision != revision || latest.Reason != "owner id outside the accepted forms" {
+		t.Fatalf("refusal with another reason = %+v", latest)
 	}
-	if n := cli.refusedEvents(refused); n != 1 {
-		t.Fatalf("%d owner.refused events after a conflicting refusal, want 1", n)
+	if n := cli.refusedEvents(refused); n != 2 {
+		t.Fatalf("%d owner.refused events after another reason, want 2", n)
 	}
-	cli.assertOwners(cliOwnerLine{Owner: refused, Refusal: &first}, cliOwnerLine{Owner: other})
+	cli.assertOwners(cliOwnerLine{Owner: refused, Refusal: &latest}, cliOwnerLine{Owner: other})
 
 	newer := cli.enqueue("item-3", refused)
 	cli.assertOwners(cliOwnerLine{Owner: refused}, cliOwnerLine{Owner: other})
 	second := cli.refuse(refused, newer, "owner id outside the accepted forms")
 	cli.assertOwners(cliOwnerLine{Owner: refused, Refusal: &second}, cliOwnerLine{Owner: other})
-	if n := cli.refusedEvents(refused); n != 2 {
-		t.Fatalf("%d owner.refused events after a refusal at the new revision, want 2", n)
+	if n := cli.refusedEvents(refused); n != 3 {
+		t.Fatalf("%d owner.refused events after a refusal at the new revision, want 3", n)
 	}
 }
 
-// Every malformed refuse-owner exits 2 and records nothing: a wrong argument count, an empty owner or reason, a
-// revision below 1, a revision that is not in canonical decimal form (so "07" is never read as 7), and a revision
-// newer than the owner's work revision, whose error names the current one.
+// Every malformed refuse-owner exits 2 and records nothing: a wrong argument count, an empty owner or reason, and a
+// revision below 1 or not an integer.
 func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 	cli := newOwnerRefusalCLI(t)
 	const owner = "struct:mount"
@@ -196,10 +196,7 @@ func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 		{"empty reason", []string{"refuse-owner", "r", owner, canonical, ""}, "empty reason"},
 		{"zero revision", []string{"refuse-owner", "r", owner, "0", "no template"}, "revision 0"},
 		{"negative revision", []string{"refuse-owner", "r", owner, "-1", "no template"}, "revision -1"},
-		{"leading zero", []string{"refuse-owner", "r", owner, "0" + canonical, "no template"}, "revision"},
-		{"plus sign", []string{"refuse-owner", "r", owner, "+" + canonical, "no template"}, "revision"},
-		{"not a number", []string{"refuse-owner", "r", owner, canonical + "x", "no template"}, "revision"},
-		{"newer revision", []string{"refuse-owner", "r", owner, strconv.FormatInt(revision+1, 10), "no template"}, "work revision " + canonical},
+		{"not a number", []string{"refuse-owner", "r", owner, canonical + "x", "no template"}, `invalid integer "` + canonical + `x"`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			code, stdout, stderr := cli.call(test.args...)
@@ -220,5 +217,127 @@ func TestRefuseOwnerCommandInvalidInputExitsTwo(t *testing.T) {
 	cli.assertOwners(cliOwnerLine{Owner: owner, Refusal: &refusal})
 	if code, stdout, stderr := cli.call("refuse-owner", "missing", owner, canonical, "no template"); code != 3 {
 		t.Fatalf("refusal in a missing repository: code=%d stdout=%q stderr=%q, want 3", code, stdout, stderr)
+	}
+}
+
+// The revision is an integer, so every decimal form of it names the same work revision: "07" and "+7" are 7, and a
+// refusal through either repeats the refusal at 7 rather than recording another.
+func TestRefuseOwnerCommandReadsTheRevisionAsAnInteger(t *testing.T) {
+	cli := newOwnerRefusalCLI(t)
+	const owner = "struct:mount"
+	revision := cli.enqueue("item-1", owner)
+	canonical := strconv.FormatInt(revision, 10)
+	first := cli.refuse(owner, revision, "no template")
+	for _, form := range []string{"0" + canonical, "+" + canonical} {
+		var repeat cliOwnerRefusal
+		cli.decode(cli.invoke("--json", "refuse-owner", "r", owner, form, "no template"), &repeat)
+		if repeat.Revision != revision || !repeat.At.Equal(first.At) {
+			t.Fatalf("refusal at %q = %+v, want the stored refusal %+v", form, repeat, first)
+		}
+	}
+	if n := cli.refusedEvents(owner); n != 1 {
+		t.Fatalf("%d owner.refused events, want 1", n)
+	}
+}
+
+// enqueue, owners, a supervised claim and release-holder round-trip through the command line: the
+// owner is the exact node id, the stored item and its item.enqueued event say so, and the exit codes
+// are 0 for an enqueue or a repeat, 1 for an item another owner holds, and 2 for usage errors.
+func TestOwnerCommandsRoundTrip(t *testing.T) {
+	call := ledgerCommand(t)
+	invoke := func(args ...string) string {
+		t.Helper()
+		return mustRun(t, call, args...)
+	}
+	invoke("repo", "ensure", "r", "3")
+	invoke("enqueue", "r", "item-1", "function:get_mountpoint")
+	invoke("enqueue", "r", "item-1", "function:get_mountpoint")
+	invoke("enqueue", "r", "item-2", "struct:mount")
+
+	var item struct {
+		Owner string `json:"owner"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &item); err != nil ||
+		item.Owner != "function:get_mountpoint" || item.State != "open" {
+		t.Fatalf("enqueued item: %v %+v", err, item)
+	}
+	var log []struct {
+		Kind    string `json:"kind"`
+		Subject string `json:"subject"`
+		Data    struct {
+			Owner string `json:"owner"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "events", "r", "0", "item-1")), &log); err != nil {
+		t.Fatal(err)
+	}
+	enqueued := 0
+	for _, e := range log {
+		if e.Kind == "item.enqueued" {
+			enqueued++
+			if e.Data.Owner != "function:get_mountpoint" {
+				t.Fatalf("enqueue event: %+v", e)
+			}
+		}
+	}
+	if enqueued != 1 {
+		t.Fatalf("%d item.enqueued events for item-1, want 1: %+v", enqueued, log)
+	}
+
+	var owners []struct {
+		Owner   string           `json:"owner"`
+		Refusal *json.RawMessage `json:"refusal"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "owners", "r")), &owners); err != nil ||
+		len(owners) != 2 || owners[0].Owner != "function:get_mountpoint" || owners[1].Owner != "struct:mount" ||
+		owners[0].Refusal != nil || owners[1].Refusal != nil {
+		t.Fatalf("open owners: %v %+v", err, owners)
+	}
+
+	if code, out, _ := call("--json", "enqueue", "r", "item-1", "struct:mount"); code != 1 || !strings.Contains(out, `"reason":"exists"`) {
+		t.Fatalf("enqueue for another owner: code %d output %q", code, out)
+	}
+	for _, usage := range [][]string{{"enqueue", "r", "item-1"}, {"enqueue", "r", "", "struct:mount"}, {"owners"}, {"release-holder", "r", "x"}} {
+		if code, _, _ := call(usage...); code != 2 {
+			t.Fatalf("%v exited %d, want 2", usage, code)
+		}
+	}
+
+	invoke("claim", "r", "item-1", "function:get_mountpoint", "0")
+	var held struct {
+		Holder    string     `json:"holder"`
+		ExpiresAt *time.Time `json:"expires_at"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &held); err != nil ||
+		held.Holder != "function:get_mountpoint" || held.ExpiresAt != nil {
+		t.Fatalf("supervised claim: %v %+v", err, held)
+	}
+	var freed []struct {
+		ID         string `json:"id"`
+		Generation int64  `json:"generation"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "release-holder", "r", "function:get_mountpoint", "pane gone")), &freed); err != nil ||
+		len(freed) != 1 || freed[0].ID != "item-1" || freed[0].Generation != 1 {
+		t.Fatalf("released holder: %v %+v", err, freed)
+	}
+	if code, _, _ := call("complete", "r", "item-1", "function:get_mountpoint", "1", "late"); code != 1 {
+		t.Fatalf("late result exited %d, want the refusal's 1", code)
+	}
+	var after struct {
+		Holder string `json:"holder"`
+	}
+	if err := json.Unmarshal([]byte(invoke("--json", "item", "r", "item-1")), &after); err != nil || after.Holder != "" {
+		t.Fatalf("item after release-holder: %v %+v", err, after)
+	}
+	invoke("claim", "r", "item-2", "struct:mount", "0")
+	invoke("complete", "r", "item-2", "struct:mount", "1", "done")
+	owners = nil
+	if err := json.Unmarshal([]byte(invoke("--json", "owners", "r")), &owners); err != nil ||
+		len(owners) != 1 || owners[0].Owner != "function:get_mountpoint" || owners[0].Refusal != nil {
+		t.Fatalf("open owners after a completion: %v %+v", err, owners)
+	}
+	if code, _, _ := call("--json", "enqueue", "r", "item-2", "struct:mount"); code != 1 {
+		t.Fatalf("enqueue of a done item exited %d, want 1", code)
 	}
 }

@@ -479,6 +479,8 @@ func librarianID(line json.RawMessage) string {
 //   - a librarian line creates the intent librarian/<batch>/<id> (op librarian), whose result holds the line, the
 //     landing commit and the apply's hook.
 //
+// A name that an admitted member reads is fenced, as RegisterContract is.
+//
 // Registrations run in name order and librarian intents in id order, which every apply shares, and every row write
 // comes before the first event: an event holds the repository's event lock until its transaction commits, so a call
 // that waits on a row never holds it. So no two applies, and no apply and RegisterContract, deadlock. A line that is
@@ -487,6 +489,9 @@ func librarianID(line json.RawMessage) string {
 func (s *Store) BatchEffectApplyContracts(ctx context.Context, repo, batch, key string) (Effect, error) {
 	var effect Effect
 	err := s.tx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
+			return err
+		}
 		apply, err := lockEffect(ctx, tx, repo, batch, key)
 		if err != nil {
 			return err
@@ -514,6 +519,9 @@ func (s *Store) BatchEffectApplyContracts(ctx context.Context, repo, batch, key 
 		applied, unchanged, registered := []string{}, []string{}, []Contract{}
 		for _, register := range registers {
 			want := register.value
+			if err := fenceContract(ctx, tx, repo, want.Name, true); err != nil {
+				return err
+			}
 			contract, inserted, err := insertContract(ctx, tx, repo, want.Name, want.Owner, want.StatementHash, false)
 			if err != nil {
 				return err
@@ -522,7 +530,7 @@ func (s *Store) BatchEffectApplyContracts(ctx context.Context, repo, batch, key 
 				applied, registered = append(applied, want.Name), append(registered, contract)
 				continue
 			}
-			present, err := loadContract(ctx, tx, repo, want.Name, false)
+			present, err := loadContract(ctx, tx, repo, want.Name, noLock)
 			if err != nil {
 				return err
 			}

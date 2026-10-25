@@ -42,6 +42,18 @@ func (records readyList) String() string {
 	return out.String()
 }
 
+// lease is a granted or renewed lease. It prints as ledger.Lease in JSON, and as one line without --json: a supervised
+// lease says so, because it has no end to print.
+type lease ledger.Lease
+
+func (l lease) String() string {
+	end := "supervised"
+	if l.ExpiresAt != nil {
+		end = "expires_at=" + l.ExpiresAt.Format(time.RFC3339Nano)
+	}
+	return fmt.Sprintf("%s holder=%s generation=%d %s", l.ID, l.Holder, l.Generation, end)
+}
+
 func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 }
@@ -91,13 +103,9 @@ parsed:
 	if err != nil {
 		var check *checkResultError
 		if errors.As(err, &check) {
-			if jsonOutput || read {
-				if encodeErr := json.NewEncoder(stdout).Encode(check.result); encodeErr != nil {
-					fmt.Fprintln(stderr, encodeErr)
-					return 4
-				}
-			} else {
-				fmt.Fprintln(stdout, check.result)
+			if encodeErr := writeResult(stdout, check.result, jsonOutput || read); encodeErr != nil {
+				fmt.Fprintln(stderr, encodeErr)
+				return 4
 			}
 			return check.exit
 		}
@@ -113,16 +121,27 @@ parsed:
 	}
 	holdAfterCommit()
 	if value != nil {
-		if jsonOutput || read {
-			if err := json.NewEncoder(stdout).Encode(value); err != nil {
-				fmt.Fprintln(stderr, err)
-				return 4
-			}
-		} else {
-			fmt.Fprintln(stdout, value)
+		if err := writeResult(stdout, value, jsonOutput || read); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 4
 		}
 	}
 	return 0
+}
+
+// writeResult prints a command's result. With --json, and for a read command in either mode, it prints one line of
+// JSON. Otherwise it prints the result's text form when it has one (a lease line, the ready list), and else the same
+// JSON indented, so text output is never Go syntax.
+func writeResult(stdout io.Writer, value any, asJSON bool) error {
+	encoder := json.NewEncoder(stdout)
+	if !asJSON {
+		if text, ok := value.(fmt.Stringer); ok {
+			_, err := fmt.Fprintln(stdout, text)
+			return err
+		}
+		encoder.SetIndent("", "  ")
+	}
+	return encoder.Encode(value)
 }
 
 func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, error) {
@@ -130,18 +149,14 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 	args = args[1:]
 	switch command {
 	case "repo":
-		if len(args) < 3 || args[0] != "ensure" || (len(args) != 3 && (len(args) != 5 || args[3] != "--upstream-owner")) {
-			return nil, false, usagef("repo ensure <repo> <max-rounds> [--upstream-owner <name>]")
+		if len(args) != 3 || args[0] != "ensure" {
+			return nil, false, usagef("repo ensure <repo> <max-rounds>")
 		}
 		limit, err := roundLimit(args[2])
 		if err != nil {
 			return nil, false, err
 		}
-		options := []ledger.EnsureRepoOption{}
-		if len(args) == 5 {
-			options = append(options, ledger.WithUpstreamOwner(args[4]))
-		}
-		return mutation(s.EnsureRepo(ctx, args[1], limit, options...))
+		return mutation(s.EnsureRepo(ctx, args[1], limit))
 	case "enqueue":
 		if len(args) != 3 || args[0] == "" || args[1] == "" || args[2] == "" {
 			return nil, false, usagef("enqueue <repo> <item> <owner>")
@@ -157,7 +172,7 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if len(args) != 4 {
 			return nil, false, usagef("refuse-owner <repo> <owner> <revision> <reason>")
 		}
-		revision, err := canonicalInteger("revision", args[2])
+		revision, err := integer(args[2])
 		if err != nil {
 			return nil, false, err
 		}
@@ -170,7 +185,8 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if err != nil {
 			return nil, false, err
 		}
-		return mutation(s.Claim(ctx, args[0], args[1], args[2], ttl))
+		value, err := s.Claim(ctx, args[0], args[1], args[2], ttl)
+		return lease(value), false, err
 	case "release-holder":
 		if len(args) != 3 {
 			return nil, false, usagef("release-holder <repo> <holder> <reason>")
@@ -188,7 +204,8 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		if err != nil {
 			return nil, false, err
 		}
-		return mutation(s.Renew(ctx, args[0], args[1], args[2], generation, ttl))
+		value, err := s.Renew(ctx, args[0], args[1], args[2], generation, ttl)
+		return lease(value), false, err
 	case "release":
 		if len(args) != 4 {
 			return nil, false, usagef("release <repo> <item> <holder> <generation>")
@@ -217,6 +234,12 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			return nil, true, usagef("item <repo> <item>")
 		}
 		value, err := s.Item(ctx, args[0], args[1])
+		return value, true, err
+	case "items":
+		if len(args) != 3 || args[1] != "--owner" {
+			return nil, true, usagef("items <repo> --owner <key>")
+		}
+		value, err := s.OpenItems(ctx, args[0], args[2])
 		return value, true, err
 	case "open":
 		if request, jsonInput, err := requestFile[ledger.OpenRequest](args); jsonInput {
@@ -278,7 +301,7 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			request = decoded
 		} else {
 			if len(args) < 3 {
-				return nil, false, usagef("ready <repo> <id> <generation> --head <sha> [--changed-contract <name=hash>] " +
+				return nil, false, usagef("ready <repo> <id> <generation> --key <key> --head <sha> [--changed-contract <name=hash>] " +
 					"[--compatibility-proof <name>] [--reviewed-head <sha>] [--review <contract=reviewer@head>] " +
 					"[--approved-pinned <name>] [--upstream <commit>]")
 			}
@@ -317,11 +340,11 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			if err != nil {
 				return nil, true, err
 			}
-			request, err = parseCheckFlags(args[3:])
+			request, err = parseCandidateFlags(candidateOptions{command: "check", deferReads: true}, args[3:])
 			if err != nil {
 				return nil, true, err
 			}
-			request.Repo, request.ID, request.Generation = args[0], args[1], generation
+			request.Repo, request.Migration, request.Generation = args[0], args[1], generation
 		}
 		value, err := s.Check(ctx, request)
 		if err != nil {
@@ -350,6 +373,11 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			return nil, false, err
 		}
 		return mutation(s.Abandon(ctx, args[0], args[1], generation, args[3]))
+	case "retry":
+		if len(args) != 2 {
+			return nil, false, usagef("retry <repo> <id>")
+		}
+		return mutation(s.Retry(ctx, args[0], args[1]))
 	case "round":
 		var request ledger.RoundRequest
 		if decoded, jsonInput, err := requestFile[ledger.RoundRequest](args); jsonInput {
@@ -359,7 +387,8 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			request = decoded
 		} else {
 			if len(args) < 4 {
-				return nil, false, usagef("round <repo> <id> <generation> <reason> --key <key> [--batch <batch>] [--detail <detail>] [--log <log>]")
+				return nil, false, usagef("round <repo> <id> <generation> <reason> --key <key> --ready-event <id> [--batch <batch>] " +
+					"[--detail <detail>] [--log <log>]")
 			}
 			generation, err := integer(args[2])
 			if err != nil {
@@ -558,15 +587,6 @@ func writeError(stderr io.Writer, jsonOutput bool, err error) int {
 
 func usagef(format string, args ...any) error { return &usageError{fmt.Sprintf(format, args...)} }
 
-// canonicalInteger parses value only in its canonical decimal form, so "07" and "+7" are refused rather than read as
-// the 7 that the ledger stores.
-func canonicalInteger(what, value string) (int64, error) {
-	n, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || strconv.FormatInt(n, 10) != value {
-		return 0, usagef("invalid %s %q: want a decimal integer without sign or leading zeros", what, value)
-	}
-	return n, nil
-}
 func integer(value string) (int64, error) {
 	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
@@ -582,13 +602,18 @@ func duration(value string) (time.Duration, error) {
 	return d, nil
 }
 
-// leaseLength is a claim's lease length: 0 is a supervised lease with no end, anything else a
-// duration.
+// leaseLength is a claim's lease length: the literal 0 is a supervised lease with no end, anything else a positive
+// duration. A duration that is zero, such as 0s, is refused rather than read as supervised, so a computed length that
+// comes out zero is an error and not a lease that only a supervisor can free.
 func leaseLength(value string) (time.Duration, error) {
 	if value == "0" {
 		return 0, nil
 	}
-	return duration(value)
+	d, err := duration(value)
+	if err == nil && d == 0 {
+		return 0, usagef("lease length %q is zero; give 0 for a supervised lease, or a positive duration", value)
+	}
+	return d, err
 }
 
 // roundLimit parses a repository's landing-round limit into the range of the schema's integer column.
@@ -721,10 +746,56 @@ func parseWritesAndReads(args []string) ([]string, map[string]string, error) {
 	return writes, reads, nil
 }
 
-// parseCheckFlags reads a check's candidate: its changed paths, current read hashes, changed contracts and statement
-// records. The records are single values, kept verbatim as --path keeps its value.
-func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
-	request := ledger.CheckRequest{Current: map[string]string{}, ChangedContracts: map[string]string{}}
+// parseRecordFlag reads one statement-record flag into r, for ready, check and land alike, and reports whether flag
+// is one. Values are kept verbatim; the ledger validates them, by the same rules for all three commands.
+func parseRecordFlag(flag, value string, r *ledger.StatementRecords) (bool, error) {
+	switch flag {
+	case "--head":
+		r.Head = value
+	case "--changed-contract":
+		name, hash, err := parsePair(value, false)
+		if err != nil {
+			return true, err
+		}
+		if r.ChangedContracts == nil {
+			r.ChangedContracts = map[string]string{}
+		}
+		r.ChangedContracts[name] = hash
+	case "--compatibility-proof":
+		r.CompatibilityProof = value
+	case "--reviewed-head":
+		r.ReviewedHead = value
+	case "--review":
+		review, err := parseReview(value)
+		if err != nil {
+			return true, err
+		}
+		r.Reviews = append(r.Reviews, review)
+	case "--approved-pinned":
+		r.ApprovedPinned = append(r.ApprovedPinned, value)
+	case "--upstream":
+		r.Upstream = value
+	default:
+		return false, nil
+	}
+	return true, nil
+}
+
+// candidateOptions are the flags a command takes beyond the candidate flags that check and land share.
+type candidateOptions struct {
+	command    string // the command's name, for usage errors
+	deferReads bool   // the command takes --defer-reads (check)
+	identity   bool   // the command names its migration with --repo, --migration and --generation (land)
+}
+
+// parseCandidateFlags reads the candidate of a check or a landing: its changed paths, current read hashes, landed
+// commit and statement records, and the flags that opts gives the command. --no-paths distinguishes an empty
+// candidate from an omitted changed-path list.
+func parseCandidateFlags(opts candidateOptions, args []string) (ledger.CheckRequest, error) {
+	request := ledger.CheckRequest{LandRequest: ledger.LandRequest{
+		Current:          map[string]string{},
+		StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{}},
+	}}
 	sawPath, noPaths := false, false
 	for len(args) > 0 {
 		switch args[0] {
@@ -733,19 +804,36 @@ func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
 			args = args[1:]
 			continue
 		case "--defer-reads":
+			if !opts.deferReads {
+				return ledger.CheckRequest{}, usagef("unknown %s flag %q", opts.command, args[0])
+			}
 			request.DeferReads = true
 			args = args[1:]
 			continue
 		}
 		if len(args) < 2 {
-			return ledger.CheckRequest{}, usagef("check flags need values")
+			return ledger.CheckRequest{}, usagef("%s flags need values", opts.command)
 		}
 		flag, value := args[0], args[1]
 		args = args[2:]
+		if record, err := parseRecordFlag(flag, value, &request.StatementRecords); record {
+			if err != nil {
+				return ledger.CheckRequest{}, err
+			}
+			continue
+		}
+		if opts.identity {
+			if identity, err := parseIdentityFlag(flag, value, &request.LandRequest); identity {
+				if err != nil {
+					return ledger.CheckRequest{}, err
+				}
+				continue
+			}
+		}
 		switch flag {
 		case "--path":
 			sawPath = true
-			request.Changed = append(request.Changed, value)
+			request.ChangedPaths = append(request.ChangedPaths, value)
 		case "--current":
 			name, hash, err := parsePair(value, true)
 			if err != nil {
@@ -754,39 +842,36 @@ func parseCheckFlags(args []string) (ledger.CheckRequest, error) {
 			request.Current[name] = hash
 		case "--commit":
 			request.Commit = value
-		case "--approved-pinned":
-			request.ApprovedPinned = append(request.ApprovedPinned, value)
-		case "--changed-contract":
-			name, hash, err := parsePair(value, false)
-			if err != nil {
-				return ledger.CheckRequest{}, err
-			}
-			request.ChangedContracts[name] = hash
-		case "--head":
-			request.Head = value
-		case "--compatibility-proof":
-			request.CompatibilityProof = value
-		case "--reviewed-head":
-			request.ReviewedHead = value
-		case "--review":
-			review, err := parseReview(value)
-			if err != nil {
-				return ledger.CheckRequest{}, err
-			}
-			request.Reviews = append(request.Reviews, review)
-		case "--upstream":
-			request.Upstream = value
 		default:
-			return ledger.CheckRequest{}, usagef("unknown check flag %q", flag)
+			return ledger.CheckRequest{}, usagef("unknown %s flag %q", opts.command, flag)
 		}
 	}
 	if sawPath && noPaths {
-		return ledger.CheckRequest{}, usagef("check takes --path or --no-paths, not both")
+		return ledger.CheckRequest{}, usagef("%s takes --path or --no-paths, not both", opts.command)
 	}
 	if noPaths {
-		request.Changed = []string{}
+		request.ChangedPaths = []string{}
 	}
 	return request, nil
+}
+
+// parseIdentityFlag reads one of the flags that name land's migration into r, and reports whether flag is one.
+func parseIdentityFlag(flag, value string, r *ledger.LandRequest) (bool, error) {
+	switch flag {
+	case "--repo":
+		r.Repo = value
+	case "--migration":
+		r.Migration = value
+	case "--generation":
+		generation, err := integer(value)
+		if err != nil {
+			return true, err
+		}
+		r.Generation = generation
+	default:
+		return false, nil
+	}
+	return true, nil
 }
 
 func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
@@ -800,6 +885,12 @@ func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
 		switch flag {
 		case "--key":
 			request.Key = value
+		case "--ready-event":
+			readyEvent, err := integer(value)
+			if err != nil {
+				return ledger.RoundRequest{}, err
+			}
+			request.ReadyEvent = readyEvent
 		case "--batch":
 			request.Batch = value
 		case "--detail":
@@ -813,52 +904,38 @@ func parseRoundFlags(args []string) (ledger.RoundRequest, error) {
 	if request.Key == "" {
 		return ledger.RoundRequest{}, usagef("round needs --key")
 	}
+	if request.ReadyEvent == 0 {
+		return ledger.RoundRequest{}, usagef("round needs --ready-event")
+	}
 	return request, nil
 }
 
+// parseReadyFlags reads a ready submission's key and statement records.
 func parseReadyFlags(args []string) (ledger.ReadyRequest, error) {
-	request := ledger.ReadyRequest{ChangedContracts: map[string]string{}}
+	request := ledger.ReadyRequest{StatementRecords: ledger.StatementRecords{ChangedContracts: map[string]string{}}}
 	for len(args) > 0 {
 		if len(args) < 2 {
 			return ledger.ReadyRequest{}, usagef("ready flags need values")
 		}
 		flag, value := args[0], args[1]
 		args = args[2:]
-		switch flag {
-		case "--head":
-			request.Head = value
-		case "--changed-contract":
-			name, hash, err := parsePair(value, false)
-			if err != nil {
-				return ledger.ReadyRequest{}, err
-			}
-			if strings.ContainsAny(name, "=@") {
-				return ledger.ReadyRequest{}, usagef("ambiguous name=value %q; use --request-file", value)
-			}
-			request.ChangedContracts[name] = hash
-		case "--compatibility-proof":
-			request.CompatibilityProof = value
-		case "--reviewed-head":
-			request.ReviewedHead = value
-		case "--review":
-			review, err := parseReview(value)
-			if err != nil {
-				return ledger.ReadyRequest{}, err
-			}
-			request.Reviews = append(request.Reviews, review)
-		case "--approved-pinned":
-			if value == "" || strings.ContainsAny(value, "=@") {
-				return ledger.ReadyRequest{}, usagef("ambiguous name %q; use --request-file", value)
-			}
-			request.ApprovedPinned = append(request.ApprovedPinned, value)
-		case "--upstream":
-			request.Upstream = value
-		default:
+		if flag == "--key" {
+			request.Key = value
+			continue
+		}
+		record, err := parseRecordFlag(flag, value, &request.StatementRecords)
+		if err != nil {
+			return ledger.ReadyRequest{}, err
+		}
+		if !record {
 			return ledger.ReadyRequest{}, usagef("unknown ready flag %q", flag)
 		}
 	}
 	if request.Head == "" {
 		return ledger.ReadyRequest{}, usagef("ready needs --head")
+	}
+	if request.Key == "" {
+		return ledger.ReadyRequest{}, usagef("ready needs --key")
 	}
 	return request, nil
 }
@@ -908,79 +985,12 @@ func parseLandRequest(args []string) (ledger.LandRequest, error) {
 	if request, jsonInput, err := requestFile[ledger.LandRequest](args); jsonInput {
 		return request, err
 	}
-	request := ledger.LandRequest{
-		Current:          map[string]string{},
-		ChangedContracts: map[string]string{},
-	}
-	// --no-paths distinguishes an empty candidate from an omitted changed-path list.
-	sawPath, noPaths := false, false
-	for len(args) > 0 {
-		if args[0] == "--no-paths" {
-			noPaths = true
-			args = args[1:]
-			continue
-		}
-		if len(args) < 2 {
-			return ledger.LandRequest{}, usagef("land flags need values")
-		}
-		flag, value := args[0], args[1]
-		args = args[2:]
-		switch flag {
-		case "--repo":
-			request.Repo = value
-		case "--migration":
-			request.Migration = value
-		case "--generation":
-			generation, err := integer(value)
-			if err != nil {
-				return ledger.LandRequest{}, err
-			}
-			request.Generation = generation
-		case "--commit":
-			request.Commit = value
-		case "--path":
-			sawPath = true
-			request.ChangedPaths = append(request.ChangedPaths, value)
-		case "--current":
-			name, hash, err := parsePair(value, true)
-			if err != nil {
-				return ledger.LandRequest{}, err
-			}
-			request.Current[name] = hash
-		case "--changed-contract":
-			name, hash, err := parsePair(value, false)
-			if err != nil {
-				return ledger.LandRequest{}, err
-			}
-			request.ChangedContracts[name] = hash
-		case "--approved-pinned":
-			request.ApprovedPinned = append(request.ApprovedPinned, value)
-		case "--head":
-			request.Head = value
-		case "--compatibility-proof":
-			request.CompatibilityProof = value
-		case "--reviewed-head":
-			request.ReviewedHead = value
-		case "--review":
-			review, err := parseReview(value)
-			if err != nil {
-				return ledger.LandRequest{}, err
-			}
-			request.Reviews = append(request.Reviews, review)
-		case "--upstream":
-			request.Upstream = value
-		default:
-			return ledger.LandRequest{}, usagef("unknown land flag %q", flag)
-		}
+	request, err := parseCandidateFlags(candidateOptions{command: "land", identity: true}, args)
+	if err != nil {
+		return ledger.LandRequest{}, err
 	}
 	if request.Repo == "" || request.Migration == "" {
 		return ledger.LandRequest{}, usagef("land needs --repo and --migration")
 	}
-	if sawPath && noPaths {
-		return ledger.LandRequest{}, usagef("land takes --path or --no-paths, not both")
-	}
-	if noPaths {
-		request.ChangedPaths = []string{}
-	}
-	return request, nil
+	return request.LandRequest, nil
 }

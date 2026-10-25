@@ -50,8 +50,9 @@ func (req DeclineRequest) digest() (string, error) {
 //     and record the request carries, because the request is the retry of the decline whose response was lost;
 //   - the version: a batch at another record version than ExpectedVersion is refused with stale_batch;
 //   - the release: the members are no longer admitted, so the fence no longer holds them;
-//   - the returns: each one recorded, as sent, as RecordRound records it, which counts the member's round and clears
-//     its ready record;
+//   - the returns: each one recorded as RecordRound records it, which counts the member's round and clears its ready
+//     record, at the ready event that the member's admission froze (batch_members.ready_event), so the round clears
+//     exactly the record that admission checked and a newer submission survives;
 //   - the write: the caller's record at the next version, admission declined, the digest and the successor, and
 //     batch.declined.
 //
@@ -95,8 +96,13 @@ func (s *Store) DeclineBatch(ctx context.Context, req DeclineRequest) (Batch, er
 			req.Repo, req.ID); err != nil {
 			return err
 		}
+		frozen := make(map[string]int64, len(members))
+		for _, member := range members {
+			frozen[member.migration] = member.readyEvent
+		}
 		returned := make([]string, len(req.Returns))
 		for i, round := range req.Returns {
+			round.ReadyEvent = frozen[round.ID]
 			if _, err := recordRound(ctx, tx, repository, round); err != nil {
 				return err
 			}

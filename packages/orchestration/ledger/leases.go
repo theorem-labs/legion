@@ -9,141 +9,30 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// EnsureRepoOption configures optional repository records.
-type EnsureRepoOption func(*ensureRepoOptions)
-
-type ensureRepoOptions struct {
-	upstreamOwner *string
-}
-
-// WithUpstreamOwner sets the migration owner allowed to attach upstream provenance. An empty owner clears it.
-func WithUpstreamOwner(owner string) EnsureRepoOption {
-	return func(options *ensureRepoOptions) {
-		options.upstreamOwner = &owner
-	}
-}
-
-// EnsureRepo creates the repository record, or updates its landing-round limit and selected configuration if it exists.
-func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds int, options ...EnsureRepoOption) (Repository, error) {
+// EnsureRepo creates the repository record, or updates its landing-round limit if it exists.
+func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds int) (Repository, error) {
 	if name == "" {
 		return Repository{}, invalid("empty repository name")
 	}
 	if maxLandingRounds < 0 {
 		return Repository{}, invalid("max landing rounds %d is negative", maxLandingRounds)
 	}
-	config := ensureRepoOptions{}
-	for _, option := range options {
-		option(&config)
-	}
-	var configuredOwner any
-	if config.upstreamOwner != nil && *config.upstreamOwner != "" {
-		configuredOwner = *config.upstreamOwner
-	}
 	var r Repository
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		var previousRounds int
-		var previousOwner string
-		err := tx.QueryRow(ctx, `SELECT max_landing_rounds, coalesce(upstream_owner, '') FROM repositories WHERE name = $1 FOR UPDATE`, name).
-			Scan(&previousRounds, &previousOwner)
-		exists := err == nil
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		var prev *int
+		_ = tx.QueryRow(ctx, `SELECT max_landing_rounds FROM repositories WHERE name = $1 FOR UPDATE`, name).Scan(&prev)
+		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds) VALUES ($1, $2)
+			ON CONFLICT (name) DO UPDATE SET max_landing_rounds = EXCLUDED.max_landing_rounds
+			RETURNING name, max_landing_rounds, created_at`, name, maxLandingRounds).
+			Scan(&r.Name, &r.MaxLandingRounds, &r.CreatedAt); err != nil {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `INSERT INTO repositories (name, max_landing_rounds, upstream_owner) VALUES ($1, $2, $3)
-			ON CONFLICT (name) DO UPDATE SET max_landing_rounds = EXCLUDED.max_landing_rounds,
-				upstream_owner = CASE WHEN $4 THEN EXCLUDED.upstream_owner ELSE repositories.upstream_owner END
-			RETURNING name, max_landing_rounds, coalesce(upstream_owner, ''), created_at`, name, maxLandingRounds, configuredOwner, config.upstreamOwner != nil).
-			Scan(&r.Name, &r.MaxLandingRounds, &r.UpstreamOwner, &r.CreatedAt); err != nil {
-			return err
-		}
-		if exists && previousRounds == maxLandingRounds && (config.upstreamOwner == nil || previousOwner == r.UpstreamOwner) {
+		if prev != nil && *prev == maxLandingRounds {
 			return nil
 		}
-		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{
-			"max_landing_rounds": maxLandingRounds,
-			"upstream_owner":     r.UpstreamOwner,
-		})
+		return event(ctx, tx, name, "repository.configured", name, "", map[string]any{"max_landing_rounds": maxLandingRounds})
 	})
 	return r, err
-}
-
-// Enqueue creates an open work item for owner. Repeating an open enqueue for the same owner is
-// idempotent; an existing item belongs to one owner for its whole history.
-func (s *Store) Enqueue(ctx context.Context, repo, id, owner string) error {
-	if strings.TrimSpace(id) == "" || strings.TrimSpace(owner) == "" {
-		return invalid("an enqueued item needs an id and an owner")
-	}
-	return s.tx(ctx, func(tx pgx.Tx) error {
-		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
-			return err
-		}
-		return enqueueItem(ctx, tx, repo, id, owner)
-	})
-}
-
-// enqueueItem is Enqueue inside tx, which already holds the repository's row lock: it creates the open item id for
-// owner and appends item.enqueued, returns with nothing appended when that item is already open for owner, and
-// refuses (ReasonExists) an item that another owner has or that is done.
-func enqueueItem(ctx context.Context, tx pgx.Tx, repo, id, owner string) error {
-	var existingOwner, state string
-	err := tx.QueryRow(ctx, `INSERT INTO work_items (repo, id, owner) VALUES ($1, $2, $3)
-		ON CONFLICT DO NOTHING RETURNING owner, state`, repo, id, owner).Scan(&existingOwner, &state)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if err := tx.QueryRow(ctx, `SELECT owner, state FROM work_items WHERE repo = $1 AND id = $2 FOR UPDATE`,
-			repo, id).Scan(&existingOwner, &state); err != nil {
-			return err
-		}
-		if existingOwner == owner && state == "open" {
-			return nil
-		}
-		return refuse(ReasonExists, "item %s already belongs to owner %s in state %s", id, existingOwner, state)
-	}
-	if err != nil {
-		return err
-	}
-	return event(ctx, tx, repo, "item.enqueued", id, owner, map[string]any{"owner": owner})
-}
-
-// HasOpenWork reports whether owner names at least one open item in repository.
-func (s *Store) HasOpenWork(ctx context.Context, repo, owner string) (bool, error) {
-	if strings.TrimSpace(owner) == "" {
-		return false, invalid("empty owner")
-	}
-	var open bool
-	err := s.tx(ctx, func(tx pgx.Tx) error {
-		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
-			return err
-		}
-		return tx.QueryRow(ctx, `SELECT EXISTS (
-			SELECT 1 FROM work_items WHERE repo = $1 AND owner = $2 AND state = 'open'
-		)`, repo, owner).Scan(&open)
-	})
-	return open, err
-}
-
-// OwnerWorkRevision is the newest durable queue-change event of owner. Leasing an item does not
-// change its work, while enqueueing and completing one do; callers use the revision to distinguish
-// new work from the same work that exhausted a retry budget.
-func (s *Store) OwnerWorkRevision(ctx context.Context, repo, owner string) (int64, error) {
-	if strings.TrimSpace(owner) == "" {
-		return 0, invalid("empty owner")
-	}
-	var revision int64
-	err := s.tx(ctx, func(tx pgx.Tx) error {
-		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
-			return err
-		}
-		return tx.QueryRow(ctx, ownerWorkRevisionQuery("$2"), repo, owner).Scan(&revision)
-	})
-	return revision, err
-}
-
-// ownerWorkRevisionQuery selects OwnerWorkRevision, zero for an owner with no work, of the owner that the SQL
-// expression owner names in repository $1: a parameter, or a column of an enclosing query.
-func ownerWorkRevisionQuery(owner string) string {
-	return `SELECT coalesce(max(e.id), 0)
-		FROM events e JOIN work_items item ON item.repo = e.repo AND item.id = e.subject
-		WHERE e.repo = $1 AND item.owner = ` + owner + ` AND e.kind IN ('item.enqueued', 'item.completed')`
 }
 
 // checkLeaseArgs accepts a ttl of zero, a supervised lease with no end, or a fixed end of at least a
@@ -219,18 +108,16 @@ func (s *Store) Claim(ctx context.Context, repo, id, holder string, ttl time.Dur
 			return refuse(ReasonLeaseHeld, "item %s is held by %s (generation %d) %s",
 				id, *it.holder, it.generation, leaseEnd(it.expiresAt))
 		}
-		var expires *time.Time
 		if err := tx.QueryRow(ctx, `UPDATE work_items SET holder = $3, generation = generation + 1,
 				lease_granted_at = clock_timestamp(),
 				lease_expires_at = CASE WHEN $4::bigint = 0 THEN NULL ELSE clock_timestamp() + $4::bigint * interval '1 microsecond' END,
 				updated_at = clock_timestamp()
 			WHERE repo = $1 AND id = $2 RETURNING generation, lease_expires_at`,
-			repo, id, holder, ttl.Microseconds()).Scan(&l.Generation, &expires); err != nil {
+			repo, id, holder, ttl.Microseconds()).Scan(&l.Generation, &l.ExpiresAt); err != nil {
 			return err
 		}
-		data := map[string]any{"generation": l.Generation, "supervised": expires == nil}
-		if expires != nil {
-			l.ExpiresAt = *expires
+		data := map[string]any{"generation": l.Generation, "supervised": l.ExpiresAt == nil}
+		if l.ExpiresAt != nil {
 			data["expires_at"] = l.ExpiresAt
 		}
 		if it.holder != nil {
@@ -344,11 +231,12 @@ func (s *Store) Complete(ctx context.Context, repo, id, holder string, gen int64
 	})
 }
 
-// Expire frees every item whose lease has ended and returns them as they were (holder and generation).
+// Expire frees every item whose lease has ended and returns them as they were (holder and generation), or an empty
+// list when none has.
 func (s *Store) Expire(ctx context.Context, repo string) ([]Item, error) {
 	var out []Item
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		out = nil
+		out = []Item{}
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}

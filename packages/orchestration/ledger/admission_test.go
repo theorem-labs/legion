@@ -34,6 +34,9 @@ func readyAgain(t *testing.T, s *ledger.Store, id, write string, reads map[strin
 	if ready != nil {
 		ready(&request)
 	}
+	// Each submission takes its own key, so a second ready of one migration publishes a new record rather than
+	// replaying the first.
+	request.Key = "ready-" + request.Head
 	record := must(s.Ready(context.Background(), request))
 	current := map[string]string{}
 	for name, hash := range reads {
@@ -221,7 +224,8 @@ func TestAdmitBatchRefusesAMemberWhoseReadyRecordIsGoneOrChanged(t *testing.T) {
 		}, ledger.ReasonNotReady},
 		{"cleared by a round after the program read it", func(t *testing.T, s *ledger.Store, member *ledger.AdmitMember) {
 			*member = readyMember(t, s, "M-2", "bob", "b.lean", nil, nil)
-			must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-2", Generation: 1, Reason: "build failed", Key: "round-1"}))
+			must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-2", Generation: 1, Reason: "build failed", Key: "round-1",
+				ReadyEvent: member.ReadyEvent}))
 		}, ledger.ReasonNotReady},
 		{"readied again after the program read it", func(t *testing.T, s *ledger.Store, member *ledger.AdmitMember) {
 			*member = readyMember(t, s, "M-2", "bob", "b.lean", nil, nil)
@@ -293,11 +297,11 @@ func TestAdmitBatchNamesAMemberThatCheckRefusesWithItsReasons(t *testing.T) {
 	}{
 		{"a path outside the lock and a read with no hash", func(m *ledger.AdmitMember) {
 			m.ChangedPaths, m.CurrentHashes = []string{"outside.lean"}, map[string]string{}
-		}, []string{ledger.ViolationUndeclaredWrite, ledger.ViolationUnverifiedRead}},
+		}, []string{ledger.ReasonUndeclaredWrite, ledger.ReasonUnverifiedRead}},
 		{"a changed read", func(m *ledger.AdmitMember) {
 			m.CurrentHashes = map[string]string{"D": "d0"}
-		}, []string{ledger.ViolationStaleRead}},
-		{"no changed paths", func(m *ledger.AdmitMember) { m.ChangedPaths = nil }, []string{ledger.ViolationInvalidCandidate}},
+		}, []string{ledger.ReasonStaleRead}},
+		{"no changed paths", func(m *ledger.AdmitMember) { m.ChangedPaths = nil }, []string{ledger.ReasonInvalidCandidate}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := second
@@ -307,10 +311,10 @@ func TestAdmitBatchNamesAMemberThatCheckRefusesWithItsReasons(t *testing.T) {
 			refusal := wantMemberRefusal(t, err, test.kinds[0], "M-2")
 			assertNotAdmitted(t, s, dsn, created, events)
 
-			checked := must(s.Check(ctx, ledger.CheckRequest{
-				Repo: "r", ID: "M-2", Generation: 1, Commit: "candidate-batch-1", Changed: candidate.ChangedPaths,
-				Current: candidate.CurrentHashes, Head: "head-M-2",
-			}))
+			checked := must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{
+				Repo: "r", Migration: "M-2", Generation: 1, Commit: "candidate-batch-1", ChangedPaths: candidate.ChangedPaths,
+				Current: candidate.CurrentHashes, StatementRecords: ledger.StatementRecords{Head: "head-M-2"},
+			}}))
 			if !reflect.DeepEqual(refusal.Violations, checked.Violations) {
 				t.Fatalf("admission's reasons %+v, Check's %+v", refusal.Violations, checked.Violations)
 			}

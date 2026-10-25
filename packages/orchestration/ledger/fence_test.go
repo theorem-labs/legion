@@ -29,7 +29,7 @@ func admittedFixture(t *testing.T) fenceFixture {
 	must(s.RegisterContract(ctx, "r", "C", "alice", "c1", false))
 	must(s.RegisterContract(ctx, "r", "D", "bob", "d1", false))
 	must(open(t, s, "M-1", "alice", []string{"a.lean"}, map[string]string{"C": "c1"}))
-	must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Key: "round-0"}))
+	must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Key: "round-0", ReadyEvent: unreadyEvent}))
 	members := map[string]ledger.AdmitMember{
 		"M-1": readyAgain(t, s, "M-1", "a.lean", map[string]string{"C": "c1"}, changes("C", "c2", "alice")),
 		"M-2": readyMember(t, s, "M-2", "bob", "b.lean", map[string]string{"D": "d1", "E": "e1"}, nil),
@@ -107,18 +107,18 @@ func TestFenceRefusesEveryMutationThatAdmissionChecked(t *testing.T) {
 			return err
 		}},
 		{name: "a ready of a member", mutate: func(f fenceFixture) error {
-			_, err := f.s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: "M-1", Generation: 1, Head: "head-M-1b"})
+			_, err := f.s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: "M-1", Generation: 1, Head: "head-M-1b", Key: "ready-M-1b"})
 			return err
 		}},
 		{name: "a round of a member", mutate: func(f fenceFixture) error {
-			_, err := f.s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: "round-1"})
+			_, err := f.s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: "round-1", ReadyEvent: unreadyEvent})
 			return err
 		}},
 		{
 			name:    "a round of a member that would escalate it",
 			prepare: func(f fenceFixture) { must(f.s.EnsureRepo(ctx, "r", 2)) },
 			mutate: func(f fenceFixture) error {
-				_, err := f.s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: "round-1"})
+				_, err := f.s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "failed", Key: "round-1", ReadyEvent: unreadyEvent})
 				return err
 			},
 			then: func(t *testing.T, f fenceFixture) {
@@ -195,10 +195,10 @@ func TestCheckReportsWhatTheFenceRefuses(t *testing.T) {
 	f := admittedFixture(t)
 	check := func(id string, changes map[string]string) ledger.CheckResult {
 		m := must(f.s.Migration(ctx, "r", id))
-		return must(f.s.Check(ctx, ledger.CheckRequest{
-			Repo: "r", ID: id, Generation: 1, Commit: "landed-" + id, Changed: m.Writes, Current: m.Reads,
-			ChangedContracts: changes, Head: "head-" + id, ReviewedHead: "head-" + id,
-		}))
+		return must(f.s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{
+			Repo: "r", Migration: id, Generation: 1, Commit: "landed-" + id, ChangedPaths: m.Writes, Current: m.Reads,
+			StatementRecords: ledger.StatementRecords{ChangedContracts: changes, Head: "head-" + id, ReviewedHead: "head-" + id},
+		}}))
 	}
 	for _, test := range []struct {
 		id          string
@@ -213,7 +213,7 @@ func TestCheckReportsWhatTheFenceRefuses(t *testing.T) {
 		if result.Pass || len(result.Violations) != 1 {
 			t.Fatalf("check of %s while batch-1 is admitted: %+v, want one batch_admitted violation", test.id, result)
 		}
-		if v := result.Violations[0]; v.Kind != ledger.ViolationBatchAdmitted || v.Name != test.name || v.Other != test.other {
+		if v := result.Violations[0]; v.Kind != ledger.ReasonBatchAdmitted || v.Name != test.name || v.Other != test.other {
 			t.Fatalf("check of %s reports %+v, want batch_admitted naming %q and %q", test.id, v, test.name, test.other)
 		}
 	}
@@ -262,7 +262,7 @@ func TestFenceLeavesRetryAndReplaysToTheirOwnRules(t *testing.T) {
 	before := f.snapshot(t)
 	_, err := f.s.Retry(ctx, "r", "M-1")
 	wantRefusal(t, err, ledger.ReasonNotEscalated)
-	replayed, err := f.s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Key: "round-0"})
+	replayed, err := f.s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Key: "round-0", ReadyEvent: unreadyEvent})
 	if err != nil || replayed.LandingRounds != 1 {
 		t.Fatalf("a repeat of a known round key of an admitted member: %+v, %v", replayed, err)
 	}
@@ -336,7 +336,7 @@ func TestEscalateSweepSkipsAnAdmittedMember(t *testing.T) {
 	ctx := context.Background()
 	f := admittedFixture(t)
 	must(open(t, f.s, "M-7", "gina", []string{"g.lean"}, nil))
-	must(f.s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-7", Generation: 1, Reason: "failed", Key: "round-0"}))
+	must(f.s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-7", Generation: 1, Reason: "failed", Key: "round-0", ReadyEvent: unreadyEvent}))
 	ids := func(migrations []ledger.Migration) []string {
 		out := []string{}
 		for _, m := range migrations {

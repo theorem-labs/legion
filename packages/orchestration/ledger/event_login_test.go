@@ -82,9 +82,7 @@ func TestEventLoginMigrationNamesTheMigratingLogin(t *testing.T) {
 	applySchemas(t, conn,
 		"schema/0001_init.sql",
 		"schema/0002_work_item_owner.sql",
-		"schema/0003_ready_upstream_rounds.sql",
-		"schema/0004_contract_last_change.sql",
-		"schema/0005_round_keys_body.sql",
+		"schema/0003_ready_rounds_refusals.sql",
 	)
 	if _, err := conn.Exec(ctx, `INSERT INTO events (repo, kind, subject) VALUES ('r', 'old.event', 'before')`); err != nil {
 		t.Fatal(err)

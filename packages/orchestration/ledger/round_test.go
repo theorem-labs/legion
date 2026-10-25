@@ -19,13 +19,18 @@ type roundEvent struct {
 	Key           string `json:"key"`
 	Detail        string `json:"detail"`
 	Log           string `json:"log"`
+	ReadyEvent    int64  `json:"ready_event"`
 	ReadyCleared  bool   `json:"ready_cleared"`
 }
+
+// unreadyEvent is a ready event id that no migration in these tests stores, for a round whose ready record does not
+// matter to the test: such a round clears nothing and still counts.
+const unreadyEvent = 1 << 40
 
 func roundRequest(generation int64, key, reason string) ledger.RoundRequest {
 	return ledger.RoundRequest{
 		Repo: "r", ID: "M-1", Generation: generation, Reason: reason, Batch: "batch-a", Key: key,
-		Detail: "detail for " + key, Log: "https://logs.example.test/" + key,
+		Detail: "detail for " + key, Log: "https://logs.example.test/" + key, ReadyEvent: unreadyEvent,
 	}
 }
 
@@ -175,7 +180,9 @@ func TestRecordRoundAtLimitEscalatesOnceAcrossRetry(t *testing.T) {
 	}
 }
 
-func TestRecordRoundRefusesSameKeyWithDifferentBody(t *testing.T) {
+// TestRecordRoundReplaysAKeyWhateverItsBody catches a round key that counts twice, or that refuses its repeat: a key
+// repeated with another generation, reason or batch replays the migration as it is, and records nothing.
+func TestRecordRoundReplaysAKeyWhateverItsBody(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*ledger.RoundRequest)
@@ -194,16 +201,15 @@ func TestRecordRoundRefusesSameKeyWithDifferentBody(t *testing.T) {
 			if test.name == "generation" {
 				must(s.TakeOver(ctx, "r", "M-1", "bob", 1))
 			}
-			conflicting := request
-			test.mutate(&conflicting)
+			repeated := request
+			test.mutate(&repeated)
 
-			_, err := s.RecordRound(ctx, conflicting)
-			wantRefusal(t, err, ledger.ReasonRoundKeyConflict)
-			if migration := must(s.Migration(ctx, "r", "M-1")); migration.LandingRounds != 1 {
-				t.Fatalf("conflicting key changed migration: %+v", migration)
+			replay := must(s.RecordRound(ctx, repeated))
+			if migration := must(s.Migration(ctx, "r", "M-1")); migration.LandingRounds != 1 || replay.LandingRounds != 1 {
+				t.Fatalf("repeated key counted again: replay %+v, migration %+v", replay, migration)
 			}
-			if events := roundEvents(t, s); len(events) != 1 {
-				t.Fatalf("conflicting key appended round events: %+v", events)
+			if events := roundEvents(t, s); len(events) != 1 || events[0].Reason != "build failed" {
+				t.Fatalf("repeated key changed the round events: %+v", events)
 			}
 		})
 	}
@@ -219,9 +225,69 @@ func TestRecordRoundRequiresKey(t *testing.T) {
 	}
 }
 
+// A round names the ready record it consumed. Without one it cannot tell the failed submission from a newer one, so
+// it is invalid input, and it records nothing.
+func TestRecordRoundRequiresTheReadyEventItConsumed(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+	must(s.Ready(ctx, readyRequest("M-1", 1, "head-1")))
+	request := roundRequest(1, "round-1", "build failed")
+	request.ReadyEvent = 0
+	_, err := s.RecordRound(ctx, request)
+	var invalid *ledger.InvalidError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("no ready event: want invalid input, got %v", err)
+	}
+	if records := must(s.ReadyMigrations(ctx, "r")); len(records) != 1 {
+		t.Fatalf("a refused round cleared the ready record: %+v", records)
+	}
+	if migration := must(s.Migration(ctx, "r", "M-1")); migration.LandingRounds != 0 || len(roundEvents(t, s)) != 0 {
+		t.Fatalf("a refused round counted: %+v", migration)
+	}
+}
+
+// TestRoundForAnOlderReadyRecordKeepsItsReplacement catches a failed return that deletes the owner's newer
+// submission. The owner publishes H1, the landing program starts on it, the owner publishes H2 at the same
+// generation, and the landing program returns H1. H1 really failed, so the round counts, but H2 stays listed and
+// the event says nothing was cleared. A round for H2 then clears H2 (control).
+func TestRoundForAnOlderReadyRecordKeepsItsReplacement(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+	h1 := must(s.Ready(ctx, readyRequest("M-1", 1, "H1")))
+	h2 := must(s.Ready(ctx, readyRequest("M-1", 1, "H2")))
+
+	stale := roundRequest(1, "round-1", "H1 build failed")
+	stale.ReadyEvent = h1.ReadyEvent
+	if migration := must(s.RecordRound(ctx, stale)); migration.LandingRounds != 1 {
+		t.Fatalf("the round for H1 did not count: %+v", migration)
+	}
+	ready := must(s.ReadyMigrations(ctx, "r"))
+	if len(ready) != 1 || ready[0].Head != "H2" || ready[0].ReadyEvent != h2.ReadyEvent {
+		t.Fatalf("the round for H1 changed the ready list: %+v, want H2 at event %d", ready, h2.ReadyEvent)
+	}
+	events := roundEvents(t, s)
+	if len(events) != 1 || events[0].ReadyEvent != h1.ReadyEvent || events[0].ReadyCleared {
+		t.Fatalf("round event %+v, want ready_event %d and ready_cleared false", events, h1.ReadyEvent)
+	}
+
+	current := roundRequest(1, "round-2", "H2 build failed")
+	current.ReadyEvent = h2.ReadyEvent
+	if migration := must(s.RecordRound(ctx, current)); migration.LandingRounds != 2 {
+		t.Fatalf("the round for H2 did not count: %+v", migration)
+	}
+	if ready := must(s.ReadyMigrations(ctx, "r")); len(ready) != 0 {
+		t.Fatalf("the round for H2 left its record: %+v", ready)
+	}
+	if events := roundEvents(t, s); len(events) != 2 || events[1].ReadyEvent != h2.ReadyEvent || !events[1].ReadyCleared {
+		t.Fatalf("round events %+v, want the second to clear event %d", events, h2.ReadyEvent)
+	}
+}
+
 // TestRecordRoundAfterCloseReplaysAndRefusesNewKey catches a round counted on a closed migration: after a landing or
-// an abandonment, a retried key replays the closed migration with no change and no event, a new key is refused
-// not_open, and the retried key with another reason is refused round_key_conflict.
+// an abandonment, a retried key replays the closed migration with no change and no event, whatever its reason, and a
+// new key is refused not_open.
 func TestRecordRoundAfterCloseReplaysAndRefusesNewKey(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -256,8 +322,10 @@ func TestRecordRoundAfterCloseReplaysAndRefusesNewKey(t *testing.T) {
 			}
 			_, err := s.RecordRound(ctx, roundRequest(1, "round-2", "build failed"))
 			wantRefusal(t, err, ledger.ReasonNotOpen)
-			_, err = s.RecordRound(ctx, roundRequest(1, "round-1", "test failed"))
-			wantRefusal(t, err, ledger.ReasonRoundKeyConflict)
+			replay = must(s.RecordRound(ctx, roundRequest(1, "round-1", "test failed")))
+			if replay.State != test.state || replay.LandingRounds != 1 {
+				t.Fatalf("replay with another reason after %s: %+v", test.name, replay)
+			}
 
 			if migration := must(s.Migration(ctx, "r", "M-1")); migration.State != test.state || migration.LandingRounds != 1 {
 				t.Fatalf("migration after rounds on a closed migration: %+v", migration)
@@ -273,17 +341,18 @@ func TestRecordRoundEventHoldsEveryField(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
 	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
-	must(s.Ready(ctx, readyRequest("M-1", 1, "head-1")))
+	readied := must(s.Ready(ctx, readyRequest("M-1", 1, "head-1")))
 	request := ledger.RoundRequest{
 		Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Batch: "batch-a", Key: "round-1",
-		Detail: "compiler reported an error", Log: "https://logs.example.test/round-1",
+		Detail: "compiler reported an error", Log: "https://logs.example.test/round-1", ReadyEvent: readied.ReadyEvent,
 	}
 
 	must(s.RecordRound(ctx, request))
 	events := roundEvents(t, s)
 	want := roundEvent{
 		Generation: 1, LandingRounds: 1, Reason: "build failed", Batch: "batch-a", Key: "round-1",
-		Detail: "compiler reported an error", Log: "https://logs.example.test/round-1", ReadyCleared: true,
+		Detail: "compiler reported an error", Log: "https://logs.example.test/round-1", ReadyEvent: readied.ReadyEvent,
+		ReadyCleared: true,
 	}
 	if len(events) != 1 || events[0] != want {
 		t.Fatalf("round event: got %+v, want %+v", events, want)

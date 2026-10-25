@@ -188,32 +188,31 @@ func landMember(ctx context.Context, tx pgx.Tx, repo, batch string, m Migration,
 	if err := json.Unmarshal(data, &ready); err != nil {
 		return err
 	}
-	records := LandRequest{
-		Head: ready.Head, CompatibilityProof: ready.CompatibilityProof, ReviewedHead: ready.ReviewedHead,
-		Reviews: ready.Reviews, Upstream: ready.Upstream,
-	}
-	names := sortedNames(ready.ChangedContracts)
-	advances := make([]contractAdvance, 0, len(names))
+	records := ready.withEmptyLists()
+	names := sortedNames(records.ChangedContracts)
+	contracts := make([]Contract, 0, len(names))
 	for _, name := range names {
-		current, err := loadContract(ctx, tx, repo, name, false)
+		current, err := loadContract(ctx, tx, repo, name, noLock)
 		if err != nil {
 			return err
 		}
-		lastChange, err := contractLastChange(records, current)
-		if err != nil {
-			return err
-		}
-		advances = append(advances, contractAdvance{current: current, hash: ready.ChangedContracts[name], lastChange: lastChange})
+		contracts = append(contracts, current)
+	}
+	cleared := clearStatements(contracts, records)
+	advances := make([]contractAdvance, 0, len(contracts))
+	for _, current := range contracts {
+		advances = append(advances, contractAdvance{current: current, hash: records.ChangedContracts[current.Name],
+			lastChange: cleared[current.Name]})
 	}
 	return landMigration(ctx, tx, repo, m, advances, mergedCommit, map[string]any{
 		"generation":          member.generation,
 		"commit":              mergedCommit,
 		"contracts":           names,
-		"head":                ready.Head,
-		"compatibility_proof": ready.CompatibilityProof,
-		"reviewed_head":       ready.ReviewedHead,
-		"reviews":             ready.Reviews,
-		"upstream":            ready.Upstream,
+		"head":                records.Head,
+		"compatibility_proof": records.CompatibilityProof,
+		"reviewed_head":       records.ReviewedHead,
+		"reviews":             records.Reviews,
+		"upstream":            records.Upstream,
 		"batch":               batch,
 	})
 }

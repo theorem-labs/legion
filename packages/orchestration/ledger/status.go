@@ -30,8 +30,8 @@ func (s *Store) Status(ctx context.Context, repo string) (Status, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	err = tx.QueryRow(ctx, `SELECT name, max_landing_rounds, coalesce(upstream_owner, ''), created_at FROM repositories WHERE name = $1`, repo).
-		Scan(&st.Repository.Name, &st.Repository.MaxLandingRounds, &st.Repository.UpstreamOwner, &st.Repository.CreatedAt)
+	err = tx.QueryRow(ctx, `SELECT name, max_landing_rounds, created_at FROM repositories WHERE name = $1`, repo).
+		Scan(&st.Repository.Name, &st.Repository.MaxLandingRounds, &st.Repository.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return st, &NotFoundError{What: "repository", ID: repo}
 	}

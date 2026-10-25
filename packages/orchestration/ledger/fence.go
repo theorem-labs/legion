@@ -63,7 +63,7 @@ func (r reliance) String() string {
 // admittedReliance returns, for each of names that an admitted member reads, those members: the ones that change it
 // first, then by migration.
 func admittedReliance(ctx context.Context, q querier, repo string, names []string) (map[string][]reliance, error) {
-	rows, err := q.Query(ctx, `SELECT r.name, b.batch, b.migration, coalesce(m.ready_changed_contracts ? r.name, false) AS changes
+	rows, err := q.Query(ctx, `SELECT r.name, b.batch, b.migration, coalesce(m.ready_records -> 'changed_contracts' ? r.name, false) AS changes
 		FROM batch_members b
 		JOIN migrations m ON m.repo = b.repo AND m.id = b.migration
 		JOIN migration_reads r ON r.repo = b.repo AND r.migration = b.migration
@@ -118,7 +118,7 @@ func fenceViolations(ctx context.Context, q querier, repo, id string, changed []
 		return nil, err
 	}
 	if batch, ok := batches[id]; ok {
-		return []Violation{{Kind: ViolationBatchAdmitted, Message: fmt.Sprintf(
+		return []Violation{{Kind: ReasonBatchAdmitted, Message: fmt.Sprintf(
 			"migration %s is admitted in batch %s; only that batch lands it", id, batch)}}, nil
 	}
 	relying, err := admittedReliance(ctx, q, repo, changed)
@@ -129,7 +129,7 @@ func fenceViolations(ctx context.Context, q querier, repo, id string, changed []
 	for _, name := range changed {
 		if len(relying[name]) > 0 {
 			r := relying[name][0]
-			violations = append(violations, Violation{Kind: ViolationBatchAdmitted, Name: name, Other: r.member,
+			violations = append(violations, Violation{Kind: ReasonBatchAdmitted, Name: name, Other: r.member,
 				Message: fmt.Sprintf("the candidate advances contract %s, and %s", name, r)})
 		}
 	}

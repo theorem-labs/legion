@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,15 +18,11 @@ import (
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
-type landCheckCandidate struct {
-	check ledger.CheckRequest
-	land  ledger.LandRequest
-}
-
-// TestCheckMirrorsLandRefusals exercises the same candidate through both APIs and both command forms. Every row
-// names the one reason Land would refuse; Check must report that same kind before the candidate reaches Land.
+// TestCheckMirrorsLandRefusals exercises one candidate through both APIs and both command forms. A check request is
+// the land request with nothing added, so the same candidate goes to both commands, and the CLI's request-file form
+// writes one file for both. Every row names the one reason Land would refuse; Check must report that same kind.
 func TestCheckMirrorsLandRefusals(t *testing.T) {
-	type setup func(t *testing.T, s *ledger.Store, dsn string) landCheckCandidate
+	type setup func(t *testing.T, s *ledger.Store, dsn string) ledger.CheckRequest
 	tests := []struct {
 		name  string
 		kind  string
@@ -34,21 +31,19 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "invalid candidate has no changed paths",
 			kind: "invalid_candidate",
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
-				candidate.check.Changed = nil
-				candidate.land.ChangedPaths = nil
+				candidate.ChangedPaths = nil
 				return candidate
 			},
 		},
 		{
 			name: "invalid candidate changes a contract without paths",
 			kind: "invalid_candidate",
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
-				candidate.check.Changed = []string{}
-				candidate.land.ChangedPaths = []string{}
+				candidate.ChangedPaths = []string{}
 				parityStatement(&candidate, "head-1", "head-1")
 				return candidate
 			},
@@ -56,30 +51,27 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "invalid candidate changes a contract without a head despite proof",
 			kind: "invalid_candidate",
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
-				candidate.check.ChangedContracts = map[string]string{"C": "hash-2"}
-				candidate.check.CompatibilityProof = "Spec.C_compat"
-				candidate.land.ChangedContracts = map[string]string{"C": "hash-2"}
-				candidate.land.CompatibilityProof = "Spec.C_compat"
+				candidate.ChangedContracts = map[string]string{"C": "hash-2"}
+				candidate.CompatibilityProof = "Spec.C_compat"
 				return candidate
 			},
 		},
 		{
 			name: "invalid candidate has no commit",
 			kind: "invalid_candidate",
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
-				candidate.check.Commit = ""
-				candidate.land.Commit = ""
+				candidate.Commit = ""
 				return candidate
 			},
 		},
 		{
 			name: "migration is not open",
 			kind: ledger.ReasonNotOpen,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
 				if _, err := s.Abandon(context.Background(), "r", "M-1", 1, "stopped"); err != nil {
 					t.Fatal(err)
@@ -90,23 +82,22 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "migration generation is stale",
 			kind: ledger.ReasonStaleGeneration,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
-				candidate.check.Generation = 0
-				candidate.land.Generation = 0
+				candidate.Generation = 0
 				return candidate
 			},
 		},
 		{
 			name: "migration is escalated",
 			kind: ledger.ReasonEscalated,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				if _, err := s.EnsureRepo(context.Background(), "r", 1); err != nil {
 					t.Fatal(err)
 				}
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
 				if _, err := s.RecordRound(context.Background(), ledger.RoundRequest{
-					Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Key: "parity-round",
+					Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed", Key: "parity-round", ReadyEvent: 1 << 40,
 				}); err != nil {
 					t.Fatal(err)
 				}
@@ -116,17 +107,16 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "candidate writes outside its lock",
 			kind: ledger.ReasonUndeclaredWrite,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
-				candidate.check.Changed = []string{"outside.lean"}
-				candidate.land.ChangedPaths = []string{"outside.lean"}
+				candidate.ChangedPaths = []string{"outside.lean"}
 				return candidate
 			},
 		},
 		{
 			name: "candidate has an overlapping migration",
 			kind: ledger.ReasonOverlap,
-			setup: func(t *testing.T, s *ledger.Store, dsn string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, dsn string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
 				conn, err := pgx.Connect(context.Background(), dsn)
 				if err != nil {
@@ -145,22 +135,21 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "declared read has no current hash",
 			kind: ledger.ReasonUnverifiedRead,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
-				candidate.check.Current = map[string]string{}
-				candidate.land.Current = map[string]string{}
+				candidate.Current = map[string]string{}
 				return candidate
 			},
 		},
 		{
 			name: "contract version is stale even when the hash returned to its old value",
 			kind: ledger.ReasonStaleRead,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
 				writer := parityOpen(t, s, "M-writer", "writer.lean", map[string]string{"C": "hash-1"})
 				parityStatement(&writer, "writer-head", "writer-head")
-				if _, err := s.Land(context.Background(), writer.land); err != nil {
+				if _, err := s.Land(context.Background(), writer.LandRequest); err != nil {
 					t.Fatal(err)
 				}
 				return candidate
@@ -169,7 +158,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "changed contract was undeclared",
 			kind: ledger.ReasonUndeclaredContract,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
 				parityStatement(&candidate, "head-1", "head-1")
@@ -179,7 +168,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "pinned contract lacks approval",
 			kind: ledger.ReasonPinned,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", true)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
 				parityStatement(&candidate, "head-1", "head-1")
@@ -189,7 +178,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "statement has neither review nor proof",
 			kind: ledger.ReasonStatementUnreviewed,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
 				parityStatement(&candidate, "head-1", "")
@@ -197,111 +186,97 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 			},
 		},
 		{
-			name: "upstream is not allowed for another migration owner",
-			kind: ledger.ReasonUpstreamNotAllowed,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			name: "upstream provenance is accepted from any migration owner",
+			kind: "",
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
-				candidate.check.Upstream = "upstream-commit"
-				candidate.land.Upstream = "upstream-commit"
+				candidate.Upstream = "upstream-commit"
 				return candidate
 			},
 		},
 		{
 			name: "one contract owner accepts one reviewed head",
 			kind: "",
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				parityRegister(t, s, "D", "hash-d1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1", "D": "hash-d1"})
-				candidate.check.ChangedContracts = map[string]string{"C": "hash-2", "D": "hash-d2"}
-				candidate.check.Head, candidate.check.ReviewedHead = "head-1", "head-1"
-				candidate.land.ChangedContracts = map[string]string{"C": "hash-2", "D": "hash-d2"}
-				candidate.land.Head, candidate.land.ReviewedHead = "head-1", "head-1"
+				candidate.ChangedContracts = map[string]string{"C": "hash-2", "D": "hash-d2"}
+				candidate.Head, candidate.ReviewedHead = "head-1", "head-1"
 				return candidate
 			},
 		},
 		{
 			name: "two contract owners reject one reviewed head",
 			kind: ledger.ReasonStatementUnreviewed,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				parityRegisterOwner(t, s, "D", "bob", "hash-d1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1", "D": "hash-d1"})
-				candidate.check.ChangedContracts = map[string]string{"C": "hash-2", "D": "hash-d2"}
-				candidate.check.Head, candidate.check.ReviewedHead = "head-1", "head-1"
-				candidate.land.ChangedContracts = map[string]string{"C": "hash-2", "D": "hash-d2"}
-				candidate.land.Head, candidate.land.ReviewedHead = "head-1", "head-1"
+				candidate.ChangedContracts = map[string]string{"C": "hash-2", "D": "hash-d2"}
+				candidate.Head, candidate.ReviewedHead = "head-1", "head-1"
 				return candidate
 			},
 		},
 		{
 			name: "two owners accept one review each",
 			kind: "",
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				parityRegisterOwner(t, s, "D", "bob", "hash-d1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1", "D": "hash-d1"})
-				reviews := []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-1"}, {Contract: "D", Reviewer: "bob", Head: "head-1"}}
-				candidate.check.ChangedContracts, candidate.check.Head, candidate.check.Reviews = map[string]string{"C": "hash-2", "D": "hash-d2"}, "head-1", reviews
-				candidate.land.ChangedContracts, candidate.land.Head, candidate.land.Reviews = map[string]string{"C": "hash-2", "D": "hash-d2"}, "head-1", reviews
+				candidate.ChangedContracts, candidate.Head = map[string]string{"C": "hash-2", "D": "hash-d2"}, "head-1"
+				candidate.Reviews = []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-1"}, {Contract: "D", Reviewer: "bob", Head: "head-1"}}
 				return candidate
 			},
 		},
 		{
 			name: "wrong review reviewer is refused",
 			kind: ledger.ReasonStatementUnreviewed,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
-				candidate.check.ChangedContracts, candidate.check.Head, candidate.check.Reviews = map[string]string{"C": "hash-2"}, "head-1", []ledger.Review{{Contract: "C", Reviewer: "bob", Head: "head-1"}}
-				candidate.land.ChangedContracts, candidate.land.Head, candidate.land.Reviews = map[string]string{"C": "hash-2"}, "head-1", []ledger.Review{{Contract: "C", Reviewer: "bob", Head: "head-1"}}
+				candidate.ChangedContracts, candidate.Head = map[string]string{"C": "hash-2"}, "head-1"
+				candidate.Reviews = []ledger.Review{{Contract: "C", Reviewer: "bob", Head: "head-1"}}
 				return candidate
 			},
 		},
 		{
 			name: "wrong review head is refused",
 			kind: ledger.ReasonStatementUnreviewed,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
-				candidate.check.ChangedContracts, candidate.check.Head, candidate.check.Reviews = map[string]string{"C": "hash-2"}, "head-1", []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-0"}}
-				candidate.land.ChangedContracts, candidate.land.Head, candidate.land.Reviews = map[string]string{"C": "hash-2"}, "head-1", []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-0"}}
+				candidate.ChangedContracts, candidate.Head = map[string]string{"C": "hash-2"}, "head-1"
+				candidate.Reviews = []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-0"}}
 				return candidate
 			},
 		},
 		{
 			name: "upstream provenance does not clear a statement",
 			kind: ledger.ReasonStatementUnreviewed,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
-				if _, err := s.EnsureRepo(context.Background(), "r", 3, ledger.WithUpstreamOwner("alice")); err != nil {
-					t.Fatal(err)
-				}
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
-				candidate.check.ChangedContracts, candidate.check.Head, candidate.check.Upstream = map[string]string{"C": "hash-2"}, "head-1", "upstream-commit"
-				candidate.land.ChangedContracts, candidate.land.Head, candidate.land.Upstream = map[string]string{"C": "hash-2"}, "head-1", "upstream-commit"
+				candidate.ChangedContracts, candidate.Head, candidate.Upstream = map[string]string{"C": "hash-2"}, "head-1", "upstream-commit"
 				return candidate
 			},
 		},
 		{
 			name: "pinned contract remains pinned under upstream provenance",
 			kind: ledger.ReasonPinned,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
-				if _, err := s.EnsureRepo(context.Background(), "r", 3, ledger.WithUpstreamOwner("alice")); err != nil {
-					t.Fatal(err)
-				}
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", true)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
-				reviews := []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-1"}}
-				candidate.check.ChangedContracts, candidate.check.Head, candidate.check.Reviews, candidate.check.Upstream = map[string]string{"C": "hash-2"}, "head-1", reviews, "upstream-commit"
-				candidate.land.ChangedContracts, candidate.land.Head, candidate.land.Reviews, candidate.land.Upstream = map[string]string{"C": "hash-2"}, "head-1", reviews, "upstream-commit"
+				candidate.ChangedContracts, candidate.Head, candidate.Upstream = map[string]string{"C": "hash-2"}, "head-1", "upstream-commit"
+				candidate.Reviews = []ledger.Review{{Contract: "C", Reviewer: "alice", Head: "head-1"}}
 				return candidate
 			},
 		},
 		{
 			name: "an admitted member lands only with its batch",
 			kind: ledger.ReasonBatchAdmitted,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				candidate := parityOpen(t, s, "M-1", "a.lean", nil)
 				parityAdmit(t, s, "M-1", "a.lean", nil)
 				return candidate
@@ -310,7 +285,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "a candidate advances a contract that an admitted member reads",
 			kind: ledger.ReasonBatchAdmitted,
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				parityRegister(t, s, "C", "hash-1", false)
 				candidate := parityOpen(t, s, "M-1", "a.lean", map[string]string{"C": "hash-1"})
 				parityStatement(&candidate, "head-1", "head-1")
@@ -322,7 +297,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		{
 			name: "clean candidate passes",
 			kind: "",
-			setup: func(t *testing.T, s *ledger.Store, _ string) landCheckCandidate {
+			setup: func(t *testing.T, s *ledger.Store, _ string) ledger.CheckRequest {
 				return parityOpen(t, s, "M-1", "a.lean", nil)
 			},
 		},
@@ -332,7 +307,7 @@ func TestCheckMirrorsLandRefusals(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			for _, surface := range []struct {
 				name string
-				run  func(t *testing.T, s *ledger.Store, dsn string, candidate landCheckCandidate, kind string)
+				run  func(t *testing.T, s *ledger.Store, dsn string, candidate ledger.CheckRequest, kind string)
 			}{
 				{name: "Go API", run: assertAPIParity},
 				{name: "CLI flags", run: assertFlagParity},
@@ -373,7 +348,8 @@ func parityRegisterOwner(t *testing.T, s *ledger.Store, name, owner, hash string
 	}
 }
 
-func parityOpen(t *testing.T, s *ledger.Store, id, path string, reads map[string]string) landCheckCandidate {
+// parityOpen opens migration id writing path and reading reads, and returns a clean candidate for it.
+func parityOpen(t *testing.T, s *ledger.Store, id, path string, reads map[string]string) ledger.CheckRequest {
 	t.Helper()
 	m, err := s.OpenMigration(context.Background(), ledger.OpenRequest{
 		Repo: "r", ID: id, Owner: "alice", BaseCommit: "base", Branch: "branch/" + id, Writes: []string{path}, Reads: reads,
@@ -381,15 +357,13 @@ func parityOpen(t *testing.T, s *ledger.Store, id, path string, reads map[string
 	if err != nil {
 		t.Fatal(err)
 	}
-	current := copyStringMap(reads)
-	return landCheckCandidate{
-		check: ledger.CheckRequest{
-			Repo: "r", ID: m.ID, Generation: m.Generation, Commit: "candidate", Changed: []string{path}, Current: current,
-		},
-		land: ledger.LandRequest{
-			Repo: "r", Migration: m.ID, Generation: m.Generation, Commit: "candidate", ChangedPaths: []string{path}, Current: copyStringMap(reads),
-		},
+	current := make(map[string]string, len(reads))
+	for name, hash := range reads {
+		current[name] = hash
 	}
+	return ledger.CheckRequest{LandRequest: ledger.LandRequest{
+		Repo: "r", Migration: m.ID, Generation: m.Generation, Commit: "candidate", ChangedPaths: []string{path}, Current: current,
+	}}
 }
 
 // parityAdmit readies open migration id and admits it alone in batch-1, with the candidate's changed path and the
@@ -397,7 +371,7 @@ func parityOpen(t *testing.T, s *ledger.Store, id, path string, reads map[string
 func parityAdmit(t *testing.T, s *ledger.Store, id, path string, current map[string]string) {
 	t.Helper()
 	ctx := context.Background()
-	ready, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: id, Generation: 1, Head: "head-" + id})
+	ready, err := s.Ready(ctx, ledger.ReadyRequest{Repo: "r", ID: id, Generation: 1, Head: "head-" + id, Key: "ready-" + id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +381,7 @@ func parityAdmit(t *testing.T, s *ledger.Store, id, path string, current map[str
 	if _, err := s.AdmitBatch(ctx, ledger.AdmitRequest{
 		Repo: "r", ID: "batch-1", Base: "base", CandidateCommit: "candidate-batch-1", CandidateTree: "tree-batch-1",
 		Members: []ledger.AdmitMember{{
-			Migration: id, ReadyEvent: ready.ReadyEvent, CurrentHashes: copyStringMap(current), ChangedPaths: []string{path},
+			Migration: id, ReadyEvent: ready.ReadyEvent, CurrentHashes: maps.Clone(current), ChangedPaths: []string{path},
 		}},
 		ExpectedVersion: 1, Record: json.RawMessage(`{"state":"publishing"}`),
 	}); err != nil {
@@ -415,24 +389,14 @@ func parityAdmit(t *testing.T, s *ledger.Store, id, path string, current map[str
 	}
 }
 
-func parityStatement(candidate *landCheckCandidate, head, reviewed string) {
-	candidate.check.ChangedContracts = map[string]string{"C": "hash-2"}
-	candidate.check.Head, candidate.check.ReviewedHead = head, reviewed
-	candidate.land.ChangedContracts = map[string]string{"C": "hash-2"}
-	candidate.land.Head, candidate.land.ReviewedHead = head, reviewed
+func parityStatement(candidate *ledger.CheckRequest, head, reviewed string) {
+	candidate.ChangedContracts = map[string]string{"C": "hash-2"}
+	candidate.Head, candidate.ReviewedHead = head, reviewed
 }
 
-func copyStringMap(in map[string]string) map[string]string {
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func assertAPIParity(t *testing.T, s *ledger.Store, _ string, candidate landCheckCandidate, kind string) {
+func assertAPIParity(t *testing.T, s *ledger.Store, _ string, candidate ledger.CheckRequest, kind string) {
 	t.Helper()
-	result, err := s.Check(context.Background(), candidate.check)
+	result, err := s.Check(context.Background(), candidate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +408,7 @@ func assertAPIParity(t *testing.T, s *ledger.Store, _ string, candidate landChec
 		t.Fatalf("refused check: %+v; want %s", result, kind)
 	}
 
-	_, err = s.Land(context.Background(), candidate.land)
+	_, err = s.Land(context.Background(), candidate.LandRequest)
 	if kind == "" {
 		if err != nil {
 			t.Fatalf("passing land: %v", err)
@@ -457,17 +421,21 @@ func assertAPIParity(t *testing.T, s *ledger.Store, _ string, candidate landChec
 	}
 }
 
-func assertFlagParity(t *testing.T, _ *ledger.Store, dsn string, candidate landCheckCandidate, kind string) {
-	assertCLIParity(t, dsn, candidate, kind, checkFlagArgs(candidate.check), landFlagArgs(candidate.land))
+func assertFlagParity(t *testing.T, _ *ledger.Store, dsn string, candidate ledger.CheckRequest, kind string) {
+	check := []string{"--json", "check", candidate.Repo, candidate.Migration, strconv.FormatInt(candidate.Generation, 10)}
+	land := []string{"--json", "land", "--repo", candidate.Repo, "--migration", candidate.Migration,
+		"--generation", strconv.FormatInt(candidate.Generation, 10)}
+	flags := candidateFlags(candidate.LandRequest)
+	assertCLIParity(t, dsn, kind, append(check, flags...), append(land, flags...))
 }
 
-func assertRequestFileParity(t *testing.T, _ *ledger.Store, dsn string, candidate landCheckCandidate, kind string) {
-	checkFile := writeParityRequest(t, "check.json", candidate.check)
-	landFile := writeParityRequest(t, "land.json", candidate.land)
-	assertCLIParity(t, dsn, candidate, kind, []string{"--json", "check", "--request-file", checkFile}, []string{"--json", "land", "--request-file", landFile})
+// assertRequestFileParity writes the candidate's land request once and gives that one file to check and to land.
+func assertRequestFileParity(t *testing.T, _ *ledger.Store, dsn string, candidate ledger.CheckRequest, kind string) {
+	file := writeParityRequest(t, "candidate.json", candidate.LandRequest)
+	assertCLIParity(t, dsn, kind, []string{"--json", "check", "--request-file", file}, []string{"--json", "land", "--request-file", file})
 }
 
-func assertCLIParity(t *testing.T, dsn string, _ landCheckCandidate, kind string, checkArgs, landArgs []string) {
+func assertCLIParity(t *testing.T, dsn, kind string, checkArgs, landArgs []string) {
 	t.Helper()
 	call := func(args []string) (int, string, string) {
 		t.Helper()
@@ -525,58 +493,41 @@ func assertLandResult(t *testing.T, code int, stdout, stderr, kind string) {
 	}
 }
 
-func checkFlagArgs(request ledger.CheckRequest) []string {
-	args := []string{"--json", "check", request.Repo, request.ID, strconv.FormatInt(request.Generation, 10)}
-	appendCandidateFlags(&args, request.Changed, request.Current, request.ChangedContracts, request.Commit, request.ApprovedPinned,
-		request.DeferReads, request.Head, request.CompatibilityProof, request.ReviewedHead, request.Reviews, request.Upstream)
-	return args
-}
-
-func landFlagArgs(request ledger.LandRequest) []string {
-	args := []string{"--json", "land", "--repo", request.Repo, "--migration", request.Migration, "--generation", strconv.FormatInt(request.Generation, 10)}
-	appendCandidateFlags(&args, request.ChangedPaths, request.Current, request.ChangedContracts, request.Commit, request.ApprovedPinned,
-		false, request.Head, request.CompatibilityProof, request.ReviewedHead, request.Reviews, request.Upstream)
-	return args
-}
-
-func appendCandidateFlags(args *[]string, changed []string, current, changedContracts map[string]string, commit string, approved []string, deferReads bool, head, proof, reviewed string, reviews []ledger.Review, upstream string) {
-	if commit != "" {
-		*args = append(*args, "--commit", commit)
+// candidateFlags gives the flags that state a candidate, the same for check and land.
+func candidateFlags(request ledger.LandRequest) []string {
+	var args []string
+	if request.Commit != "" {
+		args = append(args, "--commit", request.Commit)
 	}
-	if changed != nil {
-		if len(changed) == 0 {
-			*args = append(*args, "--no-paths")
-		} else {
-			for _, path := range changed {
-				*args = append(*args, "--path", path)
-			}
+	if request.ChangedPaths != nil {
+		if len(request.ChangedPaths) == 0 {
+			args = append(args, "--no-paths")
+		}
+		for _, path := range request.ChangedPaths {
+			args = append(args, "--path", path)
 		}
 	}
-	for _, name := range sortedMapKeys(current) {
-		*args = append(*args, "--current", name+"="+current[name])
+	for _, name := range sortedMapKeys(request.Current) {
+		args = append(args, "--current", name+"="+request.Current[name])
 	}
-	for _, name := range sortedMapKeys(changedContracts) {
-		*args = append(*args, "--changed-contract", name+"="+changedContracts[name])
+	for _, name := range sortedMapKeys(request.ChangedContracts) {
+		args = append(args, "--changed-contract", name+"="+request.ChangedContracts[name])
 	}
-	for _, name := range approved {
-		*args = append(*args, "--approved-pinned", name)
-	}
-	if deferReads {
-		*args = append(*args, "--defer-reads")
+	for _, name := range request.ApprovedPinned {
+		args = append(args, "--approved-pinned", name)
 	}
 	for _, record := range []struct{ flag, value string }{
-		{"--head", head}, {"--compatibility-proof", proof}, {"--reviewed-head", reviewed},
+		{"--head", request.Head}, {"--compatibility-proof", request.CompatibilityProof},
+		{"--reviewed-head", request.ReviewedHead}, {"--upstream", request.Upstream},
 	} {
 		if record.value != "" {
-			*args = append(*args, record.flag, record.value)
+			args = append(args, record.flag, record.value)
 		}
 	}
-	for _, review := range reviews {
-		*args = append(*args, "--review", review.Contract+"="+review.Reviewer+"@"+review.Head)
+	for _, review := range request.Reviews {
+		args = append(args, "--review", review.Contract+"="+review.Reviewer+"@"+review.Head)
 	}
-	if upstream != "" {
-		*args = append(*args, "--upstream", upstream)
-	}
+	return args
 }
 
 func sortedMapKeys(values map[string]string) []string {

@@ -8,12 +8,12 @@ type Repository struct {
 	// MaxLandingRounds is how many failed landing rounds a migration may use before it goes to the steward.
 	// Zero turns escalation off.
 	MaxLandingRounds int       `json:"max_landing_rounds"`
-	UpstreamOwner    string    `json:"upstream_owner,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 
 // Item is a work item and its lease. Owner is the standing owner whose queue carries it; Holder is
-// empty when nobody holds it.
+// empty when nobody holds it. ExpiresAt is nil when nobody holds it and for a supervised lease, which
+// has no end.
 type Item struct {
 	ID         string     `json:"id"`
 	Owner      string     `json:"owner,omitempty"`
@@ -24,12 +24,12 @@ type Item struct {
 	Result     string     `json:"result,omitempty"`
 }
 
-// Lease is a granted or renewed lease. ExpiresAt is zero for a supervised lease, which has no end.
+// Lease is a granted or renewed lease. ExpiresAt is nil for a supervised lease, which has no end.
 type Lease struct {
-	ID         string    `json:"id"`
-	Holder     string    `json:"holder"`
-	Generation int64     `json:"generation"`
-	ExpiresAt  time.Time `json:"expires_at,omitzero"`
+	ID         string     `json:"id"`
+	Holder     string     `json:"holder"`
+	Generation int64      `json:"generation"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 
 // PathClash is one overlap between two write sets: Ours covers or is covered by Theirs.
@@ -38,26 +38,30 @@ type PathClash struct {
 	Theirs string `json:"theirs"`
 }
 
-// LastChange is the JSON record that allowed a contract's most recent statement advance.
-type LastChange string
+// Review records a reviewer’s approval of one contract at a specific head.
+type Review struct {
+	Contract string `json:"contract"`
+	Reviewer string `json:"reviewer"`
+	Head     string `json:"head"`
+}
 
-// MarshalJSON preserves the JSON object stored in Postgres instead of encoding it as a JSON string.
-func (c LastChange) MarshalJSON() ([]byte, error) {
-	if c == "" {
-		return []byte("null"), nil
-	}
-	return []byte(c), nil
+// LastChange is the record that allowed a contract's most recent statement advance: the compatibility proof or the
+// owner's review that cleared it, with the upstream commit beside it when the landing carried one.
+type LastChange struct {
+	Proof    string  `json:"proof,omitempty"`
+	Review   *Review `json:"review,omitempty"`
+	Upstream string  `json:"upstream,omitempty"`
 }
 
 // Contract records who owns a statement and the version of its current hash.
 type Contract struct {
-	Name          string     `json:"name"`
-	Owner         string     `json:"owner"`
-	StatementHash string     `json:"statement_hash"`
-	Version       int64      `json:"version"`
-	Pinned        bool       `json:"pinned"`
-	LastChange    LastChange `json:"last_change"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	Name          string      `json:"name"`
+	Owner         string      `json:"owner"`
+	StatementHash string      `json:"statement_hash"`
+	Version       int64       `json:"version"`
+	Pinned        bool        `json:"pinned"`
+	LastChange    *LastChange `json:"last_change"`
+	UpdatedAt     time.Time   `json:"updated_at"`
 }
 
 // Agreement records the versions of contracts that its parties agreed to use.
