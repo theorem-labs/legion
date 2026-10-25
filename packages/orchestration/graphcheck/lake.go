@@ -291,7 +291,7 @@ func initializationStem(module, pkg string) string {
 	return b.String()
 }
 
-// mangleString is Lean's String.Internal.mangle.
+// mangleString is the escaping Lean applies to one name component when it builds a symbol.
 func mangleString(s string) string {
 	var b strings.Builder
 	for _, r := range s {
