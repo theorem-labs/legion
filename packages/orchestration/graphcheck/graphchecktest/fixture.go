@@ -168,7 +168,10 @@ func build(t testing.TB, v Variant, damage func(lib string), compiled bool) *Fix
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	write(t, filepath.Join(dir, "declindex.yaml"), "tree: repo\ndb: index/index.sqlite\nroots: [Lib]\n")
+	// The index pins the toolchain it was built with, as an operator's does: the check then needs no `lean` on the
+	// path of whoever runs it, which is how it runs in a container.
+	write(t, filepath.Join(dir, "declindex.yaml"),
+		"tree: repo\ndb: index/index.sqlite\nroots: [Lib]\nlean:\n  toolchain: "+lean.Prefix+"\n")
 	configPath := filepath.Join(dir, "graphcheck.yaml")
 	write(t, configPath, configBody)
 	cfg, err := graphcheck.LoadConfig(configPath)

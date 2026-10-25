@@ -3,6 +3,7 @@ package graphcheck
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -372,11 +373,66 @@ func (c *Candidate) ensureScratch(ctx context.Context) error {
 	return nil
 }
 
-// lakeLeanPath is the search path Lake gives `lean` for the tree's modules: every package's library directory,
-// path dependencies included, in Lake's order (`lake env printenv LEAN_PATH`), then the index configuration's
-// lean.search_path. It is read from Lake, never guessed from a directory layout, so a module that imports another
-// package of the project compiles here as it does in the build.
+// lakeLeanPath is the search path Lake gives `lean` for the tree's modules, read from what Lake itself wrote: the
+// root package's library directory, then each package of `lake-manifest.json` in Lake's order (a path dependency
+// at its `dir`, any other below `packagesDir`, under its `subDir`), then the toolchain's own library, then the
+// index configuration's lean.search_path. It is never guessed from a directory layout, so a module that imports
+// another package of the project compiles here as it does in the build, and no Lake process has to run where the
+// check runs. A tree without a manifest (a project with no dependency) asks `lake env` instead.
 func lakeLeanPath(ctx context.Context, lean declindex.Lean, icfg declindex.Config) ([]string, error) {
+	dirs, err := manifestLeanPath(lean, icfg)
+	if errors.Is(err, fs.ErrNotExist) {
+		dirs, err = lakeEnvLeanPath(ctx, lean, icfg)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, dir := range append(dirs, icfg.Lean.SearchPath...) {
+		if dir != "" && !seen[dir] {
+			seen[dir] = true
+			out = append(out, dir)
+		}
+	}
+	return out, nil
+}
+
+// manifestLeanPath reads the search path off `lake-manifest.json`.
+func manifestLeanPath(lean declindex.Lean, icfg declindex.Config) ([]string, error) {
+	raw, err := os.ReadFile(filepath.Join(icfg.Tree, "lake-manifest.json"))
+	if err != nil {
+		return nil, err
+	}
+	var manifest struct {
+		PackagesDir string `json:"packagesDir"`
+		Packages    []struct {
+			Type   string  `json:"type"`
+			Name   string  `json:"name"`
+			Dir    string  `json:"dir"`
+			SubDir *string `json:"subDir"`
+		} `json:"packages"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, unable("the tree's lake-manifest.json is not Lake's: %v", err)
+	}
+	packages := cmp.Or(manifest.PackagesDir, filepath.Join(".lake", "packages"))
+	out := []string{icfg.Lib}
+	for _, p := range manifest.Packages {
+		dir := filepath.Join(icfg.Tree, packages, p.Name)
+		if p.Type == "path" {
+			dir = filepath.Join(icfg.Tree, p.Dir)
+		}
+		if p.SubDir != nil {
+			dir = filepath.Join(dir, *p.SubDir)
+		}
+		out = append(out, filepath.Join(dir, ".lake", "build", "lib", "lean"))
+	}
+	return append(out, filepath.Join(lean.Prefix, "lib", "lean")), nil
+}
+
+// lakeEnvLeanPath asks Lake for the search path (`lake env printenv LEAN_PATH`).
+func lakeEnvLeanPath(ctx context.Context, lean declindex.Lean, icfg declindex.Config) ([]string, error) {
 	cmd := exec.CommandContext(ctx, filepath.Join(lean.Prefix, "bin", "lake"), "env", "printenv", "LEAN_PATH")
 	cmd.Dir = icfg.Tree
 	home, _ := os.UserHomeDir()
@@ -386,15 +442,7 @@ func lakeLeanPath(ctx context.Context, lean declindex.Lean, icfg declindex.Confi
 	if err := cmd.Run(); err != nil {
 		return nil, unable("lake env in %s gives no search path: %v: %s", icfg.Tree, err, strings.TrimSpace(stderr.String()))
 	}
-	var out []string
-	seen := map[string]bool{}
-	for _, dir := range append(filepath.SplitList(strings.TrimSpace(stdout.String())), icfg.Lean.SearchPath...) {
-		if dir != "" && !seen[dir] {
-			seen[dir] = true
-			out = append(out, dir)
-		}
-	}
-	return out, nil
+	return filepath.SplitList(strings.TrimSpace(stdout.String())), nil
 }
 
 // intermediates are the unchanged built modules that lie between a changed module and a target: the target imports
