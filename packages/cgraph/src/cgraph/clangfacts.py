@@ -1583,17 +1583,19 @@ def _ruled_out(way: list[dict[str, Any]], values: list[dict[str, Any] | None]) -
 
 
 def _kept_value(node: ci.Cursor) -> ci.Cursor | None:
-    """The expression under the conversions that keep every value it may take (a wider type, or one of
-    the same width): ``(long)x`` is ``x``, ``(unsigned char)x`` is not (it is 0 for 256 too)."""
+    """The expression under conversions that keep every integer value: the same type, or an integer
+    type at least as wide that is not _Bool. ``(long)x`` is ``x``; ``(unsigned char)x``, ``(_Bool)x``
+    and a float round trip are not, and yield None."""
     inner = _strip_parens(node)
     while inner.kind in (K.UNEXPOSED_EXPR, K.CSTYLE_CAST_EXPR):
         below = _operand(inner)
         if below is None:
             return None
         below = _strip_parens(below)
-        outer, under = _integer_type(inner.type), _integer_type(below.type)
-        if outer is not None and under is not None and outer["w"] < under["w"]:
-            return None
+        if inner.type.get_canonical().spelling != below.type.get_canonical().spelling:
+            outer, under = _integer_type(inner.type), _integer_type(below.type)
+            if outer is None or under is None or outer.get("b") or outer["w"] < under["w"]:
+                return None
         inner = below
     return inner
 
@@ -3032,6 +3034,7 @@ class _FunctionWalk:
         self.step_loops: dict[int, dict[int, ci.Cursor]] = collections.defaultdict(dict)
         self.parents: dict[int, ci.Cursor] = {}
         self.label_holders: set[int] = set()  # the nodes that hold a label or a case
+        self.label_names: set[str] = set()  # every label the function writes
         self.loops: list[_Place] = []
         self.once_loops: list[tuple[_Place, int, ci.Cursor]] = []  # loops that run at most once, on a variable
         self.backward = False  # the function jumps back (a goto to an earlier label, a computed goto)
@@ -3314,8 +3317,13 @@ class _FunctionWalk:
         ``level == PGTABLE_LEVEL_PMD``). A pointer set once whose value cannot be stated is named
         instead (``symbol``)."""
         key = variable.hash
-        if depth > _EXPRESSION_DEPTH or (variable.kind == K.VAR_DECL and not _is_local(variable)):
-            # A static local keeps its value between calls (__ONCE_LITE_IF's __already_done): unknown.
+        if (
+            depth > _EXPRESSION_DEPTH
+            or variable.type.is_volatile_qualified()
+            or (variable.kind == K.VAR_DECL and not _is_local(variable))
+        ):
+            # A volatile variable may change between reads, and a static local keeps its value between
+            # calls (__ONCE_LITE_IF's __already_done): unknown.
             return None
         uses = self.local_uses()
         index = self.parameters.get(key) if variable.kind == K.PARM_DECL else None
@@ -3517,8 +3525,8 @@ class _FunctionWalk:
         other one is stated as ``held`` states it."""
         key = variable.hash
         writes = self.x.evaluator.stores_in(self.cursor)
-        if variable.kind == K.VAR_DECL and not _is_local(variable):
-            # A static local keeps its value between calls.
+        if variable.type.is_volatile_qualified() or (variable.kind == K.VAR_DECL and not _is_local(variable)):
+            # A volatile variable may change between reads; a static local keeps its value between calls.
             return None
         written = key in writes.stores or key in writes.combined or key in writes.opaque
         if (
@@ -3597,7 +3605,10 @@ class _FunctionWalk:
             node = parent
 
     def value_before(self, variable: ci.Cursor, statement: ci.Cursor, depth: int) -> Any:
-        """The variable's value where control enters ``statement`` (``value_at``)."""
+        """The variable's value where control enters ``statement`` (``value_at``); a volatile one is
+        untraced, as each read may give another value."""
+        if variable.type.is_volatile_qualified():
+            return _UNTRACED
         node = statement
         while True:
             parent = self.parents.get(node.hash)
@@ -3633,22 +3644,35 @@ class _FunctionWalk:
                 return self.label_value(variable, parent, depth)
             return _UNTRACED
 
+    def asm_labels(self, statement: ci.Cursor) -> set[str]:
+        """The labels an ``asm goto`` names: libclang gives it no LABEL_REF, so the names after the
+        last colon of its tokens, where one of the function's labels carries the name."""
+        tokens = [token.spelling for token in statement.get_tokens()]
+        if "goto" not in tokens:
+            return set()
+        self.local_uses()
+        return {name for name in tokens[tokens.index("goto") :] if name in self.label_names}
+
     def branch_value(self, variable: ci.Cursor, condition: ci.Cursor, taken: bool) -> dict[str, Any] | None:
         """The one value the variable holds in a branch of an ``if`` whose condition names it: ``!v``
         and ``v == c`` where taken, ``v`` and ``v != c`` where not, give ``c`` (0 for a bare ``v``),
         through ``!`` and ``__builtin_expect``: alloc_workqueue_attrs_noprof's ``if (!attrs) goto
         fail;``. None for another condition."""
         typed = _integer_type(variable.type)
-        node = _strip(condition)
+        if variable.type.is_volatile_qualified():
+            return None
+        node = _kept_value(condition)
         negated = False
-        while True:
+        while node is not None:
             if node.kind == K.UNARY_OPERATOR and libclang.unary_kind(node) == libclang.LOGICAL_NOT and _children(node):
                 negated = not negated
-                node = _strip(_children(node)[0])
+                node = _kept_value(_children(node)[0])
             elif node.kind == K.CALL_EXPR and node.spelling == "__builtin_expect" and list(node.get_arguments()):
-                node = _strip(next(iter(node.get_arguments())))
+                node = _kept_value(next(iter(node.get_arguments())))
             else:
                 break
+        if node is None:
+            return None
         operands = _children(node)
         constant: int | None = 0
         if node.kind == K.BINARY_OPERATOR and len(operands) == 2 and libclang.binary_kind(node) in _EQUALITY:
@@ -3893,6 +3917,8 @@ class _FunctionWalk:
         initial, condition = parts.get("init"), parts.get("condition")
 
         def first(variable: ci.Cursor, reference: ci.Cursor, depth: int) -> dict[str, Any] | None:
+            if variable.type.is_volatile_qualified():
+                return None
             if not self.writes(loop, variable):
                 return self.flowed(variable, reference, depth)
             if self.writes(body, variable) or (condition is not None and self.writes(condition, variable)):
@@ -4719,6 +4745,8 @@ class _FunctionWalk:
                     uses["bases"][node.referenced.hash] += 1
                 continue
             if kind in (K.LABEL_STMT, K.CASE_STMT, K.DEFAULT_STMT):
+                if kind == K.LABEL_STMT:
+                    self.label_names.add(node.spelling)
                 above: ci.Cursor | None = node
                 while above is not None and above.hash not in self.label_holders:
                     self.label_holders.add(above.hash)
@@ -5621,9 +5649,12 @@ class _FunctionWalk:
             self.count_effect(node, kind)
             if self.effects > effects and not self.conditional and not self.image_effect(node, kind):
                 self.firm_effects += 1
-            if kind in (K.GOTO_STMT, K.ADDR_LABEL_EXPR):
-                # A goto in code, or a label whose address is taken (&&label): the label is code.
+            if kind in (K.GOTO_STMT, K.ADDR_LABEL_EXPR, K.ASM_STMT):
+                # A goto in code, a label whose address is taken (&&label), or an asm goto: the label
+                # is code. libclang shows an asm goto's labels only as its tokens.
                 self.goto_targets.update(child.spelling for child in children if child.kind == K.LABEL_REF)
+                if kind == K.ASM_STMT:
+                    self.goto_targets.update(self.asm_labels(node))
                 way = (
                     None if self.conditional or kind != K.GOTO_STMT else [self.guard_table[i] for i in self.guard_stack]
                 )

@@ -1505,3 +1505,52 @@ def test_the_flow_rules_survive_exits_op_assignments_and_asm_goto(tmp_path: Path
     assert "warn" in callees("both_exit")
     assert "warn" in {call["callee"] for call in fold(facts, "masked_eight", "masked").calls}
     assert "warn" in callees("asm_goto")
+
+
+NOT_KEPT = """
+    int probe(int k);
+    void negated_cast(int n) { int x; x = n; if (!(unsigned char)x) { if (x) warn(); } kept(); }
+    void bool_cast(unsigned char n) { unsigned char x; x = n; if ((_Bool)x == 1) { if (x == 2) warn(); } kept(); }
+    void float_trip(int n) { int x; x = n; if ((int)(float)x == 16777216) { if (x == 16777217) warn(); } kept(); }
+    void volatile_step(void) { volatile int stop = 1; for (;; stop = probe(0)) { if (stop) break; note(); } }
+"""
+
+
+def test_a_conversion_that_loses_values_and_a_volatile_loop_keep_the_code_the_compiler_keeps(
+    tmp_path: Path,
+) -> None:
+    """More counterexamples: `!(unsigned char)x` holds for x = 256, `(_Bool)x == 1` holds for x = 2, and
+    `(int)(float)x == 16777216` holds for x = 16777217, so each `warn()` is compiled; a volatile loop
+    condition cannot take the initializer's value, so the step's `probe(0)` is compiled."""
+    facts = facts_of(tmp_path, NOT_KEPT)
+
+    def callees(function: str) -> set[str]:
+        return {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+
+    assert "warn" in callees("negated_cast")
+    assert "warn" in callees("bool_cast")
+    assert "warn" in callees("float_trip")
+    assert "probe" in callees("volatile_step")
+
+
+ASM_LIVE = """
+    static inline void vol(volatile int x) { if (x == 0) { if (x) warn(); } kept(); }
+    void vol_zero(void) { vol(0); }
+    int asm_live(void)
+    {
+        asm goto("" :::: hit);
+        return 1;
+    hit:
+        note();
+        return 0;
+    }
+"""
+
+
+def test_an_asm_goto_s_label_is_code_and_a_volatile_parameter_keeps_its_reads(tmp_path: Path) -> None:
+    """A label only an `asm goto` jumps to is compiled (libclang gives the statement no LABEL_REF, so
+    its tokens name the label), and a volatile parameter's reads may differ at a fold, so `vol(0)`
+    keeps `warn` (clang-21 -O2 emits both calls)."""
+    facts = facts_of(tmp_path, ASM_LIVE)
+    assert "note" in {call["callee"] for call in facts["functions"]["asm_live"]["events"]["calls"]}
+    assert "warn" in {call["callee"] for call in fold(facts, "vol_zero", "vol").calls}
