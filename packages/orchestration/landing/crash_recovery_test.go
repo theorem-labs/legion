@@ -300,8 +300,8 @@ func TestFrozenRecoveryChecksSurvivorOnTheRebuiltCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if got := resumed[0]; got.State != Failed || len(got.ActiveMembers) != 0 {
-		t.Fatalf("resumed = %q with %v, want failed with no members", got.State, batchMemberNames(got.ActiveMembers))
+	if got := resumed[0]; got.State != Empty || len(got.ActiveMembers) != 0 {
+		t.Fatalf("resumed = %q with %v, want empty with no members", got.State, batchMemberNames(got.ActiveMembers))
 	}
 	if !ledgerReturned(ledger, "keep") {
 		t.Fatalf("refused survivor not returned: %v", ledger.returned)

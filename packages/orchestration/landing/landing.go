@@ -381,11 +381,23 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 	}
 	for {
 		if err := r.ensureCandidate(ctx, batch); err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
 			return r.fail(ctx, batch, "candidate")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
 		}
 		returned, err := r.checkLedger(ctx, batch)
 		if err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
 			return r.fail(ctx, batch, "ledger")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
 		}
 		if returned {
 			continue
@@ -396,7 +408,13 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 			if errors.As(err, &unable) {
 				return r.fail(ctx, batch, "check-unable")
 			}
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
 			return r.fail(ctx, batch, "return")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
 		}
 		if returned {
 			continue
@@ -445,8 +463,14 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 			return r.fail(ctx, batch, "base-broken")
 		}
 		batch.Round++
-		if err := r.returnMembers(ctx, batch, culprits); err != nil {
+		if err := r.dropMembers(ctx, batch, culprits); err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
 			return r.fail(ctx, batch, "return")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
 		}
 	}
 }
@@ -516,12 +540,11 @@ func (r Runner) ensureCandidate(ctx context.Context, batch *Batch) error {
 			return fmt.Errorf("record rebuilt candidate: %w", err)
 		}
 	}
+	drops := make(map[string]string, len(batch.Candidate.Dropped))
 	for _, drop := range batch.Candidate.Dropped {
-		if err := r.returnMember(ctx, batch, drop.ID, drop.Reason); err != nil {
-			return err
-		}
+		drops[drop.ID] = drop.Reason
 	}
-	return nil
+	return r.dropMembers(ctx, batch, drops)
 }
 
 // candidateMembers is the active members less those the stored candidate dropped.
@@ -578,8 +601,11 @@ func (r Runner) checkLedger(ctx context.Context, batch *Batch) (bool, error) {
 			if reason == "" {
 				reason = "refused"
 			}
-			if err := r.returnMember(ctx, batch, member.Migration, reason); err != nil {
+			if err := r.dropMembers(ctx, batch, map[string]string{member.Migration: reason}); err != nil {
 				return returned, err
+			}
+			if batch.State.terminal() {
+				return true, nil
 			}
 			returned = true
 			continue
@@ -590,46 +616,6 @@ func (r Runner) checkLedger(ctx context.Context, batch *Batch) (bool, error) {
 		}
 	}
 	return returned, nil
-}
-
-func (r Runner) returnMembers(ctx context.Context, batch *Batch, culprits map[string]string) error {
-	ids := make([]string, 0, len(culprits))
-	for id := range culprits {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		if err := r.returnMember(ctx, batch, id, culprits[id]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// returnMember removes an active member and records the intent to return it in
-// one save, so the current key changes before the ledger hears of it.
-func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reason string) error {
-	member, found := findMember(batch.ActiveMembers, migration)
-	if !found {
-		return nil
-	}
-	key := "return/" + migration
-	batch.ActiveMembers = withoutMember(batch.ActiveMembers, migration)
-	if !containsDropped(batch.Dropped, migration) {
-		batch.Dropped = append(batch.Dropped, DroppedMember{Migration: migration, Reason: reason})
-	}
-	batch.startOperation(Operation{Key: key, Kind: "return", Batch: batch.ID, Repository: batch.Repository, Member: migration, Generation: member.Generation, Reason: reason})
-	if err := r.Store.Save(ctx, batch); err != nil {
-		return fmt.Errorf("record return intent for %q: %w", migration, err)
-	}
-	if err := r.Ledger.ReturnMember(ctx, batch.Repository, member.Migration, member.Generation, reason); err != nil {
-		return fmt.Errorf("return %q: %w", migration, err)
-	}
-	batch.completeOperation(key)
-	if err := r.Store.Save(ctx, batch); err != nil {
-		return fmt.Errorf("record returned member %q: %w", migration, err)
-	}
-	return nil
 }
 
 // checkUnable is a configured check that could not decide.
@@ -678,7 +664,7 @@ func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 			}
 		}
 		batch.setCheck(CheckVerdict{Name: name, Verdict: "fail", Reason: findings[0].Reason})
-		if err := r.returnMembers(ctx, batch, culprits); err != nil {
+		if err := r.dropMembers(ctx, batch, culprits); err != nil {
 			return false, err
 		}
 		return true, nil
