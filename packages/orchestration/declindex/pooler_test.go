@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -256,5 +257,49 @@ func TestAnIndexOutsideGitWhoseFirstCompiledStepFailedIsRefused(t *testing.T) {
 	}
 	if got, err := s.CompiledCommit(ctx, false); err == nil {
 		t.Fatalf("an index outside Git whose compiled step never wrote a compiled part was accepted at %q", got)
+	}
+}
+
+// logWriter runs f on every message a refresh writes.
+type logWriter struct{ f func() }
+
+func (w logWriter) Write(p []byte) (int, error) {
+	w.f()
+	return len(p), nil
+}
+
+// Two refreshes of one index on two machines hold two file locks, so neither waits for the other, and a refresh
+// plans its write (which modules changed, which are gone, which commit it replaces) from reads it made before
+// its write transaction took the index's lock. A write that another refresh outdated would publish a commit with
+// another refresh's modules; it is refused, and the refresh asks to be run again (exit 75).
+func TestARefreshRefusesToWriteAPlanThatAnotherRefreshOutdated(t *testing.T) {
+	ctx := context.Background()
+	first := indexTarget(t)
+	second := first
+	second.TreeLock = filepath.Join(t.TempDir(), "tree.lock") // another machine's lock of its own copy
+	a, b := openAt(t, first), openAt(t, second)
+	tree := goldenTree(t)
+	if _, err := a.Refresh(ctx, tree, RefreshOptions{Commit: "base"}); err != nil {
+		t.Fatal(err)
+	}
+	// B refreshes while A has read the index and not yet written it: A's first message comes after its read.
+	var once sync.Once
+	var bErr error
+	log := logWriter{f: func() {
+		once.Do(func() { _, bErr = b.Refresh(ctx, tree, RefreshOptions{Commit: "two"}) })
+	}}
+	_, err := a.Refresh(ctx, tree, RefreshOptions{Commit: "three", Log: log})
+	if bErr != nil {
+		t.Fatalf("the second refresh: %v", bErr)
+	}
+	if err == nil {
+		t.Fatal("a refresh wrote a plan that another refresh had outdated")
+	}
+	var temp *TempError
+	if !errors.As(err, &temp) {
+		t.Errorf("the refusal is not a retry: %v", err)
+	}
+	if commit, err := a.Meta(ctx, "commit"); err != nil || commit != "two" {
+		t.Errorf("the index's commit is %q, %v; want the one the refresh that wrote it recorded", commit, err)
 	}
 }

@@ -145,6 +145,12 @@ func ClashModules(clashes []FormsClash) int {
 // whose compiled part the index holds.
 func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOptions, files []moduleFile, commit string, log io.Writer) (int, int, error) {
 	t0 := time.Now()
+	// As the reference part does: what this step reads (the stored modules, the hashes before, the clashes) is
+	// read before its write takes the index's lock, so its write refuses if another refresh wrote since.
+	generation, err := s.generation(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
 	x, m, src, err := co.prepare(ctx, tree.Roots)
 	if err != nil {
 		return 0, 0, err
@@ -207,7 +213,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			// Nothing was read with the new exporter or forms: the compiled part is not complete for commit.
 			return 0, 0, nil
 		}
-		return 0, 0, s.writeTx(ctx, func(tx pgx.Tx) error { return compiledDone(ctx, tx, commit) })
+		return 0, 0, s.writeTxFrom(ctx, generation, func(tx pgx.Tx) error { return compiledDone(ctx, tx, commit) })
 	}
 	sort.Strings(todo)
 	before, err := s.defHashes(ctx, todo)
@@ -244,7 +250,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 		}
 	}
 	// The exporter ran outside the write transaction; only the write of what it read is in one.
-	if err := s.writeTx(ctx, func(tx pgx.Tx) error {
+	if err := s.writeTxFrom(ctx, generation, func(tx pgx.Tx) error {
 		return s.writeCompiled(ctx, tx, compiledRead{read: todo, rematched: again, oleanKeys: keys, consts: consts,
 			withoutForms: withoutForms, digest: digest, commit: commit})
 	}); err != nil {

@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -385,9 +386,17 @@ func (s *Store) lockRefresh(ctx context.Context) (func(), error) {
 
 // writeTx runs f in one transaction of the index and commits it when f succeeds. Every write of the index runs
 // so. The transaction names the index's schema and takes the index's lock before f runs (xactLock), so that two
-// transactions that write one index run one after the other wherever they come from, and a lost connection
-// rolls the transaction back with its lock.
+// transactions that write one index run one after the other wherever they come from, and a lost connection rolls
+// the transaction back with its lock.
 func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
+	return s.writeTxFrom(ctx, -1, f)
+}
+
+// writeTxFrom is writeTx for a write whose content rests on reads made before the lock: it refuses when another
+// writer has written the index since generation, which a refresh reads before it reads the index and the tree.
+// On a pooled route no lock outlives its transaction, so this is what holds two refreshes of one index apart
+// when they run on different machines: the second to write wins, and the first is told to run again (75).
+func (s *Store) writeTxFrom(ctx context.Context, generation int64, f func(pgx.Tx) error) error {
 	conn := s.refresh
 	if conn == nil {
 		return fmt.Errorf("write the index %q outside its refresh lock", s.index)
@@ -403,10 +412,45 @@ func (s *Store) writeTx(ctx context.Context, f func(pgx.Tx) error) error {
 	if err := xactLock(ctx, tx, s.index); err != nil {
 		return unreachable(conn.Conn(), err)
 	}
+	if generation >= 0 {
+		now, err := generationIn(ctx, tx)
+		if err != nil {
+			return unreachable(conn.Conn(), err)
+		}
+		if now != generation {
+			return &TempError{Err: fmt.Errorf("another refresh wrote the index %q while this one read it (generation %d, now %d): run it again",
+				s.index, generation, now)}
+		}
+	}
 	if err := f(tx); err != nil {
 		return unreachable(conn.Conn(), err)
 	}
+	if _, err := tx.Exec(ctx, `INSERT INTO meta (k, v) VALUES ('generation', '1')
+		ON CONFLICT (k) DO UPDATE SET v = (meta.v::bigint + 1)::text`); err != nil {
+		return unreachable(conn.Conn(), err)
+	}
 	return unreachable(conn.Conn(), tx.Commit(ctx))
+}
+
+// generation counts the write transactions of the index: every one of them raises it by one.
+func (s *Store) generation(ctx context.Context) (int64, error) {
+	return generationIn(ctx, s.q)
+}
+
+func generationIn(ctx context.Context, q querier) (int64, error) {
+	var v string
+	err := q.QueryRow(ctx, `SELECT v FROM meta WHERE k = 'generation'`).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil || v == "" {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("the index's generation %q is no number: %w", v, err)
+	}
+	return n, nil
 }
 
 // analyze reads the statistics of the tables a refresh wrote: COPY leaves none, so the planner would read a
@@ -482,7 +526,10 @@ func (s *Store) CompiledCommit(ctx context.Context, required bool) (string, erro
 		return "", err
 	}
 	switch {
-	// Owed first: outside Git the commit is empty, and an empty compiled commit would pass as equal to it.
+	// Owed first: outside Git the commit is empty, and an empty compiled commit would pass as equal to it. An
+	// index that owes a compiled part and holds an older one is named by both commits, as before.
+	case owed == "1" && compiled != "":
+		return "", fmt.Errorf("the index's compiled part is of %s, not of its commit %s: refresh the index", compiled, commit)
 	case owed == "1":
 		return "", fmt.Errorf("the index's last refresh read no compiled part of %q: its compiled step did not finish, so the index states no fact; refresh the index", commit)
 	case compiled == commit:

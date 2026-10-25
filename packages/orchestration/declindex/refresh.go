@@ -240,6 +240,12 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	st := RefreshStats{WithoutForms: []FormsClash{}}
+	// What the index held before this refresh read it: its write refuses if another refresh has written since,
+	// because what it writes rests on these reads, which no lock of a pooled route can hold (writeTxFrom).
+	generation, err := s.generation(ctx)
+	if err != nil {
+		return st, err
+	}
 	r, err := s.readReference(ctx, tree, opt.jobs())
 	if err != nil {
 		return st, err
@@ -256,7 +262,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		st.Stale += r.results[i].Stale
 	}
 	st.Removed = len(r.gone)
-	if err := s.writeTx(ctx, func(tx pgx.Tx) error {
+	if err := s.writeTxFrom(ctx, generation, func(tx pgx.Tx) error {
 		if err := writeSources(ctx, tx, r.storedSources, r.sources); err != nil {
 			return err
 		}
