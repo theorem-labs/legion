@@ -172,11 +172,17 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 		}
 		return writeJSON(output, batches)
 	case "serve":
+		// Only serve listens: run and status never wait for a ready migration.
+		wakes, err := ledgerstore.ReadyWakes(ctx, program.dsn, program.ledger, config.Repository.Name)
+		if err != nil {
+			return fmt.Errorf("listen for ready migrations: %w", err)
+		}
 		return serve(ctx, runner, serving{
 			repository: config.Repository.Name,
 			baseBranch: config.BaseBranch,
 			maxMembers: config.Batch.MaxMembers,
 			interval:   config.Interval,
+			wakes:      wakes,
 		}, output)
 	default:
 		return fmt.Errorf("unknown batch command %q", command)
@@ -284,6 +290,8 @@ type repositoryConfig struct {
 	Name   string `json:"name"`
 	Path   string `json:"path"`
 	GitDir string `json:"git_dir"`
+	// FetchURL is where owners push their heads; each ready head is fetched from it by its SHA. Empty means Path.
+	FetchURL string `json:"fetch_url"`
 }
 
 // UnmarshalJSON refuses the old string form of the repository, whose path was
@@ -386,6 +394,9 @@ type program struct {
 	list   func(context.Context) ([]landing.Batch, error)
 	queue  landing.MergeQueue
 	close  func()
+	// ledger and dsn are the open ledger and its database, from which `land serve` opens its wake source.
+	ledger *ledger.Store
+	dsn    string
 }
 
 // program wires one configuration. It needs no configured batch: `land serve` has none, and forms each batch from
@@ -420,10 +431,12 @@ func (c config) program(ctx context.Context) (program, error) {
 	if len(c.PostLanding.Hooks) != 0 && strings.TrimSpace(c.Escalations.Owner) == "" {
 		return program{}, fmt.Errorf("escalations.owner is required: the ledger enqueues every escalation for it")
 	}
+	git := landing.RepositoryGit{Path: path, FetchURL: c.Repository.FetchURL}
 	runner := landing.Runner{
 		Builder:              landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
 		Hasher:               landing.CommandHasher{Command: c.Hasher, Directory: path},
-		Git:                  landing.RepositoryGit{Path: path},
+		Git:                  git,
+		Heads:                git,
 		ModuleRoots:          append([]string(nil), c.ModuleRoots...),
 		MaxRounds:            c.MaxRounds,
 		InfraRetries:         c.InfraRetries,
@@ -475,6 +488,7 @@ func (c config) program(ctx context.Context) (program, error) {
 	runner.Effects = calls
 	out.list = batches.ListActive
 	out.close = store.Close
+	out.ledger, out.dsn = store, dsn
 	out.runner = runner
 	return out, nil
 }
@@ -495,24 +509,32 @@ func commandToolchain(directory string, command []string) func(context.Context, 
 	}
 }
 
-// serving is what the serve loop forms each batch from: the repository, the branch it lands on, the cap on a
-// batch's members and how long it waits between rounds.
+// serving is what the serve loop forms each batch from: the repository, the branch it lands on and the cap on a
+// batch's members; and what starts its next round: a wake when an owner readies a migration, or else the interval,
+// so a wake that is lost delays a round by at most one interval.
 type serving struct {
 	repository string
 	baseBranch string
 	maxMembers int
 	interval   time.Duration
+	// wakes delivers a wake for each ready submission (ledgerstore.ReadyWakes). Nil, or closed, leaves the interval.
+	wakes <-chan struct{}
 }
 
 // serve reconciles and publishes until ctx ends. With no batch left to do, it forms the next one from the ledger's
 // ready migrations, on the current tip of the base branch; a round with no ready migration does nothing and waits.
-// A StopError (an unclassified ledger refusal) stops it, and the batch stays for an operator.
+// The next round starts when an owner readies a migration (a wake) or when the interval passes, whichever is first.
+// A wake that arrives during a round is kept for the next one; the round itself reads the ready list, so a wake
+// carries no member. A StopError (an unclassified ledger refusal) stops it, and the batch stays for an operator.
 func serve(ctx context.Context, runner landing.Runner, configured serving, output io.Writer) error {
 	interval := configured.interval
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
+	wakes := configured.wakes
 	for {
+		// This round reads the ready list as it is now, so every wake already pending is answered by it.
+		wakes = drain(wakes)
 		batches, err := runner.Reconcile(ctx)
 		if err != nil {
 			return err
@@ -552,11 +574,29 @@ func serve(ctx context.Context, runner landing.Runner, configured serving, outpu
 		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
+		case _, open := <-wakes:
+			timer.Stop()
+			if !open {
+				// The wake source ended (its connection failed): the interval alone starts the rounds from now on.
+				wakes = nil
+			}
+		}
+	}
+}
+
+// drain takes every wake already pending and returns the wake source, or nil once it has ended.
+func drain(wakes <-chan struct{}) <-chan struct{} {
+	for {
+		select {
+		case _, open := <-wakes:
+			if !open {
+				return nil
+			}
+		default:
+			return wakes
 		}
 	}
 }
