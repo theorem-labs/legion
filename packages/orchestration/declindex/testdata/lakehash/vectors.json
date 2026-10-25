@@ -1,0 +1,29 @@
+{
+  "toolchain": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)",
+  "vectors": [
+    {
+      "text": "",
+      "hash": "21c42906adea99f5"
+    },
+    {
+      "text": "a",
+      "hash": "6ccb214a796350f7"
+    },
+    {
+      "text": "abcdefgh",
+      "hash": "4a88fc15a029668c"
+    },
+    {
+      "text": "one\ntwo\n",
+      "hash": "3a02e8fdb34ea3d4"
+    },
+    {
+      "text": "one\r\ntwo\r\n",
+      "hash": "3a02e8fdb34ea3d4"
+    },
+    {
+      "text": "λ and 😀",
+      "hash": "5f760fc4e12cbc3f"
+    }
+  ]
+}

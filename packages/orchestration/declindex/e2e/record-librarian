@@ -1,0 +1,106 @@
+#!/bin/sh
+set -eu
+
+usage() {
+	printf '%s\n' 'usage: record-librarian --id ID --proposer OWNER --proposal FILE' \
+		'   or: record-librarian -- COMMAND ... --id ID --proposer OWNER --proposal FILE' >&2
+	exit 2
+}
+
+record=${LIBRARIAN_RECORD-}
+if [ -z "$record" ]; then
+	printf '%s\n' 'record-librarian: LIBRARIAN_RECORD is required' >&2
+	exit 2
+fi
+
+# The gate appends its arguments after the configured command, so `librarian: [record-librarian, --, COMMAND, ...]`
+# calls `record-librarian -- COMMAND ... --id ID --proposer OWNER --proposal FILE`. Then the command is everything
+# between the leading `--` and the gate's six arguments: move it behind them, parse those, and run it with them.
+wrapped=0
+if [ "$#" -gt 0 ] && [ "$1" = -- ]; then
+	shift
+	[ "$#" -ge 7 ] || usage
+	n=$(($# - 6))
+	while [ "$n" -gt 0 ]; do
+		arg=$1
+		shift
+		set -- "$@" "$arg"
+		n=$((n - 1))
+	done
+	wrapped=1
+fi
+
+id=
+proposer=
+proposal=
+pairs=0
+while [ "$#" -gt 0 ]; do
+	if [ "$wrapped" = 1 ] && [ "$pairs" = 3 ]; then
+		break
+	fi
+	case "$1" in
+	--id)
+		[ "$#" -ge 2 ] || usage
+		id=$2
+		shift 2
+		;;
+	--proposer)
+		[ "$#" -ge 2 ] || usage
+		proposer=$2
+		shift 2
+		;;
+	--proposal)
+		[ "$#" -ge 2 ] || usage
+		proposal=$2
+		shift 2
+		;;
+	--)
+		usage
+		;;
+	*)
+		usage
+		;;
+	esac
+	pairs=$((pairs + 1))
+done
+
+case "$id" in
+'' | *[!A-Za-z0-9._:-]*)
+	printf '%s\n' 'record-librarian: id must contain only letters, digits, dot, underscore, colon, and hyphen' >&2
+	exit 2
+	;;
+esac
+case "$proposer" in
+'' | *"$(printf '\t')"* | *'
+'*)
+	printf '%s\n' 'record-librarian: proposer must be one non-empty TSV field' >&2
+	exit 2
+	;;
+esac
+[ -n "$proposal" ] || usage
+
+umask 077
+hash_line=$(sha256sum "$proposal")
+hash=${hash_line%% *}
+case "$hash" in
+????????????????????????????????????????????????????????????????)
+	;;
+*)
+	printf '%s\n' 'record-librarian: sha256sum returned an invalid digest' >&2
+	exit 2
+	;;
+esac
+case "$hash" in
+*[!0-9a-f]*)
+	printf '%s\n' 'record-librarian: sha256sum returned an invalid digest' >&2
+	exit 2
+	;;
+esac
+
+mkdir -p "$record.d"
+printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$proposer" "$hash" >> "$record"
+cp "$proposal" "$record.d/$id"
+
+if [ "$wrapped" = 1 ]; then
+	"$@" --id "$id" --proposer "$proposer" --proposal "$proposal"
+fi

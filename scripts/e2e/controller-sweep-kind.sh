@@ -99,7 +99,7 @@ begin drivers
 # controller's Sandbox by the known set alone, as main's did before the fix.
 CGO_ENABLED=0 go -C "$root/packages/daemon" test -c -tags e2e -o "$work/controller-sweep.test" ./internal/daemon
 mkdir "$work/reverted"
-tar -C "$root" --exclude=node_modules -cf - go.work go.work.sum packages/daemon packages/envoy | tar -C "$work/reverted" -xf -
+tar -C "$root" --exclude=node_modules -cf - go.work go.work.sum packages/daemon packages/envoy packages/orchestration | tar -C "$work/reverted" -xf -
 swept=$work/reverted/packages/daemon/internal/runtime/sandbox/sandbox.go
 sed -i '/^func (r \*Runtime) controllerOwned(/a\	return false, nil // the negative control: the sweep before the fix reads no claim' "$swept"
 [ "$(sed -n '/^func (r \*Runtime) controllerOwned(/{n;p;}' "$swept")" = $'\treturn false, nil // the negative control: the sweep before the fix reads no claim' ] ||
