@@ -3,13 +3,16 @@ reason. Each test builds a compiled program whose C holds the item, and reads th
 
 from __future__ import annotations
 
+import hashlib
+import json
+import shutil
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import read
 
-from cgraph import config, pipeline
+from cgraph import cli, config, pipeline
 
 # State accesses the graph cannot hold (tests/fixtures/reasons).
 REASONS = Path(__file__).parent / "fixtures" / "reasons"
@@ -73,3 +76,29 @@ def test_checks_count_each_reason_the_exclusions_list(built: Path) -> None:
     counts = read(built, "exclusions.json")["counts"]["access"]
     assert counts == {"parameter_at_root": 2, "unbound_parameter": 2}
     assert read(built, "checks.json")["exclusions"]["access"] == counts
+
+
+def test_facts_whose_struct_access_has_no_record_stop_the_build_without_changing_the_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The extractor writes the record of every struct an access names into the same unit's facts,
+    so no C input gives an access without its record. Facts that do (a cache an inconsistent
+    extractor wrote) are an error, exit 3, never an exclusion: the graph would lose the access
+    silently. ``take_loaded`` reads ``struct holder``; its record is removed from the cached facts."""
+    program, cache, out = tmp_path / "reasons", tmp_path / "cache", tmp_path / "out"
+    shutil.copytree(REASONS, program)
+    arguments = ["build", "--config", str(program / "cgraph.toml"), "--part", "one", "--out", str(out)]
+    assert cli.main([*arguments, "--cache", str(cache)]) == 0
+    before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(out.iterdir())}
+    entry = cache / "facts" / f"{json.loads((cache / 'manifest.json').read_text())['src/reasons.c']['key']}.json"
+    facts = json.loads(entry.read_text())
+    del facts["records"]["holder@src/reasons.c:13"]
+    entry.write_text(json.dumps(facts))
+    # The link's core would otherwise be reused unchanged: its key holds the unit's key, not its facts.
+    shutil.rmtree(cache / "link")
+    capsys.readouterr()
+
+    assert cli.main([*arguments, "--cache", str(cache)]) == 3
+
+    assert "struct unit holder@src/reasons.c:13 has no record in the facts" in capsys.readouterr().err
+    assert {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(out.iterdir())} == before
