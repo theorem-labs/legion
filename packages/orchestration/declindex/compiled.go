@@ -610,9 +610,9 @@ func (s *Store) owners(ctx context.Context, consts []declRef) (map[declRef]Found
 		if err != nil {
 			return nil, err
 		}
-		ref[c] = o
-		if slices.Contains(declaring[o.name], o.module) {
-			declared[o.name] = true
+		ref[c] = o.ref
+		if slices.Contains(declaring[o.ref.name], o.ref.module) {
+			declared[o.ref.name] = true
 		}
 	}
 	found := map[declRef]Found{}

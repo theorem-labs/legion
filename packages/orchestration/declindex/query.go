@@ -179,7 +179,7 @@ func (s *Store) usersOf(ctx context.Context, d declRef) ([]useRow, error) {
 		if err != nil {
 			return nil, err
 		}
-		if owner == d {
+		if owner.ref == d {
 			out = append(out, x.u)
 		}
 	}

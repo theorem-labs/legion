@@ -10,77 +10,69 @@ import (
 )
 
 // propagates says whether an edge passes a change on: a use in a statement, or any use by a definition (defKinds).
-var propagates = `(e.stmt OR e.kind IN ('` + strings.Join(defKinds, `', '`) + `'))`
+var propagates = `(e.stmt OR e.kind = ANY('{` + strings.Join(defKinds, ",") + `}'))`
 
-// reachEdge is one edge of the declaration graph out of a declaration: the declaration that uses it, and whether
-// the use passes a change on.
-type reachEdge struct {
+// outEdge is one declaration that uses another, and whether a change passes to it.
+type outEdge struct {
 	dst  declRef
 	prop bool
 }
 
-// edgesFrom reads the edges whose used declaration is one of nodes, by that declaration: the refresh resolved each
-// use to the declaration it belongs to (edges.owner, edges.owner_module), so one indexed read gives a node's
-// users. Two uses of one declaration by one user give one edge, which propagates when either use does, and a
-// declaration's use of itself is no edge.
-func edgesFrom(ctx context.Context, q querier, nodes []declRef) (map[declRef][]reachEdge, error) {
-	names, modules := make([]string, len(nodes)), make([]string, len(nodes))
-	for i, n := range nodes {
-		names[i], modules[i] = n.name, n.module
+// outEdges reads the edges out of every declaration of frontier in one query, on the index of (owner_module,
+// owner): the declarations that use a constant of one of them. Two constants of one owner give one edge, which
+// propagates when either use does, and a declaration's use of its own constant is no edge. Each declaration's
+// edges come ordered by the name and then the module of their user, the walk's tie-break.
+func (s *Store) outEdges(ctx context.Context, frontier []declRef) (map[declRef][]outEdge, error) {
+	modules, names := make([]string, len(frontier)), make([]string, len(frontier))
+	for i, d := range frontier {
+		modules[i], names[i] = d.module, d.name
 	}
-	out := map[declRef][]reachEdge{}
-	at := map[[2]declRef]int{}
-	rows, err := q.Query(ctx, `SELECT e.owner, e.owner_module, e.dst, e.module, `+propagates+` FROM edges e
-		JOIN unnest($1::text[], $2::text[]) AS n(name, module) ON e.owner = n.name AND e.owner_module = n.module`,
-		names, modules)
+	out := make(map[declRef][]outEdge, len(frontier))
+	rows, err := s.q.Query(ctx, `
+		SELECT e.owner_module, e.owner, e.dst, e.module, bool_or(`+propagates+`)
+		  FROM unnest($1::text[], $2::text[]) AS f (m, n)
+		  JOIN edges e ON e.owner_module = f.m AND e.owner = f.n
+		 WHERE e.dst <> e.owner OR e.module <> e.owner_module
+		 GROUP BY e.owner_module, e.owner, e.dst, e.module
+		 ORDER BY e.dst, e.module`, modules, names)
 	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var src, dst declRef
 		var prop bool
-		if err := r.Scan(&src.name, &src.module, &dst.name, &dst.module, &prop); err != nil {
+		if err := r.Scan(&src.module, &src.name, &dst.name, &dst.module, &prop); err != nil {
 			return err
 		}
-		if src == dst {
-			return nil
-		}
-		if i, ok := at[[2]declRef{src, dst}]; ok {
-			out[src][i].prop = out[src][i].prop || prop
-			return nil
-		}
-		at[[2]declRef{src, dst}] = len(out[src])
-		out[src] = append(out[src], reachEdge{dst: dst, prop: prop})
+		out[src] = append(out[src], outEdge{dst, prop})
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	// A walk follows a node's users in one order whatever the server returns them in: by name, then by module.
-	for _, es := range out {
-		slices.SortFunc(es, func(a, b reachEdge) int { return a.dst.compare(b.dst) })
-	}
 	return out, nil
 }
 
-// walk computes the statements that a change to root changes (followed through propagating edges) and the proofs
-// at their edge, and for each, the declaration it was first reached from. It reads one level of the graph at a
-// time, so a change that reaches nothing reads almost nothing.
-func (s *Store) walk(ctx context.Context, root declRef) (changed, reprove map[declRef]bool, via map[declRef]declRef, err error) {
-	changed, reprove, via = map[declRef]bool{}, map[declRef]bool{}, map[declRef]declRef{}
+// walk computes the statements that a change to root changes (followed through propagating edges), and for each
+// the declaration it was first reached from. With reprove it also gives the proofs at the edge of that closure,
+// the users a change does not pass through, and the declaration each was first reached from.
+//
+// It walks the edges table breadth first, one query for each level over the whole level's declarations, and reads
+// only the rows it reaches.
+func (s *Store) walk(ctx context.Context, root declRef, reprove bool) (map[declRef]bool, map[declRef]bool, map[declRef]declRef, error) {
+	changed, proofs, via := map[declRef]bool{}, map[declRef]bool{}, map[declRef]declRef{}
 	inClosure := map[declRef]bool{root: true}
 	frontier := []declRef{root}
-	// The edges that do not propagate are the proofs at the edge of the change, and are counted once the closure
-	// is known: a declaration the closure holds is changed, not reproved.
-	type edge struct{ src, dst declRef }
-	var atEdge []edge
+	var atEdge [][2]declRef // the edges out of the closure that do not propagate, checked after it
 	for len(frontier) > 0 {
-		users, err := edgesFrom(ctx, s.q, frontier)
+		out, err := s.outEdges(ctx, frontier)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		var next []declRef
 		for _, src := range frontier {
-			for _, e := range users[src] {
+			for _, e := range out[src] {
 				if !e.prop {
-					atEdge = append(atEdge, edge{src, e.dst})
+					if reprove {
+						atEdge = append(atEdge, [2]declRef{src, e.dst})
+					}
 					continue
 				}
 				if e.dst != root {
@@ -96,25 +88,24 @@ func (s *Store) walk(ctx context.Context, root declRef) (changed, reprove map[de
 		frontier = next
 	}
 	for _, e := range atEdge {
-		if inClosure[e.dst] {
+		if inClosure[e[1]] {
 			continue
 		}
-		reprove[e.dst] = true
-		if _, ok := via[e.dst]; !ok {
-			via[e.dst] = e.src
+		proofs[e[1]] = true
+		if _, ok := via[e[1]]; !ok {
+			via[e[1]] = e[0]
 		}
 	}
-	return changed, reprove, via, nil
+	return changed, proofs, via, nil
 }
 
-// reach computes the statements a change to root's statement changes, and the proofs at their edge, on the
-// declaration graph in the edges table.
+// reach computes the statements a change to root's statement changes, and the proofs at their edge.
 func (s *Store) reach(ctx context.Context, root declRef, why bool) (Reach, error) {
-	paths, err := s.modulePaths(ctx)
+	changed, reprove, via, err := s.walk(ctx, root, true)
 	if err != nil {
 		return Reach{}, err
 	}
-	changed, reprove, via, err := s.walk(ctx, root)
+	paths, err := s.modulePaths(ctx)
 	if err != nil {
 		return Reach{}, err
 	}
@@ -178,7 +169,7 @@ func (s *Store) reachedModules(ctx context.Context, defs []declRef, skip []strin
 	}
 	var out []string
 	for _, d := range defs {
-		changed, _, _, err := s.walk(ctx, d)
+		changed, _, _, err := s.walk(ctx, d, false)
 		if err != nil {
 			return nil, err
 		}

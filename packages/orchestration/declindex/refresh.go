@@ -260,7 +260,14 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		if err := writeSources(ctx, tx, r.storedSources, r.sources); err != nil {
 			return err
 		}
+		before, err := readBeforeModules(ctx, tx, r)
+		if err != nil {
+			return err
+		}
 		if err := writeModules(ctx, tx, r); err != nil {
+			return err
+		}
+		if err := reresolveOwners(ctx, tx, r, before, opt.Log); err != nil {
 			return err
 		}
 		return s.writeMeta(ctx, tx, r, opt.Commit, st.Unreadable)
