@@ -1,96 +1,109 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
+	"os"
+	"slices"
 	"strings"
+
+	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
-// cmdLandHash is the landing program's statement hasher. It reads LAND_TREE (a git tree id) and LAND_NAMES (a
-// JSON array of fully qualified names) and prints exactly `name<TAB>hash`, one line per requested name. The hash
-// is the text statement hash at LAND_TREE. The index has it for a declaration whose source file is the same blob
-// at LAND_TREE as at the index's commit; a file the candidate changed has no hash before it is built. Any name
-// that is missing, declared twice, requested twice, in a changed file, or without a hash makes the whole call
-// unable to check (exit 3), and nothing is printed.
+// cmdLandHash answers a landing's declaration reads at one Git tree (declindex.Store.LandHash), from LAND_TREE,
+// LAND_GIT_DIR, LAND_NAMES or LAND_NAMES_FILE, and LAND_BUILD_DIR. It reads the index read-only and never the
+// configured tree.
 func cmdLandHash(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
-		return fail(e.stderr, &usageError{"land-hash takes no arguments; it reads LAND_TREE and LAND_NAMES"})
+		return fail(e.stderr, &usageError{"land-hash takes no arguments; it reads LAND_TREE, LAND_GIT_DIR, LAND_NAMES or LAND_NAMES_FILE, and LAND_BUILD_DIR for changed sources"})
 	}
 	tree := strings.TrimSpace(e.getenv("LAND_TREE"))
-	var names []string
-	if tree == "" {
-		return fail(e.stderr, &unableError{fmt.Errorf("LAND_TREE is empty")})
+	// LAND_TREE goes only to Git, which reads an object id in either case, so it may be uppercase; LAND_COMMIT is
+	// compared as text with the commits the index records, so it must be lowercase.
+	if !declindex.IsObjectID(strings.ToLower(tree)) {
+		return fail(e.stderr, &unableError{fmt.Errorf("LAND_TREE must be a 40-hex tree id")})
 	}
-	if err := json.Unmarshal([]byte(e.getenv("LAND_NAMES")), &names); err != nil {
-		return fail(e.stderr, &unableError{fmt.Errorf("LAND_NAMES is not a JSON array of names: %w", err)})
+	gitDir := strings.TrimSpace(e.getenv("LAND_GIT_DIR"))
+	if gitDir == "" {
+		return fail(e.stderr, &unableError{fmt.Errorf("LAND_GIT_DIR is empty")})
 	}
-	if err := e.open(true); err != nil {
-		return fail(e.stderr, err)
-	}
-	defer e.close()
-	commit, err := e.store.Meta(ctx, "commit")
+	names, err := landNames(e.getenv)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	type hashed struct{ name, hash, path string }
-	var out []hashed
-	seen := map[string]bool{}
-	for _, n := range names {
-		if seen[n] {
-			return fail(e.stderr, &unableError{fmt.Errorf("%s is requested twice", n)})
-		}
-		seen[n] = true
-		found, err := e.store.Resolve(ctx, n)
-		if err != nil {
-			return fail(e.stderr, &unableError{err})
-		}
-		var exact []hashed
-		for _, f := range found {
-			if f.Name == n {
-				exact = append(exact, hashed{n, f.StmtHash, f.Path})
-			}
-		}
-		switch {
-		case len(exact) == 0:
-			return fail(e.stderr, &unableError{fmt.Errorf("no declaration %s in the index at %s", n, short(commit))})
-		case len(exact) > 1:
-			return fail(e.stderr, &unableError{fmt.Errorf("%s is declared %d times", n, len(exact))})
-		case exact[0].hash == "":
-			return fail(e.stderr, &unableError{fmt.Errorf("%s has no statement hash: its source file is missing or newer than its build", n)})
-		}
-		out = append(out, exact[0])
+	if err := e.openReadOnly(ctx, declindex.IndexOnly, true); err != nil {
+		return fail(e.stderr, err)
 	}
-	// One git process compares every file's blob at the candidate tree with the one the index read.
-	var q strings.Builder
-	for _, h := range out {
-		fmt.Fprintf(&q, "%s:%s\n%s:%s\n", tree, h.path, commit, h.path)
-	}
-	cmd := exec.CommandContext(ctx, "git", "-C", e.cfg.Tree, "cat-file", "--batch-check=%(objectname)")
-	cmd.Stdin = strings.NewReader(q.String())
-	raw, err := cmd.Output()
+	defer e.close()
+	answers, err := e.store.LandHash(ctx, declindex.LandHashRequest{
+		GitDir:   gitDir,
+		TreeID:   tree,
+		Names:    names,
+		BuildDir: strings.TrimSpace(e.getenv("LAND_BUILD_DIR")),
+		LibRel:   e.cfg.LibRel,
+		Roots:    e.cfg.TreeSpec().Roots,
+	})
 	if err != nil {
-		return fail(e.stderr, &unableError{fmt.Errorf("git cat-file in %s: %w", e.cfg.Tree, err)})
+		return fail(e.stderr, &unableError{err})
 	}
-	sc := bufio.NewScanner(bytes.NewReader(raw))
-	for _, h := range out {
-		var atTree, atIndex string
-		if sc.Scan() {
-			atTree = sc.Text()
-		}
-		if sc.Scan() {
-			atIndex = sc.Text()
-		}
-		if strings.HasSuffix(atTree, "missing") || strings.HasSuffix(atIndex, "missing") || atTree == "" || atTree != atIndex {
-			return fail(e.stderr, &unableError{fmt.Errorf("%s: %s differs at %s from the index's commit %s, so its hash is "+
-				"unknown before a build", h.name, h.path, tree, short(commit))})
-		}
-	}
-	for _, h := range out {
-		fmt.Fprintf(e.stdout, "%s\t%s\n", h.name, h.hash)
+	for _, answer := range answers {
+		fmt.Fprintf(e.stdout, "%s\t%s\t%s\n", answer.Name, answer.Hash, answer.Path)
 	}
 	return 0
+}
+
+func landNames(getenv func(string) string) ([]string, error) {
+	fromEnv := []byte(getenv("LAND_NAMES"))
+	file := strings.TrimSpace(getenv("LAND_NAMES_FILE"))
+	hasEnv := len(fromEnv) != 0
+	hasFile := file != ""
+	if !hasEnv && !hasFile {
+		return nil, fmt.Errorf("one of LAND_NAMES or LAND_NAMES_FILE is required")
+	}
+	var names []string
+	var err error
+	if hasEnv {
+		names, err = parseLandNames(fromEnv)
+		if err != nil {
+			return nil, fmt.Errorf("LAND_NAMES: %w", err)
+		}
+	}
+	if hasFile {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("LAND_NAMES_FILE: %w", err)
+		}
+		fromFile, err := parseLandNames(raw)
+		if err != nil {
+			return nil, fmt.Errorf("LAND_NAMES_FILE: %w", err)
+		}
+		if hasEnv && !slices.Equal(names, fromFile) {
+			return nil, fmt.Errorf("LAND_NAMES and LAND_NAMES_FILE differ")
+		}
+		names = fromFile
+	}
+	return names, nil
+}
+
+func parseLandNames(raw []byte) ([]string, error) {
+	var names []string
+	if err := json.Unmarshal(raw, &names); err != nil {
+		return nil, fmt.Errorf("not a JSON array of names: %w", err)
+	}
+	if names == nil && string(bytes.TrimSpace(raw)) != "[]" {
+		return nil, fmt.Errorf("not a JSON array of names")
+	}
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("%q is not a non-empty name", name)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("%s is requested twice", name)
+		}
+		seen[name] = true
+	}
+	return names, nil
 }

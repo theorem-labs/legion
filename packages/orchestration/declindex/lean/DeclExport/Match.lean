@@ -14,10 +14,23 @@ an instance of a form:
 * through a local alias: a variable that the statement equates with a term stands for that term.
 
 Matching is first-order and structural: a pattern variable matches any term, the same one each time; numeric
-literals compare by value; `=`, `≠`, `↔` and `HEq` match in either order. Names, notation and namespaces play no
+literals compare by the value they are written with, whatever their type and instance (`lit?`), which is looser
+than the exact hash; `=`, `≠`, `↔` and `HEq` match in either order. Names, notation and namespaces play no
 part. An application of a concept's own declaration is a *use* of the concept, recorded and not unfolded. -/
 
 namespace DeclExport
+
+/-- The value a numeric literal is written with, however it is elaborated: a raw literal, `OfNat.ofNat _ n _`,
+`instOfNatNat n` or `BitVec.ofNat w n` (the `n#w` notation). It ignores the type and the instance, although a
+custom `OfNat` instance can give another value: matching uses it, and the exact hash (`hashExpr`) does not. -/
+partial def lit? (e : Expr) : Option Nat :=
+  match e.consumeMData with
+  | .lit (.natVal n) => some n
+  | e =>
+    if e.isAppOfArity ``OfNat.ofNat 3 then lit? (e.getArg! 1)
+    else if e.isAppOfArity ``instOfNatNat 1 then lit? (e.getArg! 0)
+    else if e.isAppOfArity ``BitVec.ofNat 2 then lit? (e.getArg! 1)
+    else none
 
 structure Form where
   concept : String

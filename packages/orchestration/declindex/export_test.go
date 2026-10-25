@@ -7,9 +7,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // leanForTest finds a Lean toolchain on PATH. The exporter tests need one: CI installs it and sets
@@ -153,6 +156,20 @@ func TestExporterFindsTheFactHoweverItIsWritten(t *testing.T) {
 	}
 }
 
+// A matcher is an auxiliary definition, not a declaration of its own: the exporter, which imports without loading
+// environment extensions, finds it in its module's matcher entries and exports it with no row.
+func TestExporterExportsNoMatcher(t *testing.T) {
+	consts := exportFixture(t)
+	if _, ok := consts["Fx.pickA"]; !ok {
+		t.Fatal("Fx.pickA was not exported")
+	}
+	for _, m := range []string{"Fx.pickA.match_1", "Fx.pickB.match_1"} {
+		if _, ok := consts[m]; ok {
+			t.Errorf("the matcher %s was exported as a declaration", m)
+		}
+	}
+}
+
 func TestExporterHashesACopyAsTheOriginal(t *testing.T) {
 	consts := exportFixture(t)
 	orig := consts["Fx.SpAligned"]
@@ -205,6 +222,43 @@ func TestExporterAtomsAgreeAcrossSidesOfAnEquation(t *testing.T) {
 	}
 }
 
+// A relation atom counts an abstracted proof by its type, as the statement hash does. A's `one` and B's `two` each
+// abstract the proof `0 < n + 1` out of their types (`one._proof_1`, `two._proof_1`), so every atom of `one`,
+// `(⟨0, _⟩ : Fin (n + 1)).val = 0` among them, is an atom of `two`.
+func TestAnAtomCountsAnAbstractedProofByItsType(t *testing.T) {
+	l := leanForTest(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	for _, m := range []struct{ name, source string }{
+		{"A", "theorem one (n : Nat) : (⟨0, by omega⟩ : Fin (n + 1)).val = 0 := rfl\n"},
+		{"B", "theorem two (n : Nat) : (⟨0, by omega⟩ : Fin (n + 1)).val = 0 ∧ True := ⟨rfl, trivial⟩\n"},
+	} {
+		if err := os.WriteFile(filepath.Join(dir, m.name+".lean"), []byte(m.source), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := CompileModule(ctx, l, nil, dir, m.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	x := &Exporter{Lean: l, Bin: exporterForTest(t, l), SearchPath: []string{dir}, Jobs: 1}
+	consts, err := x.Run(ctx, Manifest{Modules: []string{"A", "B"}, Roots: []string{"A", "B"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	atoms := map[string][]string{}
+	for _, c := range consts {
+		atoms[c.Name] = c.Atoms
+	}
+	if len(atoms["one"]) == 0 {
+		t.Fatalf("one has no atom: %v", atoms)
+	}
+	for _, a := range atoms["one"] {
+		if !slices.Contains(atoms["two"], a) {
+			t.Errorf("one's atom %s is not an atom of two: one %v, two %v", a, atoms["one"], atoms["two"])
+		}
+	}
+}
+
 // A compiled module sees only the toolchain's environment: none of the caller's variables, and its own directory
 // as home.
 func TestCompileModuleRunsLeanInAMinimalEnvironment(t *testing.T) {
@@ -233,7 +287,7 @@ func TestCompileConfinedKeepsTheModulesCodeIn(t *testing.T) {
 		}
 		t.Skip(err)
 	}
-	dir, err := NewScratch(t.TempDir())
+	dir, err := confine.NewScratch(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +332,7 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 	x := &Exporter{Lean: l, Bin: exporterForTest(t, l)}
 	check := func(body string) error {
 		t.Helper()
-		work, err := NewScratch(t.TempDir())
+		work, err := confine.NewScratch(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}

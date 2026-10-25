@@ -3,7 +3,6 @@
 package confine
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -60,17 +59,15 @@ func shell(t *testing.T, spec Spec, script string) (int, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err = cmd.Run()
+	out, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		return ee.ExitCode(), out.String()
+		return ee.ExitCode(), string(out)
 	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	return 0, out.String()
+	return 0, string(out)
 }
 
 func TestAConfinedProcessWritesOnlyBeneathItsScratch(t *testing.T) {

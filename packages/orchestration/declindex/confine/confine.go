@@ -1,10 +1,12 @@
 // Package confine runs one program in an operating-system sandbox that an unprivileged process can build, with
 // no setuid helper and no user namespace: Landlock confines its files, and a seccomp filter its system calls.
 //
-//   - Files: it reads only beneath Spec.Read and its scratch directory, writes (creates, removes, truncates) only
-//     in its scratch directory, and links or renames nothing across directories (Landlock REFER is never
-//     granted). The scratch directory must be fresh: this user's, mode 0700 and empty; the inputs are copied
-//     into it, never linked.
+//   - Files: it reads only beneath Spec.Read, its scratch directory and the system files that a dynamically linked
+//     program needs to start (the shared libraries, the loader's cache and /dev/urandom); reads and writes
+//     /dev/null; executes only the program and its ELF interpreter; writes (creates, removes, truncates) only in
+//     its scratch directory; and links or renames nothing across directories (Landlock REFER is never granted).
+//     The scratch directory must be fresh: this user's, mode 0700 and empty; the inputs are copied into it, never
+//     linked.
 //   - Processes: the program is the only process. Its one exec is the start of the program itself; every later
 //     execve and execveat fails, and so does every clone that is not a thread (fork, vfork, clone3, posix_spawn).
 //   - Network and the rest: every socket(2) fails, and so do io_uring, ptrace, process_vm_readv/writev, the
@@ -28,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -141,11 +144,11 @@ func checkScratch(dir string) error {
 // writeInputs copies the inputs into the (checked, empty) scratch directory, creating each file new.
 func writeInputs(dir string, inputs []Input) error {
 	for _, in := range inputs {
-		clean := filepath.Clean(in.Name)
-		if in.Name == "" || filepath.IsAbs(in.Name) || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		// IsLocal refuses an empty, absolute or escaping name, and accepts "." (the scratch directory itself).
+		if !filepath.IsLocal(in.Name) || filepath.Clean(in.Name) == "." {
 			return fmt.Errorf("confine: the input name %q is not a path below the scratch directory", in.Name)
 		}
-		p := filepath.Join(dir, clean)
+		p := filepath.Join(dir, filepath.Clean(in.Name))
 		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 			return err
 		}
@@ -194,44 +197,40 @@ func Command(ctx context.Context, spec Spec) (*Cmd, error) {
 	cmd := exec.CommandContext(ctx, self)
 	cmd.Env = []string{envVar + "=" + string(raw)}
 	cmd.Dir = spec.Scratch
-	return &Cmd{Cmd: cmd}, nil
+	return &Cmd{cmd: cmd}, nil
 }
 
-// Cmd is a confined program. Start (and Run, Output, CombinedOutput) also lets through the program's one exec.
+// Cmd is a confined program. Its Start, which CombinedOutput also runs, lets through the program's one exec; the
+// exec.Cmd it runs is not exposed, so nothing can start it without that.
 type Cmd struct {
-	*exec.Cmd
+	cmd *exec.Cmd
+	// Stderr, when set before Start, receives the program's standard error.
+	Stderr io.Writer
 }
+
+// StdoutPipe gives a pipe of the program's standard output, read until Wait (exec.Cmd.StdoutPipe).
+func (c *Cmd) StdoutPipe() (io.ReadCloser, error) { return c.cmd.StdoutPipe() }
 
 // Start starts the launcher, lets its exec of the program through, and closes the channel that would let another.
-func (c *Cmd) Start() error { return start(c.Cmd) }
-
-// Run starts the program and waits for it.
-func (c *Cmd) Run() error {
-	if err := c.Start(); err != nil {
-		return err
-	}
-	return c.Wait()
+func (c *Cmd) Start() error {
+	c.cmd.Stderr = c.Stderr
+	return start(c.cmd)
 }
 
-// Output runs the program and returns its standard output.
-func (c *Cmd) Output() ([]byte, error) {
-	if c.Stdout != nil {
-		return nil, errors.New("confine: Stdout already set")
-	}
-	var out strings.Builder
-	c.Stdout = &out
-	err := c.Run()
-	return []byte(out.String()), err
-}
+// Wait waits for the started program to exit (exec.Cmd.Wait).
+func (c *Cmd) Wait() error { return c.cmd.Wait() }
 
 // CombinedOutput runs the program and returns its standard output and error together.
 func (c *Cmd) CombinedOutput() ([]byte, error) {
-	if c.Stdout != nil || c.Stderr != nil {
+	if c.cmd.Stdout != nil || c.Stderr != nil {
 		return nil, errors.New("confine: Stdout or Stderr already set")
 	}
 	var out strings.Builder
 	// exec.Cmd writes one comparable writer from one goroutine at a time.
-	c.Stdout, c.Stderr = &out, &out
-	err := c.Run()
+	c.cmd.Stdout, c.Stderr = &out, &out
+	err := c.Start()
+	if err == nil {
+		err = c.cmd.Wait()
+	}
 	return []byte(out.String()), err
 }

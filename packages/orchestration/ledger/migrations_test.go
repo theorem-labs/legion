@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -126,20 +127,18 @@ func TestTakeoverRefusesTheOldOwnersGeneration(t *testing.T) {
 	_, err := s.TakeOver(ctx, "r", "M-1", "carol", 1)
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 
-	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1,
-		Changed: []string{"a.lean"}, Current: map[string]string{"X.foo": "h1"}}))
-	if res.Pass || !hasViolation(res, ledger.ViolationStaleGeneration) {
+	res := must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "candidate", ChangedPaths: []string{"a.lean"}, Current: map[string]string{"X.foo": "h1"}}}))
+	if res.Pass || !hasViolation(res, ledger.ReasonStaleGeneration) {
 		t.Fatalf("old generation check: %+v", res)
 	}
-	_, err = s.RecordRound(ctx, "r", "M-1", 1, "kicked")
+	_, err = s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "kicked", Key: "stale-round", ReadyEvent: unreadyEvent})
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 	_, err = s.ExtendMigration(ctx, "r", "M-1", 1, []string{"b.lean"}, nil)
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 	_, err = s.Abandon(ctx, "r", "M-1", 1, "")
 	wantRefusal(t, err, ledger.ReasonStaleGeneration)
 
-	res = must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 2,
-		Changed: []string{"a.lean"}, Current: map[string]string{"X.foo": "h1"}}))
+	res = must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 2, Commit: "candidate", ChangedPaths: []string{"a.lean"}, Current: map[string]string{"X.foo": "h1"}}}))
 	if !res.Pass {
 		t.Fatalf("current generation check: %+v", res)
 	}
@@ -178,9 +177,7 @@ func TestCheckNeverPassesOldGenerationWhenTakeoverIsQueued(t *testing.T) {
 	}
 	checked := make(chan checkOutcome, 1)
 	go func() {
-		result, err := s.Check(ctx, ledger.CheckRequest{
-			Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"},
-		})
+		result, err := s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "candidate", ChangedPaths: []string{"a.lean"}}})
 		checked <- checkOutcome{result: result, err: err}
 	}()
 	waitForBlockedConnections(t, observer, 2)
@@ -196,7 +193,7 @@ func TestCheckNeverPassesOldGenerationWhenTakeoverIsQueued(t *testing.T) {
 	if got.err != nil {
 		t.Fatal(got.err)
 	}
-	if got.result.Pass || !hasViolation(got.result, ledger.ViolationStaleGeneration) {
+	if got.result.Pass || !hasViolation(got.result, ledger.ReasonStaleGeneration) {
 		t.Fatalf("check passed an old generation after takeover: %+v", got.result)
 	}
 }
@@ -249,7 +246,7 @@ func TestCheckFlagsUndeclaredWritesAndChangedReadsAndPassesACleanChange(t *testi
 	ctx := context.Background()
 	must(open(t, s, "M-1", "alice", []string{"src/a.lean", "src/new/"}, map[string]string{"X.foo": "h1", "X.bar": "h2"}))
 	check := func(changed []string, current map[string]string) ledger.CheckResult {
-		return must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: changed, Current: current}))
+		return must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "candidate", ChangedPaths: changed, Current: current}}))
 	}
 	clean := map[string]string{"X.foo": "h1", "X.bar": "h2"}
 
@@ -262,7 +259,7 @@ func TestCheckFlagsUndeclaredWritesAndChangedReadsAndPassesACleanChange(t *testi
 	}
 	got := map[string]bool{}
 	for _, v := range res.Violations {
-		if v.Kind == ledger.ViolationUndeclaredWrite {
+		if v.Kind == ledger.ReasonUndeclaredWrite {
 			got[v.Path] = true
 		}
 	}
@@ -271,17 +268,17 @@ func TestCheckFlagsUndeclaredWritesAndChangedReadsAndPassesACleanChange(t *testi
 	}
 
 	res = check([]string{"src/a.lean"}, map[string]string{"X.foo": "h1", "X.bar": "h3"})
-	v := violation(t, res, ledger.ViolationStaleRead)
+	v := violation(t, res, ledger.ReasonStaleRead)
 	if res.Pass || v.Name != "X.bar" || v.Recorded != "h2" || v.Current != "h3" {
 		t.Fatalf("changed read: %+v", res)
 	}
 	// A read that no longer exists is stale; a read nobody hashed cannot be decided, so it does not pass.
 	res = check([]string{"src/a.lean"}, map[string]string{"X.foo": "h1", "X.bar": ""})
-	if res.Pass || violation(t, res, ledger.ViolationStaleRead).Name != "X.bar" {
+	if res.Pass || violation(t, res, ledger.ReasonStaleRead).Name != "X.bar" {
 		t.Fatalf("vanished read: %+v", res)
 	}
 	res = check([]string{"src/a.lean"}, map[string]string{"X.foo": "h1"})
-	if res.Pass || violation(t, res, ledger.ViolationUnverifiedRead).Name != "X.bar" {
+	if res.Pass || violation(t, res, ledger.ReasonUnverifiedRead).Name != "X.bar" {
 		t.Fatalf("unhashed read: %+v", res)
 	}
 	conn := must(pgx.Connect(ctx, dsn))
@@ -290,10 +287,42 @@ func TestCheckFlagsUndeclaredWritesAndChangedReadsAndPassesACleanChange(t *testi
 	must(conn.Exec(ctx, `INSERT INTO migration_writes (repo, migration, path, is_prefix) VALUES ($1, $2, $3, false)`,
 		"r", "M-overlap", "src/a.lean"))
 	res = check([]string{"src/a.lean"}, clean)
-	if res.Pass || !hasViolation(res, ledger.ViolationOverlap) {
+	if res.Pass || !hasViolation(res, ledger.ReasonOverlap) {
 		t.Fatalf("overlapping migration passed: %+v", res)
 	}
 
+}
+
+func TestCheckReportsMissingCommitAsInvalidCandidate(t *testing.T) {
+	s := newStore(t)
+	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
+
+	res := must(s.Check(context.Background(), ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, ChangedPaths: []string{"a.lean"}}}))
+	if res.Pass || res.Outcome != "refused" || !hasViolation(res, ledger.ReasonInvalidCandidate) {
+		t.Fatalf("missing commit: %+v", res)
+	}
+}
+
+func TestDeferredCheckNeverPasses(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		reads    map[string]string
+		deferred []string
+	}{
+		{name: "declared read", reads: map[string]string{"C": "hash-1"}, deferred: []string{"C"}},
+		{name: "no declared reads", reads: nil, deferred: []string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newStore(t)
+			must(open(t, s, "M-1", "alice", []string{"a.lean"}, test.reads))
+
+			res := must(s.Check(context.Background(), ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "candidate", ChangedPaths: []string{"a.lean"}}, DeferReads: true}))
+			if res.Pass || res.Outcome != "incomplete" || len(res.Violations) != 0 ||
+				!slices.Equal(res.Deferred, test.deferred) {
+				t.Fatalf("deferred check: %+v; want deferred %v", res, test.deferred)
+			}
+		})
+	}
 }
 
 func TestCheckOfAClosedOrUnknownMigration(t *testing.T) {
@@ -301,13 +330,13 @@ func TestCheckOfAClosedOrUnknownMigration(t *testing.T) {
 	ctx := context.Background()
 	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
 	must(s.Abandon(ctx, "r", "M-1", 1, ""))
-	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"}}))
-	if res.Pass || !hasViolation(res, ledger.ViolationNotOpen) {
+	res := must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "candidate", ChangedPaths: []string{"a.lean"}}}))
+	if res.Pass || !hasViolation(res, ledger.ReasonNotOpen) {
 		t.Fatalf("closed migration: %+v", res)
 	}
 	_, err := s.Abandon(ctx, "r", "M-1", 1, "")
 	wantRefusal(t, err, ledger.ReasonNotOpen)
-	_, err = s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-nope", Generation: 1})
+	_, err = s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-nope", Generation: 1, Commit: "candidate", ChangedPaths: []string{}}})
 	var nf *ledger.NotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("unknown migration: %v", err)
@@ -345,7 +374,7 @@ func TestOpenAndCheckRejectPathsWithLeadingOrTrailingWhitespace(t *testing.T) {
 	}
 	must(open(t, s, "M-good", "alice", []string{"owned.lean"}, nil))
 	for _, candidate := range []string{" owned.lean", "owned.lean "} {
-		_, err := s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-good", Generation: 1, Changed: []string{candidate}})
+		_, err := s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-good", Generation: 1, Commit: "candidate", ChangedPaths: []string{candidate}}})
 		var invalid *ledger.InvalidError
 		if !errors.As(err, &invalid) {
 			t.Errorf("candidate path %q: want invalid, got %v", candidate, err)
@@ -395,8 +424,7 @@ func TestExtendAddsPathsUnlessTheyOverlap(t *testing.T) {
 	if len(m.Writes) != 2 || m.Reads["X.b"] != "2" || m.Reads["X.a"] != "1" {
 		t.Fatalf("after extend: %+v", m)
 	}
-	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1,
-		Changed: []string{"a.lean", "b.lean"}, Current: map[string]string{"X.a": "1", "X.b": "2"}}))
+	res := must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "candidate", ChangedPaths: []string{"a.lean", "b.lean"}, Current: map[string]string{"X.a": "1", "X.b": "2"}}}))
 	if !res.Pass {
 		t.Fatalf("check after extend: %+v", res)
 	}
@@ -408,7 +436,10 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	must(open(t, s, "M-1", "alice", []string{"a.lean"}, nil))
 	must(open(t, s, "M-2", "bob", []string{"b.lean"}, nil))
 	for i := 1; i <= 2; i++ {
-		m := must(s.RecordRound(ctx, "r", "M-1", 1, fmt.Sprintf("build failed %d", i)))
+		m := must(s.RecordRound(ctx, ledger.RoundRequest{
+			Repo: "r", ID: "M-1", Generation: 1, Reason: fmt.Sprintf("build failed %d", i), Key: fmt.Sprintf("round-%d", i),
+			ReadyEvent: unreadyEvent,
+		}))
 		if m.LandingRounds != i || m.EscalatedAt != nil {
 			t.Fatalf("after round %d: %+v", i, m)
 		}
@@ -416,7 +447,7 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	_, err := s.Escalate(ctx, "r", "M-1", 3)
 	wantRefusal(t, err, ledger.ReasonBelowLimit)
 
-	m := must(s.RecordRound(ctx, "r", "M-1", 1, "build failed 3"))
+	m := must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-1", Generation: 1, Reason: "build failed 3", Key: "round-3", ReadyEvent: unreadyEvent}))
 	if m.EscalatedAt == nil || m.State != ledger.StateOpen {
 		t.Fatalf("third failed round should escalate and leave it open: %+v", m)
 	}
@@ -424,8 +455,8 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	if len(st.Escalated) != 1 || st.Escalated[0].ID != "M-1" {
 		t.Fatalf("status escalated: %+v", st.Escalated)
 	}
-	res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"}}))
-	if res.Pass || !hasViolation(res, ledger.ViolationEscalated) {
+	res := must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "candidate", ChangedPaths: []string{"a.lean"}}}))
+	if res.Pass || !hasViolation(res, ledger.ReasonEscalated) {
 		t.Fatalf("an escalated migration must wait for the steward: %+v", res)
 	}
 
@@ -433,14 +464,14 @@ func TestMigrationEscalatesWhenItUsesUpItsLandingRounds(t *testing.T) {
 	if m.EscalatedAt != nil || m.LandingRounds != 0 {
 		t.Fatalf("after retry: %+v", m)
 	}
-	if res := must(s.Check(ctx, ledger.CheckRequest{Repo: "r", ID: "M-1", Generation: 1, Changed: []string{"a.lean"}})); !res.Pass {
+	if res := must(s.Check(ctx, ledger.CheckRequest{LandRequest: ledger.LandRequest{Repo: "r", Migration: "M-1", Generation: 1, Commit: "candidate", ChangedPaths: []string{"a.lean"}}})); !res.Pass {
 		t.Fatalf("after retry: %+v", res)
 	}
 	_, err = s.Retry(ctx, "r", "M-1")
 	wantRefusal(t, err, ledger.ReasonNotEscalated)
 
 	// A sweep with a lower limit flags every open migration at or over it, once.
-	must(s.RecordRound(ctx, "r", "M-2", 1, "kicked"))
+	must(s.RecordRound(ctx, ledger.RoundRequest{Repo: "r", ID: "M-2", Generation: 1, Reason: "kicked", Key: "m2-round", ReadyEvent: unreadyEvent}))
 	flagged := must(s.Escalate(ctx, "r", "", 1))
 	if len(flagged) != 1 || flagged[0].ID != "M-2" {
 		t.Fatalf("sweep flagged %+v, want M-2", flagged)

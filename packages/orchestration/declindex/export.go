@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -51,8 +52,9 @@ func FindLean(ctx context.Context, dir, prefix string) (Lean, error) {
 }
 
 // env is the whole environment of a toolchain process: the toolchain first on a system PATH, its root
-// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, and HOME and TMPDIR at home. Nothing else of the caller's environment (credentials, tokens) reaches Lean, and a
-// module that a proposal compiles sees only its scratch directory as home.
+// (LEAN_SYSROOT, so that nothing runs `lean` to find it), LEAN_PATH, and HOME and TMPDIR at home. Nothing else of
+// the caller's environment (credentials, tokens) reaches Lean, and a module that a proposal compiles sees only its
+// scratch directory as home.
 func (l Lean) env(searchPath []string, home string) []string {
 	env := []string{
 		"LEAN_SYSROOT=" + l.Prefix,
@@ -71,19 +73,16 @@ func run(ctx context.Context, dir string, env []string, name string, args ...str
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	cmd.Env = env
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, out.String())
+	InGroup(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, out)
 	}
 	return nil
 }
 
-// BuildExporter builds the exporter with toolchain l below cacheDir, once for each version of its sources and
-// each toolchain, and returns the binary. Lake compiles the modules to objects; the binary is linked against the
-// toolchain's shared runtime (libleanshared), which needs no development libraries on the machine. cc is the C
-// compiler that links (LEAN_CC, else the toolchain's own clang, else cc when empty).
-func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, error) {
+// exporterVersion names what BuildExporter builds with toolchain l: a digest of the toolchain's path and of every
+// exporter source file, which it also gives, sorted.
+func exporterVersion(l Lean) (string, []string, error) {
 	h := sha256.New()
 	h.Write([]byte(l.Prefix))
 	var files []string
@@ -94,7 +93,7 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 		return err
 	})
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	sort.Strings(files)
 	for _, f := range files {
@@ -102,7 +101,19 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 		h.Write([]byte(f))
 		h.Write(data)
 	}
-	dir := filepath.Join(cacheDir, "exporter-"+hex.EncodeToString(h.Sum(nil))[:16])
+	return hex.EncodeToString(h.Sum(nil))[:16], files, nil
+}
+
+// BuildExporter builds the exporter with toolchain l below cacheDir, once for each version of its sources and
+// each toolchain (exporterVersion), and returns the binary. Lake compiles the modules to objects; the binary is
+// linked against the toolchain's shared runtime (libleanshared), which needs no development libraries on the
+// machine. cc is the C compiler that links (LEAN_CC, else the toolchain's own clang, else cc when empty).
+func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, error) {
+	version, files, err := exporterVersion(l)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(cacheDir, "exporter-"+version)
 	binPath := filepath.Join(dir, "declexport")
 	if _, err := os.Stat(binPath); err == nil {
 		return binPath, nil
@@ -126,7 +137,10 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 		}
 	}
 	// Lake compiles with its own bundled compiler and flags unless a compiler is configured (a toolchain built from
-	// source has none bundled).
+	// source has none bundled): the configured cc, else the caller's LEAN_CC, which l.env does not pass on.
+	if cc == "" {
+		cc = os.Getenv("LEAN_CC")
+	}
 	env := l.env(nil, os.TempDir())
 	if cc != "" {
 		env = append(env, "LEAN_CC="+cc)
@@ -159,13 +173,11 @@ func BuildExporter(ctx context.Context, l Lean, cc, cacheDir string) (string, er
 	return binPath, nil
 }
 
-// linker is the C compiler that links the exporter.
+// linker is the C compiler that links the exporter: cc (the configured compiler or LEAN_CC), else the toolchain's
+// own clang, else cc on PATH.
 func linker(l Lean, cc string) string {
 	if cc != "" {
 		return cc
-	}
-	if v := os.Getenv("LEAN_CC"); v != "" {
-		return v
 	}
 	if _, err := os.Stat(l.bin("clang")); err == nil {
 		return l.bin("clang")
@@ -182,46 +194,53 @@ func CompileModule(ctx context.Context, l Lean, searchPath []string, root, rel s
 		"-o", base+".olean", "-i", base+".ilean", base+".lean")
 }
 
-// NewScratch makes a fresh scratch directory for one confined run below base (the system's temporary directory
-// when empty): this user's, mode 0700, and empty.
-func NewScratch(base string) (string, error) { return confine.NewScratch(base) }
-
-// confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path,
-// read and its scratch directory, writes only the scratch directory (which must be fresh, and into which the
-// inputs are copied), starts no other process and opens no socket. It fails when the sandbox is unavailable,
-// and then nothing runs.
-func (l Lean) confined(ctx context.Context, argv []string, scratch string, inputs []confine.Input, searchPath, read []string) (*confine.Cmd, error) {
-	reads := append(append([]string{l.Prefix}, searchPath...), read...)
+// confined runs a toolchain program in the sandbox of package confine: it reads the toolchain, the search path
+// and its scratch directory, writes only the scratch directory (which must be fresh, and into which the inputs are
+// copied), starts no other process and opens no socket. It fails when the sandbox is unavailable, and then nothing
+// runs.
+func (l Lean) confined(ctx context.Context, argv []string, scratch string, inputs []confine.Input, searchPath []string) (*confine.Cmd, error) {
+	reads := slices.Concat([]string{l.Prefix}, searchPath)
 	return confine.Command(ctx, confine.Spec{Argv: argv, Env: l.env(searchPath, scratch), Scratch: scratch, Inputs: inputs, Read: reads})
 }
 
+// ErrSourceFailed says that Lean ran on an untrusted source and reported errors in it: the source's failure, not
+// the sandbox's or the toolchain's.
+var ErrSourceFailed = errors.New("the source does not compile")
+
 // CompileConfined compiles source as the module rel in the sandbox, for source that untrusted text wrote. scratch
-// must be fresh (NewScratch): the source is copied into it, and Lean writes its outputs there and nowhere else.
+// must be fresh (confine.NewScratch): the source is copied into it, and Lean writes its outputs there and nowhere
+// else. An error that Lean reports in the source wraps ErrSourceFailed; any other failure (the sandbox, a signal)
+// does not.
 func CompileConfined(ctx context.Context, l Lean, searchPath []string, scratch, rel string, source []byte) error {
 	base := filepath.Join(scratch, filepath.FromSlash(rel))
 	argv := []string{l.bin("lean"), "-R", scratch, "-o", base + ".olean", "-i", base + ".ilean", base + ".lean"}
 	cmd, err := l.confined(ctx, argv, scratch, []confine.Input{{Name: rel + ".lean", Data: source}},
-		append([]string{scratch}, searchPath...), nil)
+		append([]string{scratch}, searchPath...))
 	if err != nil {
 		return err
 	}
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("lean %s: %w\n%s", base+".lean", err, out.String())
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &ee) && ee.ExitCode() == 1 && ctx.Err() == nil:
+		// Lean exits 1 when the file has errors; the launcher's own failures exit 126.
+		return fmt.Errorf("%w: lean %s: %v\n%s", ErrSourceFailed, base+".lean", err, out)
+	default:
+		return fmt.Errorf("lean %s: %w\n%s", base+".lean", err, out)
 	}
-	return nil
 }
 
 // CheckSandbox reports whether toolchain l runs in the sandbox here: the sandbox is available, and a confined
 // `lean --version` runs.
 func CheckSandbox(ctx context.Context, l Lean) error {
-	dir, err := NewScratch("")
+	dir, err := confine.NewScratch("")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	cmd, err := l.confined(ctx, []string{l.bin("lean"), "--version"}, dir, nil, nil, nil)
+	cmd, err := l.confined(ctx, []string{l.bin("lean"), "--version"}, dir, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -239,21 +258,19 @@ var ErrRefusedSource = errors.New("the proposal is not declarations only")
 func (x *Exporter) CheckSource(ctx context.Context, source []byte, searchPath []string, scratch string) error {
 	file := filepath.Join(scratch, "Proposal.lean")
 	cmd, err := x.Lean.confined(ctx, []string{x.Bin, "--check", file}, scratch,
-		[]confine.Input{{Name: "Proposal.lean", Data: source}}, searchPath, nil)
+		[]confine.Input{{Name: "Proposal.lean", Data: source}}, searchPath)
 	if err != nil {
 		return err
 	}
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err = cmd.Run()
+	out, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
 	switch {
 	case err == nil:
 		return nil
 	case errors.As(err, &ee) && ee.ExitCode() == 1:
-		return fmt.Errorf("%w: %s", ErrRefusedSource, strings.TrimSpace(out.String()))
+		return fmt.Errorf("%w: %s", ErrRefusedSource, strings.TrimSpace(string(out)))
 	default:
-		return fmt.Errorf("%w: the source check failed: %v: %s", ErrExporter, err, strings.TrimSpace(out.String()))
+		return fmt.Errorf("%w: the source check failed: %v: %s", ErrExporter, err, strings.TrimSpace(string(out)))
 	}
 }
 
@@ -272,31 +289,30 @@ type Manifest struct {
 	Forms    []ConstRef `json:"forms"`
 	Concepts []ConstRef `json:"concepts"`
 	Types    bool       `json:"types"`
-	// Budget bounds the expression nodes one constant's walk visits; zero is DefaultBudget.
+	// Budget is the node budget of one constant's walk (DefaultBudget).
 	Budget int `json:"budget"`
+	// Home, when set, is the module that the hashes count the constants of Modules as declared in: a proposal,
+	// compiled as a module of its own, is hashed as of the module of its home file, where it lands. Else each
+	// constant counts with the module that declares it.
+	Home string `json:"home"`
 }
 
 // DefaultBudget is the node budget of one constant's walk.
 const DefaultBudget = 3000000
 
+// nonNil gives an empty slice for nil, so that JSON writes [] and not null.
+func nonNil[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
+}
+
 // complete gives every field a JSON value: the exporter reads no null.
 func (m Manifest) complete() Manifest {
-	nonNil := func(s []string) []string {
-		if s == nil {
-			return []string{}
-		}
-		return s
-	}
 	m.Modules, m.Imports, m.Roots = nonNil(m.Modules), nonNil(m.Imports), nonNil(m.Roots)
-	if m.Forms == nil {
-		m.Forms = []ConstRef{}
-	}
-	if m.Concepts == nil {
-		m.Concepts = []ConstRef{}
-	}
-	if m.Budget == 0 {
-		m.Budget = DefaultBudget
-	}
+	m.Forms, m.Concepts = nonNil(m.Forms), nonNil(m.Concepts)
+	m.Budget = DefaultBudget
 	return m
 }
 
@@ -313,7 +329,6 @@ type Constant struct {
 	Kind      string   `json:"k"`
 	Type      string   `json:"t"`
 	Hash      string   `json:"h"`
-	ValueHash string   `json:"vh"`
 	Atoms     []string `json:"a"`
 	Facts     []Fact   `json:"f"`
 	Truncated bool     `json:"tr"`
@@ -323,6 +338,9 @@ type Constant struct {
 type Exporter struct {
 	Lean Lean
 	Bin  string
+	// Version names what Bin was built from: the exporter's sources and the toolchain (BuildExporter). The compiled
+	// part's digest covers it, and not Bin's path, which differs between the paths that name one index.
+	Version string
 	// SearchPath is LEAN_PATH: the project's library directory, its dependencies', and any extra directory
 	// (forms, proposals).
 	SearchPath []string
@@ -331,7 +349,8 @@ type Exporter struct {
 	// ModulesPerProcess bounds one process's target modules; zero is all of a shard.
 	ModulesPerProcess int
 	Log               io.Writer
-	// Confined runs the exporter in the sandbox, for modules that untrusted source wrote.
+	// Confined runs the exporter in the sandbox, for modules that untrusted source wrote; CompiledOptions then
+	// compiles the forms module in the sandbox too. It is the one switch of a confined export.
 	Confined bool
 	// ScratchDir holds each run's fresh scratch directory; empty is the system's temporary directory.
 	ScratchDir string
@@ -342,40 +361,48 @@ var ErrExporter = errors.New("exporter failed")
 
 // Run exports the manifest's modules, in parallel processes of at most ModulesPerProcess modules each.
 func (x *Exporter) Run(ctx context.Context, m Manifest) ([]Constant, error) {
-	if len(m.Modules) == 0 {
+	return x.RunEach(ctx, []Manifest{m})
+}
+
+// RunEach exports the modules of each manifest, in parallel processes of at most ModulesPerProcess modules each; a
+// process reads the modules of one manifest, which one Lean environment can import together.
+func (x *Exporter) RunEach(ctx context.Context, ms []Manifest) ([]Constant, error) {
+	total := 0
+	for _, m := range ms {
+		total += len(m.Modules)
+	}
+	if total == 0 {
 		return nil, nil
 	}
 	per := x.ModulesPerProcess
 	if per <= 0 {
-		per = (len(m.Modules) + max(1, x.Jobs) - 1) / max(1, x.Jobs)
+		per = (total + max(1, x.Jobs) - 1) / max(1, x.Jobs)
 	}
-	var chunks [][]string
-	for i := 0; i < len(m.Modules); i += per {
-		chunks = append(chunks, m.Modules[i:min(i+per, len(m.Modules))])
+	var runs []Manifest
+	for _, m := range ms {
+		for chunk := range slices.Chunk(m.Modules, per) {
+			mm := m
+			mm.Modules = chunk
+			runs = append(runs, mm)
+		}
 	}
-	results := make([][]Constant, len(chunks))
-	errs := make([]error, len(chunks))
+	results := make([][]Constant, len(runs))
+	errs := make([]error, len(runs))
 	var mu sync.Mutex
 	done := 0
-	parallel(len(chunks), max(1, x.Jobs), func(i int) {
-		mm := m
-		mm.Modules = chunks[i]
-		results[i], errs[i] = x.runOne(ctx, mm)
+	parallel(len(runs), max(1, x.Jobs), func(i int) {
+		results[i], errs[i] = x.runOne(ctx, runs[i])
 		mu.Lock()
 		done++
-		if errs[i] == nil && (done%10 == 0 || done == len(chunks)) {
-			logf(x.Log, "exporter: %d of %d module groups done", done, len(chunks))
+		if errs[i] == nil && (done%10 == 0 || done == len(runs)) {
+			logf(x.Log, "exporter: %d of %d module groups done", done, len(runs))
 		}
 		mu.Unlock()
 	})
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-	var out []Constant
-	for _, r := range results {
-		out = append(out, r...)
-	}
-	return out, nil
+	return slices.Concat(results...), nil
 }
 
 // started is a program the exporter reads: exec.Cmd, or confine.Cmd, whose Start also lets its one exec through.
@@ -390,7 +417,7 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 	if err != nil {
 		return nil, err
 	}
-	tmp, err := NewScratch(x.ScratchDir)
+	tmp, err := confine.NewScratch(x.ScratchDir)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +427,7 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 	var cmd started
 	if x.Confined {
 		c, err := x.Lean.confined(ctx, []string{x.Bin, path}, tmp, []confine.Input{{Name: "manifest.json", Data: manifest}},
-			x.SearchPath, nil)
+			x.SearchPath)
 		if err != nil {
 			return nil, err
 		}
@@ -412,6 +439,7 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 		}
 		c := exec.CommandContext(ctx, x.Bin, path)
 		c.Env = x.Lean.env(x.SearchPath, tmp)
+		InGroup(c)
 		c.Stderr = &stderr
 		cmd = c
 	}
@@ -437,14 +465,29 @@ func (x *Exporter) runOne(ctx context.Context, m Manifest) ([]Constant, error) {
 		parseErr = err
 	}
 	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("%w on %d modules (first %s): %v: %s", ErrExporter, len(m.Modules), m.Modules[0], err,
+		first := ""
+		if names := slices.Concat(m.Modules, m.Imports); len(names) > 0 {
+			first = names[0]
+		}
+		return nil, fmt.Errorf("%w on %d modules (first %s): %v: %s", ErrExporter, len(m.Modules), first, err,
 			strings.TrimSpace(stderr.String()))
 	}
 	if parseErr != nil {
 		return nil, parseErr
 	}
-	if out == nil {
-		out = []Constant{}
-	}
 	return out, nil
+}
+
+// loadsTogether reports whether one Lean environment imports modules, with roots as the project's roots: false when
+// Lean refuses it because two of them declare a name and neither declaration subsumes the other (Environment.lean,
+// subsumesInfo). The exporter imports them and reads nothing.
+func (x *Exporter) loadsTogether(ctx context.Context, roots, modules []string) (bool, error) {
+	_, err := x.runOne(ctx, Manifest{Imports: modules, Roots: roots})
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, ErrExporter) && strings.Contains(err.Error(), "environment already contains"):
+		return false, nil
+	}
+	return false, err
 }

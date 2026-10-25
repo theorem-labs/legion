@@ -57,7 +57,7 @@ func TestExpiredLeaseIsRegrantedAndOldHolderIsRefusedByGeneration(t *testing.T) 
 	ctx := context.Background()
 	observer := must(pgx.Connect(ctx, dsn))
 	defer observer.Close(ctx)
-	old := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
+	old := must(s.Claim(ctx, "r", "item", "alice", heldLease))
 	_, err := s.Claim(ctx, "r", "item", "bob", time.Minute)
 	wantRefusal(t, err, ledger.ReasonLeaseHeld)
 	waitForDatabaseExpiry(t, observer, old.ExpiresAt)
@@ -89,23 +89,26 @@ func TestExpiredLeaseIsRegrantedAndOldHolderIsRefusedByGeneration(t *testing.T) 
 	wantRefusal(t, err, ledger.ReasonDone)
 }
 
+// TestRenewMovesAndPersistsExpiryByRequestedLength renews a lease before it ends and checks that the end moves by the
+// requested length and is stored: after the first end passes, the holder still holds the item and completes it. The
+// lengths leave seconds of slack, so a loaded machine cannot let the lease end before the renew or the completion.
 func TestRenewMovesAndPersistsExpiryByRequestedLength(t *testing.T) {
 	s, dsn := newStoreDSN(t)
 	ctx := context.Background()
 	observer := must(pgx.Connect(ctx, dsn))
 	defer observer.Close(ctx)
-	l := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
-	ttl := 300 * time.Millisecond
+	l := must(s.Claim(ctx, "r", "item", "alice", heldLease))
+	ttl := 10 * time.Second
 	r := must(s.Renew(ctx, "r", "item", "alice", l.Generation, ttl))
 	if r.Generation != l.Generation {
 		t.Fatalf("renew changed the generation: %d -> %d", l.Generation, r.Generation)
 	}
-	if got := r.ExpiresAt.Sub(l.ExpiresAt); got != ttl {
+	if got := r.ExpiresAt.Sub(*l.ExpiresAt); got != ttl {
 		t.Fatalf("renew moved expiry by %s, want %s", got, ttl)
 	}
 	waitForDatabaseExpiry(t, observer, l.ExpiresAt)
 	item := must(s.Item(ctx, "r", "item"))
-	if item.Holder != "alice" || item.ExpiresAt == nil || !item.ExpiresAt.Equal(r.ExpiresAt) {
+	if item.Holder != "alice" || item.ExpiresAt == nil || !item.ExpiresAt.Equal(*r.ExpiresAt) {
 		t.Fatalf("renewed expiry was not persisted: %+v; want %s", item, r.ExpiresAt)
 	}
 	if err := s.Complete(ctx, "r", "item", "alice", l.Generation, "ok"); err != nil {
@@ -294,7 +297,7 @@ func TestExpireLocksThenRechecksLeaseLiveness(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s, dsn := newStoreDSN(t)
 			ctx := context.Background()
-			lease := must(s.Claim(ctx, "r", "item", "alice", 20*time.Millisecond))
+			lease := must(s.Claim(ctx, "r", "item", "alice", heldLease))
 			locker := must(pgx.Connect(ctx, dsn))
 			defer locker.Close(ctx)
 			observer := must(pgx.Connect(ctx, dsn))
@@ -313,9 +316,11 @@ func TestExpireLocksThenRechecksLeaseLiveness(t *testing.T) {
 	}
 }
 
-func TestClaimRejectsNonPositiveOrSubMicrosecondTTL(t *testing.T) {
+// A lease length of zero is a supervised lease (TestSupervisedLeaseNeverExpires); a negative length,
+// or one that rounds to no microsecond, is invalid.
+func TestClaimRejectsNegativeOrSubMicrosecondTTL(t *testing.T) {
 	s := newStore(t)
-	for _, ttl := range []time.Duration{0, 500 * time.Nanosecond, -time.Second} {
+	for _, ttl := range []time.Duration{500 * time.Nanosecond, -time.Second} {
 		_, err := s.Claim(context.Background(), "r", "item", "alice", ttl)
 		var inv *ledger.InvalidError
 		if !errors.As(err, &inv) {
@@ -365,7 +370,7 @@ func TestLeaseLivenessIsEvaluatedAfterTheItemRowLock(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			s, dsn := newStoreDSN(t)
 			ctx := context.Background()
-			lease := must(s.Claim(ctx, "r", "item", "alice", 100*time.Millisecond))
+			lease := must(s.Claim(ctx, "r", "item", "alice", heldLease))
 			locker := must(pgx.Connect(ctx, dsn))
 			defer locker.Close(ctx)
 			observer := must(pgx.Connect(ctx, dsn))
@@ -396,8 +401,17 @@ func TestLeaseLivenessIsEvaluatedAfterTheItemRowLock(t *testing.T) {
 	}
 }
 
-func waitForDatabaseExpiry(t *testing.T, conn *pgx.Conn, expiresAt time.Time) {
+// heldLease is the length of a lease that a test needs live for several steps (another claim, a blocked operation)
+// before it waits for the lease's end with waitForDatabaseExpiry. Seconds of slack keep a heavily loaded machine from
+// ending the lease before those steps run.
+const heldLease = 2 * time.Second
+
+// waitForDatabaseExpiry waits until the database clock passes a fixed lease end; a lease with no end fails the test.
+func waitForDatabaseExpiry(t *testing.T, conn *pgx.Conn, expiresAt *time.Time) {
 	t.Helper()
+	if expiresAt == nil {
+		t.Fatal("waiting for the end of a lease that has none")
+	}
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)

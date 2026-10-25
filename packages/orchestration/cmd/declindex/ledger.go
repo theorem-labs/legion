@@ -2,34 +2,112 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-
+	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/declindex"
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
-// cmdLedger runs after a landing: it registers new contracts in the ledger and reports every contract whose
-// ledger hash is not the index's. Exit code 1 when it finds a defect.
+// registerOperation is one registration that `ledger --emit` writes for the landing program to apply.
+type registerOperation struct {
+	Op            string `json:"op"`
+	Name          string `json:"name"`
+	Owner         string `json:"owner"`
+	StatementHash string `json:"statement_hash"`
+	VersionRead   int64  `json:"version_read"`
+}
+
+// librarianOperation is one near pair that `ledger --emit` writes for the landing program to deliver to the
+// librarian: the envelope is the exact text that the librarian command would read from its --proposal file.
+type librarianOperation struct {
+	Op       string `json:"op"`
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Proposer string `json:"proposer"`
+	Envelope string `json:"envelope"`
+}
+
+// emitter is the landing hook's ledger and librarian (`ledger --emit`): the hook has no network, so it keeps each
+// registration and each review request as an operation for the landing program to apply or deliver, in the order
+// the command makes them: the ledger check's registrations, then the recheck's near pairs.
+type emitter struct {
+	contracts  []ledger.Contract
+	operations []any
+}
+
+func (m *emitter) Contracts(context.Context, string) ([]ledger.Contract, error) {
+	return m.contracts, nil
+}
+
+func (m *emitter) RegisterContract(_ context.Context, _ string, name, owner, hash string, _ bool) (ledger.Contract, error) {
+	m.operations = append(m.operations, registerOperation{
+		Op: "register", Name: name, Owner: owner, StatementHash: hash,
+	})
+	return ledger.Contract{Name: name, Owner: owner, StatementHash: hash, Version: 1}, nil
+}
+
+func (m *emitter) Review(_ context.Context, r conceptgate.ReviewRequest) error {
+	envelope, err := conceptgate.Envelope(r)
+	if err != nil {
+		return err
+	}
+	m.operations = append(m.operations, librarianOperation{Op: "librarian", ID: r.ID, Kind: r.Kind, Proposer: r.Proposer, Envelope: envelope})
+	return nil
+}
+
+type ledgerCommandReport struct {
+	Commit    string                     `json:"commit"`
+	Contracts declindex.LedgerReport     `json:"contracts"`
+	Registry  *conceptgate.LandingReport `json:"registry"`
+}
+
+// cmdLedger runs after a landing. With a contracts file, it emits the registrations that the landing program
+// applies in its LAND_COMMIT transaction, and the near pairs for it to deliver to the librarian; a DSN is reserved
+// for an operator's manual check, which registers and calls the librarian itself.
 func cmdLedger(ctx context.Context, e *env, args []string) int {
-	dsn := e.getenv("LEDGER_DSN")
+	var dsnFile, contractsFile, emit string
 	for i := 0; i < len(args); i++ {
-		if args[i] != "--dsn-file" || i+1 >= len(args) {
-			return fail(e.stderr, &usageError{"ledger takes only --dsn-file PATH"})
+		if i+1 >= len(args) {
+			return fail(e.stderr, &usageError{"ledger options need a path"})
 		}
-		raw, err := os.ReadFile(args[i+1])
+		switch args[i] {
+		case "--dsn-file":
+			dsnFile = args[i+1]
+		case "--contracts-file":
+			contractsFile = args[i+1]
+		case "--emit":
+			emit = args[i+1]
+		default:
+			return fail(e.stderr, &usageError{"ledger takes only --dsn-file, --contracts-file and --emit"})
+		}
+		i++
+	}
+	if (contractsFile == "") != (emit == "") {
+		return fail(e.stderr, &usageError{"--contracts-file and --emit must be used together"})
+	}
+	if dsnFile != "" && contractsFile != "" {
+		return fail(e.stderr, &usageError{"--dsn-file is the operator's ledger check; --contracts-file and --emit are the landing hook's: use one"})
+	}
+	dsn := e.getenv("LEDGER_DSN")
+	if dsnFile != "" {
+		raw, err := os.ReadFile(dsnFile)
 		if err != nil {
 			return fail(e.stderr, &unableError{err})
 		}
 		dsn = strings.TrimSpace(string(raw))
-		i++
 	}
-	if dsn == "" {
-		return fail(e.stderr, &usageError{"LEDGER_DSN or --dsn-file is required"})
+	if contractsFile == "" && dsn == "" {
+		return fail(e.stderr, &usageError{"LEDGER_DSN or --dsn-file is required for an operator ledger check"})
+	}
+	landed := e.getenv("LAND_COMMIT")
+	if landed != "" && !declindex.IsObjectID(landed) {
+		return fail(e.stderr, &usageError{"LAND_COMMIT must be 40 lowercase hexadecimal characters"})
 	}
 	if e.cfg.Repo == "" {
 		return fail(e.stderr, &usageError{"the configuration names no repo"})
@@ -41,21 +119,44 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 			return fail(e.stderr, &unableError{err})
 		}
 	}
-	if err := e.open(true); err != nil {
+	// The landing hook mounts the index directory read-only. The ledger also reads the tree: its HEAD, its
+	// registry's commits and, for the recheck, its build.
+	if err := e.openReadOnly(ctx, declindex.IndexAndTree, true); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
-	if c := e.staleNote(ctx); c != treeHead(e.cfg.Tree) {
-		return fail(e.stderr, &unableError{fmt.Errorf("the index is at %q, not the tree's commit: refresh it after the landing first", c)})
-	}
-	if err := requireLedger(ctx, dsn, e.cfg.Repo); err != nil {
-		return fail(e.stderr, &unableError{err})
-	}
-	l, err := ledger.Open(ctx, dsn)
+	commit, err := e.store.CommitAtHead(ctx, e.cfg.Tree, landed)
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}
-	defer l.Close()
+
+	var l declindex.ContractLedger
+	// The recheck's librarian: in emit mode the landing program delivers each request; else (nil) the configured
+	// command receives it.
+	var librarian conceptgate.Librarian
+	var emitted *emitter
+	if contractsFile != "" {
+		raw, err := os.ReadFile(contractsFile)
+		if err != nil {
+			return fail(e.stderr, &unableError{err})
+		}
+		var contracts []ledger.Contract
+		if err := json.Unmarshal(raw, &contracts); err != nil || contracts == nil {
+			if err == nil {
+				err = errors.New("the contracts file must contain a JSON array")
+			}
+			return fail(e.stderr, &unableError{fmt.Errorf("read contracts file: %w", err)})
+		}
+		emitted = &emitter{contracts: contracts}
+		l, librarian = emitted, emitted
+	} else {
+		existing, err := ledger.OpenExisting(ctx, dsn)
+		if err != nil {
+			return fail(e.stderr, &unableError{temporaryLedgerError(err)})
+		}
+		defer existing.Close()
+		l = existing
+	}
 	r, err := e.store.CheckLedger(ctx, l, e.cfg.Repo, e.cfg.Contracts, owners)
 	if err != nil {
 		var refusal *ledger.Refusal
@@ -64,37 +165,53 @@ func cmdLedger(ctx context.Context, e *env, args []string) int {
 		}
 		return fail(e.stderr, &unableError{err})
 	}
-	if c := e.printJSON(r); c != 0 {
+	registry := conceptgate.RecheckLanding(ctx, e.cfg, e.store, commit, landed, conceptgate.Options{Librarian: librarian, Log: e.stderr})
+	if emitted != nil {
+		if err := writeLedgerOperations(emit, emitted.operations); err != nil {
+			return fail(e.stderr, &unableError{err})
+		}
+	}
+	if c := e.printJSON(ledgerCommandReport{Commit: r.Commit, Contracts: r, Registry: registry}); c != 0 {
 		return c
 	}
-	if len(r.Defects) > 0 {
+	if registry != nil && registry.Unable != "" {
+		fmt.Fprintf(e.stderr, "declindex: registry recheck unavailable: %s\n", registry.Unable)
+	}
+	added, near, defects := 0, 0, 0
+	if registry != nil {
+		added, near, defects = len(registry.Added), len(registry.Near), len(registry.Defects)
+	}
+	fmt.Fprintf(e.stderr, "declindex ledger at %s: %d contracts, %d registered, %d defects, %d gone, %d unowned, %d ambiguous; registry: %d added, %d near, %d defects\n",
+		r.Commit, r.Contracts, len(r.Registered), len(r.Defects), len(r.Gone), len(r.Unowned), len(r.Ambiguous), added, near, defects)
+	switch {
+	case registry != nil && registry.Unable != "":
+		// The landing program runs this landing's check again until its recheck runs (or an operator skips it).
+		return 75
+	case r.Defective() || registry != nil && registry.Defective():
 		return 1
 	}
 	return 0
 }
 
-// requireLedger checks, reading only, that the database holds the ledger's schema and the repository. The check
-// writes to an existing ledger; it never creates one (ledger.Open would apply the schema to an empty database).
-func requireLedger(ctx context.Context, dsn, repo string) error {
-	conn, err := pgx.Connect(ctx, dsn)
+func temporaryLedgerError(err error) error {
+	var networkErr net.Error
+	if errors.As(err, &networkErr) || errors.Is(err, context.DeadlineExceeded) {
+		return &declindex.TempError{Err: err}
+	}
+	return err
+}
+
+func writeLedgerOperations(path string, operations []any) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("connect to the ledger: %w", err)
-	}
-	defer conn.Close(ctx)
-	var schema bool
-	if err := conn.QueryRow(ctx, `SELECT to_regclass('schema_versions') IS NOT NULL AND to_regclass('contracts') IS NOT NULL
-		AND to_regclass('repositories') IS NOT NULL`).Scan(&schema); err != nil {
 		return err
 	}
-	if !schema {
-		return fmt.Errorf("the database has no ledger schema; the ledger check does not create one")
+	enc := json.NewEncoder(f)
+	for _, operation := range operations {
+		if err := enc.Encode(operation); err != nil {
+			_ = f.Close()
+			return err
+		}
 	}
-	var known bool
-	if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM repositories WHERE name = $1)`, repo).Scan(&known); err != nil {
-		return err
-	}
-	if !known {
-		return fmt.Errorf("the ledger has no repository %s", repo)
-	}
-	return nil
+	return f.Close()
 }

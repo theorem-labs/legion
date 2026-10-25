@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -34,14 +35,16 @@ func (s *Store) EnsureRepo(ctx context.Context, name string, maxLandingRounds in
 	return r, err
 }
 
+// checkLeaseArgs accepts a ttl of zero, a supervised lease with no end, or a fixed end of at least a
+// microsecond.
 func checkLeaseArgs(id, holder string, ttl time.Duration) error {
 	switch {
 	case id == "":
 		return invalid("empty item id")
 	case holder == "":
 		return invalid("empty holder")
-	case ttl <= 0 || ttl.Microseconds() == 0:
-		return invalid("lease length %v must be at least one microsecond", ttl)
+	case ttl < 0 || (ttl > 0 && ttl.Microseconds() == 0):
+		return invalid("lease length %v must be zero (supervised) or at least one microsecond", ttl)
 	}
 	return nil
 }
@@ -74,12 +77,14 @@ func lockItem(ctx context.Context, tx pgx.Tx, repo, id string) (itemRow, error) 
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		return r, err
 	}
-	r.live = r.holder != nil && r.expiresAt != nil && r.expiresAt.After(now)
+	r.live = r.holder != nil && (r.expiresAt == nil || r.expiresAt.After(now))
 	return r, nil
 }
 
 // Claim grants a lease on an item, creating the item if it is new. The generation rises by one on every grant.
 // It is refused while another lease is live, including one held by the same holder (renew that instead).
+// A ttl of zero grants a supervised lease: it has no end, and only Release, Complete or ReleaseHolder
+// frees it.
 func (s *Store) Claim(ctx context.Context, repo, id, holder string, ttl time.Duration) (Lease, error) {
 	if err := checkLeaseArgs(id, holder, ttl); err != nil {
 		return Lease{}, err
@@ -100,23 +105,36 @@ func (s *Store) Claim(ctx context.Context, repo, id, holder string, ttl time.Dur
 			return refuse(ReasonDone, "item %s is done", id)
 		}
 		if it.live {
-			return refuse(ReasonLeaseHeld, "item %s is held by %s (generation %d) until %s",
-				id, *it.holder, it.generation, it.expiresAt.UTC().Format(time.RFC3339))
+			return refuse(ReasonLeaseHeld, "item %s is held by %s (generation %d) %s",
+				id, *it.holder, it.generation, leaseEnd(it.expiresAt))
 		}
 		if err := tx.QueryRow(ctx, `UPDATE work_items SET holder = $3, generation = generation + 1,
-				lease_granted_at = clock_timestamp(), lease_expires_at = clock_timestamp() + $4 * interval '1 microsecond',
+				lease_granted_at = clock_timestamp(),
+				lease_expires_at = CASE WHEN $4::bigint = 0 THEN NULL ELSE clock_timestamp() + $4::bigint * interval '1 microsecond' END,
 				updated_at = clock_timestamp()
 			WHERE repo = $1 AND id = $2 RETURNING generation, lease_expires_at`,
 			repo, id, holder, ttl.Microseconds()).Scan(&l.Generation, &l.ExpiresAt); err != nil {
 			return err
 		}
-		data := map[string]any{"generation": l.Generation, "expires_at": l.ExpiresAt}
+		data := map[string]any{"generation": l.Generation, "supervised": l.ExpiresAt == nil}
+		if l.ExpiresAt != nil {
+			data["expires_at"] = l.ExpiresAt
+		}
 		if it.holder != nil {
 			data["expired_holder"] = *it.holder
 		}
 		return event(ctx, tx, repo, "item.claimed", id, holder, data)
 	})
 	return l, err
+}
+
+// leaseEnd describes when a lease ends: at its fixed end, or, for a supervised lease, when its
+// holder is found stopped.
+func leaseEnd(expiresAt *time.Time) string {
+	if expiresAt == nil {
+		return "until its supervisor finds it stopped"
+	}
+	return "until " + expiresAt.UTC().Format(time.RFC3339)
 }
 
 // checkHolder refuses a call whose generation or holder is not the item's current one.
@@ -136,10 +154,14 @@ func checkHolder(it itemRow, id, holder string, gen int64) error {
 	return nil
 }
 
-// Renew extends a live lease. It is refused for a stale generation, another holder, or a lease that has ended.
+// Renew extends a live lease. It is refused for a stale generation, another holder, a lease that has
+// ended, or a supervised lease, which has no end to extend.
 func (s *Store) Renew(ctx context.Context, repo, id, holder string, gen int64, ttl time.Duration) (Lease, error) {
 	if err := checkLeaseArgs(id, holder, ttl); err != nil {
 		return Lease{}, err
+	}
+	if ttl == 0 {
+		return Lease{}, invalid("a renewal needs a lease length of at least one microsecond")
 	}
 	l := Lease{ID: id, Holder: holder, Generation: gen}
 	err := s.tx(ctx, func(tx pgx.Tx) error {
@@ -149,6 +171,9 @@ func (s *Store) Renew(ctx context.Context, repo, id, holder string, gen int64, t
 		}
 		if err := checkHolder(it, id, holder, gen); err != nil {
 			return err
+		}
+		if it.expiresAt == nil {
+			return refuse(ReasonSupervisedLease, "the lease on item %s is supervised: it has no end to renew", id)
 		}
 		if !it.live {
 			return refuse(ReasonLeaseExpired, "the lease on item %s ended at %s", id, it.expiresAt.UTC().Format(time.RFC3339))
@@ -195,7 +220,7 @@ func (s *Store) Complete(ctx context.Context, repo, id, holder string, gen int64
 			return err
 		}
 		if !it.live {
-			return refuse(ReasonLeaseExpired, "the lease on item %s ended at %s", id, it.expiresAt.UTC().Format(time.RFC3339))
+			return refuse(ReasonLeaseExpired, "the lease on item %s %s", id, leaseEnd(it.expiresAt))
 		}
 		if _, err := tx.Exec(ctx, `UPDATE work_items SET state = 'done', result = $3, holder = NULL, lease_expires_at = NULL,
 				updated_at = clock_timestamp()
@@ -206,11 +231,12 @@ func (s *Store) Complete(ctx context.Context, repo, id, holder string, gen int64
 	})
 }
 
-// Expire frees every item whose lease has ended and returns them as they were (holder and generation).
+// Expire frees every item whose lease has ended and returns them as they were (holder and generation), or an empty
+// list when none has.
 func (s *Store) Expire(ctx context.Context, repo string) ([]Item, error) {
 	var out []Item
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		out = nil
+		out = []Item{}
 		if _, err := lockRepo(ctx, tx, repo, false); err != nil {
 			return err
 		}
@@ -261,13 +287,56 @@ func (s *Store) Expire(ctx context.Context, repo string) ([]Item, error) {
 	return out, err
 }
 
+// ReleaseHolder frees, in one transaction, every lease holder has in the repository, at its current
+// generation: the supervisor that watched holder found it stopped. Each freed item gets one
+// item.holder_stopped event and is returned as it was. A later result or renewal at that
+// generation is refused, and the item is claimed again at the next generation.
+func (s *Store) ReleaseHolder(ctx context.Context, repo, holder, reason string) ([]Item, error) {
+	if strings.TrimSpace(holder) == "" {
+		return nil, invalid("empty holder")
+	}
+	var out []Item
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		out = []Item{}
+		if _, err := lockRepo(ctx, tx, repo, true); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT id, owner, state, holder, generation, lease_expires_at
+			FROM work_items WHERE repo = $1 AND holder = $2 ORDER BY id FOR UPDATE`, repo, holder)
+		if err != nil {
+			return err
+		}
+		freed, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Item, error) {
+			var it Item
+			err := r.Scan(&it.ID, &it.Owner, &it.State, &it.Holder, &it.Generation, &it.ExpiresAt)
+			return it, err
+		})
+		if err != nil {
+			return err
+		}
+		for _, it := range freed {
+			if _, err := tx.Exec(ctx, `UPDATE work_items SET holder = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
+				WHERE repo = $1 AND id = $2`, repo, it.ID); err != nil {
+				return err
+			}
+			if err := event(ctx, tx, repo, "item.holder_stopped", it.ID, holder,
+				map[string]any{"generation": it.Generation, "reason": reason}); err != nil {
+				return err
+			}
+		}
+		out = freed
+		return nil
+	})
+	return out, err
+}
+
 // Item reads one work item.
 func (s *Store) Item(ctx context.Context, repo, id string) (Item, error) {
 	var it Item
 	var holder, result *string
-	err := s.pool.QueryRow(ctx, `SELECT id, state, holder, generation, lease_expires_at, result
+	err := s.pool.QueryRow(ctx, `SELECT id, owner, state, holder, generation, lease_expires_at, result
 		FROM work_items WHERE repo = $1 AND id = $2`, repo, id).
-		Scan(&it.ID, &it.State, &holder, &it.Generation, &it.ExpiresAt, &result)
+		Scan(&it.ID, &it.Owner, &it.State, &holder, &it.Generation, &it.ExpiresAt, &result)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return it, &NotFoundError{What: "item", ID: id}
 	}
@@ -280,14 +349,15 @@ func (s *Store) Item(ctx context.Context, repo, id string) (Item, error) {
 	return it, err
 }
 
-// heldItems lists items with a holder: live leases, or (stale) leases that ended but were not yet expired.
+// heldItems lists items with a holder: live leases (supervised ones, which have no end, among
+// them), or (stale) fixed-end leases that ended but were not yet expired.
 func heldItems(ctx context.Context, q querier, repo string, stale bool, now time.Time) ([]Item, error) {
-	op := ">"
+	condition := "(lease_expires_at IS NULL OR lease_expires_at > $2)"
 	if stale {
-		op = "<="
+		condition = "lease_expires_at <= $2"
 	}
 	rows, err := q.Query(ctx, `SELECT id, state, holder, generation, lease_expires_at FROM work_items
-		WHERE repo = $1 AND holder IS NOT NULL AND lease_expires_at `+op+` $2 ORDER BY lease_expires_at, id`, repo, now)
+		WHERE repo = $1 AND holder IS NOT NULL AND `+condition+` ORDER BY lease_expires_at NULLS LAST, id`, repo, now)
 	if err != nil {
 		return nil, err
 	}

@@ -4,9 +4,10 @@ open Lean Meta DeclExport
 
 /-! `declexport MANIFEST.json`: load compiled modules (no elaboration, no build) and print one JSON line for each
 constant of the target modules: its name `n`, module `m`, kind `k`, printed type `t`, compiled statement hash `h`,
-value hash `vh` (definitions), relation atom hashes `a`, the registered facts it states `f`, and `tr` when the walk
-hit its node budget. The manifest names the target modules, extra modules to import, the project's roots, the
-forms (`{concept, const}`: a constant whose value is a form lambda) and the concepts' own declarations. -/
+relation atom hashes `a`, the registered facts it states `f`, and `tr` when the walk hit its node budget. The
+manifest names the target modules, extra modules to import, the project's roots, the forms (`{concept, const}`: a
+constant whose value is a form lambda), the concepts' own declarations, and the module that the hashes count the
+target modules' constants as declared in (`home`). -/
 
 structure ConstRef where
   concept : String
@@ -21,6 +22,9 @@ structure Manifest where
   concepts : Array ConstRef := #[]
   types : Bool := true
   budget : Nat := 3000000
+  /-- When not empty, the module that the hashes count the constants of the target modules as declared in: a
+  proposal, compiled as a module of its own, is hashed as of the module of its home file, where it lands. -/
+  home : String := ""
   deriving FromJson
 
 /-- A dotted name as Lean prints it: a component in `«…»` may hold dots and other characters. -/
@@ -44,7 +48,7 @@ def kindOf : ConstantInfo → String
 /-- Constants the exporter skips: compiler and elaborator auxiliaries, not statements anyone wrote. -/
 def auxiliary (env : Environment) (c : Name) (ci : ConstantInfo) : Bool :=
   ((privateToUserName? c).getD c).isInternal || isAuxRecursor env c || isNoConfusion env c ||
-    ci matches .recInfo _ || Meta.isMatcherCore env c
+    ci matches .recInfo _ || isMatcher env c
 
 def statementExprs (env : Environment) (ci : ConstantInfo) : List Expr :=
   match ci with
@@ -68,10 +72,58 @@ partial def binderNames : Expr → List String
   | .forallE n _ b _ => n.toString :: binderNames b
   | _ => []
 
-def record (cfg : MatchConfig) (types : Bool) (m : Name) (c : Name) (ci : ConstantInfo) : StateRefT St MetaM Json := do
+mutual
+/-- Records in `ids` the identity that a reference to each constant of `e` counts in the hashes (`identify`), and,
+for an auxiliary definition that the hash reads by content, of the constants of the parts it reads (`auxParts`: an
+abstracted proof's type, a matcher's type and value). -/
+partial def identifyIn (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Name) (e : Expr) : MetaM Unit := do
+  let env ← getEnv
+  for c in e.getUsedConstants do
+    if (← ids.get).contains c then continue
+    match env.find? c with
+    | some ci =>
+      if isElabAux env c ci then
+        ids.modify (·.insert c (base c))
+        for x in auxParts ci do identifyIn ids base x
+      else identify ids base c ci
+    | none => ids.modify (·.insert c (base c))
+
+/-- The identity of a reference to `n` in the hashes. Lean imports two public theorems of one name and type, or a
+theorem and an axiom, or two axioms whose type is a proposition, from two modules as one constant, and keeps the
+module that loaded first (Environment.lean, subsumesInfo): which one depends on which other modules the exporter
+imports with it. So a reference to a public theorem, or to an axiom whose type is a proposition, counts by the hash
+of its type, and any other constant, which Lean never merges, by the module that declares it (`base`). -/
+partial def identify (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Name) (n : Name) (ci : ConstantInfo) :
+    MetaM Unit := do
+  ids.modify (·.insert n (base n))
+  let merged ← match ci with
+    | .thmInfo _ => pure !isPrivateName n
+    | .axiomInfo _ => if isPrivateName n then pure false else (try Meta.isProp ci.type catch _ => pure false)
+    | _ => pure false
+  if !merged then return
+  identifyIn ids base ci.type
+  let tbl ← ids.get
+  let h := hashOf { levels := ci.levelParams, env? := some (← getEnv), moduleOf := fun c => tbl.getD c (base c) }
+    [ci.type]
+  ids.modify (·.insert n (Name.mkSimple s!"type:{h.hex}"))
+end
+
+/-- One JSON line for the constant `c` of the target module `m`. `ids` holds the identities that the hashes count
+references by (`identify`), `base` the module of a constant that Lean does not merge. -/
+def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Name) (types : Bool) (m : Name)
+    (c : Name) (ci : ConstantInfo) : StateRefT St MetaM Json := do
   let env ← getEnv
   let exprs := statementExprs env ci
-  let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci, env? := some env }
+  let mut w : Walk := {}
+  for e in exprs do
+    w ← walk cfg e w
+  -- The constants that the hashes read: those of the statement (a definition's value included) and of its atoms;
+  -- never a theorem's proof.
+  for e in exprs ++ w.atoms.toList do
+    identifyIn ids base e
+  let tbl ← ids.get
+  let moduleOf : Name → Name := fun c => tbl.getD c (base c)
+  let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci, env? := some env, moduleOf := moduleOf }
   let fields : List String := match ci with
     | .inductInfo v => v.ctors.flatMap fun k =>
         match env.find? k with
@@ -79,13 +131,10 @@ def record (cfg : MatchConfig) (types : Bool) (m : Name) (c : Name) (ci : Consta
         | none => []
     | _ => []
   let h := fields.foldl (fun h n => H.mix h (H.ofString n)) (hashOf hctx exprs)
-  let mut w : Walk := {}
-  for e in exprs do
-    w ← walk cfg e w
   let fs := facts cfg w
   let mut atoms : Array String := #[]
   for a in w.atoms do
-    let s := (atomHash a).hex
+    let s := (atomHash env moduleOf a).hex
     if !atoms.contains s then atoms := atoms.push s
   let ty ← if types then
       try pure (truncate (toString (← ppExpr ci.type)))
@@ -95,8 +144,6 @@ def record (cfg : MatchConfig) (types : Bool) (m : Name) (c : Name) (ci : Consta
     ("n", toJson c.toString), ("m", toJson m.toString), ("k", toJson (kindOf ci)), ("t", toJson ty),
     ("h", toJson h.hex), ("a", toJson atoms),
     ("f", Json.arr (fs.map fun f => Json.mkObj [("c", toJson f.concept), ("how", toJson f.how)]))]
-  if let some v := ci.value? then
-    fields := fields ++ [("vh", toJson (hashOf hctx [v]).hex)]
   if w.truncated then fields := fields ++ [("tr", toJson true)]
   return Json.mkObj fields
 
@@ -135,6 +182,15 @@ def main (args : List String) : IO UInt32 := do
     conceptDecls := manifest.concepts.foldl (fun m r => m.insert (toName r.const) r.concept) {}
     roots := manifest.roots.toList.map toName
     budget := manifest.budget }
+  -- The module of a constant that Lean does not merge, as the hashes count it: the one that declares it, or `home`
+  -- for a target module. A merged one counts by its type (`identify`).
+  let targets : NameSet := manifest.modules.foldl (fun s t => s.insert (toName t)) {}
+  let base : Name → Name := fun n =>
+    let m := match env.getModuleIdxFor? n with
+      | some idx => env.header.moduleNames[idx.toNat]!
+      | none => env.mainModule
+    if !manifest.home.isEmpty && targets.contains m then toName manifest.home else m
+  let ids ← IO.mkRef ({} : Std.HashMap Name Name)
   let ctx : Core.Context := { fileName := "<declexport>", fileMap := default, maxHeartbeats := 0 }
   let out ← IO.getStdout
   let act : StateRefT St MetaM Nat := do
@@ -145,7 +201,7 @@ def main (args : List String) : IO UInt32 := do
       for c in env.header.moduleData[idx.toNat]!.constNames do
         let some ci := env.find? c | continue
         if auxiliary env c ci then continue
-        let j ← record cfg manifest.types m c ci
+        let j ← record cfg ids base manifest.types m c ci
         out.putStrLn j.compress
         n := n + 1
     return n

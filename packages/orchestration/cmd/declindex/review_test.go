@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,7 +36,7 @@ func TestQueriesRefuseAnIndexWithUnreadableModules(t *testing.T) {
 	}
 }
 
-// The ledger check writes only to an existing ledger: it never creates the ledger's schema.
+// OpenExisting refuses a database that lacks the ledger schema without creating it.
 func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 	dsn := testpg.Database(t, "declindex_noschema")
 	config := fixture(t)
@@ -44,6 +45,11 @@ func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 	if err := os.WriteFile(config, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The ledger compares the index's commit with the tree's, so the tree is a Git work tree.
+	tree := filepath.Join(filepath.Dir(config), "tree")
+	git(t, tree, "init", "-q")
+	git(t, tree, "add", "-A")
+	git(t, tree, "commit", "-q", "-m", "one")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}
@@ -54,7 +60,7 @@ func TestLedgerRefusesADatabaseWithoutTheLedgerSchema(t *testing.T) {
 		}
 		return ""
 	}, &out, &errOut)
-	if code != 3 {
+	if code != 3 || !strings.Contains(errOut.String(), "ledger schema is missing versions") {
 		t.Fatalf("ledger on an empty database exited %d: %s %s", code, out.String(), errOut.String())
 	}
 	conn, err := pgx.Connect(context.Background(), dsn)
@@ -126,11 +132,15 @@ func TestAModuleNewerThanItsBuildStopsQueriesAndTheLedger(t *testing.T) {
 	}
 }
 
-// On a machine whose sandbox is unavailable (here Landlock ABI 2, which does not govern truncation), the gate is
-// unable to decide before it starts anything: no Lean process, no exporter build, even with nothing cached.
+// On a machine whose sandbox is unavailable (here as confine reports Landlock ABI 2, which does not govern
+// truncation; confine's TestALandlockWithoutTruncationIsNoSandbox shows that such a kernel has no sandbox), the
+// gate is unable to decide before it starts anything: no Lean process, no exporter build, even with nothing cached.
 func TestGateStartsNoLeanWithoutASandbox(t *testing.T) {
-	restore := confine.SetLandlockABIForTest(2, nil)
-	defer restore()
+	old := gateSandboxAvailable
+	gateSandboxAvailable = func() error {
+		return fmt.Errorf("%w: Landlock ABI 2 does not govern truncation; ABI 3 (Linux 6.2) is needed", confine.ErrUnavailable)
+	}
+	t.Cleanup(func() { gateSandboxAvailable = old })
 	config := fixture(t)
 	dir := filepath.Dir(config)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
@@ -163,7 +173,7 @@ func TestGateStartsNoLeanWithoutASandbox(t *testing.T) {
 		}
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	r := invoke(t, "--config", config, "gate", proposal)
+	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
 	if r.code != 3 || !strings.Contains(r.errOut, "sandbox") {
 		t.Fatalf("gate without a sandbox: %+v", r)
 	}

@@ -440,12 +440,3 @@ func waitReadable(fd int, deadline time.Time) error {
 		return errors.New("the launcher exited")
 	}
 }
-
-// SetLandlockABIForTest makes the sandbox see Landlock ABI abi (or err) in place of the kernel's answer until
-// restore is called. Tests of a caller use it to show that the caller fails closed, and starts nothing, where the
-// kernel's Landlock is too old. It is not safe for concurrent use.
-func SetLandlockABIForTest(abi int, err error) (restore func()) {
-	saved := landlockVersion
-	landlockVersion = func() (int, error) { return abi, err }
-	return func() { landlockVersion = saved }
-}

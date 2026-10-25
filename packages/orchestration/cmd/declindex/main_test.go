@@ -62,6 +62,36 @@ func TestHelpStartsWithOneLineUsage(t *testing.T) {
 	}
 }
 
+func TestHelpListsFinalCommandInterfacesAndExitCodes(t *testing.T) {
+	r := invoke(t, "--help")
+	for _, want := range []string{
+		"refresh: 0 read; 2 usage; 3 unable; 75 retry",
+		"gate --proposer OWNER [--accepted-by OWNER] PROPOSAL.json",
+		"ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry",
+		"LAND_NAMES or LAND_NAMES_FILE",
+		"LAND_BUILD_DIR for changed sources",
+		"name<TAB>hash<TAB>path",
+	} {
+		if !strings.Contains(r.out, want) {
+			t.Errorf("help does not list %q:\n%s", want, r.out)
+		}
+	}
+}
+
+// land-hash exits 3 for a changed source without LAND_BUILD_DIR, so its usage message names it with the rest of
+// its environment.
+func TestLandHashUsageNamesItsWholeEnvironment(t *testing.T) {
+	r := invoke(t, "--config", fixture(t), "land-hash", "unexpected")
+	if r.code != 2 {
+		t.Fatalf("land-hash with an argument exited %d, want 2: %+v", r.code, r)
+	}
+	for _, want := range []string{"LAND_TREE", "LAND_GIT_DIR", "LAND_NAMES_FILE", "LAND_BUILD_DIR for changed sources"} {
+		if !strings.Contains(r.errOut, want) {
+			t.Errorf("the usage message does not name %q: %s", want, r.errOut)
+		}
+	}
+}
+
 func TestUsageErrorsExitTwo(t *testing.T) {
 	config := fixture(t)
 	for _, args := range [][]string{
@@ -171,48 +201,4 @@ func git(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
-}
-
-// The landing program's hasher: LAND_TREE and LAND_NAMES in, exactly name<TAB>hash out; anything it cannot
-// answer for every name is unable to check (exit 3) with nothing printed.
-func TestLandHashAnswersTheLandingProgram(t *testing.T) {
-	config := fixture(t)
-	tree := filepath.Join(filepath.Dir(config), "tree")
-	git(t, tree, "init", "-q")
-	git(t, tree, "add", "-A")
-	git(t, tree, "commit", "-q", "-m", "one")
-	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
-		t.Fatalf("refresh: %+v", r)
-	}
-	land := func(treeID string, names ...string) result {
-		t.Helper()
-		j, _ := json.Marshal(names)
-		env := map[string]string{"LAND_TREE": treeID, "LAND_NAMES": string(j)}
-		var out, errOut bytes.Buffer
-		code := run(context.Background(), []string{"--config", config, "land-hash"}, func(k string) string { return env[k] }, &out, &errOut)
-		return result{code, out.String(), errOut.String()}
-	}
-	first := git(t, tree, "rev-parse", "HEAD^{tree}")
-	r := land(first, "Gold.frame_lo", "Gold2.FrameAt")
-	if r.code != 0 || !strings.HasPrefix(r.out, "Gold.frame_lo\t9d9fba31f41fc258\nGold2.FrameAt\t") || strings.Count(r.out, "\n") != 2 {
-		t.Fatalf("land-hash: %+v", r)
-	}
-	for _, names := range [][]string{{"NoSuch"}, {"Gold.frame_lo", "Gold.frame_lo"}, {"frame_lo"}} {
-		if r := land(first, names...); r.code != 3 || r.out != "" {
-			t.Errorf("%v: %+v, want unable to check and no output", names, r)
-		}
-	}
-	src := filepath.Join(tree, "Golden.lean")
-	data, _ := os.ReadFile(src)
-	if err := os.WriteFile(src, append(data, []byte("\n-- an edit\n")...), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	git(t, tree, "commit", "-q", "-am", "two")
-	second := git(t, tree, "rev-parse", "HEAD^{tree}")
-	if r := land(second, "Gold2.FrameAt"); r.code != 0 {
-		t.Fatalf("a file the candidate kept: %+v", r)
-	}
-	if r := land(second, "Gold2.FrameAt", "Gold.frame_lo"); r.code != 3 || r.out != "" {
-		t.Fatalf("a file the candidate changed: %+v", r)
-	}
 }

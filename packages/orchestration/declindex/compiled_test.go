@@ -33,18 +33,23 @@ func compiledTree(t *testing.T) (Tree, *CompiledOptions) {
 	}
 }
 
+// compiledWith is the compiled step of a refresh with fixed options.
+func compiledWith(co *CompiledOptions) func(context.Context) (*CompiledOptions, error) {
+	return func(context.Context) (*CompiledOptions, error) { return co, nil }
+}
+
 func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	tree, co := compiledTree(t)
 	s := openStore(t)
 	ctx := context.Background()
-	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co})
+	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Exported != 1 {
 		t.Fatalf("exported %d modules, want 1", st.Exported)
 	}
-	c, err := s.Constant(ctx, "Fx.SpAligned")
+	c, err := s.Constant(ctx, "Fx.SpAligned", "Fixture")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,22 +82,53 @@ func TestRefreshReadsTheCompiledModules(t *testing.T) {
 	if !reflect.DeepEqual(spBox, []string{"Fx.SpBox", "Fx.SpBox.al", "Fx.SpBox.mk"}) {
 		t.Errorf("a constructor's fact is not its structure's: %v", spBox)
 	}
-	same, err := s.SameAtoms(ctx, "Fx.inline")
+	same, err := s.SameAtoms(ctx, declaration(t, s, "Fx.inline"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !contains(same, "Fx.swapped") || contains(same, "Fx.other_reg") {
+	var sameNames []string
+	for _, f := range same {
+		sameNames = append(sameNames, f.Name)
+	}
+	if !contains(sameNames, "Fx.swapped") || contains(sameNames, "Fx.other_reg") {
 		t.Errorf("same atoms as Fx.inline: %v", same)
 	}
-	again, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co})
+	again, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if again.Exported != 0 {
 		t.Fatalf("an unchanged build was exported again: %d", again.Exported)
 	}
+	// The same exporter at another path (the exporter beside a symlinked index's link, or its target) reads nothing
+	// again: the compiled part's digest covers what the exporter was built from (Exporter.Version), not its path.
+	bin, err := os.ReadFile(co.Exporter.Bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	co.Exporter.Bin = filepath.Join(t.TempDir(), "declexport")
+	if err := os.WriteFile(co.Exporter.Bin, bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.Exported != 0 {
+		t.Fatalf("the same exporter at another path exported again: %d", moved.Exported)
+	}
+	// Changed exporter sources or another toolchain give another version: every module is read again, so no hash of
+	// the old exporter stays.
+	co.Exporter.Version = "another build"
+	rebuilt, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.Exported != 1 {
+		t.Fatalf("another exporter did not export again: %d", rebuilt.Exported)
+	}
 	co.Forms.Concepts[0].Forms = spForms[:1]
-	changed, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co})
+	changed, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,14 +156,20 @@ func contains(ss []string, s string) bool {
 }
 
 // A definition's facts pass to every statement that applies it. When a landing changes the definition, a module
-// that applies it is matched again even if its own compiled module is byte for byte the same.
+// that applies it is matched again even if its own compiled module is byte for byte the same. The definition is in
+// Wrap, which the forms do not import: a change in the forms' import closure reads every module again
+// (TestRefreshReadsAgainWhenTheFormsImportsChange in cmd/declindex).
 func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 	tree, co := compiledTree(t)
 	l, ctx := co.Exporter.Lean, context.Background()
-	user := "import Fixture\n\ntheorem user_frame (R : BitVec 5 → BitVec 64) (_h : Fx.Frame (R 2#5) 8) : True := trivial\n"
-	if err := os.WriteFile(filepath.Join(tree.Source, "User.lean"), []byte(user), 0o644); err != nil {
-		t.Fatal(err)
+	write := func(rel, src string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(tree.Source, rel+".lean"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
+	write("Wrap", "import Fixture\n\ndef Fx.Aligned8 (sp : BitVec 64) : Prop := sp &&& 7#64 = 0#64\n")
+	write("User", "import Wrap\n\ntheorem user_aligned (R : BitVec 5 → BitVec 64) (_h : Fx.Aligned8 (R 2#5)) : True := trivial\n")
 	stamp := func(rel, h string) {
 		t.Helper()
 		for _, ext := range []string{".ilean.hash", ".olean.hash"} {
@@ -136,39 +178,38 @@ func TestRefreshRematchesTheStatementsAChangedDefinitionReaches(t *testing.T) {
 			}
 		}
 	}
-	if err := CompileModule(ctx, l, nil, tree.Source, "User"); err != nil {
-		t.Fatal(err)
-	}
-	stamp("Fixture", "a")
-	stamp("User", "u")
-	tree.Roots["User"] = true
-	s := openStore(t)
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co}); err != nil {
-		t.Fatal(err)
-	}
-	if c, err := s.Constant(ctx, "user_frame"); err != nil || len(c.Facts) != 1 || c.Facts[0].How != "via:Fx.Frame" {
-		t.Fatalf("before the change: %+v %v", c, err)
-	}
-	src, _ := os.ReadFile(filepath.Join(tree.Source, "Fixture.lean"))
-	changed := []byte(string(src[:0]) + strings.Replace(string(src), "n ≤ 64 ∧ sp &&& 7#64 = 0#64", "n ≤ 64 ∧ sp.toNat ≥ 0", 1))
-	if err := os.WriteFile(filepath.Join(tree.Source, "Fixture.lean"), changed, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for _, rel := range []string{"Fixture", "User"} {
+	for _, rel := range []string{"Wrap", "User"} {
 		if err := CompileModule(ctx, l, nil, tree.Source, rel); err != nil {
 			t.Fatal(err)
 		}
 	}
-	stamp("Fixture", "b")
+	stamp("Fixture", "a")
+	stamp("Wrap", "w")
 	stamp("User", "u")
-	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: co})
+	tree.Roots["Wrap"], tree.Roots["User"] = true, true
+	s := openStore(t)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := s.Constant(ctx, "user_aligned", "User"); err != nil || len(c.Facts) != 1 || c.Facts[0].How != "via:Fx.Aligned8" {
+		t.Fatalf("before the change: %+v %v", c, err)
+	}
+	write("Wrap", "import Fixture\n\ndef Fx.Aligned8 (sp : BitVec 64) : Prop := sp.toNat ≥ 0\n")
+	for _, rel := range []string{"Wrap", "User"} {
+		if err := CompileModule(ctx, l, nil, tree.Source, rel); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stamp("Wrap", "w2")
+	stamp("User", "u")
+	st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: compiledWith(co)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Exported != 1 || st.Rematched != 1 {
 		t.Fatalf("exported %d and re-matched %d modules, want 1 and 1", st.Exported, st.Rematched)
 	}
-	if c, err := s.Constant(ctx, "user_frame"); err != nil || len(c.Facts) != 0 {
+	if c, err := s.Constant(ctx, "user_aligned", "User"); err != nil || len(c.Facts) != 0 {
 		t.Fatalf("after the change the user still states the fact: %+v %v", c, err)
 	}
 }
@@ -198,10 +239,10 @@ func TestRefreshRematchesEverythingWhenAFormlessConceptsBodyChanges(t *testing.T
 	tree.Roots["Restate"] = true
 	co.Forms = FormsModule{Imports: []string{"Fixture"}, Concepts: []ConceptForms{{Concept: "Fx.Frame"}}}
 	s := openStore(t)
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: co}); err != nil {
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one", Compiled: compiledWith(co)}); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := s.Constant(ctx, "restate"); err != nil || len(c.Facts) != 1 || c.Facts[0].Concept != "Fx.Frame" {
+	if c, err := s.Constant(ctx, "restate", "Restate"); err != nil || len(c.Facts) != 1 || c.Facts[0].Concept != "Fx.Frame" {
 		t.Fatalf("before the change: %+v %v", c, err)
 	}
 	src, _ := os.ReadFile(filepath.Join(tree.Source, "Fixture.lean"))
@@ -213,10 +254,10 @@ func TestRefreshRematchesEverythingWhenAFormlessConceptsBodyChanges(t *testing.T
 		t.Fatal(err)
 	}
 	stamp("Fixture", "b")
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: co}); err != nil {
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two", Compiled: compiledWith(co)}); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := s.Constant(ctx, "restate"); err != nil || len(c.Facts) != 0 {
+	if c, err := s.Constant(ctx, "restate", "Restate"); err != nil || len(c.Facts) != 0 {
 		t.Fatalf("after the concept's body changed, the old restatement still matches: %+v %v", c, err)
 	}
 }

@@ -4,8 +4,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -41,6 +44,19 @@ func TestConfigResolvesPathsAgainstItsDirectory(t *testing.T) {
 	}
 }
 
+func TestConfigGivesAbsolutePathsForARelativeConfigPath(t *testing.T) {
+	p := writeConfig(t, "tree: ../tree\ndb: state/index.sqlite\nroots: [A]\nregistry: registry\n")
+	t.Chdir(filepath.Dir(filepath.Dir(p)))
+	c, err := LoadConfig(filepath.Join("conf", "index.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(filepath.Dir(filepath.Dir(p)), "tree")
+	if c.Tree != want || !filepath.IsAbs(c.DB) || c.Registry != filepath.Join(want, "registry") {
+		t.Fatalf("relative config gave tree %q, db %q, registry %q; want tree %q and absolute paths", c.Tree, c.DB, c.Registry, want)
+	}
+}
+
 func TestConfigRefusesMissingTreeAndRoots(t *testing.T) {
 	for _, body := range []string{"roots: [A]\n", "tree: x\n", "tree: x\nroots: [A]\nunknown_key: 1\n"} {
 		if _, err := LoadConfig(writeConfig(t, body)); err == nil {
@@ -71,9 +87,45 @@ func TestConfigBuildSettingsAndLibraryRelativePath(t *testing.T) {
 	if defaults.LibRel != filepath.Join(".lake", "build", "lib", "lean") || defaults.BuildTimeout != 6*time.Hour {
 		t.Fatalf("defaults: relative library %q, timeout %s", defaults.LibRel, defaults.BuildTimeout)
 	}
-	for _, timeout := range []string{"tomorrow", "-1s"} {
+	for _, timeout := range []string{"tomorrow", "-1s", "0s", "90"} {
 		if _, err := LoadConfig(writeConfig(t, "tree: tree\nroots: [A]\nbuild_timeout: "+timeout+"\n")); err == nil {
 			t.Errorf("accepted build_timeout %q", timeout)
+		}
+	}
+}
+
+func TestPublicConfigKeepsItsYAMLSchema(t *testing.T) {
+	raw, err := yaml.Marshal(Config{
+		Tree:         "tree",
+		Lib:          "lib",
+		DB:           "state.sqlite",
+		FileKinds:    []string{"Spec"},
+		Build:        []string{"build"},
+		Remote:       "remote",
+		BuildTimeout: time.Minute,
+		OwnersFormat: "owners/v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, key := range []string{"file_kinds:", "build:", "remote:", "build_timeout:", "owners_format:"} {
+		if !strings.Contains(text, key) {
+			t.Errorf("public Config YAML lacks %q:\n%s", key, text)
+		}
+	}
+	for _, key := range []string{"filekinds:", "buildtimeout:", "ownersformat:"} {
+		if strings.Contains(text, key) {
+			t.Errorf("public Config YAML uses an implicit key %q:\n%s", key, text)
+		}
+	}
+}
+
+func TestConfigRefusesUnsafeRegistryPaths(t *testing.T) {
+	for _, registry := range []string{"/srv/registry", "../registry", "../../registry"} {
+		_, err := LoadConfig(writeConfig(t, "tree: tree\nroots: [A]\nregistry: "+registry+"\n"))
+		if err == nil || !strings.Contains(err.Error(), "registry") {
+			t.Errorf("unsafe registry path %q: %v", registry, err)
 		}
 	}
 }

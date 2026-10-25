@@ -1,10 +1,15 @@
 package declindex
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"maps"
+	"math"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,24 +32,21 @@ func (f Found) At() string { return f.Path + ":" + strconv.Itoa(f.Line) }
 // declared in two namespaces gives both.
 func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 	short := q[strings.LastIndexByte(q, '.')+1:]
-	rows, err := s.db.QueryContext(ctx, `SELECT d.name, d.module, d.kind, d.line, d.stmt_hash, COALESCE(m.rel, '')
-		FROM decls d LEFT JOIN modules m ON m.module = d.module WHERE d.short = ?`, short)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []Found
-	for rows.Next() {
-		var f Found
-		var rel string
-		if err := rows.Scan(&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel); err != nil {
-			return nil, err
+	rows, err := s.q.QueryContext(ctx, foundSelect+` WHERE d.short = ?`, short)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		f, err := scanFound(r)
+		if err != nil {
+			return err
 		}
 		if f.Name != q && !strings.HasSuffix(f.Name, "."+q) {
-			continue
+			return nil
 		}
-		f.Path = sourcePath(rel, f.Module)
 		out = append(out, f)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Name != out[j].Name {
@@ -52,7 +54,24 @@ func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 		}
 		return out[i].Module < out[j].Module
 	})
-	return out, rows.Err()
+	return out, nil
+}
+
+// declarationsNamed gives the declarations of each of the full names in names, by name.
+func (s *Store) declarationsNamed(ctx context.Context, names []string) (map[string][]Found, error) {
+	out := make(map[string][]Found, len(names))
+	err := eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, names, func(r *sql.Rows) error {
+		f, err := scanFound(r)
+		if err != nil {
+			return err
+		}
+		out[f.Name] = append(out[f.Name], f)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func sourcePath(rel, module string) string {
@@ -93,6 +112,7 @@ type Reach struct {
 // Answer is the index's answer about one declaration: who uses it and how far a change to it reaches.
 type Answer struct {
 	Declaration string      `json:"declaration"`
+	Module      string      `json:"module"`
 	Kind        string      `json:"kind"`
 	At          string      `json:"at"`
 	StmtHash    string      `json:"stmt_hash"`
@@ -106,140 +126,112 @@ type Answer struct {
 type AnswerOptions struct {
 	Why   bool
 	Lines bool
-	// FileKinds group users' files (see Tree.FileKinds).
+	// FileKinds are the file-name prefixes that group a user's file in an answer (for example the kinds of file a
+	// project's layout names); a file with none of them is "other".
 	FileKinds []string
 }
 
 type useRow struct {
-	target, module string
-	line, col      int
-	parent, class  string
+	module        string
+	line, col     int
+	parent, class string
 }
 
-func (s *Store) declared(ctx context.Context, q querier, names []string) (map[string]bool, error) {
-	out := map[string]bool{}
-	for i := 0; i < len(names); i += 500 {
-		chunk := names[i:min(i+500, len(names))]
-		rows, err := q.QueryContext(ctx, `SELECT name FROM decls WHERE name IN (`+placeholders(len(chunk))+`)`, anys(chunk)...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var n string
-			if err := rows.Scan(&n); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			out[n] = true
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
+// usersOf gives the uses of the declaration d and of its generated parts: the constants Lean made from it that its
+// module never declares (a structure's fields and constructor, equation lemmas). A use of `h.wp` is recorded as
+// `X.wp`; it is a use of X. Each recorded constant counts for the declaration it belongs to (ownerResolver.owner),
+// so a use of another module's declaration of d's name is not d's.
+func (s *Store) usersOf(ctx context.Context, d declRef) ([]useRow, error) {
+	type recorded struct {
+		target declRef
+		u      useRow
 	}
-	return out, nil
-}
-
-type querier interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
-
-func placeholders(n int) string { return strings.TrimSuffix(strings.Repeat("?,", n), ",") }
-
-func anys(ss []string) []any {
-	out := make([]any, len(ss))
-	for i, s := range ss {
-		out[i] = s
-	}
-	return out
-}
-
-// usersOf gives the uses of name and of its generated parts: names Lean made from the declaration that the
-// source never declares (a structure's fields and constructor, equation lemmas). A use of `h.wp` is recorded as
-// `X.wp`; it is a use of X.
-func (s *Store) usersOf(ctx context.Context, name string) ([]useRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT target FROM uses WHERE target >= ? AND target < ?`, name+".", name+"/")
+	var rs []recorded
+	rows, err := s.q.QueryContext(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
+		WHERE target = ? OR (target >= ? AND target < ?)`, d.name, d.name+".", d.name+"/")
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var x recorded
+		if err := r.Scan(&x.target.name, &x.target.module, &x.u.module, &x.u.line, &x.u.col, &x.u.parent, &x.u.class); err != nil {
+			return err
+		}
+		rs = append(rs, x)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	var cands []string
-	for rows.Next() {
-		var t string
-		if err := rows.Scan(&t); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		cands = append(cands, t)
+	if len(rs) == 0 {
+		return nil, nil
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
+	targets := map[string]bool{}
+	for _, x := range rs {
+		targets[x.target.name] = true
 	}
-	declared, err := s.declared(ctx, s.db, cands)
+	declaring, err := declaringPrefixes(ctx, s.q, slices.Sorted(maps.Keys(targets)))
 	if err != nil {
 		return nil, err
 	}
-	keys := []string{name}
-	for _, c := range cands {
-		if !declared[c] {
-			keys = append(keys, c)
-		}
-	}
+	owners := newOwnerResolver(ctx, s.q, declaring)
 	var out []useRow
-	for i := 0; i < len(keys); i += 500 {
-		chunk := keys[i:min(i+500, len(keys))]
-		rows, err := s.db.QueryContext(ctx, `SELECT module, line, col, parent, cls FROM uses WHERE target IN (`+
-			placeholders(len(chunk))+`)`, anys(chunk)...)
+	for _, x := range rs {
+		owner, err := owners.owner(x.target)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			u := useRow{target: name}
-			if err := rows.Scan(&u.module, &u.line, &u.col, &u.parent, &u.class); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			out = append(out, u)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
+		if owner == d {
+			out = append(out, x.u)
 		}
 	}
 	return out, nil
 }
 
-// paths maps modules to their source paths. A wide declaration's answer touches tens of thousands of modules, so
-// the map is read in one query, once per answer.
-type paths struct {
-	s     *Store
-	cache map[string]string
+// modulePaths maps every module the index read to its source path. A wide declaration's answer touches tens of
+// thousands of modules, so the map is read in one query, once for the store (derived); a failed read is not kept.
+func (s *Store) modulePaths(ctx context.Context) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.derived.paths != nil {
+		return s.derived.paths, nil
+	}
+	out := map[string]string{}
+	rows, err := s.q.QueryContext(ctx, `SELECT module, rel FROM modules`)
+	err = eachRow(rows, err, func(r *sql.Rows) error {
+		var m, rel string
+		if err := r.Scan(&m, &rel); err != nil {
+			return err
+		}
+		out[m] = sourcePath(rel, m)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.derived.paths = out
+	return out, nil
 }
 
-func (p *paths) of(ctx context.Context, module string) (string, error) {
-	if p.cache == nil {
-		rows, err := p.s.db.QueryContext(ctx, `SELECT module, rel FROM modules`)
-		if err != nil {
-			return "", err
-		}
-		p.cache = map[string]string{}
-		for rows.Next() {
-			var m, rel string
-			if err := rows.Scan(&m, &rel); err != nil {
-				rows.Close()
-				return "", err
-			}
-			p.cache[m] = sourcePath(rel, m)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return "", err
-		}
+// ModuleAt is the module whose source file is at file, a slash-separated path relative to the tree (a registered
+// concept's home file), or empty when the index read no module there.
+func (s *Store) ModuleAt(ctx context.Context, file string) (string, error) {
+	rel, ok := strings.CutSuffix(path.Clean(file), ".lean")
+	if !ok {
+		return "", nil
 	}
-	if v, ok := p.cache[module]; ok {
-		return v, nil
+	var m string
+	err := s.q.QueryRowContext(ctx, `SELECT module FROM modules WHERE rel = ?`, rel).Scan(&m)
+	if err == sql.ErrNoRows {
+		return "", nil
 	}
-	return sourcePath("", module), nil
+	return m, err
+}
+
+// pathOf is the source path of module in paths (modulePaths), or the path of its name for a module the index did
+// not read.
+func pathOf(paths map[string]string, module string) string {
+	if p, ok := paths[module]; ok {
+		return p
+	}
+	return sourcePath("", module)
 }
 
 func fileKind(p string, kinds []string) string {
@@ -260,46 +252,33 @@ func dirOf(p string) string {
 	return d
 }
 
-// Answer answers about the declaration with exactly this name.
-func (s *Store) Answer(ctx context.Context, name string, opt AnswerOptions) (Answer, error) {
-	found, err := s.Resolve(ctx, name)
+// Answer answers about the declaration d, one that Resolve gave.
+func (s *Store) Answer(ctx context.Context, d Found, opt AnswerOptions) (Answer, error) {
+	paths, err := s.modulePaths(ctx)
 	if err != nil {
 		return Answer{}, err
 	}
-	var decl *Found
-	for i := range found {
-		if found[i].Name == name {
-			decl = &found[i]
-			break
-		}
-	}
-	if decl == nil {
-		return Answer{}, &NotFoundError{Name: name}
-	}
-	ps := &paths{s: s}
-	a := Answer{Declaration: decl.Name, Kind: decl.Kind, At: decl.At(), StmtHash: decl.StmtHash}
-	uses, err := s.usersOf(ctx, name)
+	ref := declRef{d.Module, d.Name}
+	a := Answer{Declaration: d.Name, Module: d.Module, Kind: d.Kind, At: d.At(), StmtHash: d.StmtHash}
+	uses, err := s.usersOf(ctx, ref)
 	if err != nil {
 		return a, err
 	}
 	a.Direct.ByDirectory = map[string]map[string]int{}
-	parents := map[string]bool{}
+	parents := map[declRef]bool{}
 	type line struct {
 		path string
 		u    useRow
 	}
 	var lines []line
 	for _, u := range uses {
-		if u.parent == name {
+		if (declRef{u.module, u.parent}) == ref {
 			continue
 		}
-		p, err := ps.of(ctx, u.module)
-		if err != nil {
-			return a, err
-		}
+		p := pathOf(paths, u.module)
 		a.Direct.Uses++
 		if u.parent != "" {
-			parents[u.parent] = true
+			parents[declRef{u.module, u.parent}] = true
 		}
 		switch u.class {
 		case "stmt":
@@ -319,11 +298,8 @@ func (s *Store) Answer(ctx context.Context, name string, opt AnswerOptions) (Ans
 	a.Direct.Declarations = len(parents)
 	a.Direct.Directories = len(a.Direct.ByDirectory)
 	if opt.Lines {
-		sort.SliceStable(lines, func(i, j int) bool {
-			if lines[i].path != lines[j].path {
-				return lines[i].path < lines[j].path
-			}
-			return lines[i].u.line < lines[j].u.line
+		slices.SortStableFunc(lines, func(x, y line) int {
+			return cmp.Or(strings.Compare(x.path, y.path), cmp.Compare(x.u.line, y.u.line))
 		})
 		for _, l := range lines {
 			parent := l.u.parent
@@ -333,7 +309,7 @@ func (s *Store) Answer(ctx context.Context, name string, opt AnswerOptions) (Ans
 			a.Lines = append(a.Lines, fmt.Sprintf("%s:%d:%d in %s [%s]", l.path, l.u.line, l.u.col, parent, l.u.class))
 		}
 	}
-	a.Reach, err = s.reach(ctx, ps, name, opt.Why)
+	a.Reach, err = s.reach(ctx, ref, opt.Why)
 	return a, err
 }
 
@@ -342,32 +318,31 @@ type NotFoundError struct{ Name string }
 
 func (e *NotFoundError) Error() string { return "no declaration " + e.Name + " in the index" }
 
-const propagates = `(e.stmt = 1 OR e.kind IN ('def', 'abbrev', 'instance', 'structure', 'class', 'inductive', 'opaque'))`
+// propagates says whether an edge passes a change on: a use in a statement, or any use by a definition (defKinds).
+var propagates = `(e.stmt = 1 OR e.kind IN ('` + strings.Join(defKinds, `', '`) + `'))`
 
 // reach computes the statements a change to root's statement changes, and the proofs at their edge, on the
-// declaration graph that the last refresh wrote. A declaration is its name and the module of its use: Lean names
-// every `example` `_example`, so one name can stand for a declaration of each of many modules.
-func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Reach, error) {
+// declaration graph that the last refresh wrote.
+func (s *Store) reach(ctx context.Context, root declRef, why bool) (Reach, error) {
 	g, err := s.graph()
 	if err != nil {
 		return Reach{}, err
 	}
+	paths, err := s.modulePaths(ctx)
+	if err != nil {
+		return Reach{}, err
+	}
 	changed, reprove, via := g.walk(root)
-	cdirs, rdirs := map[string][]string{}, map[string][]string{}
-	for d := range changed {
-		p, err := ps.of(ctx, d.module)
-		if err != nil {
-			return Reach{}, err
+	// byDir groups the reached declarations by the directory of their module's source.
+	byDir := func(set map[declRef]bool) map[string][]declRef {
+		out := map[string][]declRef{}
+		for d := range set {
+			dir := dirOf(pathOf(paths, d.module))
+			out[dir] = append(out[dir], d)
 		}
-		cdirs[dirOf(p)] = append(cdirs[dirOf(p)], d.name)
+		return out
 	}
-	for d := range reprove {
-		p, err := ps.of(ctx, d.module)
-		if err != nil {
-			return Reach{}, err
-		}
-		rdirs[dirOf(p)] = append(rdirs[dirOf(p)], d.name)
-	}
+	cdirs, rdirs := byDir(changed), byDir(reprove)
 	all := map[string]bool{}
 	for d := range cdirs {
 		all[d] = true
@@ -383,14 +358,13 @@ func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Re
 		return r, nil
 	}
 	r.Why = map[string]string{}
-	short := root[strings.LastIndexByte(root, '.')+1:]
+	short := root.name[strings.LastIndexByte(root.name, '.')+1:]
 	for d := range all {
 		ds := cdirs[d]
 		if ds == nil {
 			ds = rdirs[d]
 		}
-		sort.Strings(ds)
-		chain := []string{ds[0]}
+		chain := []declRef{slices.MinFunc(ds, declRef.compare)}
 		for len(chain) < 50 {
 			v, ok := via[chain[len(chain)-1]]
 			if !ok || v == root {
@@ -398,29 +372,45 @@ func (s *Store) reach(ctx context.Context, ps *paths, root string, why bool) (Re
 			}
 			chain = append(chain, v)
 		}
-		for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
-			chain[i], chain[j] = chain[j], chain[i]
+		slices.Reverse(chain)
+		names := make([]string, len(chain))
+		for i, c := range chain {
+			names[i] = c.name
 		}
-		r.Why[d] = short + " -> " + strings.Join(chain, " -> ")
+		r.Why[d] = short + " -> " + strings.Join(names, " -> ")
 	}
 	return r, nil
 }
 
-// graph loads the declaration graph once per open index.
+// graph loads the declaration graph once for the store (derived), from its graph file: for a store opened read-only,
+// the one in place when its snapshot began, which a later refresh's replacement does not change. A graph of another
+// generation than the index's is refused.
 func (s *Store) graph() (*graph, error) {
-	s.graphOnce.Do(func() {
-		s.g, s.graphErr = loadGraph(s.path + ".graph")
-		if s.graphErr == nil {
-			if want, err := s.Meta(context.Background(), "graph"); err != nil {
-				s.graphErr = err
-			} else if s.g.token != want {
-				s.graphErr = fmt.Errorf("the graph file is of generation %q, the index of %q", s.g.token, want)
-			}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.derived.graph != nil || s.derived.graphErr != nil {
+		return s.derived.graph, s.derived.graphErr
+	}
+	data, err := io.ReadAll(io.NewSectionReader(s.graphFile, 0, math.MaxInt64))
+	var g *graph
+	if err == nil {
+		g, err = parseGraph(s.path+".graph", data)
+	}
+	if err == nil {
+		if want, metaErr := s.Meta(context.Background(), "graph"); metaErr != nil {
+			err = metaErr
+		} else if g.token != want {
+			err = fmt.Errorf("the graph file is of generation %q, the index of %q", g.token, want)
 		}
-		if s.graphErr != nil {
-			s.g = nil
-			s.graphErr = fmt.Errorf("the declaration graph is missing, unreadable or out of date: run declindex refresh: %w", s.graphErr)
-		}
-	})
-	return s.g, s.graphErr
+	}
+	if err != nil {
+		s.derived.graphErr = graphUnreadable(err)
+		return nil, s.derived.graphErr
+	}
+	s.derived.graph = g
+	return g, nil
+}
+
+func graphUnreadable(err error) error {
+	return fmt.Errorf("the declaration graph is missing, unreadable or out of date: run declindex refresh: %w", err)
 }

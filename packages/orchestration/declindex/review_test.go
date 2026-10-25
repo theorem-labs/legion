@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -23,17 +24,22 @@ func writeModule(t *testing.T, dir, rel, ilean, src string) {
 	}
 }
 
-// A use of `A.X.wp` belongs to A.X while nothing declares `A.X.wp`. When a later landing adds a module that
-// declares it, the use belongs to A.X.wp, though the module that uses it was not read again: an incremental
-// refresh answers as a full one does.
-func TestEdgeOwnersFollowDeclarationsOfLaterModules(t *testing.T) {
+// A use of `A.X.wp` that Lean recorded under module A is a use of A's constant: it belongs to A.X while A declares no
+// `A.X.wp`, also once a later landing adds a module B that declares its own `A.X.wp`.
+//
+// A constant that Lean made in the module that uses it (`A.X.eq_1`, recorded under U) belongs to the declaration of
+// its name in U's imports. When a later landing adds a module C that declares another `A.X`, which U does not
+// import, U's use stays with A's, though U was not read again: an incremental refresh answers as a full one does.
+func TestEdgeOwnersFollowTheModuleOfEachConstant(t *testing.T) {
 	dir := t.TempDir()
 	writeModule(t, dir, "A", `{"version":5,"module":"A","decls":{"A.X":[0,0,0,19,0,4,0,7]},"references":{}}`,
 		"def A.X : Prop := True\n")
-	writeModule(t, dir, "U", `{"version":5,"module":"U","decls":{"U.u":[0,0,0,42,0,8,0,11]},`+
-		`"references":{"{\"c\":{\"m\":\"A\",\"n\":\"A.X.wp\"}}":{"definition":null,"usages":[[0,17,0,23,"U.u"]]}}}`,
-		"theorem U.u (h : A.X.wp) : True := trivial\n")
-	tree := Tree{Source: dir, Lib: dir, Roots: Roots{"A": true, "U": true, "B": true}}
+	writeModule(t, dir, "U", `{"version":5,"module":"U","directImports":[["A",false,false,false]],`+
+		`"decls":{"U.u":[0,0,0,42,0,8,0,11],"U.v":[1,0,1,44,1,8,1,11]},"references":{`+
+		`"{\"c\":{\"m\":\"A\",\"n\":\"A.X.wp\"}}":{"definition":null,"usages":[[0,17,0,23,"U.u"]]},`+
+		`"{\"c\":{\"m\":\"U\",\"n\":\"A.X.eq_1\"}}":{"definition":null,"usages":[[1,17,1,25,"U.v"]]}}}`,
+		"theorem U.u (h : A.X.wp) : True := trivial\ntheorem U.v (h : A.X.eq_1) : True := trivial\n")
+	tree := Tree{Source: dir, Lib: dir, Roots: Roots{"A": true, "U": true, "B": true, "C": true}}
 	path := filepath.Join(t.TempDir(), "index.sqlite")
 	s, err := Open(path)
 	if err != nil {
@@ -44,30 +50,38 @@ func TestEdgeOwnersFollowDeclarationsOfLaterModules(t *testing.T) {
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
 		t.Fatal(err)
 	}
-	if a, err := s.Answer(ctx, "A.X", AnswerOptions{}); err != nil || a.Reach.StatementsChanged != 1 {
-		t.Fatalf("before: %+v %v", a.Reach, err)
+	if a, err := answerFor(t, s, "A.X", AnswerOptions{}); err != nil || a.Direct.Declarations != 2 || a.Reach.StatementsChanged != 2 {
+		t.Fatalf("before: %+v %+v %v", a.Direct, a.Reach, err)
 	}
 	writeModule(t, dir, "B", `{"version":5,"module":"B","decls":{"A.X.wp":[0,0,0,24,0,8,0,14]},"references":{}}`,
 		"theorem A.X.wp : True := trivial\n")
+	writeModule(t, dir, "C", `{"version":5,"module":"C","decls":{"A.X":[0,0,0,19,0,4,0,7]},"references":{}}`,
+		"def A.X : Prop := True\n")
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); err != nil {
 		t.Fatal(err)
 	}
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	if a, err := s2.Answer(ctx, "A.X", AnswerOptions{}); err != nil || a.Reach.StatementsChanged != 0 {
-		t.Fatalf("A.X after A.X.wp is declared: %+v %v", a.Reach, err)
-	}
-	if a, err := s2.Answer(ctx, "A.X.wp", AnswerOptions{}); err != nil || a.Reach.StatementsChanged != 1 {
-		t.Fatalf("A.X.wp: %+v %v", a.Reach, err)
+	full := refreshed(t, tree)
+	for _, store := range []*Store{s, full} {
+		found, err := store.Resolve(ctx, "A.X")
+		if err != nil || len(found) != 2 || found[0].Module != "A" || found[1].Module != "C" {
+			t.Fatalf("A.X resolves to %+v, %v; want A's and C's", found, err)
+		}
+		for i, want := range []int{2, 0} {
+			a, err := store.Answer(ctx, found[i], AnswerOptions{})
+			if err != nil || a.Direct.Declarations != want || a.Reach.StatementsChanged != want {
+				t.Errorf("%s's A.X: %+v %+v %v; want %d users", found[i].Module, a.Direct, a.Reach, err, want)
+			}
+		}
+		if a, err := answerFor(t, store, "A.X.wp", AnswerOptions{}); err != nil || a.Direct.Uses != 0 || a.Reach.StatementsChanged != 0 {
+			t.Errorf("B's A.X.wp: %+v %+v %v; want no use: U uses A's", a.Direct, a.Reach, err)
+		}
 	}
 }
 
-// A graph file that failed to be written after the index committed must not be read as current: queries refuse
-// until a refresh writes it, and that refresh writes it though no module changed.
-func TestAFailedGraphWriteIsRepairedAndNeverAnswered(t *testing.T) {
+// The graph file is written before the commit of the reference part, so a refresh whose graph write fails commits
+// nothing: the index stays at the commit before, with that commit's graph, and answers from it. The next refresh
+// writes both, though no module changed since the failed one.
+func TestAFailedGraphWriteCommitsNothing(t *testing.T) {
 	tree := goldenTree(t)
 	path := filepath.Join(t.TempDir(), "index.sqlite")
 	s, err := Open(path)
@@ -78,10 +92,14 @@ func TestAFailedGraphWriteIsRepairedAndNeverAnswered(t *testing.T) {
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
 		t.Fatal(err)
 	}
+	atOne, err := answerFor(t, s, "Gold.Frame", AnswerOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(filepath.Join(tree.Lib, "Sub", "Wrap.ilean")); err != nil {
 		t.Fatal(err)
 	}
-	// The graph's temporary file cannot be created: the write fails after the commit.
+	// The graph's temporary file cannot be created: the write fails before the commit.
 	if err := os.Mkdir(path+".graph.tmp", 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -93,8 +111,11 @@ func TestAFailedGraphWriteIsRepairedAndNeverAnswered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, err := s.Answer(ctx, "Gold.Frame", AnswerOptions{}); err == nil {
-		t.Fatalf("answered from a stale graph: %+v", a.Reach)
+	if commit, err := s.Meta(ctx, "commit"); err != nil || commit != "one" {
+		t.Fatalf("the index after a failed graph write is at %q, %v; want one", commit, err)
+	}
+	if a, err := answerFor(t, s, "Gold.Frame", AnswerOptions{}); err != nil || !reflect.DeepEqual(a, atOne) {
+		t.Fatalf("after a failed graph write: %+v, %v; want the answer at one, %+v", a, err, atOne)
 	}
 	if err := os.Remove(path + ".graph.tmp"); err != nil {
 		t.Fatal(err)
@@ -102,7 +123,7 @@ func TestAFailedGraphWriteIsRepairedAndNeverAnswered(t *testing.T) {
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); err != nil {
 		t.Fatal(err)
 	}
-	a, err := s.Answer(ctx, "Gold.Frame", AnswerOptions{})
+	a, err := answerFor(t, s, "Gold.Frame", AnswerOptions{})
 	if err != nil || a.Reach.StatementsChanged != 2 {
 		t.Fatalf("after the repair: %+v %v", a.Reach, err)
 	}
@@ -157,7 +178,7 @@ func TestAUseOfItsOwnUndeclaredParentIsAnEdgeFromItsOwner(t *testing.T) {
 		`"references":{"{\"c\":{\"m\":\"A\",\"n\":\"A.f.go\"}}":{"definition":null,"usages":[[0,11,0,13,"A.f.go"]]}}}`,
 		"def A.f := go\n")
 	s := refreshed(t, Tree{Source: dir, Lib: dir, Roots: Roots{"A": true}})
-	a, err := s.Answer(context.Background(), "A.f", AnswerOptions{})
+	a, err := answerFor(t, s, "A.f", AnswerOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

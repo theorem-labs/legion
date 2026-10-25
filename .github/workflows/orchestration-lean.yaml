@@ -21,9 +21,11 @@ permissions:
 jobs:
   lean:
     runs-on: ubuntu-24.04
+    timeout-minutes: 360
     services:
       postgres:
-        image: mirror.gcr.io/library/postgres:17
+        # postgres:17 (17.11 when pinned), by its multi-platform index digest.
+        image: mirror.gcr.io/library/postgres:17@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: ci
         ports:
@@ -35,11 +37,16 @@ jobs:
           --health-retries 30
     env:
       LEGION_TEST_PG_DSN: postgres://postgres:ci@localhost:5432/postgres?sslmode=disable
-      LEAN_TOOLCHAIN: leanprover/lean4:v4.35.0
+      # These move with the served trees' lean-toolchain.
+      LEAN_FORK_REPOSITORY: https://github.com/theorem-labs/lean4
+      LEAN_FORK_COMMIT: d71bb0c6d04adbb8e94adfdf8c0e3291bfeea831
       # The Lean tests skip without lake; here a missing toolchain fails them instead.
       DECLINDEX_REQUIRE_LEAN: "1"
       # The gate compiles proposals only in the Landlock and seccomp sandbox; here its tests must run, not skip.
       DECLINDEX_REQUIRE_SANDBOX: "1"
+      # The gate's own Lean tests compile untrusted proposal source, so they run only where this is set: in a
+      # disposable runner like this one, or a container.
+      DECLINDEX_SANDBOX_TEST: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,11 +55,29 @@ jobs:
         with:
           go-version-file: packages/orchestration/go.mod
           cache-dependency-path: packages/orchestration/go.sum
-      - name: Install Lean
+      - name: Install elan
         run: |
-          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
-          sh elan-init.sh -y --no-modify-path --default-toolchain "$LEAN_TOOLCHAIN"
+          curl --fail --location --silent --show-error https://github.com/leanprover/elan/releases/download/v4.2.4/elan-x86_64-unknown-linux-gnu.tar.gz -o elan-x86_64-unknown-linux-gnu.tar.gz
+          echo "42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63  elan-x86_64-unknown-linux-gnu.tar.gz" | sha256sum -c -
+          tar -xzf elan-x86_64-unknown-linux-gnu.tar.gz
+          ./elan-init -y --no-modify-path --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Restore Lean stage2
+        id: lean-stage2
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: lean4/build/release/stage2
+          key: lean4-${{ env.LEAN_FORK_COMMIT }}-stage2-${{ runner.os }}-${{ runner.arch }}
+      - name: Build Lean stage2
+        if: steps.lean-stage2.outputs.cache-hit != 'true'
+        run: packages/orchestration/declindex/e2e/build-lean.sh "$LEAN_FORK_REPOSITORY" "$LEAN_FORK_COMMIT" lean4
+      - name: Link tree Lean toolchain
+        run: |
+          elan toolchain link tree-lean lean4/build/release/stage2
+          elan default tree-lean
+          lean_version="$(lean --version)"
+          printf '%s\n' "$lean_version"
+          grep --fixed-strings "$LEAN_FORK_COMMIT" <<<"$lean_version"
       - name: Test the declaration index and the similarity gate with Lean
         working-directory: packages/orchestration
         run: |

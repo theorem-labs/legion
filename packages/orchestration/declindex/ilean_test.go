@@ -69,13 +69,42 @@ func TestParseModuleMatchesReferenceReader(t *testing.T) {
 	sortUses(uses)
 	var wantUses []Use
 	for _, u := range want.Uses {
+		// The roots keep only Golden's constants, so Golden is the module of every use's target.
 		wantUses = append(wantUses, Use{
-			Target: u[0].(string), Module: u[1].(string), Line: int(u[2].(float64)), Col: int(u[3].(float64)),
-			Parent: u[4].(string), Class: u[5].(string),
+			Target: u[0].(string), TargetModule: "Golden", Module: u[1].(string), Line: int(u[2].(float64)),
+			Col: int(u[3].(float64)), Parent: u[4].(string), Class: u[5].(string),
 		})
 	}
 	if !reflect.DeepEqual(uses, wantUses) {
 		t.Fatalf("uses differ:\n got %+v\nwant %+v", uses, wantUses)
+	}
+}
+
+// A module's reference file names its direct imports, and the module of each constant it uses: the declaring one,
+// as for a use in Sub/Wrap of Golden's Gold.Frame.
+func TestParseModuleKeepsImportsAndTheModuleOfEachTarget(t *testing.T) {
+	dir := filepath.Join("testdata", "golden", "Sub")
+	ilean, err := os.ReadFile(filepath.Join(dir, "Wrap.ilean"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.ReadFile(filepath.Join(dir, "Wrap.lean"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ParseModule("Sub/Wrap", ilean, src, Roots{"Golden": true, "Sub": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Imports, []string{"Golden"}) {
+		t.Errorf("imports %q, want Golden", got.Imports)
+	}
+	modules := map[string]string{}
+	for _, u := range got.Uses {
+		modules[u.Target] = u.TargetModule
+	}
+	if modules["Gold.Frame"] != "Golden" || modules["Gold2.FrameAt"] != "Sub.Wrap" {
+		t.Errorf("target modules %v; want Gold.Frame's Golden and Gold2.FrameAt's Sub.Wrap", modules)
 	}
 }
 

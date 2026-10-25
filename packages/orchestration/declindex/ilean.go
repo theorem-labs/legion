@@ -37,9 +37,12 @@ type Decl struct {
 // Use is one reference that elaboration recorded to a declaration of the roots.
 type Use struct {
 	Target string
-	Module string
-	Line   int // 1-based
-	Col    int // 1-based, in code points
+	// TargetModule is the module that Lean recorded for Target: the one that declares it, or for a constant that
+	// Lean made where it is used (an equation lemma), that using module.
+	TargetModule string
+	Module       string
+	Line         int // 1-based
+	Col          int // 1-based, in code points
 	// Parent is the declaration that holds the use; empty at top level (open, attribute, variable).
 	Parent string
 	// Class says where in Parent the use is: "stmt" (its statement: type, binders, hypotheses, or anywhere in a
@@ -50,25 +53,37 @@ type Use struct {
 
 // ModuleData is what one module's reference file and source give the index.
 type ModuleData struct {
-	Rel     string // path of the module below the library directory, without suffix
-	Module  string
+	Rel    string // path of the module below the library directory, without suffix
+	Module string
+	// Imports are the modules that the module imports directly.
+	Imports []string
 	Decls   []Decl
 	Uses    []Use
-	Imports []string
-	// Shapes and Heads are read from the source alone, nil when it is missing. Their Line is a declaration's
-	// 1-based first line, its doc comment and attributes included, which the index matches to Decl.Line.
-	Shapes []SourceShape
-	Heads  []SourceHead
 	// Stale counts the declarations whose recorded position does not hold their name in the source: the source is
 	// newer than the reference file. Their statement hashes are left empty.
 	Stale int
 }
 
 type ileanFile struct {
-	Version    int                       `json:"version"`
-	Module     string                    `json:"module"`
-	Decls      map[string][]int          `json:"decls"`
-	References map[string]ileanReference `json:"references"`
+	Version       int                       `json:"version"`
+	Module        string                    `json:"module"`
+	DirectImports []ileanImport             `json:"directImports"`
+	Decls         map[string][]int          `json:"decls"`
+	References    map[string]ileanReference `json:"references"`
+}
+
+// ileanImport is `[module, isExported, isMeta, importAll]`, one direct import.
+type ileanImport struct{ Module string }
+
+func (i *ileanImport) UnmarshalJSON(b []byte) error {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if len(raw) == 0 {
+		return fmt.Errorf("import %s names no module", b)
+	}
+	return json.Unmarshal(raw[0], &i.Module)
 }
 
 type ileanReference struct {
@@ -127,12 +142,12 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 	if md.Module == "" {
 		md.Module = strings.ReplaceAll(rel, "/", ".")
 	}
+	for _, i := range f.DirectImports {
+		md.Imports = append(md.Imports, i.Module)
+	}
 	var s *source
 	if src != nil {
 		s = newSource(string(src))
-		md.Imports = HeaderImports(src)
-		md.Shapes = SourceShapes(src)
-		md.Heads = SourceHeads(src)
 	}
 	names := make([]string, 0, len(f.Decls))
 	for name := range f.Decls {
@@ -194,7 +209,8 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 					class = "stmt"
 				}
 			}
-			md.Uses = append(md.Uses, Use{Target: k.C.N, Module: md.Module, Line: u.Line + 1, Col: ci + 1, Parent: u.Parent, Class: class})
+			md.Uses = append(md.Uses, Use{Target: k.C.N, TargetModule: k.C.M, Module: md.Module, Line: u.Line + 1, Col: ci + 1,
+				Parent: u.Parent, Class: class})
 		}
 	}
 	sortUses(md.Uses)
@@ -206,6 +222,9 @@ func sortUses(us []Use) {
 		a, b := us[i], us[j]
 		if a.Target != b.Target {
 			return a.Target < b.Target
+		}
+		if a.TargetModule != b.TargetModule {
+			return a.TargetModule < b.TargetModule
 		}
 		if a.Module != b.Module {
 			return a.Module < b.Module
@@ -268,6 +287,10 @@ func madeByLean(name string) bool {
 	return false
 }
 
+// unquote drops the guillemets that quote a name's components. A Replacer builds its tables once and is safe for
+// concurrent use, and ParseModule runs on parallel goroutines.
+var unquote = strings.NewReplacer("«", "", "»", "")
+
 // selectionHolds reports whether the source still holds the declaration at the position its reference file
 // recorded: the selection range is its name (or a dotted suffix of it, or the name written from `_root_`), or the
 // command of a declaration Lean names itself. A name Lean made has no written name to compare and passes. A
@@ -280,7 +303,6 @@ func selectionHolds(text, name string, sel, selEnd int) bool {
 	if sel < 0 || sel > len(text) {
 		return false
 	}
-	unquote := strings.NewReplacer("«", "", "»", "")
 	if selEnd >= sel && selEnd <= len(text) {
 		got := strings.TrimPrefix(unquote.Replace(text[sel:selEnd]), "_root_.")
 		want := unquote.Replace(want)

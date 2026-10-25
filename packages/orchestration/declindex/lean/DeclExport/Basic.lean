@@ -1,21 +1,23 @@
 import Lean
 open Lean
 
-/-! Shared pieces of the exporter: numeric literals as values, and structural hashes of expressions that do not
-depend on binder names, binder kinds, metadata or the names of universe parameters. -/
+/-! Shared pieces of the exporter: structural hashes of expressions that do not depend on binder names, binder
+kinds, metadata, the names of universe parameters, or how a numeral of core Lean's `Nat` and `BitVec` instances is
+written, and that count each constant with the module that declares it. -/
 
 namespace DeclExport
 
-/-- The value of a numeric literal however it is elaborated: a raw literal, `OfNat.ofNat _ n _`, `instOfNatNat n`
-or `BitVec.ofNat w n` (the `n#w` notation). -/
-partial def lit? (e : Expr) : Option Nat :=
-  match e.consumeMData with
-  | .lit (.natVal n) => some n
-  | e =>
-    if e.isAppOfArity ``OfNat.ofNat 3 then lit? (e.getArg! 1)
-    else if e.isAppOfArity ``instOfNatNat 1 then lit? (e.getArg! 0)
-    else if e.isAppOfArity ``BitVec.ofNat 2 then lit? (e.getArg! 1)
+/-- What the numeral `OfNat.ofNat α n inst` unfolds to when `inst` is a core instance with a known value:
+`instOfNatNat m` gives the literal `m`, and `BitVec.instOfNat w i` gives `BitVec.ofNat w i`, the elaboration of
+`i#w`. Any other instance gives `none`: its value is the instance's, not `n`'s. -/
+def unfoldNumeral? (e : Expr) : Option Expr :=
+  if e.isAppOfArity ``OfNat.ofNat 3 then
+    let inst := (e.getArg! 2).consumeMData
+    if inst.isAppOfArity ``instOfNatNat 1 then some (inst.getArg! 0)
+    else if inst.isAppOfArity ``BitVec.instOfNat 2 then
+      some (mkApp2 (.const ``BitVec.ofNat []) (inst.getArg! 0) (inst.getArg! 1))
     else none
+  else none
 
 /-- Two independent 64-bit lanes, so that a hash collision among a million constants is not a concern. -/
 structure H where
@@ -42,18 +44,74 @@ def H.hex (h : H) : String := hex64 h.a ++ hex64 h.b
 generates from it (`X.eq_1`, `X._unfold`, `X.rec`, `X.match_1`), by a placeholder and the generated suffix, so
 that a copy under a new name hashes equal; an auxiliary definition Lean makes while elaborating (a matcher, an
 abstracted proof) by its content, since a copy elsewhere gets its own or reuses an existing one; any other
-constant, a sub-declaration the user wrote (`X.base`) included, by its name. -/
+constant, a sub-declaration the user wrote (`X.base`) included, by its name as its source writes it (a private
+name without its module's prefix) and the identity that `moduleOf` gives it: the module that declares it, since two
+modules that are never imported together can each declare one name, or for a constant that Lean merges across
+modules (a public theorem, a proposition axiom) the hash of its type (Main.lean, `identify`). -/
 structure HashCtx where
   levels : List Name := []
   self : List Name := []
   env? : Option Environment := none
+  moduleOf : Name → Name := fun _ => .anonymous
 
-/-- An auxiliary definition that elaboration made: a matcher, or a proof abstracted out of a body. -/
-def isElabAux (env : Environment) (n : Name) : Bool :=
+/-- The constant `n` as a hash counts it: its name as its source writes it, and its identity (`HashCtx.moduleOf`). A
+private name holds the module that compiled it, which `moduleOf` already gives (and can count as another, see
+`Manifest.home`). -/
+def constId (ctx : HashCtx) (n : Name) : List H :=
+  [H.ofString ((privateToUserName? n).getD n).toString, H.ofString (ctx.moduleOf n).toString]
+
+/-- Whether the name component `s` is a name that Lean generates for an abstracted proof: `_proof_` (older
+toolchains `proof_`) and an index, digits with a further `_<digits>` for each nested name generator (`_proof_1`,
+`_proof_1_2`). -/
+def abstractedProofComponent (s : String) : Bool :=
+  let rest := (if s.startsWith "_proof_" then s.toList.drop 7 else if s.startsWith "proof_" then s.toList.drop 6 else [])
+  (rest.head?.any Char.isDigit) && (rest.getLast?.any Char.isDigit) &&
+    rest.all (fun c => c.isDigit || c == '_') && !((rest.zip rest.tail).any fun (a, b) => a == '_' && b == '_')
+
+-- The forms that the pinned toolchain writes (on the indexed project: `_proof_1`, and `_proof_1_3` in recursive
+-- declarations), the older form, and names that only start the same way. The exporter does not build when one fails.
+#guard abstractedProofComponent "_proof_1"
+#guard abstractedProofComponent "_proof_12"
+#guard abstractedProofComponent "_proof_1_3"
+#guard abstractedProofComponent "_proof_1_3_2"
+#guard abstractedProofComponent "proof_2"
+#guard !abstractedProofComponent "_proof_left"
+#guard !abstractedProofComponent "_proof_"
+#guard !abstractedProofComponent "_proof_1_"
+#guard !abstractedProofComponent "_proof__1"
+#guard !abstractedProofComponent "_proof_1a"
+#guard !abstractedProofComponent "proof_wanted"
+#guard !abstractedProofComponent "match_1"
+#guard !abstractedProofComponent "_simp_1"
+
+/-- Whether `n` is a matcher that elaboration made (`X.match_1`). The exporter imports modules without loading
+their environment extensions (`importModules`), so the matcher table that `Meta.isMatcherCore` reads is empty there
+for every imported constant. Each imported module's entries are loaded all the same, and a matcher's entry sits in
+the module that declares it, so the matcher of an imported module is found there. Lean names a matcher with a last
+component that starts with `match_` (`Meta.Match.Extension.getMatcherInfo?`), which keeps the scan to those. -/
+def isMatcher (env : Environment) (n : Name) : Bool :=
   Meta.isMatcherCore env n ||
-    match n with
-    | .str _ s => s.startsWith "proof_" || s.startsWith "match_" || s.startsWith "_auxLemma"
-    | _ => false
+    match n.eraseMacroScopes, env.getModuleIdxFor? n with
+    | .str _ s, some idx => s.startsWith "match_" &&
+        (PersistentEnvExtension.getModuleEntries Meta.Match.Extension.extension env idx).any (·.name == n)
+    | _, _ => false
+
+/-- Whether `n`, whose constant is `ci`, is an auxiliary definition that elaboration made: a matcher (`isMatcher`),
+or a theorem that holds a proof abstracted out of a body (`abstractedProofComponent`, `X._proof_1`). A constant of
+another kind, or with another last name component, is a declaration like any other, also when its name starts the
+same way: the constructors `Choice._proof_left` and `Pick.match_left` keep their own identity. -/
+def isElabAux (env : Environment) (n : Name) (ci : ConstantInfo) : Bool :=
+  isMatcher env n ||
+    match ci, n with
+    | .thmInfo _, .str _ s => abstractedProofComponent s
+    | _, _ => false
+
+/-- The parts of the auxiliary definition `ci` that the hashes read: an abstracted proof's type alone, since
+elaboration reuses an earlier declaration's proof of that type, and a matcher's type and value. -/
+def auxParts (ci : ConstantInfo) : List Expr :=
+  match ci with
+  | .thmInfo _ => [ci.type]
+  | _ => ci.type :: ci.value?.toList
 
 /-- A name component Lean generates for a declaration's own parts: equation and unfolding lemmas, recursors and
 the other parts of an inductive, the parts of structural and well-founded recursion, and compiler auxiliaries. -/
@@ -86,7 +144,9 @@ structure HashState where
 
 abbrev HashM := StateM HashState
 
-/-- The structural hash of `e`. Numeric literals hash by value, so `7#64` and `OfNat.ofNat _ 7 _` agree. -/
+/-- The structural hash of `e`. A numeral of a core instance hashes as what it unfolds to (`unfoldNumeral?`), so
+`7 : Nat` and the literal `7` agree, and so do `7#64` and `7 : BitVec 64`. Any other numeral hashes as written, its
+type and instance included: the instance gives its value, so `@OfNat.ofNat Nat 7 ⟨9⟩` is 9. -/
 partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
   if let some h := (← get).memo[e]? then return h
   let h ← match e with
@@ -103,10 +163,10 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
     | .mvar _ => pure (H.tag "?" [])
     | .sort l => pure (H.tag "S" [hashLevel ctx l])
     | .const n ls =>
-      match ctx.env?.bind fun env => if isElabAux env n then env.find? n else none with
+      match ctx.env?.bind fun env => (env.find? n).filter (isElabAux env n) with
       | some ci =>
         let sub : HashCtx := { ctx with levels := ci.levelParams, self := n :: ctx.self }
-        let parts : List H := Id.run (((ci.type :: ci.value?.toList).mapM (hashExpr sub)).run' {})
+        let parts : List H := Id.run (((auxParts ci).mapM (hashExpr sub)).run' {})
         pure (H.tag "aux" (parts ++ ls.map (hashLevel ctx)))
       | none =>
         let own := ctx.self.findIdx? fun p => p == n || (p.isPrefixOf n && generatedSuffix (n.replacePrefix p .anonymous))
@@ -114,10 +174,10 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
         | some i =>
           let suffix := (n.replacePrefix ctx.self[i]! .anonymous).toString
           pure (H.tag "self" (H.ofU i.toUInt64 :: H.ofString suffix :: ls.map (hashLevel ctx)))
-        | none => pure (H.tag "c" (H.ofString n.toString :: ls.map (hashLevel ctx)))
+        | none => pure (H.tag "c" (constId ctx n ++ ls.map (hashLevel ctx)))
     | .app .. =>
-      match lit? e with
-      | some n => pure (H.tag "n" [H.ofString (toString n)])
+      match unfoldNumeral? e with
+      | some u => hashExpr ctx u
       | none => do pure (H.tag "a" [← hashExpr ctx e.appFn!, ← hashExpr ctx e.appArg!])
     | .lam _ d b _ => do pure (H.tag "L" [← hashExpr ctx d, ← hashExpr ctx b])
     | .forallE _ d b _ => do pure (H.tag "P" [← hashExpr ctx d, ← hashExpr ctx b])
@@ -125,7 +185,7 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
     | .lit (.natVal n) => pure (H.tag "n" [H.ofString (toString n)])
     | .lit (.strVal s) => pure (H.tag "str" [H.ofString s])
     | .mdata _ b => hashExpr ctx b
-    | .proj s i b => do pure (H.tag "pj" [H.ofString s.toString, H.ofU i.toUInt64, ← hashExpr ctx b])
+    | .proj s i b => do pure (H.tag "pj" (constId ctx s ++ [H.ofU i.toUInt64, ← hashExpr ctx b]))
   -- A free variable's hash depends on the order of first occurrence, so terms with free variables are not memoised.
   if !e.hasFVar then modify fun s => { s with memo := s.memo.insert e h }
   return h
@@ -139,11 +199,12 @@ def relationHeads : List Name :=
 
 def symmetricHeads : List Name := [``Eq, ``Ne, ``Iff, ``HEq]
 
-/-- The canonical hash of one atom: free variables by first occurrence, and a symmetric relation hashed in the
-order of its two hashes, so that `a = b` and `b = a` agree. -/
-def atomHash (e : Expr) : H :=
+/-- The canonical hash of one atom: free variables by first occurrence, each constant with the module that
+`moduleOf` gives it (an auxiliary definition by its content, which `env` gives), and a symmetric relation hashed in
+the order of its two hashes, so that `a = b` and `b = a` agree. -/
+def atomHash (env : Environment) (moduleOf : Name → Name) (e : Expr) : H :=
   let e := e.consumeMData
-  let one (x : Expr) : H := hashOf {} [x]
+  let one (x : Expr) : H := hashOf { env? := some env, moduleOf := moduleOf } [x]
   match e.getAppFn.consumeMData with
   | .const n _ =>
     if symmetricHeads.contains n && e.getAppNumArgs ≥ 2 then
