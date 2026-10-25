@@ -199,11 +199,11 @@ func logf(w io.Writer, format string, args ...any) {
 	}
 }
 
-// Refresh brings the index to the tree's current build. It holds the refresh lock across the landed sync
+// Refresh brings the index to the tree's current build. It holds the index's advisory lock across the landed sync
 // (RefreshOptions.Landed) and the refresh: a post-landing fetch, checkout and build cannot race a second index
-// refresh, and a reader of the tree in a read-only directory observes only the result after both complete. The
-// refresh takes the write lock only while it writes the index (Store.write), so a reader of the index alone reads
-// the index of the refresh before while the sync runs.
+// refresh, and a reader of the tree waits for the result of both. The lock and the refresh's write transactions
+// live on one connection, so a refresh that loses it has written nothing; a reader of the index alone takes no
+// lock and reads the state of the refresh before while this one runs.
 func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
 	unlock, err := s.lockRefresh(ctx)
 	if err != nil {
@@ -235,8 +235,8 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 	return s.refreshLocked(ctx, tree, opt)
 }
 
-// refreshLocked is Refresh's body. Its caller holds the refresh lock; it reads the tree first, and then writes the
-// index under the write lock.
+// refreshLocked is Refresh's body. Its caller holds the index's lock; it reads the tree first, and then writes the
+// index in one transaction on the connection that holds the lock.
 func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	st := RefreshStats{WithoutForms: []FormsClash{}}

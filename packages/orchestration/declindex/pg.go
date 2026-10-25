@@ -9,6 +9,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -61,8 +62,8 @@ func lockKeys(index string) (int32, int32) {
 	return lockClass, int32(h.Sum32())
 }
 
-// errUnreachable marks the errors this package raises about a connection that is gone, which pgx reports without
-// an error of its own (a pooled connection that a terminated backend left closed).
+// errUnreachable marks the errors this package raises about a connection that is already gone, which the driver
+// reports with an error of no kind of its own ("conn closed").
 var errUnreachable = errors.New("the index's database is unreachable")
 
 // Unreachable reports whether err is a failed connection to the index's database, rather than an answer from it:
@@ -80,9 +81,19 @@ func Unreachable(err error) bool {
 	if errors.As(err, &connErr) {
 		return true
 	}
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	if errors.As(err, &opErr) || errors.As(err, &dnsErr) {
+		return true
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return true
+		// A net.Error alone says little: syscall.Errno has Timeout and Temporary too, so a missing file would
+		// count here as a database that cannot be reached, and a command would exit 75 instead of 3.
+		var errno syscall.Errno
+		if !errors.As(err, &errno) {
+			return true
+		}
 	}
 	if pgconn.Timeout(err) {
 		return true
@@ -95,8 +106,9 @@ func Unreachable(err error) bool {
 	return false
 }
 
-// unreachable wraps err as a failed connection when conn is closed: pgx reports a statement on a connection that a
-// terminated backend left closed with an error of no kind of its own.
+// unreachable wraps err as a failed connection when conn is closed. A statement that meets the end of its
+// connection is told SQLSTATE 57P01 or a network error, which Unreachable knows; one that runs on a connection
+// closed before it reaches the server is told only that it is closed.
 func unreachable(conn *pgx.Conn, err error) error {
 	if err == nil || Unreachable(err) || conn == nil || !conn.IsClosed() {
 		return err

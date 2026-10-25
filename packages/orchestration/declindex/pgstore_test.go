@@ -3,7 +3,10 @@ package declindex
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -132,6 +135,10 @@ func TestTwoRefreshesSerializeAndATreeReaderWaitsForOne(t *testing.T) {
 	ctx := context.Background()
 	tree := pgEmptyTree(t)
 	held, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	goOn := func() { once.Do(func() { close(release) }) }
+	// A test that fails here must not leave the first refresh holding the index's lock for ever.
+	t.Cleanup(goOn)
 	first.afterRefreshLock = func(context.Context) error {
 		close(held)
 		<-release
@@ -177,7 +184,7 @@ func TestTwoRefreshesSerializeAndATreeReaderWaitsForOne(t *testing.T) {
 		t.Fatalf("the reader of the tree did not wait for the refresh: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(release)
+	goOn()
 	for _, done := range []chan error{firstDone, secondDone, readerDone} {
 		select {
 		case err := <-done:
@@ -397,5 +404,12 @@ func TestAnUnreachableDatabaseIsReportedAsUnreachable(t *testing.T) {
 	}
 	if Unreachable(errors.New("the index's compiled part is of c1")) {
 		t.Error("an answer of the database was reported as an unreachable one")
+	}
+	// A missing file is a defect of what a command reads, not a database it cannot reach: a system call error
+	// carries Timeout and Temporary, and so passes for a net.Error.
+	if _, err := os.Open(filepath.Join(t.TempDir(), "missing.json")); err == nil {
+		t.Fatal("a file that is not there opened")
+	} else if Unreachable(err) {
+		t.Errorf("the missing file %v was reported as an unreachable database, so a command would exit 75, not 3", err)
 	}
 }

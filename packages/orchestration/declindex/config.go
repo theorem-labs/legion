@@ -225,9 +225,7 @@ func (c Config) TreeSpec() Tree {
 }
 
 // Compiled gives the options of the compiled part for this configuration: the tree's toolchain, the exporter
-// built with it below the index's directory, and the library directories of the tree and its Lake packages. The
-// index's directory is the one of the file it resolves to, as for its locks and graph (resolveIndex), so that every
-// path that names one index builds one exporter and one forms module.
+// built with it below the index's state directory, and the library directories of the tree and its Lake packages.
 func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) (*CompiledOptions, error) {
 	l, err := FindLean(ctx, c.Tree, c.Lean.Toolchain)
 	if err != nil {

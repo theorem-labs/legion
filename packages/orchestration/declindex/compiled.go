@@ -610,7 +610,7 @@ func dottedPrefixes(name string) iter.Seq[string] {
 
 // owners maps each compiled constant to the declaration it belongs to (ownerResolver.owner: `X.mk` is X's
 // constructor), or to the constant itself, with no place, when it belongs to none. It resolves all the constants at
-// once: one query per maxInParams candidate names (each name and its dotted prefixes), not one lookup per constant.
+// once: one query for the candidate names (each name and its dotted prefixes), not one lookup per constant.
 // A wide concept has tens of thousands of statements.
 func (s *Store) owners(ctx context.Context, consts []declRef) (map[declRef]Found, error) {
 	names := make([]string, len(consts))
