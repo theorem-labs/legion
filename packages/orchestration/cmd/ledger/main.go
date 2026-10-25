@@ -372,6 +372,11 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 			return nil, false, err
 		}
 		return mutation(s.Abandon(ctx, args[0], args[1], generation, args[3]))
+	case "retry":
+		if len(args) != 2 {
+			return nil, false, usagef("retry <repo> <id>")
+		}
+		return mutation(s.Retry(ctx, args[0], args[1]))
 	case "round":
 		var request ledger.RoundRequest
 		if decoded, jsonInput, err := requestFile[ledger.RoundRequest](args); jsonInput {
