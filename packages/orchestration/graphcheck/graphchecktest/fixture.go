@@ -60,7 +60,14 @@ producers:
 // New builds the fixture.
 func New(t testing.TB) *Fixture {
 	t.Helper()
-	return build(t, nil)
+	return build(t, nil, true)
+}
+
+// NewWithoutCompiledPart builds the fixture with an index read from the reference files alone (lean.export off),
+// as a corpus index is: it holds no compiled constant, no type and no compiled statement hash.
+func NewWithoutCompiledPart(t testing.TB) *Fixture {
+	t.Helper()
+	return build(t, nil, false)
 }
 
 // NewWithUnreadableModule builds the fixture with Lib/Make.ilean truncated before the refresh, so the index
@@ -76,7 +83,7 @@ func NewWithUnreadableModule(t testing.TB) *Fixture {
 		if err := os.WriteFile(path, raw[:len(raw)/2], 0o644); err != nil {
 			t.Fatal(err)
 		}
-	})
+	}, true)
 }
 
 // RequireLean gives the Lean toolchain the fixture builds with: the `lean` on PATH. The rule tests compile the
@@ -97,7 +104,7 @@ func RequireLean(t testing.TB) declindex.Lean {
 	return lean
 }
 
-func build(t testing.TB, damage func(lib string)) *Fixture {
+func build(t testing.TB, damage func(lib string), compiled bool) *Fixture {
 	t.Helper()
 	lean := RequireLean(t)
 	built := baseLib(t, lean)
@@ -126,8 +133,12 @@ func build(t testing.TB, damage func(lib string)) *Fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	options := declindex.RefreshOptions{Commit: base, Jobs: 2}
+	if compiled {
+		options.Compiled = compiledPart(t, lean, lib, dir)
+	}
 	if _, err := store.Refresh(context.Background(), declindex.Tree{Source: repo, Lib: lib, Roots: declindex.Roots{"Lib": true}},
-		declindex.RefreshOptions{Commit: base, Jobs: 2, Compiled: compiledPart(t, lean, lib, dir)}); err != nil {
+		options); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

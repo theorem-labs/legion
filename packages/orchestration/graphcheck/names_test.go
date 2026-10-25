@@ -197,6 +197,23 @@ func TestNamesRefusesTheUsesOfADeletedFile(t *testing.T) {
 	}
 }
 
+// An index read from the reference files alone (a corpus index) knows no field, but every declaration: the names
+// check still decides, refuses the removed declaration, and reports no field rather than a wrong one.
+func TestNamesWithoutTheCompiledPartRefusesDeclarationsAndSkipsFields(t *testing.T) {
+	f := graphchecktest.NewWithoutCompiledPart(t)
+	tree := f.Edit(t, "Lib/Core.lean", "def helper (n : Nat) : Nat := n + 1\n\ndef size : Nat := 3\n\nstructure Box where\n  val : Nat",
+		"private def helper (n : Nat) : Nat := n + 1\n\ndef size : Nat := 3\n\nstructure Box where\n  value : Nat")
+	hits := names(t, f, tree)
+	if _, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Use.lean", "N1"); !ok {
+		t.Fatalf("no N1 refusal of Lib.Core.helper in %v", hits)
+	}
+	for _, h := range hits {
+		if h.Kind == blame.Field {
+			t.Fatalf("field finding %+v from an index with no compiled part", h)
+		}
+	}
+}
+
 func TestNamesIsUnableWhenTheIndexIsOfAnotherTree(t *testing.T) {
 	f := graphchecktest.New(t)
 	tree := f.Edit(t, "Lib/Core.lean", "def size", "def size2")
