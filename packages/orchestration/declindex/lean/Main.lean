@@ -54,19 +54,22 @@ partial def appHead (e : Expr) : String :=
   | .const n _ => n.toString
   | _ => ""
 
-/-- The constant at the head of `e` past its own binders, its type annotations (`optParam`, `autoParam`,
-`outParam`) and metadata, as Lean prints its full name; empty when the head is not a constant (a variable, a
-sort). -/
+/-- The constant at the head of `e` past its own binders, a `let` or `have` of its body, its type annotations
+(`optParam`, `autoParam`, `outParam`) and metadata, as Lean prints its full name; empty when the head is not a
+constant (a variable, a sort). -/
 partial def headOf (e : Expr) : String :=
   match e.cleanupAnnotations with
   | .forallE _ _ b _ => headOf b
+  | .letE _ _ _ b _ => headOf b
   | e => appHead e
 
 /-- The heads (`headOf`) of the types of a type's explicit binders, in order, and the head of its conclusion: the
-type past all its binders. Read from the elaborated type, not from how its source writes it. -/
+type past all its binders, and past a `let` or `have` between them. Read from the elaborated type, not from how its
+source writes it. -/
 partial def headsOf (e : Expr) (binders : Array String := #[]) : Array String × String :=
   match e.cleanupAnnotations with
   | .forallE _ t b bi => headsOf b (if bi.isExplicit then binders.push (headOf t) else binders)
+  | .letE _ _ _ b _ => headsOf b binders
   | e => (binders, headOf e)
 
 /-- Constants the exporter skips: compiler and elaborator auxiliaries, not statements anyone wrote. -/

@@ -276,3 +276,40 @@ func TestMetadataInsideAnApplicationHidesNoHead(t *testing.T) {
 		}
 	}
 }
+
+// A `let` in a type, at its top or between its binders, hides no head: the binders after it and the conclusion are
+// read past it.
+func TestALetInATypeHidesNoHead(t *testing.T) {
+	ctx := context.Background()
+	l := leanForTest(t)
+	dir := t.TempDir()
+	compileSource(t, l, dir, "Lets", "theorem letConclusion : let n := 5; n = 5 := by intro n; rfl\n"+
+		"theorem letThenBinder : let n := 5; n = 5 → True := by intros; trivial\n"+
+		"theorem binderThenLet (k : Nat) : let n := k; n = k := by intro n; rfl\n")
+	x := &Exporter{Lean: l, Bin: exporterForTest(t, l), SearchPath: []string{dir}, Jobs: 1}
+	cs, err := x.Run(ctx, Manifest{Modules: []string{"Lets"}, Roots: []string{"Lets"}, Types: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Constant{}
+	for _, c := range cs {
+		got[c.Name] = c
+	}
+	for name, want := range map[string]struct {
+		binders    []string
+		conclusion string
+	}{
+		"letConclusion": {[]string{}, "Eq"},
+		"letThenBinder": {[]string{"Eq"}, "True"},
+		"binderThenLet": {[]string{"Nat"}, "Eq"},
+	} {
+		c, ok := got[name]
+		if !ok {
+			t.Errorf("the exporter gave no constant %s", name)
+			continue
+		}
+		if !reflect.DeepEqual(c.Binders, want.binders) || c.Conclusion != want.conclusion {
+			t.Errorf("%s (%s): binders %q, conclusion %q; want %q, %q", name, c.Type, c.Binders, c.Conclusion, want.binders, want.conclusion)
+		}
+	}
+}
