@@ -29,6 +29,7 @@ var schemaTables = []string{
 	"repositories", "work_items", "migrations", "migration_writes", "migration_reads",
 	"contracts", "agreements", "agreement_reads", "events",
 	"ready_keys", "round_keys", "owner_refusals",
+	"batches", "batch_members", "batch_effects", "batch_effect_outputs",
 }
 
 // Store is a connection pool to one ledger database.
