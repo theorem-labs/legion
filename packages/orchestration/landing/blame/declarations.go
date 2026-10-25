@@ -478,9 +478,8 @@ func (s *scanner) continuation(code string, armMayStart bool) scanned {
 	return scanned{owned: true, signature: true}
 }
 
-// bodyField records a body line of a structure or class that names one of its
-// own fields: a line at the body's first indentation that matches fieldRE and
-// is not the constructor's `name ::` line.
+// bodyField records the fields that a body line of a structure or class
+// declares, when the line is at the body's first indentation.
 func (s *scanner) bodyField(code string) {
 	declaration := &s.declarations[len(s.declarations)-1]
 	if declaration.Kind != "structure" && declaration.Kind != "class" {
@@ -492,11 +491,82 @@ func (s *scanner) bodyField(code string) {
 	if indentation(code) != s.fieldColumn {
 		return
 	}
-	match := fieldRE.FindStringSubmatchIndex(code)
-	if match == nil || strings.HasPrefix(code[match[1]:], ":") {
-		return
+	declaration.Fields = append(declaration.Fields, fieldNames(code)...)
+}
+
+// fieldNames returns the fields an indented structure line declares, in
+// order: attributes and `private` or `protected`, one or more names, binder
+// groups, then `:`. A constructor line (`mk ::`), a default for a parent's
+// field (`base := 0`) and any other line declare none.
+func fieldNames(code string) []string {
+	if indentation(code) == 0 {
+		return nil
 	}
-	declaration.Fields = append(declaration.Fields, code[match[2]:match[3]])
+	rest := strings.TrimSpace(code)
+	for {
+		if strings.HasPrefix(rest, "@[") {
+			end := strings.IndexByte(rest, ']')
+			if end < 0 {
+				return nil
+			}
+			rest = strings.TrimLeft(rest[end+1:], " \t")
+			continue
+		}
+		if word := firstWord(rest); word == "private" || word == "protected" {
+			rest = strings.TrimLeft(rest[len(word):], " \t")
+			continue
+		}
+		break
+	}
+	var names []string
+	binders := false
+	for rest != "" {
+		first, size := utf8.DecodeRuneInString(rest)
+		switch {
+		case first == ':':
+			if strings.HasPrefix(rest, ":=") || strings.HasPrefix(rest, "::") {
+				return nil
+			}
+			return names
+		case strings.ContainsRune("([{⦃", first):
+			if len(names) == 0 {
+				return nil
+			}
+			end := closingBracket(rest)
+			if end < 0 {
+				return nil
+			}
+			rest, binders = rest[end:], true
+		case first == ' ' || first == '\t':
+			rest = rest[size:]
+		default:
+			word := firstWord(rest)
+			if word == "" || binders || !startsIdentifier(word) {
+				return nil
+			}
+			names = append(names, word)
+			rest = rest[len(word):]
+		}
+	}
+	return nil
+}
+
+// closingBracket is the index just after the bracket that closes the one text
+// starts with, or -1.
+func closingBracket(text string) int {
+	depth := 0
+	for index, r := range text {
+		switch {
+		case strings.ContainsRune("([{⦃", r):
+			depth++
+		case strings.ContainsRune(")]}⦄", r):
+			depth--
+			if depth == 0 {
+				return index + utf8.RuneLen(r)
+			}
+		}
+	}
+	return -1
 }
 
 // endLine records a code line of the current declaration as its last one. A

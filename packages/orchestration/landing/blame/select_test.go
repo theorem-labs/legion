@@ -33,3 +33,17 @@ func TestSelectForBoundsBroadEvidence(t *testing.T) {
 		t.Fatalf("SelectFor = %+v, want no member and the strong-matches note", got)
 	}
 }
+
+// A graph finding of kind field names the field by its qualified name, as the
+// evidence records it; build blame names it bare. Both select the member.
+func TestSelectForMatchesAQualifiedField(t *testing.T) {
+	evidence := map[string]Evidence{"culprit": NewEvidence(), "bystander": NewEvidence()}
+	evidence["culprit"].FieldsRemoved["Lib.Core.Box.val"] = struct{}{}
+	evidence["bystander"].FieldsRemoved["Lib.Core.Other.size"] = struct{}{}
+	for _, name := range []string{"Lib.Core.Box.val", "Box.val", "val"} {
+		got := SelectFor(Name{Value: name, Kind: Field}, evidence, TreeLines{})
+		if len(got.Members) != 1 || got.Members[0].Member != "culprit" {
+			t.Errorf("SelectFor(%q) = %+v, want culprit", name, got)
+		}
+	}
+}

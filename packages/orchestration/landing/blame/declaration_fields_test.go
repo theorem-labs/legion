@@ -37,3 +37,34 @@ func TestScanDeclarationsReadsOnlyTopLevelFields(t *testing.T) {
 		t.Fatalf("theorem = %+v", ds[1])
 	}
 }
+
+// Every Lean field form gives its names, in order: binders, several names on
+// one line, a modifier, an attribute. A default that overrides a parent's
+// field, the constructor line and `deriving` declare no field.
+func TestScanDeclarationsReadsEveryFieldForm(t *testing.T) {
+	for name, test := range map[string]struct {
+		line string
+		want []string
+	}{
+		"binders":         {"  f (n : Nat) {m : Nat} [inst : Inhabited α] : Fin (n+1)", []string{"f"}},
+		"several names":   {"  x y : Nat", []string{"x", "y"}},
+		"protected":       {"  protected p : Nat", []string{"p"}},
+		"private":         {"  private q : Nat", []string{"q"}},
+		"attribute":       {"  @[simp] h : 0 = 0", []string{"h"}},
+		"default":         {"  d : Nat := 3", []string{"d"}},
+		"primed":          {"  v' : Nat", []string{"v'"}},
+		"parent default":  {"  base := 0", nil},
+		"constructor":     {"  mk' ::", nil},
+		"deriving":        {"  deriving Repr", nil},
+		"proof by tactic": {"  ok : True := by\n    trivial", []string{"ok"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			src := "structure S extends Base where\n  z : Nat\n" + test.line + "\n  w : Nat\n"
+			ds := ScanDeclarations("S.lean", src, nil)
+			want := append(append([]string{"z"}, test.want...), "w")
+			if len(ds) != 1 || !reflect.DeepEqual(ds[0].Fields, want) {
+				t.Fatalf("declarations = %+v, want fields %q", ds, want)
+			}
+		})
+	}
+}

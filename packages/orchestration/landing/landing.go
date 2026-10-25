@@ -1221,13 +1221,12 @@ func (r Runner) CheckCandidate(ctx context.Context, input Input) (CheckReport, e
 	if err := r.readChanges(ctx, input.Repository, input.Base, input.Members); err != nil {
 		return CheckReport{}, err
 	}
-	batch := Batch{ID: input.ID, Repository: input.Repository, Base: input.Base, FrozenMembers: input.Members, ActiveMembers: cloneMembers(input.Members)}
-	candidate, err := r.candidate(ctx, batch.Repository, batch.Base, batch.ActiveMembers)
+	candidate, err := r.candidate(ctx, input.Repository, input.Base, input.Members)
 	if err != nil {
 		return CheckReport{}, fmt.Errorf("build candidate: %w", err)
 	}
-	batch.Candidate = candidate
-	batch.ActiveMembers = candidateMembers(batch)
+	batch := Batch{ID: input.ID, Repository: input.Repository, Base: input.Base, FrozenMembers: input.Members, Candidate: candidate,
+		ActiveMembers: candidateMembers(Batch{ActiveMembers: cloneMembers(input.Members), Candidate: candidate})}
 	verdicts, _, err := r.evaluateChecks(ctx, &batch, true)
 	if err != nil {
 		return CheckReport{}, err
@@ -1604,16 +1603,6 @@ func (r Runner) infraLimit() int {
 		return r.InfraRetries
 	}
 	return 0
-}
-
-func (b *Batch) setCheck(verdict CheckVerdict) {
-	for index, current := range b.Checks {
-		if current.Name == verdict.Name {
-			b.Checks[index] = verdict
-			return
-		}
-	}
-	b.Checks = append(b.Checks, verdict)
 }
 
 func sameInput(batch Batch, input Input) bool {

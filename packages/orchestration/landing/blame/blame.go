@@ -71,7 +71,6 @@ var (
 	importRE       = regexp.MustCompile(`\bimport (\S+) failed`)
 	blockEndRE     = regexp.MustCompile(`^(?:error:|warning:|info:|trace:|✔|✖|⚠|\[|-- build round|Build completed|Some required|Some builds)`)
 	identifier     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.'!?-]*$`)
-	fieldRE        = regexp.MustCompile(`^\s+([A-Za-z_][A-Za-z0-9_']*)\s*:`)
 	unknownRE      = regexp.MustCompile("(?i)(?:unknown identifier|unknown constant|the environment does not contain|unknown namespace)\\s*[`']([^`']+)[`']")
 	addedRE        = regexp.MustCompile(`environment already contains '([^']+)'`)
 	fieldOfRE      = regexp.MustCompile("is not a field of structure `([^`]+)`")
@@ -337,15 +336,10 @@ func EvidenceFor(name Name, evidence Evidence) (int, string) {
 			return 1, "edited"
 		}
 	case Field:
-		for value := range evidence.FieldsAdded {
-			if last(value) == name.Value {
-				return 2, "field"
-			}
-		}
-		for value := range evidence.FieldsRemoved {
-			if last(value) == name.Value {
-				return 2, "field"
-			}
+		// Evidence records a field by its qualified name; build blame names
+		// it bare and a graph finding names it qualified.
+		if containsName(evidence.FieldsAdded, name.Value) || containsName(evidence.FieldsRemoved, name.Value) {
+			return 2, "field"
 		}
 	default:
 		switch {
