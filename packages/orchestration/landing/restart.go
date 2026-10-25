@@ -63,7 +63,7 @@ func (r Runner) recoverReturns(ctx context.Context, batch *Batch) error {
 			return fmt.Errorf("check return %q: %w", operation.Member, err)
 		}
 		if !done {
-			if err := r.Ledger.ReturnMember(ctx, batch.Repository, member.Migration, member.Generation, operation.Reason); err != nil {
+			if err := r.Ledger.ReturnMember(ctx, roundRequest(operation, member)); err != nil {
 				return fmt.Errorf("complete return %q: %w", operation.Member, err)
 			}
 		}

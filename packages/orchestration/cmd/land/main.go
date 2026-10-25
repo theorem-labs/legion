@@ -126,12 +126,29 @@ type checkConfig struct {
 	Name    string   `json:"name"`
 	Command []string `json:"command"`
 }
+
+// ledgerConfig names the ledger CLI's argv before the command (command), which
+// runs the checks, the landings, the rounds and the contract list, and the
+// configured status and migration-state commands.
 type ledgerConfig struct {
-	Check          []string `json:"check"`
-	Land           []string `json:"land"`
-	Return         []string `json:"return"`
+	Command        []string `json:"command"`
 	Status         []string `json:"status"`
 	MigrationState []string `json:"migrationState"`
+}
+
+// UnmarshalJSON refuses the removed per-operation ledger commands.
+func (l *ledgerConfig) UnmarshalJSON(body []byte) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(body, &keys); err != nil {
+		return err
+	}
+	for _, removed := range []string{"check", "land", "return"} {
+		if _, found := keys[removed]; found {
+			return fmt.Errorf("ledger.%s is removed; set ledger.command to the ledger CLI's argv", removed)
+		}
+	}
+	type plain ledgerConfig
+	return json.Unmarshal(body, (*plain)(l))
 }
 
 // repositoryConfig names the repository the program lands into: Name is its
@@ -192,14 +209,14 @@ func (c config) runner() (landing.Runner, landing.Input, *landing.JSONStore, err
 	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" || c.StatePath == "" {
 		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, baseBranch, and statePath are required")
 	}
-	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Check) == 0 || len(c.Ledger.Land) == 0 || len(c.Ledger.Return) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
-		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build, hasher, toolchain, and every ledger command including state are required")
+	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Command) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
+		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build, hasher, toolchain, ledger.command, ledger.status, and ledger.migrationState are required")
 	}
 	path := c.Repository.Path
 	store := &landing.JSONStore{Path: c.StatePath}
 	runner := landing.Runner{
 		Store:        store,
-		Ledger:       landing.CommandLedger{Directory: path, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
+		Ledger:       landing.CommandLedger{Directory: path, Command: c.Ledger.Command, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
 		Builder:      landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
 		Hasher:       landing.CommandHasher{Command: c.Hasher, Directory: path},
 		Git:          landing.RepositoryGit{Path: path},

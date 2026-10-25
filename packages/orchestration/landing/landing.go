@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/sjawhar/legion/orchestration/landing/blame"
@@ -18,33 +19,103 @@ import (
 // Tree is an immutable source tree supplied to checks and builds.
 type Tree = blame.Tree
 
-// Builder builds a tree. An empty module list selects the configured roots.
-type Builder = blame.Builder
+// Builder builds a tree. Build removes its directory when it returns; it serves
+// the blame and confirmation builds. BuildKept builds the candidate and keeps
+// its directory until the caller releases it, so the hasher can read the build.
+type Builder interface {
+	blame.Builder
+	BuildKept(context.Context, Tree) (KeptBuild, error)
+}
+
+// KeptBuild is a candidate build whose directory stays until Release. Release
+// is never nil, and a second call does nothing.
+type KeptBuild struct {
+	Result    blame.BuildResult
+	Directory string
+	Release   func()
+}
+
+func noRelease() {}
 
 // Ledger is the landing-facing contract with the durable ledger.
 type Ledger interface {
-	Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error)
+	Check(context.Context, CheckRequest) (CheckResult, error)
 	Land(context.Context, LandRequest) error
-	ReturnMember(context.Context, string, string, int64, string) error
+	ReturnMember(context.Context, RoundRequest) error
+	Contracts(context.Context, string) ([]Contract, error)
 	MigrationState(context.Context, string, string) (state string, landedCommit string, err error)
 }
 
-// LandRequest matches the ledger's complete landing transaction input.
-type LandRequest struct {
-	Repo             string            `json:"repo"`
-	Migration        string            `json:"migration"`
-	Generation       int64             `json:"generation"`
-	Commit           string            `json:"commit"`
-	ChangedPaths     []string          `json:"changed_paths"`
-	Current          map[string]string `json:"current"`
-	ChangedContracts map[string]string `json:"changed_contracts"`
-	ApprovedPinned   []string          `json:"approved_pinned"`
+// Review is an owner's review of one contract's statement change at a head.
+type Review struct {
+	Contract string `json:"contract"`
+	Reviewer string `json:"reviewer"`
+	Head     string `json:"head"`
 }
 
-// CheckResult describes one ledger decision.
+// LandRequest is the ledger's LandRequest, field for field: the candidate, the
+// current hash of each read, and the member's statement records.
+type LandRequest struct {
+	Repo               string            `json:"repo"`
+	Migration          string            `json:"migration"`
+	Generation         int64             `json:"generation"`
+	Commit             string            `json:"commit"`
+	ChangedPaths       []string          `json:"changed_paths"`
+	Current            map[string]string `json:"current"`
+	ChangedContracts   map[string]string `json:"changed_contracts"`
+	Head               string            `json:"head"`
+	CompatibilityProof string            `json:"compatibility_proof"`
+	ReviewedHead       string            `json:"reviewed_head"`
+	Reviews            []Review          `json:"reviews"`
+	ApprovedPinned     []string          `json:"approved_pinned"`
+}
+
+// CheckRequest is the ledger's CheckRequest. DeferReads asks for the check
+// before the build, which compares no read hashes and needs no commit.
+type CheckRequest struct {
+	LandRequest
+	DeferReads bool `json:"defer_reads"`
+}
+
+// The ledger's check outcomes. A deferred check that finds nothing is incomplete.
+const (
+	CheckPass       = "pass"
+	CheckRefused    = "refused"
+	CheckIncomplete = "incomplete"
+)
+
+// Violation is one reason the ledger gives that a candidate must not land.
+type Violation struct {
+	Kind    string `json:"kind"`
+	Name    string `json:"name,omitempty"`
+	Path    string `json:"path,omitempty"`
+	Message string `json:"message"`
+}
+
+// CheckResult is the ledger's decision on one member.
 type CheckResult struct {
-	Refused bool
-	Reason  string
+	Outcome    string      `json:"outcome"`
+	Violations []Violation `json:"violations"`
+}
+
+// RoundRequest is the ledger's RoundRequest: one member sent back from one
+// batch. ReadyEvent is the ready record the batch read, so the round clears
+// that record and never a newer one.
+type RoundRequest struct {
+	Repo       string `json:"repo"`
+	ID         string `json:"id"`
+	Generation int64  `json:"generation"`
+	Reason     string `json:"reason"`
+	Batch      string `json:"batch"`
+	Key        string `json:"key"`
+	ReadyEvent int64  `json:"ready_event"`
+	Detail     string `json:"detail"`
+}
+
+// Contract is a registered contract, as the ledger's contract list prints it.
+type Contract struct {
+	Name          string `json:"name"`
+	StatementHash string `json:"statement_hash"`
 }
 
 // OperationStatus lets an external dependency confirm a durable operation
@@ -53,10 +124,34 @@ type OperationStatus interface {
 	OperationComplete(context.Context, Operation) (bool, error)
 }
 
-// Hasher gives declaration hashes at a tree.
-type Hasher interface {
-	Hashes(context.Context, Tree, []string) (map[string]string, error)
+// HashInput asks for the statement hash of each name at a tree. BuildDirectory
+// is the candidate's kept build; it is empty for the base tree.
+type HashInput struct {
+	Tree           Tree
+	BuildDirectory string
+	Names          []string
 }
+
+// StatementHash is one name's statement at a tree and the paths that declare
+// it. No path means the name is absent, with the empty hash; more than one
+// path means the name is ambiguous, and its hash cannot be used.
+type StatementHash struct {
+	Hash  string
+	Paths []string
+}
+
+// Ambiguous reports that more than one path declares the name.
+func (h StatementHash) Ambiguous() bool { return len(h.Paths) > 1 }
+
+// Hasher gives statement hashes at a tree.
+type Hasher interface {
+	Hashes(context.Context, HashInput) (map[string]StatementHash, error)
+}
+
+// HashUnableError says the hasher could not check a tree (its exit 3).
+type HashUnableError struct{ Output string }
+
+func (e HashUnableError) Error() string { return "hasher unable to check: " + e.Output }
 
 // Git creates candidate commits and exposes declaration evidence.
 type Git interface {
@@ -95,20 +190,29 @@ const (
 )
 
 // Member is the frozen identity of one proposed migration. Changed is read once,
-// when the batch freezes. CurrentHashes and the ledger decision are derived
-// values, each stored with the batch key it was derived at.
+// when the batch freezes. The statement records (ChangedContracts as the owner
+// declares them, Reviews, ReviewedHead, CompatibilityProof and ApprovedPinned)
+// and ReadyEvent come from the member's ready record and never change.
+// CurrentHashes, DerivedContracts and the ledger decision are derived values,
+// each stored with the batch key it was derived at.
 type Member struct {
-	Migration        string            `json:"migration"`
-	Generation       int64             `json:"generation"`
-	Head             string            `json:"head"`
-	ComparisonBase   string            `json:"comparisonBase"`
-	Changed          []string          `json:"changed"`
-	ReadNames        []string          `json:"readNames"`
-	CurrentHashes    map[string]string `json:"currentHashes"`
-	HashesKey        string            `json:"hashesKey"`
-	LedgerKey        string            `json:"ledgerKey"`
-	ChangedContracts map[string]string `json:"changedContracts"`
-	ApprovedPinned   []string          `json:"approvedPinned"`
+	Migration          string            `json:"migration"`
+	Generation         int64             `json:"generation"`
+	Head               string            `json:"head"`
+	ReadyEvent         int64             `json:"ready_event"`
+	ComparisonBase     string            `json:"comparisonBase"`
+	Changed            []string          `json:"changed"`
+	ReadNames          []string          `json:"readNames"`
+	CurrentHashes      map[string]string `json:"currentHashes"`
+	DerivedContracts   map[string]string `json:"derivedContracts"`
+	HashesKey          string            `json:"hashesKey"`
+	DeferredKey        string            `json:"deferredKey"`
+	LedgerKey          string            `json:"ledgerKey"`
+	ChangedContracts   map[string]string `json:"changedContracts"`
+	Reviews            []Review          `json:"reviews"`
+	ReviewedHead       string            `json:"reviewedHead"`
+	CompatibilityProof string            `json:"compatibilityProof"`
+	ApprovedPinned     []string          `json:"approvedPinned"`
 }
 
 // DroppedMember records why a frozen member left the candidate.
@@ -160,6 +264,7 @@ type Operation struct {
 	Generation int64          `json:"generation"`
 	Commit     string         `json:"commit"`
 	Reason     string         `json:"reason"`
+	Detail     string         `json:"detail,omitempty"`
 	State      OperationState `json:"state"`
 }
 
@@ -333,12 +438,12 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 	return r.advance(ctx, &batch)
 }
 
-// advance brings every derived value to the batch's current key, in order (the
-// candidate, each member's ledger decision, the repository checks, the build
-// and its receipt), and builds until the candidate is green or the batch fails.
-// Each step compares its stored key with the current key before its side
-// effect and recomputes only when they differ. A returned member changes the
-// key, so the loop starts again from the candidate.
+// advance brings every derived value to the batch's current key, in order: the
+// candidate, each member's deferred ledger check, the repository checks, the
+// candidate build, the statement hashes at the base and the candidate, each
+// member's derived statement changes and its full ledger check, and the
+// receipt. It builds until the candidate is green or the batch fails. A
+// returned member changes the key, so the loop starts again from the candidate.
 func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 	if policy := r.policyDigest(); batch.CheckPolicyDigest != policy {
 		batch.CheckPolicyDigest = policy
@@ -350,7 +455,7 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 		if err := r.ensureCandidate(ctx, batch); err != nil {
 			return r.fail(ctx, batch, "candidate")
 		}
-		returned, err := r.checkLedger(ctx, batch)
+		returned, err := r.deferredCheck(ctx, batch)
 		if err != nil {
 			return r.fail(ctx, batch, "ledger")
 		}
@@ -379,15 +484,30 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 		if batch.Round >= r.roundLimit() {
 			return r.fail(ctx, batch, "max-rounds")
 		}
-		result, infra, err := r.build(ctx, batch)
+		build, infra, err := r.build(ctx, batch)
 		if err != nil {
 			return r.fail(ctx, batch, "build")
 		}
 		if infra {
 			return r.fail(ctx, batch, "infra")
 		}
-		if result.Green {
-			receipt, err := r.receipt(ctx, *batch, result.Output)
+		if build.Result.Green {
+			returned, err := r.checkStatements(ctx, batch, build)
+			if err != nil {
+				var unable HashUnableError
+				var unattributed statementUnattributed
+				switch {
+				case errors.As(err, &unable):
+					return r.fail(ctx, batch, "hash-unable")
+				case errors.As(err, &unattributed):
+					return r.fail(ctx, batch, "statement-unattributed")
+				}
+				return r.fail(ctx, batch, "ledger")
+			}
+			if returned {
+				continue
+			}
+			receipt, err := r.receipt(ctx, *batch, build.Result.Output)
 			if err != nil {
 				return r.fail(ctx, batch, "receipt")
 			}
@@ -397,10 +517,11 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 			}
 			return *batch, nil
 		}
+		build.Release()
 		if err := r.transition(ctx, batch, Blaming, ""); err != nil {
 			return Batch{}, err
 		}
-		baseBroken, culprits, err := r.blame(ctx, batch, result.Output)
+		baseBroken, culprits, err := r.blame(ctx, batch, build.Result.Output)
 		if err != nil {
 			var infraFailure InfrastructureError
 			if errors.As(err, &infraFailure) {
@@ -484,7 +605,7 @@ func (r Runner) ensureCandidate(ctx context.Context, batch *Batch) error {
 		}
 	}
 	for _, drop := range batch.Candidate.Dropped {
-		if err := r.returnMember(ctx, batch, drop.ID, drop.Reason); err != nil {
+		if err := r.returnMember(ctx, batch, drop.ID, drop.Reason, ""); err != nil {
 			return err
 		}
 	}
@@ -509,54 +630,258 @@ func candidateMembers(batch Batch) []Member {
 	return out
 }
 
-// checkLedger checks each active member whose ledger decision is not at the
-// current key, with read hashes of the current candidate, also stored with
-// that key. Every member is checked against the same candidate; the refused
-// ones are returned, and checkLedger reports whether it returned any.
-func (r Runner) checkLedger(ctx context.Context, batch *Batch) (bool, error) {
+// deferredCheck runs the ledger's check before the build for each active member
+// whose deferred decision is not at the current key: its changed paths, the
+// contracts it declares as changed, its head and its statement records, with
+// defer_reads. An incomplete outcome passes. A refused member is returned with
+// the kinds of its violations, and deferredCheck reports whether it returned any.
+func (r Runner) deferredCheck(ctx context.Context, batch *Batch) (bool, error) {
 	key := r.key(*batch)
 	returned := false
 	for _, snapshot := range cloneMembers(batch.ActiveMembers) {
-		if snapshot.LedgerKey == key {
+		if snapshot.DeferredKey == key {
 			continue
 		}
-		index := memberIndex(batch.ActiveMembers, snapshot.Migration)
-		if index < 0 {
-			continue
-		}
-		member := &batch.ActiveMembers[index]
-		if member.HashesKey != key {
-			hashes, err := r.Hasher.Hashes(ctx, Tree(batch.Candidate.Tree), member.ReadNames)
-			if err != nil {
-				return returned, fmt.Errorf("hash reads for %q: %w", member.Migration, err)
-			}
-			member.CurrentHashes = cloneHashes(hashes)
-			member.HashesKey = key
-			if err := r.Store.Save(ctx, *batch); err != nil {
-				return returned, fmt.Errorf("record current hashes for %q: %w", member.Migration, err)
-			}
-		}
-		result, err := r.Ledger.Check(ctx, batch.Repository, member.Migration, member.Generation, member.Changed, cloneHashes(member.CurrentHashes))
+		request := CheckRequest{LandRequest: landRequest(batch.Repository, snapshot, "", nil, snapshot.ChangedContracts), DeferReads: true}
+		result, err := r.Ledger.Check(ctx, request)
 		if err != nil {
-			return returned, fmt.Errorf("check %q: %w", member.Migration, err)
+			return returned, fmt.Errorf("deferred check %q: %w", snapshot.Migration, err)
 		}
-		if result.Refused || result.Reason != "" {
-			reason := result.Reason
-			if reason == "" {
-				reason = "refused"
-			}
-			if err := r.returnMember(ctx, batch, member.Migration, reason); err != nil {
+		if result.Outcome == CheckRefused {
+			reason, detail := refusal(result)
+			if err := r.returnMember(ctx, batch, snapshot.Migration, reason, detail); err != nil {
 				return returned, err
 			}
 			returned = true
 			continue
 		}
-		member.LedgerKey = key
-		if err := r.Store.Save(ctx, *batch); err != nil {
-			return returned, fmt.Errorf("record ledger decision for %q: %w", member.Migration, err)
+		if result.Outcome != CheckIncomplete && result.Outcome != CheckPass {
+			return returned, fmt.Errorf("deferred check %q: outcome %q", snapshot.Migration, result.Outcome)
+		}
+		if index := memberIndex(batch.ActiveMembers, snapshot.Migration); index >= 0 {
+			batch.ActiveMembers[index].DeferredKey = key
+			if err := r.Store.Save(ctx, *batch); err != nil {
+				return returned, fmt.Errorf("record deferred decision for %q: %w", snapshot.Migration, err)
+			}
 		}
 	}
 	return returned, nil
+}
+
+// statementUnattributed is a statement change that no member's diff touches.
+type statementUnattributed struct{ name string }
+
+func (e statementUnattributed) Error() string {
+	return fmt.Sprintf("statement of %q changed, but no member changes a path that declares it", e.name)
+}
+
+// checkStatements runs after a green candidate build. It hashes every
+// registered contract and every member's read at the batch's base tree and at
+// the candidate tree with the kept build, releases the build when the
+// candidate hasher exits, and derives each member's statement changes: a
+// contract whose hash differs, attributed to the member whose diff touches a
+// path that declares it. A member whose derived changes differ from the ones it
+// declares is returned with undeclared_statement_change, and a member that reads
+// or changes an ambiguous name with hash_unable. Each remaining member gets the
+// full ledger check: a read of a contract it changes is current at the base,
+// every other read at the candidate. A refused member is returned with the kinds
+// of its violations. checkStatements reports whether it returned any member.
+func (r Runner) checkStatements(ctx context.Context, batch *Batch, build KeptBuild) (bool, error) {
+	defer build.Release()
+	contracts, err := r.Ledger.Contracts(ctx, batch.Repository)
+	if err != nil {
+		return false, fmt.Errorf("list contracts: %w", err)
+	}
+	names := statementNames(contracts, batch.ActiveMembers)
+	base, err := r.candidate(ctx, batch.Repository, batch.Base, nil)
+	if err != nil {
+		return false, fmt.Errorf("read base tree: %w", err)
+	}
+	before, err := r.Hasher.Hashes(ctx, HashInput{Tree: Tree(base.Tree), Names: names})
+	if err != nil {
+		return false, fmt.Errorf("hash base tree: %w", err)
+	}
+	after, err := r.Hasher.Hashes(ctx, HashInput{Tree: Tree(batch.Candidate.Tree), BuildDirectory: build.Directory, Names: names})
+	build.Release()
+	if err != nil {
+		return false, fmt.Errorf("hash candidate tree: %w", err)
+	}
+	derived := make(map[string]map[string]string, len(batch.ActiveMembers))
+	unable := make(map[string]string)
+	for _, contract := range contracts {
+		name := contract.Name
+		was, now := before[name], after[name]
+		paths := append(append([]string(nil), was.Paths...), now.Paths...)
+		if was.Ambiguous() || now.Ambiguous() {
+			for _, member := range batch.ActiveMembers {
+				if touchesAny(member.Changed, paths) {
+					unable[member.Migration] = name
+				}
+			}
+			continue
+		}
+		if was.Hash == now.Hash {
+			continue
+		}
+		attributed := false
+		for _, member := range batch.ActiveMembers {
+			if touchesAny(member.Changed, paths) {
+				if derived[member.Migration] == nil {
+					derived[member.Migration] = make(map[string]string)
+				}
+				derived[member.Migration][name] = now.Hash
+				attributed = true
+			}
+		}
+		if !attributed {
+			return false, statementUnattributed{name: name}
+		}
+	}
+	for _, member := range batch.ActiveMembers {
+		for _, name := range member.ReadNames {
+			if before[name].Ambiguous() || after[name].Ambiguous() {
+				unable[member.Migration] = name
+			}
+		}
+	}
+	key := r.key(*batch)
+	returned := false
+	for _, snapshot := range cloneMembers(batch.ActiveMembers) {
+		if name, found := unable[snapshot.Migration]; found {
+			if err := r.returnMember(ctx, batch, snapshot.Migration, "hash_unable", fmt.Sprintf("%s is declared at more than one path", name)); err != nil {
+				return returned, err
+			}
+			returned = true
+			continue
+		}
+		changes := derived[snapshot.Migration]
+		if declared, found := sortedKeys(snapshot.ChangedContracts), sortedKeys(changes); !equalStrings(declared, found) {
+			detail := fmt.Sprintf("declared %s; derived %s", formatSet(declared), formatSet(found))
+			if err := r.returnMember(ctx, batch, snapshot.Migration, "undeclared_statement_change", detail); err != nil {
+				return returned, err
+			}
+			returned = true
+			continue
+		}
+		current := make(map[string]string, len(snapshot.ReadNames))
+		for _, name := range snapshot.ReadNames {
+			if _, changes := changes[name]; changes {
+				current[name] = before[name].Hash
+			} else {
+				current[name] = after[name].Hash
+			}
+		}
+		result, err := r.Ledger.Check(ctx, CheckRequest{LandRequest: landRequest(batch.Repository, snapshot, batch.Candidate.Commit, current, changes)})
+		if err != nil {
+			return returned, fmt.Errorf("check %q: %w", snapshot.Migration, err)
+		}
+		if result.Outcome != CheckPass {
+			if result.Outcome != CheckRefused {
+				return returned, fmt.Errorf("check %q: outcome %q", snapshot.Migration, result.Outcome)
+			}
+			reason, detail := refusal(result)
+			if err := r.returnMember(ctx, batch, snapshot.Migration, reason, detail); err != nil {
+				return returned, err
+			}
+			returned = true
+			continue
+		}
+		if index := memberIndex(batch.ActiveMembers, snapshot.Migration); index >= 0 {
+			member := &batch.ActiveMembers[index]
+			member.CurrentHashes = current
+			member.DerivedContracts = cloneHashes(changes)
+			member.HashesKey = key
+			member.LedgerKey = key
+			if err := r.Store.Save(ctx, *batch); err != nil {
+				return returned, fmt.Errorf("record ledger decision for %q: %w", snapshot.Migration, err)
+			}
+		}
+	}
+	return returned, nil
+}
+
+// landRequest is the ledger request for a member: its changed paths, the given
+// commit, current hashes and changed contracts, its head and its statement
+// records.
+func landRequest(repository string, member Member, commit string, current, changed map[string]string) LandRequest {
+	return LandRequest{
+		Repo:               repository,
+		Migration:          member.Migration,
+		Generation:         member.Generation,
+		Commit:             commit,
+		ChangedPaths:       append([]string{}, member.Changed...),
+		Current:            cloneHashes(current),
+		ChangedContracts:   cloneHashes(changed),
+		Head:               member.Head,
+		CompatibilityProof: member.CompatibilityProof,
+		ReviewedHead:       member.ReviewedHead,
+		Reviews:            append([]Review(nil), member.Reviews...),
+		ApprovedPinned:     append([]string(nil), member.ApprovedPinned...),
+	}
+}
+
+// refusal is a refused check's return reason, the kinds of its violations in
+// order without repeats, and its detail, their messages.
+func refusal(result CheckResult) (string, string) {
+	var kinds, messages []string
+	for _, violation := range result.Violations {
+		if !contains(kinds, violation.Kind) {
+			kinds = append(kinds, violation.Kind)
+		}
+		messages = append(messages, violation.Message)
+	}
+	if len(kinds) == 0 {
+		return "refused", ""
+	}
+	return strings.Join(kinds, ","), strings.Join(messages, "; ")
+}
+
+// statementNames is every registered contract and every member's read, sorted.
+func statementNames(contracts []Contract, members []Member) []string {
+	seen := make(map[string]struct{})
+	for _, contract := range contracts {
+		seen[contract.Name] = struct{}{}
+	}
+	for _, member := range members {
+		for _, name := range member.ReadNames {
+			seen[name] = struct{}{}
+		}
+	}
+	return sortedKeys(seen)
+}
+
+func sortedKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func formatSet(names []string) string {
+	return "[" + strings.Join(names, ",") + "]"
+}
+
+func touchesAny(changed, paths []string) bool {
+	for _, path := range paths {
+		if contains(changed, path) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r Runner) returnMembers(ctx context.Context, batch *Batch, culprits map[string]string) error {
@@ -566,7 +891,7 @@ func (r Runner) returnMembers(ctx context.Context, batch *Batch, culprits map[st
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		if err := r.returnMember(ctx, batch, id, culprits[id]); err != nil {
+		if err := r.returnMember(ctx, batch, id, culprits[id], ""); err != nil {
 			return err
 		}
 	}
@@ -575,7 +900,7 @@ func (r Runner) returnMembers(ctx context.Context, batch *Batch, culprits map[st
 
 // returnMember removes an active member and records the intent to return it in
 // one save, so the current key changes before the ledger hears of it.
-func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reason string) error {
+func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reason, detail string) error {
 	member, found := findMember(batch.ActiveMembers, migration)
 	if !found {
 		return nil
@@ -585,11 +910,12 @@ func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reaso
 	if !containsDropped(batch.Dropped, migration) {
 		batch.Dropped = append(batch.Dropped, DroppedMember{Migration: migration, Reason: reason})
 	}
-	batch.startOperation(Operation{Key: key, Kind: "return", Batch: batch.ID, Repository: batch.Repository, Member: migration, Generation: member.Generation, Reason: reason})
+	operation := Operation{Key: key, Kind: "return", Batch: batch.ID, Repository: batch.Repository, Member: migration, Generation: member.Generation, Reason: reason, Detail: detail}
+	batch.startOperation(operation)
 	if err := r.Store.Save(ctx, *batch); err != nil {
 		return fmt.Errorf("record return intent for %q: %w", migration, err)
 	}
-	if err := r.Ledger.ReturnMember(ctx, batch.Repository, member.Migration, member.Generation, reason); err != nil {
+	if err := r.Ledger.ReturnMember(ctx, roundRequest(operation, member)); err != nil {
 		return fmt.Errorf("return %q: %w", migration, err)
 	}
 	batch.completeOperation(key)
@@ -597,6 +923,22 @@ func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reaso
 		return fmt.Errorf("record returned member %q: %w", migration, err)
 	}
 	return nil
+}
+
+// roundRequest is the ledger round for a return: its key is
+// <batch>/<member>/<generation>, since a member leaves one batch at most once
+// at one generation, so a retry after a crash replays the same round.
+func roundRequest(operation Operation, member Member) RoundRequest {
+	return RoundRequest{
+		Repo:       operation.Repository,
+		ID:         member.Migration,
+		Generation: member.Generation,
+		Reason:     operation.Reason,
+		Batch:      operation.Batch,
+		Key:        fmt.Sprintf("%s/%s/%d", operation.Batch, member.Migration, member.Generation),
+		ReadyEvent: member.ReadyEvent,
+		Detail:     operation.Detail,
+	}
 }
 
 // checkUnable is a configured check that could not decide.
@@ -685,26 +1027,34 @@ func (b *Batch) completeOperation(key string) {
 	b.Operations[key] = operation
 }
 
-func (r Runner) build(ctx context.Context, batch *Batch) (blame.BuildResult, bool, error) {
+// build builds the candidate and keeps its directory for the hasher. Every
+// result it does not hand back is released here; the caller releases the one
+// it gets.
+func (r Runner) build(ctx context.Context, batch *Batch) (KeptBuild, bool, error) {
 	for attempt := 0; attempt <= r.infraLimit(); attempt++ {
 		if err := r.transition(ctx, batch, Building, ""); err != nil {
-			return blame.BuildResult{}, false, err
+			return KeptBuild{Release: noRelease}, false, err
 		}
-		result, err := r.Builder.Build(ctx, Tree(batch.Candidate.Tree), nil)
+		build, err := r.Builder.BuildKept(ctx, Tree(batch.Candidate.Tree))
+		if build.Release == nil {
+			build.Release = noRelease
+		}
 		if err != nil {
+			build.Release()
 			if attempt == r.infraLimit() {
-				return blame.BuildResult{}, true, nil
+				return KeptBuild{Release: noRelease}, true, nil
 			}
 			continue
 		}
-		if result.InfraClass == "" {
-			return result, false, nil
+		if build.Result.InfraClass == "" {
+			return build, false, nil
 		}
+		build.Release()
 		if attempt == r.infraLimit() {
-			return result, true, nil
+			return KeptBuild{Result: build.Result, Release: noRelease}, true, nil
 		}
 	}
-	return blame.BuildResult{}, true, nil
+	return KeptBuild{Release: noRelease}, true, nil
 }
 
 // InfrastructureError says a builder did not reach a source verdict.
@@ -1013,12 +1363,9 @@ func cloneMembers(members []Member) []Member {
 				out[index].CurrentHashes[name] = hash
 			}
 		}
-		if member.ChangedContracts != nil {
-			out[index].ChangedContracts = make(map[string]string, len(member.ChangedContracts))
-			for name, hash := range member.ChangedContracts {
-				out[index].ChangedContracts[name] = hash
-			}
-		}
+		out[index].ChangedContracts = cloneHashes(member.ChangedContracts)
+		out[index].DerivedContracts = cloneHashes(member.DerivedContracts)
+		out[index].Reviews = append([]Review(nil), member.Reviews...)
 	}
 	return out
 }

@@ -18,7 +18,7 @@ func publicationConfig(t *testing.T) config {
 		Build:      []string{"sh", "-c", "true"},
 		Hasher:     []string{"sh", "-c", "true"},
 		Toolchain:  []string{"sh", "-c", "printf tool"},
-		Ledger:     ledgerConfig{Check: []string{"sh", "-c", "printf '{\"pass\":true}'"}, Land: []string{"sh", "-c", "true"}, Return: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, MigrationState: []string{"sh", "-c", "printf '{\"state\":\"open\"}'"}},
+		Ledger:     ledgerConfig{Command: []string{"ledger"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, MigrationState: []string{"sh", "-c", "printf '{\"state\":\"open\"}'"}},
 		GitHub:     githubConfig{Remote: "origin"},
 	}
 }
