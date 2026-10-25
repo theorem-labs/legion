@@ -997,11 +997,7 @@ func (c *Candidate) reverseGraph() map[string][]string {
 
 // exporter builds (once, cached by its version) the index's exporter for the tree's toolchain.
 func (c *Candidate) exporter(ctx context.Context, searchPath []string) (*declindex.Exporter, error) {
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		cache = os.TempDir()
-	}
-	bin, err := declindex.BuildExporter(ctx, c.lean, c.icfg.Lean.CC, filepath.Join(cache, "graphcheck", "exporter"))
+	bin, err := declindex.BuildExporter(ctx, c.lean, c.icfg.Lean.CC, exporterCache())
 	if err != nil {
 		return nil, unable("build the exporter: %v", err)
 	}
@@ -1010,6 +1006,22 @@ func (c *Candidate) exporter(ctx context.Context, searchPath []string) (*declind
 		jobs = min(48, runtime.NumCPU())
 	}
 	return &declindex.Exporter{Lean: c.lean, Bin: bin, SearchPath: searchPath, Jobs: jobs, ScratchDir: c.scratch}, nil
+}
+
+// exporterCache is where the index's exporter is built and kept between runs: the user's cache directory when the
+// check may write there, else the temporary directory. A check container's home is read-only or absent, and the
+// exporter is then built once per container.
+func exporterCache() string {
+	if cache, err := os.UserCacheDir(); err == nil {
+		dir := filepath.Join(cache, "graphcheck", "exporter")
+		if os.MkdirAll(dir, 0o755) == nil {
+			if probe, err := os.MkdirTemp(dir, ".probe-"); err == nil {
+				_ = os.Remove(probe)
+				return dir
+			}
+		}
+	}
+	return filepath.Join(os.TempDir(), "graphcheck", "exporter")
 }
 
 // Constants gives the compiled constants of every compiled changed module, and BaseConstants those of the base's

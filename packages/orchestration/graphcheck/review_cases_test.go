@@ -246,3 +246,26 @@ func TestACandidateModuleCompilesAgainstAnotherPackage(t *testing.T) {
 		t.Fatal("nothing compiled")
 	}
 }
+
+// In a check container the home directory is read-only or absent, so the user's cache directory cannot hold the
+// index's exporter. The check builds it in the temporary directory instead, and still decides.
+func TestNamesDecidesWithAReadOnlyHome(t *testing.T) {
+	f := graphchecktest.New(t)
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(home, 0o755) })
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("TMPDIR", t.TempDir())
+	tree := f.Edit(t, "Lib/Core.lean", "def helper", "private def helper")
+	c, idx := open(t, f, tree)
+	hits, err := graphcheck.Names(context.Background(), c, idx, f.Cfg)
+	if err != nil {
+		t.Fatalf("Names = %v, %v; want a decided check", hits, err)
+	}
+	if _, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Use.lean", "N1"); !ok {
+		t.Fatalf("no N1 refusal at Lib/Use.lean in %v", hits)
+	}
+}
