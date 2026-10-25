@@ -1,4 +1,4 @@
-package landing
+package landing_test
 
 import (
 	"context"
@@ -11,10 +11,13 @@ import (
 	"time"
 
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
+	. "github.com/sjawhar/legion/orchestration/landing"
+	"github.com/sjawhar/legion/orchestration/landing/ledgerstore"
+	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
-// These tests run the runner's statement path through the real ledger binary,
-// on a Postgres of their own, and a fixture hasher that follows the hasher
+// These tests run the runner's statement path through the ledger store, on a
+// Postgres of their own, with the ledger binary for the setup the owners do, and a fixture hasher that follows the hasher
 // contract: it reads LAND_NAMES_FILE, checks LAND_NAMES against it, hashes each
 // name as the blob of <name>.lean at LAND_TREE in LAND_GIT_DIR, and prints
 // name<TAB>hash<TAB>path, with "-" for an absent name. For the candidate it
@@ -52,6 +55,7 @@ done
 // ledger binary built from this module.
 type statementFixture struct {
 	t        *testing.T
+	store    *ledger.Store
 	repo     string
 	base     string
 	baseHash string
@@ -78,8 +82,14 @@ func newStatementFixture(t *testing.T) *statementFixture {
 	writeSource(t, repo, "Other.lean", "def other := 0\n")
 	gitRun(t, repo, "add", ".")
 	gitRun(t, repo, "commit", "-qm", "base")
+	store, err := ledger.Open(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
 	f := &statementFixture{
 		t:       t,
+		store:   store,
 		repo:    repo,
 		base:    gitRun(t, repo, "rev-parse", "HEAD"),
 		ledger:  []string{bin, "--dsn-file", dsnFile},
@@ -148,15 +158,15 @@ func (f *statementFixture) readyEvents() map[string]int64 {
 }
 
 func (f *statementFixture) runner(ledger *recordingLedger, hasherMode string) Runner {
-	ledger.CommandLedger = CommandLedger{Directory: f.repo, Command: f.ledger}
+	ledger.Ledger = ledgerstore.NewLedger(f.store, "R")
 	hasher := []string{"sh", "-c", fixtureHasher, "hasher", f.hashLog}
 	if hasherMode != "" {
 		hasher = append(hasher, hasherMode)
 	}
 	return Runner{
-		Store:         &MemoryStore{},
+		Store:         ledgerstore.New(f.store, "R"),
 		Ledger:        ledger,
-		Admission:     &batchLedgerFake{ledger: ledger},
+		Admission:     ledgerstore.NewLedger(f.store, "R"),
 		Builder:       CommandBuilder{RepositoryPath: f.repo, Command: []string{"sh", "-c", "touch built"}},
 		Hasher:        CommandHasher{Command: hasher, Directory: f.repo},
 		Git:           RepositoryGit{Path: f.repo},
@@ -177,13 +187,11 @@ func (f *statementFixture) runBatch(runner Runner, members ...Member) Batch {
 	return batch
 }
 
-// recordingLedger is the command ledger with each round and landing recorded.
-// beforeReturn runs before a round reaches the ledger. MigrationState reports
-// open, since the configured state command is not under test here.
+// recordingLedger is the ledger store's calls with each round recorded.
+// beforeReturn runs before a round reaches the ledger.
 type recordingLedger struct {
-	CommandLedger
+	*ledgerstore.Ledger
 	rounds       []RoundRequest
-	lands        []LandRequest
 	beforeReturn func(RoundRequest)
 }
 
@@ -192,16 +200,7 @@ func (l *recordingLedger) ReturnMember(ctx context.Context, round RoundRequest) 
 		l.beforeReturn(round)
 	}
 	l.rounds = append(l.rounds, round)
-	return l.CommandLedger.ReturnMember(ctx, round)
-}
-
-func (l *recordingLedger) Land(ctx context.Context, request LandRequest) error {
-	l.lands = append(l.lands, request)
-	return l.CommandLedger.Land(ctx, request)
-}
-
-func (l *recordingLedger) MigrationState(context.Context, string, string) (string, string, error) {
-	return "open", "", nil
+	return l.Ledger.ReturnMember(ctx, round)
 }
 
 func reviewed(f *statementFixture, id, head string) Member {
@@ -240,7 +239,7 @@ func TestReviewedStatementChangeLands(t *testing.T) {
 	}
 	assertBuildDirectoriesGone(t, f.hashLog)
 
-	runner.GitHub = &githubFake{wait: PullRequest{Number: 1, Head: batch.Candidate.Commit, MergedCommit: batch.Candidate.Commit, State: PullRequestMerged}}
+	runner.GitHub = &mergedGitHub{head: batch.Candidate.Commit}
 	landed, err := runner.Publish(context.Background(), batch)
 	if err != nil || landed.State != Landed {
 		t.Fatalf("Publish() = %s (%s), %v; want landed", landed.State, landed.Reason, err)
@@ -271,8 +270,8 @@ func TestUnreviewedStatementChangeIsReturned(t *testing.T) {
 	if len(ledger.rounds) != 1 || ledger.rounds[0].Reason != "statement_unreviewed" {
 		t.Fatalf("rounds = %+v, want one statement_unreviewed return", ledger.rounds)
 	}
-	if len(batch.ActiveMembers) != 0 || len(ledger.lands) != 0 {
-		t.Fatalf("active %+v, lands %+v; want the member returned and nothing landed", batch.ActiveMembers, ledger.lands)
+	if m, err := f.store.Migration(context.Background(), "R", "M-unreviewed"); err != nil || len(batch.ActiveMembers) != 0 || m.State != "open" {
+		t.Fatalf("active %+v, migration %+v (%v); want the member returned and nothing landed", batch.ActiveMembers, m, err)
 	}
 }
 
@@ -400,7 +399,7 @@ func TestHasherRetryThenLands(t *testing.T) {
 	if batch.State != Green || len(batch.ActiveMembers) != 1 || len(ledger.rounds) != 0 || batch.HashAttempts != 0 {
 		t.Fatalf("batch = %s (%s), active %d, rounds %+v, attempts %d; want green with the member", batch.State, batch.Reason, len(batch.ActiveMembers), ledger.rounds, batch.HashAttempts)
 	}
-	runner.GitHub = &githubFake{wait: PullRequest{Number: 1, Head: batch.Candidate.Commit, MergedCommit: batch.Candidate.Commit, State: PullRequestMerged}}
+	runner.GitHub = &mergedGitHub{head: batch.Candidate.Commit}
 	landed, err := runner.Publish(context.Background(), batch)
 	if err != nil || landed.State != Landed {
 		t.Fatalf("Publish() = %s (%s), %v; want landed", landed.State, landed.Reason, err)
@@ -452,4 +451,39 @@ func TestHasherAlwaysRetryEscalatesAtThreshold(t *testing.T) {
 	if left, _ := filepath.Glob(filepath.Join(scratch, "landing-build-*")); len(left) != 0 {
 		t.Fatalf("build directories left: %v", left)
 	}
+}
+
+// mergedGitHub opens pull request 1 and reports it merged at head.
+type mergedGitHub struct{ head string }
+
+func (g *mergedGitHub) Push(context.Context, string, string, string) error { return nil }
+func (g *mergedGitHub) FindPullRequest(context.Context, string, string) (PullRequest, bool, error) {
+	return PullRequest{}, false, nil
+}
+func (g *mergedGitHub) Open(context.Context, string, string, string, string) (PullRequest, error) {
+	return PullRequest{Number: 1, Head: g.head, State: PullRequestOpen}, nil
+}
+func (g *mergedGitHub) Enqueue(context.Context, string, int) error { return nil }
+func (g *mergedGitHub) Wait(context.Context, string, int, string) (PullRequest, error) {
+	return PullRequest{Number: 1, Head: g.head, MergedCommit: g.head, State: PullRequestMerged}, nil
+}
+func (g *mergedGitHub) Withdraw(context.Context, string, int) error { return nil }
+func (g *mergedGitHub) Read(ctx context.Context, repository string, number int) (PullRequest, error) {
+	return g.Wait(ctx, repository, number, g.head)
+}
+
+func writeSource(t *testing.T, repo, name, contents string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo, name), []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func gitRun(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	output, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
 }

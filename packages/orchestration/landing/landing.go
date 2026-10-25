@@ -38,13 +38,13 @@ type KeptBuild struct {
 
 func noRelease() {}
 
-// Ledger is the landing-facing contract with the durable ledger.
+// Ledger is the member half of the ledger, in the order the runner calls it: the deferred check before the build,
+// the contract list and the full check after it, each member's return, and the escalation of a step that is
+// retried. The landing itself is the batch half's (BatchLedger.LandBatch).
 type Ledger interface {
 	Check(context.Context, CheckRequest) (CheckResult, error)
-	Land(context.Context, LandRequest) error
 	ReturnMember(context.Context, RoundRequest) error
 	Contracts(context.Context, string) ([]Contract, error)
-	MigrationState(context.Context, string, string) (state string, landedCommit string, err error)
 	// Escalate enqueues the work item for the owner. A repeated call for an
 	// open item of the same owner does nothing.
 	Escalate(ctx context.Context, repository, item, owner string) error
@@ -58,7 +58,8 @@ type Review struct {
 }
 
 // LandRequest is the ledger's LandRequest, field for field: the candidate, the
-// current hash of each read, and the member's statement records.
+// current hash of each read, and the member's statement records. The checks
+// send it, and it is the request the ledger lands each member with.
 type LandRequest struct {
 	Repo               string            `json:"repo"`
 	Migration          string            `json:"migration"`
@@ -72,6 +73,7 @@ type LandRequest struct {
 	ReviewedHead       string            `json:"reviewed_head"`
 	Reviews            []Review          `json:"reviews"`
 	ApprovedPinned     []string          `json:"approved_pinned"`
+	Upstream           string            `json:"upstream"`
 }
 
 // CheckRequest is the ledger's CheckRequest. DeferReads asks for the check

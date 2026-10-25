@@ -263,6 +263,7 @@ func passed(request CheckRequest) CheckResult {
 
 func (f *ledgerFake) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
 
+// Land records a member landing, which the batch ledger fake sends for each member its LandBatch lands.
 func (f *ledgerFake) Land(_ context.Context, request LandRequest) error {
 	f.landed = append(f.landed, request.Migration)
 	if f.commits == nil {
@@ -278,15 +279,7 @@ func (f *ledgerFake) ReturnMember(_ context.Context, round RoundRequest) error {
 	return nil
 }
 
-// MigrationState reports what Land recorded, as the real ledger does.
 func (f *ledgerFake) Escalate(context.Context, string, string, string) error { return nil }
-
-func (f *ledgerFake) MigrationState(_ context.Context, _ string, migration string) (string, string, error) {
-	if commit, landed := f.commits[migration]; landed {
-		return "landed", commit, nil
-	}
-	return "open", "", nil
-}
 
 type builderFake struct {
 	results map[string]blame.BuildResult

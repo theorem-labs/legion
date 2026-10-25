@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,24 +65,28 @@ func TestConfigurationFillsEscalateToAndRetryLimit(t *testing.T) {
 	}
 }
 
-// Publishing to GitHub needs the ledger: a batch is admitted there before its pull request is queued.
-func TestPublicationWithoutTheLedgerIsRefused(t *testing.T) {
-	cfg := publicationConfig(t)
-	cfg.Ledger.DSNFile = ""
-	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
-	if _, err := buildProgram(t, cfg); err == nil || !strings.Contains(err.Error(), "ledger.dsn_file") {
-		t.Fatalf("program() error = %v, want publication without the ledger refused", err)
+// The program keeps its batches in the ledger, so a configuration without ledger.dsn_file is refused, with or without
+// GitHub.
+func TestConfigurationWithoutTheLedgerIsRefused(t *testing.T) {
+	for _, publishing := range []bool{true, false} {
+		cfg := publicationConfig(t)
+		if !publishing {
+			cfg.GitHub = githubConfig{}
+		}
+		cfg.Ledger.DSNFile = ""
+		if _, err := buildProgram(t, cfg); err == nil || !strings.Contains(err.Error(), "ledger.dsn_file is required") {
+			t.Fatalf("program() with publishing=%v error = %v, want the missing ledger refused", publishing, err)
+		}
 	}
 }
 
-// With ledger.dsn_file set, the program opens the ledger on that DSN and keeps its batches there: the batch store is
-// the ledger's, the batch calls go to the ledger, no state file is written, and a batch the program creates is the
-// ledger's record, which the status command lists.
+// The program opens the ledger on ledger.dsn_file and keeps its batches there: the batch store, the member calls and
+// the batch calls are all the ledger's, and a batch the program creates is the ledger's record, which the status
+// command lists.
 func TestLedgerDSNFileOpensTheLedgerBackedStore(t *testing.T) {
 	ctx := context.Background()
 	cfg := withLedger(t, publicationConfig(t))
 	cfg.GitHub = githubConfig{}
-	cfg.StatePath = filepath.Join(t.TempDir(), "state.json")
 	built, err := buildProgram(t, cfg)
 	if err != nil {
 		t.Fatalf("program() error = %v", err)
@@ -94,6 +96,9 @@ func TestLedgerDSNFileOpensTheLedgerBackedStore(t *testing.T) {
 	}
 	if _, ok := built.runner.Admission.(*ledgerstore.Ledger); !ok {
 		t.Fatalf("batch ledger = %T, want *ledgerstore.Ledger", built.runner.Admission)
+	}
+	if _, ok := built.runner.Ledger.(*ledgerstore.Ledger); !ok {
+		t.Fatalf("member ledger = %T, want *ledgerstore.Ledger", built.runner.Ledger)
 	}
 	body, err := os.ReadFile(cfg.Ledger.DSNFile)
 	if err != nil {
@@ -123,8 +128,5 @@ func TestLedgerDSNFileOpensTheLedgerBackedStore(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), `"id":"batch-1"`) {
 		t.Fatalf("status output = %q, want the ledger's batch-1", output.String())
-	}
-	if _, err := os.Stat(cfg.StatePath); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("the state file %s exists (%v); the ledger holds the batches", cfg.StatePath, err)
 	}
 }

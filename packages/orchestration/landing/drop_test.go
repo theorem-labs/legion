@@ -43,9 +43,6 @@ func (l *dropLedger) ReturnMember(_ context.Context, round RoundRequest) error {
 	l.returned = append(l.returned, round.ID)
 	return nil
 }
-func (*dropLedger) MigrationState(context.Context, string, string) (string, string, error) {
-	return "open", "", nil
-}
 
 type declineCall struct {
 	record    Batch

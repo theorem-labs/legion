@@ -153,7 +153,6 @@ type config struct {
 	Repository   repositoryConfig `json:"repository"`
 	Base         string           `json:"base"`
 	BaseBranch   string           `json:"baseBranch"`
-	StatePath    string           `json:"statePath"`
 	Members      []landing.Member `json:"members"`
 	Build        []string         `json:"build"`
 	Hasher       []string         `json:"hasher"`
@@ -192,16 +191,10 @@ type checkConfig struct {
 	Format  string   `json:"format"` // findings (the default) or graph
 }
 
-// ledgerConfig names the ledger CLI's argv before the command (command), which
-// runs the checks, the landings, the rounds and the contract list, and the
-// configured status and migration-state commands.
+// ledgerConfig names the file that holds the ledger database's connection string. The program keeps its batches in
+// the ledger and makes every ledger call through its Go API on that database.
 type ledgerConfig struct {
-	// DSNFile is a file that holds the ledger database's connection string. When it is set, the batches are kept in
-	// the ledger and the batch calls go to it, in place of the state file.
-	DSNFile        string   `json:"dsn_file"`
-	Command        []string `json:"command"`
-	Status         []string `json:"status"`
-	MigrationState []string `json:"migrationState"`
+	DSNFile string `json:"dsn_file"`
 }
 
 // publishingConfig bounds the failed enqueues and waits of an admitted batch before it is withdrawn. Zero keeps the
@@ -210,15 +203,15 @@ type publishingConfig struct {
 	RetryLimit int `json:"retry_limit"`
 }
 
-// UnmarshalJSON refuses the removed per-operation ledger commands.
+// UnmarshalJSON refuses the removed ledger commands, with the key to set instead.
 func (l *ledgerConfig) UnmarshalJSON(body []byte) error {
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(body, &keys); err != nil {
 		return err
 	}
-	for _, removed := range []string{"check", "land", "return"} {
+	for _, removed := range []string{"check", "land", "return", "command", "status", "migrationState"} {
 		if _, found := keys[removed]; found {
-			return fmt.Errorf("ledger.%s is removed; set ledger.command to the ledger CLI's argv", removed)
+			return fmt.Errorf("ledger.%s is removed; set ledger.dsn_file, and the program calls the ledger directly", removed)
 		}
 	}
 	type plain ledgerConfig
@@ -308,11 +301,11 @@ func (c config) program(ctx context.Context) (program, error) {
 	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" {
 		return program{}, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, and baseBranch are required")
 	}
-	if c.Ledger.DSNFile == "" && c.StatePath == "" {
-		return program{}, fmt.Errorf("ledger.dsn_file or statePath is required")
+	if c.Ledger.DSNFile == "" {
+		return program{}, fmt.Errorf("ledger.dsn_file is required: the batches are kept in the ledger")
 	}
-	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Command) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
-		return program{}, fmt.Errorf("build, hasher, toolchain, ledger.command, ledger.status, and ledger.migrationState are required")
+	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 {
+		return program{}, fmt.Errorf("build, hasher, and toolchain are required")
 	}
 	if strings.TrimSpace(c.Escalations.Owner) == "" {
 		return program{}, fmt.Errorf("escalations.owner is required: the ledger enqueues every escalation for it")
@@ -327,7 +320,6 @@ func (c config) program(ctx context.Context) (program, error) {
 		close: func() {},
 	}
 	runner := landing.Runner{
-		Ledger:               landing.CommandLedger{Directory: path, Command: c.Ledger.Command, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
 		Builder:              landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
 		Hasher:               landing.CommandHasher{Command: c.Hasher, Directory: path},
 		Git:                  landing.RepositoryGit{Path: path},
@@ -363,32 +355,25 @@ func (c config) program(ctx context.Context) (program, error) {
 			runner.Events = landing.CommandEvents{Directory: path, Command: event.Command, StatusCommand: event.Status}
 		}
 	}
-	if publishing && c.Ledger.DSNFile == "" {
-		return program{}, fmt.Errorf("github needs ledger.dsn_file: a batch is admitted in the ledger before its pull request is queued")
+	body, err := os.ReadFile(c.Ledger.DSNFile)
+	if err != nil {
+		return program{}, fmt.Errorf("read ledger.dsn_file: %w", err)
 	}
-	if c.Ledger.DSNFile != "" {
-		body, err := os.ReadFile(c.Ledger.DSNFile)
-		if err != nil {
-			return program{}, fmt.Errorf("read ledger.dsn_file: %w", err)
-		}
-		dsn := strings.TrimSpace(string(body))
-		if dsn == "" {
-			return program{}, fmt.Errorf("ledger.dsn_file %s is empty", c.Ledger.DSNFile)
-		}
-		store, err := ledger.Open(ctx, dsn)
-		if err != nil {
-			return program{}, fmt.Errorf("open the ledger: %w", err)
-		}
-		batches := ledgerstore.New(store, c.Repository.Name)
-		runner.Store = batches
-		runner.Admission = ledgerstore.NewLedger(store, c.Repository.Name)
-		out.list = batches.ListActive
-		out.close = store.Close
-	} else {
-		state := &landing.JSONStore{Path: c.StatePath}
-		runner.Store = state
-		out.list = state.List
+	dsn := strings.TrimSpace(string(body))
+	if dsn == "" {
+		return program{}, fmt.Errorf("ledger.dsn_file %s is empty", c.Ledger.DSNFile)
 	}
+	store, err := ledger.Open(ctx, dsn)
+	if err != nil {
+		return program{}, fmt.Errorf("open the ledger: %w", err)
+	}
+	batches := ledgerstore.New(store, c.Repository.Name)
+	calls := ledgerstore.NewLedger(store, c.Repository.Name)
+	runner.Store = batches
+	runner.Ledger = calls
+	runner.Admission = calls
+	out.list = batches.ListActive
+	out.close = store.Close
 	out.runner = runner
 	return out, nil
 }

@@ -23,7 +23,7 @@ func publicationConfig(t *testing.T) config {
 		Hasher:      []string{"sh", "-c", "true"},
 		Toolchain:   []string{"sh", "-c", "printf tool"},
 		Escalations: escalations{Owner: "landing-operator"},
-		Ledger:      ledgerConfig{DSNFile: dsnFile, Command: []string{"ledger"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, MigrationState: []string{"sh", "-c", "printf '{\"state\":\"open\"}'"}},
+		Ledger:      ledgerConfig{DSNFile: dsnFile},
 		GitHub:      githubConfig{Remote: "origin"},
 	}
 }
