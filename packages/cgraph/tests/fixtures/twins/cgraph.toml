@@ -1,0 +1,48 @@
+# A two-unit program whose units each define a static function of one name, with different
+# parameter counts. The incremental build test reads it; nothing else does.
+[inputs]
+c_tree = "."
+image = "image/twins.elf"
+system_map = "image/System.map"
+
+[parts.both]
+files = ["src/a.c", "src/b.c"]
+
+[c]
+flags = ["-nostdinc", "--target=riscv64-unknown-elf", "-march=rv64imac", "-mabi=lp64", "-std=gnu2x",
+         "-ffreestanding", "-mcmodel=medany"]
+kit_types = []
+value_types = []
+lock_types = []
+lock_type_words = []
+percpu_globals = []
+percpu_structs = []
+membership_witness_macros = []
+base_type_min_containers = 2
+
+[c.calls]
+unlock = "unlock"
+lock = "^(?!.*unlock)(?:.*lock)"
+allocate = "alloc"
+free = "free"
+
+[c.membership]
+list = []
+hash = []
+
+[c.cleanup]
+class_type = "^class_(.+)_t$"
+destructor = "class_{name}_destructor"
+attribute_macros = {}
+
+[checks]
+min_call_agreement = 1.0
+min_access_agreement = 1.0
+min_field_offsets = 1.0
+
+[image]
+arch = "riscv64"
+percpu_sections = []
+
+[topics]
+prefix = "notifications.example."

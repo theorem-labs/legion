@@ -800,10 +800,12 @@ class Image:
         self.cache: dict[int, FunctionFacts] = {}
         self.section_data: dict[str, bytes] = {}
         # The number of parameters of each function the C defines, for the argument registers a
-        # call passes, and the registers it returns in; set by the caller before facts are read.
+        # call passes, and the registers it returns in, by the address of the copy it is; set by
+        # the caller before facts are read. A static name that several units define has a copy per
+        # unit, each with its own signature, so a bare name would name several functions.
         # Where unknown: _DEFAULT_ARGUMENTS arguments, _DEFAULT_RESULTS result registers.
-        self.arity: dict[str, int] = {}
-        self.results: dict[str, int] = {}
+        self.arity: dict[int, int] = {}
+        self.results: dict[int, int] = {}
         # Whether the function at an address cannot return, decided once per callee.
         self.no_return: dict[int, bool] = {}
         # Each trap the image's trap table lists, and whether it resumes ([image] trap_table).
@@ -968,6 +970,17 @@ class Image:
     def symbol_class(self, name: str, section: str) -> str:
         return self.rules.symbol_class(name, section)
 
+    def copies(self, name: str, unit: str, file: str, *, static: bool) -> list[int]:
+        """The addresses of the image copies of the function ``name`` that the translation unit
+        ``unit`` defines in ``file``: a static function has one copy per unit that defines it, the
+        one the object file of that unit holds; an external function has the single definition the
+        linker kept."""
+        symbols = self.functions.get(name, [])
+        if not static:
+            return sorted({symbol.address for symbol in symbols if not symbol.local})
+        units = {Path(unit).name, Path(file).name}
+        return sorted({symbol.address for symbol in symbols if symbol.local and symbol.file in units})
+
     def _end(self, symbol: Symbol) -> int:
         if symbol.size:
             return symbol.address + symbol.size
@@ -1040,7 +1053,7 @@ class Image:
             symbol_key = self.image_cache.symbol_key(symbol.name, symbol.address, symbol.size)
             callees = self.image_cache.callees(symbol_key)
             if callees is not None:
-                facts_key = self._facts_key(symbol_key, symbol.name, callees)
+                facts_key = self._facts_key(symbol_key, symbol.address, callees)
                 payload = self.image_cache.load(facts_key)
                 if payload is not None:
                     loaded = _facts_from_cache(payload)
@@ -1049,34 +1062,32 @@ class Image:
                     self.cache[symbol.address] = loaded
                     return loaded
         instructions, patches = self._patched(list(self.decoder.disasm(code, symbol.address)))
-        facts = self._decode(symbol.name, instructions, patches)
+        facts = self._decode(symbol.name, symbol.address, instructions, patches)
         self.cache[symbol.address] = facts
         if self.image_cache.enabled:
             callees = self._direct_callees(instructions)
             self.image_cache.store_callees(symbol_key, callees)
-            self.image_cache.store(self._facts_key(symbol_key, symbol.name, callees), _facts_for_cache(facts))
+            self.image_cache.store(self._facts_key(symbol_key, symbol.address, callees), _facts_for_cache(facts))
         return facts
 
-    def _facts_key(self, symbol_key: str, name: str, callees: list[str]) -> str:
+    def _facts_key(self, symbol_key: str, address: int, callees: list[str]) -> str:
         """The key of a function's facts: the only C facts its decoding reads are its own result
-        registers and the parameter counts of the functions it calls or jumps to directly."""
+        registers and the parameter counts of the copies it calls or jumps to directly."""
         return self.image_cache.facts_key(
             symbol_key,
-            self.results.get(name, _DEFAULT_RESULTS),
-            {callee: self.arity.get(callee, _DEFAULT_ARGUMENTS) for callee in callees},
+            self.results.get(address, _DEFAULT_RESULTS),
+            {callee: self.arity.get(int(callee, 16), _DEFAULT_ARGUMENTS) for callee in callees},
         )
 
     def _direct_callees(self, instructions: list[Any]) -> list[str]:
-        """The text functions ``_arguments`` may read the arity of: every direct jump target and
-        every callee of an ``auipc`` and ``jalr`` pair."""
+        """The addresses, as text, of the copies ``_arguments`` may read the arity of: every direct
+        jump target, and every callee of an ``auipc`` and ``jalr`` pair, that a text symbol starts."""
         return sorted(
             {
-                name
+                _hex(address)
                 for index in range(len(instructions))
                 for address in [self._target(instructions, index)]
-                if address is not None
-                for name in [self.text_at.get(address)]
-                if name is not None
+                if address is not None and address in self.text_at
             }
         )
 
@@ -1090,7 +1101,7 @@ class Image:
 
     def decode(self, name: str, code: bytes, address: int) -> FunctionFacts:
         """The facts of a function's machine code that starts at ``address``."""
-        return self._decode(name, *self._patched(list(self.decoder.disasm(code, address))))
+        return self._decode(name, address, *self._patched(list(self.decoder.disasm(code, address))))
 
     def _patched(self, instructions: list[Any]) -> tuple[list[Any], tuple[_Patch, ...]]:
         """A function's instructions, then those of each replacement the image may patch over one of
@@ -1119,7 +1130,7 @@ class Image:
                 patches.append(_Patch(index_of[site], index_of.get(after, len(instructions)), first, len(extended) - 1))
         return extended, tuple(patches)
 
-    def _decode(self, name: str, instructions: list[Any], patches: tuple[_Patch, ...]) -> FunctionFacts:
+    def _decode(self, name: str, address: int, instructions: list[Any], patches: tuple[_Patch, ...]) -> FunctionFacts:
         facts = FunctionFacts()
         successors = _flow(self.decoder, instructions, self.never_returns, self._halts, patches)
         roots = _roots(patches)
@@ -1128,7 +1139,7 @@ class Image:
         states = self._block_states(instructions, successors, roots=roots)
         before = dict(states)
         first = dict(self._block_states(instructions, successors, _retreating(successors), roots))
-        returned = {f"a{position}" for position in range(self.results.get(name, _DEFAULT_RESULTS))}
+        returned = {f"a{position}" for position in range(self.results.get(address, _DEFAULT_RESULTS))}
         for index, state in states:
             instruction = instructions[index]
             escapes, partner = None, None
@@ -1198,12 +1209,10 @@ class Image:
                 )
 
     def _arguments(self, instructions: list[Any], index: int) -> set[str]:
-        """The argument registers a call or a tail jump passes: as many as the callee's C takes."""
-        count = _DEFAULT_ARGUMENTS
+        """The argument registers a call or a tail jump passes: as many as the C of the copy it
+        goes to takes."""
         target = self._target(instructions, index)
-        callee = None if target is None else self.text_at.get(target)
-        if callee is not None:
-            count = self.arity.get(callee, _DEFAULT_ARGUMENTS)
+        count = _DEFAULT_ARGUMENTS if target is None else self.arity.get(target, _DEFAULT_ARGUMENTS)
         return {f"a{position}" for position in range(count)}
 
     def _escapes(

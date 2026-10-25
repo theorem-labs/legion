@@ -79,6 +79,12 @@ def test_image_cache_reuses_every_function_without_decoding(tmp_path: Path) -> N
     assert _cache_bytes(cache) == cold_bytes
 
 
+def _by_address(image: Image, counts: dict[str, int]) -> dict[int, int]:
+    """The counts a test gives by name, by the address of each copy of the name: the signatures the
+    image reads name a copy, not a name."""
+    return {symbol.address: value for name, value in counts.items() for symbol in image.functions[name]}
+
+
 def _decodes(
     cache: Path, name: str, arity: dict[str, int], results: dict[str, int], monkeypatch: pytest.MonkeyPatch
 ) -> int:
@@ -96,7 +102,7 @@ def _decodes(
         return disassemble(code, address, *rest)
 
     monkeypatch.setattr(image.decoder, "disasm", counting)
-    image.arity, image.results = arity, results
+    image.arity, image.results = _by_address(image, arity), _by_address(image, results)
     try:
         image.facts(symbol)
     finally:
@@ -450,10 +456,10 @@ def test_an_address_in_an_argument_the_callee_does_not_take_does_not_escape(imag
     high, low = _split(image.object_symbols["pair_a"][0].address - start)
     jal = _jal(RA, callee - (start + 8))
     code = struct.pack("<5I", _u(0x17, A1, high), _addi(A1, A1, low), jal, _load(A2, S1, 0), RET)
-    image.arity = {"box_weight": 0}
+    image.arity = {callee: 0}
     try:
         assert ("pair_a", "addi_address") not in _operations(image.decode("synthetic", code, start))
-        image.arity = {"box_weight": 2}
+        image.arity = {callee: 2}
         assert ("pair_a", "addi_address") in _operations(image.decode("synthetic", code, start))
     finally:
         image.arity = {}
@@ -463,7 +469,7 @@ def test_a_void_function_returns_no_register(image: Image) -> None:
     start = image.functions["anchor_pair"][0].address
     high, low = _split(image.object_symbols["pair_a"][0].address - start)
     code = struct.pack("<3I", _u(0x17, A0, high), _addi(A0, A0, low), RET)
-    image.results = {"synthetic": 0}
+    image.results = {start: 0}
     try:
         assert image.decode("synthetic", code, start).globals == []
     finally:
@@ -1184,7 +1190,7 @@ def test_a_far_call_passes_only_the_arguments_its_callee_takes(image: Image) -> 
         _u(0x17, RA, upper), _i(0x67, RA, 0, RA, lower), RET,
     )  # fmt: skip
     saved = dict(image.arity)
-    image.arity["box_weight"] = 1
+    image.arity[image.functions["box_weight"][0].address] = 1
     try:
         facts = image.decode("synthetic", code, start)
     finally:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,9 @@ from conftest import FIXTURE, build, read
 
 from cgraph import cli, pipeline
 from cgraph import image as image_module
+
+# A program whose two units each define a static function of one name (tests/fixtures/twins).
+TWINS = Path(__file__).parent / "fixtures" / "twins"
 
 OUTPUTS = (
     "graph.json",
@@ -124,6 +128,29 @@ def test_a_header_change_reparses_every_unit_that_includes_it(copy: Path, tmp_pa
     assert again.parsed == ["src/bags.c", "src/store.c"]
     unchanged = build(copy, "both", tmp_path / "again", cache)
     assert unchanged.parsed == [] and digests(tmp_path / "again") == digests(tmp_path / "after")
+
+
+def test_a_reused_unit_does_not_decide_another_unit_s_copy_of_a_static_name(tmp_path: Path) -> None:
+    """The twins program's two units each define a static ``tally`` of their own, with different
+    parameter counts. Which of them the cache serves must not decide how many argument registers
+    the image's calls pass, so it must not decide which addresses escape into them."""
+    program = tmp_path / "twins"
+    shutil.copytree(TWINS, program)
+    cache = tmp_path / "cache"
+    build(program, "both", tmp_path / "cold", cache)
+    source = program / "src" / "a.c"
+    source.write_text(source.read_text() + "/* edited */\n")
+
+    warm = build(program, "both", tmp_path / "warm", cache)
+
+    assert warm.parsed == ["src/a.c"] and warm.reused == ["src/b.c"]
+    full = build(program, "both", tmp_path / "full", tmp_path / "empty-cache")
+    assert full.parsed == ["src/a.c", "src/b.c"]
+    assert digests(tmp_path / "warm") == digests(tmp_path / "full")
+    assert warm.passes and full.passes
+    # Both entries of the second unit pass the address of their own global to its three-parameter
+    # copy: the graph holds those accesses whichever unit was parsed.
+    assert read(tmp_path / "warm", "checks.json")["access_layer"]["agree"] == 3
 
 
 def test_cli_exit_status_preserves_existing_outputs_on_unable_runs(copy: Path, tmp_path: Path) -> None:

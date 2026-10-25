@@ -47,6 +47,31 @@ def _sha256(path: Path | None) -> str | None:
         raise InputError(f"cannot read {path}: {error}") from error
 
 
+def _signatures(facts: dict[str, dict[str, Any]], image: Image) -> tuple[dict[int, int], dict[int, int]]:
+    """The number of parameters and of result registers of each function the C defines, by the
+    address of the image copy it is.
+
+    A static name that several units define has a copy per unit, each with its own signature. Keyed
+    by the bare name, the last unit of the facts would give its signature to every copy of the name,
+    and the cache decides which unit is last (a reused unit comes before a parsed one), so the
+    decoded facts would depend on the cache.
+    """
+    arity: dict[int, int] = {}
+    results: dict[int, int] = {}
+    for source, unit in sorted(facts.items()):
+        for name, function in sorted(unit["functions"].items()):
+            addresses = image.copies(name, source, function["file"], static=function["static"])
+            for key, counts in (("parameters", arity), ("result_registers", results)):
+                value = function.get(key)
+                if value is None:
+                    continue
+                for address in addresses:
+                    # Where two definitions claim one copy, the larger count: the order of the
+                    # units then decides nothing either.
+                    counts[address] = max(value, counts.get(address, value))
+    return arity, results
+
+
 def _write_outputs(out: Path, rendered: dict[str, str]) -> None:
     """Write every output to a distinct temporary file before replacing any prior output."""
     temporary_paths: list[tuple[Path, Path]] = []
@@ -125,11 +150,7 @@ def run(config: Config, part: str, out: Path, cache_directory: Path | None = Non
         cache.close()
         raise
     image = Image(inputs.image, inputs.system_map, config.image, cache_directory)
-    functions = [(name, function) for unit in facts.values() for name, function in unit["functions"].items()]
-    image.arity = {name: function["parameters"] for name, function in functions if "parameters" in function}
-    image.results = {
-        name: function["result_registers"] for name, function in functions if "result_registers" in function
-    }
+    image.arity, image.results = _signatures(facts, image)
     try:
         contracts = ContractGraph.load(inputs.contract_graph, config.contract_function_prefix)
         recorded = {
