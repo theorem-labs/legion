@@ -3,17 +3,41 @@ name: orchestration-lean
 # The declaration index's Lean exporter and the similarity gate: their tests compile Lean fixtures, so they run
 # where a Lean toolchain is installed. The rest of packages/orchestration is tested by pr-and-main.yaml, where these
 # tests skip for want of lake.
+# Only the packages this job's `go test` loads start it: declindex and conceptgate, the declindex
+# command, and the two packages they import (ledger, internal/testpg). A change to another
+# package of packages/orchestration compiles nothing this job runs, and pr-and-main.yaml tests the
+# whole module on every pull request anyway.
 on:
   pull_request:
     paths:
-      - "packages/orchestration/**"
+      - "packages/orchestration/declindex/**"
+      - "packages/orchestration/conceptgate/**"
+      - "packages/orchestration/cmd/declindex/**"
+      - "packages/orchestration/ledger/**"
+      - "packages/orchestration/internal/testpg/**"
+      - "packages/orchestration/go.mod"
+      - "packages/orchestration/go.sum"
       - ".github/workflows/orchestration-lean.yaml"
   push:
     branches:
       - main
+    # The same list: GitHub Actions reads no YAML anchor in a workflow file.
     paths:
-      - "packages/orchestration/**"
+      - "packages/orchestration/declindex/**"
+      - "packages/orchestration/conceptgate/**"
+      - "packages/orchestration/cmd/declindex/**"
+      - "packages/orchestration/ledger/**"
+      - "packages/orchestration/internal/testpg/**"
+      - "packages/orchestration/go.mod"
+      - "packages/orchestration/go.sum"
       - ".github/workflows/orchestration-lean.yaml"
+
+# A new push to a pull request cancels that pull request's still-running run here; outside
+# pull_request the key is github.sha, so a push to main never drops the run that saves the Lean
+# stage2 cache every pull request restores.
+concurrency:
+  group: orchestration-lean-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -50,6 +74,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The save step below asks whether this pull request is the one that moves
+          # LEAN_FORK_COMMIT, which it reads from the first parent of the merge commit.
+          fetch-depth: 2
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -62,15 +89,37 @@ jobs:
           tar -xzf elan-x86_64-unknown-linux-gnu.tar.gz
           ./elan-init -y --no-modify-path --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      # Restore only on a pull request that leaves LEAN_FORK_COMMIT where main has it: a cache a
+      # pull request saves is readable by that one pull request alone, so a 962 MB copy per pull
+      # request buys nothing for anyone else and evicts, from the repository's 10 GB, the one copy
+      # on main that every pull request does restore — and each eviction costs the next run a
+      # 108-minute Lean build (runs 40018371394, 40089006223, 40171002137). The pull request that
+      # moves the toolchain is the exception: main has no copy of its stage2 yet, so its own
+      # copy is what its next push restores.
       - name: Restore Lean stage2
         id: lean-stage2
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: lean4/build/release/stage2
           key: lean4-${{ env.LEAN_FORK_COMMIT }}-stage2-${{ runner.os }}-${{ runner.arch }}
       - name: Build Lean stage2
         if: steps.lean-stage2.outputs.cache-hit != 'true'
         run: packages/orchestration/declindex/e2e/build-lean.sh "$LEAN_FORK_REPOSITORY" "$LEAN_FORK_COMMIT" lean4
+      - name: Does this candidate move the Lean toolchain?
+        id: toolchain
+        if: steps.lean-stage2.outputs.cache-hit != 'true'
+        run: |
+          if git diff --quiet HEAD^1 HEAD -- .github/workflows/orchestration-lean.yaml; then
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save Lean stage2
+        if: steps.lean-stage2.outputs.cache-hit != 'true' && (github.event_name == 'push' || steps.toolchain.outputs.moved == 'true')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: lean4/build/release/stage2
+          key: lean4-${{ env.LEAN_FORK_COMMIT }}-stage2-${{ runner.os }}-${{ runner.arch }}
       - name: Link tree Lean toolchain
         run: |
           elan toolchain link tree-lean lean4/build/release/stage2
