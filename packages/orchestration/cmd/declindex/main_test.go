@@ -181,6 +181,48 @@ func TestQueriesBeforeAnyRefreshAreUnableToCheck(t *testing.T) {
 	}
 }
 
+// Two indexes of one Postgres database are two schemas, named by `index:`, and neither sees the other's rows: a
+// refresh of one leaves the other without an index to read, and `--index` picks the schema whatever the
+// configuration says. The connection string comes from the environment here, as a hook sets it (P-1, P-2).
+func TestTwoIndexesOfOneDatabaseStayApart(t *testing.T) {
+	config := fixture(t)
+	dsn, err := os.ReadFile(indexDSNFile(config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DECLINDEX_DSN", strings.TrimSpace(string(dsn)))
+	// Not invoke: this test gives the connection string in the environment, so no --index-dsn-file is passed.
+	command := func(args ...string) result {
+		t.Helper()
+		var out, errOut bytes.Buffer
+		code := run(context.Background(), append([]string{"--config", config}, args...),
+			func(name string) string { return os.Getenv(name) }, &out, &errOut)
+		return result{code, out.String(), errOut.String()}
+	}
+	if r := command("refresh"); r.code != 0 {
+		t.Fatalf("refresh of the index idx: %+v", r)
+	}
+	if r := command("--index", "other", "status"); r.code != 3 || !strings.Contains(r.errOut, `the index "other" was never refreshed`) {
+		t.Fatalf("status of the index other, which no refresh made: want exit 3 and its name, got %+v", r)
+	}
+	if r := command("--index", "other", "refresh"); r.code != 0 {
+		t.Fatalf("refresh of the index other: %+v", r)
+	}
+	// Each index answers from its own rows, and dropping one leaves the other whole.
+	for _, index := range []string{"idx", "other"} {
+		if r := command("--index", index, "users", "Frame"); r.code != 0 || !strings.Contains(r.out, "Gold.Frame") {
+			t.Errorf("users in the index %s: %+v", index, r)
+		}
+	}
+	conn := indexConn(t, indexConfig(t, config))
+	if _, err := conn.Exec(context.Background(), `DROP SCHEMA other CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if r := command("users", "Frame"); r.code != 0 || !strings.Contains(r.out, "Gold.Frame") {
+		t.Errorf("users in the index idx after the index other was dropped: %+v", r)
+	}
+}
+
 func TestRefreshThenAnswerAsTheReferenceTool(t *testing.T) {
 	config := fixture(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {

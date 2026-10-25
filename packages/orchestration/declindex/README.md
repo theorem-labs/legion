@@ -117,7 +117,7 @@ Both controls are rules about content: a proposal holds declarations only. Once 
 
 ### Landing containers
 
-The landing program's container contract decides each container's mounts and network. Every command that opens the index needs a route to the Postgres server and the connection string of its login; `refresh` writes the index with the owning login, the rest read it with the `reader` login. Besides `TMPDIR`, where `declindex` makes its registry snapshots, its proposal work and the sandboxed and toolchain runs' scratch directories, each command needs these writable places and nothing else:
+The landing program's container contract decides each container's mounts and network. Every command that opens the index needs a route to the Postgres server and the connection string of its login; `refresh` writes the index with the owning login, the rest read it with the `reader` login. Besides `TMPDIR`, where `declindex` makes its registry snapshots, its proposal work and the toolchain runs' scratch directories, each command needs these writable places and nothing else:
 
 | Command | Writes |
 | --- | --- |
