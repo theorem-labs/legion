@@ -11,7 +11,7 @@ import (
 func publicationConfig(t *testing.T) config {
 	return config{
 		BatchID:    "batch",
-		Repository: repositoryConfig{Name: "owner/repo", Path: t.TempDir(), GitDir: "/theorem/land/repo.git"},
+		Repository: repositoryConfig{Name: "owner/repo", Path: t.TempDir(), GitDir: "/srv/land/repo.git"},
 		Base:       "base",
 		BaseBranch: "trunk",
 		StatePath:  t.TempDir() + "/state.json",
@@ -69,12 +69,12 @@ func TestConfiguredPublicationRefusesPartialScoreOrEvent(t *testing.T) {
 func TestReadConfigRepositoryObject(t *testing.T) {
 	dir := t.TempDir()
 	object := filepath.Join(dir, "object.json")
-	write(t, object, `{"repository": {"name": "owner/repo", "path": "/srv/repo.git", "fetch_url": "https://example.invalid/repo.git", "git_dir": "/theorem/land/repo.git"}}`)
+	write(t, object, `{"repository": {"name": "owner/repo", "path": "/srv/repo.git", "fetch_url": "https://example.invalid/repo.git", "git_dir": "/srv/land/repo.git"}}`)
 	cfg, err := readConfig(object)
 	if err != nil {
 		t.Fatalf("readConfig(object) error = %v", err)
 	}
-	if want := (repositoryConfig{Name: "owner/repo", Path: "/srv/repo.git", GitDir: "/theorem/land/repo.git"}); cfg.Repository != want {
+	if want := (repositoryConfig{Name: "owner/repo", Path: "/srv/repo.git", GitDir: "/srv/land/repo.git"}); cfg.Repository != want {
 		t.Fatalf("repository = %+v, want %+v", cfg.Repository, want)
 	}
 

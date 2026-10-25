@@ -128,7 +128,7 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 	config := filepath.Join(t.TempDir(), "config.json")
 	raw, err := json.Marshal(map[string]any{
 		"batchId":    "batch",
-		"repository": map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/theorem/land/repo.git"},
+		"repository": map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/srv/land/repo.git"},
 		"base":       base,
 		"baseBranch": "trunk",
 		"statePath":  filepath.Join(t.TempDir(), "state.json"),

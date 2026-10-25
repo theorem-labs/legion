@@ -1,0 +1,3 @@
+name: Fx.Frame
+home: Fixture.lean
+meaning: A window of n bytes at an aligned word.
