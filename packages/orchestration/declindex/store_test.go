@@ -791,3 +791,46 @@ func TestRefreshRecordsEachLandingWithItsPreviousCommit(t *testing.T) {
 		t.Fatalf("an unrecorded landing: recorded %v, %v", ok, err)
 	}
 }
+
+// An index of schema 13 has no heads table and no decls.shape column. Open reads its version before it creates this
+// schema over it, since the index on decls.shape cannot be made on its decls table, and rebuilds it; the next
+// refresh fills the shapes.
+func TestOpenRebuildsAnIndexOfSchema13(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := goldenTree(t)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE heads`,
+		`DROP INDEX decls_shape`,
+		`ALTER TABLE decls DROP COLUMN shape`,
+		`UPDATE meta SET v = '13' WHERE k = 'schema'`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = Open(path); err != nil {
+		t.Fatalf("open an index of schema 13: %v", err)
+	}
+	defer s.Close()
+	if version, err := s.Meta(ctx, "schema"); err != nil || version != SchemaVersion {
+		t.Fatalf("schema after the rebuild = %q, %v; want %q", version, err, SchemaVersion)
+	}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	decls, err := s.DeclsNamed(ctx, []string{"Gold.frame_al"})
+	if err != nil || len(decls) != 1 || decls[0].Shape == "" {
+		t.Fatalf("DeclsNamed(Gold.frame_al) after the rebuild = %+v, %v; want it with a shape", decls, err)
+	}
+}

@@ -195,6 +195,29 @@ class IgnoredHead (h : Input) : Output where
 	}
 }
 
+// An instance produces its class: its conclusion head is the class, named or anonymous, with a priority or
+// instance-implicit binders before it, and its explicit binders give heads as a theorem's do.
+func TestSourceHeadsGiveAnInstanceItsClass(t *testing.T) {
+	src := []byte(`instance : Sized Nat := ⟨1⟩
+instance named : Sized Int where
+  size := 2
+instance (priority := low) [Sized α] : Sized (List α) := ⟨3⟩
+@[simp] instance fromInput (h : Input) : Sized (Box h) := ⟨4⟩
+`)
+	heads := SourceHeads(src)
+	for _, line := range []int{1, 2, 4} {
+		if got, want := headsAt(heads, line), []SourceHead{{Line: line, Role: "conclusion", Written: "Sized"}}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("heads at line %d = %+v, want %+v", line, got, want)
+		}
+	}
+	if got, want := headsAt(heads, 5), []SourceHead{
+		{Line: 5, Role: "binder", Written: "Input"},
+		{Line: 5, Role: "conclusion", Written: "Sized"},
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("heads at line 5 = %+v, want %+v", got, want)
+	}
+}
+
 func TestResolveHeadStripsRootQualification(t *testing.T) {
 	head := SourceHead{Written: "_root_.T", Namespace: "Nested", Opens: []string{"Opened"}}
 	if got := ResolveHead(head, func(name string) bool { return name == "T" }); got != "T" {

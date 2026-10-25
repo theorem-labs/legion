@@ -2,9 +2,12 @@ package declindex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -151,5 +154,189 @@ func TestOpenReadOnlyConfigOpensTheConfiguredIndex(t *testing.T) {
 	}
 	if _, err := OpenReadOnlyConfig(ctx, Config{}, IndexOnly); !errors.Is(err, ErrNoDB) {
 		t.Fatalf("OpenReadOnlyConfig of a configuration without an index: %v; want ErrNoDB", err)
+	}
+}
+
+// The index keeps each declaration's shape (SourceShapes of its source) and the resolved heads of its explicit
+// binders and conclusion (SourceHeads, ResolveHead), so a candidate's source can be compared with the base's.
+func TestReadFunctionsFindPersistedShapesAndHeads(t *testing.T) {
+	_, src, _ := readGolden(t)
+	shape := sourceShapeAt(t, SourceShapes(src), 14).Shape
+	s := refreshedGolden(t)
+	ctx := context.Background()
+
+	decls, err := s.DeclsWithShape(ctx, []string{shape})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decls) != 1 || decls[0].Name != "Gold.frame_al" || decls[0].Shape != shape {
+		t.Fatalf("DeclsWithShape(%q) = %+v, want Gold.frame_al with that shape", shape, decls)
+	}
+	named, err := s.DeclsNamed(ctx, []string{"Gold.frame_al"})
+	if err != nil || len(named) != 1 || named[0].Shape != shape {
+		t.Fatalf("DeclsNamed(Gold.frame_al) = %+v, %v; want its shape %q", named, err, shape)
+	}
+
+	heads, err := s.Heads(ctx, "binder", []string{"Gold.Frame", "Gold.Frame"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBinder := Head{Name: "Gold.frame_al", Module: "Golden", Role: "binder", Head: "Gold.Frame", Line: 14}
+	if want := []Head{wantBinder, {Name: "Gold.frame_lo", Module: "Golden", Role: "binder", Head: "Gold.Frame", Line: 17}}; !reflect.DeepEqual(heads, want) {
+		t.Fatalf("Heads(binder, Gold.Frame) = %+v, want %+v", heads, want)
+	}
+	if got, err := s.Heads(ctx, "conclusion", []string{"Gold.Frame"}); err != nil || len(got) != 0 {
+		t.Fatalf("Heads(conclusion, Gold.Frame) = %+v, %v; want none", got, err)
+	}
+	wantConclusion := Head{Name: "Gold.frame_al", Module: "Golden", Role: "conclusion", Head: "Gold.Aligned", Line: 14}
+	aligned, err := s.Heads(ctx, "", []string{"Gold.Aligned"})
+	if want := []Head{wantConclusion, {Name: "Gold2.frameAt_al", Module: "Sub.Wrap", Role: "conclusion", Head: "Gold.Aligned", Line: 10}}; err != nil || !reflect.DeepEqual(aligned, want) {
+		t.Fatalf("Heads(any role, Gold.Aligned) = %+v, %v; want %+v", aligned, err, want)
+	}
+	assertHeads(t, s, "Gold.frame_al", []Head{wantBinder, wantConclusion})
+}
+
+// An instance is a producer of its class: its conclusion head is the class, and its explicit binders' heads are kept
+// as for a theorem.
+func TestRefreshKeepsTheHeadsOfInstances(t *testing.T) {
+	s := refreshedGolden(t)
+	assertHeads(t, s, "Gold.instFrameDec", []Head{
+		{Name: "Gold.instFrameDec", Module: "Golden", Role: "binder", Head: "BitVec", Line: 27},
+		{Name: "Gold.instFrameDec", Module: "Golden", Role: "conclusion", Head: "Decidable", Line: 27},
+	})
+	// An anonymous instance has the name Lean gave it, and its heads are joined to it by its line.
+	src := "class Sized (α : Type) where\n  size : Nat\ninstance : Sized Nat := ⟨1⟩\n"
+	ilean := `{"version":5,"module":"M","directImports":[],"decls":{"Sized":[0,0,1,12,0,6,0,11],` +
+		`"instSizedNat":[2,0,2,27,2,0,2,8]},"references":{}}`
+	dir := t.TempDir()
+	writeModuleFiles(t, dir, "M", src, ilean)
+	m := refreshed(t, Tree{Source: dir, Lib: dir, Roots: Roots{"M": true}})
+	heads, err := m.Heads(context.Background(), "conclusion", []string{"Sized"})
+	if want := []Head{{Name: "instSizedNat", Module: "M", Role: "conclusion", Head: "Sized", Line: 3}}; err != nil || !reflect.DeepEqual(heads, want) {
+		t.Fatalf("Heads(conclusion, Sized) = %+v, %v; want %+v", heads, err, want)
+	}
+}
+
+func TestDeclsWithShapeReturnsEveryMatchingDeclaration(t *testing.T) {
+	dir := t.TempDir()
+	src := "theorem one (h : Input) : Output := by sorry\ntheorem two (h : Input) : Output := by sorry\n"
+	writeModuleFiles(t, dir, "M", src, `{"version":5,"module":"M","decls":{"M.one":[0,0,0,44,0,8,0,11],"M.two":[1,0,1,44,1,8,1,11]},"references":{}}`)
+	s := refreshed(t, Tree{Source: dir, Lib: dir, Roots: Roots{"M": true}})
+	shape := sourceShapeAt(t, SourceShapes([]byte(src)), 1).Shape
+	decls, err := s.DeclsWithShape(context.Background(), []string{shape})
+	if want := []string{"M.one@M", "M.two@M"}; err != nil || !reflect.DeepEqual(declNames(decls), want) {
+		t.Fatalf("DeclsWithShape(%q) = %v, %v; want %v", shape, declNames(decls), err, want)
+	}
+}
+
+// A declaration's line is its first, doc comment included, both in the reference file and in SourceShapes and
+// SourceHeads, so the index joins them on it.
+func TestPersistedSourceFactsUseDocumentedDeclarationLines(t *testing.T) {
+	_, src, _ := readGolden(t)
+	shape := sourceShapeAt(t, SourceShapes(src), 4).Shape
+	s := refreshedGolden(t)
+	decls, err := s.DeclsWithShape(context.Background(), []string{shape})
+	if err != nil || len(decls) != 1 || decls[0].Name != "Gold.SpWord" {
+		t.Fatalf("DeclsWithShape(%q) = %+v, %v; want Gold.SpWord", shape, decls, err)
+	}
+	assertHeads(t, s, "Gold.Aligned", []Head{
+		{Name: "Gold.Aligned", Module: "Golden", Role: "binder", Head: "BitVec", Line: 7},
+		{Name: "Gold.Aligned", Module: "Golden", Role: "conclusion", Head: "Prop", Line: 7},
+	})
+}
+
+// A head is resolved against every declaration of the index. When another module adds or removes a declaration of
+// its name, the refresh resolves it again, though its own module did not change.
+func TestRefreshReresolvesHeadsWhenAnotherModuleChanges(t *testing.T) {
+	tree := goldenTree(t)
+	s := refreshed(t, tree)
+	ctx := context.Background()
+	resolved := []Head{
+		{Name: "Gold2.frameAt_al", Module: "Sub.Wrap", Role: "binder", Head: "BitVec", Line: 10},
+		{Name: "Gold2.frameAt_al", Module: "Sub.Wrap", Role: "binder", Head: "Gold2.FrameAt", Line: 10},
+		{Name: "Gold2.frameAt_al", Module: "Sub.Wrap", Role: "conclusion", Head: "Gold.Aligned", Line: 10},
+	}
+	assertHeads(t, s, "Gold2.frameAt_al", resolved)
+
+	path := filepath.Join(tree.Lib, "Golden.ilean")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ilean map[string]json.RawMessage
+	if err := json.Unmarshal(original, &ilean); err != nil {
+		t.Fatal(err)
+	}
+	var decls map[string]json.RawMessage
+	if err := json.Unmarshal(ilean["decls"], &decls); err != nil {
+		t.Fatal(err)
+	}
+	delete(decls, "Gold.Aligned")
+	if ilean["decls"], err = json.Marshal(decls); err != nil {
+		t.Fatal(err)
+	}
+	withoutAligned, err := json.Marshal(ilean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, withoutAligned, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "without-aligned"}); err != nil {
+		t.Fatal(err)
+	}
+	unresolved := slices.Clone(resolved)
+	unresolved[2].Head = "Aligned"
+	assertHeads(t, s, "Gold2.frameAt_al", unresolved)
+
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "with-aligned"}); err != nil {
+		t.Fatal(err)
+	}
+	assertHeads(t, s, "Gold2.frameAt_al", resolved)
+}
+
+// A module that leaves the index takes its heads with it, and the heads that resolved to its declarations are
+// resolved again.
+func TestRefreshDeletesProviderHeadsAndReresolvesDependents(t *testing.T) {
+	tree := goldenTree(t)
+	s := refreshed(t, tree)
+	if err := os.Remove(filepath.Join(tree.Lib, "Golden.ilean")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Refresh(context.Background(), tree, RefreshOptions{Commit: "without-golden"}); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := s.HeadsOf(context.Background(), []string{"Gold.Aligned"}); err != nil || len(removed) != 0 {
+		t.Fatalf("heads of the removed Gold.Aligned = %+v, %v; want none", removed, err)
+	}
+	assertHeads(t, s, "Gold2.frameAt_al", []Head{
+		{Name: "Gold2.frameAt_al", Module: "Sub.Wrap", Role: "binder", Head: "BitVec", Line: 10},
+		{Name: "Gold2.frameAt_al", Module: "Sub.Wrap", Role: "binder", Head: "Gold2.FrameAt", Line: 10},
+		{Name: "Gold2.frameAt_al", Module: "Sub.Wrap", Role: "conclusion", Head: "Aligned", Line: 10},
+	})
+}
+
+func assertHeads(t *testing.T, s *Store, name string, want []Head) {
+	t.Helper()
+	got, err := s.HeadsOf(context.Background(), []string{name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("HeadsOf(%s) = %+v, want %+v", name, got, want)
+	}
+}
+
+// writeModuleFiles writes the source and reference file of module rel into dir, a tree that is its own library.
+func writeModuleFiles(t *testing.T, dir, rel, src, ilean string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, rel+".lean"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, rel+".ilean"), []byte(ilean), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
