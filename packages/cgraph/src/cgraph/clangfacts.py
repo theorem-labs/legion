@@ -3321,8 +3321,10 @@ class _FunctionWalk:
         index = self.parameters.get(key) if variable.kind == K.PARM_DECL else None
         if key in self.holding:
             # The parameter in the condition of its own store (alloc_pages_node_noprof's ``if (nid ==
-            # NUMA_NO_NODE) nid = numa_mem_id();``): before every store it holds the argument.
-            if key in self.guarding and index is not None and self.assigned_after(variable, reference):
+            # NUMA_NO_NODE) nid = numa_mem_id();``): before every store it holds the argument, unless
+            # an op= changes it first (mode &= 7; if (!mode) mode = 4;).
+            plain = not uses["written"][key]
+            if key in self.guarding and index is not None and plain and self.assigned_after(variable, reference):
                 return {"p": index}
             return None
         combined = self.combined(variable, uses["written"][key])
@@ -3611,7 +3613,8 @@ class _FunctionWalk:
                         return _UNTRACED
                     found = self.statement_value(variable, sibling, depth)
                     if found is not _UNWRITTEN:
-                        return found
+                        # A statement no path leaves by its end (both arms of an if exit): untraced.
+                        return _UNTRACED if found is _ENDS else found
                 node = parent
                 continue
             if parent.kind == K.FUNCTION_DECL:
@@ -4730,9 +4733,12 @@ class _FunctionWalk:
                     self.loops.append(loop)
             elif kind == K.INDIRECT_GOTO_STMT:
                 self.backward = True
-            elif kind == K.ADDR_LABEL_EXPR:
-                # &&label (_THIS_IP_): a computed goto may enter the label.
-                self.gotos["*"] += [child for child in operands if child.kind == K.LABEL_REF]
+            elif kind == K.ADDR_LABEL_EXPR or (
+                kind == K.ASM_STMT and any(token.spelling == "goto" for token in node.get_tokens())
+            ):
+                # &&label (_THIS_IP_), or an asm goto, whose labels libclang does not show: a jump may
+                # enter any label, so a label's value is untraced.
+                self.gotos["*"].append(node)
             elif kind == K.GOTO_STMT:
                 label = next((child.referenced for child in operands if child.kind == K.LABEL_REF), None)
                 at, to = _place(node), _place(label) if label is not None else None

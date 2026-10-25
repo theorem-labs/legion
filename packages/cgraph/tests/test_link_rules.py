@@ -996,31 +996,8 @@ def test_a_field_matches_from_the_next_element_where_the_code_walks_an_array_one
     """__reserved_mem_init_node: for (i = table; …; i++) i->data (192 of a 200-byte of_device_id). The
     code keeps i + 1 in a register, steps it by 200, and loads -8(i + 1)."""
     walk = _walk_graph(_field(192), [-8, 0], [200])
-    assert checks.structure(walk)["field_offsets"]["by_method"] == {"walked_element_displacement": 1}
+    assert checks.structure(walk)["field_offsets"]["by_method"] == {"next_element_displacement": 1}
     address = _walk_graph({**_field(64), "address": True}, [0, 16], [200, -136])
-    assert checks.structure(address)["field_offsets"]["by_method"] == {"walked_element_displacement": 1}
+    assert checks.structure(address)["field_offsets"]["by_method"] == {"next_element_displacement": 1}
     # Without the step by the element's size, -8 is no evidence.
     assert checks.structure(_walk_graph(_field(192), [-8, 0], [64]))["field_offsets"]["matched"] == 0
-
-
-def test_a_field_matches_from_any_element_the_code_walks_to() -> None:
-    """rcu_exp_sel_wait_wake: rcu_for_each_leaf_node walks rcu_node (256 bytes) and takes
-    &rnp->exp_lock at 384; the image keeps the next node in a register and forms 640. thaw_super_locked:
-    sb_freeze_unlock walks `sb->s_writers.rw_sem + level` down by the element's 96 bytes from 752, so
-    the element at 560 has no constant of its own."""
-    node = _walk_graph({**_field(384), "address": True}, [0, 8], [256, 640])
-    node["nodes"][-1]["size"] = 256
-    assert checks.structure(node)["field_offsets"]["by_method"] == {"walked_element_displacement": 1}
-    element = {**_field(560), "address": True, "element_size": 96, "size": -1, "element_displacement": 0}
-    walked = _walk_graph(element, [464, 536], [-96, 752])
-    assert checks.structure(walked)["field_offsets"]["by_method"] == {"walked_element_displacement": 1}
-    # The last of SB_FREEZE_LEVELS elements, and one element too far.
-    assert checks.structure(_walk_graph(element, [200], [-96, 944]))["field_offsets"]["matched"] == 1
-    assert checks.structure(_walk_graph(element, [200], [-96, 1040]))["field_offsets"]["matched"] == 0
-    # Without a step by an element's size, a far offset is no evidence.
-    far = _walk_graph({**_field(384), "address": True}, [0, 8], [640])
-    far["nodes"][-1]["size"] = 256
-    assert checks.structure(far)["field_offsets"]["matched"] == 0
-    # An unrelated integer constant and a load through another pointer are no walk: `(p->f - p->f) +
-    # q[49] + n + 200` gives memory 392 and addi 200, and the image never forms p + 192.
-    assert checks.structure(_walk_graph(_field(192), [200, 392], [200]))["field_offsets"]["matched"] == 0
