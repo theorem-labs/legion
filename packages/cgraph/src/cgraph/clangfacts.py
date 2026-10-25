@@ -4077,6 +4077,7 @@ class _FunctionWalk:
             later: set[str] = set()
             places: dict[str, int] = {}
             gotos: list[tuple[str, int]] = []
+            assembled: list[tuple[str, int]] = []
             for node in self.cursor.walk_preorder():
                 if node.kind == K.LABEL_STMT:
                     places[node.spelling] = node.extent.start.offset
@@ -4087,10 +4088,12 @@ class _FunctionWalk:
                         later.add("*")
                     gotos += [(target, node.extent.start.offset) for target in targets]
                 elif node.kind == K.ASM_STMT:
-                    # An asm goto's labels, which libclang shows only as its tokens: one it names that is
-                    # already placed is reached from after it.
-                    gotos += [(target, node.extent.start.offset) for target in self.asm_labels(node)]
+                    # An asm goto's labels, which libclang shows only as its tokens: one it names that
+                    # is already placed is reached from after it. One macro that writes both the label
+                    # and the asm gives them one offset, so an equal offset counts as later too.
+                    assembled += [(target, node.extent.start.offset) for target in self.asm_labels(node)]
             later |= {target for target, offset in gotos if target in places and offset > places[target]}
+            later |= {target for target, offset in assembled if target in places and offset >= places[target]}
             self.jumps = {"later": later}
         name = label.spelling
         if name in self.jumps["later"] or "*" in self.jumps["later"]:

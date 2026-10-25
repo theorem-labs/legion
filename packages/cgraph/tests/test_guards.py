@@ -1737,3 +1737,17 @@ def test_the_external_reviews_cases_keep_what_the_compiler_keeps(
     LegionR6ReviewAstra finding 1): clang-21 -O2 keeps each call, global and field named here."""
     facts = facts_of(tmp_path, EXTERNAL_REVIEW)
     assert kept_event in _compiled(facts, function)
+
+
+MACRO_ASM = """
+    #define BODY(x) if (x) goto after; again: warn(); after: asm goto("j %l0" :::: again)
+    static inline void macro_back(int x) { BODY(x); }
+    void macro_back_one(void) { macro_back(1); }
+"""
+
+
+def test_a_macro_that_writes_both_a_label_and_an_asm_goto_to_it_keeps_the_label_s_code(tmp_path: Path) -> None:
+    """One macro writes `again:` and the `asm goto` that jumps to it, so libclang gives both the macro's
+    offset: the backward way is still a way in, and macro_back(1) keeps warn (clang-21 -O2 emits it)."""
+    facts = facts_of(tmp_path, MACRO_ASM)
+    assert "warn" in {call["callee"] for call in fold(facts, "macro_back_one", "macro_back").calls}
