@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -235,6 +236,58 @@ func TestALandingWritesNoRowOfAnotherModule(t *testing.T) {
 		t.Errorf("after the landing a change to A.X changes %d statements; want B.b and U.u", got)
 	}
 	sameAsFullRefresh(t, s, tree, declRef{"A", "A.X"}, declRef{"U", "U.u"}, declRef{"V", "V.v"})
+}
+
+// A refresh from nothing writes every edge with its owner already resolved, and no edge of an older module exists
+// to move, so it reads no edge back: on the indexed project (4.4 million edges) the read of every changed name over
+// the edges ran for more than ten minutes and stalled the refresh. The table's read counters, read after the store
+// closes (a backend reports its counters when it ends), say that no query read a row of `edges`. The delete of the
+// rows of the modules about to be written scans the table, but it finds none.
+func TestARefreshFromNothingReadsNoEdgeBack(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	tree := leanTree(t, dir,
+		leanModule{name: "A", decls: []string{"A.X"}, src: "def A.X : Prop := True\n"},
+		leanModule{name: "B", imports: []string{"A"}, decls: []string{"B.b"},
+			src:  "theorem B.b (h : A.X.wp) : True := trivial\n",
+			uses: []leanUse{{"A.X.wp", "A", "A.X.wp"}}},
+		leanModule{name: "C", imports: []string{"B"}, decls: []string{"C.c"},
+			src:  "theorem C.c (h : B.b) : True := trivial\n",
+			uses: []leanUse{{"B.b", "B", "B.b"}}},
+	)
+	tg := indexTarget(t)
+	s, err := Open(ctx, tg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		_ = s.Close()
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.Connect(ctx, tg.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var seqRead, idxFetched, written int64
+	// The counters of the closed backends are in the database's statistics a moment after they end.
+	for range 50 {
+		if err := conn.QueryRow(ctx, `SELECT coalesce(seq_tup_read, 0), coalesce(idx_tup_fetch, 0), coalesce(n_tup_ins, 0)
+			FROM pg_stat_user_tables WHERE schemaname = $1 AND relname = 'edges'`, tg.Index).Scan(&seqRead, &idxFetched, &written); err == nil && written > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if written == 0 {
+		t.Fatal("the statistics of the table edges show no row written: the test cannot tell")
+	}
+	if seqRead+idxFetched != 0 {
+		t.Errorf("a refresh from nothing read %d rows of the table edges (%d by scan, %d by index); want none",
+			seqRead+idxFetched, seqRead, idxFetched)
+	}
 }
 
 // An index that landings built answers reach as one built from nothing, whatever a landing changed about the

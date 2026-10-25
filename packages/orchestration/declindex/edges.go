@@ -147,11 +147,22 @@ func reresolveOwners(ctx context.Context, tx pgx.Tx, r reference, before indexBe
 	if len(names) == 0 && len(seeds) == 0 {
 		return nil
 	}
+	// The rows of the modules this refresh wrote were resolved as they were written, against the index it leaves.
+	// Only the rows of the other modules can be out of line, so with no other module there is nothing to read.
+	rewritten := refreshedModules(r)
+	var others bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM modules WHERE module <> ALL($1::text[]))`,
+		rewritten).Scan(&others); err != nil {
+		return err
+	}
+	if !others {
+		return nil
+	}
 	modules, err := closureChanged(ctx, tx, seeds)
 	if err != nil {
 		return err
 	}
-	rows, err := ownersToCheck(ctx, tx, names, modules)
+	rows, err := ownersToCheck(ctx, tx, names, modules, rewritten)
 	if err != nil || len(rows) == 0 {
 		return err
 	}
@@ -208,11 +219,31 @@ type constOwner struct {
 	owner owned
 }
 
-// ownersToCheck reads the constants whose owner this refresh may have moved: those at or below one of the changed
-// declaration names (edges_target), and those whose owner the imports decided in a module whose closure changed
-// (edges_closure). It gives each (constant, stored owner) once, so that a constant whose rows hold two owners,
-// the one this refresh wrote and the one an older row of another module kept, is checked under both.
-func ownersToCheck(ctx context.Context, q querier, names, modules []string) (map[constOwner]bool, error) {
+// refreshedModules are the modules whose rows this refresh wrote or dropped, sorted: a module that is gone, one
+// that was re-read, and the name that a re-read module had before.
+func refreshedModules(r reference) []string {
+	set := map[string]bool{}
+	for _, rel := range r.gone {
+		if m := r.old[rel].module; m != "" {
+			set[m] = true
+		}
+	}
+	for i, md := range r.results {
+		if m := r.old[r.changed[i].rel].module; m != "" {
+			set[m] = true
+		}
+		if r.errs[i] == nil {
+			set[md.Module] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(set))
+}
+
+// ownersToCheck reads the constants whose owner this refresh may have moved, as the rows of the modules it did not
+// write (rewritten) hold them: those at or below one of the changed declaration names (edges_target), and those
+// whose owner the imports decided in a module whose closure changed (edges_closure). It gives each (constant,
+// stored owner) once, so that a constant whose rows hold two owners is checked under both.
+func ownersToCheck(ctx context.Context, q querier, names, modules, rewritten []string) (map[constOwner]bool, error) {
 	out := map[constOwner]bool{}
 	scan := func(r pgx.Rows) error {
 		var c constOwner
@@ -225,17 +256,19 @@ func ownersToCheck(ctx context.Context, q querier, names, modules []string) (map
 	if len(names) > 0 {
 		// The columns are COLLATE "C", so the names below n are those between n + "." and n + "/".
 		rows, err := q.Query(ctx, `
-			SELECT target, tmodule, owner, owner_module, by_closure FROM edges WHERE target = ANY($1::text[])
+			SELECT target, tmodule, owner, owner_module, by_closure FROM edges
+			 WHERE target = ANY($1::text[]) AND module <> ALL($2::text[])
 			UNION
 			SELECT e.target, e.tmodule, e.owner, e.owner_module, e.by_closure
-			  FROM unnest($1::text[]) AS n JOIN edges e ON e.target >= n || '.' AND e.target < n || '/'`, names)
+			  FROM unnest($1::text[]) AS n JOIN edges e ON e.target >= n || '.' AND e.target < n || '/'
+			 WHERE e.module <> ALL($2::text[])`, names, rewritten)
 		if err := eachRow(rows, err, scan); err != nil {
 			return nil, err
 		}
 	}
 	if len(modules) > 0 {
 		rows, err := q.Query(ctx, `SELECT DISTINCT target, tmodule, owner, owner_module, by_closure
-			FROM edges WHERE tmodule = ANY($1) AND by_closure`, modules)
+			FROM edges WHERE tmodule = ANY($1) AND by_closure AND module <> ALL($2::text[])`, modules, rewritten)
 		if err := eachRow(rows, err, scan); err != nil {
 			return nil, err
 		}
