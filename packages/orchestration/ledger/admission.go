@@ -156,25 +156,8 @@ func admitMembers(ctx context.Context, tx pgx.Tx, repository Repository, req Adm
 	for i, member := range req.Members {
 		ids[i] = member.Migration
 	}
-	if _, err := tx.Exec(ctx, `SELECT 1 FROM migrations WHERE repo = $1 AND id = ANY($2) ORDER BY id FOR UPDATE`,
-		req.Repo, ids); err != nil {
-		return nil, err
-	}
-	migrations := make([]Migration, len(req.Members))
-	read := map[string]struct{}{}
-	for i, id := range ids {
-		m, err := loadMigration(ctx, tx, req.Repo, id, false)
-		if err != nil {
-			return nil, err
-		}
-		migrations[i] = m
-		for name := range m.Reads {
-			read[name] = struct{}{}
-		}
-	}
-	names := sortedNames(read)
-	if _, err := tx.Exec(ctx, `SELECT 1 FROM contracts WHERE repo = $1 AND name = ANY($2) ORDER BY name FOR UPDATE`,
-		req.Repo, names); err != nil {
+	migrations, names, err := lockMembers(ctx, tx, req.Repo, ids)
+	if err != nil {
 		return nil, err
 	}
 	// Check refuses a member that another batch admits, and a change to a contract that an admitted member reads. What
@@ -254,6 +237,34 @@ func admitMembers(ctx context.Context, tx pgx.Tx, repository Repository, req Adm
 		readies[i] = ready
 	}
 	return readies, nil
+}
+
+// lockMembers takes, after the repository and batch rows that its caller holds, the rest of the batch lock order: the
+// row locks of migrations ids, sorted by id, then of the contracts they read, sorted by name. It returns the migrations
+// in the order of ids, and the sorted names of the contracts they read.
+func lockMembers(ctx context.Context, tx pgx.Tx, repo string, ids []string) ([]Migration, []string, error) {
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM migrations WHERE repo = $1 AND id = ANY($2) ORDER BY id FOR UPDATE`,
+		repo, ids); err != nil {
+		return nil, nil, err
+	}
+	migrations := make([]Migration, len(ids))
+	read := map[string]struct{}{}
+	for i, id := range ids {
+		m, err := loadMigration(ctx, tx, repo, id, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		migrations[i] = m
+		for name := range m.Reads {
+			read[name] = struct{}{}
+		}
+	}
+	names := sortedNames(read)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM contracts WHERE repo = $1 AND name = ANY($2) ORDER BY name FOR UPDATE`,
+		repo, names); err != nil {
+		return nil, nil, err
+	}
+	return migrations, names, nil
 }
 
 // contractConflict returns a contract that member m changes and earlier reads, or that m reads and earlier changes.

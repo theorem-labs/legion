@@ -447,6 +447,16 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		value, err := s.AdmitBatch(ctx, request)
 		return value, true, err
+	case "land-batch":
+		request, jsonInput, err := requestFile[ledger.LandBatchRequest](args)
+		if !jsonInput {
+			return nil, true, usagef("land-batch --request-file <json>")
+		}
+		if err != nil {
+			return nil, true, err
+		}
+		value, err := s.LandBatch(ctx, request)
+		return value, true, err
 	case "batch":
 		if len(args) != 2 {
 			return nil, true, usagef("batch <repo> <id>")
