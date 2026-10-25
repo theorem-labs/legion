@@ -50,7 +50,7 @@ printf '{"commit":"%s","part":"%s"}' "$1" "$2" > /land/scratch/score.json
 		Containers:    d,
 		Trees:         d,
 	}
-	if err := runner.PostLanding.Validate(runner.Container.Mounts); err != nil {
+	if err := runner.PostLanding.Validate(runner.Container); err != nil {
 		t.Fatal(err)
 	}
 	effects, scores := newEffectLog(), &scoreFake{}
