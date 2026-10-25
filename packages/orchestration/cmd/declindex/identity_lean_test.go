@@ -183,6 +183,80 @@ func TestTheGateRefusesACopyOfAMergedTheoremReferenceHoweverTheIndexWasRead(t *t
 	refused("after a refresh that read B alone")
 }
 
+// gateRefuses runs `gate` on a proposal of the concept name, with its home file and source, and requires exit 1, a
+// refused verdict naming one of existing.
+func gateRefuses(t *testing.T, config, label, name, source string, existing ...string) {
+	t.Helper()
+	raw, err := json.Marshal(conceptgate.Proposal{ID: "copy", Concept: conceptgate.Concept{Name: name, Home: name + ".lean",
+		Meaning: "A copy of an existing statement."}, Source: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal := filepath.Join(t.TempDir(), "copy.json")
+	writeTestFile(t, proposal, string(raw))
+	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
+	var v conceptgate.Verdict
+	if err := json.Unmarshal([]byte(r.out), &v); err != nil || r.code != 1 || v.Outcome != conceptgate.Refused ||
+		!slices.Contains(existing, v.Existing) {
+		t.Errorf("gate %s: want exit 1, refused as one of %q, got %+v, %+v (%v)", label, existing, r, v, err)
+	}
+}
+
+// Lean abstracts a proof inside a definition's value into an auxiliary theorem (`foo._proof_2`), and in one module
+// reuses an earlier one of the same type: `bar`'s value names `foo._proof_2`. A copy of `bar` gets its own
+// abstracted proof, of the same type. The hash counts an abstracted proof by its type, so the copy is refused, with
+// or without importing the module, as a copy of `foo` is.
+func TestTheGateRefusesACopyThatUsesAnotherDeclarationsAbstractedProof(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	config, tree, lean := leanRegistryTree(t, "A")
+	writeTestFile(t, filepath.Join(tree, "A.lean"), "def foo (n : Nat) (h : 0 < n) : Fin n := ⟨n - 1, by omega⟩\n"+
+		"def bar (n : Nat) (h : 0 < n) : Fin n := ⟨n - 1, Nat.sub_lt h Nat.one_pos⟩\n")
+	if err := declindex.CompileModule(context.Background(), lean, nil, tree, "A"); err != nil {
+		t.Fatal(err)
+	}
+	land(t, config, tree, "add A")
+	const copyOfBar = "def Copy (n : Nat) (h : 0 < n) : Fin n := ⟨n - 1, Nat.sub_lt h Nat.one_pos⟩\n"
+	gateRefuses(t, config, "a copy of bar", "Copy", copyOfBar, "bar", "foo")
+	gateRefuses(t, config, "a copy of bar that imports A", "Copy", "import A\n\n"+copyOfBar, "bar", "foo")
+	gateRefuses(t, config, "a copy of foo", "Copy", "def Copy (n : Nat) (h : 0 < n) : Fin n := ⟨n - 1, by omega⟩\n", "bar", "foo")
+}
+
+// An abstracted proof in a theorem's type (`t3._proof_1`) is merged with the theorem when two modules declare it, so
+// its identity, like the theorem's, does not depend on the modules that one exporter run read together. B's
+// `Original` restates `t3`'s type; a proposal that imports B and states it again is refused after a refresh that read
+// A and B together and after one that read B alone.
+func TestTheGateRefusesACopyOfAStatementWithAMergedAbstractedProofHoweverTheIndexWasRead(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	config, tree, lean := leanRegistryTree(t, "A", "B")
+	compile := func(name, source string) {
+		t.Helper()
+		writeTestFile(t, filepath.Join(tree, name+".lean"), source)
+		if err := declindex.CompileModule(context.Background(), lean, nil, tree, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const t3 = "theorem t3 (n : Nat) (h : 0 < n) : (⟨n - 1, by omega⟩ : Fin n).val = n - 1 := rfl\n"
+	const original = "def Original (n : Nat) (h : 0 < n) : (⟨n - 1, by omega⟩ : Fin n).val = n - 1 := t3 n h\n"
+	compile("A", t3)
+	compile("B", t3+original)
+	land(t, config, tree, "add A and B")
+	const copy = "import B\n\ndef Different (n : Nat) (h : 0 < n) : (⟨n - 1, by omega⟩ : Fin n).val = n - 1 := t3 n h\n"
+	gateRefuses(t, config, "a copy of B's Original after a refresh that read A and B together", "Different", copy, "Original")
+	compile("B", t3+original+"theorem spare : True := trivial\n")
+	land(t, config, tree, "add a theorem to B")
+	gateRefuses(t, config, "a copy of B's Original after a refresh that read B alone", "Different", copy, "Original")
+}
+
 // A name whose source writes it with a leading `_` is a declaration like any other: two modules that each declare
 // `_Value` are never imported together, and a refresh with the compiled part reads them in two exporter groups, as
 // it reads two modules that each declare `Value`.

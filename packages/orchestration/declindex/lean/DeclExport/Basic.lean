@@ -60,11 +60,12 @@ private name holds the module that compiled it, which `moduleOf` already gives (
 def constId (ctx : HashCtx) (n : Name) : List H :=
   [H.ofString ((privateToUserName? n).getD n).toString, H.ofString (ctx.moduleOf n).toString]
 
-/-- An auxiliary definition that elaboration made: a matcher, or a proof abstracted out of a body. -/
+/-- An auxiliary definition that elaboration made: a matcher, or a proof abstracted out of a body (`X._proof_1`;
+older toolchains wrote `X.proof_1`). -/
 def isElabAux (env : Environment) (n : Name) : Bool :=
   Meta.isMatcherCore env n ||
     match n with
-    | .str _ s => s.startsWith "proof_" || s.startsWith "match_" || s.startsWith "_auxLemma"
+    | .str _ s => s.startsWith "_proof_" || s.startsWith "proof_" || s.startsWith "match_" || s.startsWith "_auxLemma"
     | _ => false
 
 /-- A name component Lean generates for a declaration's own parts: equation and unfolding lemmas, recursors and
@@ -120,7 +121,12 @@ partial def hashExpr (ctx : HashCtx) (e : Expr) : HashM H := do
       match ctx.env?.bind fun env => if isElabAux env n then env.find? n else none with
       | some ci =>
         let sub : HashCtx := { ctx with levels := ci.levelParams, self := n :: ctx.self }
-        let parts : List H := Id.run (((ci.type :: ci.value?.toList).mapM (hashExpr sub)).run' {})
+        -- An abstracted proof counts by its type alone: elaboration reuses an earlier declaration's proof of that
+        -- type, so its value is that declaration's.
+        let body := match ci with
+          | .thmInfo _ => [ci.type]
+          | _ => ci.type :: ci.value?.toList
+        let parts : List H := Id.run ((body.mapM (hashExpr sub)).run' {})
         pure (H.tag "aux" (parts ++ ls.map (hashLevel ctx)))
       | none =>
         let own := ctx.self.findIdx? fun p => p == n || (p.isPrefixOf n && generatedSuffix (n.replacePrefix p .anonymous))
@@ -154,11 +160,11 @@ def relationHeads : List Name :=
 def symmetricHeads : List Name := [``Eq, ``Ne, ``Iff, ``HEq]
 
 /-- The canonical hash of one atom: free variables by first occurrence, each constant with the module that
-`moduleOf` gives it, and a symmetric relation hashed in the order of its two hashes, so that `a = b` and `b = a`
-agree. -/
-def atomHash (moduleOf : Name → Name) (e : Expr) : H :=
+`moduleOf` gives it (an auxiliary definition by its content, which `env` gives), and a symmetric relation hashed in
+the order of its two hashes, so that `a = b` and `b = a` agree. -/
+def atomHash (env : Environment) (moduleOf : Name → Name) (e : Expr) : H :=
   let e := e.consumeMData
-  let one (x : Expr) : H := hashOf { moduleOf := moduleOf } [x]
+  let one (x : Expr) : H := hashOf { env? := some env, moduleOf := moduleOf } [x]
   match e.getAppFn.consumeMData with
   | .const n _ =>
     if symmetricHeads.contains n && e.getAppNumArgs ≥ 2 then

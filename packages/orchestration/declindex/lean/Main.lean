@@ -102,7 +102,8 @@ partial def identify (ids : IO.Ref (Std.HashMap Name Name)) (base : Name → Nam
   if !merged then return
   identifyIn ids base ci.type
   let tbl ← ids.get
-  let h := hashOf { levels := ci.levelParams, moduleOf := fun c => tbl.getD c (base c) } [ci.type]
+  let h := hashOf { levels := ci.levelParams, env? := some (← getEnv), moduleOf := fun c => tbl.getD c (base c) }
+    [ci.type]
   ids.modify (·.insert n (Name.mkSimple s!"type:{h.hex}"))
 end
 
@@ -130,7 +131,7 @@ def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Na
   let fs := facts cfg w
   let mut atoms : Array String := #[]
   for a in w.atoms do
-    let s := (atomHash moduleOf a).hex
+    let s := (atomHash env moduleOf a).hex
     if !atoms.contains s then atoms := atoms.push s
   let ty ← if types then
       try pure (truncate (toString (← ppExpr ci.type)))
