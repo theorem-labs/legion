@@ -225,7 +225,7 @@ func concurrentApplies(t *testing.T, ops [2][]byte, hold string) (followOns []st
 	applierDSN.RawQuery = query.Encode()
 	s := must(ledger.Open(ctx, applierDSN.String()))
 	hooks, applies := []string{"hook/0", "hook/1"}, []string{"apply/0", "apply/1"}
-	landedBatch(t, s, dsn, "batch-1", hooks...)
+	landedBatch(t, s, "batch-1", hooks...)
 	for i, hook := range hooks {
 		must(s.BatchEffectDone(ctx, "r", "batch-1", hook, ledger.DoneRequest{
 			Result:  jsonValue(map[string]any{"outcome": "exit", "exit": 0}),
@@ -326,7 +326,7 @@ func TestApplyAndRegisterContractAtOnceDoNotDeadlock(t *testing.T) {
 	query.Set("pool_max_conns", "2")
 	sized.RawQuery = query.Encode()
 	s := must(ledger.Open(ctx, sized.String()))
-	landedBatch(t, s, dsn, "batch-1", hookKey)
+	landedBatch(t, s, "batch-1", hookKey)
 	must(s.BatchEffectDone(ctx, "r", "batch-1", hookKey, ledger.DoneRequest{
 		Result:  jsonValue(map[string]any{"outcome": "exit", "exit": 0}),
 		Then:    []ledger.FollowOn{{Key: applyKey, Op: "apply", Kind: "contracts", Input: "ops.jsonl"}},

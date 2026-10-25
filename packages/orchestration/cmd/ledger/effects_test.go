@@ -100,8 +100,7 @@ type cliEffect struct {
 	At          string            `json:"at"`
 }
 
-// newEffectCLI is repository r with batch-1 landed and a hook intent for each key, as LandBatch leaves it. LandBatch is
-// built separately; until it is, the test writes the effect rows directly.
+// newEffectCLI is repository r with batch-1 landed through land-batch and a hook intent for each key.
 func newEffectCLI(t *testing.T, keys ...string) batchCLI {
 	t.Helper()
 	cli := newBatchCLI(t)
@@ -109,16 +108,20 @@ func newEffectCLI(t *testing.T, keys ...string) batchCLI {
 	return cli
 }
 
-// landed creates batch id, landed, with a hook intent carrying the landing commit for each key, as LandBatch records one
-// for each post_land_effects entry.
+// landed lands batch id through admit-batch and land-batch at cliLandingAt, with one member, M-<id>, and one
+// post-landing hook for each key, so the batch holds a hook intent for each key.
 func (cli batchCLI) landed(id string, keys ...string) {
 	cli.t.Helper()
-	cli.create(id, cliRecord("landed"))
-	cli.setAdmission(id, "landed", "")
+	member := cli.openReady("M-"+id, "owner-"+id, id+".lean", nil)
+	cli.create(id, cliRecord("checked"))
+	admitted := cli.admit(admitFields(id, 1, member))
+	effects := []map[string]any{}
 	for _, key := range keys {
-		cli.sql(`INSERT INTO batch_effects (repo, batch, key, op, result) VALUES ('r', $1, $2, 'hook', jsonb_build_object('commit', $3::text))`,
-			id, key, cliLandingAt)
+		effects = append(effects, map[string]any{"key": key, "op": "hook"})
 	}
+	cli.landBatch(map[string]any{"repo": "r", "id": id, "merged_commit": cliLandingAt, "expected_version": admitted.RecordVersion,
+		"record": cliRecord("landed", "pull_request", map[string]any{"number": 7, "merged_commit": cliLandingAt},
+			"post_land_effects", effects)})
 }
 
 func (cli batchCLI) effects(batch string) []cliEffect {

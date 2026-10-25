@@ -23,30 +23,39 @@ const (
 	landingCommit = "merged-1"
 )
 
-// hookIntent records the intent of effect key on batch, with the landing commit in its result, as LandBatch records one
-// for each post_land_effects entry of a landed batch. LandBatch is built separately; until it is, the tests write the
-// row directly.
+// hookIntent records one more intent of effect key on batch, with commit in its result, beside the ones that the
+// batch's landing recorded: a test uses it for an effect that must exist before a call creates the same key, or for an
+// intent that appears after the test's earlier calls.
 func hookIntent(t *testing.T, dsn, batch, key, commit string) {
 	t.Helper()
 	batchSQL(t, dsn, `INSERT INTO batch_effects (repo, batch, key, op, result)
 		VALUES ('r', $1, $2, 'hook', jsonb_build_object('commit', $3::text))`, batch, key, commit)
 }
 
-// landedBatch creates batch id of repository r, landed, with a hook intent for each key, as LandBatch leaves it.
-func landedBatch(t *testing.T, s *ledger.Store, dsn, id string, keys ...string) {
+// landedBatch lands batch id of repository r through LandBatch at landingCommit, with one member, M-<id>, and one
+// post-landing hook for each key, so the batch holds a hook intent for each key.
+func landedBatch(t *testing.T, s *ledger.Store, id string, keys ...string) {
 	t.Helper()
-	createBatch(t, s, id, batchRecord("landed"))
-	setAdmission(t, dsn, id, "landed", "")
+	ctx := context.Background()
+	member := readyMember(t, s, "M-"+id, "owner-"+id, id+".lean", nil, nil)
+	createBatch(t, s, id, batchRecord("checked"))
+	admitted := must(s.AdmitBatch(ctx, admitRequest(id, 1, member)))
+	effects := []map[string]any{}
 	for _, key := range keys {
-		hookIntent(t, dsn, id, key, landingCommit)
+		effects = append(effects, map[string]any{"key": key, "op": "hook"})
 	}
+	must(s.LandBatch(ctx, ledger.LandBatchRequest{
+		Repo: "r", ID: id, MergedCommit: landingCommit, ExpectedVersion: admitted.RecordVersion,
+		Record: batchRecord("landed", "pull_request", map[string]any{"number": 7, "merged_commit": landingCommit},
+			"post_land_effects", effects),
+	}))
 }
 
 // effectFixture is repository r with batch-1 landed and one hook intent, hookKey.
 func effectFixture(t *testing.T) (*ledger.Store, string) {
 	t.Helper()
 	s, dsn := newStoreDSN(t)
-	landedBatch(t, s, dsn, "batch-1", hookKey)
+	landedBatch(t, s, "batch-1", hookKey)
 	return s, dsn
 }
 
@@ -205,7 +214,7 @@ func TestBatchEffectAttemptThenDone(t *testing.T) {
 	if _, listed := pendingOf(t, s, "batch-1"); listed {
 		t.Fatal("a landed batch with no effect left to do is still listed as active")
 	}
-	if got := eventKinds(t, s, "batch-1"); !slices.Equal(got, []string{"batch.created", "effect.attempted", "effect.done"}) {
+	if got := eventKinds(t, s, "batch-1"); !slices.Equal(got, []string{"batch.created", "batch.admitted", "batch.landed", "effect.attempted", "effect.done"}) {
 		t.Fatalf("batch events = %q", got)
 	}
 	attempt := eventsOf(t, s, "batch-1", "effect.attempted")[0]
@@ -476,8 +485,8 @@ func TestBatchEffectDoneWithEscalateToEnqueuesItsItem(t *testing.T) {
 func TestEffectKeysAreScopedToTheirBatch(t *testing.T) {
 	ctx := context.Background()
 	s, dsn := newStoreDSN(t)
-	landedBatch(t, s, dsn, "batch-1", "score")
-	landedBatch(t, s, dsn, "batch-2", "score")
+	landedBatch(t, s, "batch-1", "score")
+	landedBatch(t, s, "batch-2", "score")
 	second := effectOf(t, s, "batch-2", "score")
 	attempted := must(s.BatchEffectAttempt(ctx, "r", "batch-1", "score", ledger.AttemptRequest{
 		Result: jsonValue(map[string]any{"outcome": "exit", "exit": 75}), EscalateTo: escalationOwner, EscalateAfter: 1,
@@ -537,7 +546,7 @@ func TestBeginWithdrawCreatesTheWithdrawIntentOnce(t *testing.T) {
 func TestBatchEffectSkipIsADoneThatNamesTheOperator(t *testing.T) {
 	ctx := context.Background()
 	s, dsn := newStoreDSN(t)
-	landedBatch(t, s, dsn, "batch-1", hookKey, "hook/batch-1/1/score")
+	landedBatch(t, s, "batch-1", hookKey, "hook/batch-1/1/score")
 	operator, operatorDSN := testpg.Login(t, dsn, "ledger_operator")
 	operatorStore := must(ledger.Open(ctx, operatorDSN))
 	defer operatorStore.Close()
@@ -582,7 +591,7 @@ func TestConcurrentDonesCompleteAnEffectOnce(t *testing.T) {
 	_, dsn := newStoreDSN(t)
 	const executors = 8
 	s := openStoreWithPool(t, dsn, "effect_executors", executors)
-	landedBatch(t, s, dsn, "batch-1", hookKey)
+	landedBatch(t, s, "batch-1", hookKey)
 	conn := must(pgx.Connect(ctx, dsn))
 	defer conn.Close(ctx)
 	holder := must(conn.Begin(ctx))
@@ -635,7 +644,7 @@ func TestConcurrentDonesWithFollowOnsInOppositeOrdersDoNotDeadlock(t *testing.T)
 	query.Set("pool_max_conns", "2")
 	sized.RawQuery = query.Encode()
 	s := must(ledger.Open(ctx, sized.String()))
-	landedBatch(t, s, dsn, "batch-1", "hook/0", "hook/1")
+	landedBatch(t, s, "batch-1", "hook/0", "hook/1")
 	observer := must(pgx.Connect(ctx, dsn))
 	defer observer.Close(ctx)
 	holderConn := must(pgx.Connect(ctx, dsn))
@@ -688,7 +697,7 @@ func TestConcurrentAttemptsCountEveryAttempt(t *testing.T) {
 	_, dsn := newStoreDSN(t)
 	const executors = 8
 	s := openStoreWithPool(t, dsn, "effect_executors", executors)
-	landedBatch(t, s, dsn, "batch-1", hookKey)
+	landedBatch(t, s, "batch-1", hookKey)
 	conn := must(pgx.Connect(ctx, dsn))
 	defer conn.Close(ctx)
 	holder := must(conn.Begin(ctx))
