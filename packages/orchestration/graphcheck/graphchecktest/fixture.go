@@ -63,6 +63,10 @@ producers:
 type Variant struct {
 	Lakefile string
 	Files    map[string]string
+	// Pruned modules lose their object file after the build, keeping their reference file, so the index knows
+	// them and the base build has nothing to compile against: what pruning to the targets' closure leaves. The
+	// index of such a fixture is read without its compiled part, as the replay corpus's is.
+	Pruned []string
 }
 
 // New builds the fixture.
@@ -75,7 +79,7 @@ func New(t testing.TB) *Fixture {
 // changed project's own sources.
 func NewVariant(t testing.TB, v Variant) *Fixture {
 	t.Helper()
-	return build(t, v, nil, true)
+	return build(t, v, nil, len(v.Pruned) == 0)
 }
 
 // NewWithoutCompiledPart builds the fixture with an index read from the reference files alone (lean.export off),
@@ -138,6 +142,11 @@ func build(t testing.TB, v Variant, damage func(lib string), compiled bool) *Fix
 		t.Fatal(err)
 	}
 	lib := filepath.Join(repo, ".lake", "build", "lib", "lean")
+	for _, module := range v.Pruned {
+		if err := os.Remove(filepath.Join(lib, strings.ReplaceAll(module, ".", "/")+".olean")); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if damage != nil {
 		damage(lib)
 	}

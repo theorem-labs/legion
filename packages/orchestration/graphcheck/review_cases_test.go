@@ -73,6 +73,42 @@ func TestNamesDoesNotRefuseARemovalForAnotherMembersBreak(t *testing.T) {
 	}
 }
 
+// A module the batch changes that no build target reaches has no object file in the base build. The check must
+// never need it: here a removal makes it read the compiled constants, and it still decides.
+func TestNamesNeverNeedsTheOutputOfAModuleNoTargetBuilds(t *testing.T) {
+	f := graphchecktest.NewVariant(t, graphchecktest.Variant{Files: map[string]string{
+		"Lib/Orphan.lean": "def orphan : Nat := 1\n",
+	}})
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Core.lean":   {"def helper", "private def helper"},
+		"Lib/Orphan.lean": {"def orphan : Nat := 1", "def orphan : Nat := 2"},
+	})
+	if _, ok := find(names(t, f, tree), landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Use.lean", "N1"); !ok {
+		t.Fatal("no N1 refusal at Lib/Use.lean")
+	}
+}
+
+// A module the index knows but the base build has no object file for (a build pruned to its targets' closure) is
+// outside what the build builds: no finding is made at it, and the check still decides.
+func TestNamesMakesNoFindingInAModuleTheBaseBuildDidNotBuild(t *testing.T) {
+	f := graphchecktest.NewVariant(t, graphchecktest.Variant{Pruned: []string{"Lib.Make"}})
+	tree := f.Edit(t, "Lib/Core.lean", "  val : Nat", "  value : Nat")
+	for _, h := range names(t, f, tree) {
+		if h.Path == "Lib/Make.lean" {
+			t.Fatalf("finding %+v in a module the base build did not build", h)
+		}
+	}
+}
+
+// A module whose name has a dot inside one component (`Lib.«Foo.Bar»`, file Lib/Foo.Bar.lean) is one graphcheck
+// cannot name as Lean and Lake do: the check is unable rather than compiling it under a wrong name.
+func TestADottedModuleNameIsUnable(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Foo.Bar.lean", "", "def dotted : Nat := 1\n")
+	_, _, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, tree)
+	isUnable(t, err)
+}
+
 // An unchanged module between two changed ones is rebuilt as the build rebuilds it: its base .olean was elaborated
 // against the old version of the module it imports, and compiling the downstream changed module against that stale
 // output would fail where the build succeeds.

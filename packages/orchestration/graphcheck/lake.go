@@ -26,29 +26,30 @@ type lakeSetup struct {
 	} `json:"plugins"`
 }
 
-// lakeState is one leanArgs call's view of the base build's setup files: each file read once, and each changed
-// module's plugins computed once.
+// lakeState is the candidate's view of the base build's setup files: each file read once, and each module's plugin
+// list worked out once.
 type lakeState struct {
 	// mu guards every map below: the compiles that ask for their arguments run in parallel.
 	mu      sync.Mutex
 	c       *Candidate
-	dir     string
-	setups  map[string]*lakeSetup // module -> its base setup, nil when it has none
-	plugins map[string][]string   // changed module -> the plugins of its candidate imports
-	pending map[string]bool       // changed modules whose plugins are being computed
+	dir     string                // the root package's setup directory
+	setups  map[string]*lakeSetup // module -> its base setup in whichever package builds it, nil when none has one
+	plugins map[string][]string   // module without a setup of its own -> the plugin list worked out for it
+	pending map[string]bool       // modules whose plugin list is being worked out
 	stale   map[string]string     // shared library path -> the changed precompiled module it belongs to
 }
 
-// leanArgs gives the arguments Lake gave a module of the base build, for the scratch compile of a candidate module:
-// `-D<name>=<value>` for each option of its package and library, and `--plugin=<path>` for each shared library
-// Lake loads into its compile, sorted and deduplicated. They come from the base build's setup files.
+// leanArgs gives the arguments Lake gives a module's compile, read from the base build's setup files:
+// `-D<name>=<value>` for each option of its package and library, sorted, then `--plugin=<path>` for each shared
+// library Lake loads, in Lake's load order, each once.
 //
-// A modified module takes its own setup's options; an added module those of a direct import of its library (the
-// same first name component), else of any direct import with a setup. Its plugins are its own setup's, and for
-// each direct import, that import's plugins (its base setup's, or, for a changed import, what leanArgs computes
-// for it) and the import's own precompiled shared library. A changed module that is precompiled has a stale
-// shared library in the base build, which the check cannot rebuild: a compile that would load it is unable.
-// A tree that Lake did not build has no setup directory and gives no arguments.
+// A module with a setup of its own takes its options and plugins from it. One without (an added module) takes the
+// options of its own library, which Lake gives every module of the library alike, and the plugins its imports
+// bring: each import's own list (found in the build of the package that builds it, a dependency's included) and the
+// import's own precompiled shared library, merged into one order that keeps each list's order. Where Lake's answer
+// cannot be read off the base build (a library with no module built, two imports that order two plugins
+// differently, a changed module whose shared library would be stale), the check is unable, never wrong. A tree
+// that Lake did not build has no setup directory and gives no arguments.
 func (c *Candidate) leanArgs(m *Module) ([]string, error) {
 	dir := filepath.Join(filepath.Dir(filepath.Dir(c.icfg.Lib)), "ir")
 	if info, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) || err == nil && !info.IsDir() {
@@ -74,44 +75,168 @@ func (c *Candidate) leanArgs(m *Module) ([]string, error) {
 	}
 	opts := own
 	if opts == nil {
-		if opts, err = s.inheritedOptions(m); err != nil {
+		if opts, err = s.libraryOptions(m.Module); err != nil {
 			return nil, err
 		}
 	}
-	// Lake writes the whole plugin list of a module's compile into its own setup, in load order, so the setup is
-	// the list: an added module takes the one of the import whose options it inherits.
-	var plugins []string
-	if opts != nil {
-		for _, p := range opts.Plugins {
-			plugins = append(plugins, p.Path)
-		}
+	plugins, err := s.pluginsOf(m)
+	if err != nil {
+		return nil, err
 	}
 	var options []string
-	if opts != nil {
-		for name, raw := range opts.Options {
-			value, err := optionValue(raw)
-			if err != nil {
-				return nil, unable("the base build's setup of %s has option %s: %v", m.Module, name, err)
-			}
-			options = append(options, "-D"+name+"="+value)
+	for name, raw := range opts.Options {
+		value, err := optionValue(raw)
+		if err != nil {
+			return nil, unable("the base build's setup of %s has option %s: %v", m.Module, name, err)
 		}
+		options = append(options, "-D"+name+"="+value)
 	}
 	sort.Strings(options)
 	args := slices.Compact(options)
-	// The plugins keep Lake's order, each the first time it appears: one plugin's symbols resolve against those
-	// loaded before it, so a sorted list fails to load.
-	seen := make(map[string]bool, len(plugins))
+	// The plugins keep Lake's order: one plugin's symbols resolve against those loaded before it, so a sorted list
+	// fails to load.
 	for _, p := range plugins {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
 		if module, ok := s.stale[p]; ok {
 			return nil, staleLibrary(module, m.Module)
 		}
 		args = append(args, "--plugin="+p)
 	}
 	return args, nil
+}
+
+// pluginsOf is a module's plugin list in load order: its own setup's, else the merge of what its imports bring.
+func (s *lakeState) pluginsOf(m *Module) ([]string, error) {
+	own, err := s.setup(m.Module)
+	if err != nil {
+		return nil, err
+	}
+	if own != nil {
+		return own.pluginPaths(), nil
+	}
+	if plugins, ok := s.plugins[m.Module]; ok {
+		return plugins, nil
+	}
+	if s.pending[m.Module] {
+		return nil, unable("the candidate's imports of %s form a cycle", m.Module)
+	}
+	s.pending[m.Module] = true
+	defer delete(s.pending, m.Module)
+	var lists [][]string
+	for _, imp := range m.Imports {
+		var list []string
+		if changed := s.c.modules[imp]; changed != nil {
+			if list, err = s.pluginsOf(changed); err != nil {
+				return nil, err
+			}
+		} else {
+			setup, err := s.setup(imp)
+			if err != nil {
+				return nil, err
+			}
+			if setup == nil {
+				continue
+			}
+			list = setup.pluginPaths()
+			if lib, ok := s.sharedLibrary(imp, setup.Package); ok {
+				list = append(list, lib)
+			}
+		}
+		lists = append(lists, list)
+	}
+	plugins, ok := mergeOrders(lists)
+	if !ok {
+		return nil, unable("the imports of %s load their plugins in orders that disagree, so Lake's order for it cannot be read off the base build", m.Module)
+	}
+	s.plugins[m.Module] = plugins
+	return plugins, nil
+}
+
+// pluginPaths is a setup's plugin list, each path once, in its order.
+func (setup *lakeSetup) pluginPaths() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, p := range setup.Plugins {
+		if !seen[p.Path] {
+			seen[p.Path] = true
+			out = append(out, p.Path)
+		}
+	}
+	return out
+}
+
+// mergeOrders merges lists that each give a load order into one order that keeps every list's order, the earliest
+// seen first where they leave a choice. It reports false when two lists order two entries differently.
+func mergeOrders(lists [][]string) ([]string, bool) {
+	var order []string
+	first := map[string]int{}
+	after := map[string]map[string]bool{}
+	waits := map[string]int{}
+	for _, list := range lists {
+		for i, p := range list {
+			if _, ok := first[p]; !ok {
+				first[p] = len(order)
+				order = append(order, p)
+			}
+			if i == 0 || list[i-1] == p {
+				continue
+			}
+			prev := list[i-1]
+			if after[prev] == nil {
+				after[prev] = map[string]bool{}
+			}
+			if !after[prev][p] {
+				after[prev][p] = true
+				waits[p]++
+			}
+		}
+	}
+	out := make([]string, 0, len(order))
+	done := map[string]bool{}
+	for len(out) < len(order) {
+		next := ""
+		for _, p := range order {
+			if !done[p] && waits[p] == 0 {
+				next = p
+				break
+			}
+		}
+		if next == "" {
+			return nil, false
+		}
+		done[next] = true
+		out = append(out, next)
+		for p := range after[next] {
+			waits[p]--
+		}
+	}
+	return out, true
+}
+
+// libraryOptions is the setup an added module takes its options from: any base setup of a module of its own
+// library (its first name component), as Lake gives all of them the package's and the library's options. With no
+// module of the library built, there is nothing to read them from.
+func (s *lakeState) libraryOptions(module string) (*lakeSetup, error) {
+	library := nameComponents(module)[0]
+	var found string
+	for _, start := range []string{filepath.Join(s.dir, library+".setup.json"), filepath.Join(s.dir, library)} {
+		_ = filepath.WalkDir(start, func(p string, entry fs.DirEntry, err error) error {
+			if err != nil || found != "" {
+				return filepath.SkipAll
+			}
+			if !entry.IsDir() && strings.HasSuffix(p, ".setup.json") {
+				found = p
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		if found != "" {
+			break
+		}
+	}
+	if found == "" {
+		return nil, unable("no module of library %s is in the base build, so the options Lake gives its new module %s cannot be read", library, module)
+	}
+	return readSetup(found)
 }
 
 func staleLibrary(module, importer string) error {
@@ -136,109 +261,47 @@ func (s *lakeState) findStale() error {
 	return nil
 }
 
-// inheritedOptions is the setup whose options an added module takes: that of a direct import of its library, else
-// of any direct import, in name order.
-func (s *lakeState) inheritedOptions(m *Module) (*lakeSetup, error) {
-	first, _, _ := strings.Cut(m.Module, ".")
-	var fallback *lakeSetup
-	for _, imp := range slices.Sorted(slices.Values(m.Imports)) {
-		setup, err := s.setup(imp)
-		if err != nil {
-			return nil, err
-		}
-		if setup == nil {
-			continue
-		}
-		if impFirst, _, _ := strings.Cut(imp, "."); impFirst == first {
-			return setup, nil
-		}
-		if fallback == nil {
-			fallback = setup
-		}
-	}
-	return fallback, nil
-}
-
-// importPlugins gives the plugins a module's direct imports bring in the candidate.
-func (s *lakeState) importPlugins(module string, imports []string) ([]string, error) {
-	var out []string
-	for _, imp := range imports {
-		setup, err := s.setup(imp)
-		if err != nil {
-			return nil, err
-		}
-		if changed := s.c.modules[imp]; changed != nil {
-			if setup != nil {
-				if _, ok := s.sharedLibrary(imp, setup.Package); ok {
-					return nil, staleLibrary(imp, module)
-				}
-			}
-			plugins, err := s.changedPlugins(changed)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, plugins...)
-			continue
-		}
-		if setup == nil {
-			continue
-		}
-		for _, p := range setup.Plugins {
-			out = append(out, p.Path)
-		}
-		if lib, ok := s.sharedLibrary(imp, setup.Package); ok {
-			out = append(out, lib)
-		}
-	}
-	return out, nil
-}
-
-// changedPlugins gives a changed module's plugins: its own setup's and those its candidate imports bring.
-func (s *lakeState) changedPlugins(m *Module) ([]string, error) {
-	if plugins, ok := s.plugins[m.Module]; ok {
-		return plugins, nil
-	}
-	if s.pending[m.Module] {
-		return nil, unable("the candidate's imports of %s form a cycle", m.Module)
-	}
-	s.pending[m.Module] = true
-	defer delete(s.pending, m.Module)
-	plugins, err := s.importPlugins(m.Module, m.Imports)
-	if err != nil {
-		return nil, err
-	}
-	setup, err := s.setup(m.Module)
-	if err != nil {
-		return nil, err
-	}
-	if setup != nil {
-		for _, p := range setup.Plugins {
-			plugins = append(plugins, p.Path)
-		}
-	}
-	s.plugins[m.Module] = plugins
-	return plugins, nil
-}
-
-// setup reads a module's base setup file, or gives nil when the base build has none.
+// setup reads a module's base setup file from the build of the package that builds it, or gives nil when none of
+// them has one. Lake keeps each package's setups beside its library directory, `<build>/ir`, so each directory on
+// the search path names one; the root package's comes first.
 func (s *lakeState) setup(module string) (*lakeSetup, error) {
 	if setup, ok := s.setups[module]; ok {
 		return setup, nil
 	}
-	path := filepath.Join(s.dir, filepath.FromSlash(strings.ReplaceAll(module, ".", "/"))+".setup.json")
-	raw, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		s.setups[module] = nil
-		return nil, nil
+	rel := filepath.Join(nameComponents(module)...) + ".setup.json"
+	dirs := []string{s.dir}
+	for _, lib := range s.c.leanPath {
+		dirs = append(dirs, filepath.Join(filepath.Dir(filepath.Dir(lib)), "ir"))
 	}
+	for _, dir := range dirs {
+		path := filepath.Join(dir, rel)
+		if _, err := os.Stat(path); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return nil, unable("the base build's setup of %s cannot be read: %v", module, err)
+		}
+		setup, err := readSetup(path)
+		if err != nil {
+			return nil, err
+		}
+		s.setups[module] = setup
+		return setup, nil
+	}
+	s.setups[module] = nil
+	return nil, nil
+}
+
+// readSetup reads one setup file.
+func readSetup(path string) (*lakeSetup, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, unable("the base build's setup of %s cannot be read: %v", module, err)
+		return nil, unable("the base build's setup %s cannot be read: %v", path, err)
 	}
 	var setup lakeSetup
 	if err := json.Unmarshal(raw, &setup); err != nil {
-		return nil, unable("the base build's setup of %s (%s) is not Lake's: %v", module, path, err)
+		return nil, unable("the base build's setup %s is not Lake's: %v", path, err)
 	}
-	s.setups[module] = &setup
 	return &setup, nil
 }
 
@@ -274,7 +337,8 @@ func optionValue(raw json.RawMessage) (string, error) {
 }
 
 // initializationStem is Lean's mkModuleInitializationStem (Lean/Compiler/NameMangling.lean): the mangled package
-// name, `_`, and the mangled module name.
+// name, `_`, and the mangled module name, one name component at a time, a «»-quoted component (which may hold a
+// dot) as one.
 func initializationStem(module, pkg string) string {
 	var b strings.Builder
 	if pkg != "" {
@@ -282,7 +346,7 @@ func initializationStem(module, pkg string) string {
 		b.WriteByte('_')
 	}
 	prev := ""
-	for i, part := range strings.Split(module, ".") {
+	for i, part := range nameComponents(module) {
 		m := mangleString(part)
 		switch {
 		case i == 0 && needsDisambiguation(m):
@@ -296,6 +360,27 @@ func initializationStem(module, pkg string) string {
 		prev = part
 	}
 	return b.String()
+}
+
+// nameComponents splits a Lean name into its components: at each dot outside «», with the «» taken off.
+func nameComponents(name string) []string {
+	var out []string
+	var b strings.Builder
+	quoted := false
+	for _, r := range name {
+		switch {
+		case r == '«' && !quoted:
+			quoted = true
+		case r == '»' && quoted:
+			quoted = false
+		case r == '.' && !quoted:
+			out = append(out, b.String())
+			b.Reset()
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return append(out, b.String())
 }
 
 // mangleString is the escaping Lean applies to one name component when it builds a symbol.

@@ -13,22 +13,43 @@ import (
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
-// lakeTree is a synthetic base build: a library directory and Lake's setup directory beside it.
+// lakeTree is a synthetic base build: a library directory and Lake's setup directory beside it, and the builds of
+// the dependency packages it requires, each laid out the same way.
 type lakeTree struct {
 	t       *testing.T
+	root    string
 	lib, ir string
+	deps    []*lakeTree
 }
 
 func newLakeTree(t *testing.T) *lakeTree {
 	t.Helper()
-	root := t.TempDir()
-	tree := &lakeTree{t: t, lib: filepath.Join(root, ".lake", "build", "lib", "lean"), ir: filepath.Join(root, ".lake", "build", "ir")}
+	return makeLakeTree(t, t.TempDir())
+}
+
+func makeLakeTree(t *testing.T, root string) *lakeTree {
+	t.Helper()
+	tree := &lakeTree{t: t, root: root, lib: filepath.Join(root, ".lake", "build", "lib", "lean"), ir: filepath.Join(root, ".lake", "build", "ir")}
 	for _, dir := range []string{tree.lib, tree.ir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	return tree
+}
+
+// dependency adds the build of a required package, which Lake puts on the search path after the root's.
+func (l *lakeTree) dependency(name string) *lakeTree {
+	l.t.Helper()
+	dep := makeLakeTree(l.t, filepath.Join(l.root, ".lake", "packages", name))
+	l.deps = append(l.deps, dep)
+	return dep
+}
+
+// olean writes a module's object file, which says which package builds the module.
+func (l *lakeTree) olean(module string) {
+	l.t.Helper()
+	l.write(filepath.Join(l.lib, strings.ReplaceAll(module, ".", "/")+".olean"), []byte("olean"))
 }
 
 // setup writes a module's setup file as Lake writes it, importArts included.
@@ -69,7 +90,10 @@ func (l *lakeTree) write(path string, raw []byte) {
 
 // candidate is a candidate over the tree whose changed modules are changed, each with its imports.
 func (l *lakeTree) candidate(changed map[string][]string) *Candidate {
-	c := &Candidate{icfg: declindex.Config{Lib: l.lib}, modules: map[string]*Module{}}
+	c := &Candidate{icfg: declindex.Config{Lib: l.lib}, modules: map[string]*Module{}, leanPath: []string{l.lib}}
+	for _, dep := range l.deps {
+		c.leanPath = append(c.leanPath, dep.lib)
+	}
 	for name, imports := range changed {
 		c.modules[name] = &Module{Change: Change{Module: name, Status: Modified}, Imports: imports}
 	}
@@ -99,23 +123,85 @@ func TestLeanArgsFormatsOptionsAndKeepsThePluginOrder(t *testing.T) {
 	}
 }
 
+// An added module takes its own library's options, as Lake gives every module of a library the same ones, whatever
+// it imports.
 func TestLeanArgsGivesAnAddedModuleItsLibrarysOptions(t *testing.T) {
 	l := newLakeTree(t)
 	l.setup("Aux.X", map[string]any{"other": 1})
 	l.setup("Lib.B", map[string]any{"maxRecDepth": 8192})
-	c := l.candidate(map[string][]string{"Lib.New": {"Aux.X", "Lib.B"}})
+	for _, imports := range [][]string{{"Aux.X", "Lib.B"}, {"Aux.X"}} {
+		c := l.candidate(map[string][]string{"Lib.New": imports})
+		c.modules["Lib.New"].Status = Added
+		args, err := c.leanArgs(c.modules["Lib.New"])
+		if err != nil || !slices.Equal(args, []string{"-DmaxRecDepth=8192"}) {
+			t.Fatalf("imports %v: leanArgs = %q, %v, want Lib's options", imports, args, err)
+		}
+	}
+}
+
+// A library with no module in the base build gives no options to read: the check cannot match Lake and says so.
+func TestLeanArgsIsUnableForAModuleOfANewLibrary(t *testing.T) {
+	l := newLakeTree(t)
+	l.setup("Lib.B", map[string]any{"maxRecDepth": 8192})
+	c := l.candidate(map[string][]string{"Fresh.New": {"Lib.B"}})
+	c.modules["Fresh.New"].Status = Added
+	var u *UnableError
+	if _, err := c.leanArgs(c.modules["Fresh.New"]); !errors.As(err, &u) || !strings.Contains(u.Reason, "Fresh") {
+		t.Fatalf("leanArgs error %v, want *UnableError naming the library Fresh", err)
+	}
+}
+
+// An added module that imports only a dependency package's modules gets the plugins Lake gives them: those modules'
+// own setups live in that package's build, not in the root's.
+func TestLeanArgsGivesAnAddedModuleThePluginsOfADependencyImport(t *testing.T) {
+	l := newLakeTree(t)
+	l.setup("Lib.B", map[string]any{"maxRecDepth": 8192})
+	dep := l.dependency("dep")
+	dep.olean("Dep.X")
+	dep.setup("Dep.X", nil, "/tc/libLake_shared.so", "/dep/libdep_Dep.so")
+	c := l.candidate(map[string][]string{"Lib.New": {"Dep.X"}})
 	c.modules["Lib.New"].Status = Added
 	args, err := c.leanArgs(c.modules["Lib.New"])
-	if err != nil {
-		t.Fatal(err)
+	want := []string{"-DmaxRecDepth=8192", "--plugin=/tc/libLake_shared.so", "--plugin=/dep/libdep_Dep.so"}
+	if err != nil || !slices.Equal(args, want) {
+		t.Fatalf("leanArgs = %q, %v, want %q", args, err, want)
 	}
-	if want := []string{"-DmaxRecDepth=8192"}; !slices.Equal(args, want) {
-		t.Fatalf("leanArgs = %q, want %q", args, want)
+}
+
+// Several imports' plugin lists merge into one load order that keeps each list's own order.
+func TestLeanArgsMergesThePluginOrdersOfSeveralImports(t *testing.T) {
+	l := newLakeTree(t)
+	l.setup("Lib.B", map[string]any{}, "/a.so", "/b.so", "/d.so")
+	l.setup("Lib.C", map[string]any{}, "/a.so", "/c.so", "/d.so")
+	c := l.candidate(map[string][]string{"Lib.New": {"Lib.B", "Lib.C"}})
+	c.modules["Lib.New"].Status = Added
+	args, err := c.leanArgs(c.modules["Lib.New"])
+	want := []string{"--plugin=/a.so", "--plugin=/b.so", "--plugin=/c.so", "--plugin=/d.so"}
+	if err != nil || !slices.Equal(args, want) {
+		t.Fatalf("leanArgs = %q, %v, want %q", args, err, want)
 	}
-	// With no import of its own library, it takes the options of another import.
-	c = l.candidate(map[string][]string{"Lib.New": {"Aux.X"}})
-	if args, err := c.leanArgs(c.modules["Lib.New"]); err != nil || !slices.Equal(args, []string{"-Dother=1"}) {
-		t.Fatalf("leanArgs = %q, %v, want -Dother=1", args, err)
+}
+
+// Two imports whose plugin lists order two libraries differently leave no load order Lake would use.
+func TestLeanArgsIsUnableWhenImportsDisagreeOnPluginOrder(t *testing.T) {
+	l := newLakeTree(t)
+	l.setup("Lib.B", map[string]any{}, "/a.so", "/b.so")
+	l.setup("Lib.C", map[string]any{}, "/b.so", "/a.so")
+	c := l.candidate(map[string][]string{"Lib.New": {"Lib.B", "Lib.C"}})
+	c.modules["Lib.New"].Status = Added
+	var u *UnableError
+	if _, err := c.leanArgs(c.modules["Lib.New"]); !errors.As(err, &u) {
+		t.Fatalf("leanArgs error %v, want *UnableError", err)
+	}
+}
+
+// A name component written in «» may hold a dot; Lean mangles it as one component, and so does the library name.
+func TestInitializationStemOfAQuotedComponent(t *testing.T) {
+	if got, want := initializationStem("Lib.«a.b»", "lib"), "lib_Lib_a_x2eb"; got != want {
+		t.Fatalf("initializationStem = %q, want %q", got, want)
+	}
+	if got := nameComponents("Lib.«a.b».C"); !slices.Equal(got, []string{"Lib", "a.b", "C"}) {
+		t.Fatalf("nameComponents = %q", got)
 	}
 }
 

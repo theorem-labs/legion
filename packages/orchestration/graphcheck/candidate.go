@@ -220,6 +220,10 @@ func (c *Candidate) read(ctx context.Context, g gitDir, idx *declindex.Store) er
 		if strings.ContainsAny(file, "\n\t") {
 			return unable("changed file %q has a tab or a newline in its path", file)
 		}
+		if dotted(strings.Split(strings.TrimSuffix(file, ".lean"), "/")) {
+			return unable("changed file %s names a module with a dot inside one name component; graphcheck cannot "+
+				"name its outputs and its shared library as Lean and Lake do", file)
+		}
 		var s Status
 		switch status {
 		case "A":
@@ -559,6 +563,11 @@ func (c *Candidate) closure() error {
 		if !ok || c.built[module] {
 			continue
 		}
+		// An unchanged module the base build has no object file for lies outside what the build's targets build:
+		// the build does not read it, so neither does the check.
+		if c.byModule[module] == nil && !c.baseBuilt(module) {
+			continue
+		}
 		c.built[module] = true
 		stack = append(stack, imported...)
 	}
@@ -604,6 +613,10 @@ func (c *Candidate) headerImports(ctx context.Context, files []string) ([]header
 		}
 		seen := map[string]bool{}
 		for _, imp := range entry.Result.Imports {
+			if dotted(nameComponents(imp.Module)) {
+				return nil, unable("%s imports %s, a module with a dot inside one name component; graphcheck "+
+					"cannot name its outputs and its shared library as Lean and Lake do", files[i], imp.Module)
+			}
 			name := normalName(imp.Module)
 			if !seen[name] {
 				seen[name] = true
@@ -612,6 +625,11 @@ func (c *Candidate) headerImports(ctx context.Context, files []string) ([]header
 		}
 	}
 	return headers, nil
+}
+
+// dotted reports whether a name component holds a dot: a module named with «a.b», whose file is a.b.lean.
+func dotted(components []string) bool {
+	return slices.ContainsFunc(components, func(c string) bool { return strings.Contains(c, ".") })
 }
 
 // compileBuilt compiles the changed modules that the build builds. Each starts as soon as every changed module in
@@ -930,7 +948,7 @@ func (c *Candidate) export(ctx context.Context) error {
 			compiled = append(compiled, ch.Module)
 		}
 		if ch.Status != Added {
-			if module, ok := c.indexModule(ch); ok {
+			if module, ok := c.indexModule(ch); ok && c.baseBuilt(module) {
 				before = append(before, module)
 			}
 		}
@@ -965,6 +983,14 @@ func (c *Candidate) export(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// baseBuilt reports whether the base build produced a module's object file. A module outside the closure of the
+// build's targets has none: the build never reads it, and nothing of graphcheck may need it either.
+func (c *Candidate) baseBuilt(module string) bool {
+	path := filepath.Join(c.icfg.Lib, filepath.Join(nameComponents(module)...)+".olean")
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // indexModule is the index's name of a changed file's module.
