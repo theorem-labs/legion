@@ -2,6 +2,32 @@
 
 `cmd/declindex` answers questions about a built Lean project and protects the concept registry that its owners share. The command's help is the short command reference; this document describes the persisted data and the landing contracts. The container acceptance drivers are in [e2e/README.md](e2e/README.md).
 
+## Configuration and connection
+
+Each index is one schema of a Postgres database that many indexes share. The configuration file names the schema; no configuration file holds a connection string.
+
+| Key | What it names |
+| --- | --- |
+| `index` | the schema of this index: a lower-case letter, then lower-case letters, digits and `_`, at most 48 characters, and none of `pg_*`, `public` or `information_schema`. Every command that opens the index needs it. |
+| `state` | the local directory of the exporter build (`<state>/exporter`) and of the registry's forms module (`<state>/forms`), relative to the configuration file's directory. It must resolve outside the tree, so that nothing the index or the gate builds can dirty the tree. Without it, the state is `<user cache directory>/declindex/<index>`. |
+| `reader` | the read-only role that a refresh grants `USAGE` on the schema and `SELECT` on its tables. Empty grants nothing. |
+
+The connection string comes from the variable `DECLINDEX_DSN`, or from the file that `--index-dsn-file FILE` names, whose trimmed contents win over the variable. `refresh` runs with a login that owns the schema; the queries, `status`, `land-hash`, `gate` and `ledger` run with the `reader` login. `ledger` keeps its own connection to the ledger, another database, from `LEDGER_DSN` or `--dsn-file`.
+
+The key `db` and the flag `--db`, which named the index's file, are refused: `db: was removed: the index is a Postgres schema; set index: and pass DECLINDEX_DSN or --index-dsn-file`.
+
+Global options come before the command:
+
+| Option | Effect |
+| --- | --- |
+| `--config FILE` | the configuration file, or `DECLINDEX_CONFIG` |
+| `--index NAME` | the schema, overriding `index`, so that one configuration in a tree serves a main and a test index |
+| `--index-dsn-file FILE` | the connection string, from a file |
+| `--state DIR` | the state directory, overriding `state` |
+| `--json` | answer as JSON, where the command answers in JSON |
+
+A command that opens the index without a schema name or a connection string is a usage error, exit 2. A failed connection to the index's database (no route, a refused or dropped connection, a server that restarts) exits 75 in every command, with `declindex: the index's database is unreachable: …`, so that the landing program runs that hook again rather than count a defect. `declindex --help` lists every command's exit codes.
+
 ## Index data and storage
 
 The index has two parts, in a schema of its own on a shared Postgres server:
@@ -64,6 +90,7 @@ declindex --config <cfg> gate --proposer <owner-id> [--accepted-by <owner-id>] P
 | 4 | `near`: a registered fact is restated. | Wait for the librarian's decision. |
 | 5 | `name-taken`: a concept, a declaration or a concept file that the loader refused already has the proposal name. | Use that concept, or use another name for a different statement. |
 | 2 | Usage error. | Correct the command invocation. |
+| 75 | The index's database could not be reached. | Run the gate again. |
 
 The comparison has no embedding threshold and no partial-atom threshold. Exact compiled hashes are refused. Two statements have the same compiled hash when their elaborated terms are equal up to binder names, the declaration's own name, and how a numeral of core Lean's `Nat` and `BitVec` instances is written (`7#64` and `7 : BitVec 64` agree). Any other numeral counts with its type and instance, since its instance gives its value: `@OfNat.ofNat Nat 7 ⟨9⟩` is 9, so it is not `@OfNat.ofNat Nat 7 ⟨10⟩`. Each constant that a statement names counts with the module that declares it, so a statement about A's `Value` is not one about B's `Value`, and a private name counts by the name its source writes. An auxiliary definition that elaboration made (a matcher, or a theorem that holds a proof abstracted out of a body, whose last name component Lean writes as `_proof_` and an index: `foo._proof_2`, or `rt._proof_1_3` in a recursive declaration) counts by its content, and an abstracted proof by its type alone. A matcher is one that Lean recorded as a matcher in its module (the exporter reads that record from the imported module, since it does not load environment extensions), and it gets no row of its own. A constant of another kind, or with another name, keeps its own identity, also when its name starts the same way (the constructors `Choice._proof_left` and `Pick.match_left`). In one module, elaboration reuses an earlier declaration's proof of the same type, and its matcher for the same patterns, so `def bar … := ⟨n - 1, Nat.sub_lt h Nat.one_pos⟩` names `foo._proof_2` and `def bar (n : Nat) : Nat := match n with …` can name `foo.match_1`, while a copy of `bar` gets its own, and the two still hash equal. A proposal, compiled as a module of its own, is hashed as of the module of its home file, so the declaration that lands there has the compiled hash that the gate recorded. A statement that directly states a registered form, or states it through a declaration in the proposal, is near. Form matching compares numerals only by the value they are written with, so it gives only near results. A proposal that the gate cannot compare is also near rather than accepted. `--accepted-by` records a librarian decision that a near proposal is new; the resulting addition records `accepted_by` and `accepted_near`.
 
@@ -88,7 +115,7 @@ Both controls are rules about content: a proposal holds declarations only. Once 
 
 ### Landing containers
 
-The landing program's container contract decides each container's mounts and network. Besides `TMPDIR`, where `declindex` makes its registry snapshots, its proposal work and the toolchain runs' temporary directories, it needs these writable places and nothing else:
+The landing program's container contract decides each container's mounts and network. Every command that opens the index needs a route to the Postgres server and the connection string of its login; `refresh` writes the index with the owning login, the rest read it with the `reader` login. Besides `TMPDIR`, where `declindex` makes its registry snapshots, its proposal work and the sandboxed and toolchain runs' scratch directories, each command needs these writable places and nothing else:
 
 | Command | Writes |
 | --- | --- |
@@ -121,7 +148,7 @@ The landing program sets `LAND_COMMIT` and `LAND_PART`; `declindex` reads `LAND_
 
 The remote can hold the landed commit under a ref that is not a branch, as a landing program's clone does, so the fetch asks for `LAND_COMMIT` by its id. Only when the remote refuses that (a server that allows only the tips it advertises) does it fetch the remote's branches; a refresh whose fetches both fail exits 75. The fetch writes refs only under `refs/declindex/remote/<pid>-<random>/`, a namespace of that run, and deletes those refs when the sync ends; the checkout is by hash. So refreshes in several worktrees of one repository, which share its refs, never move each other's refs.
 
-`refresh` exits 0 after reading the build, 3 when it cannot safely read it, 75 for a failed fetch, build timeout, or signalled build, and 2 for usage. A configured build that exits nonzero exits 3. A registry defect is a note, not a failure. So is an index defect, a module read without the registry's forms: refresh exits 0 and names each such module and its clash on stderr, after this refresh and every later one until the clash is gone.
+`refresh` exits 0 after reading the build, 3 when it cannot safely read it, 75 for a failed fetch, build timeout, signalled build or unreachable index database, and 2 for usage. A configured build that exits nonzero exits 3. A registry defect is a note, not a failure. So is an index defect, a module read without the registry's forms: refresh exits 0 and names each such module and its clash on stderr, after this refresh and every later one until the clash is gone.
 
 ### `land-hash`
 
@@ -155,18 +182,18 @@ On exit 0, each requested name produces one line in request order:
 name<TAB>hash<TAB>path
 ```
 
-The `hash` is the 16-hex text statement hash and `path` is the repository-relative declaration path. The hash is the first 16 hex digits of the SHA-256 of the declaration's statement as written (a theorem's signature, a definition's whole text), with comments dropped and each run of white space between tokens collapsed to one space; a string or character literal keeps its own white space. An absent declaration is `name<TAB>absent<TAB>-`; an ambiguous declaration is `name<TAB>ambiguous<TAB><sorted,comma-joined paths>`. Exit 3 writes no stdout when the request, Git tree, source snapshot, candidate build, trace, or parsed declaration is unusable, or when a path that an answer line prints contains a tab, carriage return, newline, or comma. Such a character in a source path that no answer prints does not affect the call. Exit 2 is a usage error.
+The `hash` is the 16-hex text statement hash and `path` is the repository-relative declaration path. The hash is the first 16 hex digits of the SHA-256 of the declaration's statement as written (a theorem's signature, a definition's whole text), with comments dropped and each run of white space between tokens collapsed to one space; a string or character literal keeps its own white space. An absent declaration is `name<TAB>absent<TAB>-`; an ambiguous declaration is `name<TAB>ambiguous<TAB><sorted,comma-joined paths>`. Exit 3 writes no stdout when the request, Git tree, source snapshot, candidate build, trace, or parsed declaration is unusable, or when a path that an answer line prints contains a tab, carriage return, newline, or comma. Such a character in a source path that no answer prints does not affect the call. Exit 75 writes none either, when the index's database cannot be reached. Exit 2 is a usage error.
 
 ### `ledger`
 
-`ledger` checks the ledger only after the index is at the tree's HEAD. It opens the index read-only. It opens the ledger through `ledger.OpenExisting`: a database without every required schema version, or without the configured repository, is not changed and is unable to check. The DSN comes from `LEDGER_DSN` or `--dsn-file`, for an operator's check. The landing hook instead uses `--contracts-file FILE --emit FILE`; that mode never connects to Postgres or runs the librarian command, and `--dsn-file` with it is a usage error.
+`ledger` checks the ledger only after the index is at the tree's HEAD. It opens the index read-only, over the index's own connection. It opens the ledger through `ledger.OpenExisting`: a database without every required schema version, or without the configured repository, is not changed and is unable to check. The ledger's DSN comes from `LEDGER_DSN` or `--dsn-file`, for an operator's check. The landing hook instead uses `--contracts-file FILE --emit FILE`; that mode never connects to the ledger or runs the librarian command, and `--dsn-file` with it is a usage error.
 
 The contract check registers selected, owned declarations that the ledger lacks, then compares every ledger contract whose name has no `:` with the index by exact name across every module. It reports a changed hash as a defect, no declaration as gone, and multiple declarations as ambiguous. Names with `:` are non-Lean ledger contracts and are not compared with declarations.
 
 The registry check reads the registry as committed at the index's commit, never the working tree, so a local edit after `refresh` does not change what it audits. It checks one landing: `LAND_COMMIT`, or the index's commit without it. It lists the files directly under `concepts/` with a `.yaml` extension (the files the registry loader reads) that the commits from the commit that landing's refresh replaced to that landing's commit added, with rename detection off, so a file added next to a deleted, similar one is an addition. When no refresh stopped at `LAND_COMMIT` (a later landing's refresh read it), the landing that read it rechecks its additions. When the landed build declares an added concept in the module of its home file, that declaration is the concept: its compiled hash must be the one the concept file records, else the landed declaration is not the one the gate added (a defect). That module is read again, as the gate reads a proposal, with the registry's forms and the compiled stored sources of the concepts that have not landed, so the facts of the concept and of the other `declarations` of its proposal in that module (its helpers, each with the parts Lean generated from it) are compared with every registered concept, landed or not. Another declaration of that module is not the proposal's, also one in the namespace of a listed one. Otherwise the concept is recompiled from its stored source, after Lean's parser allow-list, as the gate compiles a proposal; Lean refuses two definitions of one name, so the recheck's forms then import no module whose imports declare the concept, and a registered concept whose compiled constant is in such a module is compiled from its stored source, as a pending concept is. The check records additions by their paths from the repository's root (the paths the gate printed as `addition.path`, also for a tree below that root), loader and recheck defects (a stored source that Lean refuses or does not compile is one), near pairs, and an inability reason in the `registry` JSON member. Each near pair not suppressed by an accepted-near record goes to the librarian once:
 
-- With `--emit`, the hook has no network: after the registration lines, the emit file gets one line per near pair, `{"op":"librarian","id":"recheck-<added hash>-<other>","kind":"recheck","proposer":"<owner id of the added concept>","envelope":"<the text the librarian command would read from its --proposal file>"}`, for the landing program to deliver with the librarian command.
-- With a DSN, `ledger` runs the librarian command itself, as the gate does.
+- With `--emit`, the hook does not reach the ledger: after the registration lines, the emit file gets one line per near pair, `{"op":"librarian","id":"recheck-<added hash>-<other>","kind":"recheck","proposer":"<owner id of the added concept>","envelope":"<the text the librarian command would read from its --proposal file>"}`, for the landing program to deliver with the librarian command.
+- With a ledger DSN, `ledger` runs the librarian command itself, as the gate does.
 
 The JSON output is:
 
@@ -174,7 +201,7 @@ The JSON output is:
 {"commit":"…","contracts":{…},"registry":{"added":[],"defects":[],"near":[],"unable":""}}
 ```
 
-The final stderr line counts contracts, registrations, contract defects, gone, unowned, ambiguous, and registry additions, near pairs, and defects. `ledger` exits 0 only when both checks are clean; 1 for a contract hash defect, gone, unowned, ambiguous contract, registry defect, or added near pair; 3 when it cannot check the contracts; 75 for a ledger connection failure, and when the registry recheck cannot run at all (no toolchain, a missing landing record, an exporter that does not run), whatever else it found, so that the landing program runs the check of that landing again; and 2 for usage.
+The final stderr line counts contracts, registrations, contract defects, gone, unowned, ambiguous, and registry additions, near pairs, and defects. `ledger` exits 0 only when both checks are clean; 1 for a contract hash defect, gone, unowned, ambiguous contract, registry defect, or added near pair; 3 when it cannot check the contracts; 75 for a failed connection to the ledger or to the index's database, and when the registry recheck cannot run at all (no toolchain, a missing landing record, an exporter that does not run), whatever else it found, so that the landing program runs the check of that landing again; and 2 for usage.
 
 ## Baseline measurements
 

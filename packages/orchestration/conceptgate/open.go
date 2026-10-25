@@ -100,12 +100,13 @@ func newGate(ctx context.Context, p project, index *declindex.Store, registry, w
 // once, after the snapshot, that the registry has no local changes, so that what the caller sees in its tree is what
 // the gate reads. Close releases the index and removes the snapshot and the gate's work directory.
 func OpenGate(ctx context.Context, cfg declindex.Config, opts Options) (_ *Gate, err error) {
-	indexPath, err := cfg.GateIndexPath()
-	if err != nil {
+	// The gate builds its exporter and its forms module in the index's state directory, which must be outside
+	// the tree, so that nothing the gate does can dirty the tree.
+	if _, err := cfg.StateDir(); err != nil {
 		return nil, err
 	}
 	// The gate also reads the tree: its HEAD, its registry's commit and its build.
-	index, err := declindex.OpenReadOnly(ctx, indexPath, declindex.IndexAndTree)
+	index, err := declindex.OpenReadOnly(ctx, cfg.Target(), declindex.IndexAndTree)
 	if err != nil {
 		return nil, err
 	}
