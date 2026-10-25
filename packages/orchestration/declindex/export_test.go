@@ -156,6 +156,20 @@ func TestExporterFindsTheFactHoweverItIsWritten(t *testing.T) {
 	}
 }
 
+// A matcher is an auxiliary definition, not a declaration of its own: the exporter, which imports without loading
+// environment extensions, finds it in its module's matcher entries and exports it with no row.
+func TestExporterExportsNoMatcher(t *testing.T) {
+	consts := exportFixture(t)
+	if _, ok := consts["Fx.pickA"]; !ok {
+		t.Fatal("Fx.pickA was not exported")
+	}
+	for _, m := range []string{"Fx.pickA.match_1", "Fx.pickB.match_1"} {
+		if _, ok := consts[m]; ok {
+			t.Errorf("the matcher %s was exported as a declaration", m)
+		}
+	}
+}
+
 func TestExporterHashesACopyAsTheOriginal(t *testing.T) {
 	consts := exportFixture(t)
 	orig := consts["Fx.SpAligned"]

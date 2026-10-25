@@ -266,6 +266,29 @@ func TestTheGateAddsADefinitionOfAnotherConstructorWhoseNameLooksGenerated(t *te
 	gateRefuses(t, config, "a copy of Original", "Same", "import A\n\ndef Same : Choice := Choice._proof_left\n", "Original")
 }
 
+// Lean reuses a matcher in one module: `bar`'s value names `foo.match_1`, since a matcher depends only on the
+// patterns, not on the right-hand sides. A copy of `bar` gets its own matcher, with the same content. The exporter
+// imports modules without loading their environment extensions, so the matcher table that `Meta.isMatcherCore` reads
+// is empty there; a matcher is still read by its content, and the copy is refused as `bar`.
+func TestTheGateRefusesACopyThatUsesAnotherDeclarationsMatcher(t *testing.T) {
+	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
+		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	}
+	if _, err := exec.LookPath("lake"); err != nil {
+		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
+	}
+	config, tree, lean := leanRegistryTree(t, "A")
+	writeTestFile(t, filepath.Join(tree, "A.lean"), "def foo (n : Nat) : Nat := match n with | 0 => 1 | k + 1 => k\n"+
+		"def bar (n : Nat) : Nat := match n with | 0 => 7 | k + 1 => k + 2\n")
+	if err := declindex.CompileModule(context.Background(), lean, nil, tree, "A"); err != nil {
+		t.Fatal(err)
+	}
+	land(t, config, tree, "add A")
+	const copy = "def Copy (n : Nat) : Nat := match n with | 0 => 7 | k + 1 => k + 2\n"
+	gateRefuses(t, config, "a copy of bar", "Copy", copy, "bar")
+	gateRefuses(t, config, "a copy of bar that imports A", "Copy", "import A\n\n"+copy, "bar")
+}
+
 // An abstracted proof in a theorem's type (`t3._proof_1`) is merged with the theorem when two modules declare it, so
 // its identity, like the theorem's, does not depend on the modules that one exporter run read together. B's
 // `Original` restates `t3`'s type; a proposal that imports B and states it again is refused after a refresh that read

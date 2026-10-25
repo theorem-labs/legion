@@ -84,12 +84,24 @@ def abstractedProofComponent (s : String) : Bool :=
 #guard !abstractedProofComponent "match_1"
 #guard !abstractedProofComponent "_simp_1"
 
-/-- Whether `n`, whose constant is `ci`, is an auxiliary definition that elaboration made: a matcher, or a theorem
-that holds a proof abstracted out of a body (`abstractedProofComponent`, `X._proof_1`). A constant of another kind,
-or with another last name component, is a declaration like any other, also when its name starts the same way: the
-constructor `Choice._proof_left` keeps its own identity. -/
-def isElabAux (env : Environment) (n : Name) (ci : ConstantInfo) : Bool :=
+/-- Whether `n` is a matcher that elaboration made (`X.match_1`). The exporter imports modules without loading
+their environment extensions (`importModules`), so the matcher table that `Meta.isMatcherCore` reads is empty there
+for every imported constant. Each imported module's entries are loaded all the same, and a matcher's entry sits in
+the module that declares it, so the matcher of an imported module is found there. Lean names a matcher with a last
+component that starts with `match_` (`Meta.Match.Extension.getMatcherInfo?`), which keeps the scan to those. -/
+def isMatcher (env : Environment) (n : Name) : Bool :=
   Meta.isMatcherCore env n ||
+    match n.eraseMacroScopes, env.getModuleIdxFor? n with
+    | .str _ s, some idx => s.startsWith "match_" &&
+        (PersistentEnvExtension.getModuleEntries Meta.Match.Extension.extension env idx).any (·.name == n)
+    | _, _ => false
+
+/-- Whether `n`, whose constant is `ci`, is an auxiliary definition that elaboration made: a matcher (`isMatcher`),
+or a theorem that holds a proof abstracted out of a body (`abstractedProofComponent`, `X._proof_1`). A constant of
+another kind, or with another last name component, is a declaration like any other, also when its name starts the
+same way: the constructors `Choice._proof_left` and `Pick.match_left` keep their own identity. -/
+def isElabAux (env : Environment) (n : Name) (ci : ConstantInfo) : Bool :=
+  isMatcher env n ||
     match ci, n with
     | .thmInfo _, .str _ s => abstractedProofComponent s
     | _, _ => false

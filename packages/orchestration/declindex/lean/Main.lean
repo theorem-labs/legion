@@ -48,7 +48,7 @@ def kindOf : ConstantInfo → String
 /-- Constants the exporter skips: compiler and elaborator auxiliaries, not statements anyone wrote. -/
 def auxiliary (env : Environment) (c : Name) (ci : ConstantInfo) : Bool :=
   ((privateToUserName? c).getD c).isInternal || isAuxRecursor env c || isNoConfusion env c ||
-    ci matches .recInfo _ || Meta.isMatcherCore env c
+    ci matches .recInfo _ || isMatcher env c
 
 def statementExprs (env : Environment) (ci : ConstantInfo) : List Expr :=
   match ci with
