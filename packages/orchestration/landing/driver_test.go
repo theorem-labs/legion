@@ -325,9 +325,9 @@ type checkerFake struct {
 
 func (f checkerFake) Name() string { return f.name }
 
-func (f checkerFake) Check(_ context.Context, tree Tree) ([]Finding, error) {
+func (f checkerFake) Check(_ context.Context, in CheckInput) ([]Finding, error) {
 	if f.findingsByTree != nil {
-		return f.findingsByTree[tree], f.err
+		return f.findingsByTree[in.Tree], f.err
 	}
 	return f.findings, f.err
 }
@@ -378,7 +378,7 @@ func (f *gitFake) ChangeSet(_ context.Context, _ string, base string, member Mem
 	return f.changes[member.Migration], nil
 }
 
-func (f *gitFake) DeclarationEvidence(_ context.Context, _ string, _ string, member Member) (blame.Evidence, error) {
+func (f *gitFake) DeclarationEvidence(_ context.Context, _ string, _ string, member Member, _ blame.InstanceNames) (blame.Evidence, error) {
 	return f.evidence[member.Migration], nil
 }
 

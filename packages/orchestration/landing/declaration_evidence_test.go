@@ -16,7 +16,7 @@ import (
 func memberEvidence(t *testing.T, base, writes map[string]string, deletes ...string) blame.Evidence {
 	t.Helper()
 	repo, baseCommit, head := memberRepository(t, base, writes, deletes...)
-	evidence, err := (RepositoryGit{}).DeclarationEvidence(context.Background(), repo, baseCommit, Member{Migration: "member", Head: head})
+	evidence, err := (RepositoryGit{}).DeclarationEvidence(context.Background(), repo, baseCommit, Member{Migration: "member", Head: head}, nil)
 	if err != nil {
 		t.Fatalf("DeclarationEvidence() error = %v", err)
 	}
@@ -282,6 +282,47 @@ func TestDeclarationEvidenceNeverBlamesAnInstanceForItsNeighboursName(t *testing
 	}
 }
 
+// Lean numbers a repeated instance name by what the whole namespace holds, so
+// two files of one namespace that generate the same name get that name and
+// that name with _1. One file cannot tell which, so when the round's scan of
+// the candidate tree finds a generated name in more than one file, every one
+// of them is named by position instead: the diagnostic then matches no
+// declaration and the module falls to bisection, rather than blaming the
+// member that holds the other file.
+func TestDeclarationEvidenceDropsAnInstanceNameTwoFilesGenerate(t *testing.T) {
+	const edited, other = "Edited.lean", "Other.lean"
+	instance := "namespace LinuxMmu.SK\ninstance : Decidable (isErr e) := by\n  unfold isErr\n  infer_instance\nend LinuxMmu.SK\n"
+	base := map[string]string{edited: instance, other: instance}
+	member := map[string]string{edited: strings.Replace(instance, "  unfold isErr\n", "  unfold isErr'\n", 1)}
+	repo, baseCommit, head := memberRepository(t, base, member)
+
+	git := RepositoryGit{}
+	candidate, err := git.TreeDeclarations(context.Background(), repo, Tree(head))
+	if err != nil {
+		t.Fatalf("TreeDeclarations() error = %v", err)
+	}
+	ambiguous := blame.AmbiguousInstanceNames(candidate)
+	if _, found := ambiguous["LinuxMmu.SK.instDecidableIsErr"]; !found {
+		t.Fatalf("ambiguous names = %v, want LinuxMmu.SK.instDecidableIsErr, which both files generate", ambiguous)
+	}
+	blame.ResolveInstanceNames(candidate, ambiguous)
+	for _, declaration := range candidate {
+		if declaration.Name == "LinuxMmu.SK.instDecidableIsErr" {
+			t.Errorf("%s keeps the generated name, which Lean gives only one of the two files", declaration.File)
+		}
+	}
+
+	evidence, err := git.DeclarationEvidence(context.Background(), repo, baseCommit, Member{Migration: "member", Head: head}, ambiguous)
+	if err != nil {
+		t.Fatalf("DeclarationEvidence() error = %v", err)
+	}
+	for _, kind := range []blame.Kind{blame.Changed, blame.Unknown, blame.Added, blame.Weak} {
+		wantEvidence(t, evidence, blame.Name{Value: "LinuxMmu.SK.instDecidableIsErr", Kind: kind}, 0, "")
+	}
+	// The edit is still evidence under the name the scanner does give it.
+	wantEvidence(t, evidence, blame.Name{Value: "LinuxMmu.SK.<anon-instance>#1", Kind: blame.Changed}, 2, "edited")
+}
+
 // A `namespace` line inside a block comment opens no namespace, so removing
 // the comment closes none.
 func TestDeclarationEvidenceIgnoresNamespaceInComment(t *testing.T) {
@@ -352,7 +393,7 @@ func TestDeclarationEvidenceReadsNonASCIIPaths(t *testing.T) {
 		map[string]string{path: "def gone := 0\ndef kept : Nat :=\n  1\n"},
 		map[string]string{path: "def kept : Nat :=\n  2\n"},
 	)
-	evidence, err := (RepositoryGit{}).DeclarationEvidence(context.Background(), repo, baseCommit, Member{Migration: "member", Head: head})
+	evidence, err := (RepositoryGit{}).DeclarationEvidence(context.Background(), repo, baseCommit, Member{Migration: "member", Head: head}, nil)
 	if err != nil {
 		t.Fatalf("DeclarationEvidence() error = %v", err)
 	}

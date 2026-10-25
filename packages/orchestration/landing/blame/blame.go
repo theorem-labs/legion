@@ -536,9 +536,9 @@ func anyOutside(left, right map[treeDeclarationLine]struct{}) bool {
 	return false
 }
 
-// TreeDeclarations gives matching declarations at the frozen base and
-// candidate tree.
-type TreeDeclarations struct {
+// TreeLines gives the declarations that one name can refer to at the frozen
+// base and in the candidate tree.
+type TreeLines struct {
 	Base      []Declaration
 	Candidate []Declaration
 }
@@ -557,10 +557,10 @@ type Attribution struct {
 // declaration slices apply to every name for compatibility with callers that
 // have one pair.
 func Identify(report Report, evidence map[string]Evidence, baseDeclarations, candidateDeclarations []Declaration) []string {
-	declarations := make(map[string]TreeDeclarations)
+	declarations := make(map[string]TreeLines)
 	for _, block := range report.Blocks {
 		for _, name := range Names(block.Message) {
-			declarations[name.Value] = TreeDeclarations{Base: baseDeclarations, Candidate: candidateDeclarations}
+			declarations[name.Value] = TreeLines{Base: baseDeclarations, Candidate: candidateDeclarations}
 		}
 	}
 	attributions := IdentifyDetailed(report, evidence, declarations)
@@ -578,7 +578,7 @@ func Identify(report Report, evidence map[string]Evidence, baseDeclarations, can
 
 // IdentifyDetailed attributes each module independently and retains exact
 // diagnostic evidence for every selected member.
-func IdentifyDetailed(report Report, evidence map[string]Evidence, declarations map[string]TreeDeclarations) []Attribution {
+func IdentifyDetailed(report Report, evidence map[string]Evidence, declarations map[string]TreeLines) []Attribution {
 	byModule := make(map[string][]Name)
 	for _, block := range report.Blocks {
 		seen := make(map[string]struct{}, len(byModule[block.Module]))
@@ -604,16 +604,7 @@ func IdentifyDetailed(report Report, evidence map[string]Evidence, declarations 
 		selections := make([]Selection, len(names))
 		hasPrimary := false
 		for index, name := range names {
-			rows := make([]Row, 0, len(evidence))
-			for member, memberEvidence := range evidence {
-				strength, label := EvidenceFor(name, memberEvidence)
-				if strength != 0 {
-					rows = append(rows, Row{Member: member, Strength: strength, Label: label})
-				}
-			}
-			treeDeclarations := declarations[name.Value]
-			rows = AgainstTree(name.Value, rows, evidence, treeDeclarations.Base, treeDeclarations.Candidate)
-			selection := Pick(rows)
+			selection := SelectFor(name, evidence, declarations[name.Value])
 			selections[index] = selection
 			if selection.Strength != 0 && primary(name.Kind) {
 				hasPrimary = true
@@ -645,6 +636,20 @@ func IdentifyDetailed(report Report, evidence map[string]Evidence, declarations 
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// SelectFor is the bounded evidence selection for one name: EvidenceFor for
+// each member, AgainstTree, then Pick. Build blame and the graph checks both
+// attribute a name through it.
+func SelectFor(name Name, evidence map[string]Evidence, lines TreeLines) Selection {
+	rows := make([]Row, 0, len(evidence))
+	for member, memberEvidence := range evidence {
+		strength, label := EvidenceFor(name, memberEvidence)
+		if strength != 0 {
+			rows = append(rows, Row{Member: member, Strength: strength, Label: label})
+		}
+	}
+	return Pick(AgainstTree(name.Value, rows, evidence, lines.Base, lines.Candidate))
 }
 
 func primary(kind Kind) bool {

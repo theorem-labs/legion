@@ -375,11 +375,22 @@ type CommandEvents struct {
 	StatusCommand []string
 }
 
+// Publish runs the event command with the member's flags in LAND_FLAGS, a
+// JSON array ("[]" when it has none).
 func (e CommandEvents) Publish(ctx context.Context, event LandingEvent) error {
-	_, err := runLandingCommand(ctx, e.Directory, e.Command, []string{
+	flags := event.Flags
+	if flags == nil {
+		flags = []Flag{}
+	}
+	encoded, err := json.Marshal(flags)
+	if err != nil {
+		return fmt.Errorf("encode event flags: %w", err)
+	}
+	_, err = runLandingCommand(ctx, e.Directory, e.Command, []string{
 		"LAND_BATCH=" + event.Batch,
 		"LAND_MEMBER=" + event.Member,
 		"LAND_COMMIT=" + event.Commit,
+		"LAND_FLAGS=" + string(encoded),
 	})
 	if err != nil {
 		return fmt.Errorf("publish event: %w", err)

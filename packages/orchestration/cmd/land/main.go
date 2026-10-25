@@ -26,21 +26,33 @@ import (
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "land:", err)
+		var usage usageError
+		if errors.As(err, &usage) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 }
 
+// usageError is a command line that names no known command or lacks a
+// required flag; land exits 2 for it.
+type usageError struct{ error }
+
+func (e usageError) Unwrap() error { return e.error }
+
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: land <run|serve|status|blame>")
+		return usageError{fmt.Errorf("usage: land <run|serve|status|blame|check>")}
 	}
 	switch args[0] {
 	case "blame":
 		return runBlame(ctx, args[1:], output)
+	case "check":
+		return runCheck(ctx, args[1:], output)
 	case "run", "serve", "status":
 		return runBatchCommand(ctx, args[0], args[1:], output)
 	default:
-		return fmt.Errorf("unknown command %q", args[0])
+		return usageError{fmt.Errorf("unknown command %q", args[0])}
 	}
 }
 
@@ -125,6 +137,7 @@ type config struct {
 type checkConfig struct {
 	Name    string   `json:"name"`
 	Command []string `json:"command"`
+	Format  string   `json:"format"` // findings (the default) or graph
 }
 
 // ledgerConfig names the ledger CLI's argv before the command (command), which
@@ -197,9 +210,23 @@ func readConfig(path string) (config, error) {
 	if err := json.Unmarshal(body, &cfg); err != nil {
 		return config{}, fmt.Errorf("decode configuration: %w", err)
 	}
+	for index, check := range cfg.Checks {
+		if check.Format != "" && check.Format != landing.FormatFindings && check.Format != landing.FormatGraph {
+			return config{}, fmt.Errorf("checks[%d].format %q is not %q or %q", index, check.Format, landing.FormatFindings, landing.FormatGraph)
+		}
+	}
 	digest := sha256.Sum256(body)
 	cfg.Digest = hex.EncodeToString(digest[:])
 	return cfg, nil
+}
+
+// checkers are the configured checks, each run in the repository path.
+func (c config) checkers() []landing.Checker {
+	checkers := make([]landing.Checker, 0, len(c.Checks))
+	for _, check := range c.Checks {
+		checkers = append(checkers, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: c.Repository.Path, Format: check.Format})
+	}
+	return checkers
 }
 
 func (c config) runner() (landing.Runner, landing.Input, *landing.JSONStore, error) {
@@ -226,9 +253,7 @@ func (c config) runner() (landing.Runner, landing.Input, *landing.JSONStore, err
 		ConfigDigest: c.Digest,
 		Toolchain:    commandToolchain(path, c.Toolchain),
 	}
-	for _, check := range c.Checks {
-		runner.Checks = append(runner.Checks, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: path})
-	}
+	runner.Checks = c.checkers()
 	if c.GitHub.Remote != "" || c.GitHub.Executable != "" {
 		runner.GitHub = landing.GitHubCLI{RepositoryPath: path, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
 		// The score and the member event are optional: without them the
@@ -350,10 +375,6 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 		return fmt.Errorf("read build log: %w", err)
 	}
 	report := blame.Parse(string(log), nil)
-	evidence, err := collectEvidence(ctx, *repository, *base, members)
-	if err != nil {
-		return err
-	}
 	var candidateTree blame.Tree
 	if *candidateRef != "" {
 		tree, err := git(ctx, *repository, "rev-parse", "--verify", *candidateRef+"^{tree}")
@@ -372,7 +393,14 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 		}
 		candidateTree = blame.Tree(candidate.Tree)
 	}
-	lines, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
+	// The trees are scanned first: their candidate names the generated
+	// instance names that no declaration may keep, and each member's
+	// evidence must use the same set as the trees.
+	lines, ambiguous, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
+	if err != nil {
+		return err
+	}
+	evidence, err := collectEvidence(ctx, *repository, *base, members, ambiguous)
 	if err != nil {
 		return err
 	}
@@ -435,11 +463,11 @@ func withoutExcluded(members []blame.Member, excluded map[string]struct{}) []bla
 	return out
 }
 
-func collectEvidence(ctx context.Context, repository, base string, members []blame.Member) (map[string]blame.Evidence, error) {
+func collectEvidence(ctx context.Context, repository, base string, members []blame.Member, ambiguous blame.InstanceNames) (map[string]blame.Evidence, error) {
 	evidence := make(map[string]blame.Evidence, len(members))
 	git := landing.RepositoryGit{}
 	for _, member := range members {
-		memberEvidence, err := git.DeclarationEvidence(ctx, repository, base, landing.Member{Migration: member.ID, Head: member.Head})
+		memberEvidence, err := git.DeclarationEvidence(ctx, repository, base, landing.Member{Migration: member.ID, Head: member.Head}, ambiguous)
 		if err != nil {
 			return nil, fmt.Errorf("read declaration evidence for %q: %w", member.ID, err)
 		}
@@ -448,30 +476,37 @@ func collectEvidence(ctx context.Context, repository, base string, members []bla
 	return evidence, nil
 }
 
-func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeDeclarations, error) {
+// collectTreeLines groups, by each name the report mentions, the declarations
+// of the base and candidate trees that carry it. It also returns the round's
+// ambiguous generated instance names, which it has resolved in both trees and
+// which every scan of the round must use.
+func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, blame.InstanceNames, error) {
 	git := landing.RepositoryGit{}
 	baseDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(base))
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at base: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at base: %w", err)
 	}
 	candidateDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(candidate))
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at candidate: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
 	}
+	ambiguous := blame.AmbiguousInstanceNames(candidateDeclarations)
+	blame.ResolveInstanceNames(candidateDeclarations, ambiguous)
+	blame.ResolveInstanceNames(baseDeclarations, ambiguous)
 	names := make(map[string]struct{})
 	for _, block := range report.Blocks {
 		for _, name := range blame.Names(block.Message) {
 			names[name.Value] = struct{}{}
 		}
 	}
-	declarations := make(map[string]blame.TreeDeclarations, len(names))
+	declarations := make(map[string]blame.TreeLines, len(names))
 	for name := range names {
-		declarations[name] = blame.TreeDeclarations{
+		declarations[name] = blame.TreeLines{
 			Base:      blame.DeclarationsFor(name, baseDeclarations),
 			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}
 	}
-	return declarations, nil
+	return declarations, ambiguous, nil
 }
 
 func confirmAttributions(ctx context.Context, repository, base string, members []blame.Member, modules []string, attributions []blame.Attribution, command string) ([]blame.Attribution, error) {
