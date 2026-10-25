@@ -100,7 +100,7 @@ type Candidate struct {
 	scratch  string
 	byPath   map[string]*Change
 	byModule map[string]*Change
-	text     map[string]string // path -> candidate text, for added and modified files
+	text     map[string]string  // path -> candidate text, for added and modified files
 	modules  map[string]*Module // added and modified modules
 	graph    map[string][]string
 	built    map[string]bool
