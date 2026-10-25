@@ -136,6 +136,10 @@ func lock(ctx context.Context, conn *pgxpool.Conn, index string, exclusive bool)
 		q = `SELECT pg_advisory_lock($1, $2)`
 	}
 	if _, err := conn.Exec(ctx, q, k1, k2); err != nil {
+		// A wait that ctx ended is that, whatever the driver made of the cancelled statement.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("wait for the lock of index %q: %w", index, ctxErr)
+		}
 		return fmt.Errorf("wait for the lock of index %q: %w", index, err)
 	}
 	return nil
