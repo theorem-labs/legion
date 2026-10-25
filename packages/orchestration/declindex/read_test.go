@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -157,15 +156,9 @@ func TestImportsGivesEachModulesDirectImports(t *testing.T) {
 // OpenReadOnlyConfig opens the index that a configuration names, read-only, as graph checks do.
 func TestOpenReadOnlyConfigOpensTheConfiguredIndex(t *testing.T) {
 	ctx := context.Background()
-	cfg := Config{DB: filepath.Join(t.TempDir(), "index.sqlite")}
-	s, err := Open(cfg.DB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Refresh(ctx, goldenTree(t), RefreshOptions{Commit: goldenCommit}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Close(); err != nil {
+	written := refreshedGolden(t)
+	cfg := Config{DB: written.path}
+	if err := written.Close(); err != nil {
 		t.Fatal(err)
 	}
 	reader, err := OpenReadOnlyConfig(ctx, cfg, IndexOnly)
