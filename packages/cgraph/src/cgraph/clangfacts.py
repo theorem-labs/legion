@@ -1164,10 +1164,12 @@ class _Extractor:
 
     def stored_parameters(self, callee: ci.Cursor | None) -> tuple[frozenset[int], dict[int, frozenset[int]]]:
         """An inline function's parameters that compiled code only stores through (``r->end = end``:
-        r), and the parameters it reads only as the value of such stores, each with the positions it
-        is stored through (end: {r}). Where a caller passes the address of a local nothing reads, those
-        stores and the values they store are not computed (page_vma_mkclean_one's
-        ``mmu_notifier_range_init(&range, ..., vma_address_end(pvmw))`` without MMU_NOTIFIER)."""
+        r, and ``dstp->bits`` given to an inline callee that only stores through that parameter), and
+        the parameters it reads only to make such a store (end: {r}; ``src1p->bits``, read only as what
+        bitmap_andnot stores into dstp). Where a caller passes the address of a local nothing reads,
+        those stores and the values they make are not computed (page_vma_mkclean_one's
+        ``mmu_notifier_range_init(&range, ..., vma_address_end(pvmw))`` without MMU_NOTIFIER,
+        print_cpus_isolated's ``cpumask_andnot(isolated, cpu_possible_mask, ...)``)."""
         none: tuple[frozenset[int], dict[int, frozenset[int]]] = (frozenset(), {})
         if callee is None or callee.kind != K.FUNCTION_DECL or not self.inline_function(callee.spelling):
             return none
@@ -1188,18 +1190,24 @@ class _Extractor:
         written = frozenset(
             index
             for index, parameter in enumerate(parameters)
-            if walk.read_sites.get(parameter.hash)
-            and all(walk.store_base(site) is not None for site in walk.read_sites[parameter.hash])
+            for sites in [walk.read_sites.get(parameter.hash, [])]
+            if any(walk.stores_into(site) for site in sites)
+            and all(walk.stores_into(site) or walk.image_dropped(site) for site in sites)
         )
         stored: dict[int, frozenset[int]] = {}
         for index, parameter in enumerate(parameters):
             sites = walk.read_sites.get(parameter.hash, [])
             if index in written or not sites:
                 continue
-            through = [walk.stored_through(site) for site in sites]
-            bases = {positions.get(base.hash) if base is not None else None for base in through}
-            if bases and None not in bases and bases <= written:
-                stored[index] = frozenset(position for position in bases if position is not None)
+            bases = [base for site in sites if (base := walk.stored_target(site)) is not None]
+            targets = {positions.get(base.hash) for base in bases}
+            if (
+                bases
+                and None not in targets
+                and targets <= written
+                and all(walk.stored_target(site) is not None or walk.image_dropped(site) for site in sites)
+            ):
+                stored[index] = frozenset(position for position in targets if position is not None)
         self.stored_cache[name] = (written, stored)
         return written, stored
 
@@ -2037,9 +2045,24 @@ def _is_overflow_builtin(name: str) -> bool:
     return _OVERFLOW_BUILTIN.fullmatch(name) is not None
 
 
+def _base_variable(expression: ci.Cursor) -> ci.Cursor | None:
+    """The variable a pointer expression is reached from (``p``, ``p->m``, ``&v``), or None."""
+    node = _bare(expression)
+    while _children(node) and (
+        node.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR, K.CSTYLE_CAST_EXPR)
+        or (node.kind == K.UNARY_OPERATOR and (libclang.unary_kind(node) == _DEREF or libclang.is_address_of(node)))
+    ):
+        node = _bare(_children(node)[0] if node.kind != K.CSTYLE_CAST_EXPR else _children(node)[-1])
+    return node.referenced if node.kind == K.DECL_REF_EXPR else None
+
+
 def _whole_local_address(expression: ci.Cursor) -> ci.Cursor | None:
-    """The local ``v`` of ``&v``, a parameter or a local that is not static, or None."""
+    """The local ``v`` whose address an argument is: ``&v``, or ``v`` itself where it is an array, as
+    cpumask_var_t is without CONFIG_CPUMASK_OFFSTACK. None for another expression."""
     node = _strip(expression)
+    if node.kind == K.DECL_REF_EXPR and _is_local(node.referenced):
+        array = node.referenced.type.get_canonical().kind in _ARRAY_TYPES
+        return node.referenced if array else None
     if node.kind != K.UNARY_OPERATOR or not libclang.is_address_of(node) or not _children(node):
         return None
     operand = _strip(_children(node)[0])
@@ -5610,6 +5633,111 @@ class _FunctionWalk:
                 return base.referenced
             node = base
         return None
+
+    def image_dropped(self, node: ci.Cursor) -> bool:
+        """``node`` is in a part a choice the image makes selects (an ``if``, ``?:``, ``&&`` or ``||``
+        on __builtin_constant_p), not in the condition: bitmap_andnot's ``__bitmap_andnot(...)`` beside
+        its ``small_const_nbits(nbits)`` path. The image decides whether it is compiled."""
+        child, parent = node, self.parents.get(node.hash)
+        while parent is not None:
+            children = _children(parent)
+            if (
+                (
+                    parent.kind in (K.IF_STMT, K.CONDITIONAL_OPERATOR)
+                    or (
+                        parent.kind == K.BINARY_OPERATOR
+                        and libclang.binary_kind(parent) in (libclang.LOGICAL_AND, libclang.LOGICAL_OR)
+                    )
+                )
+                and children
+                and children[0].hash != child.hash
+                and _mentions(children[0], _IMAGE_DECIDES)
+            ):
+                return True
+            if parent.kind == K.COMPOUND_STMT:
+                statements = _children(parent)
+                at = next((index for index, part in enumerate(statements) if part.hash == child.hash), -1)
+                if any(self.image_exit(part) for part in statements[:at]):
+                    # bitmap_andnot's return __bitmap_andnot(...) after if (small_const_nbits(nbits))
+                    # return ...;: control reaches it only where the image chose the other way.
+                    return True
+            child, parent = parent, self.parents.get(parent.hash)
+        return False
+
+    def image_exit(self, statement: ci.Cursor) -> bool:
+        """An ``if`` on __builtin_constant_p whose branch leaves the function: what follows is compiled
+        only where the image chose the other branch."""
+        children = _children(statement)
+        return (
+            statement.kind == K.IF_STMT
+            and len(children) >= 2
+            and _mentions(children[0], _IMAGE_DECIDES)
+            and self.x.evaluator.exits(children[1])
+        )
+
+    def stores_into(self, reference: ci.Cursor) -> bool:
+        """A pointer ``reference`` is only the base of what a store writes (``store_base``), or a
+        member of it is given at a parameter an inline callee only stores through (cpumask_andnot's
+        ``bitmap_andnot(dstp->bits, ...)``)."""
+        if self.store_base(reference) is not None:
+            return True
+        position, call = self.argument_position(reference)
+        if call is None or position is None:
+            return False
+        written, _ = self.x.stored_parameters(call.referenced)
+        return position in written
+
+    def value_of_store(self, reference: ci.Cursor) -> ci.Cursor | None:
+        """The variable a store writes whose value ``reference`` only helps to make (bitmap_andnot's
+        ``*src1`` in ``*dst = *src1 & ~(*src2) & mask``), or None."""
+        child, parent = self.climb(reference)
+        while parent is not None and (
+            parent.kind in (K.CSTYLE_CAST_EXPR, K.CONDITIONAL_OPERATOR, K.UNARY_OPERATOR)
+            or (parent.kind == K.BINARY_OPERATOR and not libclang.is_assignment(parent))
+        ):
+            child, parent = self.climb(parent)
+        if parent is None or not _is_plain_assignment(parent) or _children(parent)[1].hash != child.hash:
+            return None
+        return _base_variable(_children(parent)[0])
+
+    def stored_target(self, reference: ci.Cursor) -> ci.Cursor | None:
+        """The variable whose pointee ``reference`` is the stored value of (``stored_through``), or
+        the one an inline callee stores it into: a member of it given at a parameter the callee reads
+        only to make a store through another parameter (cpumask_andnot's ``src1p->bits``)."""
+        through = self.stored_through(reference) or self.value_of_store(reference)
+        if through is not None:
+            return through
+        position, call = self.argument_position(reference)
+        if call is None or position is None:
+            return None
+        _, stored = self.x.stored_parameters(call.referenced)
+        arguments = list(call.get_arguments() or [])
+        targets = {
+            base
+            for at in stored.get(position, ())
+            if at < len(arguments) and (base := _base_variable(arguments[at])) is not None
+        }
+        return next(iter(targets)) if len(targets) == 1 else None
+
+    def argument_position(self, reference: ci.Cursor) -> tuple[int | None, ci.Cursor | None]:
+        """The position and the call where ``reference``, or a member reached through it, is an
+        argument of a call to a function of the unit."""
+        child, parent = self.climb(reference)
+        while parent is not None and (
+            parent.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR, K.CSTYLE_CAST_EXPR)
+            or (
+                parent.kind == K.UNARY_OPERATOR
+                and (libclang.unary_kind(parent) == _DEREF or libclang.is_address_of(parent))
+            )
+        ):
+            child, parent = self.climb(parent)
+        if parent is None or parent.kind != K.CALL_EXPR or parent.referenced is None:
+            return None, None
+        operands = _children(parent)
+        arguments = list(parent.get_arguments() or [])
+        offset = len(operands) - len(arguments)
+        at = next((index for index, operand in enumerate(operands) if operand.hash == child.hash), -1) - offset
+        return (at, parent) if at >= 0 else (None, None)
 
     def same_value(self, left: ci.Cursor, right: ci.Cursor) -> bool:
         """Two locals or parameters that hold one value: the same one, or one whose every store in

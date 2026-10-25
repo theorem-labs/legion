@@ -316,7 +316,10 @@ These rules follow what the machine code shows, each only where it shows it:
   are left to the image with it, and so are the
   operands of `__builtin_prefetch`, a hint rv64 without Zicbop emits nothing for
   (`task_sched_runtime`'s `prefetch_curr_exec_start`).
-  `&v` of a local passed to a parameter an inline callee only stores through (`range->end = end`),
+  `&v` of a local (or `v` itself, an array, as `cpumask_var_t`) passed to a parameter an inline callee
+  only stores through (`range->end = end`, or a member of it given at such a parameter of another
+  inline callee, a use beside a `__builtin_constant_p` path aside: `cpumask_andnot`'s
+  `bitmap_andnot(dstp->bits, ...)`),
   and, where nothing else reads `v`, a value the callee only stores there, are `conditional`: where
   the image inlines the callee neither is computed, where it calls the callee both are, so the image
   decides at each site (`page_vma_mkclean_one`'s `mmu_notifier_range_init(&range, ...,

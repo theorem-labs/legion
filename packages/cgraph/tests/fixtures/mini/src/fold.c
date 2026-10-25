@@ -1090,3 +1090,51 @@ void fd_put_first(struct list_node *head)
 		obj_free(&k->list);
 	obj_free(head->prev);
 }
+
+/* drivers/base/cpu.c print_cpus_isolated without CONFIG_SYSFS: cpumask_andnot(isolated,
+ * cpu_possible_mask, ...) writes into a local nothing reads, through bitmap_andnot, whose store is
+ * on its __builtin_constant_p path and whose call is beside it: the sources are the image's to decide
+ * (llvm-objdump: li a0, 0x0; ret). all_bags and tree_sem stand for the masks. */
+struct fd_mask {
+	unsigned long bits;
+};
+typedef struct fd_mask fd_mask_t[1];
+
+int fd_bitmap_slow(unsigned long *dst, const unsigned long *s1, const unsigned long *s2, unsigned int nbits);
+
+static inline int fd_bitmap_andnot(unsigned long *dst, const unsigned long *s1, const unsigned long *s2,
+				   unsigned int nbits)
+{
+	if (__builtin_constant_p(nbits) && nbits <= 64)
+		return (*dst = *s1 & ~*s2) != 0;
+	return fd_bitmap_slow(dst, s1, s2, nbits);
+}
+
+static inline int fd_mask_andnot(struct fd_mask *d, const struct fd_mask *a, const struct fd_mask *b)
+{
+	return fd_bitmap_andnot(&d->bits, &a->bits, &b->bits, 64);
+}
+
+int fd_show_isolated(char *buf)
+{
+	fd_mask_t isolated;
+
+	fd_mask_andnot(isolated, (const struct fd_mask *)&all_bags, (const struct fd_mask *)&tree_sem);
+	return fd_emit_at(buf, 0, "%lu", isolated[0].bits);
+}
+
+/* A helper the evaluator folds to 0 that the image calls out of line: total += fd_zero_called(b)
+ * keeps total, but the call stays in the code (llvm-objdump: jal fd_zero_called). */
+static __attribute__((noinline)) int fd_zero_called(struct box *b)
+{
+	__asm__ volatile("" ::: "memory");
+	return 0;
+}
+
+int fd_accumulate_called(struct box *b)
+{
+	int total = box_size(b);
+
+	total += fd_zero_called(b);
+	return total;
+}

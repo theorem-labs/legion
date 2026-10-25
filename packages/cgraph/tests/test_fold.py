@@ -387,3 +387,24 @@ def test_a_member_at_offset_zero_of_a_held_address_is_that_address(fold_build: d
     assert (item["address"], item["displacement"], item["offset"]) == (True, -32, 0)
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert "function:fd_put_first" not in {entry["function"] for entry in offsets["misses"]}
+
+
+def test_values_a_call_only_writes_into_a_dead_local_are_left_to_the_image(fold_facts: dict[str, Any]) -> None:
+    """fd_show_isolated: li a0, 0x0; ret (llvm-objdump). isolated is read only by fd_emit_at, which
+    ignores its variadic arguments, so the store and the globals it reads are the image's to decide:
+    it inlines fd_mask_andnot and drops them."""
+    events = fold_facts["functions"]["fd_show_isolated"]["events"]
+    assert {(item["unit"]["name"], bool(item.get("conditional"))) for item in events["accesses"]} == {
+        ("all_bags", True),
+        ("tree_sem", True),
+    }
+    assert {call["callee"] for call in events["calls"]} == {"fd_emit_at", "fd_mask_andnot"}
+
+
+def test_a_zero_helper_the_image_calls_stays_a_call(fold_facts: dict[str, Any], fold_build: dict[str, Any]) -> None:
+    """fd_accumulate_called: jal box_size; jal fd_zero_called (llvm-objdump). total += 0 keeps total,
+    but the call is the image's and has an effect, so it stays."""
+    calls = {call["callee"] for call in fold_facts["functions"]["fd_accumulate_called"]["events"]["calls"]}
+    assert {"box_size", "fd_zero_called"} <= calls
+    pairs = fold_build["checks"]["call_layer"]["pairs"]
+    assert "function:fd_accumulate_called" not in {pair["source"] for pair in pairs["only_image"] + pairs["only_c"]}
