@@ -6,8 +6,10 @@ name: orchestration-lean
 # Only the packages this job's `go test` loads start it: declindex and conceptgate, the declindex
 # command, and the two packages they import (ledger, internal/testpg). A change to another
 # package of packages/orchestration compiles nothing this job runs, and pr-and-main.yaml tests the
-# whole module on every pull request anyway. The go test runs in workspace mode, so go.work and the
-# manifests of the other modules it binds move the versions it compiles (golang.org/x/sys, x/text).
+# whole module on every pull request that changes any file but the orchestration-only workflows
+# (.github/scripts/tests-scope.sh says which). The go test runs in workspace mode, so go.work and
+# the manifests of the other modules it binds move the versions it compiles (golang.org/x/sys,
+# x/text).
 on:
   pull_request:
     paths:
