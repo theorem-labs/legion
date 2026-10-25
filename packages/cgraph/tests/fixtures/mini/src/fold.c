@@ -1023,3 +1023,43 @@ done:
 	sp = fd_subsys_get(sp);
 	return sp;
 }
+
+/* kernel/ksysfs.c ksysfs_init without CONFIG_SYSFS: if (notes_size > 0) { bin_attr_notes.private =
+ * (void *)&__start_notes; bin_attr_notes.size = notes_size; error = sysfs_create_bin_file(kernel_kobj,
+ * &bin_attr_notes); if (error) goto group_exit; } return;, where the stub ignores bin_attr_notes,
+ * which nothing else reads: the if is not code (llvm-objdump: no reference to all_bags or tree_sem,
+ * which stand for __start_notes and __stop_notes). */
+struct fd_bin_attr {
+	const void *private;
+	long size;
+};
+static struct fd_bin_attr fd_notes_attr;
+#define fd_notes_start ((const char *)&all_bags)
+#define fd_notes_stop ((const char *)&tree_sem)
+
+static inline int fd_create_bin(struct box *b, const struct fd_bin_attr *attr)
+{
+	return 0;
+}
+
+void fd_notes_init(struct box *b)
+{
+	int error;
+
+	error = box_size(b);
+	if (error)
+		goto exit;
+	if (fd_notes_stop - fd_notes_start > 0) {
+		fd_notes_attr.private = fd_notes_start;
+		fd_notes_attr.size = fd_notes_stop - fd_notes_start;
+		error = fd_create_bin(b, &fd_notes_attr);
+		if (error)
+			goto group_exit;
+	}
+	return;
+
+group_exit:
+	obj_free(b);
+exit:
+	obj_free((void *)(long)error);
+}

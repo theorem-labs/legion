@@ -369,3 +369,10 @@ def test_an_assignment_does_not_reach_its_own_right_side(fold_build: dict[str, A
     assert (item["base"], item["displacement"]) == ("container_of", -8)
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert "function:fd_class_to_subsys" not in {entry["function"] for entry in offsets["misses"]}
+
+
+def test_stores_into_a_static_nothing_reads_are_not_code(fold_build: dict[str, Any]) -> None:
+    """fd_notes_init (llvm-objdump): box_size, obj_free on error, no reference to all_bags or tree_sem:
+    fd_notes_attr is given only to a stub that ignores it."""
+    targets = {edge["target"] for edge in fold_build["graph"]["edges"] if edge["source"] == "function:fd_notes_init"}
+    assert not targets & {"global:all_bags", "global:tree_sem", "global:fd_notes_attr@src/fold.c"}
