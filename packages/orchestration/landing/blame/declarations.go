@@ -18,6 +18,10 @@ type Declaration struct {
 	Text      string
 	Private   bool
 	Protected bool
+	Kind      string   // the command keyword: def, theorem, structure, class, …
+	Line      int      // 1-based line of the keyword
+	Fields    []string // structure or class: its own field names, in order
+	Extends   bool     // structure or class: it has an `extends` clause
 }
 
 // DeclarationID identifies a declaration in one Lean source file.
@@ -95,6 +99,11 @@ type scanner struct {
 	file   string
 	scopes []scope
 	depth  int
+	// line is the 1-based number of the line being scanned.
+	line int
+	// fieldColumn is the indentation of the current structure or class
+	// body's first line, or -1 until that line is read.
+	fieldColumn int
 	// declarations holds the declarations read so far, in source order.
 	// While inDeclaration is set the scanner is in the signature or body of
 	// the last one, and while inSignature is also set its signature is still
@@ -201,6 +210,7 @@ func refersToNamespace(reference, namespace string) bool {
 
 // scan reads one source line.
 func (s *scanner) scan(line string) scanned {
+	s.line++
 	startedInString := s.inString
 	code := s.uncomment(line)
 	result := s.command(code, startedInString)
@@ -274,7 +284,7 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 	}
 	if match := declarationRE.FindStringSubmatch(code); match != nil {
 		modifiers := strings.Fields(match[1])
-		s.startDeclaration(code, pendingText, s.qualify(strings.TrimSuffix(match[3], ".")), pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
+		s.startDeclaration(code, pendingText, s.qualify(strings.TrimSuffix(match[3], ".")), strings.Join(strings.Fields(match[2]), " "), pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
 		s.currentIsStructure = isStructureDecl(code)
 		switch match[2] {
 		case "def", "theorem", "lemma", "instance", "abbrev":
@@ -287,7 +297,7 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 	}
 	if match := anonymousInstanceRE.FindStringSubmatch(code); match != nil {
 		modifiers := strings.Fields(match[1])
-		s.startDeclaration(code, pendingText, "", pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
+		s.startDeclaration(code, pendingText, "", "instance", pendingPrivate || containsString(modifiers, "private"), pendingProtected || containsString(modifiers, "protected"))
 		s.currentMatchArm, s.anonymous = true, true
 		s.signatureLine(code)
 		return scanned{kind: declarationLine, owned: true, signature: true}
@@ -299,15 +309,16 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 	return s.continuation(code, true)
 }
 
-// startDeclaration ends the current declaration and starts one named name on
-// a declaration line. An anonymous instance's name is "" until its signature
-// ends.
-func (s *scanner) startDeclaration(code, pendingText, name string, private, protected bool) {
+// startDeclaration ends the current declaration and starts one named name,
+// declared by the keyword kind, on a declaration line. An anonymous
+// instance's name is "" until its signature ends.
+func (s *scanner) startDeclaration(code, pendingText, name, kind string, private, protected bool) {
 	s.endDeclaration()
-	s.declarations = append(s.declarations, Declaration{File: s.file, Name: name, Private: private, Protected: protected})
+	s.declarations = append(s.declarations, Declaration{File: s.file, Name: name, Private: private, Protected: protected, Kind: kind, Line: s.line})
 	s.inDeclaration, s.inSignature = true, true
 	s.brackets, s.column = 0, indentation(code)
 	s.blockColumn, s.blockPending = -1, false
+	s.fieldColumn = -1
 	s.signature = appendFields(appendFields(s.signature[:0], pendingText), code)
 }
 
@@ -335,8 +346,12 @@ func (s *scanner) continuation(code string, armMayStart bool) scanned {
 	}
 	defer s.endLine(code)
 	arm := armMayStart && s.currentMatchArm && s.brackets == 0 && startsMatchArm(code)
+	brackets := s.brackets
 	bodyStarts := s.track(code)
 	if !s.inSignature {
+		if armMayStart && brackets == 0 {
+			s.bodyField(code)
+		}
 		return scanned{owned: true}
 	}
 	if arm {
@@ -348,6 +363,27 @@ func (s *scanner) continuation(code string, armMayStart bool) scanned {
 		s.endSignature()
 	}
 	return scanned{owned: true, signature: true}
+}
+
+// bodyField records a body line of a structure or class that names one of its
+// own fields: a line at the body's first indentation that matches fieldRE and
+// is not the constructor's `name ::` line.
+func (s *scanner) bodyField(code string) {
+	declaration := &s.declarations[len(s.declarations)-1]
+	if declaration.Kind != "structure" && declaration.Kind != "class" {
+		return
+	}
+	if s.fieldColumn < 0 {
+		s.fieldColumn = indentation(code)
+	}
+	if indentation(code) != s.fieldColumn {
+		return
+	}
+	match := fieldRE.FindStringSubmatchIndex(code)
+	if match == nil || strings.HasPrefix(code[match[1]:], ":") {
+		return
+	}
+	declaration.Fields = append(declaration.Fields, code[match[2]:match[3]])
 }
 
 // endLine records a code line of the current declaration as its last one. A
@@ -482,6 +518,9 @@ func (s *scanner) endSignature() {
 	declaration := &s.declarations[len(s.declarations)-1]
 	declaration.Text = string(s.signature)
 	s.inSignature = false
+	if declaration.Kind == "structure" || declaration.Kind == "class" {
+		declaration.Extends = extendsBeforeWhere(declaration.Text)
+	}
 	if s.anonymous {
 		// A line that changes the scopes ends the declaration first, so the
 		// scopes are still the instance's. Lean names a repeated name in a
@@ -496,6 +535,20 @@ func (s *scanner) endSignature() {
 		}
 		s.instances[base]++
 	}
+}
+
+// extendsBeforeWhere reports whether a structure or class signature has the
+// word `extends` before the `where` that opens its body.
+func extendsBeforeWhere(text string) bool {
+	for _, word := range identifiers(text) {
+		switch word {
+		case "extends":
+			return true
+		case "where":
+			return false
+		}
+	}
+	return false
 }
 
 // instanceBinder is one binder group of an anonymous instance: the names it

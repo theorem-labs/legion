@@ -42,10 +42,12 @@ type Scorer interface {
 }
 
 // LandingEvent is emitted once per member after its merge is durably recorded.
+// Flags are the member's flags from the receipt's check verdicts.
 type LandingEvent struct {
 	Batch  string
 	Member string
 	Commit string
+	Flags  []Flag
 }
 
 // EventPublisher publishes post-landing member events.
@@ -261,7 +263,7 @@ func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error)
 				return r.retryable(ctx, batch, "event operation status", err)
 			}
 			if !done {
-				if err := r.Events.Publish(ctx, LandingEvent{Batch: batch.ID, Member: member.Migration, Commit: mergedCommit}); err != nil {
+				if err := r.Events.Publish(ctx, LandingEvent{Batch: batch.ID, Member: member.Migration, Commit: mergedCommit, Flags: memberFlags(batch.Receipt, member.Migration)}); err != nil {
 					return r.retryable(ctx, batch, "event", err)
 				}
 			}
@@ -276,6 +278,22 @@ func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error)
 		return Batch{}, err
 	}
 	return *batch, nil
+}
+
+// memberFlags is a member's flags in the receipt's check verdicts, never nil.
+func memberFlags(receipt *Receipt, member string) []Flag {
+	flags := []Flag{}
+	if receipt == nil {
+		return flags
+	}
+	for _, verdict := range receipt.Checks {
+		for _, flag := range verdict.Flags {
+			if flag.Member == member {
+				flags = append(flags, flag)
+			}
+		}
+	}
+	return flags
 }
 
 func (r Runner) retryable(ctx context.Context, batch *Batch, reason string, cause error) (Batch, error) {

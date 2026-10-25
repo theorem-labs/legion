@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/sjawhar/legion/orchestration/landing/blame"
 	"github.com/sjawhar/legion/orchestration/landing/gitx"
@@ -68,16 +70,61 @@ type Git interface {
 	TreeDeclarations(context.Context, string, Tree) ([]blame.Declaration, error)
 }
 
-// Checker reports paths that a configured policy rejects in a candidate tree.
-type Checker interface {
-	Name() string
-	Check(context.Context, Tree) ([]Finding, error)
+// CheckInput is what a configured check reads: the candidate tree and the
+// batch's frozen base commit.
+type CheckInput struct {
+	Tree Tree   // the candidate tree
+	Base string // the batch's base commit
 }
 
-// Finding is one policy violation attributed by its changed path.
+// Checker reports what a configured policy rejects or flags in a candidate.
+type Checker interface {
+	Name() string
+	Check(context.Context, CheckInput) ([]Finding, error)
+}
+
+// Finding is one check result. A findings-format line has only Path and
+// Reason and is attributed by its changed path; a graph line names a
+// declaration, attributed by the members' declaration evidence.
 type Finding struct {
-	Path   string
-	Reason string
+	Path        string     `json:"path"`
+	Reason      string     `json:"reason"`                // "<rule>: <message>" for a graph finding
+	Verdict     string     `json:"verdict"`               // VerdictRefuse or VerdictFlag; a findings-format line is VerdictRefuse
+	Declaration string     `json:"declaration,omitempty"` // empty for a findings-format line
+	Kind        blame.Kind `json:"kind,omitempty"`
+	Line        int        `json:"line,omitempty"`
+	Col         int        `json:"col,omitempty"`
+}
+
+// Refusal is one member a check returns, with the finding and evidence.
+type Refusal struct {
+	Member      string `json:"member"`
+	Declaration string `json:"declaration,omitempty"`
+	Path        string `json:"path"`
+	Line        int    `json:"line,omitempty"`
+	Strength    int    `json:"strength,omitempty"`
+	Evidence    string `json:"evidence,omitempty"`
+	Reason      string `json:"reason"`
+}
+
+// Flag is one flagged finding attributed to one member. A flag returns no
+// member; it is carried in the receipt and the member's landing event.
+type Flag struct {
+	Check       string `json:"check"`
+	Member      string `json:"member"`
+	Declaration string `json:"declaration"`
+	Path        string `json:"path"`
+	Line        int    `json:"line"`
+	Reason      string `json:"reason"`
+}
+
+// CheckUnableError is a check that could not decide (a graph check's exit
+// 3). Its verdict is "unable" and the batch goes on to the build, which
+// decides; any other check error fails the batch.
+type CheckUnableError struct{ Check, Reason string }
+
+func (e *CheckUnableError) Error() string {
+	return fmt.Sprintf("check %q is unable: %s", e.Check, e.Reason)
 }
 
 // State is the durable state of a landing batch.
@@ -119,9 +166,13 @@ type DroppedMember struct {
 
 // CheckVerdict is a configured check's final result for the current candidate.
 type CheckVerdict struct {
-	Name    string `json:"name"`
-	Verdict string `json:"verdict"`
-	Reason  string `json:"reason"`
+	Name         string    `json:"name"`
+	Verdict      string    `json:"verdict"` // "pass", "fail" (members refused), "flag" (flags only), "unable"
+	Reason       string    `json:"reason"`
+	Refused      []Refusal `json:"refused,omitempty"`
+	Flags        []Flag    `json:"flags,omitempty"`
+	Unattributed []Finding `json:"unattributed,omitempty"` // findings no member's evidence selects: the check is unable
+	Seconds      float64   `json:"seconds"`
 }
 
 // Receipt binds a green candidate to its policy and evidence. Key is the batch
@@ -599,52 +650,28 @@ func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reaso
 	return nil
 }
 
-// checkUnable is a configured check that could not decide.
+// checkUnable is a configured check that failed, so the batch fails.
 type checkUnable struct{ error }
 
 func (e checkUnable) Unwrap() error { return e.error }
 
 // runChecks runs the configured repository checks on the candidate when their
-// stored result is not at the current key. A finding returns the members that
-// changed its path, and runChecks reports that it returned them.
+// stored result is not at the current key. The members the first failing
+// check refuses are returned, and runChecks reports that it returned them.
 func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 	key := r.key(*batch)
 	if batch.ChecksKey == key {
 		return false, nil
 	}
-	batch.Checks = nil
-	for index, checker := range r.Checks {
-		name := checkName(checker, index)
-		findings, err := checker.Check(ctx, Tree(batch.Candidate.Tree))
-		if err != nil {
-			batch.setCheck(CheckVerdict{Name: name, Verdict: "unable", Reason: err.Error()})
-			if saveErr := r.Store.Save(ctx, *batch); saveErr != nil {
-				return false, fmt.Errorf("record unavailable check: %w", saveErr)
-			}
-			return false, checkUnable{err}
+	verdicts, culprits, err := r.evaluateChecks(ctx, batch, false)
+	batch.Checks = verdicts
+	if err != nil {
+		if saveErr := r.Store.Save(ctx, *batch); saveErr != nil {
+			return false, fmt.Errorf("record failed check: %w", saveErr)
 		}
-		if len(findings) == 0 {
-			batch.setCheck(CheckVerdict{Name: name, Verdict: "pass"})
-			continue
-		}
-		culprits := make(map[string]string)
-		for _, finding := range findings {
-			matched := false
-			for _, member := range batch.ActiveMembers {
-				if contains(member.Changed, finding.Path) {
-					culprits[member.Migration] = finding.Reason
-					matched = true
-				}
-			}
-			if !matched {
-				batch.setCheck(CheckVerdict{Name: name, Verdict: "unable", Reason: finding.Reason})
-				if err := r.Store.Save(ctx, *batch); err != nil {
-					return false, fmt.Errorf("record unattributable check: %w", err)
-				}
-				return false, checkUnable{fmt.Errorf("check %q cannot attribute %q", name, finding.Path)}
-			}
-		}
-		batch.setCheck(CheckVerdict{Name: name, Verdict: "fail", Reason: findings[0].Reason})
+		return false, err
+	}
+	if len(culprits) != 0 {
 		if err := r.returnMembers(ctx, batch, culprits); err != nil {
 			return false, err
 		}
@@ -655,6 +682,177 @@ func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 		return false, err
 	}
 	return false, nil
+}
+
+// evaluateChecks runs the configured checks on the batch's candidate and
+// returns their verdicts and the members to return, each with its reason. It
+// saves nothing. It stops after the first check that refuses a member unless
+// every is set. A finding with no declaration (a findings-format line)
+// returns every active member that changed its path. A graph finding is
+// attributed by blame.SelectFor; when it selects nobody for any finding, the
+// check is unable and returns and flags nobody. A check that is unable lets
+// the next check run; any other check error is a checkUnable, which fails the
+// batch, returned with the verdicts so far.
+func (r Runner) evaluateChecks(ctx context.Context, batch *Batch, every bool) ([]CheckVerdict, map[string]string, error) {
+	verdicts := make([]CheckVerdict, 0, len(r.Checks))
+	culprits := make(map[string]string)
+	attribute := checkAttribution{runner: r, batch: batch}
+	for index, checker := range r.Checks {
+		name := checkName(checker, index)
+		started := time.Now()
+		findings, err := checker.Check(ctx, CheckInput{Tree: Tree(batch.Candidate.Tree), Base: batch.Base})
+		verdict := CheckVerdict{Name: name, Seconds: time.Since(started).Seconds()}
+		if err != nil {
+			verdict.Verdict, verdict.Reason = "unable", err.Error()
+			var unable *CheckUnableError
+			if errors.As(err, &unable) {
+				verdict.Reason = unable.Reason
+				verdicts = append(verdicts, verdict)
+				continue
+			}
+			return append(verdicts, verdict), nil, checkUnable{err}
+		}
+		checkCulprits := make(map[string]string)
+		var unattributed []string
+		for _, finding := range findings {
+			if finding.Declaration == "" {
+				matched := false
+				for _, member := range batch.ActiveMembers {
+					if contains(member.Changed, finding.Path) {
+						addCulprit(checkCulprits, member.Migration, finding.Reason)
+						verdict.Refused = append(verdict.Refused, Refusal{Member: member.Migration, Path: finding.Path, Reason: finding.Reason})
+						matched = true
+					}
+				}
+				if !matched {
+					verdict.Verdict, verdict.Reason = "unable", finding.Reason
+					return append(verdicts, verdict), nil, checkUnable{fmt.Errorf("check %q cannot attribute %q", name, finding.Path)}
+				}
+				continue
+			}
+			selection, err := attribute.selectFor(ctx, finding)
+			if err != nil {
+				verdict.Verdict, verdict.Reason = "unable", err.Error()
+				return append(verdicts, verdict), nil, checkUnable{err}
+			}
+			if len(selection.Members) == 0 {
+				note := selection.Note
+				if note == "" {
+					note = "no evidence"
+				}
+				verdict.Unattributed = append(verdict.Unattributed, finding)
+				unattributed = append(unattributed, fmt.Sprintf("%s at %s:%d: %s", finding.Declaration, finding.Path, finding.Line, note))
+				continue
+			}
+			for _, row := range selection.Members {
+				if finding.Verdict == VerdictFlag {
+					verdict.Flags = append(verdict.Flags, Flag{Check: name, Member: row.Member, Declaration: finding.Declaration, Path: finding.Path, Line: finding.Line, Reason: finding.Reason})
+					continue
+				}
+				rule, _, _ := strings.Cut(finding.Reason, ":")
+				addCulprit(checkCulprits, row.Member, fmt.Sprintf("check %s: %s %s (%s)", name, rule, finding.Declaration, row.Label))
+				verdict.Refused = append(verdict.Refused, Refusal{Member: row.Member, Declaration: finding.Declaration, Path: finding.Path, Line: finding.Line, Strength: row.Strength, Evidence: row.Label, Reason: finding.Reason})
+			}
+		}
+		switch {
+		case len(unattributed) != 0:
+			verdict.Verdict, verdict.Reason = "unable", "no member selected for "+strings.Join(unattributed, "; ")
+			verdict.Refused, verdict.Flags = nil, nil
+		case len(checkCulprits) != 0:
+			verdict.Verdict, verdict.Reason = "fail", verdict.Refused[0].Reason
+			for member, reason := range checkCulprits {
+				addCulprit(culprits, member, reason)
+			}
+		case len(verdict.Flags) != 0:
+			verdict.Verdict, verdict.Reason = "flag", verdict.Flags[0].Reason
+		default:
+			verdict.Verdict = "pass"
+		}
+		verdicts = append(verdicts, verdict)
+		if len(culprits) != 0 && !every {
+			break
+		}
+	}
+	return verdicts, culprits, nil
+}
+
+// CheckReport is what CheckCandidate found: the frozen base, the candidate
+// tree, the members in it and every check's verdict.
+type CheckReport struct {
+	Base    string         `json:"base"`
+	Tree    string         `json:"tree"`
+	Members []string       `json:"members"`
+	Checks  []CheckVerdict `json:"checks"`
+}
+
+// CheckCandidate freezes the input, builds its candidate and runs every
+// configured check on it. It builds nothing, returns no member and saves
+// nothing. A member the candidate itself drops (a conflict) is left out of
+// the members. A check error other than a CheckUnableError is returned.
+func (r Runner) CheckCandidate(ctx context.Context, input Input) (CheckReport, error) {
+	input, err := r.freezeInput(ctx, input)
+	if err != nil {
+		return CheckReport{}, err
+	}
+	if err := r.readChanges(ctx, input.Repository, input.Base, input.Members); err != nil {
+		return CheckReport{}, err
+	}
+	batch := Batch{ID: input.ID, Repository: input.Repository, Base: input.Base, FrozenMembers: input.Members, ActiveMembers: cloneMembers(input.Members)}
+	candidate, err := r.candidate(ctx, batch.Repository, batch.Base, batch.ActiveMembers)
+	if err != nil {
+		return CheckReport{}, fmt.Errorf("build candidate: %w", err)
+	}
+	batch.Candidate = candidate
+	batch.ActiveMembers = candidateMembers(batch)
+	verdicts, _, err := r.evaluateChecks(ctx, &batch, true)
+	if err != nil {
+		return CheckReport{}, err
+	}
+	report := CheckReport{Base: batch.Base, Tree: candidate.Tree, Members: make([]string, 0, len(batch.ActiveMembers)), Checks: verdicts}
+	for _, member := range batch.ActiveMembers {
+		report.Members = append(report.Members, member.Migration)
+	}
+	return report, nil
+}
+
+// addCulprit records a member's first reason.
+func addCulprit(culprits map[string]string, member, reason string) {
+	if _, found := culprits[member]; !found {
+		culprits[member] = reason
+	}
+}
+
+// checkAttribution reads, once per evaluation and only when a graph finding
+// needs them, the active members' declaration evidence and the declarations
+// of the base and candidate trees.
+type checkAttribution struct {
+	runner    Runner
+	batch     *Batch
+	loaded    bool
+	evidence  map[string]blame.Evidence
+	base      []blame.Declaration
+	candidate []blame.Declaration
+}
+
+// selectFor attributes one graph finding through blame.SelectFor.
+func (a *checkAttribution) selectFor(ctx context.Context, finding Finding) (blame.Selection, error) {
+	if !a.loaded {
+		evidence, err := a.runner.memberEvidence(ctx, a.batch)
+		if err != nil {
+			return blame.Selection{}, err
+		}
+		base, err := a.runner.candidate(ctx, a.batch.Repository, a.batch.Base, nil)
+		if err != nil {
+			return blame.Selection{}, fmt.Errorf("build base candidate: %w", err)
+		}
+		baseDeclarations, candidateDeclarations, err := a.runner.treeDeclarations(ctx, a.batch, Tree(base.Tree))
+		if err != nil {
+			return blame.Selection{}, err
+		}
+		a.evidence, a.base, a.candidate, a.loaded = evidence, baseDeclarations, candidateDeclarations, true
+	}
+	lines := blame.TreeLines{Base: blame.DeclarationsFor(finding.Declaration, a.base), Candidate: blame.DeclarationsFor(finding.Declaration, a.candidate)}
+	return blame.SelectFor(blame.Name{Value: finding.Declaration, Kind: finding.Kind}, a.evidence, lines), nil
 }
 
 func containsDropped(dropped []DroppedMember, migration string) bool {
@@ -751,17 +949,9 @@ func (r Runner) blame(ctx context.Context, batch *Batch, output string) (bool, m
 	if !baseResult.Green {
 		return true, nil, nil
 	}
-	evidence := make(map[string]blame.Evidence, len(batch.ActiveMembers))
-	for _, member := range batch.ActiveMembers {
-		comparisonBase := member.ComparisonBase
-		if comparisonBase == "" {
-			comparisonBase = batch.Base
-		}
-		memberEvidence, err := r.Git.DeclarationEvidence(ctx, batch.Repository, comparisonBase, member)
-		if err != nil {
-			return false, nil, fmt.Errorf("read declaration evidence for %q: %w", member.Migration, err)
-		}
-		evidence[member.Migration] = memberEvidence
+	evidence, err := r.memberEvidence(ctx, batch)
+	if err != nil {
+		return false, nil, err
 	}
 	report := blame.Parse(output, r.ModuleRoots)
 	lines, err := r.declarationLines(ctx, batch, Tree(base.Tree), report)
@@ -812,14 +1002,42 @@ func (r Runner) blame(ctx context.Context, batch *Batch, output string) (bool, m
 	return false, culprits, nil
 }
 
-func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, report blame.Report) (map[string]blame.TreeDeclarations, error) {
+// memberEvidence reads each active member's declaration evidence, from its
+// comparison base (the batch base when it has none) to its head.
+func (r Runner) memberEvidence(ctx context.Context, batch *Batch) (map[string]blame.Evidence, error) {
+	evidence := make(map[string]blame.Evidence, len(batch.ActiveMembers))
+	for _, member := range batch.ActiveMembers {
+		comparisonBase := member.ComparisonBase
+		if comparisonBase == "" {
+			comparisonBase = batch.Base
+		}
+		memberEvidence, err := r.Git.DeclarationEvidence(ctx, batch.Repository, comparisonBase, member)
+		if err != nil {
+			return nil, fmt.Errorf("read declaration evidence for %q: %w", member.Migration, err)
+		}
+		evidence[member.Migration] = memberEvidence
+	}
+	return evidence, nil
+}
+
+// treeDeclarations reads every declaration of the base tree and of the
+// batch's candidate tree.
+func (r Runner) treeDeclarations(ctx context.Context, batch *Batch, base Tree) ([]blame.Declaration, []blame.Declaration, error) {
 	baseDeclarations, err := r.Git.TreeDeclarations(ctx, batch.Repository, base)
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at base: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at base: %w", err)
 	}
 	candidateDeclarations, err := r.Git.TreeDeclarations(ctx, batch.Repository, Tree(batch.Candidate.Tree))
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at candidate: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
+	}
+	return baseDeclarations, candidateDeclarations, nil
+}
+
+func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, report blame.Report) (map[string]blame.TreeLines, error) {
+	baseDeclarations, candidateDeclarations, err := r.treeDeclarations(ctx, batch, base)
+	if err != nil {
+		return nil, err
 	}
 	names := make(map[string]struct{})
 	for _, block := range report.Blocks {
@@ -827,9 +1045,9 @@ func (r Runner) declarationLines(ctx context.Context, batch *Batch, base Tree, r
 			names[name.Value] = struct{}{}
 		}
 	}
-	declarations := make(map[string]blame.TreeDeclarations, len(names))
+	declarations := make(map[string]blame.TreeLines, len(names))
 	for name := range names {
-		declarations[name] = blame.TreeDeclarations{
+		declarations[name] = blame.TreeLines{
 			Base:      blame.DeclarationsFor(name, baseDeclarations),
 			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}

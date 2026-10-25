@@ -31,7 +31,7 @@ end Alpha
 		t.Fatalf("ScanDeclarations() returned %d declarations: %#v, want %d", len(got), got, len(want))
 	}
 	for index := range want {
-		if got[index] != want[index] {
+		if !sameIdentity(got[index], want[index]) {
 			t.Errorf("declaration %d = %#v, want %#v", index, got[index], want[index])
 		}
 	}
@@ -56,7 +56,7 @@ end Alpha
 		t.Fatalf("ScanDeclarations() returned %d declarations: %#v, want %d", len(got), got, len(want))
 	}
 	for index := range want {
-		if got[index] != want[index] {
+		if !sameIdentity(got[index], want[index]) {
 			t.Errorf("declaration %d = %#v, want %#v", index, got[index], want[index])
 		}
 	}
@@ -329,7 +329,7 @@ func TestScanDeclarationsNamesAnonymousInstances(t *testing.T) {
 		t.Fatalf("ScanDeclarations() = %+v, want %+v", got, want)
 	}
 	for index := range want {
-		if got[index] != want[index] {
+		if !sameIdentity(got[index], want[index]) {
 			t.Errorf("declaration %d = %+v, want %+v", index, got[index], want[index])
 		}
 	}
@@ -337,4 +337,10 @@ func TestScanDeclarationsNamesAnonymousInstances(t *testing.T) {
 	if owner := owners[4].Owner.Name; owner != "Alpha.instInhabitedBoxOfGroup" || owners[4].IsSignature {
 		t.Errorf("line 5 owner = %q (signature %v), want the body of Alpha.instInhabitedBoxOfGroup", owner, owners[4].IsSignature)
 	}
+}
+
+// sameIdentity compares what these tests pin: the identity, signature and
+// visibility of a declaration.
+func sameIdentity(got, want Declaration) bool {
+	return got.File == want.File && got.Name == want.Name && got.Text == want.Text && got.Private == want.Private && got.Protected == want.Protected
 }
