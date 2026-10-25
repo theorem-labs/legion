@@ -332,6 +332,12 @@ type Constant struct {
 	Atoms     []string `json:"a"`
 	Facts     []Fact   `json:"f"`
 	Truncated bool     `json:"tr"`
+	// Binders are the heads of the types of the constant's explicit binders, in order, and Conclusion the head of its
+	// type past every binder. A head is the constant applied at the top of a type, past the type's own binders and
+	// its default value's or tactic's annotation, as Lean prints its full name; empty when it is not a constant (a
+	// variable, a sort). They are read from the elaborated type, which every reader of it gets alike.
+	Binders    []string `json:"b"`
+	Conclusion string   `json:"c"`
 }
 
 // Exporter runs the built exporter over compiled modules.

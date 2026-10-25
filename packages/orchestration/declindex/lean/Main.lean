@@ -4,10 +4,11 @@ open Lean Meta DeclExport
 
 /-! `declexport MANIFEST.json`: load compiled modules (no elaboration, no build) and print one JSON line for each
 constant of the target modules: its name `n`, module `m`, kind `k`, printed type `t`, compiled statement hash `h`,
-relation atom hashes `a`, the registered facts it states `f`, and `tr` when the walk hit its node budget. The
-manifest names the target modules, extra modules to import, the project's roots, the forms (`{concept, const}`: a
-constant whose value is a form lambda), the concepts' own declarations, and the module that the hashes count the
-target modules' constants as declared in (`home`). -/
+relation atom hashes `a`, the registered facts it states `f`, the heads of its explicit binders' types `b` and of its
+conclusion `c` (`headsOf`), and `tr` when the walk hit its node budget. The manifest names the target modules, extra
+modules to import, the project's roots, the forms (`{concept, const}`: a constant whose value is a form lambda), the
+concepts' own declarations, and the module that the hashes count the target modules' constants as declared in
+(`home`). -/
 
 structure ConstRef where
   concept : String
@@ -44,6 +45,22 @@ def toName (s : String) : Name := Id.run do
 def kindOf : ConstantInfo → String
   | .defnInfo _ => "def" | .thmInfo _ => "theorem" | .inductInfo _ => "inductive" | .ctorInfo _ => "ctor"
   | .axiomInfo _ => "axiom" | .opaqueInfo _ => "opaque" | .recInfo _ => "rec" | .quotInfo _ => "quot"
+
+/-- The constant at the head of `e` past its own binders and its type annotations (`optParam`, `autoParam`,
+`outParam`), as Lean prints its full name; empty when the head is not a constant (a variable, a sort). -/
+partial def headOf (e : Expr) : String :=
+  match e.cleanupAnnotations with
+  | .forallE _ _ b _ => headOf b
+  | e => match e.getAppFn.cleanupAnnotations with
+    | .const n _ => n.toString
+    | _ => ""
+
+/-- The heads (`headOf`) of the types of a type's explicit binders, in order, and the head of its conclusion: the
+type past all its binders. Read from the elaborated type, not from how its source writes it. -/
+partial def headsOf (e : Expr) (binders : Array String := #[]) : Array String × String :=
+  match e.cleanupAnnotations with
+  | .forallE _ t b bi => headsOf b (if bi.isExplicit then binders.push (headOf t) else binders)
+  | e => (binders, headOf e)
 
 /-- Constants the exporter skips: compiler and elaborator auxiliaries, not statements anyone wrote. -/
 def auxiliary (env : Environment) (c : Name) (ci : ConstantInfo) : Bool :=
@@ -140,10 +157,12 @@ def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Na
       try pure (truncate (toString (← ppExpr ci.type)))
       catch _ => pure (truncate (toString ci.type))
     else pure ""
+  let (binders, conclusion) := headsOf ci.type
   let mut fields : List (String × Json) := [
     ("n", toJson c.toString), ("m", toJson m.toString), ("k", toJson (kindOf ci)), ("t", toJson ty),
     ("h", toJson h.hex), ("a", toJson atoms),
-    ("f", Json.arr (fs.map fun f => Json.mkObj [("c", toJson f.concept), ("how", toJson f.how)]))]
+    ("f", Json.arr (fs.map fun f => Json.mkObj [("c", toJson f.concept), ("how", toJson f.how)])),
+    ("b", toJson binders), ("c", toJson conclusion)]
   if w.truncated then fields := fields ++ [("tr", toJson true)]
   return Json.mkObj fields
 

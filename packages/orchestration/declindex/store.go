@@ -46,32 +46,17 @@ CREATE INDEX IF NOT EXISTS modules_module ON modules (module);
 CREATE TABLE IF NOT EXISTS imports (module TEXT NOT NULL, imported TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS imports_module ON imports (module);
 -- A declaration is its module and its name: two modules that are never imported together can declare one name.
--- shape is the declaration's SourceShapes entry ('' without a trusted source position): renamed copies share it.
 CREATE TABLE IF NOT EXISTS decls (
     name      TEXT NOT NULL,
     short     TEXT NOT NULL,
     module    TEXT NOT NULL,
     kind      TEXT NOT NULL,
     line      INTEGER NOT NULL,
-    stmt_hash TEXT NOT NULL,
-    shape     TEXT NOT NULL DEFAULT ''
+    stmt_hash TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS decls_name ON decls (name);
 CREATE INDEX IF NOT EXISTS decls_short ON decls (short);
 CREATE INDEX IF NOT EXISTS decls_module ON decls (module);
-CREATE INDEX IF NOT EXISTS decls_shape ON decls (shape);
--- The type heads that a declaration's source writes (SourceHeads): role is binder (an explicit binder's type) or
--- conclusion, head the name ResolveHead gave it against every declaration of the index, line the declaration's.
-CREATE TABLE IF NOT EXISTS heads (
-    name   TEXT NOT NULL,
-    module TEXT NOT NULL,
-    role   TEXT NOT NULL,
-    head   TEXT NOT NULL,
-    line   INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS heads_role_head ON heads (role, head);
-CREATE INDEX IF NOT EXISTS heads_name ON heads (name);
-CREATE INDEX IF NOT EXISTS heads_module ON heads (module);
 -- One use of a constant: target and tmodule are its name and the module that Lean recorded for it; module, line,
 -- col and parent are where the use is.
 CREATE TABLE IF NOT EXISTS uses (
@@ -98,17 +83,21 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS edges_module ON edges (module);
 -- What the Lean exporter read from the compiled module: every constant (generated ones included), its elaborated
--- type as printed, and its compiled statement hash.
+-- type as printed, its compiled statement hash, the heads of its explicit binders' types (a JSON array, in order)
+-- and the head of its conclusion (Constant.Binders and Constant.Conclusion).
 CREATE TABLE IF NOT EXISTS consts (
-    name   TEXT NOT NULL,
-    module TEXT NOT NULL,
-    kind   TEXT NOT NULL,
-    type   TEXT NOT NULL,
-    cstmt  TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    module     TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    cstmt      TEXT NOT NULL,
+    binders    TEXT NOT NULL,
+    conclusion TEXT NOT NULL,
     PRIMARY KEY (name, module)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS consts_module ON consts (module);
 CREATE INDEX IF NOT EXISTS consts_cstmt ON consts (cstmt);
+CREATE INDEX IF NOT EXISTS consts_conclusion ON consts (conclusion);
 -- The relation atoms of each constant's statement, by canonical hash: who else states the same fact.
 CREATE TABLE IF NOT EXISTS atoms (name TEXT NOT NULL, module TEXT NOT NULL, atom TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS atoms_atom ON atoms (atom);
@@ -134,7 +123,7 @@ CREATE TABLE IF NOT EXISTS without_forms (
 CREATE TABLE IF NOT EXISTS landings (landed TEXT PRIMARY KEY, previous TEXT NOT NULL) WITHOUT ROWID;
 `
 
-var tables = []string{"meta", "sources", "modules", "imports", "decls", "heads", "uses", "edges", "consts", "atoms", "facts", "without_forms", "landings"}
+var tables = []string{"meta", "sources", "modules", "imports", "decls", "uses", "edges", "consts", "atoms", "facts", "without_forms", "landings"}
 
 // The index's two lock files, beside it. A refresh holds the refresh lock exclusive across its sync (fetch,
 // checkout and build) and its reads of the tree, so that two refreshes never interleave. Every write of the index

@@ -245,8 +245,8 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 	if err != nil {
 		return st, err
 	}
-	logf(opt.Log, "index: %d modules, %d reference files changed, %d gone, %d read again to resolve their heads, read in %s",
-		len(r.files), len(r.changed)-r.reresolved, len(r.gone), r.reresolved, time.Since(t0).Round(time.Millisecond))
+	logf(opt.Log, "index: %d modules, %d reference files changed, %d gone, read in %s", len(r.files), len(r.changed),
+		len(r.gone), time.Since(t0).Round(time.Millisecond))
 	for i, err := range r.errs {
 		if err != nil {
 			st.Unreadable++
@@ -295,8 +295,7 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 
 // reference is what a refresh read before it writes the reference part: the tree's sources (nil outside Git) and
 // the index's, the modules of the build and of the index, which of them changed or are gone, and the re-read
-// modules (an error for each that could not be read). The last reresolved of changed did not change: they are read
-// again because the changed and gone modules' declarations can resolve their heads otherwise.
+// modules (an error for each that could not be read).
 type reference struct {
 	sources, storedSources map[string]string
 	sourcePrefix           string
@@ -307,7 +306,6 @@ type reference struct {
 	gone                   []string
 	results                []ModuleData
 	errs                   []error
-	reresolved             int
 }
 
 // readReference reads the tree's sources and build, and the index's sources and modules, and re-reads the modules
@@ -348,78 +346,8 @@ func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (referen
 	parallel(len(r.changed), jobs, func(i int) {
 		r.results[i], r.errs[i] = readModule(tree, r.changed[i].rel)
 	})
-	resolve, err := s.headModulesToResolve(ctx, r)
-	if err != nil {
-		return r, err
-	}
-	more, moreErrs := make([]ModuleData, len(resolve)), make([]error, len(resolve))
-	parallel(len(resolve), jobs, func(i int) {
-		more[i], moreErrs[i] = readModule(tree, resolve[i].rel)
-	})
-	r.changed, r.results, r.errs = append(r.changed, resolve...), append(r.results, more...), append(r.errs, moreErrs...)
-	r.reresolved = len(resolve)
 	return r, nil
 }
-
-// headModulesToResolve gives the unchanged modules that hold a head which the changed and gone modules can make
-// resolve otherwise. Every name that ResolveHead tries ends with the written name, so a head resolves otherwise only
-// when a declaration whose last name component is the head's is added or removed.
-func (s *Store) headModulesToResolve(ctx context.Context, r reference) ([]moduleFile, error) {
-	rewritten := map[string]bool{}
-	for _, rel := range slices.Concat(r.gone, relsOf(r.changed)) {
-		if o, ok := r.old[rel]; ok {
-			rewritten[o.module] = true
-		}
-	}
-	before, err := declaredBy(ctx, s.q, slices.Sorted(maps.Keys(rewritten)))
-	if err != nil {
-		return nil, err
-	}
-	after := map[string]bool{}
-	for i, md := range r.results {
-		if r.errs[i] == nil {
-			for _, d := range md.Decls {
-				after[d.Name] = true
-			}
-		}
-	}
-	moved := map[string]bool{}
-	for name := range before {
-		if !after[name] {
-			moved[lastComponent(name)] = true
-		}
-	}
-	for name := range after {
-		if !before[name] {
-			moved[lastComponent(name)] = true
-		}
-	}
-	if len(moved) == 0 {
-		return nil, nil
-	}
-	heads, err := headsByModule(ctx, s.q)
-	if err != nil {
-		return nil, err
-	}
-	changed := map[string]bool{}
-	for _, f := range r.changed {
-		changed[f.rel] = true
-	}
-	var out []moduleFile
-	for _, f := range r.files {
-		o, ok := r.old[f.rel]
-		if !ok || changed[f.rel] || rewritten[o.module] {
-			continue
-		}
-		if slices.ContainsFunc(heads[o.module], func(h string) bool { return moved[lastComponent(h)] }) {
-			out = append(out, f)
-		}
-	}
-	return out, nil
-}
-
-// lastComponent is the part of a dotted name after its last dot, as Decl.Short is.
-func lastComponent(name string) string { return name[strings.LastIndexByte(name, '.')+1:] }
 
 // writeSources makes the sources table current: the rows of sources that stored has and current lacks are
 // deleted, and only new or changed rows written. The refresh lock, held since stored was read, keeps another
@@ -447,7 +375,7 @@ func writeSources(ctx context.Context, tx *sql.Tx, stored, current map[string]st
 
 // writeModules replaces the reference rows of the changed and gone modules (and the compiled rows of the gone ones,
 // and of the changed ones that could not be read, which leave the index) with those of the re-read modules: their
-// imports, declarations, heads, uses, modules rows and edges.
+// imports, declarations, uses, modules rows and edges.
 func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 	if err := deleteModules(ctx, tx, slices.Concat(r.gone, relsOf(r.changed)), r.old); err != nil {
 		return err
@@ -464,7 +392,7 @@ func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 			}
 		}
 	}
-	decls := newBatch(tx, "INSERT", "decls (name, short, module, kind, line, stmt_hash, shape)", 7)
+	decls := newBatch(tx, "INSERT", "decls", 6)
 	uses := newBatch(tx, "INSERT", "uses", 7)
 	imports := newBatch(tx, "INSERT", "imports", 2)
 	modules := newBatch(tx, "INSERT", "modules", 4)
@@ -478,7 +406,7 @@ func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 			}
 		}
 		for _, d := range md.Decls {
-			if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash, d.Shape); err != nil {
+			if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash); err != nil {
 				return err
 			}
 		}
@@ -497,9 +425,6 @@ func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
 		if err := b.flush(ctx); err != nil {
 			return err
 		}
-	}
-	if err := insertHeads(ctx, tx, r.results, r.errs); err != nil {
-		return err
 	}
 	return insertEdges(ctx, tx, r.results, r.errs)
 }
@@ -574,7 +499,7 @@ func deleteModules(ctx context.Context, tx *sql.Tx, rels []string, old map[strin
 		return nil
 	}
 	var byModule []*sql.Stmt
-	for _, t := range []string{"imports", "decls", "heads", "uses", "edges"} {
+	for _, t := range []string{"imports", "decls", "uses", "edges"} {
 		stmt, err := tx.PrepareContext(ctx, "DELETE FROM "+t+" WHERE module = ?")
 		if err != nil {
 			return err
@@ -631,31 +556,6 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 	return md, err
 }
 
-// insertHeads adds the source heads of the re-read modules, each resolved (ResolveHead) against every declaration
-// of the index as this refresh leaves it. It runs after the declarations are written.
-func insertHeads(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []error) error {
-	if !slices.ContainsFunc(results, func(md ModuleData) bool { return len(md.heads) > 0 }) {
-		return nil
-	}
-	declared, err := allDeclaring(ctx, tx)
-	if err != nil {
-		return err
-	}
-	isDeclared := func(name string) bool { return len(declared[name]) > 0 }
-	heads := newBatch(tx, "INSERT", "heads (name, module, role, head, line)", 5)
-	for i, md := range results {
-		if errs[i] != nil {
-			continue
-		}
-		for _, h := range md.heads {
-			if err := heads.add(ctx, h.name, md.Module, h.head.Role, ResolveHead(h.head, isDeclared), h.head.Line); err != nil {
-				return err
-			}
-		}
-	}
-	return heads.flush(ctx)
-}
-
 // insertEdges adds the declaration-level edges of the re-read modules: for each user declaration, the targets
 // it uses as recorded. Which declaration a target belongs to (`X.wp` is X's field while its module declares no
 // `X.wp`) depends on the declarations and imports of other modules, so buildGraph decides it when it writes the graph.
@@ -695,8 +595,7 @@ func insertEdges(ctx context.Context, tx *sql.Tx, results []ModuleData, errs []e
 	return edges.flush(ctx)
 }
 
-// batch inserts rows into one table many at a time, with the statement verb INSERT or INSERT OR REPLACE. table is
-// the table's name, followed by its column list when the rows give columns by name.
+// batch inserts rows into one table many at a time, with the statement verb INSERT or INSERT OR REPLACE.
 type batch struct {
 	tx          *sql.Tx
 	verb, table string

@@ -4,13 +4,14 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"maps"
 	"slices"
 )
 
 // The reads that graph checks make of an index: a candidate's declarations, uses and imports against the built
-// base's. Each takes a list of keys and gives every row that matches one of them, sorted, so that a caller needs no
-// SQL of its own.
+// base's, and the compiled constants of either. Each takes a list of keys and gives every row that matches one of
+// them, sorted, so that a caller needs no SQL of its own.
 
 // Commit is the commit whose build the index describes (meta "commit").
 func (s *Store) Commit(ctx context.Context) (string, error) {
@@ -41,17 +42,12 @@ func (s *Store) DeclsShort(ctx context.Context, shorts []string) ([]Decl, error)
 	return s.declsWhere(ctx, "short", shorts)
 }
 
-// DeclsWithShape gives the declarations whose shape (Decl.Shape) is one of shapes: renamed copies of a statement.
-func (s *Store) DeclsWithShape(ctx context.Context, shapes []string) ([]Decl, error) {
-	return s.declsWhere(ctx, "shape", shapes)
-}
-
 // declColumns are the columns of a Decl, in the order scanDecl reads them.
-const declColumns = `name, short, module, kind, line, stmt_hash, shape`
+const declColumns = `name, short, module, kind, line, stmt_hash`
 
 func scanDecl(r *sql.Rows, out *[]Decl) error {
 	var d Decl
-	if err := r.Scan(&d.Name, &d.Short, &d.Module, &d.Kind, &d.Line, &d.StmtHash, &d.Shape); err != nil {
+	if err := r.Scan(&d.Name, &d.Short, &d.Module, &d.Kind, &d.Line, &d.StmtHash); err != nil {
 		return err
 	}
 	*out = append(*out, d)
@@ -74,13 +70,15 @@ func (s *Store) declsWhere(ctx context.Context, column string, values []string) 
 }
 
 // UsesOf gives the recorded uses of each named declaration and of the constants Lean made from it: those whose
-// target is the name, or begins with the name and a dot (a field, a constructor) or a slash (an auxiliary). It is
-// the range that usersOf reads, without its owner resolution: a graph check compares the targets themselves.
+// target is the name, or begins with the name and a dot (a field, a constructor, an equation lemma) or a slash (a
+// name a macro made). The range is from the name and a dot to the name and the character after a slash, which are
+// the only two characters between them, so one index range holds both and nothing else. A graph check compares the
+// targets themselves, so this read does not resolve which declaration a target belongs to, as usersOf does.
 func (s *Store) UsesOf(ctx context.Context, names []string) ([]Use, error) {
 	var out []Use
 	for _, name := range distinct(names) {
 		rows, err := s.q.QueryContext(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
-			WHERE target = ? OR (target >= ? AND target < ?)`, name, name+".", name+"/")
+			WHERE target = ? OR (target >= ? AND target < ?)`, name, name+".", name+"0")
 		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var u Use
 			if err := r.Scan(&u.Target, &u.TargetModule, &u.Module, &u.Line, &u.Col, &u.Parent, &u.Class); err != nil {
@@ -122,88 +120,41 @@ func (s *Store) Imports(ctx context.Context) (map[string][]string, error) {
 	return out, nil
 }
 
-// Head is one type head that a declaration's source writes (SourceHeads), as the index keeps it: Role is binder or
-// conclusion, Head the name that ResolveHead gave it against every declaration of the index (a declared full name,
-// else the name as written), and Line the declaration's line.
-type Head struct {
-	Name, Module, Role, Head string
-	Line                     int
+// ConstantsIn gives the compiled constants of the modules as the index's compiled part holds them: what the
+// exporter gave (Constant), without Atoms, Facts and Truncated, sorted by module and name. A module that a graph
+// check compiles itself gives the same rows from Exporter.Run with Manifest.Types. The rows are of the index's commit
+// only when CompiledCommit(ctx, true) accepts the index; else a module has none, or another commit's.
+func (s *Store) ConstantsIn(ctx context.Context, modules []string) ([]Constant, error) {
+	return s.constantsWhere(ctx, "module", modules)
 }
 
-// Heads gives the heads of role (of any role when role is empty) that resolved to one of heads.
-func (s *Store) Heads(ctx context.Context, role string, heads []string) ([]Head, error) {
-	return s.headsWhere(ctx, "head", role, heads)
+// ConstantsConcluding gives the compiled constants whose Conclusion is one of heads, as ConstantsIn does: the
+// declarations that produce a head (an instance of a class, a theorem that concludes a proposition).
+func (s *Store) ConstantsConcluding(ctx context.Context, heads []string) ([]Constant, error) {
+	return s.constantsWhere(ctx, "conclusion", heads)
 }
 
-// HeadsOf gives every head of the named declarations.
-func (s *Store) HeadsOf(ctx context.Context, names []string) ([]Head, error) {
-	return s.headsWhere(ctx, "name", "", names)
-}
-
-// headsWhere gives the heads of role (any when empty) whose column (a heads column this file names) is one of values,
-// sorted by name, module, role, head and line.
-func (s *Store) headsWhere(ctx context.Context, column, role string, values []string) ([]Head, error) {
-	var out []Head
-	for chunk := range slices.Chunk(distinct(values), maxInParams) {
-		query := `SELECT name, module, role, head, line FROM heads WHERE ` + column + ` IN (` + placeholders(len(chunk)) + `)`
-		args := anys(chunk)
-		if role != "" {
-			query += ` AND role = ?`
-			args = append(args, role)
-		}
-		rows, err := s.q.QueryContext(ctx, query, args...)
-		err = eachRow(rows, err, func(r *sql.Rows) error {
-			var h Head
-			if err := r.Scan(&h.Name, &h.Module, &h.Role, &h.Head, &h.Line); err != nil {
+// constantsWhere gives the constants whose column (a consts column this file names) is one of values, sorted by
+// module and name.
+func (s *Store) constantsWhere(ctx context.Context, column string, values []string) ([]Constant, error) {
+	var out []Constant
+	err := eachRowIn(ctx, s.q, `SELECT name, module, kind, type, cstmt, binders, conclusion FROM consts WHERE `+column+` IN`,
+		distinct(values), func(r *sql.Rows) error {
+			var c Constant
+			var binders string
+			if err := r.Scan(&c.Name, &c.Module, &c.Kind, &c.Type, &c.Hash, &binders, &c.Conclusion); err != nil {
 				return err
 			}
-			out = append(out, h)
+			if err := json.Unmarshal([]byte(binders), &c.Binders); err != nil {
+				return err
+			}
+			out = append(out, c)
 			return nil
 		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	slices.SortFunc(out, func(a, b Head) int {
-		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Module, b.Module), cmp.Compare(a.Role, b.Role),
-			cmp.Compare(a.Head, b.Head), cmp.Compare(a.Line, b.Line))
-	})
-	return out, nil
-}
-
-// declaredBy gives the names that modules declare, as the index holds them: a refresh compares them with what the
-// modules declare after it (headModulesToResolve).
-func declaredBy(ctx context.Context, q querier, modules []string) (map[string]bool, error) {
-	out := map[string]bool{}
-	err := eachRowIn(ctx, q, `SELECT name FROM decls WHERE module IN`, modules, func(r *sql.Rows) error {
-		var name string
-		if err := r.Scan(&name); err != nil {
-			return err
-		}
-		out[name] = true
-		return nil
-	})
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
-}
-
-// headsByModule maps each module that holds a head to the distinct heads it holds.
-func headsByModule(ctx context.Context, q querier) (map[string][]string, error) {
-	out := map[string][]string{}
-	rows, err := q.QueryContext(ctx, `SELECT DISTINCT module, head FROM heads`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
-		var module, head string
-		if err := r.Scan(&module, &head); err != nil {
-			return err
-		}
-		out[module] = append(out[module], head)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
+	slices.SortFunc(out, func(a, b Constant) int { return cmp.Or(cmp.Compare(a.Module, b.Module), cmp.Compare(a.Name, b.Name)) })
 	return out, nil
 }
 
