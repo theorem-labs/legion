@@ -73,10 +73,10 @@ def test_a_folded_callee_s_lock_through_the_caller_s_member_is_an_edge(built: Pa
 
 
 def test_a_read_in_an_unreadable_generic_association_is_generic_unconfirmed(built: Path) -> None:
-    """``active_ring`` reads through to_common(), whose associations are each the same member of
-    another struct, inside another macro's argument (the kernel's ns_tree_active()). Every
-    association has the type of the whole, and the macro's text gives no selection either, so which
-    struct the read names is unknown: the access is kept with its reason, not held."""
+    """``active_ring`` reads through a _Generic whose association list a macro writes, so the facts
+    read no table of types from its text, and whose associations both have the type of the whole, so
+    the type of the selection names neither. Which struct the read names is unknown: the access is
+    kept with its reason, not held."""
     assert _accesses(built, "generic_unconfirmed") == [
         {
             "kind": "access",
@@ -84,7 +84,7 @@ def test_a_read_in_an_unreadable_generic_association_is_generic_unconfirmed(buil
             "function": "function:active_ring",
             "target": "struct:ring@src/reasons.c",
             "detail": {"event": "access"},
-            "provenance": [{"source": "c", "file": "src/reasons.c", "line": 75}],
+            "provenance": [{"source": "c", "file": "src/reasons.c", "line": 71}],
         }
     ]
     # What the compiler left of the read is held against the struct the association's type names.

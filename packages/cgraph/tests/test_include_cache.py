@@ -229,5 +229,5 @@ def test_the_tool_digest_covers_every_module_the_facts_come_from() -> None:
             reached.add(module)
             pending.append(module)
     assert "expressions" in reached
-    hashed = {Path(module.__file__ or "").stem for module in cache.TOOL_MODULES}
+    hashed = {path.stem for path in cache._extractor_sources()}
     assert reached <= hashed

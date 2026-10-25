@@ -60,17 +60,13 @@ struct other {
 	long tail;
 };
 
-/* As the kernel's ns_tree_active(): a _Generic whose associations are all the same member of a
- * different struct, inside the argument of another macro. Every association has the type of the
- * whole, so the type tells nothing, and the facts read no selection from the text either: the
- * access through it is kept with its reason, not held. */
-#define EMPTY_STATE(member) ((member) == 0)
-#define to_common(p)                                                                           \
-	_Generic((p), struct ring *: &(p)->ns, const struct ring *: &(p)->ns, struct other *: &(p)->ns, \
-		 const struct other *: &(p)->ns)
-#define ring_active(p) (!EMPTY_STATE(to_common(p)->state))
+/* A _Generic the facts cannot read: a macro writes its association list, so the text of the
+ * selection cannot be read as a table of types, and both associations have the type of the whole
+ * (struct common *), so the type of the selection names neither. Which struct the read names is
+ * unknown, and the access is kept with its reason instead of being held. */
+#define RING_OR_OTHER struct ring *: &r->ns, struct other *: (struct common *)0
 
 long active_ring(struct ring *r)
 {
-	return ring_active(r);
+	return _Generic((r), RING_OR_OTHER)->state;
 }
