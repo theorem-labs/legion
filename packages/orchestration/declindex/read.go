@@ -4,13 +4,14 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"maps"
 	"slices"
 )
 
 // The reads that graph checks make of an index: a candidate's declarations, uses and imports against the built
-// base's. Each takes a list of keys and gives every row that matches one of them, sorted, so that a caller needs no
-// SQL of its own.
+// base's, and the compiled constants of either. Each takes a list of keys and gives every row that matches one of
+// them, sorted, so that a caller needs no SQL of its own.
 
 // Commit is the commit whose build the index describes (meta "commit").
 func (s *Store) Commit(ctx context.Context) (string, error) {
@@ -116,6 +117,44 @@ func (s *Store) Imports(ctx context.Context) (map[string][]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return out, nil
+}
+
+// ConstantsIn gives the compiled constants of the modules as the index's compiled part holds them: what the
+// exporter gave (Constant), without Atoms, Facts and Truncated, sorted by module and name. A module that a graph
+// check compiles itself gives the same rows from Exporter.Run with Manifest.Types. The rows are of the index's commit
+// only when CompiledCommit(ctx, true) accepts the index; else a module has none, or another commit's.
+func (s *Store) ConstantsIn(ctx context.Context, modules []string) ([]Constant, error) {
+	return s.constantsWhere(ctx, "module", modules)
+}
+
+// ConstantsConcluding gives the compiled constants whose Conclusion is one of heads, as ConstantsIn does: the
+// declarations that produce a head (an instance of a class, a theorem that concludes a proposition).
+func (s *Store) ConstantsConcluding(ctx context.Context, heads []string) ([]Constant, error) {
+	return s.constantsWhere(ctx, "conclusion", heads)
+}
+
+// constantsWhere gives the constants whose column (a consts column this file names) is one of values, sorted by
+// module and name.
+func (s *Store) constantsWhere(ctx context.Context, column string, values []string) ([]Constant, error) {
+	var out []Constant
+	err := eachRowIn(ctx, s.q, `SELECT name, module, kind, type, cstmt, binders, conclusion FROM consts WHERE `+column+` IN`,
+		distinct(values), func(r *sql.Rows) error {
+			var c Constant
+			var binders string
+			if err := r.Scan(&c.Name, &c.Module, &c.Kind, &c.Type, &c.Hash, &binders, &c.Conclusion); err != nil {
+				return err
+			}
+			if err := json.Unmarshal([]byte(binders), &c.Binders); err != nil {
+				return err
+			}
+			out = append(out, c)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(out, func(a, b Constant) int { return cmp.Or(cmp.Compare(a.Module, b.Module), cmp.Compare(a.Name, b.Name)) })
 	return out, nil
 }
 

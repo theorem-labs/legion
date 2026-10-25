@@ -165,7 +165,7 @@ func TestAModuleThatBecomesUnreadableLeavesNoCompiledRows(t *testing.T) {
 		t.Fatalf("first refresh: %+v, %v", st, err)
 	}
 	for _, q := range []string{
-		`INSERT INTO consts (name, module, kind, type, cstmt) VALUES ('M.x', 'M', 'def', 'Nat', 'h')`,
+		`INSERT INTO consts (name, module, kind, type, cstmt, binders, conclusion) VALUES ('M.x', 'M', 'def', 'Nat', 'h', '[]', 'Nat')`,
 		`INSERT INTO without_forms (module, name, declarer, forms) VALUES ('M', 'dup', 'A', 0), ('M', 'dup', 'B', 1)`,
 	} {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
