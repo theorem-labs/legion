@@ -1,0 +1,95 @@
+package conceptgate
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// A proposal is a Lean module of declarations. Compiling it must run no code of the proposal's: Lean runs `#eval`,
+// `run_cmd` and their kind, `initialize` and `[init]` declarations, macros and elaborators the module defines,
+// and `native_decide`, all as the gate's user. checkProposalSource refuses a module that contains any of them,
+// outside comments and strings. It reads the text, not the elaboration: code that the project itself defines
+// (its own elaborators and tactics) runs as it does in the project's build.
+
+// runningCommands are the commands and tactics that run code at compile time, refused unless used as a name in an
+// ascription (`(prefix : Nat)`, a field `prefix : Nat`).
+var runningCommands = []string{"run_cmd", "run_meta", "run_elab", "run_tac", "initialize", "builtin_initialize",
+	"macro", "macro_rules", "elab", "elab_rules", "syntax", "declare_syntax_cat", "notation", "infix", "infixl",
+	"infixr", "prefix", "postfix", "unsafe", "native_decide", "implemented_by", "extern"}
+
+var (
+	hashCommand   = regexp.MustCompile(`#[A-Za-z_]`)
+	runningWord   = regexp.MustCompile(`(?:^|[^\w.'])(` + strings.Join(runningCommands, "|") + `)\b`)
+	ascription    = regexp.MustCompile(`^\s+:`)
+	attributeList = regexp.MustCompile(`(?:@\[|\battribute\s*\[)([^\]]*)\]`)
+	runningAttr   = regexp.MustCompile(`\b(init|builtin_init|export|extern|implemented_by|command_elab|term_elab|tactic|macro|env_extension|builtin_\w+|register_\w+)\b`)
+)
+
+// leanCode drops comments (docstrings included) and the contents of string literals.
+func leanCode(s string) string {
+	var out strings.Builder
+	n := len(s)
+	for i := 0; i < n; {
+		switch {
+		case strings.HasPrefix(s[i:], "--"):
+			j := strings.IndexByte(s[i:], '\n')
+			if j < 0 {
+				i = n
+			} else {
+				i += j
+			}
+		case strings.HasPrefix(s[i:], "/-"):
+			d := 1
+			i += 2
+			for i < n && d > 0 {
+				switch {
+				case strings.HasPrefix(s[i:], "/-"):
+					d++
+					i += 2
+				case strings.HasPrefix(s[i:], "-/"):
+					d--
+					i += 2
+				default:
+					i++
+				}
+			}
+			out.WriteByte(' ')
+		case s[i] == '"':
+			i++
+			for i < n && s[i] != '"' {
+				if s[i] == '\\' {
+					i++
+				}
+				i++
+			}
+			i++
+			out.WriteString(`""`)
+		default:
+			out.WriteByte(s[i])
+			i++
+		}
+	}
+	return out.String()
+}
+
+// checkProposalSource refuses a proposal that would run code while it is compiled.
+func checkProposalSource(src string) error {
+	code := leanCode(src)
+	if m := hashCommand.FindString(code); m != "" {
+		return fmt.Errorf("the proposal holds a %q command: a proposal is declarations only", m+"…")
+	}
+	for _, loc := range runningWord.FindAllStringSubmatchIndex(code, -1) {
+		word := code[loc[2]:loc[3]]
+		if ascription.MatchString(code[loc[3]:]) {
+			continue
+		}
+		return fmt.Errorf("the proposal uses %q, which runs code at compile time: a proposal is declarations only", word)
+	}
+	for _, m := range attributeList.FindAllStringSubmatch(code, -1) {
+		if a := runningAttr.FindString(m[1]); a != "" {
+			return fmt.Errorf("the proposal uses the attribute %q, which runs or exports code: a proposal is declarations only", a)
+		}
+	}
+	return nil
+}
