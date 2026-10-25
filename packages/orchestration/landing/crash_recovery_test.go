@@ -233,9 +233,10 @@ func runAndPublishUntilCrash(runner Runner, input Input) (crashed bool) {
 func TestPublishRecoveryAtEveryCrashBoundaryLandsTheSurvivorOnce(t *testing.T) {
 	for _, scenario := range recoveryScenarios() {
 		t.Run(scenario.name, func(t *testing.T) {
-			runner, _ := scenario.runner()
+			runner, ledger := scenario.runner()
 			counter := &crashStore{}
 			runner.Store = counter
+			runner.Admission = &batchLedgerFake{ledger: ledger, store: counter}
 			runner.GitHub = &mergingGitHub{}
 			if runAndPublishUntilCrash(runner, recoveryInput()) {
 				t.Fatal("uninterrupted run crashed")
@@ -245,6 +246,7 @@ func TestPublishRecoveryAtEveryCrashBoundaryLandsTheSurvivorOnce(t *testing.T) {
 					runner, ledger := scenario.runner()
 					store := &crashStore{crashAt: crashAt}
 					runner.Store = store
+					runner.Admission = &batchLedgerFake{ledger: ledger, store: store}
 					github := &mergingGitHub{}
 					runner.GitHub = github
 					if !runAndPublishUntilCrash(runner, recoveryInput()) {

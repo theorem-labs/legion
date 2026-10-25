@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/sjawhar/legion/orchestration/landing/blame"
 	"github.com/sjawhar/legion/orchestration/landing/gitx"
@@ -187,9 +188,9 @@ type Operation struct {
 // candidate, each member's current hashes and ledger decision, the repository
 // checks and the receipt) is stored with the key it was derived at, and it is
 // recomputed before the next side effect whenever that key differs from the
-// batch's current key. A batch that GitHub merged (MergeValidated) is the one
-// exception: it completes under the receipt, and so the policy, that the merge
-// validated, whatever policy the runner has later.
+// batch's current key. A batch that the ledger admitted is the one exception:
+// it is in the merge queue, so it completes under the receipt, and so the
+// policy, that its admission checked, whatever policy the runner has later.
 type Batch struct {
 	// SchemaVersion is the version of this record's shape, which the ledger stores as the program sends it.
 	SchemaVersion int `json:"schema_version"`
@@ -198,9 +199,20 @@ type Batch struct {
 	RecordVersion int64 `json:"record_version,omitempty"`
 	// Successor is the batch that the members of a declined batch go to next.
 	Successor string `json:"successor,omitempty"`
+	// EscalateTo is the owner that the ledger escalates a landed_unrecorded batch to.
+	EscalateTo string `json:"escalate_to,omitempty"`
+	// PublishAttempts counts the failed enqueues and waits of an admitted batch.
+	PublishAttempts int `json:"publish_attempts,omitempty"`
+	// Withdraw is the publishing step whose failures started the batch's withdraw, and empty while none is started.
+	Withdraw string `json:"withdraw,omitempty"`
 	// Admission is the ledger's admission of this batch, which the store fills on every read. It is the ledger's
 	// column, not part of the record.
-	Admission         string               `json:"-"`
+	Admission string `json:"-"`
+	// PostLandEffects are the effects that the landing records as intents in its own transaction.
+	PostLandEffects []PostLandEffect `json:"post_land_effects,omitempty"`
+	// PendingEffects are the keys of this batch's effects still to do, which the store fills on every read from the
+	// ledger's own rows.
+	PendingEffects    []string             `json:"-"`
 	ID                string               `json:"id"`
 	Repository        string               `json:"repository"`
 	Base              string               `json:"base"`
@@ -211,8 +223,6 @@ type Batch struct {
 	InitialCandidate  gitx.Result          `json:"initialCandidate"`
 	FrozenMembers     []Member             `json:"frozenMembers"`
 	ActiveMembers     []Member             `json:"activeMembers"`
-	LandedMembers     []Member             `json:"landedMembers"`
-	NotifiedMembers   []string             `json:"notifiedMembers"`
 	Dropped           []DroppedMember      `json:"dropped"`
 	Operations        map[string]Operation `json:"operations"`
 	State             State                `json:"state"`
@@ -221,9 +231,7 @@ type Batch struct {
 	CheckPolicyDigest string               `json:"checkPolicyDigest"`
 	Checks            []CheckVerdict       `json:"checks"`
 	ChecksKey         string               `json:"checksKey"`
-	Score             CheckVerdict         `json:"score"`
 	PullRequest       PullRequest          `json:"pullRequest"`
-	MergeValidated    bool                 `json:"mergeValidated"`
 	Receipt           *Receipt             `json:"receipt"`
 }
 
@@ -308,7 +316,14 @@ type Runner struct {
 	MaxRounds    int
 	InfraRetries int
 	ConfigDigest string
-	Toolchain    func(context.Context, Tree) (string, error)
+	// PublishingRetryLimit is the number of failed enqueues and waits after which an admitted batch is withdrawn.
+	PublishingRetryLimit int
+	// PublishingBackoff is the first pause after a failed publishing step, doubled after each failure. Zero is 30
+	// seconds.
+	PublishingBackoff time.Duration
+	// EscalationsOwner is the owner that a landed_unrecorded batch is escalated to.
+	EscalationsOwner string
+	Toolchain        func(context.Context, Tree) (string, error)
 }
 
 // Run freezes one batch and advances it until it is green or failed.
@@ -1118,8 +1133,8 @@ func (s *MemoryStore) has(id string) bool {
 func cloneBatch(batch Batch) Batch {
 	batch.FrozenMembers = cloneMembers(batch.FrozenMembers)
 	batch.ActiveMembers = cloneMembers(batch.ActiveMembers)
-	batch.LandedMembers = cloneMembers(batch.LandedMembers)
-	batch.NotifiedMembers = append([]string(nil), batch.NotifiedMembers...)
+	batch.PostLandEffects = append([]PostLandEffect(nil), batch.PostLandEffects...)
+	batch.PendingEffects = append([]string(nil), batch.PendingEffects...)
 	batch.Dropped = append([]DroppedMember(nil), batch.Dropped...)
 	batch.Candidate.Dropped = append([]gitx.Drop(nil), batch.Candidate.Dropped...)
 	batch.InitialCandidate.Dropped = append([]gitx.Drop(nil), batch.InitialCandidate.Dropped...)

@@ -134,6 +134,19 @@ func (l *Ledger) EndWithdraw(ctx context.Context, repo, batch string) error {
 	return nil
 }
 
+// EffectDone records a post-landing effect done with result. A repeat finds it done and succeeds.
+func (l *Ledger) EffectDone(ctx context.Context, repo, batch, key string, result []byte) error {
+	_, err := l.ledger.BatchEffectDone(ctx, repo, batch, key, ledger.DoneRequest{Result: result})
+	var refused *ledger.Refusal
+	if errors.As(err, &refused) && refused.Reason == ledger.ReasonEffectDone {
+		return nil
+	}
+	if err != nil {
+		return refusal(err)
+	}
+	return nil
+}
+
 // ReadyMembers lists the repository's ready migrations, in the order their ready records were published, each as the
 // member a batch freezes from it.
 func (l *Ledger) ReadyMembers(ctx context.Context, repo string) ([]landing.Member, error) {
@@ -160,6 +173,7 @@ func apply(batch *landing.Batch, stored ledger.Batch) {
 	batch.SchemaVersion = landing.BatchSchemaVersion
 	batch.RecordVersion = stored.RecordVersion
 	batch.Admission = stored.Admission
+	batch.PendingEffects = stored.PendingEffects
 }
 
 // refusal turns a ledger refusal into the landing program's, which the runner routes by its outcome, and leaves

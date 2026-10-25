@@ -8,29 +8,42 @@ import (
 	"github.com/sjawhar/legion/orchestration/landing/blame"
 )
 
+// A transport error from the landing leaves the batch admitted in Publishing with GitHub's merge recorded, and a
+// later round lands it once.
 func TestReviewMergedBatchRemainsReconciliableAfterLedgerFailure(t *testing.T) {
-	ledger := &flakyLedger{failLand: true}
+	ledger := &ledgerFake{}
+	admission := &batchLedgerFake{ledger: ledger, landErr: errors.New("connection reset")}
 	store := &MemoryStore{}
 	runner := Runner{
-		Store:   store,
-		Ledger:  ledger,
-		Builder: &builderFake{},
-		Hasher:  hasherFake{},
-		Git:     newGitFake(),
-		GitHub:  &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+		Store:     store,
+		Ledger:    ledger,
+		Admission: admission,
+		Builder:   &builderFake{},
+		Hasher:    hasherFake{},
+		Git:       newGitFake(),
+		GitHub:    &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+	}
+	batch := greenBatch()
+	if _, err := store.Create(context.Background(), &batch); err != nil {
+		t.Fatal(err)
 	}
 
-	batch, err := runner.Publish(context.Background(), greenBatch())
+	batch, err := runner.Publish(context.Background(), batch)
 	if err == nil {
-		t.Fatal("Publish() error = nil, want transient ledger failure")
+		t.Fatal("Publish() error = nil, want the transport failure")
 	}
-	if got, want := batch.State, Publishing; got != want {
-		t.Fatalf("state = %q, want %q", got, want)
+	if batch.State != Publishing || batch.Admission != Admitted {
+		t.Fatalf("batch = %q/%q, want admitted in publishing", batch.State, batch.Admission)
 	}
 	if got, want := batch.PullRequest.MergedCommit, "merged"; got != want {
 		t.Fatalf("merged observation = %q, want %q", got, want)
 	}
-	ledger.failLand = false
+	stored, _, _ := store.Load(context.Background(), batch.ID)
+	stored.Admission = Admitted
+	if err := store.Save(context.Background(), &stored); err != nil {
+		t.Fatal(err)
+	}
+	admission.landErr = nil
 
 	resumed, err := runner.Reconcile(context.Background())
 	if err != nil {
@@ -39,36 +52,29 @@ func TestReviewMergedBatchRemainsReconciliableAfterLedgerFailure(t *testing.T) {
 	if got, want := resumed[0].State, Landed; got != want {
 		t.Fatalf("reconciled state = %q, want %q", got, want)
 	}
-	if got, want := ledger.landCalls, 2; got != want {
-		t.Fatalf("land calls = %d, want retry after pending operation", got)
+	if !sameStrings(ledger.landed, []string{"one"}) || len(admission.landings) != 1 {
+		t.Fatalf("lands = %v (%d landing calls), want one", ledger.landed, len(admission.landings))
 	}
 }
 
-func TestReviewReconcileKeepsRetryablePublishingBatch(t *testing.T) {
-	ledger := &flakyLedger{failLand: true}
-	store := &MemoryStore{}
+// A ledger refusal of the landing ends the batch LandedUnrecorded with the escalations owner, and the runner stops
+// retrying it.
+func TestReviewLandingRefusalIsLandedUnrecorded(t *testing.T) {
+	ledger := &ledgerFake{}
+	admission := &batchLedgerFake{ledger: ledger, landErr: &Refusal{Reason: "stale_batch", Message: "moved"}}
 	runner := Runner{
-		Store:   store,
-		Ledger:  ledger,
-		Builder: &builderFake{},
-		Hasher:  hasherFake{},
-		Git:     newGitFake(),
-		GitHub:  &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+		Store:            &MemoryStore{},
+		Ledger:           ledger,
+		Admission:        admission,
+		GitHub:           &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+		EscalationsOwner: "landing-operator",
 	}
-	batch := greenBatch()
-	batch.State = Publishing
-	batch.PullRequest = PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}
-	batch.MergeValidated = true
-	if err := store.Save(context.Background(), &batch); err != nil {
-		t.Fatal(err)
-	}
-
-	resumed, err := runner.Reconcile(context.Background())
+	batch, err := runner.Publish(context.Background(), greenBatch())
 	if err != nil {
-		t.Fatalf("Reconcile() error = %v, want retryable publishing result", err)
+		t.Fatalf("Publish() error = %v", err)
 	}
-	if got, want := resumed[0].State, Publishing; got != want {
-		t.Fatalf("state = %q, want %q", got, want)
+	if batch.State != LandedUnrecorded || batch.EscalateTo != "landing-operator" || len(ledger.landed) != 0 {
+		t.Fatalf("batch = %q escalated to %q, lands %v; want landed_unrecorded for the operator", batch.State, batch.EscalateTo, ledger.landed)
 	}
 }
 

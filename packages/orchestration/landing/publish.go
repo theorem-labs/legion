@@ -2,8 +2,10 @@ package landing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // PullRequestState is GitHub's final or in-progress view of a pull request.
@@ -25,13 +27,18 @@ type PullRequest struct {
 	Reason       string
 }
 
-// GitHub is the small merge-queue surface the publisher needs.
+// GitHub is the merge-queue surface the publisher needs.
 type GitHub interface {
 	Push(context.Context, string, string, string) error
 	FindPullRequest(context.Context, string, string) (PullRequest, bool, error)
 	Open(context.Context, string, string, string, string) (PullRequest, error)
 	Enqueue(context.Context, string, int) error
 	Wait(context.Context, string, int, string) (PullRequest, error)
+	// Withdraw takes the pull request out of the merge queue and closes it. A pull request that is already closed
+	// or merged is left as it is.
+	Withdraw(context.Context, string, int) error
+	// Read reads the pull request once, without waiting for an outcome.
+	Read(context.Context, string, int) (PullRequest, error)
 }
 
 // Scorer records the configured post-merge score and commits its output through
@@ -53,18 +60,36 @@ type EventPublisher interface {
 	Publish(context.Context, LandingEvent) error
 }
 
-// Publish puts a green candidate through the merge queue and records its members
-// only after GitHub confirms that exact head merged. Until its pull request is
-// recorded, a batch whose derived values are not at the current key (a new
-// checking policy) is advanced again before anything is pushed. Once the pull
-// request is recorded, the batch has been published to the merge queue, which
-// may merge it at any moment, so it waits for the queue's outcome: failing it
-// would leave the queued pull request to merge without a ledger record. A merged
-// batch completes under the receipt, and so the policy, that its merge
-// validated.
+// StopError stops the runner with the batch left for an operator: the ledger refused a batch call with a reason the
+// runner has no rule for.
+type StopError struct {
+	Batch  string
+	Reason string
+	Cause  error
+}
+
+func (e *StopError) Error() string {
+	return fmt.Sprintf("batch %q stopped (%s): %v", e.Batch, e.Reason, e.Cause)
+}
+
+func (e *StopError) Unwrap() error { return e.Cause }
+
+// ErrEffectsPending says that a landed batch has a post-landing effect still to do; a later round finishes it.
+var ErrEffectsPending = errors.New("post-landing effects are still to do")
+
+// Publish puts a green candidate through the merge queue under the ledger's admission. Before its pull request is
+// enqueued, a batch whose derived values are not at the current key (a new checking policy) is advanced again. The
+// push, the find and the open come first; a failure in any of them is Failed, with nothing admitted. Then the ledger
+// admits the batch, which fences everything its members' checks read, and only then is the pull request enqueued.
+// From admission on, the batch ends only through LandBatch, DeclineBatch or LandedUnrecorded, also after a restart:
+// an enqueue or wait that fails is retried up to the limit and then withdrawn; GitHub's merge of the candidate lands
+// the batch; a merge of anything else is LandedUnrecorded; a pull request closed or removed unmerged declines it.
 func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
-	if r.Store == nil || r.Ledger == nil || r.GitHub == nil {
-		return Batch{}, fmt.Errorf("store, ledger, and GitHub are required to publish")
+	if r.Store == nil || r.Admission == nil || r.GitHub == nil {
+		return Batch{}, fmt.Errorf("store, batch ledger, and GitHub are required to publish")
+	}
+	if batch.State.terminal() {
+		return batch, nil
 	}
 	if batch.State != Green && batch.State != Publishing {
 		return Batch{}, fmt.Errorf("batch %q is %q, not publishable", batch.ID, batch.State)
@@ -75,10 +100,10 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 	if batch.BaseBranch == "" {
 		return Batch{}, fmt.Errorf("batch %q has no base branch", batch.ID)
 	}
-	if batch.MergeValidated {
-		return r.completeMerged(ctx, &batch)
+	if batch.Admission == Admitted {
+		return r.publishAdmitted(ctx, &batch)
 	}
-	if batch.PullRequest.Number == 0 && !r.fresh(batch) {
+	if !r.fresh(batch) {
 		if err := r.valid(); err != nil {
 			return Batch{}, err
 		}
@@ -114,177 +139,254 @@ func (r Runner) Publish(ctx context.Context, batch Batch) (Batch, error) {
 		}
 	}
 	batch.PullRequest = pull
-	if err := r.Store.Save(ctx, &batch); err != nil {
-		return Batch{}, fmt.Errorf("record pull request: %w", err)
+	batch.EscalateTo = r.EscalationsOwner
+	if err := r.Admission.Admit(ctx, &batch, admissionMembers(batch.ActiveMembers)); err != nil {
+		return r.admissionRefused(ctx, &batch, err)
 	}
-	if err := r.GitHub.Enqueue(ctx, batch.Repository, pull.Number); err != nil {
-		return r.fail(ctx, &batch, "github: enqueue")
-	}
-	pull, err = r.GitHub.Wait(ctx, batch.Repository, pull.Number, batch.Candidate.Commit)
-	if err != nil {
-		return r.fail(ctx, &batch, "github: wait")
-	}
-	return r.recordMerge(ctx, &batch, pull)
+	return r.publishAdmitted(ctx, &batch)
 }
 
-// recordMerge records GitHub's final view of the batch's pull request. Only a
-// merge of the exact candidate commit validates the batch and completes it.
+// admissionRefused routes a refused admission, which recorded nothing, by its outcome: a member refusal drops the
+// member it names; a batch conflict drops and declines nothing and continues from the stored batch; any other
+// refusal stops the runner and leaves the batch for an operator.
+func (r Runner) admissionRefused(ctx context.Context, batch *Batch, err error) (Batch, error) {
+	var refusal *Refusal
+	if !errors.As(err, &refusal) {
+		return *batch, fmt.Errorf("admit batch %q: %w", batch.ID, err)
+	}
+	switch {
+	case refusal.MemberRefusal():
+		if err := r.dropMembers(ctx, batch, map[string]string{
+			refusal.Member: droppedReason(refusal.Reason, refusal.Violations),
+		}); err != nil && !r.reloaded(ctx, batch, err) {
+			return *batch, err
+		}
+		return *batch, nil
+	case refusal.BatchConflict():
+		if loaded, found, loadErr := r.Store.Load(ctx, batch.ID); loadErr != nil {
+			return *batch, fmt.Errorf("reload batch %q: %w", batch.ID, loadErr)
+		} else if found {
+			*batch = loaded
+		}
+		return *batch, nil
+	default:
+		return *batch, &StopError{Batch: batch.ID, Reason: "unclassified_refusal", Cause: err}
+	}
+}
+
+// publishAdmitted takes an admitted batch to its end from its durable state. A withdraw that was started is
+// finished first; then the pull request is enqueued and awaited, with each failure counted in the batch, until the
+// limit starts a withdraw.
+func (r Runner) publishAdmitted(ctx context.Context, batch *Batch) (Batch, error) {
+	if batch.Withdraw != "" {
+		return r.withdraw(ctx, batch)
+	}
+	number := batch.PullRequest.Number
+	if err := r.GitHub.Enqueue(ctx, batch.Repository, number); err != nil {
+		return r.publishFailed(ctx, batch, "github: enqueue", err)
+	}
+	pull, err := r.GitHub.Wait(ctx, batch.Repository, number, batch.Candidate.Commit)
+	if err != nil {
+		return r.publishFailed(ctx, batch, "github: wait", err)
+	}
+	return r.recordMerge(ctx, batch, pull)
+}
+
+// publishFailed counts a failed enqueue or wait. Below the limit the batch stays admitted in Publishing, and a later
+// round tries again after the backoff; at the limit the runner withdraws the pull request.
+func (r Runner) publishFailed(ctx context.Context, batch *Batch, step string, cause error) (Batch, error) {
+	batch.PublishAttempts++
+	if batch.PublishAttempts >= r.publishingRetryLimit() {
+		batch.Withdraw = step
+		if err := r.Store.Save(ctx, batch); err != nil {
+			return *batch, fmt.Errorf("record withdraw of %q: %w", batch.ID, err)
+		}
+		return r.withdraw(ctx, batch)
+	}
+	batch.Reason = step
+	if err := r.Store.Save(ctx, batch); err != nil {
+		return *batch, fmt.Errorf("record %s failure: %w", step, err)
+	}
+	r.pause(ctx, batch.PublishAttempts)
+	return *batch, fmt.Errorf("%s: %w", step, cause)
+}
+
+// withdraw records the withdraw effect, takes the pull request out of the queue and closes it, records the effect
+// done and reads the pull request again. A merge during the withdraw lands the batch; a closed, unmerged pull request
+// declines it with no returns. While GitHub cannot be reached, the batch stays admitted and the withdraw is retried:
+// it never declines while the pull request could still merge.
+func (r Runner) withdraw(ctx context.Context, batch *Batch) (Batch, error) {
+	number := batch.PullRequest.Number
+	if err := r.Admission.BeginWithdraw(ctx, batch.Repository, batch.ID); err != nil {
+		return *batch, fmt.Errorf("begin withdraw of %q: %w", batch.ID, err)
+	}
+	if err := r.GitHub.Withdraw(ctx, batch.Repository, number); err != nil {
+		return *batch, fmt.Errorf("withdraw %q: %w", batch.ID, err)
+	}
+	pull, err := r.GitHub.Read(ctx, batch.Repository, number)
+	if err != nil {
+		return *batch, fmt.Errorf("read withdrawn %q: %w", batch.ID, err)
+	}
+	if pull.State == PullRequestOpen {
+		return *batch, fmt.Errorf("withdraw %q: the pull request is still open", batch.ID)
+	}
+	if err := r.Admission.EndWithdraw(ctx, batch.Repository, batch.ID); err != nil {
+		return *batch, fmt.Errorf("end withdraw of %q: %w", batch.ID, err)
+	}
+	if pull.State == PullRequestMerged {
+		return r.recordMerge(ctx, batch, pull)
+	}
+	return r.decline(ctx, batch, "publish_failed: "+batch.Withdraw)
+}
+
+// recordMerge ends an admitted batch from GitHub's final view of its pull request. Only a merge of the exact candidate
+// commit with a merged commit lands it. A merge of anything else is on the base branch and cannot be declined, so it
+// is LandedUnrecorded. A pull request closed or removed unmerged declines the batch with no returns.
 func (r Runner) recordMerge(ctx context.Context, batch *Batch, pull PullRequest) (Batch, error) {
 	batch.PullRequest = pull
-	batch.MergeValidated = pull.State == PullRequestMerged && pull.Head == batch.Candidate.Commit && pull.MergedCommit != ""
-	if err := r.Store.Save(ctx, batch); err != nil {
-		return Batch{}, fmt.Errorf("record merged pull request: %w", err)
+	switch {
+	case pull.State == PullRequestMerged && pull.MergedCommit == "":
+		return r.landedUnrecorded(ctx, batch, "github: merged commit unavailable")
+	case pull.State == PullRequestMerged && pull.Head != batch.Candidate.Commit:
+		return r.landedUnrecorded(ctx, batch, "github: merged unexpected head")
+	case pull.State == PullRequestMerged:
+		return r.land(ctx, batch)
 	}
-	if !batch.MergeValidated {
-		reason := strings.TrimSpace(pull.Reason)
-		if reason == "" {
-			reason = string(pull.State)
-		}
-		if pull.State == PullRequestMerged && pull.MergedCommit == "" {
-			reason = "merged commit unavailable"
-		}
-		if pull.State == PullRequestMerged && pull.Head != batch.Candidate.Commit {
-			reason = "merged unexpected head"
-		}
-		return r.fail(ctx, batch, "github: "+reason)
+	reason := strings.TrimSpace(pull.Reason)
+	if reason == "" {
+		reason = string(pull.State)
 	}
-	return r.completeMerged(ctx, batch)
+	return r.decline(ctx, batch, reason)
 }
 
-// completeMerged records a merged batch's members, score and events. It never
-// rechecks: the merge is irreversible, and the receipt holds the key, and so the
-// policy, that validated it.
-func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error) {
-	mergedCommit := batch.PullRequest.MergedCommit
-	for _, member := range batch.ActiveMembers {
-		if contains(batchMemberNames(batch.LandedMembers), member.Migration) {
-			continue
+// decline ends the admission with no member blamed: every member goes to the successor.
+func (r Runner) decline(ctx context.Context, batch *Batch, reason string) (Batch, error) {
+	if err := r.declineBatch(ctx, batch, reason, nil, nil); err != nil {
+		if r.reloaded(ctx, batch, err) {
+			return *batch, nil
 		}
-		if member.LedgerKey != batch.Receipt.Key || member.HashesKey != batch.Receipt.Key {
-			return r.retryable(ctx, batch, "ledger decision stale", fmt.Errorf("member %q was checked at key %q, the receipt is at %q", member.Migration, member.LedgerKey, batch.Receipt.Key))
-		}
-		request := LandRequest{
-			Repo:             batch.Repository,
-			Migration:        member.Migration,
-			Generation:       member.Generation,
-			Commit:           mergedCommit,
-			ChangedPaths:     append([]string(nil), member.Changed...),
-			Current:          cloneHashes(member.CurrentHashes),
-			ChangedContracts: cloneHashes(member.ChangedContracts),
-			ApprovedPinned:   append([]string(nil), member.ApprovedPinned...),
-		}
-		key := "land/" + member.Migration
-		operation, found := batch.operation(key)
-		if !found {
-			operation = Operation{Key: key, Kind: "land", Batch: batch.ID, Repository: batch.Repository, Member: member.Migration, Generation: member.Generation, Commit: mergedCommit}
-			batch.startOperation(operation)
-			if err := r.Store.Save(ctx, batch); err != nil {
-				return Batch{}, fmt.Errorf("record land intent for %q: %w", member.Migration, err)
-			}
-		}
-		if operation.State != OperationComplete {
-			state, landedCommit, err := r.Ledger.MigrationState(ctx, batch.Repository, member.Migration)
-			if err != nil {
-				return r.retryable(ctx, batch, "ledger migration state", err)
-			}
-			if state == "landed" {
-				if landedCommit != mergedCommit {
-					return r.retryable(ctx, batch, "ledger landed commit mismatch", fmt.Errorf("migration %q landed at %q, want %q", member.Migration, landedCommit, mergedCommit))
-				}
-				batch.completeOperation(key)
-				if err := r.Store.Save(ctx, batch); err != nil {
-					return Batch{}, fmt.Errorf("record observed land %q: %w", member.Migration, err)
-				}
-			} else {
-				if err := r.Ledger.Land(ctx, request); err != nil {
-					return r.retryable(ctx, batch, "ledger: land", err)
-				}
-				batch.completeOperation(key)
-				if err := r.Store.Save(ctx, batch); err != nil {
-					return Batch{}, fmt.Errorf("record landed operation %q: %w", member.Migration, err)
-				}
-			}
-		}
-		batch.LandedMembers = append(batch.LandedMembers, member)
-		if err := r.Store.Save(ctx, batch); err != nil {
-			return Batch{}, fmt.Errorf("record landed member %q: %w", member.Migration, err)
-		}
-	}
-	if r.Score != nil && batch.Score.Verdict != "pass" {
-		key := "score"
-		operation, found := batch.operation(key)
-		if !found {
-			operation = Operation{Key: key, Kind: "score", Batch: batch.ID, Repository: batch.Repository, Commit: mergedCommit}
-			batch.startOperation(operation)
-			if err := r.Store.Save(ctx, batch); err != nil {
-				return Batch{}, fmt.Errorf("record score intent: %w", err)
-			}
-		}
-		done, err := operationComplete(ctx, r.Score, operation)
-		if err != nil {
-			batch.Score = CheckVerdict{Name: "score", Verdict: "unable", Reason: err.Error()}
-			return r.retryable(ctx, batch, "score operation status", err)
-		}
-		if !done {
-			output, err := r.Score.Score(ctx, mergedCommit, batch.ID)
-			if err != nil {
-				batch.Score = CheckVerdict{Name: "score", Verdict: "unable", Reason: err.Error()}
-				return r.retryable(ctx, batch, "score", err)
-			}
-			if err := r.Score.Commit(ctx, batch.Repository, mergedCommit, r.ScorePath, output); err != nil {
-				batch.Score = CheckVerdict{Name: "score", Verdict: "unable", Reason: err.Error()}
-				return r.retryable(ctx, batch, "score commit", err)
-			}
-		}
-		batch.completeOperation(key)
-		batch.Score = CheckVerdict{Name: "score", Verdict: "pass"}
-		if err := r.Store.Save(ctx, batch); err != nil {
-			return Batch{}, fmt.Errorf("record score: %w", err)
-		}
-	}
-	if r.Events != nil {
-		for _, member := range batch.ActiveMembers {
-			if contains(batch.NotifiedMembers, member.Migration) {
-				continue
-			}
-			key := "event/" + member.Migration
-			operation, found := batch.operation(key)
-			if !found {
-				operation = Operation{Key: key, Kind: "event", Batch: batch.ID, Repository: batch.Repository, Member: member.Migration, Generation: member.Generation, Commit: mergedCommit}
-				batch.startOperation(operation)
-				if err := r.Store.Save(ctx, batch); err != nil {
-					return Batch{}, fmt.Errorf("record event intent for %q: %w", member.Migration, err)
-				}
-			}
-			done, err := operationComplete(ctx, r.Events, operation)
-			if err != nil {
-				return r.retryable(ctx, batch, "event operation status", err)
-			}
-			if !done {
-				if err := r.Events.Publish(ctx, LandingEvent{Batch: batch.ID, Member: member.Migration, Commit: mergedCommit}); err != nil {
-					return r.retryable(ctx, batch, "event", err)
-				}
-			}
-			batch.completeOperation(key)
-			batch.NotifiedMembers = append(batch.NotifiedMembers, member.Migration)
-			if err := r.Store.Save(ctx, batch); err != nil {
-				return Batch{}, fmt.Errorf("record member event %q: %w", member.Migration, err)
-			}
-		}
-	}
-	if err := r.transition(ctx, batch, Landed, ""); err != nil {
-		return Batch{}, err
+		return *batch, err
 	}
 	return *batch, nil
 }
 
-func (r Runner) retryable(ctx context.Context, batch *Batch, reason string, cause error) (Batch, error) {
-	batch.State = Publishing
-	batch.Reason = reason
-	if err := r.Store.Save(ctx, batch); err != nil {
-		return Batch{}, fmt.Errorf("record retryable %s: %w", reason, err)
+// land lands every member at GitHub's merged commit in one ledger transaction, which also records each
+// post-landing effect as an intent, and then finishes those effects. A transport error leaves the batch admitted for
+// a later round; a ledger refusal is LandedUnrecorded with that refusal, and the runner stops retrying.
+func (r Runner) land(ctx context.Context, batch *Batch) (Batch, error) {
+	record := cloneBatch(*batch)
+	record.State, record.Reason = Landed, ""
+	record.PostLandEffects = r.postLandEffects(record)
+	if err := r.Admission.LandBatch(ctx, &record, batch.PullRequest.MergedCommit); err != nil {
+		var refusal *Refusal
+		if errors.As(err, &refusal) {
+			return r.landedUnrecorded(ctx, batch, "ledger: "+refusal.Error())
+		}
+		return *batch, fmt.Errorf("land batch %q: %w", batch.ID, err)
 	}
-	return *batch, fmt.Errorf("%s: %w", reason, cause)
+	*batch = record
+	if err := r.finishEffects(ctx, batch); err != nil {
+		return *batch, err
+	}
+	return *batch, nil
+}
+
+// landedUnrecorded ends a batch that GitHub merged and the ledger did not land. The ledger escalates it to the
+// escalations owner in the same transaction, and the fence stays until an operator resolves it.
+func (r Runner) landedUnrecorded(ctx context.Context, batch *Batch, reason string) (Batch, error) {
+	batch.EscalateTo = r.EscalationsOwner
+	if err := r.transition(ctx, batch, LandedUnrecorded, reason); err != nil {
+		return *batch, err
+	}
+	return *batch, nil
+}
+
+// postLandEffects are the effects of a landing: the score, when one is configured, and one event per member, when
+// events are published.
+func (r Runner) postLandEffects(batch Batch) []PostLandEffect {
+	effects := []PostLandEffect{}
+	if r.Score != nil {
+		effects = append(effects, PostLandEffect{Key: "score", Op: "score"})
+	}
+	if r.Events != nil {
+		for _, member := range batch.ActiveMembers {
+			effects = append(effects, PostLandEffect{Key: "event/" + member.Migration, Op: "event", Member: member.Migration})
+		}
+	}
+	return effects
+}
+
+// finishEffects does each post-landing effect of a landed batch that the ledger still lists, and records it done.
+// The batch record is never saved again: the ledger's effect rows are the durable state. An effect that fails stays
+// pending, so the batch stays listed and a later round finishes it.
+func (r Runner) finishEffects(ctx context.Context, batch *Batch) error {
+	commit := batch.PullRequest.MergedCommit
+	var failed []error
+	pending := []string{}
+	for _, key := range batch.PendingEffects {
+		if err := r.finishEffect(ctx, *batch, key, commit); err != nil {
+			failed = append(failed, fmt.Errorf("%s: %w", key, err))
+			pending = append(pending, key)
+			continue
+		}
+		if err := r.Admission.EffectDone(ctx, batch.Repository, batch.ID, key, []byte(`{"outcome":"done"}`)); err != nil {
+			failed = append(failed, fmt.Errorf("record %s done: %w", key, err))
+			pending = append(pending, key)
+		}
+	}
+	batch.PendingEffects = pending
+	if len(failed) != 0 {
+		return fmt.Errorf("%w: %w", ErrEffectsPending, errors.Join(failed...))
+	}
+	return nil
+}
+
+func (r Runner) finishEffect(ctx context.Context, batch Batch, key, commit string) error {
+	switch {
+	case key == "score":
+		if r.Score == nil {
+			return nil
+		}
+		output, err := r.Score.Score(ctx, commit, batch.ID)
+		if err != nil {
+			return err
+		}
+		return r.Score.Commit(ctx, batch.Repository, commit, r.ScorePath, output)
+	case strings.HasPrefix(key, "event/"):
+		if r.Events == nil {
+			return nil
+		}
+		return r.Events.Publish(ctx, LandingEvent{Batch: batch.ID, Member: strings.TrimPrefix(key, "event/"), Commit: commit})
+	}
+	return nil
+}
+
+func (r Runner) publishingRetryLimit() int {
+	if r.PublishingRetryLimit > 0 {
+		return r.PublishingRetryLimit
+	}
+	return 10
+}
+
+// pause waits the backoff after the attempt-th failed publishing step, doubling from PublishingBackoff, or until ctx
+// ends.
+func (r Runner) pause(ctx context.Context, attempt int) {
+	backoff := r.PublishingBackoff
+	if backoff <= 0 {
+		backoff = 30 * time.Second
+	}
+	for range attempt - 1 {
+		if backoff >= time.Hour {
+			break
+		}
+		backoff *= 2
+	}
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func operationComplete(ctx context.Context, dependency any, operation Operation) (bool, error) {

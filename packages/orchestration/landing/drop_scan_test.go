@@ -11,11 +11,13 @@ import (
 )
 
 // activeSetWriters are the only functions that may assign a batch's active set: removeMember, which every drop goes
-// through, the freeze that sets it from the input members, and the deep copy.
+// through, the two freezes that set it from their members (a new batch's input, and a declined batch's successor
+// from the members still ready), and the deep copy.
 var activeSetWriters = map[string]bool{
-	"removeMember": true,
-	"Run":          true,
-	"cloneBatch":   true,
+	"removeMember":    true,
+	"Run":             true,
+	"createSuccessor": true,
+	"cloneBatch":      true,
 }
 
 // TestOnlyDropMembersAssignsTheActiveSet fails when code outside the allowed functions assigns ActiveMembers, so a

@@ -118,6 +118,7 @@ func decode(stored ledger.Batch) (landing.Batch, error) {
 	}
 	batch.RecordVersion = stored.RecordVersion
 	batch.Admission = stored.Admission
+	batch.PendingEffects = stored.PendingEffects
 	return batch, nil
 }
 

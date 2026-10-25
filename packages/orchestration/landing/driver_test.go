@@ -211,6 +211,7 @@ func testRunner(ledger *ledgerFake, builder *builderFake) Runner {
 	return Runner{
 		Store:        &storeFake{},
 		Ledger:       ledger,
+		Admission:    &batchLedgerFake{ledger: ledger},
 		Builder:      builder,
 		Hasher:       hasherFake{},
 		Git:          newGitFake(),

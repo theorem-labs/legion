@@ -138,6 +138,34 @@ func TestLandBatchLandsTheMembersAndReleasesTheFence(t *testing.T) {
 	}
 }
 
+// A landing records each post-landing effect of the batch's record as an intent, the batch shows them pending, and
+// EffectDone finishes them one by one; a repeat succeeds.
+func TestLandBatchRecordsItsPostLandingEffects(t *testing.T) {
+	ctx := context.Background()
+	batches, calls, _, admitted, _ := admittedBatch(t)
+	admitted.State = landing.Landed
+	admitted.PostLandEffects = []landing.PostLandEffect{{Key: "score", Op: "score"}, {Key: "event/M-1", Op: "event", Member: "M-1"}}
+	if err := calls.LandBatch(ctx, &admitted, "merged-1"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(admitted.PendingEffects, []string{"event/M-1", "score"}) {
+		t.Fatalf("pending effects after the landing = %q", admitted.PendingEffects)
+	}
+	for range 2 {
+		if err := calls.EffectDone(ctx, "r", "batch-1", "score", []byte(`{"outcome":"scored"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loaded, _, err := batches.Load(ctx, "batch-1")
+	if err != nil || !slices.Equal(loaded.PendingEffects, []string{"event/M-1"}) {
+		t.Fatalf("pending effects after one done = %q, %v", loaded.PendingEffects, err)
+	}
+	active := must(batches.ListActive(ctx))
+	if len(active) != 1 || active[0].ID != "batch-1" {
+		t.Fatalf("a landed batch with an effect to do is not listed: %+v", active)
+	}
+}
+
 // DeclineBatch records each return at the member's frozen ready record, names the successor and stores the declined
 // record. The returned member is open again, with its round counted.
 func TestDeclineBatchReturnsItsMembers(t *testing.T) {

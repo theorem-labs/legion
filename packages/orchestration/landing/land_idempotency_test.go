@@ -6,58 +6,56 @@ import (
 	"testing"
 )
 
+// A landing whose response is lost lands nothing twice: the restart sends the same landing again, the ledger replays
+// it, and the batch ends landed with each member landed once.
 func TestReviewRestartDoesNotRepeatObservedLedgerLand(t *testing.T) {
-	ledger := &observedLedger{}
-	store := &landCrashStore{}
+	ledger := &ledgerFake{}
+	store := &MemoryStore{}
+	admission := &lostResponseLedger{batchLedgerFake: batchLedgerFake{ledger: ledger, store: store}}
 	runner := Runner{
-		Store:   store,
-		Ledger:  ledger,
-		Builder: &builderFake{},
-		Hasher:  hasherFake{},
-		Git:     newGitFake(),
-		GitHub:  &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+		Store:     admittedStore{MemoryStore: store},
+		Ledger:    ledger,
+		Admission: admission,
+		Builder:   &builderFake{},
+		Hasher:    hasherFake{},
+		Git:       newGitFake(),
+		GitHub:    &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}},
+	}
+	batch := greenBatch()
+	if _, err := store.Create(context.Background(), &batch); err != nil {
+		t.Fatal(err)
 	}
 
-	if _, err := runner.Publish(context.Background(), greenBatch()); err == nil {
-		t.Fatal("Publish() error = nil, want checkpoint failure after Land")
+	if _, err := runner.Publish(context.Background(), batch); err == nil {
+		t.Fatal("Publish() error = nil, want the lost response")
 	}
-	resumed, err := runner.Reconcile(context.Background())
-	if err != nil {
+	// The ledger committed the landing, so the restart has nothing to resume and the stored batch is landed.
+	if _, err := runner.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if got, want := resumed[0].State, Landed; got != want {
-		t.Fatalf("state = %q, want %q", got, want)
+	if stored, _, _ := store.Load(context.Background(), batch.ID); stored.State != Landed {
+		t.Fatalf("state = %q, want %q", stored.State, Landed)
 	}
-	if got, want := ledger.lands, 1; got != want {
-		t.Fatalf("Land calls = %d, want %d", got, want)
+	if !sameStrings(ledger.landed, []string{"one"}) {
+		t.Fatalf("lands = %v, want one once", ledger.landed)
 	}
 }
 
-type observedLedger struct{ lands int }
-
-func (l *observedLedger) Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error) {
-	return CheckResult{}, nil
+// lostResponseLedger lands the first time and loses that response.
+type lostResponseLedger struct {
+	batchLedgerFake
+	lost bool
 }
-func (l *observedLedger) Land(context.Context, LandRequest) error { l.lands++; return nil }
-func (l *observedLedger) ReturnMember(context.Context, string, string, int64, string) error {
+
+func (l *lostResponseLedger) LandBatch(ctx context.Context, batch *Batch, mergedCommit string) error {
+	record := cloneBatch(*batch)
+	if err := l.batchLedgerFake.LandBatch(ctx, &record, mergedCommit); err != nil {
+		return err
+	}
+	if !l.lost {
+		l.lost = true
+		return errors.New("connection reset after the commit")
+	}
+	*batch = record
 	return nil
-}
-func (l *observedLedger) MigrationState(context.Context, string, string) (string, string, error) {
-	if l.lands > 0 {
-		return "landed", "merged", nil
-	}
-	return "open", "", nil
-}
-
-type landCrashStore struct {
-	MemoryStore
-	failed bool
-}
-
-func (s *landCrashStore) Save(ctx context.Context, batch *Batch) error {
-	if operation, found := batch.Operations["land/one"]; found && operation.State == OperationComplete && !s.failed {
-		s.failed = true
-		return errors.New("injected checkpoint failure")
-	}
-	return s.MemoryStore.Save(ctx, batch)
 }

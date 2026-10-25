@@ -5,32 +5,20 @@ import (
 	"testing"
 )
 
+// The landing lands at GitHub's merged commit, not the candidate's, and so do the score and the events that follow
+// it.
 func TestReviewPublishUsesMergedCommitForPostMergeEffects(t *testing.T) {
-	ledger := &requestLedgerFake{}
+	ledger := &ledgerFake{}
 	github := &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}}
 	score := &commitScoreFake{}
 	events := &eventsFake{}
-	runner := Runner{Store: &storeFake{}, Ledger: ledger, GitHub: github, Score: score, Events: events}
-	input := greenBatch()
-	input.ActiveMembers[0].Changed = []string{"path"}
-	input.ActiveMembers[0].CurrentHashes = map[string]string{"Read": "current"}
-	input.ActiveMembers[0].ChangedContracts = map[string]string{"Contract": "changed"}
-	input.ActiveMembers[0].ApprovedPinned = []string{"Contract"}
-	batch, err := runner.Publish(context.Background(), input)
+	runner := Runner{Store: &storeFake{}, Ledger: ledger, Admission: &batchLedgerFake{ledger: ledger}, GitHub: github, Score: score, Events: events}
+	batch, err := runner.Publish(context.Background(), greenBatch())
 	if err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
-	if got, want := ledger.requests[0].Commit, "merged"; got != want {
-		t.Fatalf("Land commit = %q, want %q", got, want)
-	}
-	if got, want := ledger.requests[0].ChangedPaths, []string{"path"}; !sameStrings(got, want) {
-		t.Fatalf("changed paths = %#v, want %#v", got, want)
-	}
-	if got, want := ledger.requests[0].Current["Read"], "current"; got != want {
-		t.Fatalf("current hash = %q, want %q", got, want)
-	}
-	if got, want := ledger.requests[0].ChangedContracts["Contract"], "changed"; got != want {
-		t.Fatalf("changed contract = %q, want %q", got, want)
+	if got, want := ledger.commits["one"], "merged"; got != want {
+		t.Fatalf("land commit = %q, want %q", got, want)
 	}
 	if got, want := score.commit, "merged"; got != want {
 		t.Fatalf("score commit = %q, want %q", got, want)
@@ -41,23 +29,6 @@ func TestReviewPublishUsesMergedCommitForPostMergeEffects(t *testing.T) {
 	if got, want := batch.PullRequest.MergedCommit, "merged"; got != want {
 		t.Fatalf("stored merged commit = %q, want %q", got, want)
 	}
-}
-
-type requestLedgerFake struct{ requests []LandRequest }
-
-func (f *requestLedgerFake) Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error) {
-	return CheckResult{}, nil
-}
-func (f *requestLedgerFake) Land(_ context.Context, request LandRequest) error {
-	f.requests = append(f.requests, request)
-	return nil
-}
-func (f *requestLedgerFake) ReturnMember(context.Context, string, string, int64, string) error {
-	return nil
-}
-
-func (f *requestLedgerFake) MigrationState(context.Context, string, string) (string, string, error) {
-	return "open", "", nil
 }
 
 type commitScoreFake struct{ commit string }
