@@ -126,6 +126,9 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 	if command == "serve" && strings.TrimSpace(config.Escalations.Owner) == "" {
 		return fmt.Errorf("escalations.owner is required to serve: an escalation enqueued for an empty owner wakes nobody")
 	}
+	if command == "run" && (config.BatchID == "" || config.Base == "") {
+		return fmt.Errorf("batchId and base are required to run a single batch; land serve forms its batches from the ledger's ready migrations")
+	}
 	program, err := config.program(ctx)
 	if err != nil {
 		return err
@@ -169,7 +172,12 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 		}
 		return writeJSON(output, batches)
 	case "serve":
-		return serve(ctx, runner, program.input, config.Interval, output)
+		return serve(ctx, runner, serving{
+			repository: config.Repository.Name,
+			baseBranch: config.BaseBranch,
+			maxMembers: config.Batch.MaxMembers,
+			interval:   config.Interval,
+		}, output)
 	default:
 		return fmt.Errorf("unknown batch command %q", command)
 	}
@@ -221,7 +229,13 @@ type config struct {
 	GitHub       githubConfig        `json:"github"`
 	Escalations  escalationsConfig   `json:"escalations"`
 	Effects      effectsConfig       `json:"effects"`
+	Batch        batchConfig         `json:"batch"`
 	Digest       string              `json:"-"`
+}
+
+// batchConfig caps how many ready migrations one batch takes. Zero is the runner's default.
+type batchConfig struct {
+	MaxMembers int `json:"max_members"`
 }
 
 // escalationsConfig names the owner for whom every escalation of the program is
@@ -374,12 +388,12 @@ type program struct {
 	close  func()
 }
 
+// program wires one configuration. It needs no configured batch: `land serve` has none, and forms each batch from
+// the ledger's ready migrations on the current tip of the base branch. `land run`, which keeps its fixed member
+// list for a single batch, checks its own keys before it calls this.
 func (c config) program(ctx context.Context) (program, error) {
-	if c.BatchID == "" {
-		return program{}, fmt.Errorf("batchId is required")
-	}
-	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" {
-		return program{}, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, and baseBranch are required")
+	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.BaseBranch == "" {
+		return program{}, fmt.Errorf("repository.name, repository.path, repository.git_dir, and baseBranch are required")
 	}
 	if c.Ledger.DSNFile == "" {
 		return program{}, fmt.Errorf("ledger.dsn_file is required: the batches are kept in the ledger")
@@ -481,9 +495,20 @@ func commandToolchain(directory string, command []string) func(context.Context, 
 	}
 }
 
-// serve reconciles and publishes until ctx ends. A StopError (an unclassified ledger refusal) stops it, and the batch
-// stays for an operator.
-func serve(ctx context.Context, runner landing.Runner, input landing.Input, interval time.Duration, output io.Writer) error {
+// serving is what the serve loop forms each batch from: the repository, the branch it lands on, the cap on a
+// batch's members and how long it waits between rounds.
+type serving struct {
+	repository string
+	baseBranch string
+	maxMembers int
+	interval   time.Duration
+}
+
+// serve reconciles and publishes until ctx ends. With no batch left to do, it forms the next one from the ledger's
+// ready migrations, on the current tip of the base branch; a round with no ready migration does nothing and waits.
+// A StopError (an unclassified ledger refusal) stops it, and the batch stays for an operator.
+func serve(ctx context.Context, runner landing.Runner, configured serving, output io.Writer) error {
+	interval := configured.interval
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
@@ -493,11 +518,18 @@ func serve(ctx context.Context, runner landing.Runner, input landing.Input, inte
 			return err
 		}
 		if len(batches) == 0 {
-			batch, err := runner.Run(ctx, input)
-			if err != nil {
+			input, err := runner.ReadyInput(ctx, configured.repository, configured.baseBranch, configured.maxMembers)
+			switch {
+			case errors.Is(err, landing.ErrNoReadyMembers):
+			case err != nil:
 				return err
+			default:
+				batch, err := runner.Run(ctx, input)
+				if err != nil {
+					return err
+				}
+				batches = []landing.Batch{batch}
 			}
-			batches = []landing.Batch{batch}
 		}
 		for index := range batches {
 			if (batches[index].State == landing.Green || batches[index].State == landing.Publishing) && runner.GitHub != nil {
