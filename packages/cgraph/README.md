@@ -56,7 +56,11 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   an effect, only that effect is code: `for_each_leaf_node_cpu_mask`'s `WARN_ON_ONCE`), stores to a local or a parameter
   that compiled code never reads, such as `local_lock`'s `__tl` or a struct whose address only dead
   code takes, a store every read sees stored again first (`ipi_mux_send_mask`'s `icpu`, stored again
-  at the top of the loop), and arguments to a parameter the callee never reads in compiled code),
+  at the top of the loop), a store from which control reaches no read (`transport_add_class_device`'s
+  `error = sysfs_create_group(...)`, read only past `return 0;` at a label only an earlier goto
+  reaches; a constant condition without a call reads no local, and an `if` whose branches hold only
+  such stores and conditions the walk decides has no effect), and arguments to a parameter the callee
+  never reads in compiled code),
   of which only the parts with an effect are code (`psi_sched_switch(..., !task_on_rq_queued(prev)
   || p->x)` keeps the `READ_ONCE` and drops the read of `p->x`; the last statement of `({ ... })` is
   its value). The initializer of a static local is data, an edge of that local in

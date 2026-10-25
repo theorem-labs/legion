@@ -322,3 +322,14 @@ def test_a_copy_of_no_bytes_is_not_code(fold_build: dict[str, Any]) -> None:
     """fd_area_copy: ld a2, 0x0(a1); sd a2, 0x0(a0); ret (llvm-objdump): the copy of the empty uffd
     is gone with its arguments."""
     assert folded_fields(fold_build, "fd_area_copy") == {"start"}
+
+
+@pytest.mark.parametrize(
+    ("function", "fields"), [("fd_add_class", {"remove"}), ("fd_add_class_kept", {"stats", "code", "remove"})]
+)
+def test_a_store_control_cannot_carry_to_a_read_is_not_code(
+    fold_build: dict[str, Any], function: str, fields: set[str]
+) -> None:
+    """fd_add_class (llvm-objdump): box_size, then remove, never stats or enc: error = 0 reaches only
+    return 0. In fd_add_class_kept a goto after the store takes its value, t->code, to return error."""
+    assert folded_fields(fold_build, function) == fields

@@ -1293,7 +1293,7 @@ class _Extractor:
                     labels |= walk.goto_targets
                     continue
             never_read, image_read = walk.never_read(), walk.read_only_where_the_image_decides()
-            stored_again = walk.overwritten_stores() | walk.unseen_stores()
+            stored_again = walk.overwritten_stores() | walk.unseen_stores() | walk.unreached_stores()
             # Only a subtraction of two locals asks which stores are compiled (``same_value``).
             not_code = frozenset(walk.uncompiled_stores) if walk.subtractions else frozenset()
             if never_read <= dead and image_read <= decided and stored_again <= overwritten and not_code <= uncompiled:
@@ -1313,16 +1313,25 @@ class _Extractor:
         definition = self.evaluator.definitions.get(name)
         return definition is not None and _is_inline(definition)
 
-    def effect_free(self, expression: ci.Cursor, dead: frozenset[int] = frozenset(), image: bool = False) -> bool:
+    def effect_free(
+        self,
+        expression: ci.Cursor,
+        dead: frozenset[int] = frozenset(),
+        image: bool = False,
+        live: Callable[[ci.Cursor, list[ci.Cursor]], list[ci.Cursor]] | None = None,
+        skip: frozenset[int] = frozenset(),
+    ) -> bool:
         """Computing ``expression`` changes nothing but its value, so the compiler removes it when
         the value is not used: no asm that is volatile or has no output, no volatile access, no store
         except to a variable the expression declares or one in ``dead`` (which nothing reads), no
         loop that may not end, and calls only to the builtins that compute a value and to functions
         of the unit that are themselves effect-free. Operands that are never evaluated (sizeof,
         typeof) do not count. With ``image``, neither do the effects under a choice the image makes
-        (bitmap_empty's find_first_bit beside its __builtin_constant_p path): the image decides."""
+        (bitmap_empty's find_first_bit beside its __builtin_constant_p path): the image decides.
+        ``live`` replaces ``live_children`` (a walk's, which decides what its locals hold), and the
+        stores in ``skip`` are no effect (a walk's stores no read sees)."""
         own = {node.hash for node in _effect_nodes(expression) if node.kind == K.VAR_DECL and _is_local(node)}
-        return self._effect_free(expression, own | dead, inlined=True, image=image)
+        return self._effect_free(expression, own | dead, inlined=True, image=image, live=live, skip=skip)
 
     def function_effect_free(self, name: str, image: bool = False) -> bool:
         """A call of the function changes nothing but its result: its compiled code, as its settled
@@ -1370,8 +1379,16 @@ class _Extractor:
             return children[:1]
         return self.live_children(node, children)
 
-    def _effect_free(self, root: ci.Cursor, own: set[int], inlined: bool, image: bool = False) -> bool:
-        for node in _effect_nodes(root, self.image_live if image else self.live_children):
+    def _effect_free(
+        self,
+        root: ci.Cursor,
+        own: set[int],
+        inlined: bool,
+        image: bool = False,
+        live: Callable[[ci.Cursor, list[ci.Cursor]], list[ci.Cursor]] | None = None,
+        skip: frozenset[int] = frozenset(),
+    ) -> bool:
+        for node in _effect_nodes(root, live or (self.image_live if image else self.live_children)):
             kind = node.kind
             if kind == K.CALL_EXPR:
                 callee = node.referenced
@@ -1393,7 +1410,7 @@ class _Extractor:
                 target = _store_target(node) if not self.unchanging(node) else None
                 if target is not None:
                     variable = _stored_variable(target)
-                    if variable is None or variable.hash not in own:
+                    if node.hash not in skip and (variable is None or variable.hash not in own):
                         return False
         return True
 
@@ -3191,6 +3208,8 @@ class _FunctionWalk:
         # Per label, the guards each goto in code reached it under (None: under a choice the image
         # makes, or a label whose address is taken), in the order the walk met them.
         self.goto_guards: dict[str, list[list[dict[str, Any]] | None]] = collections.defaultdict(list)
+        self.live_gotos: list[tuple[str, int]] = []  # the gotos in code: target label and offset
+        self.deciding = 0  # inside a condition the walk decides: its locals are not read for it
         self.jumps: dict[str, Any] | None = None
         self.labelled: dict[int, bool] = {}
 
@@ -3348,6 +3367,96 @@ class _FunctionWalk:
                     found.add(store.hash)
         return frozenset(found)
 
+    def unreached_stores(self) -> frozenset[int]:
+        """The plain assignments to a local, as statements, from which control reaches no read the
+        walk counted: each read before it is outside any loop around it, and each read after it is
+        past a statement of the function's body that always exits, where the labels between are
+        reached only by gotos in code before the body's statement that holds the store
+        (transport_add_class_device's ``error = sysfs_create_group(...)``, read only by ``return
+        error`` past ``return 0;`` and ``err_remove:``, which only the goto before it reaches). A local
+        whose address is taken, a struct, an array and a function that jumps back do not count."""
+        if self.backward:
+            return frozenset()
+        found: set[int] = set()
+        for variable, stores in self.store_sites.items():
+            reads = self.read_sites.get(variable)
+            if not reads or variable in self.address_taken:
+                continue
+            for store in stores:
+                if store.kind != K.BINARY_OPERATOR or not _is_plain_assignment(store):
+                    continue
+                target = _bare(_children(store)[0]).referenced
+                if target is None or target.type.get_canonical().kind in (TK.RECORD, *_ARRAY_TYPES):
+                    continue
+                if not any(self.store_reaches(store, read) for read in reads):
+                    found.add(store.hash)
+        return frozenset(found)
+
+    def store_reaches(self, store: ci.Cursor, read: ci.Cursor) -> bool:
+        """Control may go from ``store`` to ``read`` (``unreached_stores``)."""
+        here, there = _place(store), _place(read)
+        if here is None or there is None or here[0] != there[0]:
+            return True
+        if there[2] <= here[1]:
+            return self.reaches(here, there)
+        body = _children(self.cursor)[-1]
+        statements = _children(body) if body.kind == K.COMPOUND_STMT else []
+        at = [index for index, statement in enumerate(statements) if _inside(here, _place(statement) or here)]
+        to = [index for index, statement in enumerate(statements) if _inside(there, _place(statement) or there)]
+        if len(at) != 1 or len(to) != 1 or at[0] >= to[0]:
+            return True
+        start = _place(statements[at[0]])
+        later = self.later_labels()
+        if start is None or "*" in later:
+            return True
+        labels = [node for node in body.walk_preorder() if node.kind == K.LABEL_STMT]
+        for index in range(at[0] + 1, to[0]):
+            exit_place = _place(statements[index])
+            if exit_place is None or not self.x.evaluator.exits(statements[index]):
+                continue
+            between = [
+                label
+                for label in labels
+                if (place := _place(label)) is not None and exit_place[2] <= place[1] < there[1]
+            ]
+            if all(
+                label.spelling not in later
+                and all(offset < start[1] for name, offset in self.live_gotos if name == label.spelling)
+                for label in between
+            ):
+                return False
+        return True
+
+    def held_live(self, node: ci.Cursor, children: list[ci.Cursor]) -> list[ci.Cursor]:
+        """``live_children``, with the conditions the walk decides from what locals hold
+        (``if (error)`` right after ``error = 0``)."""
+        kept = self.x.live_children(node, children)
+        if (
+            node.kind == K.IF_STMT
+            and len(kept) == len(children) >= 2
+            and not _mentions(children[0], _IMAGE_DECIDES)
+            and (value := self.decided(children[0])) is not None
+        ):
+            selected = 1 if value else 2
+            chosen = [child for index, child in enumerate(children) if index in (0, selected)]
+            return children if any(_holds_label(child) for child in children if child not in chosen) else chosen
+        return kept
+
+    def if_without_effect(self, statement: ci.Cursor) -> bool:
+        """``branches_without_effect``, with the stores the walk finds no read sees (``overwritten``)
+        and the conditions it decides: transport_add_class_device's ``if (tcont->statistics) { error =
+        sysfs_create_group(...); if (error) goto err_del; }``."""
+        children = _children(statement)
+        return (
+            statement.kind == K.IF_STMT
+            and len(children) >= 2
+            and not _jumps_out(statement, 0, self.held_live)
+            and all(
+                self.x.effect_free(branch, self.dead_variables, live=self.held_live, skip=self.overwritten)
+                for branch in children[1:]
+            )
+        )
+
     def stored_again_before(self, read: ci.Cursor, store: ci.Cursor, kills: set[int]) -> bool:
         """A block around ``read`` without a label or a case has one of ``kills`` (assignments of the
         variable as statements of that block) before the statement that holds the read, and
@@ -3385,7 +3494,7 @@ class _FunctionWalk:
         """A statement of a block, not an expression, that is not code beyond what its parts do
         besides computing values: an if whose branches have no effect, a loop without effect, or an
         if whose two outcomes agree."""
-        if self.x.branches_without_effect(statement, self.dead_variables):
+        if self.x.branches_without_effect(statement, self.dead_variables) or self.if_without_effect(statement):
             return True
         if statement.kind in _LOOPS:
             return self.x.loop_without_effect(
@@ -4158,10 +4267,9 @@ class _FunctionWalk:
             return None
         return target
 
-    def label_guard(self, label: ci.Cursor, fallthrough: list[dict[str, Any]] | None) -> dict[str, Any] | None:
-        """The guard on a label's code: reached by the gotos met before it and, unless ``fallthrough`` is
-        None, by control falling into it under those guards; so compiled where any of them is. None
-        when a goto after the label (a loop) or a computed goto may reach it, or one way is unguarded."""
+    def later_labels(self) -> set[str]:
+        """The labels a goto after them (a loop) may reach, with every label and ``*`` where a computed
+        goto may."""
         if self.jumps is None:
             later: set[str] = set()
             places: dict[str, int] = {}
@@ -4184,8 +4292,16 @@ class _FunctionWalk:
             later |= {target for target, offset in gotos if target in places and offset > places[target]}
             later |= {target for target, offset in assembled if target in places and offset >= places[target]}
             self.jumps = {"later": later}
+        later_found: set[str] = self.jumps["later"]
+        return later_found
+
+    def label_guard(self, label: ci.Cursor, fallthrough: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+        """The guard on a label's code: reached by the gotos met before it and, unless ``fallthrough`` is
+        None, by control falling into it under those guards; so compiled where any of them is. None
+        when a goto after the label (a loop) or a computed goto may reach it, or one way is unguarded."""
+        later = self.later_labels()
         name = label.spelling
-        if name in self.jumps["later"] or "*" in self.jumps["later"]:
+        if name in later or "*" in later:
             return None
         ways = list(self.goto_guards.get(name, []))
         if fallthrough is not None:
@@ -4302,7 +4418,9 @@ class _FunctionWalk:
                     self.walk(statement, children[0], statement_index, None, generic)
             return
         if kind == K.IF_STMT and (
-            node.hash in self.same_outcomes or self.x.branches_without_effect(node, self.dead_variables)
+            node.hash in self.same_outcomes
+            or self.x.branches_without_effect(node, self.dead_variables)
+            or self.if_without_effect(node)
         ):
             # An if whose branches have no effect, or whose two outcomes agree: only what its
             # condition does is code.
@@ -4943,11 +5061,15 @@ class _FunctionWalk:
             elif kind == K.INDIRECT_GOTO_STMT:
                 self.backward = True
             elif kind == K.ADDR_LABEL_EXPR or (
-                kind == K.ASM_STMT and any(token.spelling == "goto" for token in node.get_tokens())
+                kind == K.ASM_STMT and "goto" in (tokens := [token.spelling for token in node.get_tokens()])
             ):
                 # &&label (_THIS_IP_), or an asm goto, whose labels libclang does not show: a jump may
                 # enter any label, so a label's value is untraced.
                 self.gotos["*"].append(node)
+                if kind == K.ASM_STMT and set(tokens[tokens.index("goto") :]) & self.label_names:
+                    # An asm goto to a label met before it (or around it) jumps back (asm_labels, whose
+                    # labels are the ones met so far here).
+                    self.backward = True
             elif kind == K.GOTO_STMT:
                 label = next((child.referenced for child in operands if child.kind == K.LABEL_REF), None)
                 at, to = _place(node), _place(label) if label is not None else None
@@ -5809,6 +5931,7 @@ class _FunctionWalk:
             and (
                 kind.is_expression()
                 or self.x.branches_without_effect(node, self.dead_variables)
+                or self.if_without_effect(node)
                 or (
                     kind in _LOOPS
                     and (
@@ -5854,6 +5977,11 @@ class _FunctionWalk:
                 # A goto in code, a label whose address is taken (&&label), or an asm goto: the label
                 # is code. libclang shows an asm goto's labels only as its tokens.
                 self.goto_targets.update(child.spelling for child in children if child.kind == K.LABEL_REF)
+                # Where each goto in code jumps from (``store_reaches``), an asm goto's labels too.
+                jumped = {child.spelling for child in children if child.kind == K.LABEL_REF}
+                if kind == K.ASM_STMT:
+                    jumped |= self.asm_labels(node)
+                self.live_gotos += [(label, node.extent.start.offset) for label in sorted(jumped)]
                 way = (
                     None if self.conditional or kind != K.GOTO_STMT else [self.guard_table[i] for i in self.guard_stack]
                 )
@@ -5865,7 +5993,12 @@ class _FunctionWalk:
                     for label in self.asm_labels(node):
                         self.goto_targets.add(label)
                         self.goto_guards[label].append(None)
-            elif kind == K.DECL_REF_EXPR and _is_local(node.referenced) and node.hash not in self.stores:
+            elif (
+                kind == K.DECL_REF_EXPR
+                and _is_local(node.referenced)
+                and node.hash not in self.stores
+                and not self.deciding
+            ):
                 if self.conditional or node.referenced.hash in self.self_stored:
                     self.decided_reads[node.referenced.hash] += 1
                 else:
@@ -6068,7 +6201,15 @@ class _FunctionWalk:
                     # condition of inline code, so only its effects are computed.
                     self.discard(condition, node, 0, generic)
                 else:
-                    self.walk(condition, node, 0, reason, generic)
+                    # A constant condition without a call does not read the locals it names
+                    # (transport_add_class_device's if (error) right after error = sysfs_create_group(...),
+                    # a stub that gives 0). A call in it may still pass them.
+                    calls = any(part.kind == K.CALL_EXPR for part in condition.walk_preorder())
+                    self.deciding += 0 if calls else 1
+                    try:
+                        self.walk(condition, node, 0, reason, generic)
+                    finally:
+                        self.deciding -= 0 if calls else 1
                 for child_index, child in enumerate(children[1:], 1):
                     self.walk(child, node, child_index, None if child_index == live else "dead_branch", generic)
                 return

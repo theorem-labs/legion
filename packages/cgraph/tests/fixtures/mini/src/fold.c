@@ -791,3 +791,63 @@ void fd_area_copy(struct fd_area *dest, const struct fd_area *src)
 	dest->start = src->start;
 	__builtin_memcpy(&dest->uffd, &src->uffd, sizeof(dest->uffd));
 }
+
+/* drivers/base/transport_class.c transport_add_class_device without CONFIG_SYSFS: error =
+ * sysfs_create_group(...), a stub that gives 0, then if (error) goto err_del;, which never jumps:
+ * the store reaches only return 0, as err_remove: is reached only by the goto before it. So the ifs
+ * around the stores have no effect (llvm-objdump: no load of stats or enc). */
+static inline int fd_create_group(struct box *b, const long *group)
+{
+	return 0;
+}
+
+struct fd_tcont {
+	long *stats;
+	long *enc;
+	void (*remove)(struct box *b);
+	int code;
+};
+
+int fd_add_class(struct fd_tcont *t, struct box *b)
+{
+	int error = box_size(b);
+
+	if (error)
+		goto err_remove;
+	if (t->stats) {
+		error = fd_create_group(b, t->stats);
+		if (error)
+			goto err_del;
+	}
+	if (t->enc) {
+		error = fd_create_group(b, t->enc);
+		if (error)
+			goto err_del;
+	}
+	return 0;
+
+err_del:
+	obj_free(b);
+err_remove:
+	if (t->remove)
+		t->remove(b);
+	return error;
+}
+
+/* The same store where a goto after it can carry it to the read: the ifs stay. */
+int fd_add_class_kept(struct fd_tcont *t, struct box *b)
+{
+	int error = box_size(b);
+
+	if (t->stats) {
+		error = t->code;
+		if (box_size(b))
+			goto err_remove;
+	}
+	return 0;
+
+err_remove:
+	if (t->remove)
+		t->remove(b);
+	return error;
+}
