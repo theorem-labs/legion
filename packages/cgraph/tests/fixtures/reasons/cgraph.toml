@@ -1,0 +1,49 @@
+# A program with state accesses the graph cannot hold, each kept with its exclusion reason
+# (contract C3). The exclusion tests read it; nothing else does.
+[inputs]
+c_tree = "."
+image = "image/reasons.elf"
+system_map = "image/System.map"
+
+[parts.one]
+files = ["src/reasons.c"]
+
+[c]
+flags = ["-nostdinc", "--target=riscv64-unknown-elf", "-march=rv64imac", "-mabi=lp64", "-std=gnu2x",
+         "-ffreestanding", "-mcmodel=medany"]
+kit_types = []
+value_types = []
+lock_types = ["guard"]
+lock_type_words = []
+percpu_globals = []
+percpu_structs = []
+membership_witness_macros = []
+base_type_min_containers = 2
+
+[c.calls]
+unlock = "unlock"
+lock = "^(?!.*unlock)(?:.*lock)"
+allocate = "alloc"
+free = "free"
+
+[c.membership]
+list = []
+hash = []
+
+[c.cleanup]
+class_type = "^class_(.+)_t$"
+destructor = "class_{name}_destructor"
+attribute_macros = {}
+
+[checks]
+# The tests read the exclusions, not the agreement this small program reaches.
+min_call_agreement = 0.0
+min_access_agreement = 0.0
+min_field_offsets = 0.0
+
+[image]
+arch = "riscv64"
+percpu_sections = []
+
+[topics]
+prefix = "notifications.example."
