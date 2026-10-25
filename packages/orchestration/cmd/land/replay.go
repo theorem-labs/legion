@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/landing"
@@ -180,11 +181,50 @@ type replayer struct {
 
 // roundBlame is the build blame of one recorded build round.
 type roundBlame struct {
-	tree         string
-	members      map[string]landing.Member // the candidate's members
+	tree    string
+	members map[string]landing.Member // the candidate's members
+	// changed holds, per source path asked for, the members whose head has
+	// another blob there than the base. A member whose file is the base's
+	// added no line of it, so only these members are asked what they added.
+	changed      map[string][]landing.Member
 	report       blame.Report
 	lines        map[string]blame.TreeLines
 	attributions []blame.Attribution
+}
+
+// membersChanging returns the round's members whose head holds another blob
+// at path than the base does. It asks git once for every member, through one
+// cat-file --batch-check process, and keeps the answer for the path.
+func (r *replayer) membersChanging(ctx context.Context, built *roundBlame, path string) []landing.Member {
+	if found, ok := built.changed[path]; ok {
+		return found
+	}
+	ids := make([]string, 0, len(built.members))
+	for id := range built.members {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var request strings.Builder
+	request.WriteString(r.manifest.Base + ":" + path + "\n")
+	for _, id := range ids {
+		request.WriteString(built.members[id].Head + ":" + path + "\n")
+	}
+	command := exec.CommandContext(ctx, "git", "-C", r.manifest.Repository, "cat-file", "--batch-check=%(objectname)")
+	command.Stdin = strings.NewReader(request.String())
+	output, err := command.Output()
+	var changed []landing.Member
+	if err == nil {
+		answers := strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
+		if len(answers) == len(ids)+1 {
+			for index, id := range ids {
+				if answers[index+1] != answers[0] {
+					changed = append(changed, built.members[id])
+				}
+			}
+		}
+	}
+	built.changed[path] = changed
+	return changed
 }
 
 // roundMembers is the manifest's members less the build round's excluded ones.
@@ -221,7 +261,7 @@ func (r *replayer) blameFor(ctx context.Context, index int) (*roundBlame, error)
 	for _, drop := range candidate.Dropped {
 		dropped[drop.ID] = true
 	}
-	result := &roundBlame{tree: candidate.Tree, members: map[string]landing.Member{}}
+	result := &roundBlame{tree: candidate.Tree, members: map[string]landing.Member{}, changed: map[string][]landing.Member{}}
 	var blameMembers []blame.Member
 	for _, member := range members {
 		if !dropped[member.Migration] {
@@ -456,7 +496,7 @@ func (r *replayer) useAdded(ctx context.Context, built *roundBlame, attribution 
 		if use == "" {
 			continue
 		}
-		for _, member := range built.members {
+		for _, member := range r.membersChanging(ctx, built, block.Path) {
 			if r.addedLines(ctx, member, block.Path)[use] {
 				return true
 			}
