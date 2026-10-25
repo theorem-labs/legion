@@ -10,8 +10,10 @@ name: Docs
 # The packages below are the ones the site reads: docs/site/scripts/build-binaries.sh builds
 # `legion` from packages/daemon and the Dispatch and broker binaries from packages/envoy, the
 # generators import packages/contracts and packages/envoy-client, and the screenshots boot
-# Dispatch, built from packages/dispatch with the editor in packages/proof-editor. The other
-# packages reach no page, so a change to one rebuilds nothing here.
+# Dispatch, built from packages/dispatch with the editor in packages/proof-editor. Those two Go
+# builds run in workspace mode, so the workspace file and the manifests of every module it binds
+# belong here too, packages/orchestration's among them: a requirement or a `replace` of its own
+# moves the versions the binaries compile with. No other package reaches a page.
 on:
   push:
     branches: [main]
@@ -23,6 +25,9 @@ on:
       - "packages/envoy-client/**"
       - "packages/dispatch/**"
       - "packages/proof-editor/**"
+      - "go.work"
+      - "packages/orchestration/go.mod"
+      - "packages/orchestration/go.sum"
       # The frozen install the build and its screenshots run.
       - "package.json"
       - "bun.lock"
@@ -41,6 +46,9 @@ on:
       - "packages/envoy-client/**"
       - "packages/dispatch/**"
       - "packages/proof-editor/**"
+      - "go.work"
+      - "packages/orchestration/go.mod"
+      - "packages/orchestration/go.sum"
       - "package.json"
       - "bun.lock"
       - "patches/**"

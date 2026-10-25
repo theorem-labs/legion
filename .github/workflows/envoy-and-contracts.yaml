@@ -199,9 +199,11 @@ jobs:
               - 'go.work'
               # The Go builds run in workspace mode, where the daemon module's requirements raise
               # the versions envoy compiles with. go.work.sum and the orchestration module's own
-              # manifests are not here: the first carries checksums only, and the second reaches
-              # this job's builds through minimal version selection alone, which the `changes`
-              # job's build-list step answers (`workspace_versions`, in this job's `if:`).
+              # manifests are not here: the first carries checksums only, which pr-and-main.yaml's
+              # required typecheck job verifies on every pull request by resolving each module's
+              # test graph, and the second reaches this job's builds only through the versions and
+              # replacements the workspace selects, which the `changes` job's build-list step
+              # answers (`workspace_versions`, in this job's `if:`).
               - 'packages/daemon/go.mod'
               - 'packages/daemon/go.sum'
               # The daemon's generated body cap: the envoy job runs bun run check:go, the only
@@ -430,13 +432,21 @@ jobs:
               - 'scripts/third-party-notices.ts'
 
       # packages/orchestration is in go.work, and no other module imports it, so its own go.mod
-      # and go.sum reach an envoy or daemon build through minimal version selection alone: a
-      # requirement of its own can raise a version the other modules compile with. Their file
-      # names cannot say whether it did; the workspace build list can, and it is the list every
-      # `go build` in this repository selects from. When it is the same as the base's, every
-      # other module compiles exactly what it compiled at the base, so a Go job below has
-      # nothing new to check and skips. Anything this step cannot answer leaves `moved` true and
-      # every job runs, as they did before this step existed.
+      # and go.sum reach an envoy or daemon build through module selection alone: a requirement
+      # of its own can raise a version the other modules compile with, and a `replace` of its own
+      # applies to the whole workspace. Their file names cannot say whether either happened; the
+      # workspace build list can, and the list below carries each module's replacement as well as
+      # its selected version, so a replace-only edit moves it (`go list -m` keeps the replacement
+      # in .Replace, which a path-and-version line alone would drop). When the list is the base's,
+      # every other module compiles exactly what it compiled at the base, so a Go job below has
+      # nothing new to check and skips. Anything this step cannot answer — an unreachable base, a
+      # proxy failure, a module that will not load — leaves `moved` true and every job runs, as
+      # they did before this step existed.
+      #
+      # The base is the event's own base, not HEAD^1: a push of several commits to main carries
+      # the manifest change in an earlier commit, and `github.event.before` is where the branch
+      # stood before the push. It is read in a worktree of its own, so the job's checkout is never
+      # modified and a later step cannot inherit a half-restored tree.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.filter.outputs.workspace_modules == 'true'
         with:
@@ -447,26 +457,40 @@ jobs:
       - name: Does the workspace build list move?
         id: versions
         if: steps.filter.outputs.workspace_modules == 'true'
+        env:
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
         run: |
           set -uo pipefail
-          manifests="go.work go.work.sum packages/daemon/go.mod packages/daemon/go.sum packages/envoy/go.mod packages/envoy/go.sum packages/orchestration/go.mod packages/orchestration/go.sum"
+          fmt='{{.Path}} {{.Version}}{{with .Replace}} => {{.Path}} {{.Version}}{{end}}'
+          work="$RUNNER_TEMP/workspace-base"
           moved=true
-          # shellcheck disable=SC2086
-          if head=$(go list -m -f '{{.Path}} {{.Version}}' all 2>&1) &&
-             git checkout --quiet HEAD^1 -- $manifests &&
-             base=$(go list -m -f '{{.Path}} {{.Version}}' all 2>&1); then
-            if [ "$head" = "$base" ]; then
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            base=$(git rev-parse HEAD^1)
+          else
+            base=$BASE_SHA
+          fi
+          case "$base" in
+            *[!0]*)
+              git cat-file -e "$base^{commit}" 2> /dev/null ||
+                git fetch --quiet --no-tags --depth 1 origin "$base" 2> /dev/null || true
+              ;;
+            *) base= ;;
+          esac
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2> /dev/null &&
+             git worktree add --quiet --detach "$work" "$base" &&
+             head=$(go list -m -f "$fmt" all 2>&1) &&
+             base_list=$(cd "$work" && go list -m -f "$fmt" all 2>&1); then
+            if [ "$head" = "$base_list" ]; then
               moved=false
-              echo "the workspace build list is the base's; the Go jobs have nothing new to compile"
+              echo "the workspace build list is the base's ($base); the Go jobs have nothing new to compile"
             else
-              diff <(echo "$base") <(echo "$head") || true
+              diff <(printf '%s\n' "$base_list") <(printf '%s\n' "$head") || true
             fi
           else
-            echo "::notice::the workspace build list could not be read; every Go job runs"
+            echo "::notice::the workspace build list at base '${base:-unknown}' could not be read; every Go job runs"
           fi
-          # shellcheck disable=SC2086
-          git checkout --quiet HEAD -- $manifests
           echo "moved=$moved" >> "$GITHUB_OUTPUT"
+          git worktree remove --force "$work" 2> /dev/null || true
 
   contracts:
     needs: changes
