@@ -135,27 +135,31 @@ func attestMergeGroups(ctx context.Context, runner landing.Runner, queue landing
 }
 
 type config struct {
-	BatchID      string            `json:"batchId"`
-	Repository   repositoryConfig  `json:"repository"`
-	Base         string            `json:"base"`
-	BaseBranch   string            `json:"baseBranch"`
-	StatePath    string            `json:"statePath"`
-	Members      []landing.Member  `json:"members"`
-	Build        []string          `json:"build"`
-	Hasher       []string          `json:"hasher"`
-	Checks       []checkConfig     `json:"checks"`
-	Ledger       ledgerConfig      `json:"ledger"`
-	Escalations  escalationsConfig `json:"escalations"`
-	Publishing   publishingConfig  `json:"publishing"`
-	Toolchain    []string          `json:"toolchain"`
-	Score        scoreConfig       `json:"score"`
-	Event        eventConfig       `json:"event"`
-	ModuleRoots  []string          `json:"moduleRoots"`
-	MaxRounds    int               `json:"maxRounds"`
-	InfraRetries int               `json:"infraRetries"`
-	Interval     time.Duration     `json:"interval"`
-	GitHub       githubConfig      `json:"github"`
-	Digest       string            `json:"-"`
+	BatchID      string              `json:"batchId"`
+	Repository   repositoryConfig    `json:"repository"`
+	Base         string              `json:"base"`
+	BaseBranch   string              `json:"baseBranch"`
+	StatePath    string              `json:"statePath"`
+	Members      []landing.Member    `json:"members"`
+	Build        []string            `json:"build"`
+	Hasher       []string            `json:"hasher"`
+	Checks       []checkConfig       `json:"checks"`
+	Ledger       ledgerConfig        `json:"ledger"`
+	Escalations  escalationsConfig   `json:"escalations"`
+	Publishing   publishingConfig    `json:"publishing"`
+	Toolchain    []string            `json:"toolchain"`
+	Event        eventConfig         `json:"event"`
+	Container    containerConfig     `json:"container"`
+	PostLanding  landing.PostLanding `json:"post_landing"`
+	Librarian    librarianConfig     `json:"librarian"`
+	Publish      publishConfig       `json:"publish"`
+	Effects      effectsConfig       `json:"effects"`
+	ModuleRoots  []string            `json:"moduleRoots"`
+	MaxRounds    int                 `json:"maxRounds"`
+	InfraRetries int                 `json:"infraRetries"`
+	Interval     time.Duration       `json:"interval"`
+	GitHub       githubConfig        `json:"github"`
+	Digest       string              `json:"-"`
 }
 
 type checkConfig struct {
@@ -209,11 +213,46 @@ type githubConfig struct {
 	PollInterval time.Duration `json:"pollInterval"`
 }
 
-type scoreConfig struct {
+// containerConfig is the container boundary every command that reads candidate or landed content runs behind: the
+// image pinned by digest, the uid:gid of the VM user that owns the mounted paths, and the named mounts a hook, a
+// build or the hasher may be given.
+type containerConfig struct {
+	Image  string        `json:"image"`
+	User   string        `json:"user"`
+	Mounts []mountConfig `json:"mounts"`
+}
+
+// mountConfig declares one named path of the build VM, mounted at that same path inside a container.
+type mountConfig struct {
+	Name     string `json:"name"`
+	HostPath string `json:"host_path"`
+}
+
+// publishConfig is the argv that a hook defect is published with, for a hook that names a topic.
+type publishConfig struct {
 	Command []string `json:"command"`
-	Commit  []string `json:"commit"`
-	Status  []string `json:"status"`
-	Path    string   `json:"path"`
+}
+
+// librarianConfig is the argv that each near pair of a contracts apply is delivered with.
+type librarianConfig struct {
+	Command []string `json:"command"`
+}
+
+// effectsConfig is the attempt threshold at which a retried effect is escalated (default 10) and the first wait
+// between two of its attempts (default 10 seconds).
+type effectsConfig struct {
+	EscalateAfter int           `json:"escalate_after"`
+	Backoff       time.Duration `json:"backoff"`
+}
+
+// container is the part of the container configuration that a frozen hook definition copies, with the declared
+// mounts by name.
+func (c config) container() landing.Container {
+	mounts := make(map[string]landing.Mount, len(c.Container.Mounts))
+	for _, mount := range c.Container.Mounts {
+		mounts[mount.Name] = landing.Mount{Name: mount.Name, HostPath: mount.HostPath}
+	}
+	return landing.Container{Image: c.Container.Image, User: c.Container.User, GitDir: c.Repository.GitDir, Mounts: mounts}
 }
 
 type eventConfig struct {
@@ -268,6 +307,13 @@ func (c config) program(ctx context.Context) (program, error) {
 		input: landing.Input{ID: c.BatchID, Repository: c.Repository.Name, Base: c.Base, BaseBranch: c.BaseBranch, Members: c.Members},
 		close: func() {},
 	}
+	container := c.container()
+	if err := c.PostLanding.Validate(container.Mounts); err != nil {
+		return program{}, err
+	}
+	if len(c.PostLanding.Hooks) != 0 && strings.TrimSpace(c.Escalations.Owner) == "" {
+		return program{}, fmt.Errorf("escalations.owner is required: the ledger enqueues every escalation for it")
+	}
 	runner := landing.Runner{
 		Ledger:               landing.CommandLedger{Directory: path, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
 		Builder:              landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
@@ -279,25 +325,26 @@ func (c config) program(ctx context.Context) (program, error) {
 		ConfigDigest:         c.Digest,
 		PublishingRetryLimit: c.Publishing.RetryLimit,
 		EscalationsOwner:     strings.TrimSpace(c.Escalations.Owner),
+		EscalateAfter:        c.Effects.EscalateAfter,
+		RetryBackoff:         c.Effects.Backoff,
+		PostLanding:          c.PostLanding,
+		Container:            container,
+		Librarian:            c.Librarian.Command,
+		Scores:               landing.RepositoryScore{Path: path},
 		Toolchain:            commandToolchain(path, c.Toolchain),
 	}
 	for _, check := range c.Checks {
 		runner.Checks = append(runner.Checks, landing.CommandChecker{CheckName: check.Name, Command: check.Command, Directory: path})
 	}
+	if len(c.Publish.Command) != 0 {
+		runner.Defects = landing.CommandDefects{Directory: path, Command: c.Publish.Command}
+	}
 	if publishing {
 		github := landing.GitHubCLI{RepositoryPath: path, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
 		runner.GitHub = github
 		out.queue = github
-		// The score and the member event are optional: without them the
-		// program publishes no score status and runs no event, and the
-		// ledger's migration.landed is the record. A partial one is refused.
-		if score := c.Score; len(score.Command) != 0 || len(score.Commit) != 0 || len(score.Status) != 0 || score.Path != "" {
-			if len(score.Command) == 0 || len(score.Commit) == 0 || len(score.Status) == 0 || score.Path == "" {
-				return program{}, fmt.Errorf("score needs command, commit, status, and path")
-			}
-			runner.Score = landing.CommandScorer{Directory: path, ScoreCommand: score.Command, CommitCommand: score.Commit, StatusCommand: score.Status}
-			runner.ScorePath = score.Path
-		}
+		// The member event is optional: without it no member event runs, and the ledger's migration.landed is the
+		// record. A partial one is refused. The score is a post-landing hook like any other.
 		if event := c.Event; len(event.Command) != 0 || len(event.Status) != 0 {
 			if len(event.Command) == 0 || len(event.Status) == 0 {
 				return program{}, fmt.Errorf("event needs command and status")
@@ -322,8 +369,10 @@ func (c config) program(ctx context.Context) (program, error) {
 			return program{}, fmt.Errorf("open the ledger: %w", err)
 		}
 		batches := ledgerstore.New(store, c.Repository.Name)
+		calls := ledgerstore.NewLedger(store, c.Repository.Name)
 		runner.Store = batches
-		runner.Admission = ledgerstore.NewLedger(store, c.Repository.Name)
+		runner.Admission = calls
+		runner.Effects = calls
 		out.list = batches.ListActive
 		out.close = store.Close
 	} else {
