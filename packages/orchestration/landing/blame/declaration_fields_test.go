@@ -7,7 +7,7 @@ import (
 
 func TestScanDeclarationsReportsStructureFields(t *testing.T) {
 	src := "namespace Lib\nstructure Box extends Base where\n  val : Nat\n  ok : val > 0 := by decide\n\ndef f := 1\nend Lib\n"
-	ds := ScanDeclarations("Lib/Core.lean", src)
+	ds := ScanDeclarations("Lib/Core.lean", src, nil)
 	if len(ds) != 2 {
 		t.Fatalf("declarations = %+v", ds)
 	}
@@ -25,7 +25,7 @@ func TestScanDeclarationsReportsStructureFields(t *testing.T) {
 // class without extends: only the body's own fields at its first indentation.
 func TestScanDeclarationsReadsOnlyTopLevelFields(t *testing.T) {
 	src := "class Shape (α : Type) where\n  mk ::\n  area : α →\n    Nat\n  name : String\n  deriving Repr\ntheorem t : True := trivial\n"
-	ds := ScanDeclarations("Shape.lean", src)
+	ds := ScanDeclarations("Shape.lean", src, nil)
 	if len(ds) != 2 {
 		t.Fatalf("declarations = %+v", ds)
 	}

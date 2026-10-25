@@ -358,10 +358,6 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 		return fmt.Errorf("read build log: %w", err)
 	}
 	report := blame.Parse(string(log), nil)
-	evidence, err := collectEvidence(ctx, *repository, *base, members)
-	if err != nil {
-		return err
-	}
 	var candidateTree blame.Tree
 	if *candidateRef != "" {
 		tree, err := git(ctx, *repository, "rev-parse", "--verify", *candidateRef+"^{tree}")
@@ -380,7 +376,14 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 		}
 		candidateTree = blame.Tree(candidate.Tree)
 	}
-	lines, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
+	// The trees are scanned first: their candidate names the generated
+	// instance names that no declaration may keep, and each member's
+	// evidence must use the same set as the trees.
+	lines, ambiguous, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
+	if err != nil {
+		return err
+	}
+	evidence, err := collectEvidence(ctx, *repository, *base, members, ambiguous)
 	if err != nil {
 		return err
 	}
@@ -443,11 +446,11 @@ func withoutExcluded(members []blame.Member, excluded map[string]struct{}) []bla
 	return out
 }
 
-func collectEvidence(ctx context.Context, repository, base string, members []blame.Member) (map[string]blame.Evidence, error) {
+func collectEvidence(ctx context.Context, repository, base string, members []blame.Member, ambiguous blame.InstanceNames) (map[string]blame.Evidence, error) {
 	evidence := make(map[string]blame.Evidence, len(members))
 	git := landing.RepositoryGit{}
 	for _, member := range members {
-		memberEvidence, err := git.DeclarationEvidence(ctx, repository, base, landing.Member{Migration: member.ID, Head: member.Head})
+		memberEvidence, err := git.DeclarationEvidence(ctx, repository, base, landing.Member{Migration: member.ID, Head: member.Head}, ambiguous)
 		if err != nil {
 			return nil, fmt.Errorf("read declaration evidence for %q: %w", member.ID, err)
 		}
@@ -456,16 +459,23 @@ func collectEvidence(ctx context.Context, repository, base string, members []bla
 	return evidence, nil
 }
 
-func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, error) {
+// collectTreeLines groups, by each name the report mentions, the declarations
+// of the base and candidate trees that carry it. It also returns the round's
+// ambiguous generated instance names, which it has resolved in both trees and
+// which every scan of the round must use.
+func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, blame.InstanceNames, error) {
 	git := landing.RepositoryGit{}
 	baseDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(base))
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at base: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at base: %w", err)
 	}
 	candidateDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(candidate))
 	if err != nil {
-		return nil, fmt.Errorf("read declarations at candidate: %w", err)
+		return nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
 	}
+	ambiguous := blame.AmbiguousInstanceNames(candidateDeclarations)
+	blame.ResolveInstanceNames(candidateDeclarations, ambiguous)
+	blame.ResolveInstanceNames(baseDeclarations, ambiguous)
 	names := make(map[string]struct{})
 	for _, block := range report.Blocks {
 		for _, name := range blame.Names(block.Message) {
@@ -479,7 +489,7 @@ func collectTreeLines(ctx context.Context, repository string, base, candidate bl
 			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}
 	}
-	return declarations, nil
+	return declarations, ambiguous, nil
 }
 
 func confirmAttributions(ctx context.Context, repository, base string, members []blame.Member, modules []string, attributions []blame.Attribution, command string) ([]blame.Attribution, error) {

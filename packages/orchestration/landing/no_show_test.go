@@ -94,14 +94,14 @@ exec ` + realGit + ` "$@"
 	g := RepositoryGit{}
 
 	// DeclarationEvidence must work through the wrapper (no git show).
-	evidenceA, err := g.DeclarationEvidence(ctx, repo, base, Member{Migration: "a", Head: headA})
+	evidenceA, err := g.DeclarationEvidence(ctx, repo, base, Member{Migration: "a", Head: headA}, nil)
 	if err != nil {
 		t.Fatalf("DeclarationEvidence(a) error = %v", err)
 	}
 	if s, l := blame.EvidenceFor(blame.Name{Value: "alpha", Kind: blame.Changed}, evidenceA); s != 3 || l != "signature changed" {
 		t.Fatalf("alpha evidence = (%d, %q), want (3, signature changed)", s, l)
 	}
-	evidenceB, err := g.DeclarationEvidence(ctx, repo, base, Member{Migration: "b", Head: headB})
+	evidenceB, err := g.DeclarationEvidence(ctx, repo, base, Member{Migration: "b", Head: headB}, nil)
 	if err != nil {
 		t.Fatalf("DeclarationEvidence(b) error = %v", err)
 	}

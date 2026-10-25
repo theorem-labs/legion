@@ -18,7 +18,7 @@ end A.B
 def _root_.rooted := 5
 end Alpha
 `
-	got := ScanDeclarations("Declarations.lean", source)
+	got := ScanDeclarations("Declarations.lean", source, nil)
 	want := []Declaration{
 		{File: "Declarations.lean", Name: "Alpha.Beta.annotated", Text: "@[tag] noncomputable unsafe partial def annotated := 0"},
 		{File: "Declarations.lean", Name: "Alpha.Beta.guarded", Text: "protected def guarded := 1", Protected: true},
@@ -47,7 +47,7 @@ def first := "end Alpha"
 def second := 0
 end Alpha
 `
-	got := ScanDeclarations("Comments.lean", source)
+	got := ScanDeclarations("Comments.lean", source, nil)
 	want := []Declaration{
 		{File: "Comments.lean", Name: "Alpha.first", Text: `def first := "end Alpha"`},
 		{File: "Comments.lean", Name: "Alpha.second", Text: "def second := 0"},
@@ -72,7 +72,7 @@ def T.{u, v} (α : Sort u) (β : Sort v) : Prop := True
 instance (priority := low) feedR_drop : Inhabited Nat := ⟨0⟩
 end A
 `
-	got := ScanDeclarations("Universe.lean", source)
+	got := ScanDeclarations("Universe.lean", source, nil)
 	var names []string
 	for _, declaration := range got {
 		names = append(names, declaration.Name)
@@ -112,7 +112,7 @@ func TestScanDeclarationsKeepsScopeAcrossConstructs(t *testing.T) {
 		{"attribute line", "namespace Alpha\n@[simp]\ntheorem lemma_one : True := trivial\ndef after := 0\nend Alpha\n", []string{"Alpha.lemma_one", "Alpha.after"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := declarationNames(ScanDeclarations("Construct.lean", test.source)); !sameStrings(got, test.want) {
+			if got := declarationNames(ScanDeclarations("Construct.lean", test.source, nil)); !sameStrings(got, test.want) {
 				t.Fatalf("ScanDeclarations() names = %q, want %q", got, test.want)
 			}
 		})
@@ -122,7 +122,7 @@ func TestScanDeclarationsKeepsScopeAcrossConstructs(t *testing.T) {
 // A modifier written on its own line belongs to the declaration below it.
 func TestScanDeclarationsCarriesModifierLines(t *testing.T) {
 	source := "namespace Alpha\nprivate\ndef hidden := 0\n@[simp] protected\ntheorem guarded : True := trivial\ndef open_ := 0\nend Alpha\n"
-	got := ScanDeclarations("Modifiers.lean", source)
+	got := ScanDeclarations("Modifiers.lean", source, nil)
 	if names := declarationNames(got); !sameStrings(names, []string{"Alpha.hidden", "Alpha.guarded", "Alpha.open_"}) {
 		t.Fatalf("ScanDeclarations() names = %q", names)
 	}
@@ -147,7 +147,7 @@ func TestScanDeclarationsJoinsSignatureLines(t *testing.T) {
 		"structure Point (α : Type)\n    (β : Type) where\n  x : α\n" +
 		"inductive Tree\n  | leaf\n  | node (l r : Tree)\n" +
 		"theorem open_ (n : Nat)\n    (h : n = 0)\n"
-	got := ScanDeclarations("Signatures.lean", source)
+	got := ScanDeclarations("Signatures.lean", source, nil)
 	want := map[string]string{
 		"T":     "theorem T (n : Nat) (h : n = 0) : True := by",
 		"f":     "def f : Nat → Nat",
@@ -273,7 +273,7 @@ func TestScanDeclarationsEndsSignatureOnlyAtBody(t *testing.T) {
 		owners: []string{`sig "one"`, "", `sig "two"`, "", `sig "three"`, "", "", `sig "four"`, "", "", "sig after", ""},
 	}} {
 		t.Run(test.name, func(t *testing.T) {
-			got := ScanDeclarations("Signatures.lean", test.source)
+			got := ScanDeclarations("Signatures.lean", test.source, nil)
 			if len(got) != len(test.text) {
 				t.Fatalf("ScanDeclarations() = %+v, want %d declarations", got, len(test.text))
 			}
@@ -282,7 +282,7 @@ func TestScanDeclarationsEndsSignatureOnlyAtBody(t *testing.T) {
 					t.Errorf("%s Text = %q, want %q", declaration.Name, declaration.Text, want)
 				}
 			}
-			owners := ScanLineOwners("Signatures.lean", test.source)
+			owners := ScanLineOwners("Signatures.lean", test.source, nil)
 			shape := make([]string, len(owners))
 			for index, owner := range owners {
 				switch {
@@ -321,15 +321,15 @@ func TestScanDeclarationsNamesAnonymousInstances(t *testing.T) {
 		"instance : Shape Point := ⟨fun p => p.x⟩\n" +
 		"end Gamma\n"
 	want := []Declaration{
-		{File: "Instances.lean", Name: "Alpha.instInhabitedPoint", Text: "instance : Inhabited Point := ⟨⟨0⟩⟩"},
-		{File: "Instances.lean", Name: "Alpha.instInhabitedBoxOfGroup", Text: "noncomputable instance (priority := low) (G : Type) [Group G] : Inhabited (Box G) where"},
-		{File: "Instances.lean", Name: "Alpha.instDecidableFits", Text: "@[simp] instance {n : Nat} : Data.Shape.Decidable (Fits n) := ⟨true⟩"},
+		{File: "Instances.lean", Name: "Alpha.instInhabitedPoint", Text: "instance : Inhabited Point := ⟨⟨0⟩⟩", Generated: true},
+		{File: "Instances.lean", Name: "Alpha.instInhabitedBoxOfGroup", Text: "noncomputable instance (priority := low) (G : Type) [Group G] : Inhabited (Box G) where", Generated: true},
+		{File: "Instances.lean", Name: "Alpha.instDecidableFits", Text: "@[simp] instance {n : Nat} : Data.Shape.Decidable (Fits n) := ⟨true⟩", Generated: true},
 		{File: "Instances.lean", Name: "Alpha.named", Text: "instance named : Inhabited Unit := ⟨()⟩"},
 		// GF is a section variable, so it adds nothing to the name.
-		{File: "Instances.lean", Name: "Alpha.instShapeBox", Text: "instance : Shape (Box GF) := ⟨fun _ => 0⟩"},
-		{File: "Instances.lean", Name: "Gamma.instShapePoint", Text: "instance : Shape Point := ⟨fun p => p.x⟩"},
+		{File: "Instances.lean", Name: "Alpha.instShapeBox", Text: "instance : Shape (Box GF) := ⟨fun _ => 0⟩", Generated: true},
+		{File: "Instances.lean", Name: "Gamma.instShapePoint", Text: "instance : Shape Point := ⟨fun p => p.x⟩", Generated: true},
 	}
-	got := ScanDeclarations("Instances.lean", source)
+	got := ScanDeclarations("Instances.lean", source, nil)
 	if len(got) != len(want) {
 		t.Fatalf("ScanDeclarations() = %+v, want %+v", got, want)
 	}
@@ -338,7 +338,7 @@ func TestScanDeclarationsNamesAnonymousInstances(t *testing.T) {
 			t.Errorf("declaration %d = %+v, want %+v", index, got[index], want[index])
 		}
 	}
-	owners := ScanLineOwners("Instances.lean", source)
+	owners := ScanLineOwners("Instances.lean", source, nil)
 	if owner := owners[5].Owner.Name; owner != "Alpha.instInhabitedBoxOfGroup" || owners[5].IsSignature {
 		t.Errorf("line 6 owner = %q (signature %v), want the body of Alpha.instInhabitedBoxOfGroup", owner, owners[5].IsSignature)
 	}
@@ -383,7 +383,7 @@ func TestScanDeclarationsNamesUncomputableInstancesByPosition(t *testing.T) {
 		"Beta.instShapeBox",
 	}
 	var got []string
-	for _, declaration := range ScanDeclarations("Instances.lean", source) {
+	for _, declaration := range ScanDeclarations("Instances.lean", source, nil) {
 		got = append(got, declaration.Name)
 	}
 	if !sameStrings(got, want) {
