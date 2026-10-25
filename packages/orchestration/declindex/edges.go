@@ -300,35 +300,29 @@ func changedImports(r reference, before indexBefore) []string {
 
 // closureChanged are the modules whose import closure this refresh changed: those of seeds, and every module that
 // imports one of them, directly or not. A module that no longer imports a seed is a seed itself, since its own
-// imports changed, so the walk over the imports the refresh leaves finds every module whose closure moved.
+// imports changed, so the walk over the imports the refresh leaves finds every module whose closure moved. The
+// walk is the query's, on imports_imported, so it reads the importers of the seeds and no other import row.
 func closureChanged(ctx context.Context, q querier, seeds []string) ([]string, error) {
 	if len(seeds) == 0 {
 		return nil, nil
 	}
-	g, err := loadImports(ctx, q)
-	if err != nil {
+	var out []string
+	rows, err := q.Query(ctx, `
+		WITH RECURSIVE importers (module) AS (
+			SELECT unnest($1::text[]) COLLATE "C"
+			UNION
+			SELECT i.module FROM importers u JOIN imports i ON i.imported = u.module
+		)
+		SELECT module FROM importers ORDER BY module`, seeds)
+	if err := eachRow(rows, err, func(r pgx.Rows) error {
+		var m string
+		if err := r.Scan(&m); err != nil {
+			return err
+		}
+		out = append(out, m)
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	importedBy := map[string][]string{}
-	for m, is := range g {
-		for _, i := range is {
-			importedBy[i] = append(importedBy[i], m)
-		}
-	}
-	seen := map[string]bool{}
-	todo := slices.Clone(seeds)
-	for _, m := range todo {
-		seen[m] = true
-	}
-	for len(todo) > 0 {
-		m := todo[len(todo)-1]
-		todo = todo[:len(todo)-1]
-		for _, u := range importedBy[m] {
-			if !seen[u] {
-				seen[u] = true
-				todo = append(todo, u)
-			}
-		}
-	}
-	return slices.Sorted(maps.Keys(seen)), nil
+	return out, nil
 }
