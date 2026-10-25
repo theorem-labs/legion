@@ -10,6 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/internal/indextest"
 )
 
 // fixture copies the golden tree of the declindex package and writes a configuration for it.
@@ -36,11 +40,72 @@ func fixture(t *testing.T) (config string) {
 		t.Fatal(err)
 	}
 	config = filepath.Join(dir, "index.yaml")
-	body := "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Golden, Sub]\nfile_kinds: [Spec, Link, Proof]\n"
-	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Golden, Sub]\nfile_kinds: [Spec, Link, Proof]\n")
+	return config
+}
+
+// indexDSNFile is where a fixture keeps the connection string of its index. The index itself is a schema of a
+// Postgres server, named by `index:`; nothing in the tree says how to reach that server, so every command gets
+// the connection string with --index-dsn-file, as an operator's hook does.
+func indexDSNFile(config string) string { return filepath.Join(filepath.Dir(config), "index.dsn") }
+
+// writeIndexConfig writes a fixture's configuration and, beside it, the connection string of a database of its
+// own. It writes the connection string once, so that a test that rewrites its configuration keeps its index.
+func writeIndexConfig(t *testing.T, config, body string) {
+	t.Helper()
+	writeTestFile(t, config, body)
+	if _, err := os.Stat(indexDSNFile(config)); err == nil {
+		return
+	}
+	writeTestFile(t, indexDSNFile(config), indextest.DSN(t))
+}
+
+// withIndexDSN gives the command the connection string of the index that its --config names, when the fixture
+// wrote one. The flag comes first, where the global flags are.
+func withIndexDSN(args []string) []string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "--config" {
+			continue
+		}
+		if _, err := os.Stat(indexDSNFile(args[i+1])); err == nil {
+			return append([]string{"--index-dsn-file", indexDSNFile(args[i+1])}, args...)
+		}
+		break
+	}
+	return args
+}
+
+// indexConfig loads a fixture's configuration with the connection string that invoke passes with it, so that a
+// test opens the index that the commands open: declindex.Open(ctx, cfg.Target()).
+func indexConfig(t *testing.T, config string) declindex.Config {
+	t.Helper()
+	cfg, err := declindex.LoadConfig(config)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return config
+	raw, err := os.ReadFile(indexDSNFile(config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DSN = strings.TrimSpace(string(raw))
+	return cfg
+}
+
+// indexConn connects to a fixture's index schema, for the rows that a test writes itself: rows that no refresh
+// would write, to put the index in a state that the command must report.
+func indexConn(t *testing.T, cfg declindex.Config) *pgx.Conn {
+	t.Helper()
+	c, err := pgx.ParseConfig(cfg.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.RuntimeParams["search_path"] = pgx.Identifier{cfg.Index}.Sanitize()
+	conn, err := pgx.ConnectConfig(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	return conn
 }
 
 type result struct {
@@ -51,7 +116,7 @@ type result struct {
 func invoke(t *testing.T, args ...string) result {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), args, func(string) string { return "" }, &out, &errOut)
+	code := run(context.Background(), withIndexDSN(args), func(string) string { return "" }, &out, &errOut)
 	return result{code, out.String(), errOut.String()}
 }
 
