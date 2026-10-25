@@ -40,7 +40,7 @@ type LinksConfig struct {
 	// ExcludeFiles.
 	LinkFiles    []string `yaml:"link_files"`
 	ExcludeFiles []string `yaml:"exclude_files"`
-	// ContractName is an RE2 expression that a binder's type head must match whole.
+	// ContractName is an RE2 expression that the last component of a binder's compiled type head must match whole.
 	ContractName string `yaml:"contract_name"`
 	// OpenMarker followed by a reason of at least OpenMarkerMinReason characters exempts a binder.
 	OpenMarker          string `yaml:"open_marker"`
@@ -50,7 +50,8 @@ type LinksConfig struct {
 
 // ProducersConfig configures P1.
 type ProducersConfig struct {
-	// InterfaceNames are RE2 expressions; a binder's type head that matches one whole is an interface.
+	// InterfaceNames are RE2 expressions; a binder whose compiled type head's last component matches one whole
+	// binds an interface.
 	InterfaceNames []string `yaml:"interface_names"`
 	// BinderFiles are repository-relative globs of the files whose binders P1 reads.
 	BinderFiles []string `yaml:"binder_files"`
@@ -153,7 +154,7 @@ func (l LinksConfig) IsLinkFile(file string) bool {
 // Excluded reports whether the file matches exclude_files.
 func (l LinksConfig) Excluded(file string) bool { return matchAny(l.ExcludeFiles, file) }
 
-// IsContract reports whether a type head, as written, matches contract_name whole.
+// IsContract reports whether the last component of a compiled type head matches contract_name whole.
 func (l LinksConfig) IsContract(head string) bool {
 	return l.contract != nil && l.contract.MatchString(head)
 }
@@ -161,7 +162,7 @@ func (l LinksConfig) IsContract(head string) bool {
 // IsBinderFile reports whether the file matches binder_files.
 func (p ProducersConfig) IsBinderFile(file string) bool { return matchAny(p.BinderFiles, file) }
 
-// IsInterface reports whether a type head, as written, matches one of interface_names whole.
+// IsInterface reports whether the last component of a compiled type head matches one of interface_names whole.
 func (p ProducersConfig) IsInterface(head string) bool {
 	for _, re := range p.interfaces {
 		if re.MatchString(head) {

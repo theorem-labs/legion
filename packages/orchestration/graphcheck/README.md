@@ -75,9 +75,36 @@ one name in one module are Lean's own error, so C1 reports that case.
 **S2** (`statements.go`), **L1** (`links.go`) and **P1** (`producers.go`) are flags over compiled statements and
 types: nothing is refused on them.
 
-P1 is a name-level signal. It accepts an instance, a declaration whose conclusion is the interface, or a use of
-the interface's constructor, so a producer written in a way it does not recognise is a **missed flag**, never a
-false refusal.
+**L1** (`links.go`). In a file that matches `link_files` and not `exclude_files`, an explicit binder of a public
+theorem whose type head matches `contract_name` is flagged when a public theorem of another directory's link file
+concludes that same head: the candidate keeps as a hypothesis what the tree already proves. The heads are the
+exporter's, so a head written through an open namespace is the head it resolves to, and `contract_name` matches
+the head's last name component. The links of the base come from the index (`ConstantsConcluding`), those of the
+candidate's own changed link files from their compiled constants. A binder is left alone when the declaration's
+doc comment, the binder's line or the line above holds `open_marker` and at least `open_marker_min_reason`
+characters of reason, which is a convention of the text and the only thing either rule reads a comment for.
+
+**P1** (`producers.go`). In a file that matches `binder_files`, an explicit binder whose type head matches one of
+`interface_names` (again on the head's last component) is flagged when the candidate has no producer of that
+interface. A producer is a declaration someone wrote whose conclusion is the interface — an instance, a
+definition, a theorem — or a declaration that applies the interface's constructor; the constructor and the
+projections Lean generates are not producers of their own structure. A binder that already had no producer at the
+base is the base's state and is not reported. A binder whose last producer the candidate removes is reported, at
+the binder, and the finding names that producer, whether the binder's file changed or not.
+
+P1 is a name-level signal. An instance is real only if a Lean theorem builds it from a state that the model
+reaches; P1 does not check that. It accepts any instance, any declaration whose conclusion names the interface,
+and any use of the interface's constructor as a producer. P1 only flags, so a producer it accepts that is not real
+is a **missed flag**, never a false refusal.
+
+Both rules judge Lean by its compiled output alone, so both need the index's compiled part. With an index read
+without it (`lean.export` off) `CompiledCommit` refuses the read and the check is **unable** (exit 3) rather than
+silent: a rule with nothing to judge by must not report a clean candidate.
+
+**S2** (`statements.go`). A declaration a compiled candidate module adds whose compiled statement hash (the
+exporter's, the index's `cstmt`) equals another declaration's — one the base has outside the changed modules, or
+another new one — is flagged at the new declaration, naming the other. A rename restates nothing: the old name and
+its hash leave the candidate with it.
 
 ## Configuration
 
@@ -104,6 +131,7 @@ library directory), `jobs`, `lean.toolchain` and `lean.search_path`. `graphcheck
 - The index's tree is not a checkout root, so its module paths are not repository paths.
 - `LAND_BASE` or `LAND_TREE` is unset or unknown to the repository.
 - A changed module does not compile and Lean's output names no declaration.
+- `statements`, `links` or `producers` runs on an index read without its compiled part (`lean.export` off).
 - A configured input is missing or of the wrong format (exit 2 when the configuration file itself is wrong).
 
 ## Limits
@@ -115,6 +143,8 @@ library directory), `jobs`, `lean.toolchain` and `lean.search_path`. `graphcheck
 - A removed field is seen only where the index read the module with its compiled part (the exporter's constants):
   a field is the compiled constant `S.f`, and no module's declarations hold it. An index without that part gives
   no field finding — a miss, never a false refusal.
+- S2 compares compiled statement hashes. A copy of a structure whose field has a tactic default does not hash
+  equal to the original, because its constructor names the field's own default constant, so S2 misses that copy.
 - The candidate side needs a Lean toolchain and the base build's `.olean` files. The package's rule tests build
   the fixture for real; without a toolchain they skip, and `GRAPHCHECK_REQUIRE_LEAN` turns that skip into a
   failure, as the `orchestration-lean` workflow does.

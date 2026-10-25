@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -315,11 +318,54 @@ func (c *Candidate) compile(ctx context.Context, idx *declindex.Store) error {
 		m.Imports = h.imports
 		c.graph[m.Module] = m.Imports
 		if h.err != "" {
-			m.State, m.Errors = Failed, []LeanError{{Line: 1, Col: 1, Message: h.err}}
+			m.State, m.Output = Failed, h.err
+			m.Errors = []LeanError{{File: m.Path, Line: 1, Col: 1, Message: h.err}}
 		}
 	}
 	c.closure()
+	if err := c.linkBase(); err != nil {
+		return err
+	}
 	return c.compileBuilt(ctx, changed)
+}
+
+// linkBase fills the scratch with the base build's outputs, so that it is a complete library of the candidate.
+// Lean resolves every module of a root in the first search-path directory that holds that root and looks no
+// further, so the changed modules and the unchanged ones have to sit together. The outputs of a changed module
+// are left out: its own compile writes them, and a deleted module's are gone from the candidate. The links are
+// symbolic, and no compile writes through one.
+func (c *Candidate) linkBase() error {
+	return filepath.WalkDir(c.icfg.Lib, func(p string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(c.icfg.Lib, p)
+		if err != nil {
+			return err
+		}
+		if c.byModule[moduleOfOutput(rel)] != nil {
+			return nil
+		}
+		target := filepath.Join(c.scratch, rel)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := os.Symlink(p, target); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		return nil
+	})
+}
+
+// moduleOfOutput is the module one build output belongs to: its path without the first suffix of its last
+// component, so that Lib/Core.olean, Lib/Core.olean.hash and Lib/Core.trace all give Lib.Core.
+func moduleOfOutput(rel string) string {
+	rel = filepath.ToSlash(rel)
+	slash := strings.LastIndexByte(rel, '/')
+	if dot := strings.IndexByte(rel[slash+1:], '.'); dot >= 0 {
+		rel = rel[:slash+1+dot]
+	}
+	return strings.ReplaceAll(rel, "/", ".")
 }
 
 // closure computes the modules the build builds: the closure of build_roots over the candidate's import graph,
@@ -394,8 +440,9 @@ func (c *Candidate) headerImports(ctx context.Context, files []string) ([]header
 	return headers, nil
 }
 
-// compileBuilt compiles the changed modules that the build builds, each once every changed module it imports is
-// compiled, at most jobs at a time. A module whose changed import did not compile is skipped.
+// compileBuilt compiles the changed modules that the build builds. Each starts as soon as every changed module in
+// its import closure is compiled, at most 48 at a time; a module whose closure holds a changed module that did not
+// compile is skipped, and so are the modules waiting for it.
 func (c *Candidate) compileBuilt(ctx context.Context, changed []*Module) error {
 	pending := map[string]*Module{}
 	for _, m := range changed {
@@ -403,71 +450,127 @@ func (c *Candidate) compileBuilt(ctx context.Context, changed []*Module) error {
 			pending[m.Module] = m
 		}
 	}
+	if len(pending) == 0 {
+		return nil
+	}
 	jobs := c.icfg.Jobs
 	if jobs <= 0 {
-		jobs = min(48, runtime.NumCPU())
+		jobs = runtime.NumCPU()
 	}
+	jobs = min(jobs, 48)
 	searchPath := append([]string{c.icfg.Lib}, c.icfg.Lean.SearchPath...)
 	roots := declindex.Roots{}
 	for _, r := range c.icfg.Roots {
 		roots[r] = true
 	}
-	for len(pending) > 0 {
-		var ready []*Module
-		for _, m := range pending {
-			waiting, skip := false, false
-			for _, imp := range m.Imports {
-				dep := c.modules[imp]
-				if dep == nil || imp == m.Module {
-					continue
-				}
-				switch {
-				case pending[imp] != nil:
-					waiting = true
-				case dep.State == Failed || dep.State == Skipped || (dep.State == NotBuilt && c.built[imp]):
-					skip = true
-				}
-			}
-			switch {
-			case skip:
-				m.State = Skipped
-				delete(pending, m.Module)
-			case !waiting:
-				ready = append(ready, m)
+	// deps are the changed modules in each module's closure, waits how many of them are still pending, and users
+	// the pending modules that wait for each one.
+	deps := make(map[string][]string, len(pending))
+	waits := make(map[string]int, len(pending))
+	users := map[string][]*Module{}
+	for name, m := range pending {
+		deps[name] = c.changedDeps(m)
+		for _, d := range deps[name] {
+			if pending[d] != nil {
+				waits[name]++
+				users[d] = append(users[d], m)
 			}
 		}
-		if len(ready) == 0 {
-			if len(pending) == 0 {
+	}
+	var queue []*Module
+	left := len(pending)
+	// finish records a module that compiled, failed or was skipped, and makes ready each user it was the last wait
+	// of; a ready user with a changed module in its closure that did not compile is skipped, and finished in turn.
+	var finish func(m *Module)
+	finish = func(m *Module) {
+		left--
+		for _, u := range users[m.Module] {
+			if waits[u.Module]--; waits[u.Module] != 0 {
+				continue
+			}
+			if c.closureFailed(deps[u.Module]) {
+				u.State = Skipped
+				finish(u)
+				continue
+			}
+			queue = append(queue, u)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(pending)) {
+		if m := pending[name]; waits[name] == 0 {
+			if c.closureFailed(deps[name]) {
+				m.State = Skipped
+				finish(m)
+			} else {
+				queue = append(queue, m)
+			}
+		}
+	}
+	type result struct {
+		m   *Module
+		err error
+	}
+	results := make(chan result, len(pending))
+	running := 0
+	var firstErr error
+	for left > 0 || running > 0 {
+		for firstErr == nil && running < jobs && len(queue) > 0 {
+			m := queue[0]
+			queue = queue[1:]
+			running++
+			go func() { results <- result{m, c.compileOne(ctx, m, searchPath, roots)} }()
+		}
+		if running == 0 {
+			if firstErr != nil || left == 0 {
 				break
 			}
+			// Nothing runs and nothing is ready, yet modules wait: they import each other.
 			for _, m := range pending {
-				m.State, m.Errors = Failed, []LeanError{{Line: 1, Col: 1, Message: "import cycle among the changed modules"}}
-				delete(pending, m.Module)
+				if m.State == NotBuilt {
+					m.State, m.Errors = Failed, []LeanError{{File: m.Path, Line: 1, Col: 1, Message: "import cycle among the changed modules"}}
+				}
 			}
 			break
 		}
-		sort.Slice(ready, func(i, j int) bool { return ready[i].Module < ready[j].Module })
-		errs := make([]error, len(ready))
-		sem := make(chan struct{}, jobs)
-		var wg sync.WaitGroup
-		for i, m := range ready {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func() {
-				defer wg.Done()
-				defer func() { <-sem }()
-				errs[i] = c.compileOne(ctx, m, searchPath, roots)
-			}()
+		r := <-results
+		running--
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
 		}
-		wg.Wait()
-		for i, m := range ready {
-			if errs[i] != nil {
-				return errs[i]
-			}
-			delete(pending, m.Module)
+		finish(r.m)
+	}
+	return firstErr
+}
+
+// changedDeps gives the changed modules a module imports, directly or through unchanged modules: Lean reads the
+// .olean of every module in the import closure, so each of them must be compiled first.
+func (c *Candidate) changedDeps(m *Module) []string {
+	seen := map[string]bool{m.Module: true}
+	var out []string
+	stack := slices.Clone(m.Imports)
+	for len(stack) > 0 {
+		name := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if c.modules[name] != nil {
+			out = append(out, name)
+		}
+		stack = append(stack, c.graph[name]...)
+	}
+	return out
+}
+
+// closureFailed reports whether one of the changed modules a module needs did not compile.
+func (c *Candidate) closureFailed(deps []string) bool {
+	for _, d := range deps {
+		if s := c.modules[d].State; s == Failed || s == Skipped {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // leanMessageRE is the first line of one of Lean's messages: `<file>:<line>:<col>: <severity>: <text>`.

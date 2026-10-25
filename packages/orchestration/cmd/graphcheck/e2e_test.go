@@ -75,8 +75,8 @@ func landConfig(t *testing.T, f *graphchecktest.Fixture, members []map[string]an
 		"batchId": "e2e", "repository": map[string]any{"name": "fixture", "path": f.Repo, "git_dir": filepath.Join(f.Repo, ".git")},
 		"base": f.Base, "baseBranch": "main", "statePath": filepath.Join(t.TempDir(), "state.json"), "members": members,
 		"build": []string{"sh", "-c", "exit 99"}, "hasher": []string{"true"}, "toolchain": []string{"true"},
-		"ledger": map[string]any{"check": []string{"true"}, "land": []string{"true"}, "return": []string{"true"},
-			"status": []string{"true"}, "migrationState": []string{"true"}},
+		"escalations": map[string]any{"owner": "steward"},
+		"ledger":      map[string]any{"command": []string{"true"}, "status": []string{"true"}, "migrationState": []string{"true"}},
 		"checks": []map[string]any{{"name": "names", "format": "graph",
 			"command": []string{graphcheckBin, "names", "--config", f.ConfigPath}}},
 	})
@@ -133,13 +133,15 @@ func TestC1AttributesLeansErrorToTheChangedMember(t *testing.T) {
 	if v.Verdict != "fail" || len(v.Refused) == 0 {
 		t.Fatalf("names verdict = %+v", v)
 	}
+	sawC1 := false
 	for _, r := range v.Refused {
 		if r.Member != "culprit" {
 			t.Fatalf("refusal %+v, want the member that made Lib.Core.helper private", r)
 		}
-		if !strings.HasPrefix(r.Reason, "C1:") {
-			t.Fatalf("refusal %+v, want Lean's own error as the reason", r)
-		}
+		sawC1 = sawC1 || (strings.HasPrefix(r.Reason, "C1:") && r.Path == "Lib/Open.lean")
+	}
+	if !sawC1 {
+		t.Fatalf("refusals %+v, want Lean's own error in Lib/Open.lean among them", v.Refused)
 	}
 }
 

@@ -283,9 +283,13 @@ func (n *nameState) keepOutermost() {
 }
 
 // readStructures records the base structures and classes of the changed modules, and, when there are any, the
-// compiled constants of the candidate's modules, which is where a field lives.
+// compiled constants of the candidate's modules, which is where a field lives. An index read without its
+// compiled part knows no field, so nothing is read and no field is reported: a miss, never a false refusal.
 func (n *nameState) readStructures(ctx context.Context) error {
 	n.structures = map[string][]string{}
+	if _, err := n.idx.CompiledCommit(ctx, true); err != nil {
+		return nil
+	}
 	for file, decls := range n.baseDecls {
 		if ch := n.c.Change(file); ch == nil || ch.Status == Deleted {
 			continue

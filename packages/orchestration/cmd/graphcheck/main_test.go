@@ -117,7 +117,7 @@ func TestEveryRuleGroupPrintsParseableLines(t *testing.T) {
 	f := graphchecktest.New(t)
 	tree := f.EditMany(t, map[string][2]string{
 		"Lib/Core.lean":        {"def size : Nat := 3", "def size : Nat := 4"},
-		"Lib/Copy.lean":        {"", "namespace Lib.Copy\n\nstructure Box where\n  val : Nat\n  ok : val > 0 := by decide\n\nend Lib.Copy\n"},
+		"Lib/Copy.lean":        {"", "namespace Lib.Copy\n\nstructure PortCopy where\n  id : Nat\n\nend Lib.Copy\n"},
 		"Lib/Drv/LinkDrv.lean": {"", "import Lib.Spec.LinkSpec\nimport Lib.Iface\n\nopen Lib.Spec Lib.Iface\n\ntheorem keeps (h : SIZE_OK) (p : Port) : True := trivial\n"},
 	})
 	env := []string{"LAND_BASE=" + f.Base, "LAND_TREE=" + tree}

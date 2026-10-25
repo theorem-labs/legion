@@ -23,18 +23,20 @@ func statements(t *testing.T, f *graphchecktest.Fixture, tree string) []landing.
 	return hits
 }
 
+// A structure that restates Lib.Iface.Port: the compiled statement of an inductive reads its constructors' types
+// and its field names, so a copy under another name hashes the same.
 func TestS2FlagsARestatedStructure(t *testing.T) {
 	f := graphchecktest.New(t)
-	tree := f.Edit(t, "Lib/Copy.lean", "", "namespace Lib.Copy\n\nstructure BoxCopy where\n  val : Nat\n  ok : val > 0 := by decide\n\nend Lib.Copy\n")
+	tree := f.Edit(t, "Lib/Copy.lean", "", "namespace Lib.Copy\n\nstructure PortCopy where\n  id : Nat\n\nend Lib.Copy\n")
 	hits := statements(t, f, tree)
-	h, ok := find(hits, landing.VerdictFlag, blame.Added, "Lib.Copy.BoxCopy", "Lib/Copy.lean", "S2")
+	h, ok := find(hits, landing.VerdictFlag, blame.Added, "Lib.Copy.PortCopy", "Lib/Copy.lean", "S2")
 	if !ok || h.Line != 3 || h.Col != 1 {
 		t.Fatalf("no S2 flag at Lib/Copy.lean:3:1 in %v", hits)
 	}
-	if want := "S2: restates Lib.Core.Box (Lib/Core.lean:7); a concept proposal goes to the similarity gate first"; h.Reason != want {
+	if want := "S2: restates Lib.Iface.Port (Lib/Iface.lean:6); a concept proposal goes to the similarity gate first"; h.Reason != want {
 		t.Fatalf("reason %q, want %q", h.Reason, want)
 	}
-	// The constructor restates Box's too, but it is part of the structure, not a declaration of its own.
+	// The constructor restates Port.mk too, but it is part of the structure, not a declaration of its own.
 	if len(ruleHits(hits, "S2")) != 1 {
 		t.Fatalf("S2 findings %v, want only the structure's", hits)
 	}
