@@ -130,10 +130,15 @@ type scanner struct {
 	currentMatchArm    bool
 	currentArrow       bool
 	// anonymous is set while the current declaration is an instance without
-	// a name, which is named when its signature ends; instances counts the
-	// file's anonymous instances of each class so far.
-	anonymous bool
-	instances map[string]int
+	// a name; anonymousInstances holds the file's anonymous instances, which
+	// nameAnonymousInstances names once the whole file is read.
+	anonymous          bool
+	anonymousInstances []anonymousInstance
+	// variables holds the names a `variable` command binds. Lean includes a
+	// section variable in no generated name. The scanner keeps them for the
+	// whole file: a name that a section no longer binds still contributes
+	// nothing, which is the safe direction.
+	variables map[string]bool
 	// inString is set inside a string literal. rawHashes is the number of #
 	// that close a raw string literal, or -1 in an ordinary one. literals
 	// holds the byte spans of the current line's code that are string or
@@ -304,14 +309,41 @@ func (s *scanner) command(code string, startedInString bool) scanned {
 	}
 	if commandRE.MatchString(code) || s.inDeclaration && s.startsCommand(code) {
 		s.endDeclaration()
+		s.recordVariables(code)
 		return scanned{}
 	}
 	return s.continuation(code, true)
 }
 
+// recordVariables adds the names a `variable` command binds, which Lean
+// includes in no generated name. The names are those bound before each
+// group's `:`, outside every bracket of the group.
+func (s *scanner) recordVariables(code string) {
+	trimmed := strings.TrimLeft(code, " \t")
+	if word := firstWord(trimmed); word != "variable" && word != "variables" {
+		return
+	}
+	for _, group := range splitBinderGroups(trimmed) {
+		names := group[1 : len(group)-1]
+		if colon := topLevelIndex(group[1:], ":"); colon >= 0 && !strings.HasPrefix(group[1+colon:], ":=") {
+			names = group[1 : 1+colon]
+		} else if group[0] == '[' {
+			// An instance binder without a name binds none.
+			continue
+		}
+		for _, name := range strings.Fields(names) {
+			if s.variables == nil {
+				s.variables = map[string]bool{}
+			}
+			s.variables[name] = true
+		}
+	}
+}
+
 // startDeclaration ends the current declaration and starts one named name,
 // declared by the keyword kind, on a declaration line. An anonymous
-// instance's name is "" until its signature ends.
+// instance's name is set by nameAnonymousInstances, once the whole file is
+// read.
 func (s *scanner) startDeclaration(code, pendingText, name, kind string, private, protected bool) {
 	s.endDeclaration()
 	s.declarations = append(s.declarations, Declaration{File: s.file, Name: name, Private: private, Protected: protected, Kind: kind, Line: s.line})
@@ -509,8 +541,10 @@ func indentation(code string) int {
 	return len(code) - len(strings.TrimLeft(code, " \t"))
 }
 
-// endSignature stores the open signature as the current declaration's Text,
-// and names an anonymous instance from it.
+// endSignature stores the open signature as the current declaration's Text.
+// An anonymous instance's name is resolved in finish, which needs the whole
+// file; its computed name and namespace are recorded here, while the scopes
+// are still its own (a line that changes them ends the declaration first).
 func (s *scanner) endSignature() {
 	if !s.inSignature {
 		return
@@ -522,18 +556,10 @@ func (s *scanner) endSignature() {
 		declaration.Extends = extendsBeforeWhere(declaration.Text)
 	}
 	if s.anonymous {
-		// A line that changes the scopes ends the declaration first, so the
-		// scopes are still the instance's. Lean names a repeated name in a
-		// namespace name_1, name_2 and so on.
-		base := s.qualify(instanceName(declaration.Text))
-		if s.instances == nil {
-			s.instances = map[string]int{}
-		}
-		declaration.Name = base
-		if count := s.instances[base]; count != 0 {
-			declaration.Name = base + "_" + strconv.Itoa(count)
-		}
-		s.instances[base]++
+		name, computed := instanceName(declaration.Text, s.variables)
+		s.anonymousInstances = append(s.anonymousInstances, anonymousInstance{
+			index: len(s.declarations) - 1, prefix: s.prefix(), name: name, computed: computed,
+		})
 	}
 }
 
@@ -551,6 +577,72 @@ func extendsBeforeWhere(text string) bool {
 	return false
 }
 
+// anonymousInstance is an instance declared without a name: index is its
+// declaration, prefix the namespace it is in, and name the name Lean
+// generates for it when computed is set.
+type anonymousInstance struct {
+	index    int
+	prefix   string
+	name     string
+	computed bool
+}
+
+// nameAnonymousInstances names the file's anonymous instances, once the whole
+// file is read.
+//
+// An instance keeps the name Lean generates for it only when the scanner
+// computed that name exactly and the name is the file's alone: Lean numbers a
+// repeated name `_1`, `_2` by what the namespace already holds, which one
+// file does not say, so a guessed number can be the name Lean gives another
+// instance. Every other anonymous instance is named by its position among the
+// file's anonymous instances. `<anon-instance>` is not a Lean identifier, so
+// such a name never equals a name Lean generates, and a diagnostic that names
+// a generated instance finds no declaration rather than the wrong one.
+//
+// The scanner reads one file, so it cannot see the rest of the namespace:
+// when two files of one namespace generate the same name, Lean numbers the
+// later one and the scanner gives both the unnumbered name. On the round-177
+// base that is 8 names over 19 of the 1,712 anonymous instances, all of the
+// form instDecidable<Predicate> or instPersistent<Predicate>. Closing it
+// needs the whole project, which neither the evidence step (a member's
+// changed files) nor one tree scan gives a declaration in isolation.
+func (s *scanner) nameAnonymousInstances() {
+	taken := map[string]int{}
+	for index, declaration := range s.declarations {
+		if !s.isAnonymous(index) {
+			taken[declaration.Name]++
+		}
+	}
+	for _, instance := range s.anonymousInstances {
+		if instance.computed {
+			taken[qualifyIn(instance.prefix, instance.name)]++
+		}
+	}
+	for position, instance := range s.anonymousInstances {
+		name := qualifyIn(instance.prefix, instance.name)
+		if !instance.computed || taken[name] != 1 {
+			name = qualifyIn(instance.prefix, "<anon-instance>#"+strconv.Itoa(position+1))
+		}
+		s.declarations[instance.index].Name = name
+	}
+}
+
+func (s *scanner) isAnonymous(index int) bool {
+	for _, instance := range s.anonymousInstances {
+		if instance.index == index {
+			return true
+		}
+	}
+	return false
+}
+
+func qualifyIn(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "." + name
+}
+
 // instanceBinder is one binder group of an anonymous instance: the names it
 // binds and their type.
 type instanceBinder struct {
@@ -562,18 +654,23 @@ type instanceBinder struct {
 // signature (Lean.Elab.Command.NameGen): "inst", the constants of the
 // instance's type, then "Of" and the constants of each binder that neither
 // the type nor a later binder depends on. Each constant is its last name
-// component, capitalised, and appears once. Bound names, one-letter names
-// (which Lean binds automatically), named arguments and keywords add nothing.
+// component, capitalised, and appears once. A bound name, a section variable
+// in variables, a one-letter name (Lean binds it automatically), a named
+// argument and a keyword all add nothing. computed is false when the scanner
+// cannot be sure the name is Lean's, which computableType decides.
 //
-// The scanner does not elaborate, so the name differs from Lean's for an
-// instance whose type has a numeral (Lean names its OfNat), an implicit
-// argument written explicitly, or only constants from outside the project
-// (Lean adds a module suffix), and Lean counts repeats across every module
-// of the namespace, not one file. A diagnostic naming Lean's name then finds
-// no declaration, as it did before anonymous instances were recorded.
-func instanceName(text string) string {
+// A residual case computed does not catch: when no constant of the name is
+// defined in the project, Lean appends a suffix made from the module
+// (mkBaseNameWithSuffix), which the scanner cannot see. The name is then not
+// Lean's, and a diagnostic that names the instance finds no declaration. It
+// cannot name another instance of the same file, because two instances of one
+// file never keep the same computed name.
+func instanceName(text string, variables map[string]bool) (string, bool) {
 	binders, typ := splitInstance(instancePrefixRE.ReplaceAllString(text, ""))
 	bound := map[string]bool{}
+	for name := range variables {
+		bound[name] = true
+	}
 	groups := make([]instanceBinder, 0, len(binders))
 	for _, group := range binders {
 		names, typ := "", group
@@ -597,20 +694,76 @@ func instanceName(text string) string {
 	// Lean names the type first, then each binder from the innermost out,
 	// and writes the binders from the outermost in.
 	suffixes := make([]string, len(groups))
+	computed := computableType(typ, bound)
 	for index := len(groups) - 1; index >= 0; index-- {
 		if dependsOn(groups[index].names, typ, groups[index+1:]) {
 			continue
 		}
+		computed = computed && computableType(groups[index].typ, bound)
 		if words := constantWords(groups[index].typ, bound, seen); words != "" {
 			suffixes[index] = "Of" + words
 		}
 	}
-	return name + strings.Join(suffixes, "")
+	return name + strings.Join(suffixes, ""), computed
+}
+
+// computableType reports whether the scanner reads a type the way Lean's name
+// generator does. It rejects every shape whose name needs elaboration:
+// notation such as `→`, `×`, `+` and `∀`, which Lean names by the constants
+// behind it; a type ascription or any other `:`, which Lean ignores; a
+// numeral, whose `OfNat` Lean names; a projection of a bound name such as
+// `st.room`, where Lean names the projected structure's field instead; and
+// `inferInstance`, whose value Lean elaborates. Only identifiers, dotted
+// constant names, spaces and round brackets remain.
+func computableType(typ string, bound map[string]bool) bool {
+	for _, word := range identifiers(typ) {
+		if word == "inferInstance" {
+			return false
+		}
+		if base, _, dotted := strings.Cut(word, "."); dotted && bound[base] {
+			return false
+		}
+	}
+	for index := 0; index < len(typ); {
+		r, size := utf8.DecodeRuneInString(typ[index:])
+		switch {
+		case unicode.IsLetter(r) && r != 'λ', r == '_', r == '\'', r == '.':
+		case r == ' ' || r == '\t' || r == '(' || r == ')':
+		case unicode.IsDigit(r):
+			// A digit is part of an identifier, never a numeral of its own.
+			if index == 0 || !identifierRune(rune(typ[index-1])) {
+				return false
+			}
+		default:
+			return false
+		}
+		index += size
+	}
+	return true
 }
 
 // splitInstance splits an anonymous instance's signature after the word
 // instance into its bracketed binder groups and its type, without the body.
 func splitInstance(text string) ([]string, string) {
+	groups := splitBinderGroups(text)
+	colon := topLevelIndex(text, ":")
+	if colon < 0 || strings.HasPrefix(text[colon:], ":=") {
+		return groups, ""
+	}
+	typ := text[colon+1:]
+	if body := topLevelIndex(typ, ":="); body >= 0 {
+		typ = typ[:body]
+	}
+	typ = strings.TrimSpace(typ)
+	if lastWord(typ) == "where" {
+		typ = strings.TrimSpace(strings.TrimSuffix(typ, "where"))
+	}
+	return groups, typ
+}
+
+// splitBinderGroups returns the bracketed binder groups of text, in order,
+// up to the first `:` outside every bracket.
+func splitBinderGroups(text string) []string {
 	var groups []string
 	depth, start := 0, -1
 	for index, r := range text {
@@ -626,19 +779,11 @@ func splitInstance(text string) ([]string, string) {
 				groups = append(groups, text[start:index+utf8.RuneLen(r)])
 				start = -1
 			}
-		case r == ':' && depth == 0:
-			typ := text[index+1:]
-			if body := topLevelIndex(typ, ":="); body >= 0 {
-				typ = typ[:body]
-			}
-			typ = strings.TrimSpace(typ)
-			if lastWord(typ) == "where" {
-				typ = strings.TrimSpace(strings.TrimSuffix(typ, "where"))
-			}
-			return groups, typ
+		case r == ':' && depth == 0 && !strings.HasPrefix(text[index:], ":="):
+			return groups
 		}
 	}
-	return groups, ""
+	return groups
 }
 
 // topLevelIndex is the index of the first token in text outside every
@@ -738,9 +883,11 @@ func (s *scanner) endDeclaration() {
 	s.currentIsStructure, s.currentMatchArm, s.currentArrow, s.anonymous = false, false, false, false
 }
 
-// finish ends the source and returns its declarations.
+// finish ends the source, names its anonymous instances and returns its
+// declarations.
 func (s *scanner) finish() []Declaration {
 	s.endDeclaration()
+	s.nameAnonymousInstances()
 	return s.declarations
 }
 

@@ -300,31 +300,36 @@ func TestScanDeclarationsEndsSignatureOnlyAtBody(t *testing.T) {
 	}
 }
 
-// An anonymous instance is recorded under the name Lean generates for it:
-// inst, the constants of its type, and Of with the constants of each binder
-// its type does not depend on; a repeat in the same namespace gets _1, _2.
-// The expected names are what Lean 4.35 generated for this source. The type
-// may be on a continuation line, after modifiers and a priority.
+// An anonymous instance whose generated name the scanner can compute exactly
+// is recorded under it: inst, the constants of its type, and Of with the
+// constants of each binder its type does not depend on. A section variable
+// contributes nothing, as in Lean. The expected names are what Lean 4.35
+// generated for this source. The type may be on a continuation line, after
+// modifiers and a priority.
 func TestScanDeclarationsNamesAnonymousInstances(t *testing.T) {
-	source := "namespace Alpha\n" +
+	source := "variable {GF : Type} [Group GF]\n" +
+		"namespace Alpha\n" +
 		"instance : Inhabited Point := ⟨⟨0⟩⟩\n" +
-		"noncomputable instance (priority := low) [Group G] (x : G) :\n" +
-		"    Inhabited (Box x) where\n" +
+		"noncomputable instance (priority := low) (G : Type) [Group G] :\n" +
+		"    Inhabited (Box G) where\n" +
 		"  default := ⟨0⟩\n" +
 		"@[simp] instance {n : Nat} : Data.Shape.Decidable (Fits n) := ⟨true⟩\n" +
 		"instance named : Inhabited Unit := ⟨()⟩\n" +
-		"instance : Inhabited Point := ⟨⟨2⟩⟩\n" +
+		"instance : Shape (Box GF) := ⟨fun _ => 0⟩\n" +
 		"end Alpha\n" +
-		"instance : Inhabited Point := ⟨⟨1⟩⟩\n"
-	got := ScanDeclarations("Instances.lean", source)
+		"namespace Gamma\n" +
+		"instance : Shape Point := ⟨fun p => p.x⟩\n" +
+		"end Gamma\n"
 	want := []Declaration{
 		{File: "Instances.lean", Name: "Alpha.instInhabitedPoint", Text: "instance : Inhabited Point := ⟨⟨0⟩⟩"},
-		{File: "Instances.lean", Name: "Alpha.instInhabitedBoxOfGroup", Text: "noncomputable instance (priority := low) [Group G] (x : G) : Inhabited (Box x) where"},
+		{File: "Instances.lean", Name: "Alpha.instInhabitedBoxOfGroup", Text: "noncomputable instance (priority := low) (G : Type) [Group G] : Inhabited (Box G) where"},
 		{File: "Instances.lean", Name: "Alpha.instDecidableFits", Text: "@[simp] instance {n : Nat} : Data.Shape.Decidable (Fits n) := ⟨true⟩"},
 		{File: "Instances.lean", Name: "Alpha.named", Text: "instance named : Inhabited Unit := ⟨()⟩"},
-		{File: "Instances.lean", Name: "Alpha.instInhabitedPoint_1", Text: "instance : Inhabited Point := ⟨⟨2⟩⟩"},
-		{File: "Instances.lean", Name: "instInhabitedPoint", Text: "instance : Inhabited Point := ⟨⟨1⟩⟩"},
+		// GF is a section variable, so it adds nothing to the name.
+		{File: "Instances.lean", Name: "Alpha.instShapeBox", Text: "instance : Shape (Box GF) := ⟨fun _ => 0⟩"},
+		{File: "Instances.lean", Name: "Gamma.instShapePoint", Text: "instance : Shape Point := ⟨fun p => p.x⟩"},
 	}
+	got := ScanDeclarations("Instances.lean", source)
 	if len(got) != len(want) {
 		t.Fatalf("ScanDeclarations() = %+v, want %+v", got, want)
 	}
@@ -334,8 +339,55 @@ func TestScanDeclarationsNamesAnonymousInstances(t *testing.T) {
 		}
 	}
 	owners := ScanLineOwners("Instances.lean", source)
-	if owner := owners[4].Owner.Name; owner != "Alpha.instInhabitedBoxOfGroup" || owners[4].IsSignature {
-		t.Errorf("line 5 owner = %q (signature %v), want the body of Alpha.instInhabitedBoxOfGroup", owner, owners[4].IsSignature)
+	if owner := owners[5].Owner.Name; owner != "Alpha.instInhabitedBoxOfGroup" || owners[5].IsSignature {
+		t.Errorf("line 6 owner = %q (signature %v), want the body of Alpha.instInhabitedBoxOfGroup", owner, owners[5].IsSignature)
+	}
+}
+
+// The scanner does not elaborate, so for a shape whose generated name it
+// cannot compute exactly it records a positional name that no Lean name can
+// equal, rather than a guess that may be the name Lean gives another
+// instance. Two anonymous instances whose computed name is the same are both
+// positional: Lean numbers the second one by what the whole namespace already
+// holds, which one file does not say.
+func TestScanDeclarationsNamesUncomputableInstancesByPosition(t *testing.T) {
+	source := "namespace Beta\n" +
+		// A repeated base name: Lean gives instInhabitedPoint and
+		// instInhabitedPoint_1, numbered by what the namespace already holds.
+		"instance : Inhabited Point := ⟨⟨0⟩⟩\n" +
+		"instance : Inhabited Point := ⟨⟨2⟩⟩\n" +
+		// Notation: Lean names its constants (instInhabitedForallPoint,
+		// instInhabitedProdPointNat).
+		"instance : Inhabited (Point → Point) := ⟨id⟩\n" +
+		"instance : Inhabited (Point × Nat) := ⟨(default, 0)⟩\n" +
+		// A numeral: Lean names its OfNat (instInhabitedVecOfNatNat).
+		"instance : Inhabited (Vec 1) := ⟨⟨0⟩⟩\n" +
+		// A projection of a binder: Lean drops the binder (instTimelessRoom).
+		"instance (st : St) (k : Nat) : Timeless (st.room k) := ⟨trivial⟩\n" +
+		// An ascription: Lean ignores it (instTimelessWrapTrue).
+		"instance : Timeless (wrap True : IProp) := ⟨trivial⟩\n" +
+		// A computed name that a declaration of the same file already has:
+		// Lean numbers the instance instShapeBox_1.
+		"instance : Shape Box := ⟨fun _ => 0⟩\n" +
+		"def instShapeBox : Nat := 0\n" +
+		"end Beta\n"
+	want := []string{
+		"Beta.<anon-instance>#1",
+		"Beta.<anon-instance>#2",
+		"Beta.<anon-instance>#3",
+		"Beta.<anon-instance>#4",
+		"Beta.<anon-instance>#5",
+		"Beta.<anon-instance>#6",
+		"Beta.<anon-instance>#7",
+		"Beta.<anon-instance>#8",
+		"Beta.instShapeBox",
+	}
+	var got []string
+	for _, declaration := range ScanDeclarations("Instances.lean", source) {
+		got = append(got, declaration.Name)
+	}
+	if !sameStrings(got, want) {
+		t.Errorf("names = %q, want %q", got, want)
 	}
 }
 
