@@ -46,17 +46,21 @@ type Unresolved struct {
 	Why string `json:"why"`
 }
 
-// Load reads and checks a manifest. It reads the manifest and its logs through one handle on the manifest's
-// directory, so a path through a symbolic link and `..` cannot read the manifest in one directory and its logs in
-// another. The JSON must spell every key exactly once and exactly as the format does: a repeated key, a key in
-// another case, an unknown key or a trailing value is refused.
+// Load reads and checks a manifest. It reads the manifest and its logs through one handle on the directory the
+// operating system resolves for the path's directory part, uncleaned, so the file it reads is the one the path names
+// (`link/..` included) and its logs are checked beside that file. The JSON must spell every key exactly once and
+// exactly as the format does: a repeated key, a key in another case, an unknown key or a trailing value is refused.
 func Load(path string) (Manifest, error) {
-	root, err := os.OpenRoot(filepath.Dir(path))
+	dir, name := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("open manifest directory: %w", err)
 	}
 	defer root.Close()
-	file, err := root.Open(filepath.Base(path))
+	file, err := root.Open(name)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("open manifest: %w", err)
 	}

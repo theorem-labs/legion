@@ -369,6 +369,32 @@ func TestLoadReadsTheManifestAndItsLogsInOneDirectory(t *testing.T) {
 	}
 }
 
+// Load reads the file the operating system opens for the path, `..` after a symbolic link included, not the file of
+// the lexically cleaned path.
+func TestLoadReadsTheFileThePathNames(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"actual/child", "lexical"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requested, other := minimalManifest("build.log"), minimalManifest("build.log")
+	other.Base = strings.Repeat("c", 40)
+	for dir, m := range map[string]Manifest{"actual": requested, "lexical": other} {
+		writeManifestIn(t, filepath.Join(root, dir), m)
+		if err := os.WriteFile(filepath.Join(root, dir, "build.log"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join("..", "actual", "child"), filepath.Join(root, "lexical", "jump")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(root + "/lexical/jump/../manifest.json")
+	if err != nil || got.Base != requested.Base {
+		t.Fatalf("Load = base %q, %v; want the manifest in actual/ (base %q), which the path names", got.Base, err, requested.Base)
+	}
+}
+
 func minimalManifest(log string) Manifest {
 	return Manifest{
 		Format:     Format,
