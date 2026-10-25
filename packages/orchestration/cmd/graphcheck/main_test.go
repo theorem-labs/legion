@@ -56,6 +56,39 @@ func TestCommandPrintsFindingLinesAndExitCodes(t *testing.T) {
 	}
 }
 
+// Lean's error for a qualified name also yields its namespace, a weak name, which no graph line may carry: the
+// command still exits 0 and refuses the name itself.
+func TestC1RefusesAQualifiedNameWithoutAWeakLine(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Core.lean": {"def helper", "private def helper"},
+		"Lib/Use.lean":  {"namespace Lib.Use", "namespace Lib.Use\n\n-- Lib/Use.lean keeps its use of Lib.Core.helper."},
+	})
+	r := invoke(t, []string{"LAND_BASE=" + f.Base, "LAND_TREE=" + tree}, "names", "--config", f.ConfigPath)
+	if r.code != 0 || r.stderr != "" {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+	found := false
+	for _, h := range parseLines(t, r.stdout) {
+		found = found || (strings.HasPrefix(h.Reason, "C1:") && h.Declaration == "Lib.Core.helper" && h.Path == "Lib/Use.lean")
+	}
+	if !found {
+		t.Fatalf("no C1 refusal of Lib.Core.helper in Lib/Use.lean in %q", r.stdout)
+	}
+}
+
+// A type mismatch names only weak types: the command exits 3 (unable) or decides, and never exits 1, which would
+// fail the whole batch.
+func TestC1TypeErrorNeverFailsTheCommand(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Open.lean", "def viaOpen : Nat := helper 2", "def viaOpen : Nat := helper 2\n\ndef bad : Lib.Core.Box := Lib.Core.size")
+	r := invoke(t, []string{"LAND_BASE=" + f.Base, "LAND_TREE=" + tree}, "names", "--config", f.ConfigPath)
+	if r.code != 0 && r.code != 3 {
+		t.Fatalf("exit %d, stdout %q, stderr %q; want 0 or 3", r.code, r.stdout, r.stderr)
+	}
+	parseLines(t, r.stdout)
+}
+
 // The lines are sorted by path, line, column and declaration, whatever order the rules found them in.
 func TestCommandSortsItsLines(t *testing.T) {
 	f := graphchecktest.New(t)

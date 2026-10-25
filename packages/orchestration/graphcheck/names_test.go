@@ -144,7 +144,7 @@ func TestNamesRefusesASecondDeclarationInABuiltModule(t *testing.T) {
 	if !ok || h.Line != 2 || h.Col != 1 {
 		t.Fatal("no N2 refusal at Lib/New.lean:2:1")
 	}
-	if want := "N2: Lib.Core.helper is also declared in Lib/Core.lean:3; both modules are built"; h.Reason != want {
+	if want := "N2: Lib.Core.helper is also declared in Lib/Core.lean:3; a built module imports both"; h.Reason != want {
 		t.Fatalf("reason %q, want %q", h.Reason, want)
 	}
 }
@@ -210,6 +210,29 @@ func TestNamesWithoutTheCompiledPartRefusesDeclarationsAndSkipsFields(t *testing
 	for _, h := range hits {
 		if h.Kind == blame.Field {
 			t.Fatalf("field finding %+v from an index with no compiled part", h)
+		}
+	}
+}
+
+// A new root module that redeclares a name no built module imports together with the original builds: Lean meets
+// two declarations of one name only in one environment, so N2 says nothing.
+func TestNamesIgnoresASecondDeclarationNoModuleImportsTogether(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/New.lean", "", "namespace Lib.Core\ndef helper (n : Nat) : Nat := n\nend Lib.Core\n")
+	if hits := ruleHits(names(t, f, tree), "N2"); len(hits) != 0 {
+		t.Fatalf("N2 findings %v for two modules no built module imports together", hits)
+	}
+}
+
+// A command macro makes a constant that the reference file records no declaration range for: the constant still
+// exists, its users still build, and N1 refuses nothing.
+func TestNamesKeepsAConstantACommandMacroMakes(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Core.lean", "def size : Nat := 3",
+		"macro \"mk_size\" : command => `(def $(Lean.mkIdent `size) : Nat := 3)\n\nmk_size")
+	for _, h := range names(t, f, tree) {
+		if h.Declaration == "Lib.Core.size" {
+			t.Fatalf("finding %+v for a constant the macro still makes", h)
 		}
 	}
 }

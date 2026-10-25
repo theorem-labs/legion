@@ -69,8 +69,9 @@ may still resolve: another declaration of the candidate has the removed name's l
 a removed field now extends another structure, which may give the field back.
 
 **N2** (`names.go`). A name a compiled candidate module declares that the base did not declare in that module, and
-that another built module of the candidate declares too, is a refusal at the new declaration. Two declarations of
-one name in one module are Lean's own error, so C1 reports that case.
+that another module declares too, is a refusal at the new declaration when some built module's import closure holds
+both: only there does Lean meet the two declarations. Two modules no built module imports together both build, so
+N2 says nothing about them. Two declarations of one name in one module are Lean's own error, so C1 reports that case.
 
 **S2** (`statements.go`), **L1** (`links.go`) and **P1** (`producers.go`) are flags over compiled statements and
 types: nothing is refused on them.

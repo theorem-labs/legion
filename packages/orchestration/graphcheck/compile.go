@@ -31,7 +31,10 @@ func compileFindings(c *Candidate, cfg Config) ([]landing.Finding, error) {
 	return out, nil
 }
 
-// refusals turns one module's compile output into one refusal per declaration that Lean's errors name.
+// refusals turns one module's compile output into one refusal per declaration that Lean's errors name. A weak name
+// (the namespace of a dotted name, a type that a mismatch mentions) is left out, as the build's blame leaves it out
+// when a primary name is there: a graph finding is never weak, and a module whose errors give only weak names is
+// unable.
 func refusals(m *Module, cfg Config) ([]landing.Finding, error) {
 	reason := "C1: " + firstLine(leanReason(m))
 	var out []landing.Finding
@@ -39,7 +42,7 @@ func refusals(m *Module, cfg Config) ([]landing.Finding, error) {
 	for _, e := range m.Errors {
 		for _, block := range blame.Parse(blameLog(m.Module, e), cfg.Roots).Blocks {
 			for _, name := range blame.Names(block.Message) {
-				if named[name.Value] {
+				if name.Kind == blame.Weak || named[name.Value] {
 					continue
 				}
 				named[name.Value] = true

@@ -64,6 +64,8 @@ type nameState struct {
 	structures      map[string][]string
 	candidateConsts map[string]map[string]bool
 	removed         []*removal
+	// reverse maps each module of the candidate to the modules that import it directly, read once for N2.
+	reverse map[string][]string
 }
 
 // located is one declaration of a compiled candidate module.
@@ -252,12 +254,41 @@ func (n *nameState) findRemovals(ctx context.Context) error {
 				Publicly: n.private[name]})
 		}
 	}
+	if err := n.keepCompiledConstants(ctx); err != nil {
+		return err
+	}
 	n.keepOutermost()
 	if err := n.removedFields(ctx); err != nil {
 		return err
 	}
 	n.keepOutermost()
 	return n.addDoubts(ctx)
+}
+
+// keepCompiledConstants drops a removal that a compiled candidate module still has as a constant. The reference
+// file records no declaration range for a constant that a command macro or `deriving` makes, so only the exporter
+// tells such a constant from a removed one. It runs only when there is a removal to check.
+func (n *nameState) keepCompiledConstants(ctx context.Context) error {
+	if len(n.removed) == 0 {
+		return nil
+	}
+	candidate, _, err := n.c.Constants(ctx)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for module, constants := range candidate {
+		if !n.c.Built(module) {
+			continue
+		}
+		for _, k := range constants {
+			if name, isPrivate := unmangle(k.Name, module); !isPrivate {
+				have[name] = true
+			}
+		}
+	}
+	n.removed = slices.DeleteFunc(n.removed, func(r *removal) bool { return have[r.Name] })
+	return nil
 }
 
 // keepOutermost drops a removal whose name lies below another removed name: a declaration that goes takes with it
@@ -518,8 +549,8 @@ func owner(byTarget map[string]*removal, target string) *removal {
 }
 
 // duplicates runs N2: a name that a compiled candidate module declares and the base did not declare in that
-// module, which another built module of the candidate declares too. Lean refuses two declarations of one name in
-// one module itself, so C1 reports that case.
+// module, which another module declares too, where one built module imports both. Lean refuses two declarations of
+// one name in one module itself, so C1 reports that case.
 func (n *nameState) duplicates(ctx context.Context) ([]landing.Finding, error) {
 	type occurrence struct {
 		module, path string
@@ -577,18 +608,33 @@ func (n *nameState) duplicates(ctx context.Context) ([]landing.Finding, error) {
 				continue
 			}
 			for j, other := range occurrences {
-				if i == j || other.module == o.module {
+				if i == j || other.module == o.module || !n.importedTogether(o.module, other.module) {
 					continue
 				}
 				clashing[name] = true
 				out = append(out, landing.Finding{Path: o.path, Line: o.line, Col: declarationColumn(n.c.Text(o.path), o.line),
 					Verdict: landing.VerdictRefuse, Kind: blame.Added, Declaration: name,
-					Reason: fmt.Sprintf("N2: %s is also declared in %s:%d; both modules are built", name, other.path, other.line)})
+					Reason: fmt.Sprintf("N2: %s is also declared in %s:%d; a built module imports both", name, other.path, other.line)})
 				break
 			}
 		}
 	}
 	return out, nil
+}
+
+// importedTogether reports whether one built module's import closure holds both modules: only there does Lean
+// meet the two declarations and refuse the second. Two modules no built module imports together both build.
+func (n *nameState) importedTogether(a, b string) bool {
+	if n.reverse == nil {
+		n.reverse = n.c.reverseGraph()
+	}
+	importers := n.c.importersOf(normalName(a), n.reverse)
+	for m := range n.c.importersOf(normalName(b), n.reverse) {
+		if importers[m] {
+			return true
+		}
+	}
+	return false
 }
 
 // below reports whether a name lies under one already reported: Lean derives names from a declaration, and the

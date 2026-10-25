@@ -101,7 +101,6 @@ type Candidate struct {
 	byPath   map[string]*Change
 	byModule map[string]*Change
 	text     map[string]string // path -> candidate text, for added and modified files
-	patches  map[string]*filePatch
 	modules  map[string]*Module // added and modified modules
 	graph    map[string][]string
 	built    map[string]bool
@@ -140,7 +139,7 @@ func Open(ctx context.Context, cfg Config, base, tree string) (*Candidate, *decl
 	}
 	c := &Candidate{Base: baseCommit, BaseTree: baseTree, Tree: treeID, repo: cfg.Repository, cfg: cfg, icfg: icfg,
 		byPath: map[string]*Change{}, byModule: map[string]*Change{}, text: map[string]string{},
-		patches: map[string]*filePatch{}, modules: map[string]*Module{}}
+		modules: map[string]*Module{}}
 	if err := c.read(ctx, g, idx); err != nil {
 		_ = c.Close()
 		_ = idx.Close()
@@ -255,9 +254,6 @@ func (c *Candidate) read(ctx context.Context, g gitDir, idx *declindex.Store) er
 		}
 		for i, file := range patched {
 			c.text[file] = blobs[i]
-		}
-		if err := c.readPatches(ctx, g, patched); err != nil {
-			return err
 		}
 	}
 	return c.compile(ctx, idx)
@@ -797,101 +793,6 @@ func (c *Candidate) indexModule(ch Change) (string, bool) {
 		return ch.Module, true
 	}
 	return "", false
-}
-
-// hunk is one hunk of a -U0 diff: lines OldStart..OldStart+OldCount-1 of the base became NewStart..NewStart+NewCount-1.
-type hunk struct{ OldStart, OldCount, NewStart, NewCount int }
-
-type filePatch struct{ hunks []hunk }
-
-// LineChanged reports whether a candidate line of an added or modified file is an added or changed line.
-func (c *Candidate) LineChanged(file string, line int) bool {
-	ch := c.byPath[file]
-	if ch == nil {
-		return false
-	}
-	if ch.Status == Added {
-		return true
-	}
-	for _, h := range c.patches[file].hunksOrNil() {
-		if line >= h.NewStart && line < h.NewStart+h.NewCount {
-			return true
-		}
-	}
-	return false
-}
-
-func (p *filePatch) hunksOrNil() []hunk {
-	if p == nil {
-		return nil
-	}
-	return p.hunks
-}
-
-func (c *Candidate) readPatches(ctx context.Context, g gitDir, files []string) error {
-	args := []string{"-c", "core.quotePath=false", "diff-tree", "-r", "-p", "-U0", "--no-renames", "--no-color", "--no-ext-diff",
-		"--no-textconv", c.BaseTree, c.Tree, "--"}
-	for _, f := range files {
-		args = append(args, ":(literal)"+f)
-	}
-	out, err := g.output(ctx, args...)
-	if err != nil {
-		return err
-	}
-	var cur *filePatch
-	for _, line := range strings.Split(out, "\n") {
-		switch {
-		case strings.HasPrefix(line, "diff --git "):
-			cur = nil
-		case strings.HasPrefix(line, "+++ "):
-			name := strings.TrimPrefix(line, "+++ ")
-			if strings.HasPrefix(name, `"`) {
-				if unquoted, err := strconv.Unquote(name); err == nil {
-					name = unquoted
-				}
-			}
-			if name, ok := strings.CutPrefix(name, "b/"); ok {
-				cur = &filePatch{}
-				c.patches[name] = cur
-			}
-		case strings.HasPrefix(line, "@@ ") && cur != nil:
-			h, err := parseHunk(line)
-			if err != nil {
-				return err
-			}
-			cur.hunks = append(cur.hunks, h)
-		}
-	}
-	return nil
-}
-
-// parseHunk reads `@@ -a[,b] +c[,d] @@`.
-func parseHunk(line string) (hunk, error) {
-	fields := strings.Fields(line)
-	if len(fields) < 3 {
-		return hunk{}, fmt.Errorf("malformed hunk header %q", line)
-	}
-	old, err1 := parseRange(strings.TrimPrefix(fields[1], "-"))
-	new, err2 := parseRange(strings.TrimPrefix(fields[2], "+"))
-	if err := errors.Join(err1, err2); err != nil {
-		return hunk{}, fmt.Errorf("malformed hunk header %q: %w", line, err)
-	}
-	return hunk{OldStart: old[0], OldCount: old[1], NewStart: new[0], NewCount: new[1]}, nil
-}
-
-func parseRange(s string) ([2]int, error) {
-	start, count, found := strings.Cut(s, ",")
-	a, err := strconv.Atoi(start)
-	if err != nil {
-		return [2]int{}, err
-	}
-	b := 1
-	if found {
-		if b, err = strconv.Atoi(count); err != nil {
-			return [2]int{}, err
-		}
-	}
-	return [2]int{a, b}, nil
 }
 
 // gitDir runs git in one directory.

@@ -145,6 +145,42 @@ func TestC1AttributesLeansErrorToTheChangedMember(t *testing.T) {
 	}
 }
 
+// Lean's errors for a qualified name and for a type mismatch carry weak names too. Through the real land check,
+// neither may turn into a line graphcheck cannot write, which would fail the whole batch: the qualified name is
+// refused and attributed, and a mismatch that names nothing primary leaves the check unable for its own reason.
+func TestLandCheckWithWeakNamesInLeansErrors(t *testing.T) {
+	f := graphchecktest.New(t)
+	culprit := f.Branch(t, "culprit", map[string][2]string{"Lib/Core.lean": {"def helper", "private def helper"}})
+	user := f.Branch(t, "user", map[string][2]string{
+		"Lib/Use.lean": {"namespace Lib.Use", "namespace Lib.Use\n\n-- Lib/Use.lean keeps its use of Lib.Core.helper."},
+	})
+	code, out, errOut := runBin(t, landBin, "check", "--config", landConfig(t, f, []map[string]any{
+		{"migration": "culprit", "generation": 1, "head": culprit},
+		{"migration": "user", "generation": 1, "head": user},
+	}))
+	var got landing.CheckReport
+	if err := json.Unmarshal([]byte(out), &got); err != nil || code != 0 || len(got.Checks) != 1 {
+		t.Fatalf("qualified name: land check exit %d, output %s, stderr %s, %v", code, out, errOut, err)
+	}
+	if v := got.Checks[0]; v.Verdict != "fail" || len(v.Refused) == 0 || v.Refused[0].Member != "culprit" {
+		t.Fatalf("qualified name: names verdict = %+v", v)
+	}
+
+	mismatch := f.Branch(t, "mismatch", map[string][2]string{
+		"Lib/Open.lean": {"def viaOpen : Nat := helper 2", "def viaOpen : Nat := helper 2\n\ndef bad : Lib.Core.Box := Lib.Core.size"},
+	})
+	code, out, errOut = runBin(t, landBin, "check", "--config", landConfig(t, f, []map[string]any{
+		{"migration": "mismatch", "generation": 1, "head": mismatch},
+	}))
+	got = landing.CheckReport{}
+	if err := json.Unmarshal([]byte(out), &got); err != nil || len(got.Checks) != 1 {
+		t.Fatalf("type mismatch: land check exit %d, output %s, stderr %s, %v", code, out, errOut, err)
+	}
+	if v := got.Checks[0]; strings.Contains(v.Reason, "weak") || strings.Contains(v.Reason, "is not unknown, added, changed or field") {
+		t.Fatalf("type mismatch: names verdict %+v carries a weak line", v)
+	}
+}
+
 // Six members each privatise Lib.Core.helper and add a file of their own, so Pick bounds the name (more than five
 // strong rows) and the names check must be unable for the batch, with no member refused (D15).
 func TestLandCheckWithBroadEvidenceIsUnable(t *testing.T) {
