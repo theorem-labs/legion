@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -16,21 +15,17 @@ import (
 	"sort"
 	"strings"
 	"time"
-
 	"github.com/jackc/pgx/v5"
-
-	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // CompiledOptions turn on the compiled part of a refresh: types, compiled statement hashes, atoms and the
 // registry's facts, read by the exporter from the .olean files.
 type CompiledOptions struct {
-	// Exporter reads the modules. When it is Confined (the gate's setting, for proposals), the forms module is
-	// compiled in the sandbox too, in a fresh scratch directory below its ScratchDir.
+	// Exporter reads the modules.
 	Exporter *Exporter
 	// Forms are the registry's concepts and forms.
 	Forms FormsModule
-	// Dir holds the compiled forms module of an exporter that is not confined.
+	// Dir holds the compiled forms module. The gate gives each decision a fresh one of its own.
 	Dir string
 }
 
@@ -59,28 +54,14 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 			return nil, m, "", err
 		}
 		dir := co.Dir
-		if x.Confined {
-			// A fresh scratch below the caller's scratch directory, which the caller removes.
-			if x.ScratchDir == "" {
-				return nil, m, "", errors.New("a confined export needs the exporter's ScratchDir")
-			}
-			var err error
-			if dir, err = confine.NewScratch(x.ScratchDir); err != nil {
-				return nil, m, "", err
-			}
-			if err := CompileConfined(ctx, x.Lean, x.SearchPath, dir, FormsModuleName, []byte(src)); err != nil {
-				return nil, m, "", fmt.Errorf("compile the registry's forms: %w", err)
-			}
-		} else {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return nil, m, "", err
-			}
-			if err := os.WriteFile(filepath.Join(dir, FormsModuleName+".lean"), []byte(src), 0o644); err != nil {
-				return nil, m, "", err
-			}
-			if err := CompileModule(ctx, x.Lean, x.SearchPath, dir, FormsModuleName); err != nil {
-				return nil, m, "", fmt.Errorf("compile the registry's forms: %w", err)
-			}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, m, "", err
+		}
+		if err := os.WriteFile(filepath.Join(dir, FormsModuleName+".lean"), []byte(src), 0o644); err != nil {
+			return nil, m, "", err
+		}
+		if err := CompileModule(ctx, x.Lean, x.SearchPath, dir, FormsModuleName); err != nil {
+			return nil, m, "", fmt.Errorf("compile the registry's forms: %w", err)
 		}
 		x.SearchPath = slices.Concat(x.SearchPath, []string{dir})
 		m.Imports = []string{FormsModuleName}

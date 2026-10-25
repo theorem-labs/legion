@@ -2,7 +2,6 @@ package conceptgate
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,15 +28,19 @@ func (r *recordingLibrarian) Review(_ context.Context, request ReviewRequest) er
 	return r.err
 }
 
-func requireSandboxTest(t *testing.T) {
+// requireLake skips a test that needs a Lean toolchain where lake is not on PATH, unless DECLINDEX_REQUIRE_LEAN is
+// set (CI's Lean job), where a missing toolchain fails it.
+func requireLake(t *testing.T) {
 	t.Helper()
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
+	if _, err := exec.LookPath("lake"); err != nil {
+		if os.Getenv("DECLINDEX_REQUIRE_LEAN") != "" {
+			t.Fatal("DECLINDEX_REQUIRE_LEAN is set and no lake is on PATH")
+		}
+		t.Skip("no lake on PATH: the gate's Lean tests need a Lean toolchain")
 	}
 }
 
-// gateForTest builds the fixture tree, its index with the registry's facts, and a gate over them. The Lean
-// compilation exercises confinement, so it runs only in the Docker sandbox test environment.
+// gateForTest builds the fixture tree, its index with the registry's facts, and a gate over them. It needs Lean.
 func gateForTest(t *testing.T) (*Gate, *recordingLibrarian) {
 	t.Helper()
 	return gateWith(t, true)
@@ -46,10 +49,7 @@ func gateForTest(t *testing.T) (*Gate, *recordingLibrarian) {
 // gateWith is gateForTest with an index with or without its compiled part.
 func gateWith(t *testing.T, compiled bool) (*Gate, *recordingLibrarian) {
 	t.Helper()
-	requireSandboxTest(t)
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and no lake is on PATH")
-	}
+	requireLake(t)
 	ctx := context.Background()
 	l, err := declindex.FindLean(ctx, t.TempDir(), "")
 	if err != nil {
@@ -307,13 +307,10 @@ func TestGateRefusesAProposalThatRunsCode(t *testing.T) {
 }
 
 // A proposal's home is the path of a .lean file relative to the tree, where its declaration lands: the gate refuses
-// any other home before it compiles anything, and the error names it. The gate's sandbox check fails, to show that
-// the refusal comes before it.
+// any other home before it compiles anything, and the error names it. The gate has no index, so a decision that went
+// past the home would fail on it.
 func TestGateRefusesAProposalWhoseHomeIsNotALeanFileInTheTree(t *testing.T) {
-	g := &Gate{
-		Compiled:     &declindex.CompiledOptions{Exporter: &declindex.Exporter{}},
-		CheckSandbox: func(context.Context, declindex.Lean) error { return errors.New("the gate reached its sandbox check") },
-	}
+	g := &Gate{Compiled: &declindex.CompiledOptions{Exporter: &declindex.Exporter{}}}
 	for _, home := range []string{"Fresh.md", "../Fresh.lean", "/Fresh.lean", "./Fresh.lean", "Sub//Fresh.lean", "Sub/.lean", `Sub\Fresh.lean`} {
 		p := proposal("p", "Fresh", "def Fresh : Prop := True")
 		p.Concept.Home = home
@@ -326,22 +323,6 @@ func TestGateRefusesAProposalWhoseHomeIsNotALeanFileInTheTree(t *testing.T) {
 	p.Concept.Home = "Sub/Fresh.lean"
 	if err := p.Concept.check(); err != nil {
 		t.Errorf("a home in a directory of the tree: %v", err)
-	}
-}
-
-func TestGateWithoutASandboxCannotDecide(t *testing.T) {
-	g, lib := gateForTest(t)
-	g.CheckSandbox = func(context.Context, declindex.Lean) error { return errors.New("no sandbox here") }
-	work := g.WorkDir
-	v, err := g.Decide(context.Background(), proposal("q3", "Fresh3", "def Fresh3 (x : Nat) : Prop := x < 4"), DecideOptions{Proposer: "role"})
-	if err == nil || !strings.Contains(err.Error(), "no sandbox here") {
-		t.Fatalf("decided %+v (%v) without a sandbox", v, err)
-	}
-	if entries, _ := os.ReadDir(work); len(entries) != 0 {
-		t.Fatalf("the gate wrote %d entries without a sandbox", len(entries))
-	}
-	if _, defects, err := Load(g.Registry); err != nil || len(lib.got) != 0 || len(defects) != 0 {
-		t.Fatal("the gate acted without a sandbox")
 	}
 }
 

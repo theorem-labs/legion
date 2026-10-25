@@ -4,15 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/sjawhar/legion/orchestration/declindex/confine"
+	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
 
@@ -132,55 +132,60 @@ func TestAModuleNewerThanItsBuildStopsQueriesAndTheLedger(t *testing.T) {
 	}
 }
 
-// On a machine whose sandbox is unavailable (here as confine reports Landlock ABI 2, which does not govern
-// truncation; confine's TestALandlockWithoutTruncationIsNoSandbox shows that such a kernel has no sandbox), the
-// gate is unable to decide before it starts anything: no Lean process, no exporter build, even with nothing cached.
-func TestGateStartsNoLeanWithoutASandbox(t *testing.T) {
-	old := gateSandboxAvailable
-	gateSandboxAvailable = func() error {
-		return fmt.Errorf("%w: Landlock ABI 2 does not govern truncation; ABI 3 (Linux 6.2) is needed", confine.ErrUnavailable)
-	}
-	t.Cleanup(func() { gateSandboxAvailable = old })
-	config := fixture(t)
-	dir := filepath.Dir(config)
-	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
-		t.Fatalf("refresh: %+v", r)
-	}
-	registry := "version: 1\nconcepts:\n  - name: Gold.Aligned\n    home: Golden.lean\n    meaning: A word is 8-aligned.\n"
-	if err := os.WriteFile(filepath.Join(dir, "tree", "registry.yaml"), []byte(registry), 0o644); err != nil {
+// The gate compiles a proposal with the rights of the user who runs it, after Lean's parser allow-list, on any
+// machine where Lean runs: it refuses an exact duplicate, sends a near match to the librarian and adds a new concept,
+// and leaves the tree clean.
+func TestTheGateDecidesWithTheRightsOfItsCaller(t *testing.T) {
+	dir, tree, config := leanGateFixture(t, map[string]string{
+		"Fx.SpAligned.yaml": "name: Fx.SpAligned\nhome: Fixture.lean\nmeaning: Register x2 of a register file is 8-aligned.\n" +
+			"forms:\n  - \"fun (R : BitVec 5 → BitVec 64) => R 2#5 &&& 7#64 = 0#64\"\n",
+	})
+	invocations := filepath.Join(dir, "librarian-invocations")
+	librarian := filepath.Join(dir, "record-librarian")
+	writeTestFile(t, librarian, "#!/bin/sh\nprintf '%s\\n' \"$2\" >> "+strconv.Quote(invocations)+"\n")
+	if err := os.Chmod(librarian, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	body, _ := os.ReadFile(config)
-	body = append(body, []byte("registry: registry.yaml\n")...)
-	if err := os.WriteFile(config, body, 0o644); err != nil {
+	body, err := os.ReadFile(config)
+	if err != nil {
 		t.Fatal(err)
 	}
-	proposal := filepath.Join(dir, "proposal.json")
-	p := `{"id":"p1","concept":{"name":"Fresh","home":"New.lean","meaning":"A fresh concept."},` +
-		`"source":"def Fresh (x : Nat) : Prop := x < 3\n"}`
-	if err := os.WriteFile(proposal, []byte(p), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Fake toolchain programs on PATH record any start.
-	bin, marker := filepath.Join(dir, "fakebin"), filepath.Join(dir, "started")
-	if err := os.MkdirAll(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"lean", "lake", "elan"} {
-		script := "#!/bin/sh\necho " + name + " >> " + marker + "\nexit 1\n"
-		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
+	writeTestFile(t, config, string(body)+"librarian:\n  - "+librarian+"\n")
+	decide := func(id, name, source string) (result, conceptgate.Verdict) {
+		t.Helper()
+		raw, err := json.Marshal(conceptgate.Proposal{
+			ID:      id,
+			Concept: conceptgate.Concept{Name: name, Home: "New.lean", Meaning: "A proposed concept."},
+			Source:  "import Fixture\n\n" + source + "\n",
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
+		path := filepath.Join(dir, id+".json")
+		writeTestFile(t, path, string(raw))
+		r := invoke(t, "--config", config, "gate", "--proposer", "role", path)
+		var v conceptgate.Verdict
+		if r.out != "" {
+			if err := json.Unmarshal([]byte(r.out), &v); err != nil {
+				t.Fatalf("%s: %v: %+v", id, err, r)
+			}
+		}
+		return r, v
 	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
-	if r.code != 3 || !strings.Contains(r.errOut, "sandbox") {
-		t.Fatalf("gate without a sandbox: %+v", r)
+	if r, v := decide("copy", "MySp", "def MySp (Q : BitVec 5 → BitVec 64) : Prop := Q 2#5 &&& 7#64 = 0#64"); r.code != 1 || v.Existing == "" {
+		t.Fatalf("an exact duplicate: want exit 1 naming the declaration it copies, got %+v", r)
 	}
-	if started, err := os.ReadFile(marker); err == nil {
-		t.Fatalf("the gate started %q before it found the sandbox unavailable", strings.Fields(string(started)))
+	r, v := decide("near", "MyFrame", "def MyFrame (R : BitVec 5 → BitVec 64) (n : Nat) : Prop := n < 3 ∧ R 2#5 &&& 7#64 = 0#64")
+	if r.code != 4 {
+		t.Fatalf("a near match: want exit 4, got %+v", r)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "state", "exporter")); err == nil {
-		t.Fatal("the gate began an exporter build before it found the sandbox unavailable")
+	if got, _ := os.ReadFile(invocations); strings.TrimSpace(string(got)) != v.VerdictID {
+		t.Fatalf("the librarian received %q, want the one near verdict %s", got, v.VerdictID)
+	}
+	if r, v := decide("fresh", "Fresh", "def Fresh (x : Nat) : Prop := x < 3 ∧ x ≠ 1"); r.code != 0 || v.Addition == nil {
+		t.Fatalf("a new concept: want exit 0 with an addition, got %+v", r)
+	}
+	if status := git(t, tree, "status", "--porcelain"); status != "" {
+		t.Fatalf("the gate dirtied the tree: %q", status)
 	}
 }

@@ -2,25 +2,11 @@ package conceptgate
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
-
-// orchestration-lean.yaml sets DECLINDEX_REQUIRE_SANDBOX=1 ("The gate compiles proposals only in the Landlock and
-// seccomp sandbox; here its tests must run, not skip"). The gate's Lean tests (this package's requireSandboxTest,
-// cmd/declindex's gate and recheck tests) skip unless DECLINDEX_SANDBOX_TEST=1, so wherever the sandbox is
-// required, that variable must be set too, or the sandboxed gate tests would pass by skipping.
-func TestRequiredSandboxRunsTheGateTests(t *testing.T) {
-	if os.Getenv("DECLINDEX_REQUIRE_SANDBOX") == "" {
-		t.Skip("the sandbox is not required here")
-	}
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Fatal("DECLINDEX_REQUIRE_SANDBOX is set, but the gate's sandboxed Lean tests skip: they run only with DECLINDEX_SANDBOX_TEST=1")
-	}
-}
 
 // A librarian concept with forms and no stored source states its fact through its forms; the index need not
 // declare its name (README: "A concept with no form is matched by its declaration's body", so one with forms is

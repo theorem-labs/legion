@@ -76,7 +76,7 @@ func TestGateRejectsRegistryMutationAfterInitialStatus(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	g, err := OpenGate(context.Background(), cfg, Options{SandboxAvailable: func() error { return nil }})
+	g, err := OpenGate(context.Background(), cfg, Options{})
 	if g != nil {
 		g.Close()
 	}

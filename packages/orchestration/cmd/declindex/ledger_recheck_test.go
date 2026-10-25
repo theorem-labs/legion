@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -50,12 +49,7 @@ func gateAddition(t *testing.T, config, id, name, home, source string) conceptga
 }
 
 func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 
 	dir := t.TempDir()
 	tree := filepath.Join(dir, "tree")
@@ -299,12 +293,7 @@ func leanRegistryTree(t *testing.T, roots ...string) (config, tree string, lean 
 // its recorded hash and with the registry: alone, the addition is clean; landed in one home file with a concept
 // whose fact it states, the two are a near pair.
 func TestLedgerRechecksAnAdditionLandedWithItsDeclaration(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	t.Run("one concept in a new home file", func(t *testing.T) {
 		config, tree, lean := leanRegistryTree(t, "Fresh")
 		source := "import Fixture\n\ndef Fx.Fresh (n : Nat) : Prop := n < 3\n"
@@ -359,12 +348,7 @@ func TestLedgerRechecksAnAdditionLandedWithItsDeclaration(t *testing.T) {
 // lands with its declaration, also when the first states that fact through a helper that its proposal declares,
 // public or private, before and after that proposal lands.
 func TestLedgerRechecksALandedAdditionAgainstEveryConcept(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	const theorem = "theorem Fx.First (x : Nat) (_h : x < 3) : True := trivial\n"
 	const helper = "def Fx.Helper (n : Nat) : Prop := n < 3\n\ndef Fx.First (n : Nat) : Prop := Fx.Helper n\n"
 	// A private name holds its module's: the proposal's when the gate compiles it, the home file's once it lands.
@@ -423,12 +407,7 @@ func TestLedgerRechecksALandedAdditionAgainstEveryConcept(t *testing.T) {
 //   - not landed, the stored source is compiled, and the forms import no module whose imports declare the concept,
 //     here a registry import that imports a file that declares it outside its home.
 func TestLedgerRechecksAnAdditionFromItsLandedDeclaration(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	ctx := context.Background()
 	compile := func(t *testing.T, lean declindex.Lean, tree string, modules ...string) {
 		t.Helper()

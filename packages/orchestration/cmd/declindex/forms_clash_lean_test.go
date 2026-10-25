@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -336,12 +334,7 @@ func TestRefreshReadsAgainWhenTheFormsImportsChange(t *testing.T) {
 // The gate reads the index's facts, so its verdict gives the count of the modules read without the registry's
 // forms, and its stderr names the index defect.
 func TestTheGateGivesTheCountOfModulesReadWithoutTheForms(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	config, _, _ := formsClashTree(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)

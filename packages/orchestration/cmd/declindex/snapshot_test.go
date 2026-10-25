@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -54,12 +53,7 @@ func TestAQueryClosesTheIndexBeforeItWritesItsOutput(t *testing.T) {
 // it rather than join the two commits' rows: the gate exits 3, the ledger's recheck of an addition exits 75, and
 // states and same exit 3. A reader of the reference part alone (where) answers from the new commit.
 func TestReadersOfTheCompiledPartRefuseAnIndexBetweenItsTwoParts(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	tree := filepath.Join(dir, "tree")

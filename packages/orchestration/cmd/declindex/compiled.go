@@ -12,7 +12,6 @@ import (
 
 	"github.com/sjawhar/legion/orchestration/conceptgate"
 	"github.com/sjawhar/legion/orchestration/declindex"
-	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // compiledOptions are refresh's compiled step: the registry's forms module, if the configuration names a registry,
@@ -165,10 +164,6 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 	return rc
 }
 
-// gateSandboxAvailable is the gate's cheap check that this machine can build the sandbox
-// (conceptgate.Options.SandboxAvailable); a test replaces it.
-var gateSandboxAvailable = confine.Available
-
 // cmdGate decides one proposal. Exit codes: 0 added, 1 refused (an exact duplicate), 4 near (sent to the
 // librarian), 5 the name is taken, 3 unable to decide.
 func cmdGate(ctx context.Context, e *env, args []string) int {
@@ -212,7 +207,7 @@ func cmdGate(ctx context.Context, e *env, args []string) int {
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fail(e.stderr, &usageError{fmt.Sprintf("%s: %v", args[0], err)})
 	}
-	g, err := conceptgate.OpenGate(ctx, e.cfg, conceptgate.Options{Log: e.stderr, SandboxAvailable: gateSandboxAvailable})
+	g, err := conceptgate.OpenGate(ctx, e.cfg, conceptgate.Options{Log: e.stderr})
 	if err != nil {
 		return fail(e.stderr, &unableError{err})
 	}

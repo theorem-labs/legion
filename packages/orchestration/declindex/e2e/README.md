@@ -1,6 +1,6 @@
 # Acceptance drivers
 
-These drivers keep the declaration-index acceptance checks reproducible. Run every sandbox probe in a disposable container, never on a shared host or with `sudo`. Acceptance records live with the acceptance runs, not in this repository.
+These drivers keep the declaration-index acceptance checks reproducible. Acceptance records live with the acceptance runs, not in this repository.
 
 ## Build the image
 
@@ -15,7 +15,7 @@ docker buildx build --load --tag declindex-e2e:local \
 
 The image never builds Lean. It copies the prebuilt toolchain `/opt/lean/<LEAN_FORK_COMMIT>` from `LEAN_IMAGE`, a worker image pinned by digest, and the build fails unless `lean --githash` equals `LEAN_FORK_COMMIT`. `LEAN_TOOLCHAIN` is the toolchain name in the served tree's `lean-toolchain` file, so that elan in the image selects the copied toolchain for that tree. Record the `LEAN_IMAGE` digest with each run. `build-lean.sh` builds Lean from source for CI runners only.
 
-The base is the digest-pinned `golang:1.27.1-trixie` image, because the prebuilt toolchain links the system `libgmp` and `libstdc++` of Debian trixie; the build checks that `libgmp10` is 6.3.0 or newer, which Lean requires. The image installs elan v4.2.4 after checking its SHA-256, links the toolchain as `LEAN_TOOLCHAIN` and makes it the default, and installs `declindex`, `ledger`, `python3` and `strace`.
+The base is the digest-pinned `golang:1.27.1-trixie` image, because the prebuilt toolchain links the system `libgmp` and `libstdc++` of Debian trixie; the build checks that `libgmp10` is 6.3.0 or newer, which Lean requires. The image installs elan v4.2.4 after checking its SHA-256, links the toolchain as `LEAN_TOOLCHAIN` and makes it the default, and installs `declindex`, `ledger` and `python3`.
 
 The checksum's negative control is the same build with one digit of `ELAN_SHA256` changed; it must fail at `sha256sum --check`, before `elan-init` runs:
 
@@ -26,29 +26,6 @@ docker buildx build --tag declindex-e2e:bad-elan \
   --build-arg ELAN_SHA256=52b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63 \
   --file packages/orchestration/declindex/e2e/Dockerfile .
 ```
-
-## Sandbox acceptance
-
-Create one empty run directory, here `$RUN`, before starting the driver. The driver records the image ID, `docker version`, the kernel release, `lean --version`, each case's output, the Landlock `strace`, and `sandbox.tsv` there.
-
-```sh
-mkdir -p "$RUN"
-packages/orchestration/declindex/e2e/sandbox-e2e.sh \
-  --image declindex-e2e:local \
-  --out "$RUN"
-```
-
-The driver starts one-shot containers only, each as the invoking user. The first copies `declindex/testdata/lean` into the run's `work/tree`, commits it with an empty registry, builds it with Lake, and refreshes a compiled index; each probe then gets its own copy of that index, without an exporter. The probes mount `work/tree` read-only. The driver prints one TSV row for each case and exits 1 unless all five pass:
-
-| Case | Expected result |
-| --- | --- |
-| `eval` | Exit 3; `/out/pwned-eval` is absent. |
-| `char` | Exit 3; `/out/pwned-eval` is absent. |
-| `elab` | Exit 3; `/out/pwned-elab` is absent. |
-| `benign` | Exit 0 with an `added` verdict against the read-only tree, which `git status --porcelain` still shows clean. |
-| `deny-landlock` | Exit 3 with `Landlock` on stderr, exactly one `execve` or `execveat` in the trace, and no `exporter` directory in the gate's state. |
-
-The first four cases use Docker's default seccomp profile. The last passes `deny-landlock.json`, which allows every syscall except the three Landlock syscalls; each of those fails with `ENOSYS` (errno 38).
 
 ## Recall
 
