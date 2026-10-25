@@ -2,7 +2,6 @@ package landing
 
 import (
 	"context"
-	"reflect"
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/landing/blame"
@@ -269,93 +268,6 @@ func (g *orderedGitHub) Withdraw(context.Context, string, int) error {
 func (g *orderedGitHub) Read(context.Context, string, int) (PullRequest, error) {
 	g.log()
 	return PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}, nil
-}
-
-// mergeQueueFake lists fixed merge groups and records each status posted.
-type mergeQueueFake struct {
-	groups   []MergeGroup
-	statuses map[string]string
-	contexts map[string]string
-}
-
-func (q *mergeQueueFake) MergeGroups(context.Context, string, string) ([]MergeGroup, error) {
-	return q.groups, nil
-}
-
-func (q *mergeQueueFake) SetStatus(_ context.Context, _, commit, context, state, _ string) error {
-	q.statuses[commit] = state
-	q.contexts[commit] = context
-	return nil
-}
-
-// The merge-group status is success only for a group whose pull request belongs to a batch that the ledger shows
-// admitted and whose head tree is that batch's admitted candidate tree. A group whose tree differs, a group of a
-// batch that is not admitted, and a group of a pull request that no batch holds (one queued by hand) get failure.
-func TestMergeGroupStatusIsSuccessOnlyForAnAdmittedMatchingTree(t *testing.T) {
-	store, _, _, runner, _ := restartFixture()
-	admitted := greenBatchFor(runner)
-	admitted.ID, admitted.State, admitted.Admission = "a", Publishing, Admitted
-	admitted.Candidate.Tree = "tree-admitted"
-	admitted.PullRequest = PullRequest{Number: 7, Head: "candidate", State: PullRequestOpen}
-	seed(t, store, admitted)
-	pending := greenBatchFor(runner)
-	pending.ID, pending.State = "b", Publishing
-	pending.Candidate.Tree = "tree-pending"
-	pending.PullRequest = PullRequest{Number: 8, Head: "candidate-b", State: PullRequestOpen}
-	seed(t, store, pending)
-	queue := &mergeQueueFake{
-		groups: []MergeGroup{
-			{PullRequest: 7, Commit: "group-match", Tree: "tree-admitted"},
-			{PullRequest: 7, Commit: "group-mismatch", Tree: "tree-other"},
-			{PullRequest: 8, Commit: "group-not-admitted", Tree: "tree-pending"},
-			{PullRequest: 9, Commit: "group-by-hand", Tree: "tree-admitted"},
-		},
-		statuses: map[string]string{}, contexts: map[string]string{},
-	}
-
-	posted := map[string]string{}
-	if err := runner.AttestMergeGroups(context.Background(), queue, "repo", "trunk", posted); err != nil {
-		t.Fatalf("AttestMergeGroups() error = %v", err)
-	}
-	want := map[string]string{
-		"group-match": StatusSuccess, "group-mismatch": StatusFailure,
-		"group-not-admitted": StatusFailure, "group-by-hand": StatusFailure,
-	}
-	if !reflect.DeepEqual(queue.statuses, want) {
-		t.Fatalf("statuses = %v, want %v", queue.statuses, want)
-	}
-	for commit, context := range queue.contexts {
-		if context != "landing/merge-group" {
-			t.Fatalf("status context on %s = %q, want landing/merge-group", commit, context)
-		}
-	}
-	queue.statuses = map[string]string{}
-	if err := runner.AttestMergeGroups(context.Background(), queue, "repo", "trunk", posted); err != nil || len(queue.statuses) != 0 {
-		t.Fatalf("a second round posted %v (%v), want no repeated status", queue.statuses, err)
-	}
-}
-
-// GitHubCLI reads the merge queue's groups with their head trees and posts a commit status on a group's head.
-func TestGitHubCLIReadsMergeGroupsAndSetsStatus(t *testing.T) {
-	executor := &commandExecutorFake{outputs: []string{
-		`{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"headCommit":{"oid":"g1","tree":{"oid":"t1"}},"pullRequest":{"number":7}},{"headCommit":null,"pullRequest":{"number":8}}]}}}}}`,
-	}}
-	client := GitHubCLI{Executor: executor}
-
-	groups, err := client.MergeGroups(context.Background(), "owner/repo", "trunk")
-	if err != nil {
-		t.Fatalf("MergeGroups() error = %v", err)
-	}
-	if want := []MergeGroup{{PullRequest: 7, Commit: "g1", Tree: "t1"}}; !reflect.DeepEqual(groups, want) {
-		t.Fatalf("groups = %+v, want %+v", groups, want)
-	}
-	if err := client.SetStatus(context.Background(), "owner/repo", "g1", MergeGroupContext, StatusFailure, "tree differs"); err != nil {
-		t.Fatalf("SetStatus() error = %v", err)
-	}
-	want := []string{"api", "--method", "POST", "repos/owner/repo/statuses/g1", "-f", "state=failure", "-f", "context=landing/merge-group", "-f", "description=tree differs"}
-	if got := executor.calls[1].args; !sameStrings(got, want) {
-		t.Fatalf("status args = %q, want %q", got, want)
-	}
 }
 
 // Withdraw dequeues a queued pull request and closes it; a pull request already merged or closed is left alone.

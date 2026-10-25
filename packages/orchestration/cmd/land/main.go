@@ -135,11 +135,6 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 	}
 	defer program.close()
 	runner := program.runner
-	if command != "status" && program.queue != nil {
-		attestCtx, stopAttesting := context.WithCancel(ctx)
-		defer stopAttesting()
-		go attestMergeGroups(attestCtx, runner, program.queue, program.input.Repository, program.input.BaseBranch, config.GitHub.PollInterval)
-	}
 	switch command {
 	case "run":
 		batch, err := runner.Run(ctx, program.input)
@@ -186,28 +181,6 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 		}, output)
 	default:
 		return fmt.Errorf("unknown batch command %q", command)
-	}
-}
-
-// attestMergeGroups sets the merge-group status on the base branch's merge groups until ctx ends. It runs beside the
-// publisher, which waits for the queue's outcome, because the queue merges a group only after its status is set. A
-// failed round is tried again at the next tick.
-func attestMergeGroups(ctx context.Context, runner landing.Runner, queue landing.MergeQueue, repository, branch string, interval time.Duration) {
-	if interval <= 0 {
-		interval = 5 * time.Second
-	}
-	posted := make(map[string]string)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		if err := runner.AttestMergeGroups(ctx, queue, repository, branch, posted); err != nil && ctx.Err() == nil {
-			fmt.Fprintln(os.Stderr, "land: merge-group status:", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
 	}
 }
 
@@ -386,13 +359,12 @@ func (c config) checkers() []landing.Checker {
 }
 
 // program is the wiring of one configuration: the runner, the configured batch, how the status command lists
-// batches, the merge queue whose groups get the merge-group status (nil without GitHub), and what to release at the
-// end.
+// batches, and what to release at the end. The merge queue's required landing/merge-group status comes from the
+// repository's GitHub Actions workflow, not from this program.
 type program struct {
 	runner landing.Runner
 	input  landing.Input
 	list   func(context.Context) ([]landing.Batch, error)
-	queue  landing.MergeQueue
 	close  func()
 	// ledger and dsn are the open ledger and its database, from which `land serve` opens its wake source.
 	ledger *ledger.Store
@@ -458,7 +430,6 @@ func (c config) program(ctx context.Context) (program, error) {
 	if publishing {
 		github := landing.GitHubCLI{RepositoryPath: path, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
 		runner.GitHub = github
-		out.queue = github
 		// The member event is optional: without it no member event runs, and the ledger's migration.landed is the
 		// record. A partial one is refused. The score is a post-landing hook like any other.
 		if event := c.Event; len(event.Command) != 0 || len(event.Status) != 0 {
