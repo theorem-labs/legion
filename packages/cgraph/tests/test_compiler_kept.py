@@ -169,3 +169,58 @@ def test_a_scoped_noinline_attribute_is_read(tmp_path: Path) -> None:
         tmp_path, "[[gnu::noinline]] static int sq(int x) { return x * 2; } void sc(void) { if (sq(1) == 6) warn(); }"
     )
     assert "warn" in compiled(facts, "sc")
+
+
+OUT_OF_LINE = """
+    void consume(int);
+    static int vsmall(int x, ...)
+    {
+        __builtin_va_list ap;
+        __builtin_va_start(ap, x);
+        consume(__builtin_va_arg(ap, int));
+        __builtin_va_end(ap);
+        return x * 2;
+    }
+    void v_root(void) { if (vsmall(1, 11) == 6) warn(); }
+    void v_other(void) { if (vsmall(3, 22) == 6) warn(); }
+    static __attribute__((optnone)) int osmall(int x) { return x * 2; }
+    void o_root(void) { if (osmall(1) == 6) warn(); }
+    void o_other(void) { if (osmall(3) == 6) warn(); }
+    static __attribute__((cold)) int csmall(int x) { consume(x); consume(x + 1); consume(x + 2); consume(x + 3); return x * 2; }
+    void c_root(void) { if (csmall(1) == 6) warn(); }
+    void c_other(void) { if (csmall(3) == 6) warn(); }
+"""
+
+
+@pytest.mark.parametrize("function", ["v_root", "o_root", "c_root"])
+def test_a_variadic_optnone_or_cold_callee_is_called_out_of_line(tmp_path: Path, function: str) -> None:
+    """A variadic helper, an optnone one and a cold one, each with two callers: clang-21 -O2 calls each
+    and keeps `tail warn`, which a folded `x * 2 == 6` for 1 would rule out."""
+    assert "warn" in compiled(facts_of(tmp_path, OUT_OF_LINE), function)
+
+
+WRAPPED = """
+    void step(int i);
+    static inline __attribute__((always_inline)) void heavy(int x)
+    {
+        step(x); step(x + 1); step(x + 2); step(x + 3); step(x + 4); step(x + 5); step(x + 6); step(x + 7);
+        step(x + 8); step(x + 9); step(x + 10); step(x + 11); step(x + 12); step(x + 13); step(x + 14);
+        step(x + 15); step(x + 16); step(x + 17); step(x + 18); step(x + 19);
+    }
+    static int wrap(int x) { heavy(x); return x * 2; }
+    void wa(void) { if (wrap(1) == 6) warn(); kept(); }
+    void wb(void) { if (wrap(3) == 6) warn(); kept(); }
+    static inline int stub_variadic(const char *fmt, ...) { return 0; }
+    void sv(void) { if (stub_variadic("x", 1)) warn(); kept(); }
+"""
+
+
+def test_a_small_function_that_calls_a_large_inline_one_is_called(tmp_path: Path) -> None:
+    """wrap() calls an __always_inline heavy() of 20 calls: clang inlines heavy into wrap first, then
+    finds wrap too large and calls it (clang-21 -O2: call wrap; call warn)."""
+    assert "warn" in compiled(facts_of(tmp_path, WRAPPED), "wa")
+
+
+def test_a_variadic_stub_that_never_starts_its_list_still_folds(tmp_path: Path) -> None:
+    """A variadic stub with no va_start is inlined: `stub_variadic(...)` is 0, so warn is not code."""
+    assert "warn" not in compiled(facts_of(tmp_path, WRAPPED), "sv")

@@ -1751,17 +1751,29 @@ def _is_inline(definition: ci.Cursor) -> bool:
     return libclang.is_function_inlined(definition)
 
 
+# Attributes under which clang -O2 calls a function out of line (or inlines it only under a lowered
+# threshold the facts cannot model): noinline, optnone, noipa, naked, cold.
+_OUT_OF_LINE = frozenset(
+    {"noinline", "__noinline__", "optnone", "__optnone__", "noipa", "__noipa__", "naked", "__naked__", "cold",
+     "__cold__"}
+)  # fmt: skip
+
+
 def _is_noinline(definition: ci.Cursor) -> bool:
-    """A function marked ``noinline`` on any declaration, also through a macro (the kernel's
-    ``noinline``, a ``NEVER_INLINE``): libclang gives each declaration the attributes it inherits, as
-    an attribute cursor whose first token is the attribute's name, after a scope (``[[gnu::noinline]]``).
-    The compiler calls such a function, so its returns do not fold into the caller's code."""
+    """A function clang -O2 may call out of line whatever its size: one marked with an attribute of
+    ``_OUT_OF_LINE`` on any declaration, also through a macro (the kernel's ``noinline``, ``__cold``, a
+    ``NEVER_INLINE``), or one that calls ``va_start`` (LLVM inlines no such function; a variadic stub
+    that never reads its variable arguments is inlined). libclang gives each declaration the attributes
+    it inherits, as an attribute cursor whose first token is the attribute's name, after a scope
+    (``[[gnu::noinline]]``). Such a function's returns do not fold into the caller's code."""
+    if any(node.kind == K.CALL_EXPR and node.spelling in _VA_START for node in definition.walk_preorder()):
+        return True
     for declaration in (definition, definition.canonical):
         for child in declaration.get_children():
             if child.kind.is_attribute():
                 tokens = [token.spelling for token in itertools.islice(child.get_tokens(), 3)]
                 name = tokens[2] if len(tokens) == 3 and tokens[1] == "::" else (tokens[0] if tokens else "")
-                if name in ("noinline", "__noinline__"):
+                if name in _OUT_OF_LINE:
                     return True
     return False
 
@@ -1772,21 +1784,32 @@ _SMALL_CALLS = 4
 _SMALL_NODES = 60
 
 
-def _small_body(definition: ci.Cursor) -> bool:
-    """The function's body is small enough that clang inlines it at every call (``_SMALL_CALLS``)."""
-    body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
-    if body is None:
-        return False
-    calls = 0
-    for nodes, node in enumerate(body.walk_preorder(), 1):
-        if node.kind in (*_LOOPS, K.ASM_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT) or nodes > _SMALL_NODES:
+def _small_body(definition: ci.Cursor, definitions: dict[str, ci.Cursor]) -> bool:
+    """The function's body is small enough that clang inlines it at every call (``_SMALL_CALLS``),
+    counted as clang weighs it: bottom-up, with the bodies of the inline functions it calls already
+    in it (wrap()'s call of an __always_inline heavy() with 40 calls makes wrap large)."""
+    seen: set[str] = {definition.spelling}
+    pending = [definition]
+    calls = nodes = 0
+    while pending:
+        current = pending.pop()
+        body = next((child for child in _children(current) if child.kind == K.COMPOUND_STMT), None)
+        if body is None:
             return False
-        if node.kind == K.CALL_EXPR:
-            calls += 1
-            if calls > _SMALL_CALLS or (
-                node.referenced is not None and node.referenced.spelling == definition.spelling
-            ):
+        for node in body.walk_preorder():
+            nodes += 1
+            if node.kind in (*_LOOPS, K.ASM_STMT, K.GOTO_STMT, K.INDIRECT_GOTO_STMT) or nodes > _SMALL_NODES:
                 return False
+            if node.kind != K.CALL_EXPR:
+                continue
+            calls += 1
+            callee = node.referenced.spelling if node.referenced is not None else ""
+            if calls > _SMALL_CALLS or callee == definition.spelling:
+                return False
+            inner = definitions.get(callee)
+            if inner is not None and callee not in seen and _is_inline(inner):
+                seen.add(callee)
+                pending.append(inner)
     return True
 
 
@@ -2277,7 +2300,7 @@ class _Evaluator:
             definition = self.definitions.get(name)
             if definition is None or self.weak(definition) or _is_noinline(definition):
                 self.folded_into[name] = False
-            elif _is_inline(definition) or _small_body(definition):
+            elif _is_inline(definition) or _small_body(definition, self.definitions):
                 self.folded_into[name] = True
             else:
                 # A whole-unit scan for this one function, once (the answer is cached).
