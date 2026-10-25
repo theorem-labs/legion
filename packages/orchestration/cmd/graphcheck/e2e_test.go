@@ -86,7 +86,9 @@ func landConfig(t *testing.T, f *graphchecktest.Fixture, members []map[string]an
 	}
 	mounts := []map[string]any{{"name": "lake-cache", "host_path": cache}}
 	shared := map[string]any{}
-	for i, dir := range []string{f.Repo, filepath.Dir(f.ConfigPath), filepath.Dir(filepath.Dir(graphcheckBin)), f.Lean.Prefix} {
+	// The binary's own directory, never its parent: TestMain makes it directly in the temporary directory, so its
+	// parent is /tmp itself, and a read-only /tmp would leave the check nowhere to compile.
+	for i, dir := range []string{f.Repo, filepath.Dir(f.ConfigPath), filepath.Dir(graphcheckBin), f.Lean.Prefix} {
 		name := "read-" + string(rune('a'+i))
 		mounts = append(mounts, map[string]any{"name": name, "host_path": dir})
 		shared[name] = "read-only"
