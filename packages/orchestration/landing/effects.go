@@ -452,7 +452,7 @@ func (r Runner) runHook(ctx context.Context, batch Batch, effect PostLandEffect,
 			"LAND_EFFECT_KEY": effect.Key,
 		},
 		SafeDirectory:  tree,
-		Mounts:         definition.Mounts,
+		Mounts:         hookMounts(definition),
 		Network:        definition.Network,
 		Inputs:         inputs,
 		Outputs:        definition.Outputs,
@@ -476,6 +476,18 @@ func (r Runner) runHook(ctx context.Context, batch Batch, effect PostLandEffect,
 		// wrote is applied.
 		return r.attempt(ctx, batch, effect.Key, definition, map[string]any{"outcome": "exit", "exit": result.Exit})
 	}
+}
+
+// hookMounts are a hook's mounts: the program's clone read-only at its VM path, which holds LAND_TREE (its
+// worktree <git_dir>/trees/<commit>, with the worktree's git directory and the objects it reads), then the named
+// mounts its frozen definition gives. The clone is the program's contract with every hook, not a configured mount,
+// so no definition names it.
+func hookMounts(definition HookDefinition) []Mount {
+	mounts := make([]Mount, 0, len(definition.Mounts)+1)
+	if definition.GitDir != "" {
+		mounts = append(mounts, Mount{Name: "git_dir", HostPath: definition.GitDir, Mode: ReadOnly})
+	}
+	return append(mounts, definition.Mounts...)
 }
 
 // recordHook records a hook that decided (exit 0 or 1) with the outputs it declared, the apply its kind asks for

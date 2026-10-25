@@ -145,8 +145,9 @@ func TestAHookThatDecidesIsRecordedAndItsApplyFollowsIt(t *testing.T) {
 		run.Env["LAND_TREE"] != "/srv/land/repo.git/trees/merged" || run.Env["LAND_GIT_DIR"] != "/srv/land/repo.git" {
 		t.Fatalf("the hook's environment is %v", run.Env)
 	}
+	// The program's clone comes first, read-only: LAND_TREE is a worktree inside it.
 	if run.Image != "image@sha256:one" || run.User != "1002:1003" || run.Network != NetworkNone ||
-		!slices.Equal(run.Mounts, []Mount{{Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly}}) {
+		!slices.Equal(run.Mounts, []Mount{{Name: "git_dir", HostPath: "/srv/land/repo.git", Mode: ReadOnly}, {Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly}}) {
 		t.Fatalf("the hook's container is %+v", run)
 	}
 	if string(run.Inputs[ContractsInput]) != "[]" {
