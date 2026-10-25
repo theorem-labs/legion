@@ -35,18 +35,22 @@ func (f *containerFake) names() []string {
 
 // treesFake is the landed commit's worktree in the program's clone.
 type treesFake struct {
-	path    string
+	path string
+	// gitDirs are the clones each call named, in order.
+	gitDirs []string
 	removed []string
 }
 
-func (f *treesFake) LandedTree(_ context.Context, commit string) (string, error) {
+func (f *treesFake) LandedTree(_ context.Context, gitDir, commit string) (string, error) {
+	f.gitDirs = append(f.gitDirs, gitDir)
 	if f.path == "" {
-		f.path = "/srv/land/repo.git/trees/" + commit
+		f.path = gitDir + "/trees/" + commit
 	}
 	return f.path, nil
 }
 
-func (f *treesFake) RemoveLandedTree(_ context.Context, commit string) error {
+func (f *treesFake) RemoveLandedTree(_ context.Context, gitDir, commit string) error {
+	f.gitDirs = append(f.gitDirs, gitDir)
 	f.removed = append(f.removed, commit)
 	return nil
 }

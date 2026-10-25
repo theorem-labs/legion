@@ -79,3 +79,52 @@ printf '{"commit":"%s","part":"%s"}' "$1" "$2" > /land/scratch/score.json
 		t.Fatalf("the score apply pushed %q, want one path", scores.pushed)
 	}
 }
+
+// A batch keeps the clone it was admitted with. After a restart under a configuration that moved the clone, the
+// landed tree is made in the frozen clone, which is the one the hook's container mounts; otherwise LAND_TREE
+// would name a path no container has.
+func TestTheLandedTreeIsMadeInTheFrozenClone(t *testing.T) {
+	runner := hookRunner([]HookConfig{hookConfig("graph", ApplyNone, nil, nil)}, []string{"slice"})
+	effects, containers, trees := newEffectLog(), &containerFake{result: exits(0, nil)}, &treesFake{}
+	runner.Effects, runner.Containers, runner.Trees = effects, containers, trees
+	batch := Batch{ID: "batch", Repository: "r", State: Landed, PullRequest: PullRequest{Number: 7, MergedCommit: "merged", State: PullRequestMerged}}
+	batch.PostLandEffects = runner.postLandEffects(batch)
+	for _, effect := range batch.PostLandEffects {
+		effects.create(effect.Key, effect.Op, "", effect.Member, map[string]any{"commit": "merged"})
+		batch.PendingEffects = append(batch.PendingEffects, effect.Key)
+	}
+	// The configuration moves the clone after admission, as a restart under a new configuration does.
+	runner.Container.GitDir = "/srv/land/moved.git"
+
+	if err := runner.finishEffects(context.Background(), &batch); err != nil {
+		t.Fatalf("finishEffects() error = %v", err)
+	}
+	for _, gitDir := range trees.gitDirs {
+		if gitDir != "/srv/land/repo.git" {
+			t.Fatalf("a tree call named the clone %q, want the frozen /srv/land/repo.git", gitDir)
+		}
+	}
+	run := containers.runs[0]
+	if run.Env["LAND_TREE"] != "/srv/land/repo.git/trees/merged" || run.Env["LAND_GIT_DIR"] != "/srv/land/repo.git" {
+		t.Fatalf("the hook's environment is %v", run.Env)
+	}
+	if !slices.Contains(run.Mounts, Mount{Name: "git_dir", HostPath: "/srv/land/repo.git", Mode: ReadOnly}) {
+		t.Fatalf("the hook's mounts are %+v", run.Mounts)
+	}
+}
+
+// A hook definition frozen with a named mount at the clone's own path keeps one mount of it, read-only: two
+// mounts of one destination are refused by docker, so the hook would not start at all.
+func TestAMountAtTheClonePathIsNotMountedTwice(t *testing.T) {
+	definition := HookDefinition{GitDir: "/srv/land/repo.git", Mounts: []Mount{
+		{Name: "clone", HostPath: "/srv/land/repo.git", Mode: ReadWrite},
+		{Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly},
+	}}
+	want := []Mount{
+		{Name: "git_dir", HostPath: "/srv/land/repo.git", Mode: ReadOnly},
+		{Name: "index", HostPath: "/srv/land/index", Mode: ReadOnly},
+	}
+	if got := hookMounts(definition); !slices.Equal(got, want) {
+		t.Fatalf("hookMounts() = %+v, want %+v", got, want)
+	}
+}

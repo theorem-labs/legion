@@ -76,8 +76,11 @@ type ContainerRunner interface {
 }
 
 // LandedTrees gives a landed commit's detached worktree in the program's
-// clone, the hooks' LAND_TREE.
+// clone, the hooks' LAND_TREE. gitDir is the clone the batch was admitted
+// with, which is also the one its hooks mount, so a configuration that moves
+// the clone after admission cannot put the tree where the containers do not
+// look; empty means the executor's own.
 type LandedTrees interface {
-	LandedTree(ctx context.Context, commit string) (string, error)
-	RemoveLandedTree(ctx context.Context, commit string) error
+	LandedTree(ctx context.Context, gitDir, commit string) (string, error)
+	RemoveLandedTree(ctx context.Context, gitDir, commit string) error
 }

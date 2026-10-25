@@ -263,11 +263,11 @@ func TestDockerPushIsIdempotent(t *testing.T) {
 func TestDockerLandedTreeIsCleanAndTheCloneReadOnly(t *testing.T) {
 	f := newDockerFixture(t, nil)
 	ctx := context.Background()
-	tree, err := f.docker.LandedTree(ctx, f.commit)
+	tree, err := f.docker.LandedTree(ctx, "", f.commit)
 	if err != nil {
 		t.Fatalf("LandedTree() error = %v", err)
 	}
-	if again, err := f.docker.LandedTree(ctx, f.commit); err != nil || again != tree {
+	if again, err := f.docker.LandedTree(ctx, "", f.commit); err != nil || again != tree {
 		t.Fatalf("second LandedTree() = %q, %v", again, err)
 	}
 	run := shell("tree", `cd "$LAND_TREE" || exit 9
@@ -283,7 +283,7 @@ exit 0`)
 	if err != nil || result.Exit != 0 {
 		t.Fatalf("hook = exit %d, %v: %s", result.Exit, err, result.Stderr)
 	}
-	if err := f.docker.RemoveLandedTree(ctx, f.commit); err != nil {
+	if err := f.docker.RemoveLandedTree(ctx, "", f.commit); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(tree); !errors.Is(err, os.ErrNotExist) {
@@ -594,4 +594,37 @@ func fixtureServer(t *testing.T) (string, string) {
 		t.Fatalf("read the server's address: %v %q", err, address)
 	}
 	return "http://" + strings.TrimSpace(string(address)) + ":8080/", name
+}
+
+// The worktree is added in the clone the caller names, not the executor's own: a batch's hooks mount the clone
+// they were frozen with, so its tree must be there.
+func TestDockerLandedTreeUsesTheCloneItIsGiven(t *testing.T) {
+	f := newDockerFixture(t, nil)
+	other := f.docker
+	other.GitDir = filepath.Join(t.TempDir(), "frozen.git")
+	if err := os.MkdirAll(other.GitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.InitClone(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := f.docker.LandedTree(context.Background(), other.GitDir, f.commit)
+	if err != nil {
+		t.Fatalf("LandedTree() error = %v", err)
+	}
+	if want := filepath.Join(other.GitDir, "trees", f.commit); tree != want {
+		t.Fatalf("tree = %q, want %q", tree, want)
+	}
+	if _, err := os.Stat(filepath.Join(tree, "Alpha.lean")); err != nil {
+		t.Fatalf("the named clone has no worktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(f.docker.GitDir, "trees", f.commit)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the executor's own clone got the worktree: %v", err)
+	}
+	if err := f.docker.RemoveLandedTree(context.Background(), other.GitDir, f.commit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the worktree is still there: %v", err)
+	}
 }

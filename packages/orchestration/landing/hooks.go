@@ -149,6 +149,11 @@ func (p PostLanding) Validate(container Container) error {
 		// empty path in its container: the hook fails where it reads the landed tree.
 		return fmt.Errorf("repository.git_dir is required to run hooks: every hook gets the program's clone, which holds LAND_TREE")
 	}
+	for name, mount := range container.Mounts {
+		if mount.HostPath == container.GitDir {
+			return fmt.Errorf("container.mounts[%q] is the program's clone %s, which every hook gets read-only already; declaring it again is a second mount of one path, which docker refuses", name, container.GitDir)
+		}
+	}
 	for index, hook := range p.Hooks {
 		if err := hook.validate(container.Mounts); err != nil {
 			return fmt.Errorf("post_landing.hooks[%d]: %w", index, err)
