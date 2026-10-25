@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -52,10 +53,12 @@ type Name struct {
 	Kind  Kind
 }
 
-// Block is one diagnostic block associated with a module.
+// Block is one diagnostic block associated with a module. Line is the
+// 1-based line of Path that the error names.
 type Block struct {
 	Module  string
 	Path    string
+	Line    int
 	Message string
 }
 
@@ -67,11 +70,10 @@ type Report struct {
 
 var (
 	buildingRE     = regexp.MustCompile(`^✖ \[[0-9]+/[0-9]+\] (?:Building|Running|Compiling) (\S+)`)
-	errorRE        = regexp.MustCompile(`^error: (?:\./)?([^:\s]+\.lean):[0-9]+:[0-9]+: ?(.*)$`)
+	errorRE        = regexp.MustCompile(`^error: (?:\./)?([^:\s]+\.lean):([0-9]+):[0-9]+: ?(.*)$`)
 	importRE       = regexp.MustCompile(`\bimport (\S+) failed`)
 	blockEndRE     = regexp.MustCompile(`^(?:error:|warning:|info:|trace:|✔|✖|⚠|\[|-- build round|Build completed|Some required|Some builds)`)
 	identifier     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.'!?-]*$`)
-	fieldRE        = regexp.MustCompile(`^\s+([A-Za-z_][A-Za-z0-9_']*)\s*:`)
 	unknownRE      = regexp.MustCompile("(?i)(?:unknown identifier|unknown constant|the environment does not contain|unknown namespace)\\s*[`']([^`']+)[`']")
 	addedRE        = regexp.MustCompile(`environment already contains '([^']+)'`)
 	fieldOfRE      = regexp.MustCompile("is not a field of structure `([^`]+)`")
@@ -127,11 +129,12 @@ func Parse(log string, roots []string) Report {
 			flush()
 			module := moduleOfPath(match[1])
 			addRed(module)
-			for _, importMatch := range importRE.FindAllStringSubmatch(match[2], -1) {
+			for _, importMatch := range importRE.FindAllStringSubmatch(match[3], -1) {
 				addRed(importMatch[1])
 			}
 			if underRoots(module, rootSet) {
-				current = &Block{Module: module, Path: match[1], Message: match[2]}
+				line, _ := strconv.Atoi(match[2])
+				current = &Block{Module: module, Path: match[1], Line: line, Message: match[3]}
 			}
 			continue
 		}
@@ -337,15 +340,10 @@ func EvidenceFor(name Name, evidence Evidence) (int, string) {
 			return 1, "edited"
 		}
 	case Field:
-		for value := range evidence.FieldsAdded {
-			if last(value) == name.Value {
-				return 2, "field"
-			}
-		}
-		for value := range evidence.FieldsRemoved {
-			if last(value) == name.Value {
-				return 2, "field"
-			}
+		// Evidence records a field by its qualified name; build blame names
+		// it bare and a graph finding names it qualified.
+		if containsName(evidence.FieldsAdded, name.Value) || containsName(evidence.FieldsRemoved, name.Value) {
+			return 2, "field"
 		}
 	default:
 		switch {

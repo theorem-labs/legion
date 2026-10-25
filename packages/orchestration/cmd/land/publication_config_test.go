@@ -10,16 +10,17 @@ import (
 // neither a score nor an event command.
 func publicationConfig(t *testing.T) config {
 	return config{
-		BatchID:    "batch",
-		Repository: repositoryConfig{Name: "owner/repo", Path: t.TempDir(), GitDir: "/srv/land/repo.git"},
-		Base:       "base",
-		BaseBranch: "trunk",
-		StatePath:  t.TempDir() + "/state.json",
-		Build:      []string{"sh", "-c", "true"},
-		Hasher:     []string{"sh", "-c", "true"},
-		Toolchain:  []string{"sh", "-c", "printf tool"},
-		Ledger:     ledgerConfig{Check: []string{"sh", "-c", "printf '{\"pass\":true}'"}, Land: []string{"sh", "-c", "true"}, Return: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, MigrationState: []string{"sh", "-c", "printf '{\"state\":\"open\"}'"}},
-		GitHub:     githubConfig{Remote: "origin"},
+		BatchID:     "batch",
+		Repository:  repositoryConfig{Name: "owner/repo", Path: t.TempDir(), GitDir: "/srv/land/repo.git"},
+		Base:        "base",
+		BaseBranch:  "trunk",
+		StatePath:   t.TempDir() + "/state.json",
+		Build:       []string{"sh", "-c", "true"},
+		Hasher:      []string{"sh", "-c", "true"},
+		Toolchain:   []string{"sh", "-c", "printf tool"},
+		Escalations: escalations{Owner: "steward"},
+		Ledger:      ledgerConfig{Command: []string{"ledger"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, MigrationState: []string{"sh", "-c", "printf '{\"state\":\"open\"}'"}},
+		GitHub:      githubConfig{Remote: "origin"},
 	}
 }
 

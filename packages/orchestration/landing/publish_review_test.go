@@ -14,7 +14,7 @@ func TestReviewPublishUsesMergedCommitForPostMergeEffects(t *testing.T) {
 	input := greenBatch()
 	input.ActiveMembers[0].Changed = []string{"path"}
 	input.ActiveMembers[0].CurrentHashes = map[string]string{"Read": "current"}
-	input.ActiveMembers[0].ChangedContracts = map[string]string{"Contract": "changed"}
+	input.ActiveMembers[0].DerivedContracts = map[string]string{"Contract": "changed"}
 	input.ActiveMembers[0].ApprovedPinned = []string{"Contract"}
 	batch, err := runner.Publish(context.Background(), input)
 	if err != nil {
@@ -45,16 +45,20 @@ func TestReviewPublishUsesMergedCommitForPostMergeEffects(t *testing.T) {
 
 type requestLedgerFake struct{ requests []LandRequest }
 
-func (f *requestLedgerFake) Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error) {
-	return CheckResult{}, nil
+func (f *requestLedgerFake) Check(_ context.Context, request CheckRequest) (CheckResult, error) {
+	return passed(request), nil
 }
 func (f *requestLedgerFake) Land(_ context.Context, request LandRequest) error {
 	f.requests = append(f.requests, request)
 	return nil
 }
-func (f *requestLedgerFake) ReturnMember(context.Context, string, string, int64, string) error {
+func (f *requestLedgerFake) ReturnMember(context.Context, RoundRequest) error {
 	return nil
 }
+
+func (f *requestLedgerFake) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
+
+func (f *requestLedgerFake) Escalate(context.Context, string, string, string) error { return nil }
 
 func (f *requestLedgerFake) MigrationState(context.Context, string, string) (string, string, error) {
 	return "open", "", nil

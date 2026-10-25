@@ -119,12 +119,14 @@ func changedLine(evidence *Evidence, sign string, owners []LineOwner, file strin
 	if line.Owner.Name == "" {
 		return
 	}
-	if match := fieldRE.FindStringSubmatch(line.code); match != nil && line.IsStructure {
-		field := line.Owner.Name + "." + match[1]
-		if sign == "+" {
-			evidence.FieldsAdded[field] = struct{}{}
-		} else {
-			evidence.FieldsRemoved[field] = struct{}{}
+	if line.IsStructure {
+		for _, name := range fieldNames(line.code) {
+			field := line.Owner.Name + "." + name
+			if sign == "+" {
+				evidence.FieldsAdded[field] = struct{}{}
+			} else {
+				evidence.FieldsRemoved[field] = struct{}{}
+			}
 		}
 	}
 	if !line.IsSignature {

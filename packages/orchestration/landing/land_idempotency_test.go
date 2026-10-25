@@ -35,13 +35,17 @@ func TestReviewRestartDoesNotRepeatObservedLedgerLand(t *testing.T) {
 
 type observedLedger struct{ lands int }
 
-func (l *observedLedger) Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error) {
-	return CheckResult{}, nil
+func (l *observedLedger) Check(_ context.Context, request CheckRequest) (CheckResult, error) {
+	return passed(request), nil
 }
 func (l *observedLedger) Land(context.Context, LandRequest) error { l.lands++; return nil }
-func (l *observedLedger) ReturnMember(context.Context, string, string, int64, string) error {
+func (l *observedLedger) ReturnMember(context.Context, RoundRequest) error {
 	return nil
 }
+func (l *observedLedger) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
+
+func (l *observedLedger) Escalate(context.Context, string, string, string) error { return nil }
+
 func (l *observedLedger) MigrationState(context.Context, string, string) (string, string, error) {
 	if l.lands > 0 {
 		return "landed", "merged", nil

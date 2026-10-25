@@ -42,13 +42,15 @@ func (e usageError) Unwrap() error { return e.error }
 
 func run(ctx context.Context, args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return usageError{fmt.Errorf("usage: land <run|serve|status|blame|check>")}
+		return usageError{fmt.Errorf("usage: land <run|serve|status|blame|check|replay>")}
 	}
 	switch args[0] {
 	case "blame":
 		return runBlame(ctx, args[1:], output)
 	case "check":
 		return runCheck(ctx, args[1:], output)
+	case "replay":
+		return runReplayCommand(ctx, args[1:], output)
 	case "run", "serve", "status":
 		return runBatchCommand(ctx, args[0], args[1:], output)
 	default:
@@ -131,7 +133,22 @@ type config struct {
 	InfraRetries int              `json:"infraRetries"`
 	Interval     time.Duration    `json:"interval"`
 	GitHub       githubConfig     `json:"github"`
+	Escalations  escalations      `json:"escalations"`
+	Effects      effectsConfig    `json:"effects"`
 	Digest       string           `json:"-"`
+}
+
+// escalations names the owner for whom every escalation of the program is
+// enqueued.
+type escalations struct {
+	Owner string `json:"owner"`
+}
+
+// effectsConfig is the attempt threshold for a retried step (default 10) and
+// the first wait between its attempts (default 10s).
+type effectsConfig struct {
+	EscalateAfter int           `json:"escalate_after"`
+	Backoff       time.Duration `json:"backoff"`
 }
 
 type checkConfig struct {
@@ -139,12 +156,29 @@ type checkConfig struct {
 	Command []string `json:"command"`
 	Format  string   `json:"format"` // findings (the default) or graph
 }
+
+// ledgerConfig names the ledger CLI's argv before the command (command), which
+// runs the checks, the landings, the rounds and the contract list, and the
+// configured status and migration-state commands.
 type ledgerConfig struct {
-	Check          []string `json:"check"`
-	Land           []string `json:"land"`
-	Return         []string `json:"return"`
+	Command        []string `json:"command"`
 	Status         []string `json:"status"`
 	MigrationState []string `json:"migrationState"`
+}
+
+// UnmarshalJSON refuses the removed per-operation ledger commands.
+func (l *ledgerConfig) UnmarshalJSON(body []byte) error {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(body, &keys); err != nil {
+		return err
+	}
+	for _, removed := range []string{"check", "land", "return"} {
+		if _, found := keys[removed]; found {
+			return fmt.Errorf("ledger.%s is removed; set ledger.command to the ledger CLI's argv", removed)
+		}
+	}
+	type plain ledgerConfig
+	return json.Unmarshal(body, (*plain)(l))
 }
 
 // repositoryConfig names the repository the program lands into: Name is its
@@ -219,22 +253,28 @@ func (c config) runner() (landing.Runner, landing.Input, *landing.JSONStore, err
 	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" || c.StatePath == "" {
 		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, baseBranch, and statePath are required")
 	}
-	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Check) == 0 || len(c.Ledger.Land) == 0 || len(c.Ledger.Return) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
-		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build, hasher, toolchain, and every ledger command including state are required")
+	if len(c.Build) == 0 || len(c.Hasher) == 0 || len(c.Toolchain) == 0 || len(c.Ledger.Command) == 0 || len(c.Ledger.Status) == 0 || len(c.Ledger.MigrationState) == 0 {
+		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("build, hasher, toolchain, ledger.command, ledger.status, and ledger.migrationState are required")
+	}
+	if c.Escalations.Owner == "" {
+		return landing.Runner{}, landing.Input{}, nil, fmt.Errorf("escalations.owner is required: the ledger enqueues every escalation for it")
 	}
 	path := c.Repository.Path
 	store := &landing.JSONStore{Path: c.StatePath}
 	runner := landing.Runner{
-		Store:        store,
-		Ledger:       landing.CommandLedger{Directory: path, CheckCommand: c.Ledger.Check, LandCommand: c.Ledger.Land, ReturnCommand: c.Ledger.Return, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
-		Builder:      landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
-		Hasher:       landing.CommandHasher{Command: c.Hasher, Directory: path},
-		Git:          landing.RepositoryGit{Path: path},
-		ModuleRoots:  append([]string(nil), c.ModuleRoots...),
-		MaxRounds:    c.MaxRounds,
-		InfraRetries: c.InfraRetries,
-		ConfigDigest: c.Digest,
-		Toolchain:    commandToolchain(path, c.Toolchain),
+		Store:         store,
+		Ledger:        landing.CommandLedger{Directory: path, Command: c.Ledger.Command, StatusCommand: c.Ledger.Status, MigrationStateCommand: c.Ledger.MigrationState},
+		Builder:       landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
+		Hasher:        landing.CommandHasher{Command: c.Hasher, Directory: path},
+		Git:           landing.RepositoryGit{Path: path},
+		ModuleRoots:   append([]string(nil), c.ModuleRoots...),
+		MaxRounds:     c.MaxRounds,
+		InfraRetries:  c.InfraRetries,
+		ConfigDigest:  c.Digest,
+		Toolchain:     commandToolchain(path, c.Toolchain),
+		EscalateTo:    c.Escalations.Owner,
+		EscalateAfter: c.Effects.EscalateAfter,
+		RetryBackoff:  c.Effects.Backoff,
 	}
 	runner.Checks = c.checkers()
 	if c.GitHub.Remote != "" || c.GitHub.Executable != "" {

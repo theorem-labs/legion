@@ -44,14 +44,14 @@ func changes(files ...string) gitx.Change { return gitx.Change{Files: files} }
 
 // privatised is the evidence of a member that made name private.
 func privatised(name string) blame.Evidence {
-	return blame.IndexDeclarations([]blame.Declaration{{File: "Lib/Core.lean", Name: name, Text: "def " + name + " := 0"}},
-		[]blame.Declaration{{File: "Lib/Core.lean", Name: name, Text: "private def " + name + " := 0", Private: true}})
+	return blame.IndexDeclarations([]blame.Declaration{{File: "Core.lean", Name: name, Text: "def " + name + " := 0"}},
+		[]blame.Declaration{{File: "Core.lean", Name: name, Text: "private def " + name + " := 0", Private: true}})
 }
 
 // edited is the evidence of a member that edited the body of name.
 func edited(name string) blame.Evidence {
 	evidence := blame.NewEvidence()
-	evidence.Inside[blame.DeclarationID{File: "Lib/Core.lean", Name: name}] = blame.Declaration{File: "Lib/Core.lean", Name: name}
+	evidence.Inside[blame.DeclarationID{File: "Core.lean", Name: name}] = blame.Declaration{File: "Core.lean", Name: name}
 	return evidence
 }
 
@@ -81,8 +81,8 @@ func TestGraphCheckReturnsOnlyTheMemberWhoseEvidenceNamesTheDeclaration(t *testi
 	}}
 	runner.Checks = []Checker{check}
 	git := runner.Git.(*gitFake)
-	git.changes["culprit"] = changes("Lib/Core.lean")
-	git.changes["bystander"] = changes("Lib/Core.lean")
+	git.changes["culprit"] = changes("Core.lean")
+	git.changes["bystander"] = changes("Core.lean")
 	git.evidence["culprit"] = privatised("Lib.helper")
 	git.evidence["bystander"] = edited("Lib.other")
 
@@ -119,7 +119,7 @@ func TestGraphCheckRefusalListsTheMemberAndItsEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Refusal{{Member: "culprit", Declaration: "Lib.helper", Path: "Lib/Use.lean", Line: 4, Strength: 3, Evidence: "privatised",
+	want := []Refusal{{Member: "culprit", Declaration: "Lib.helper", Kind: blame.Unknown, Path: "Lib/Use.lean", Line: 4, Strength: 3, Evidence: "privatised",
 		Reason: "N1: Lib/Core.lean no longer declares Lib.helper publicly"}}
 	if len(verdicts) != 1 || verdicts[0].Verdict != "fail" || !reflect.DeepEqual(verdicts[0].Refused, want) {
 		t.Fatalf("verdicts = %+v", verdicts)
@@ -137,14 +137,14 @@ func TestGraphCheckFlagsReturnNoMember(t *testing.T) {
 		"flag\tchanged\tLib.size\tLib/Use.lean:9:20\tS1: the statement of Lib.size changed in Lib/Core.lean",
 	}}}
 	git := runner.Git.(*gitFake)
-	git.changes["editor"] = changes("Lib/Core.lean")
+	git.changes["editor"] = changes("Core.lean")
 	git.evidence["editor"] = edited("Lib.size")
 	batch, err := runner.Run(context.Background(), Input{ID: "b", Repository: "repo", Base: "base", Members: []Member{member("editor")}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	v := checkVerdict(batch, "statements")
-	want := []Flag{{Check: "statements", Member: "editor", Declaration: "Lib.size", Path: "Lib/Use.lean", Line: 9,
+	want := []Flag{{Check: "statements", Member: "editor", Declaration: "Lib.size", Kind: blame.Changed, Path: "Lib/Use.lean", Line: 9,
 		Reason: "S1: the statement of Lib.size changed in Lib/Core.lean"}}
 	if len(batch.Dropped) != 0 || len(ledger.returned) != 0 || v.Verdict != "flag" || !reflect.DeepEqual(v.Flags, want) || len(builder.trees) != 1 {
 		t.Fatalf("dropped %v, verdict %+v, builds %d", batch.Dropped, v, len(builder.trees))
@@ -300,5 +300,47 @@ func TestFindingsCheckExitThreeFailsTheBatch(t *testing.T) {
 	}
 	if batch.State != Failed || batch.Reason != "check-unable" {
 		t.Fatalf("state %s, reason %q, want failed and check-unable", batch.State, batch.Reason)
+	}
+}
+
+// I1's field line names the field qualified. The member that removed the
+// field, read through the real Git adapter, is refused; a member that edited
+// another file is not.
+func TestGraphFieldFindingRefusesTheMemberThatRemovedTheField(t *testing.T) {
+	core := "namespace Lib.Core\nstructure Box where\n  val : Nat\n  size : Nat\nend Lib.Core\n"
+	repo, root := commandRepository(t, false)
+	writeSource(t, repo, "Core.lean", core)
+	writeSource(t, repo, "Other.lean", "def other := 0\n")
+	commandReviewGit(t, repo, "add", "-A")
+	commandReviewGit(t, repo, "commit", "-qm", "base")
+	base := commandReviewGit(t, repo, "rev-parse", "HEAD")
+	branch := func(name, path, source string) Member {
+		commandReviewGit(t, repo, "checkout", "-q", "-b", name, base)
+		writeSource(t, repo, path, source)
+		commandReviewGit(t, repo, "commit", "-qam", name)
+		return Member{Migration: name, Generation: 1, Head: commandReviewGit(t, repo, "rev-parse", "HEAD")}
+	}
+	culprit := branch("culprit", "Core.lean", strings.Replace(core, "  val : Nat\n", "", 1))
+	bystander := branch("bystander", "Other.lean", "def other := 1\n")
+	_ = root
+	runner := testRunner(&ledgerFake{}, nil)
+	runner.Git = RepositoryGit{}
+	runner.Checks = []Checker{&graphCheckerFake{name: "names", lines: []string{
+		"refuse\tfield\tLib.Core.Box.val\tLib/Use.lean:8:42\tN1: structure Lib.Core.Box in Lib/Core.lean no longer has field val",
+	}}}
+	candidate, err := runner.Git.Candidate(context.Background(), repo, base, []Member{culprit, bystander})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := Batch{Repository: repo, Base: base, Candidate: candidate, ActiveMembers: []Member{culprit, bystander}}
+	verdicts, culprits, err := runner.evaluateChecks(context.Background(), &batch, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(verdicts) != 1 || verdicts[0].Verdict != "fail" || len(verdicts[0].Refused) != 1 || verdicts[0].Refused[0].Member != "culprit" {
+		t.Fatalf("verdicts = %+v", verdicts)
+	}
+	if _, found := culprits["bystander"]; found || len(culprits) != 1 {
+		t.Fatalf("culprits = %v, want culprit only", culprits)
 	}
 }

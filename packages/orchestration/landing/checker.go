@@ -48,13 +48,7 @@ func (c CommandChecker) Check(ctx context.Context, in CheckInput) ([]Finding, er
 	if len(c.Command) == 0 {
 		return nil, fmt.Errorf("check %q has no command", c.CheckName)
 	}
-	format := c.Format
-	if format == "" {
-		format = FormatFindings
-	}
-	if format != FormatFindings && format != FormatGraph {
-		return nil, fmt.Errorf("check %q has unknown format %q", c.CheckName, c.Format)
-	}
+	graph := c.Format == FormatGraph
 	command := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
 	command.Dir = c.Directory
 	command.Env = append(os.Environ(), "LAND_TREE="+string(in.Tree), "LAND_BASE="+in.Base)
@@ -64,7 +58,7 @@ func (c CommandChecker) Check(ctx context.Context, in CheckInput) ([]Finding, er
 	message := strings.TrimSpace(stderr.String())
 	if err != nil {
 		var exit *exec.ExitError
-		if format == FormatGraph && errors.As(err, &exit) && exit.ExitCode() == 3 {
+		if graph && errors.As(err, &exit) && exit.ExitCode() == 3 {
 			return nil, &CheckUnableError{Check: c.CheckName, Reason: message}
 		}
 		return nil, fmt.Errorf("run check %q: %w: %s", c.CheckName, err, message)
@@ -72,7 +66,7 @@ func (c CommandChecker) Check(ctx context.Context, in CheckInput) ([]Finding, er
 	if message != "" {
 		return nil, fmt.Errorf("check %q exited 0 with stderr: %s", c.CheckName, message)
 	}
-	if format == FormatGraph {
+	if graph {
 		return parseGraphFindings(stdout.String())
 	}
 	return parseFindings(stdout.String())

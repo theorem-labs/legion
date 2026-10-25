@@ -102,8 +102,8 @@ type flakyLedger struct {
 	landCalls int
 }
 
-func (f *flakyLedger) Check(context.Context, string, string, int64, []string, map[string]string) (CheckResult, error) {
-	return CheckResult{}, nil
+func (f *flakyLedger) Check(_ context.Context, request CheckRequest) (CheckResult, error) {
+	return passed(request), nil
 }
 func (f *flakyLedger) Land(context.Context, LandRequest) error {
 	f.landCalls++
@@ -112,7 +112,11 @@ func (f *flakyLedger) Land(context.Context, LandRequest) error {
 	}
 	return nil
 }
-func (f *flakyLedger) ReturnMember(context.Context, string, string, int64, string) error { return nil }
+func (f *flakyLedger) ReturnMember(context.Context, RoundRequest) error { return nil }
+
+func (f *flakyLedger) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
+
+func (f *flakyLedger) Escalate(context.Context, string, string, string) error { return nil }
 
 func (f *flakyLedger) MigrationState(context.Context, string, string) (string, string, error) {
 	return "open", "", nil

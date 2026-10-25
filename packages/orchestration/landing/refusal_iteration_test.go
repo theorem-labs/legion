@@ -19,9 +19,9 @@ func TestReviewRefusingFirstMemberDoesNotPanic(t *testing.T) {
 		},
 	}
 
-	returned, err := runner.checkLedger(context.Background(), &batch)
+	returned, err := runner.deferredCheck(context.Background(), &batch)
 	if err != nil || !returned {
-		t.Fatalf("checkLedger() = %t, %v; want a returned member", returned, err)
+		t.Fatalf("deferredCheck() = %t, %v; want a returned member", returned, err)
 	}
 	if got, want := batch.ActiveMembers, []Member{member("second")}; !sameMembers(got, want) {
 		t.Fatalf("active members = %#v, want %#v", got, want)

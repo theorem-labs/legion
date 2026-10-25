@@ -165,16 +165,8 @@ func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error)
 		if member.LedgerKey != batch.Receipt.Key || member.HashesKey != batch.Receipt.Key {
 			return r.retryable(ctx, batch, "ledger decision stale", fmt.Errorf("member %q was checked at key %q, the receipt is at %q", member.Migration, member.LedgerKey, batch.Receipt.Key))
 		}
-		request := LandRequest{
-			Repo:             batch.Repository,
-			Migration:        member.Migration,
-			Generation:       member.Generation,
-			Commit:           mergedCommit,
-			ChangedPaths:     append([]string(nil), member.Changed...),
-			Current:          cloneHashes(member.CurrentHashes),
-			ChangedContracts: cloneHashes(member.ChangedContracts),
-			ApprovedPinned:   append([]string(nil), member.ApprovedPinned...),
-		}
+		// Land sends the full check's request, with the commit that landed.
+		request := landRequest(batch.Repository, member, mergedCommit, member.CurrentHashes, member.DerivedContracts)
 		key := "land/" + member.Migration
 		operation, found := batch.operation(key)
 		if !found {
@@ -283,9 +275,6 @@ func (r Runner) completeMerged(ctx context.Context, batch *Batch) (Batch, error)
 // memberFlags is a member's flags in the receipt's check verdicts, never nil.
 func memberFlags(receipt *Receipt, member string) []Flag {
 	flags := []Flag{}
-	if receipt == nil {
-		return flags
-	}
 	for _, verdict := range receipt.Checks {
 		for _, flag := range verdict.Flags {
 			if flag.Member == member {
