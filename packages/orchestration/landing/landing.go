@@ -413,7 +413,7 @@ type Batch struct {
 	CheckPolicyDigest string               `json:"checkPolicyDigest"`
 	Checks            []CheckVerdict       `json:"checks"`
 	ChecksKey         string               `json:"checksKey"`
-	PullRequest       PullRequest          `json:"pullRequest"`
+	PullRequest       PullRequest          `json:"pull_request"`
 	Receipt           *Receipt             `json:"receipt"`
 }
 
