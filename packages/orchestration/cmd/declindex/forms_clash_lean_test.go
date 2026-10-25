@@ -45,7 +45,7 @@ func formsClashTree(t *testing.T) (config, tree string, lean declindex.Lean) {
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config = filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, UseA, UseB, C, UseC]\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Home, UseA, UseB, C, UseC]\n"+
 		"registry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")
@@ -165,7 +165,7 @@ func TestRefreshReadsWithTheFormsAModuleWhosePropositionAxiomTheFormsImportsDecl
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, UseB, Both]\nregistry: registry\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Home, UseB, Both]\nregistry: registry\n"+
 		"lean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")
@@ -219,7 +219,7 @@ func TestRefreshKeepsApartTwoAxiomsThatOnlyATheoremReconciles(t *testing.T) {
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Thm, Home]\nregistry: registry\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Thm, Home]\nregistry: registry\n"+
 		"lean:\n  export: true\n  jobs: 1\n")
 	r := invoke(t, "--config", config, "refresh")
 	if r.code != 0 || !strings.Contains(r.errOut, "declindex: index defect: 3 modules are read without the registry's forms") {
@@ -274,7 +274,7 @@ func TestRefreshReadsAgainWhenTheFormsImportsChange(t *testing.T) {
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, M]\nregistry: registry\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Home, M]\nregistry: registry\n"+
 		"lean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")

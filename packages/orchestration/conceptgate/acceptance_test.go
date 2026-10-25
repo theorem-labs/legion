@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/internal/indextest"
 )
 
 // orchestration-lean.yaml sets DECLINDEX_REQUIRE_SANDBOX=1 ("The gate compiles proposals only in the Landlock and
@@ -31,7 +32,7 @@ func TestFormsKeepsUndeclaredConceptsForms(t *testing.T) {
 	if err != nil || len(defects) != 0 {
 		t.Fatalf("load: %v %v", err, defects)
 	}
-	s, err := declindex.Open(filepath.Join(t.TempDir(), "index.sqlite"))
+	s, err := declindex.Open(context.Background(), declindex.Target{DSN: indextest.DSN(t), Index: "idx"})
 	if err != nil {
 		t.Fatal(err)
 	}

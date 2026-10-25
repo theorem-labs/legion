@@ -32,7 +32,7 @@ func TestTheDocumentedLandingHookRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, config, strings.Replace(string(body), "tree: tree\n", "tree: landing-tree\n", 1)+
+	writeIndexConfig(t, config, strings.Replace(string(body), "tree: tree\n", "tree: landing-tree\n", 1)+
 		"remote: "+remote+"\nbuild: [\"true\"]\nrepo: r\nregistry: registry\n"+
 		"contracts:\n  paths: [\"Nowhere/**\"]\n  kinds: [def]\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
@@ -45,9 +45,18 @@ func TestTheDocumentedLandingHookRuns(t *testing.T) {
 		"<contracts>":  contracts,
 		"<operations>": filepath.Join(root, "operations.jsonl"),
 	}
+	// The hook's command line carries no connection string: the hook's environment gives it in DECLINDEX_DSN.
+	raw, err := os.ReadFile(indexDSNFile(config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := strings.TrimSpace(string(raw))
 	env := func(k string) string {
-		if k == "LAND_COMMIT" {
+		switch k {
+		case "LAND_COMMIT":
 			return landed
+		case "DECLINDEX_DSN":
+			return dsn
 		}
 		return ""
 	}
@@ -63,6 +72,8 @@ func TestTheDocumentedLandingHookRuns(t *testing.T) {
 				args[i] = v
 			}
 		}
+		// The hook's arguments as written, not withIndexDSN's: the commands reach the index through DECLINDEX_DSN
+		// alone, so this test proves that the variable works.
 		var out, errOut bytes.Buffer
 		if code := run(context.Background(), args, env, &out, &errOut); code != 0 {
 			t.Fatalf("declindex %s exited %d: %s", strings.Join(command, " "), code, errOut.String())

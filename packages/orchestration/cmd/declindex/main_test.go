@@ -130,6 +130,7 @@ func TestHelpStartsWithOneLineUsage(t *testing.T) {
 func TestHelpListsFinalCommandInterfacesAndExitCodes(t *testing.T) {
 	r := invoke(t, "--help")
 	for _, want := range []string{
+		"--index-dsn-file",
 		"refresh: 0 read; 2 usage; 3 unable; 75 retry",
 		"gate --proposer OWNER [--accepted-by OWNER] PROPOSAL.json",
 		"ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry",
@@ -140,6 +141,31 @@ func TestHelpListsFinalCommandInterfacesAndExitCodes(t *testing.T) {
 		if !strings.Contains(r.out, want) {
 			t.Errorf("help does not list %q:\n%s", want, r.out)
 		}
+	}
+}
+
+// The index is a schema of a Postgres database, which the configuration cannot reach by itself: a command that
+// opens it without a connection string is a usage error, as a missing index file was.
+func TestACommandWithoutAConnectionStringIsAUsageError(t *testing.T) {
+	config := fixture(t)
+	var out, errOut bytes.Buffer
+	code := run(context.Background(), []string{"--config", config, "status"}, func(string) string { return "" }, &out, &errOut)
+	if code != 2 || !strings.Contains(errOut.String(), "no connection string for the index") {
+		t.Fatalf("status with neither --index-dsn-file nor DECLINDEX_DSN: want exit 2 and the missing connection string named, got %d: %s", code, errOut.String())
+	}
+}
+
+// The index file is gone, so the key and the flag that named it are refused rather than ignored: an operator who
+// still passes one is told what replaces it.
+func TestTheRemovedDatabaseKeyAndFlagAreRefused(t *testing.T) {
+	config := fixture(t)
+	if r := invoke(t, "--config", config, "--db", filepath.Join(filepath.Dir(config), "index.sqlite"), "status"); r.code != 2 ||
+		!strings.Contains(r.errOut, "db: was removed") || !strings.Contains(r.errOut, "--index-dsn-file") {
+		t.Fatalf("--db: want exit 2 and the new key and flag named, got %+v", r)
+	}
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\ndb: state/index.sqlite\nroots: [Golden, Sub]\n")
+	if r := invoke(t, "--config", config, "status"); r.code != 2 || !strings.Contains(r.errOut, "db: was removed") {
+		t.Fatalf("a configuration that still has db:: want exit 2 and the new key named, got %+v", r)
 	}
 }
 

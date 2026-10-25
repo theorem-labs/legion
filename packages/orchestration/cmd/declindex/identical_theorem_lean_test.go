@@ -49,7 +49,7 @@ func TestRefreshReadsWithTheFormsAModuleWhoseTheoremTheFormsImportsDeclareIdenti
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, UseB, Both, C, UseC, D, UseD]\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Home, UseB, Both, C, UseC, D, UseD]\n"+
 		"registry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")

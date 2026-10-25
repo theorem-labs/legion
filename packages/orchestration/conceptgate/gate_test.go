@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/internal/indextest"
 )
 
 var (
@@ -90,7 +91,7 @@ func gateWith(t *testing.T, compiled bool) (*Gate, *recordingLibrarian) {
 	runGit(t, tree, "config", "user.name", "Test")
 	runGit(t, tree, "add", ".")
 	runGit(t, tree, "commit", "-qm", "fixture")
-	s, err := declindex.Open(filepath.Join(t.TempDir(), "index.sqlite"))
+	s, err := declindex.Open(ctx, declindex.Target{DSN: indextest.DSN(t), Index: "idx"})
 	if err != nil {
 		t.Fatal(err)
 	}
