@@ -389,7 +389,9 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                     ]
                 )
                 and any(
-                    _register_relative(own + count * step, size, item, displacements, [])
+                    # A load one element back from the address the loop keeps (i[-1].field), or an
+                    # address the code forms a whole number of elements from the field.
+                    (count == -1 and _register_relative(own + count * step, size, item, displacements, []))
                     or (item.get("address") and own + count * step in constants.get(function, []))
                     for own in [item["offset"] if item.get("offset", -1) >= 0 else offset]
                     for step in steps

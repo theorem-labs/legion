@@ -1021,3 +1021,6 @@ def test_a_field_matches_from_any_element_the_code_walks_to() -> None:
     far = _walk_graph({**_field(384), "address": True}, [0, 8], [640])
     far["nodes"][-1]["size"] = 256
     assert checks.structure(far)["field_offsets"]["matched"] == 0
+    # An unrelated integer constant and a load through another pointer are no walk: `(p->f - p->f) +
+    # q[49] + n + 200` gives memory 392 and addi 200, and the image never forms p + 192.
+    assert checks.structure(_walk_graph(_field(192), [200, 392], [200]))["field_offsets"]["matched"] == 0

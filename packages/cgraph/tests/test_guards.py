@@ -1425,3 +1425,41 @@ def test_a_branch_a_condition_on_a_local_selects_holds_the_value_the_condition_n
     assert "free_obj" in {call["callee"] for call in fold(facts, "alloc_attrs_kept", "free_attrs").calls}
     # &&fail: a computed goto may enter fail with any attrs.
     assert "free_obj" in {call["callee"] for call in fold(facts, "alloc_attrs_entered", "free_attrs").calls}
+
+
+UNSOUND = """
+    int probe(int k); void other(void);
+    void narrowed(int n) { int x; x = n; if ((unsigned char)x == 0) { if (x) warn(); } kept(); }
+    void widened(int n) { int x; x = n; if ((long)x == 0) { if (x) warn(); } kept(); }
+    void volatile_test(volatile int x) { if (x == 0) { if (x) warn(); } x = 1; kept(); }
+    void in_body_goto(void) { for (; probe(0); note()) { goto next; next: kept(); } }
+    static inline void guarded_goto(int flag)
+    {
+        for (; probe(0); note()) {
+            if (flag)
+                goto next;
+            other();
+        next:
+            kept();
+        }
+    }
+    void body_goto(void) { guarded_goto(1); }
+"""
+
+
+def test_a_value_the_compiler_keeps_is_not_taken_from_a_narrowing_cast_a_volatile_read_or_a_goto_inside_a_loop(
+    tmp_path: Path,
+) -> None:
+    """Counterexamples: `(unsigned char)x == 0` holds for x = 256, so `if (x) warn()` is compiled; two
+    reads of a volatile parameter may differ; and `goto next;` to a label inside a `for` body reaches
+    the step (clang -O2 keeps `warn`, and `call note` in both loops)."""
+    facts = facts_of(tmp_path, UNSOUND)
+
+    def callees(function: str) -> set[str]:
+        return {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+
+    assert "warn" in callees("narrowed")
+    assert "warn" not in callees("widened")
+    assert "warn" in callees("volatile_test")
+    assert "note" in callees("in_body_goto")
+    assert "note" in {call["callee"] for call in fold(facts, "body_goto", "guarded_goto").calls}

@@ -1582,6 +1582,22 @@ def _ruled_out(way: list[dict[str, Any]], values: list[dict[str, Any] | None]) -
     return False
 
 
+def _kept_value(node: ci.Cursor) -> ci.Cursor | None:
+    """The expression under the conversions that keep every value it may take (a wider type, or one of
+    the same width): ``(long)x`` is ``x``, ``(unsigned char)x`` is not (it is 0 for 256 too)."""
+    inner = _strip_parens(node)
+    while inner.kind in (K.UNEXPOSED_EXPR, K.CSTYLE_CAST_EXPR):
+        below = _operand(inner)
+        if below is None:
+            return None
+        below = _strip_parens(below)
+        outer, under = _integer_type(inner.type), _integer_type(below.type)
+        if outer is not None and under is not None and outer["w"] < under["w"]:
+            return None
+        inner = below
+    return inner
+
+
 def _continues(body: ci.Cursor) -> bool:
     """A ``continue`` of the loop whose body this is (not one of a loop inside it)."""
     pending = [body]
@@ -3559,7 +3575,7 @@ class _FunctionWalk:
         with different values as the choice its condition makes (``cond ? then : else``; a branch that
         always exits gives none). ``_UNTRACED`` where the way back passes a loop, a label, a case, a
         statement that writes the variable otherwise, or the function jumps back."""
-        if self.backward or depth > _EXPRESSION_DEPTH:
+        if self.backward or depth > _EXPRESSION_DEPTH or variable.type.is_volatile_qualified():
             return _UNTRACED
         self.local_uses()
         node = reference
@@ -3635,17 +3651,20 @@ class _FunctionWalk:
         if node.kind == K.BINARY_OPERATOR and len(operands) == 2 and libclang.binary_kind(node) in _EQUALITY:
             # The condition is v == c (or v != c): equal where it holds.
             equal = libclang.binary_kind(node) == _EQUALITY[0]
-            left, right = (_strip(operand) for operand in operands)
+            left, right = (_kept_value(operand) for operand in operands)
             mine = [
                 side
                 for side in (left, right)
-                if side.kind == K.DECL_REF_EXPR
+                if side is not None
+                and side.kind == K.DECL_REF_EXPR
                 and side.referenced is not None
                 and side.referenced.hash == variable.hash
             ]
             if len(mine) != 1:
                 return None
             other = right if mine[0] is left else left
+            if other is None:
+                return None
             constant = 0 if _is_null(other) else self.x.evaluator.evaluate(other)
         elif node.kind == K.DECL_REF_EXPR and node.referenced is not None and node.referenced.hash == variable.hash:
             equal = False  # a bare v holds where v != 0
@@ -3859,12 +3878,14 @@ class _FunctionWalk:
         """What keeps a ``for`` from its step: the step runs only after a first pass that falls through,
         so each ``if (c) <exit>`` at the top of the body before any label gives ``c`` as the variables
         stand before the loop (the init's value, else the value before the loop statement; one the body
-        or the condition writes is unknown). None where the body continues, which goes to the step."""
+        or the condition writes is unknown). None where the body continues or holds a label, either of
+        which reaches the step after an exit statement."""
         parts = self.header_parts(loop)
         if not parts or "step" not in parts:
             return None
+        self.local_uses()
         body = _children(loop)[-1]
-        if _continues(body):
+        if _continues(body) or body.hash in self.label_holders:
             return None
         initial, condition = parts.get("init"), parts.get("condition")
 
