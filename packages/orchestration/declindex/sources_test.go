@@ -96,7 +96,7 @@ func TestRefreshKeysSourcesRelativeToASubdirectoryTree(t *testing.T) {
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "base"}); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT path, blob FROM sources`)
+	rows, err := s.pool.Query(ctx, `SELECT path, blob FROM sources`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestRefreshStoresSourcesAndTheReplacedCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got string
-	if err := s.db.QueryRowContext(ctx, `SELECT blob FROM sources WHERE path = 'Golden.lean'`).Scan(&got); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT blob FROM sources WHERE path = 'Golden.lean'`).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	if want := gitIn(t, tree.Source, "hash-object", "--", "Golden.lean"); got != want {
@@ -160,24 +160,24 @@ func TestRefreshStoresSourcesAndTheReplacedCommit(t *testing.T) {
 // land-hash cannot interpret.
 func TestOpenRebuildsAnOlderSchema(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "index.sqlite")
-	s, err := Open(path)
+	tg := indexTarget(t)
+	s, err := Open(ctx, tg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO sources (path, blob) VALUES ('Root.lean', 'deadbeef')`); err != nil {
+	if _, err := s.pool.Exec(ctx, `INSERT INTO sources (path, blob) VALUES ('Root.lean', 'deadbeef')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.setMeta(ctx, s.db, "built", "now"); err != nil {
+	if err := setMeta(ctx, s.pool, "built", "now"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.setMeta(ctx, s.db, "schema", "2"); err != nil {
+	if err := setMeta(ctx, s.pool, "schema", "2"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	rebuilt, err := Open(path)
+	rebuilt, err := Open(ctx, tg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestOpenRebuildsAnOlderSchema(t *testing.T) {
 		t.Fatalf("built = %q, %v; want empty after rebuild", got, err)
 	}
 	var sources int
-	if err := rebuilt.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sources`).Scan(&sources); err != nil {
+	if err := rebuilt.pool.QueryRow(ctx, `SELECT COUNT(*) FROM sources`).Scan(&sources); err != nil {
 		t.Fatal(err)
 	}
 	if sources != 0 {
@@ -204,8 +204,8 @@ func TestOpenRebuildsAnOlderSchema(t *testing.T) {
 func TestAnIndexOfThePreviousSchemaIsRebuiltByTheNextRefresh(t *testing.T) {
 	ctx := context.Background()
 	tree := goldenTree(t)
-	path := filepath.Join(t.TempDir(), "index.sqlite")
-	s, err := Open(path)
+	tg := indexTarget(t)
+	s, err := Open(ctx, tg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,20 +217,20 @@ func TestAnIndexOfThePreviousSchemaIsRebuiltByTheNextRefresh(t *testing.T) {
 		`DELETE FROM meta WHERE k IN ('compiled_commit', 'source_prefix')`,
 		`UPDATE meta SET v = '3' WHERE k = 'schema'`,
 	} {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := s.pool.Exec(ctx, statement); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if reader, err := OpenReadOnly(ctx, path, IndexOnly); err == nil {
+	if reader, err := OpenReadOnly(ctx, tg, IndexOnly); err == nil {
 		_ = reader.Close()
 		t.Errorf("opened an index of the previous schema read-only")
 	} else if !strings.Contains(err.Error(), "refresh") {
 		t.Errorf("the refusal of an index of the previous schema does not name the refresh that rebuilds it: %v", err)
 	}
-	s, err = Open(path)
+	s, err = Open(ctx, tg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestAnIndexOfThePreviousSchemaIsRebuiltByTheNextRefresh(t *testing.T) {
 	if previous, recorded, err := s.Landing(ctx, "one"); err != nil || !recorded || previous != "" {
 		t.Errorf("the landing of one after the rebuild: previous %q, recorded %v, %v; want recorded with no previous", previous, recorded, err)
 	}
-	reader, err := OpenReadOnly(ctx, path, IndexOnly)
+	reader, err := OpenReadOnly(ctx, tg, IndexOnly)
 	if err != nil {
 		t.Fatalf("open the rebuilt index read-only: %v", err)
 	}

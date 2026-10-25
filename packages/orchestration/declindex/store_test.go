@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,9 +12,12 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/sjawhar/legion/orchestration/internal/indextest"
 )
 
 // goldenTree copies testdata/golden into a fresh directory that is both the source tree and the library
@@ -44,14 +46,27 @@ func goldenTree(t *testing.T) Tree {
 	return Tree{Source: dir, Lib: dir, Roots: Roots{"Golden": true, "Sub": true}}
 }
 
-func openStore(t *testing.T) *Store {
+// indexTarget is an index of a test's own: a fresh database, which indextest drops when the test ends, and the
+// schema idx in it.
+func indexTarget(t *testing.T) Target {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "index.sqlite"))
+	return Target{DSN: indextest.DSN(t), Index: "idx"}
+}
+
+// openAt opens the index tg, which Open creates when the database holds none.
+func openAt(t *testing.T, tg Target) *Store {
+	t.Helper()
+	s, err := Open(context.Background(), tg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func openStore(t *testing.T) *Store {
+	t.Helper()
+	return openAt(t, indexTarget(t))
 }
 
 func refreshed(t *testing.T, tree Tree) *Store {
@@ -354,40 +369,36 @@ func TestRefreshSerializesTheSyncStepWithTheRefreshLock(t *testing.T) {
 }
 
 func TestOpenReadOnlyRequiresAnInitializedIndex(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "index.sqlite")
-	if _, err := OpenReadOnly(context.Background(), path, IndexOnly); err == nil {
-		t.Fatal("opened a missing index read-only")
+	ctx := context.Background()
+	tg := indexTarget(t)
+	if _, err := OpenReadOnly(ctx, tg, IndexOnly); err == nil {
+		t.Fatal("opened an index that no refresh made")
 	}
-	writer, err := Open(path)
+	writer, err := Open(ctx, tg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reader, err := OpenReadOnly(context.Background(), path, IndexOnly)
+	reader, err := OpenReadOnly(ctx, tg, IndexOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reader.Close() })
-	if version, err := reader.Meta(context.Background(), "schema"); err != nil || version != SchemaVersion {
+	if version, err := reader.Meta(ctx, "schema"); err != nil || version != SchemaVersion {
 		t.Fatalf("read-only schema: %q, %v", version, err)
 	}
 }
 
-// A refresh queued behind the refresh lock ends when its context ends (a SIGTERM to a queued `refresh`), rather
+// A refresh queued behind the index's lock ends when its context ends (a SIGTERM to a queued `refresh`), rather
 // than waiting for the lock.
-func TestARefreshWaitingForTheRefreshLockEndsWithItsContext(t *testing.T) {
+func TestARefreshWaitingForTheIndexLockEndsWithItsContext(t *testing.T) {
 	tree := goldenTree(t)
-	s := openStore(t)
-	holder, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer holder.Close()
-	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX); err != nil {
-		t.Fatal(err)
-	}
+	tg := indexTarget(t)
+	s := openAt(t, tg)
+	holder := holdIndexLock(t, tg)
+	holder.take(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	done := make(chan error, 1)
@@ -398,226 +409,56 @@ func TestARefreshWaitingForTheRefreshLockEndsWithItsContext(t *testing.T) {
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("a refresh whose context ended while it waited for the lock: %v", err)
+			t.Fatalf("a refresh whose context ended while it waited for the index's lock: %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		_ = syscall.Flock(int(holder.Fd()), syscall.LOCK_UN)
+		holder.release(t)
 		<-done
-		t.Fatal("the refresh kept waiting for the refresh lock after its context ended")
+		t.Fatal("the refresh kept waiting for the index's lock after its context ended")
 	}
 }
 
-// readOnlyDirectory makes dir read-only until the restore it gives, which the test's cleanup also runs: its mode,
-// which stops a writer that is not root, and OpenReadOnly's view of it (directoryWritable), which the mode does not
-// change for root.
-func readOnlyDirectory(t *testing.T, dir string) (restore func()) {
+// indexLock is a connection of the test's own that takes the index's advisory lock, as a refresh in another
+// process would, and keeps it until the test gives it back.
+type indexLock struct {
+	conn  *pgx.Conn
+	index string
+}
+
+func holdIndexLock(t *testing.T, tg Target) *indexLock {
 	t.Helper()
-	if err := os.Chmod(dir, 0o555); err != nil {
+	conn, err := pgx.Connect(context.Background(), tg.DSN)
+	if err != nil {
 		t.Fatal(err)
 	}
-	writable := directoryWritable
-	directoryWritable = func(string) bool { return false }
-	restore = func() {
-		directoryWritable = writable
-		_ = os.Chmod(dir, 0o755)
-	}
-	t.Cleanup(restore)
-	return restore
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	return &indexLock{conn: conn, index: tg.Index}
 }
 
-// The index directory of a post-landing check is read-only. The index there opens read-only, and a refresh waits
-// until the reader is done, so the reader never sees a refresh half written.
-func TestOpenReadOnlyReadsAnIndexInAReadOnlyDirectory(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "state")
-	path := filepath.Join(dir, "index.sqlite")
-	writer, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tree := goldenTree(t)
-	if _, err := writer.Refresh(context.Background(), tree, RefreshOptions{Commit: "one"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	restore := readOnlyDirectory(t, dir)
-	reader, err := OpenReadOnly(context.Background(), path, IndexOnly)
-	if err != nil {
-		t.Fatalf("open read-only in a read-only directory: %v", err)
-	}
-	if commit, err := reader.Meta(context.Background(), "commit"); err != nil || commit != "one" {
-		t.Fatalf("commit %q, %v", commit, err)
-	}
-	if n, err := reader.ModuleCount(context.Background()); err != nil || n != 2 {
-		t.Fatalf("modules %d, %v", n, err)
-	}
-	restore()
-	other, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	if _, err := other.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("a refresh while the read-only reader is open: %v", err)
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := other.Refresh(context.Background(), tree, RefreshOptions{Commit: "two"}); err != nil {
-		t.Fatalf("a refresh after the reader closed: %v", err)
-	}
-}
-
-// lockHolder is a test's own open file of one of the index's lock files, which it locks exclusively as a refresh
-// or a write of the index would.
-type lockHolder struct{ f *os.File }
-
-func openLockHolder(t *testing.T, path string) lockHolder {
+func (h *indexLock) take(t *testing.T) {
 	t.Helper()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
+	k1, k2 := lockKeys(h.index)
+	if _, err := h.conn.Exec(context.Background(), `SELECT pg_advisory_lock($1, $2)`, k1, k2); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = f.Close() })
-	return lockHolder{f}
 }
 
-func (h lockHolder) lock(t *testing.T) {
+func (h *indexLock) release(t *testing.T) {
 	t.Helper()
-	if err := syscall.Flock(int(h.f.Fd()), syscall.LOCK_EX); err != nil {
+	k1, k2 := lockKeys(h.index)
+	if _, err := h.conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1, $2)`, k1, k2); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func (h lockHolder) unlock(t *testing.T) {
-	t.Helper()
-	if err := syscall.Flock(int(h.f.Fd()), syscall.LOCK_UN); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// In a read-only index directory a reader holds, shared, the locks of what it reads. A reader of the index alone
-// (land-hash) holds only the write lock, which a refresh holds only while it writes the index, so it does not wait
-// while a refresh holds its refresh lock for its fetch, checkout and build. A reader that also reads the tree
-// (ledger, the gate) waits for both locks.
-func TestAReadOnlyReaderWaitsForTheLocksOfWhatItReads(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "state")
-	path := filepath.Join(dir, "index.sqlite")
-	writer, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := writer.Refresh(context.Background(), goldenTree(t), RefreshOptions{Commit: "one"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	refreshLock, writeLock := openLockHolder(t, path+".lock"), openLockHolder(t, path+".write.lock")
-	readOnlyDirectory(t, dir)
-	read := func(scope ReadScope, wait time.Duration) error {
-		ctx, cancel := context.WithTimeout(context.Background(), wait)
-		defer cancel()
-		reader, err := OpenReadOnly(ctx, path, scope)
-		if err != nil {
-			return err
-		}
-		defer reader.Close()
-		if commit, err := reader.Meta(ctx, "commit"); err != nil || commit != "one" {
-			return fmt.Errorf("read commit %q, %v", commit, err)
-		}
-		return nil
-	}
-	readers := map[ReadScope]string{IndexOnly: "an index-only reader", IndexAndTree: "a reader of the index and the tree"}
-
-	refreshLock.lock(t)
-	if err := read(IndexOnly, 5*time.Second); err != nil {
-		t.Errorf("an index-only reader while a refresh holds its refresh lock: %v; want it to read at once", err)
-	}
-	if err := read(IndexAndTree, 300*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("a reader of the index and the tree while a refresh holds its refresh lock: %v; want it to wait", err)
-	}
-	refreshLock.unlock(t)
-
-	writeLock.lock(t)
-	for scope, reader := range readers {
-		if err := read(scope, 300*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("%s while a refresh writes the index: %v; want it to wait", reader, err)
-		}
-	}
-	writeLock.unlock(t)
-
-	for scope, reader := range readers {
-		if err := read(scope, 5*time.Second); err != nil {
-			t.Errorf("%s with both locks free: %v", reader, err)
-		}
-	}
-}
-
-// The case that a landing's hasher meets: a refresh is in its sync (fetch, checkout and build) under its refresh
-// lock. A reader of the index alone in a read-only directory reads the index of the refresh before, at once; a
-// reader of the tree, which the sync changes, waits for the refresh.
-func TestAnIndexOnlyReaderReadsWhileARefreshSyncs(t *testing.T) {
+// A reader of the tree (the gate and the ledger, which compile against the build that a refresh's sync checks out
+// and rebuilds) waits for a running refresh, and a refresh waits for it: each holds the index's advisory lock, the
+// reader shared and the refresh exclusive. A reader of the index alone takes no lock, so it reads the index of the
+// refresh before while the refresh syncs.
+func TestAReaderOfTheTreeAndARefreshExcludeEachOther(t *testing.T) {
 	ctx := context.Background()
-	dir := filepath.Join(t.TempDir(), "state")
-	path := filepath.Join(dir, "index.sqlite")
-	writer, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer writer.Close()
-	tree := goldenTree(t)
-	if _, err := writer.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
-		t.Fatal(err)
-	}
-	synced := false
-	writer.afterRefreshLock = func(context.Context) error {
-		synced = true
-		defer readOnlyDirectory(t, dir)()
-		wait, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if reader, err := OpenReadOnly(wait, path, IndexOnly); err != nil {
-			t.Errorf("an index-only reader during a refresh's sync: %v; want it to read the index of the refresh before", err)
-		} else {
-			if commit, err := reader.Meta(ctx, "commit"); err != nil || commit != "one" {
-				t.Errorf("an index-only reader during a refresh's sync read commit %q, %v; want one", commit, err)
-			}
-			_ = reader.Close()
-		}
-		short, cancelShort := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer cancelShort()
-		if reader, err := OpenReadOnly(short, path, IndexAndTree); !errors.Is(err, context.DeadlineExceeded) {
-			if reader != nil {
-				_ = reader.Close()
-			}
-			t.Errorf("a reader of the index and the tree during a refresh's sync: %v; want it to wait for the refresh", err)
-		}
-		return nil
-	}
-	_, err = writer.Refresh(ctx, tree, RefreshOptions{Commit: "two"})
-	writer.afterRefreshLock = nil
-	if err != nil || !synced {
-		t.Fatalf("the refresh: %v, synced %v", err, synced)
-	}
-	if commit, err := writer.Meta(ctx, "commit"); err != nil || commit != "two" {
-		t.Fatalf("commit after the refresh: %q, %v", commit, err)
-	}
-}
-
-// In a writable index directory too, a reader of the tree (the gate and the ledger, which compile against the build
-// that a refresh's sync checks out and rebuilds) waits for a running refresh, and a refresh waits for it. A reader of
-// the index alone still reads the index of the refresh before while the refresh syncs.
-func TestAReaderOfTheTreeAndARefreshExcludeEachOtherInAWritableDirectory(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "state", "index.sqlite")
-	writer, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer writer.Close()
+	tg := indexTarget(t)
+	writer := openAt(t, tg)
 	tree := goldenTree(t)
 	if _, err := writer.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
 		t.Fatal(err)
@@ -625,27 +466,27 @@ func TestAReaderOfTheTreeAndARefreshExcludeEachOtherInAWritableDirectory(t *test
 	writer.afterRefreshLock = func(context.Context) error {
 		wait, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if reader, err := OpenReadOnly(wait, path, IndexOnly); err != nil {
+		if reader, err := OpenReadOnly(wait, tg, IndexOnly); err != nil {
 			t.Errorf("an index-only reader during a refresh's sync: %v; want it to read at once", err)
 		} else {
 			_ = reader.Close()
 		}
 		short, cancelShort := context.WithTimeout(ctx, 300*time.Millisecond)
 		defer cancelShort()
-		if reader, err := OpenReadOnly(short, path, IndexAndTree); !errors.Is(err, context.DeadlineExceeded) {
+		if reader, err := OpenReadOnly(short, tg, IndexAndTree); !errors.Is(err, context.DeadlineExceeded) {
 			if reader != nil {
 				_ = reader.Close()
 			}
-			t.Errorf("a reader of the index and the tree during a refresh's sync in a writable directory: %v; want it to wait", err)
+			t.Errorf("a reader of the index and the tree during a refresh's sync: %v; want it to wait", err)
 		}
 		return nil
 	}
-	_, err = writer.Refresh(ctx, tree, RefreshOptions{Commit: "two"})
+	_, err := writer.Refresh(ctx, tree, RefreshOptions{Commit: "two"})
 	writer.afterRefreshLock = nil
 	if err != nil {
 		t.Fatalf("the refresh: %v", err)
 	}
-	reader, err := OpenReadOnly(ctx, path, IndexAndTree)
+	reader, err := OpenReadOnly(ctx, tg, IndexAndTree)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,67 +503,20 @@ func TestAReaderOfTheTreeAndARefreshExcludeEachOtherInAWritableDirectory(t *test
 	}
 }
 
-// A symlinked index file is one index whichever path names it: its lock files and its graph are beside the file it
-// resolves to. So a reader of the tree that opens the resolved path, as the gate does (Config.GateIndexPath), waits
-// for a refresh that opened the link, and reads the graph that refresh wrote.
-func TestASymlinkedIndexFileHasOneRefreshLockAndOneGraph(t *testing.T) {
+// Open rebuilds an index of another schema version under the index's lock, so that no refresh writes it while it is
+// rebuilt and no second Open rebuilds it at the same time. An index of this schema needs no write, so Open of it
+// does not wait.
+func TestOpenRebuildsAnOlderSchemaOnlyUnderTheIndexLock(t *testing.T) {
 	ctx := context.Background()
-	target := filepath.Join(t.TempDir(), "index.sqlite")
-	created, err := Open(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := created.Close(); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(t.TempDir(), "index.sqlite")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
-	writer, err := Open(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer writer.Close()
-	writer.afterRefreshLock = func(context.Context) error {
-		short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer cancel()
-		if reader, err := OpenReadOnly(short, target, IndexAndTree); !errors.Is(err, context.DeadlineExceeded) {
-			if reader != nil {
-				_ = reader.Close()
-			}
-			t.Errorf("a reader of the resolved index during a refresh through its link: %v; want it to wait", err)
-		}
-		return nil
-	}
-	_, err = writer.Refresh(ctx, goldenTree(t), RefreshOptions{Commit: "one"})
-	writer.afterRefreshLock = nil
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := OpenReadOnly(ctx, target, IndexAndTree)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	if _, err := answerFor(t, reader, "Gold.Frame", AnswerOptions{}); err != nil {
-		t.Errorf("an answer of the resolved index after a refresh through its link: %v", err)
-	}
-}
-
-// Open rebuilds an index of another schema under the write lock, so that a rebuild never drops the tables under a
-// reader in a read-only directory. An index of this schema needs no write, so Open of it does not wait.
-func TestOpenRebuildsAnOlderSchemaOnlyUnderTheWriteLock(t *testing.T) {
-	ctx := context.Background()
-	current := filepath.Join(t.TempDir(), "index.sqlite")
-	older := filepath.Join(t.TempDir(), "index.sqlite")
-	for _, path := range []string{current, older} {
-		s, err := Open(path)
+	dsn := indextest.DSN(t)
+	current, older := Target{DSN: dsn, Index: "idx"}, Target{DSN: dsn, Index: "older"}
+	for _, tg := range []Target{current, older} {
+		s, err := Open(ctx, tg)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if path == older {
-			if err := s.setMeta(ctx, s.db, "schema", "3"); err != nil {
+		if tg == older {
+			if err := setMeta(ctx, s.pool, "schema", "3"); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -730,10 +524,10 @@ func TestOpenRebuildsAnOlderSchemaOnlyUnderTheWriteLock(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	open := func(path string) chan error {
+	open := func(tg Target) chan error {
 		done := make(chan error, 1)
 		go func() {
-			s, err := Open(path)
+			s, err := Open(ctx, tg)
 			if err == nil {
 				err = s.Close()
 			}
@@ -741,32 +535,32 @@ func TestOpenRebuildsAnOlderSchemaOnlyUnderTheWriteLock(t *testing.T) {
 		}()
 		return done
 	}
-	currentLock, olderLock := openLockHolder(t, current+".write.lock"), openLockHolder(t, older+".write.lock")
-	currentLock.lock(t)
+	currentLock, olderLock := holdIndexLock(t, current), holdIndexLock(t, older)
+	currentLock.take(t)
 	select {
 	case err := <-open(current):
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Error("Open of an index of this schema waited for the write lock")
+		t.Error("Open of an index of this schema waited for the index's lock")
 	}
-	currentLock.unlock(t)
-	olderLock.lock(t)
+	currentLock.release(t)
+	olderLock.take(t)
 	done := open(older)
 	select {
 	case err := <-done:
-		t.Fatalf("Open rebuilt an older index while its write lock was held: %v", err)
+		t.Fatalf("Open rebuilt an older index while its lock was held: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	olderLock.unlock(t)
+	olderLock.release(t)
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("Open did not rebuild the older index after its write lock was released")
+		t.Fatal("Open did not rebuild the older index after its lock was released")
 	}
 }
 
