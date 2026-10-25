@@ -359,3 +359,13 @@ def test_operands_past_the_returned_value_decide_nothing(fold_build: dict[str, A
     assert {(item["field"], bool(item.get("conditional"))) for item in accesses} == {("drv", True), ("managed", True)}
     offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
     assert "function:fd_dma_configure" not in {entry["function"] for entry in offsets["misses"]}
+
+
+def test_an_assignment_does_not_reach_its_own_right_side(fold_build: dict[str, Any]) -> None:
+    """fd_class_to_subsys (llvm-objdump: addi a0, s0, -0x8; jal obj_free): sp = fd_subsys_get(sp)
+    reads the walk's container_of, so &sp->subsys.kobj is the list node less 8."""
+    accesses = fold_build["graph"]["analysis"]["field_accesses"]["function:fd_class_to_subsys"]
+    (item,) = [item for item in accesses if item["field"] == "kobj"]
+    assert (item["base"], item["displacement"]) == ("container_of", -8)
+    offsets = fold_build["checks"]["structure_layer"]["field_offsets"]
+    assert "function:fd_class_to_subsys" not in {entry["function"] for entry in offsets["misses"]}

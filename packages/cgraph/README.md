@@ -213,7 +213,8 @@ These rules follow what the machine code shows, each only where it shows it:
   parameter is followed to its callers' globals (above) on the same rule. `analysis.object_arguments`
   lists each local object whose address a function passes to a call.
 - A local's or parameter's address is derived from the values that reach each use: the assignments
-  before it (or after it, around a loop or a backward goto), less those an assignment on every path
+  before it (or after it, around a loop or a backward goto; an assignment does not reach its own right
+  side, as `class_to_subsys`' `sp = subsys_get(sp)`), less those an assignment on every path
   overwrites (also a `for` header's: the condition's `(p = next_task(p)) != &init_task` in the body,
   the init in the whole loop; a loop that runs at most once, `for (; se; se = NULL)` as
   `for_each_sched_entity` without group scheduling, carries no value back to its start, and a value

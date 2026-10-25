@@ -5136,7 +5136,13 @@ class _FunctionWalk:
         return [value for value in found if not _is_null(value) and not self.x.returns_null(value)], entry
 
     def reaches(self, definition: _Place | None, use: _Place | None) -> bool:
-        if definition is None or use is None or definition[0] != use[0] or definition[1] <= use[2] or self.backward:
+        """An assignment at ``definition`` may give the value read at ``use``: it comes before the use,
+        or after it (also around it, the use being in what it stores, as class_to_subsys' ``sp =
+        subsys_get(sp)``) in a loop around both."""
+        if definition is None or use is None or definition[0] != use[0] or self.backward:
+            return True
+        around = definition[1] <= use[1] and use[2] <= definition[2]
+        if definition[1] <= use[2] and not around:
             return True
         return any(loop[0] == use[0] and loop[1] <= use[1] and definition[2] <= loop[2] for loop in self.loops)
 

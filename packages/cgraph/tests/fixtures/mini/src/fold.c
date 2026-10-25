@@ -972,3 +972,54 @@ int fd_dma_configure(struct fd_pdev *d, struct box *b)
 		obj_free(b);
 	return ret;
 }
+
+/* drivers/base/class.c class_to_subsys: sp = container_of_const(kset, struct subsys_private, subsys)
+ * in a list walk, then done: sp = subsys_get(sp);, whose kset_get passes &sp->subsys.kobj to an out of
+ * line call. The store to sp does not reach its own right side, so sp is the walk's container_of and
+ * the address is the list node less 8 (llvm-objdump: addi a0, s0, -0x8 before jal obj_free). */
+struct fd_kobj {
+	long name;
+	struct list_node entry;
+};
+struct fd_kset {
+	struct list_node list;
+	long lock;
+	struct fd_kobj kobj;
+};
+struct fd_subsys {
+	struct fd_kset subsys;
+	long *cls;
+};
+
+static inline struct fd_kset *fd_kset_get(struct fd_kset *k)
+{
+	if (k)
+		obj_free(&k->kobj);
+	return k;
+}
+
+static inline struct fd_subsys *fd_subsys_get(struct fd_subsys *sp)
+{
+	if (sp)
+		fd_kset_get(&sp->subsys);
+	return sp;
+}
+
+struct fd_subsys *fd_class_to_subsys(struct list_node *head, long *cls)
+{
+	struct fd_subsys *sp = NULL;
+	struct list_node *pos;
+
+	dd_for_each(pos, head) {
+		struct fd_kobj *kobj = container_of(pos, struct fd_kobj, entry);
+		struct fd_kset *kset = container_of(kobj, struct fd_kset, kobj);
+
+		sp = container_of(kset, struct fd_subsys, subsys);
+		if (sp->cls == cls)
+			goto done;
+	}
+	sp = NULL;
+done:
+	sp = fd_subsys_get(sp);
+	return sp;
+}
