@@ -243,3 +243,18 @@ func TestAnIndexWhoseFirstCompiledStepFailedIsRefused(t *testing.T) {
 		t.Errorf("the refusal does not say that the compiled part is missing: %v", err)
 	}
 }
+
+// The same outside Git, where a refresh records an empty commit: an index whose compiled step failed then has an
+// empty commit and an empty compiled commit, which are equal, and must still be refused. The cross-family review
+// reproduced it with the command itself: refresh exited 3, then states answered "nothing states it", exit 1.
+func TestAnIndexOutsideGitWhoseFirstCompiledStepFailedIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	compiled := func(context.Context) (*CompiledOptions, error) { return nil, errors.New("no toolchain here") }
+	if _, err := s.Refresh(ctx, goldenTree(t), RefreshOptions{Compiled: compiled}); err == nil {
+		t.Fatal("a refresh whose compiled step failed reported no error")
+	}
+	if got, err := s.CompiledCommit(ctx, false); err == nil {
+		t.Fatalf("an index outside Git whose compiled step never wrote a compiled part was accepted at %q", got)
+	}
+}

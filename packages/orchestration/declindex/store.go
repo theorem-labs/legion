@@ -478,10 +478,11 @@ func (s *Store) CompiledCommit(ctx context.Context, required bool) (string, erro
 		return "", err
 	}
 	switch {
+	// Owed first: outside Git the commit is empty, and an empty compiled commit would pass as equal to it.
+	case owed == "1":
+		return "", fmt.Errorf("the index's last refresh read no compiled part of %q: its compiled step did not finish, so the index states no fact; refresh the index", commit)
 	case compiled == commit:
 		return commit, nil
-	case compiled == "" && owed == "1":
-		return "", fmt.Errorf("the index's refresh of %s read no compiled part: its compiled step did not finish, so the index states no fact; refresh the index", commit)
 	case compiled == "" && !required:
 		return commit, nil
 	case compiled == "":

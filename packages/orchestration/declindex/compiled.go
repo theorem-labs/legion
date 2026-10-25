@@ -207,7 +207,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			// Nothing was read with the new exporter or forms: the compiled part is not complete for commit.
 			return 0, 0, nil
 		}
-		return 0, 0, s.writeTx(ctx, func(tx pgx.Tx) error { return setMeta(ctx, tx, "compiled_commit", commit) })
+		return 0, 0, s.writeTx(ctx, func(tx pgx.Tx) error { return compiledDone(ctx, tx, commit) })
 	}
 	sort.Strings(todo)
 	before, err := s.defHashes(ctx, todo)
@@ -439,7 +439,16 @@ func (s *Store) writeCompiled(ctx context.Context, tx pgx.Tx, w compiledRead) er
 	if err := setMeta(ctx, tx, "compiled", w.digest); err != nil {
 		return err
 	}
-	return setMeta(ctx, tx, "compiled_commit", w.commit)
+	return compiledDone(ctx, tx, w.commit)
+}
+
+// compiledDone records that the index's compiled part is of commit, and that the refresh owes no compiled part
+// any more (CompiledCommit).
+func compiledDone(ctx context.Context, tx pgx.Tx, commit string) error {
+	if err := setMeta(ctx, tx, "compiled_commit", commit); err != nil {
+		return err
+	}
+	return setMeta(ctx, tx, "compiled_owed", "")
 }
 
 // defHashes are the compiled hashes of the definitions of the modules, before they are read again.
