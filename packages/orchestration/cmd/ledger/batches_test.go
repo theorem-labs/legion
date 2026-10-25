@@ -34,6 +34,8 @@ type cliBatch struct {
 	RecordVersion   int64           `json:"record_version"`
 	Admission       string          `json:"admission"`
 	AdmissionDigest string          `json:"admission_digest"`
+	MergedCommit    string          `json:"merged_commit"`
+	DeclineDigest   string          `json:"decline_digest"`
 	Successor       string          `json:"successor"`
 	PendingEffects  []string        `json:"pending_effects"`
 }

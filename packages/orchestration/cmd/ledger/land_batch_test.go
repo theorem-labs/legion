@@ -13,13 +13,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// cliLandedBatch is a batch as the landing commands print it, with the columns they write.
-type cliLandedBatch struct {
-	cliBatch
-	MergedCommit  string `json:"merged_commit"`
-	DeclineDigest string `json:"decline_digest"`
-}
-
 // cliEffect is one effect as the batch_effects table holds it, with its result.
 type cliEffect struct {
 	Key, Member, Op, State string
@@ -64,9 +57,9 @@ func landFields(id string, version int64, mergedCommit string) map[string]any {
 		"record": landRecordFields(id, mergedCommit)}
 }
 
-func (cli batchCLI) landBatch(fields map[string]any) cliLandedBatch {
+func (cli batchCLI) landBatch(fields map[string]any) cliBatch {
 	cli.t.Helper()
-	var landed cliLandedBatch
+	var landed cliBatch
 	cli.decode(cli.invoke("land-batch", "--request-file", cli.request(fields)), &landed)
 	return landed
 }
@@ -117,9 +110,9 @@ func TestLandBatchCommandLandsTheAdmittedMembers(t *testing.T) {
 	if replayed := cli.landBatch(retry); !reflect.DeepEqual(replayed, landed) {
 		t.Fatalf("retry printed %+v, want the stored %+v", replayed, landed)
 	}
-	cli.assertUnchanged(landed.cliBatch, events)
+	cli.assertUnchanged(landed, events)
 	cli.refused("stale_batch", "save-batch", "--request-file", cli.request(saveFields("batch-1", cliRecord("landed"), admitted.RecordVersion)))
-	cli.assertUnchanged(landed.cliBatch, events)
+	cli.assertUnchanged(landed, events)
 
 	cli.invoke("contract", "transfer", "r", "C", "alice", "bob")
 	cli.refused("not_open", "takeover", "r", "M-1", "zoe", "1")
@@ -166,18 +159,18 @@ func TestLandBatchCommandSurvivesAKillAfterTheCommit(t *testing.T) {
 		t.Fatalf("the child ended with %v (%v), want SIGKILL", child.ProcessState, err)
 	}
 
-	var stored cliLandedBatch
+	var stored cliBatch
 	cli.decode(cli.invoke("batch", "r", "batch-1"), &stored)
 	if stored.Admission != "landed" || stored.MergedCommit != "merged-1" || len(cli.effects("batch-1")) != 1 {
 		t.Fatalf("after the kill the batch is %+v", stored)
 	}
 	events := len(cli.events(""))
-	var replayed cliLandedBatch
+	var replayed cliBatch
 	cli.decode(cli.invoke("land-batch", "--request-file", file), &replayed)
 	if !reflect.DeepEqual(replayed, stored) {
 		t.Fatalf("the repeat printed %+v, want the stored %+v", replayed, stored)
 	}
-	cli.assertUnchanged(stored.cliBatch, events)
+	cli.assertUnchanged(stored, events)
 }
 
 // A malformed land-batch exits 2 and changes nothing.

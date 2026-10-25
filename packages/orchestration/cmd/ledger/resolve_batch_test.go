@@ -32,7 +32,7 @@ func TestResolveBatchCommandLandsAnUnrecordedBatch(t *testing.T) {
 	}
 	cli.refused("batch_admitted", "takeover", "r", "M-1", "zoe", "1")
 
-	var resolved cliLandedBatch
+	var resolved cliBatch
 	cli.decode(cli.invoke("resolve-batch", "r", "batch-1", "merged-9"), &resolved)
 	var record map[string]any
 	if err := json.Unmarshal(resolved.Record, &record); err != nil {
@@ -60,12 +60,12 @@ func TestResolveBatchCommandLandsAnUnrecordedBatch(t *testing.T) {
 	}
 
 	events := len(cli.events(""))
-	var repeated cliLandedBatch
+	var repeated cliBatch
 	cli.decode(cli.invoke("resolve-batch", "r", "batch-1", "merged-9"), &repeated)
 	if !reflect.DeepEqual(repeated, resolved) {
 		t.Fatalf("the repeat printed %+v, want the stored %+v", repeated, resolved)
 	}
-	cli.assertUnchanged(resolved.cliBatch, events)
+	cli.assertUnchanged(resolved, events)
 
 	// BatchEffectDone finishes the effect; the test marks it done directly.
 	cli.sql(`UPDATE batch_effects SET state = 'done' WHERE repo = 'r' AND batch = 'batch-1'`)

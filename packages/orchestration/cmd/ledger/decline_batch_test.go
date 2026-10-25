@@ -48,7 +48,7 @@ func TestDeclineBatchCommandReturnsMembersAndNamesTheSuccessor(t *testing.T) {
 	admitted := cli.admit(admitFields("batch-1", 1, kept, blamed))
 
 	request := declineFields("batch-1", admitted.RecordVersion, "batch-2", cliReturn("M-2"))
-	var declined cliLandedBatch
+	var declined cliBatch
 	cli.decode(cli.invoke("decline-batch", "--request-file", cli.request(request)), &declined)
 	if declined.Phase != "declined" || declined.Admission != "declined" || declined.Successor != "batch-2" ||
 		declined.RecordVersion != admitted.RecordVersion+1 || len(declined.DeclineDigest) != 64 {
@@ -67,13 +67,13 @@ func TestDeclineBatchCommandReturnsMembersAndNamesTheSuccessor(t *testing.T) {
 	events := len(cli.events(""))
 	retry := declineFields("batch-1", admitted.RecordVersion, "batch-2", cliReturn("M-2"))
 	retry["record"] = cliRecord("other")
-	var replayed cliLandedBatch
+	var replayed cliBatch
 	cli.decode(cli.invoke("decline-batch", "--request-file", cli.request(retry)), &replayed)
 	if !reflect.DeepEqual(replayed, declined) {
 		t.Fatalf("retry printed %+v, want the stored %+v", replayed, declined)
 	}
 	cli.refused("stale_batch", "decline-batch", "--request-file", cli.request(declineFields("batch-1", admitted.RecordVersion, "batch-2")))
-	cli.assertUnchanged(declined.cliBatch, events)
+	cli.assertUnchanged(declined, events)
 
 	cli.create("batch-2", cliRecord("checked"))
 	if successor := cli.admit(admitFields("batch-2", 1, kept)); successor.Admission != "admitted" {
