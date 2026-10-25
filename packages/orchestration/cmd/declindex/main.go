@@ -157,17 +157,18 @@ type env struct {
 }
 
 func (e *env) open() error {
-	return e.openWith(false, declindex.Open)
+	return e.openWith(false, func() (*declindex.Store, error) { return declindex.Open(e.cfg.DB) })
 }
 
-// openReadOnly opens the index without writing it or its directory, which the landing hooks mount read-only: one
-// snapshot of it, until close (declindex.OpenReadOnly). scope is what the command reads besides the index.
+// openReadOnly opens the index the configuration names without writing it or its directory, which the landing hooks
+// mount read-only: one snapshot of it, until close (declindex.OpenReadOnlyConfig). scope is what the command reads
+// besides the index.
 func (e *env) openReadOnly(ctx context.Context, scope declindex.ReadScope, needIndex bool) error {
-	return e.openWith(needIndex, func(path string) (*declindex.Store, error) { return declindex.OpenReadOnly(ctx, path, scope) })
+	return e.openWith(needIndex, func() (*declindex.Store, error) { return declindex.OpenReadOnlyConfig(ctx, e.cfg, scope) })
 }
 
-func (e *env) openWith(needIndex bool, open func(string) (*declindex.Store, error)) error {
-	s, err := open(e.cfg.DB)
+func (e *env) openWith(needIndex bool, open func() (*declindex.Store, error)) error {
+	s, err := open()
 	if err != nil {
 		return &unableError{err}
 	}
