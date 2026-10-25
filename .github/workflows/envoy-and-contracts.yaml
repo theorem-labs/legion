@@ -146,8 +146,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The build-list step reads the manifests of the first parent: the base of a pull
-          # request's merge commit, of a merge group's head, or of a push to main.
+          # The build-list step reads the manifests of its base: the parent of a pull request's
+          # merge commit; the event's own base for a push or merge group.
           fetch-depth: 2
           persist-credentials: false
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -466,7 +466,7 @@ jobs:
           work="$RUNNER_TEMP/workspace-base"
           moved=true
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            base=$(git rev-parse HEAD^1)
+            base=$(git rev-parse HEAD^1 2> /dev/null) || base=
           else
             base=$BASE_SHA
           fi
@@ -963,7 +963,7 @@ jobs:
   # pr-and-main.yaml's required lint job.
   envoy-infra-go:
     needs: changes
-    if: needs.changes.outputs.envoy == 'true' || needs.changes.outputs.workspace_versions == 'true'
+    if: needs.changes.outputs.envoy == 'true'
     runs-on: ubuntu-24.04
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"

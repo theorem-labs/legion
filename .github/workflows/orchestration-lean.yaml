@@ -6,7 +6,8 @@ name: orchestration-lean
 # Only the packages this job's `go test` loads start it: declindex and conceptgate, the declindex
 # command, and the two packages they import (ledger, internal/testpg). A change to another
 # package of packages/orchestration compiles nothing this job runs, and pr-and-main.yaml tests the
-# whole module on every pull request anyway.
+# whole module on every pull request anyway. The go test runs in workspace mode, so go.work and the
+# manifests of the other modules it binds move the versions it compiles (golang.org/x/sys, x/text).
 on:
   pull_request:
     paths:
@@ -17,11 +18,13 @@ on:
       - "packages/orchestration/internal/testpg/**"
       - "packages/orchestration/go.mod"
       - "packages/orchestration/go.sum"
+      - "go.work"
+      - "packages/daemon/go.mod"
+      - "packages/envoy/go.mod"
       - ".github/workflows/orchestration-lean.yaml"
   push:
     branches:
       - main
-    # The same list: GitHub Actions reads no YAML anchor in a workflow file.
     paths:
       - "packages/orchestration/declindex/**"
       - "packages/orchestration/conceptgate/**"
@@ -30,6 +33,9 @@ on:
       - "packages/orchestration/internal/testpg/**"
       - "packages/orchestration/go.mod"
       - "packages/orchestration/go.sum"
+      - "go.work"
+      - "packages/daemon/go.mod"
+      - "packages/envoy/go.mod"
       - ".github/workflows/orchestration-lean.yaml"
 
 # A new push to a pull request cancels that pull request's still-running run here; outside
