@@ -2,65 +2,68 @@ package declindex
 
 import (
 	"context"
-	"database/sql"
-	"slices"
-	"strings"
+	"iter"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// querier reads the index: the pool, one connection of it, or one transaction (Store.q is a store's own reader,
+// the pool for a writable store and its snapshot for a store opened read-only).
 type querier interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// dbReader reads the index: the database itself, or one read transaction of it (Store.q).
-type dbReader interface {
+// dbtx reads and writes the index: the pool, one connection of it, or one transaction.
+type dbtx interface {
 	querier
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
 // eachRow calls scan on every row of a query's result and closes rows. err is the query's own error, so a call
-// takes QueryContext's two results. The first error wins: the query's, a scan's, the iteration's, then Close's;
-// rows is closed on every path.
-func eachRow(rows *sql.Rows, err error, scan func(*sql.Rows) error) error {
+// takes Query's two results. The first error wins: the query's, a scan's, then the iteration's; rows is closed on
+// every path, as it must be before the next query of its connection runs.
+func eachRow(rows pgx.Rows, err error, scan func(pgx.Rows) error) error {
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
 	for rows.Next() {
 		if err := scan(rows); err != nil {
-			rows.Close()
 			return err
 		}
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	return rows.Close()
+	return rows.Err()
 }
 
-// maxInParams bounds the values of one `IN (…)` list, well below SQLite's limit on a statement's parameters.
-const maxInParams = 500
-
-// eachRowIn runs query, which ends in `IN`, once per chunk of at most maxInParams values with the chunk as its
-// list, and calls scan on every row (see eachRow). No value runs no query.
-func eachRowIn(ctx context.Context, q querier, query string, values []string, scan func(*sql.Rows) error) error {
-	for chunk := range slices.Chunk(values, maxInParams) {
-		rows, err := q.QueryContext(ctx, query+" ("+placeholders(len(chunk))+")", anys(chunk)...)
-		if err := eachRow(rows, err, scan); err != nil {
-			return err
-		}
-	}
-	return nil
+// copySeq is a pgx.CopyFromSource over a sequence of rows: CopyFrom reads one row, writes it to the server, and
+// asks for the next, so a refresh of a whole project never holds its millions of rows at once. The sequence may
+// give one slice over and over, since CopyFrom writes each row before it calls Next again.
+type copySeq struct {
+	next func() ([]any, bool)
+	stop func()
+	row  []any
 }
 
-func placeholders(n int) string { return strings.TrimSuffix(strings.Repeat("?,", n), ",") }
-
-func anys(ss []string) []any {
-	out := make([]any, len(ss))
-	for i, s := range ss {
-		out[i] = s
-	}
-	return out
+func copyFrom(rows iter.Seq[[]any]) *copySeq {
+	next, stop := iter.Pull(rows)
+	return &copySeq{next: next, stop: stop}
 }
+
+func (c *copySeq) Next() bool {
+	row, ok := c.next()
+	c.row = row
+	if !ok {
+		c.stop()
+	}
+	return ok
+}
+
+func (c *copySeq) Values() ([]any, error) { return c.row, nil }
+
+// Err is the error of reading the rows; a sequence of rows already in memory has none.
+func (c *copySeq) Err() error { return nil }
 
 const (
 	// foundColumns are the columns of a Found that scanFound reads, of a declaration d and its module m (foundFrom).
@@ -71,7 +74,7 @@ const (
 )
 
 // scanFound reads a row of foundColumns and then of the further columns into more.
-func scanFound(r *sql.Rows, more ...any) (Found, error) {
+func scanFound(r pgx.Rows, more ...any) (Found, error) {
 	var f Found
 	var rel string
 	if err := r.Scan(append([]any{&f.Name, &f.Module, &f.Kind, &f.Line, &f.StmtHash, &rel}, more...)...); err != nil {

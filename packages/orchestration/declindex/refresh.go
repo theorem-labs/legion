@@ -2,9 +2,6 @@ package declindex
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Tree is one built Lean project.
@@ -160,8 +159,8 @@ type stored struct{ module, ileanKey, oleanKey string }
 
 func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
 	out := map[string]stored{}
-	rows, err := s.q.QueryContext(ctx, `SELECT rel, module, ilean_key, olean_key FROM modules`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT rel, module, ilean_key, olean_key FROM modules`)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var rel string
 		var st stored
 		if err := r.Scan(&rel, &st.module, &st.ileanKey, &st.oleanKey); err != nil {
@@ -179,8 +178,8 @@ func (s *Store) storedModules(ctx context.Context) (map[string]stored, error) {
 // sourceBlobs reads the sources table: each source's path and the blob the index read.
 func (s *Store) sourceBlobs(ctx context.Context) (map[string]string, error) {
 	out := map[string]string{}
-	rows, err := s.q.QueryContext(ctx, `SELECT path, blob FROM sources`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT path, blob FROM sources`)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var path, blob string
 		if err := r.Scan(&path, &blob); err != nil {
 			return err
@@ -257,24 +256,19 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		st.Stale += r.results[i].Stale
 	}
 	st.Removed = len(r.gone)
-	if err := s.writeTx(ctx, opt.Log, func(tx *sql.Tx) error {
+	if err := s.writeTx(ctx, func(tx pgx.Tx) error {
 		if err := writeSources(ctx, tx, r.storedSources, r.sources); err != nil {
 			return err
 		}
 		if err := writeModules(ctx, tx, r); err != nil {
 			return err
 		}
-		token, err := s.writeMeta(ctx, tx, r, opt.Commit, st.Unreadable)
-		if err != nil {
-			return err
-		}
-		return s.writeGraph(ctx, tx, token, opt.Log)
+		return s.writeMeta(ctx, tx, r, opt.Commit, st.Unreadable)
 	}); err != nil {
 		return st, err
 	}
-	// The write rewrote the modules and the graph: the store's answers, and the compiled step's walk
-	// (reachedModules), read them anew.
-	s.reload()
+	// The write rewrote the modules: the store's answers read them anew.
+	s.forget()
 	if opt.Compiled != nil {
 		co, err := opt.Compiled(ctx)
 		if err != nil {
@@ -350,88 +344,140 @@ func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (referen
 }
 
 // writeSources makes the sources table current: the rows of sources that stored has and current lacks are
-// deleted, and only new or changed rows written. The refresh lock, held since stored was read, keeps another
+// deleted, and only new or changed rows written. The index's lock, held since stored was read, keeps another
 // refresh from changing the table meanwhile, as it does for the modules.
-func writeSources(ctx context.Context, tx *sql.Tx, stored, current map[string]string) error {
+func writeSources(ctx context.Context, tx pgx.Tx, stored, current map[string]string) error {
+	// A copy writes new rows only, so every row it replaces is deleted first, with those that are gone.
+	var drop []string
 	for path := range stored {
-		if _, kept := current[path]; kept {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE path = ?`, path); err != nil {
-			return err
+		if _, kept := current[path]; !kept {
+			drop = append(drop, path)
 		}
 	}
-	sources := newBatch(tx, "INSERT OR REPLACE", "sources", 2)
+	var write []string
 	for _, path := range slices.Sorted(maps.Keys(current)) {
-		if blob, ok := stored[path]; ok && blob == current[path] {
-			continue
+		if blob, ok := stored[path]; ok {
+			if blob == current[path] {
+				continue
+			}
+			drop = append(drop, path)
 		}
-		if err := sources.add(ctx, path, current[path]); err != nil {
+		write = append(write, path)
+	}
+	if len(drop) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM sources WHERE path = ANY($1)`, drop); err != nil {
 			return err
 		}
 	}
-	return sources.flush(ctx)
+	if len(write) == 0 {
+		return nil
+	}
+	row := make([]any, 2)
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"sources"}, []string{"path", "blob"}, copyFrom(func(yield func([]any) bool) {
+		for _, path := range write {
+			row[0], row[1] = path, current[path]
+			if !yield(row) {
+				return
+			}
+		}
+	}))
+	return err
 }
 
 // writeModules replaces the reference rows of the changed and gone modules (and the compiled rows of the gone ones,
 // and of the changed ones that could not be read, which leave the index) with those of the re-read modules: their
 // imports, declarations, uses, modules rows and edges.
-func writeModules(ctx context.Context, tx *sql.Tx, r reference) error {
+func writeModules(ctx context.Context, tx pgx.Tx, r reference) error {
 	if err := deleteModules(ctx, tx, slices.Concat(r.gone, relsOf(r.changed)), r.old); err != nil {
 		return err
 	}
+	gone := make([]string, 0, len(r.gone))
 	for _, rel := range r.gone {
-		if err := deleteCompiled(ctx, tx, r.old[rel].module); err != nil {
-			return err
-		}
+		gone = append(gone, r.old[rel].module)
 	}
 	for i, err := range r.errs {
 		if old, ok := r.old[r.changed[i].rel]; ok && err != nil {
-			if err := deleteCompiled(ctx, tx, old.module); err != nil {
-				return err
-			}
+			gone = append(gone, old.module)
 		}
 	}
-	decls := newBatch(tx, "INSERT", "decls", 6)
-	uses := newBatch(tx, "INSERT", "uses", 7)
-	imports := newBatch(tx, "INSERT", "imports", 2)
-	modules := newBatch(tx, "INSERT", "modules", 4)
+	if err := deleteCompiled(ctx, tx, gone); err != nil {
+		return err
+	}
+	// modules has rel as its primary key, and a copy cannot replace a row, so the last row of each rel wins here
+	// as INSERT OR REPLACE did. The other three tables have no key: every row is written.
+	moduleRows := make([][]any, 0, len(r.results))
+	at := make(map[string]int, len(r.results))
 	for i, md := range r.results {
 		if r.errs[i] != nil {
 			continue
 		}
-		for _, imported := range md.Imports {
-			if err := imports.add(ctx, md.Module, imported); err != nil {
-				return err
-			}
-		}
-		for _, d := range md.Decls {
-			if err := decls.add(ctx, d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash); err != nil {
-				return err
-			}
-		}
-		for _, u := range md.Uses {
-			if err := uses.add(ctx, u.Target, u.TargetModule, u.Module, u.Line, u.Col, u.Parent, u.Class); err != nil {
-				return err
-			}
-		}
 		// The olean key says which compiled module the index's types and facts were read from; re-reading the
 		// reference file does not change it. Each re-read module's old row was deleted above.
-		if err := modules.add(ctx, md.Rel, md.Module, r.changed[i].ileanKey, r.old[md.Rel].oleanKey); err != nil {
-			return err
+		row := []any{md.Rel, md.Module, r.changed[i].ileanKey, r.old[md.Rel].oleanKey}
+		if j, ok := at[md.Rel]; ok {
+			moduleRows[j] = row
+			continue
 		}
+		at[md.Rel] = len(moduleRows)
+		moduleRows = append(moduleRows, row)
 	}
-	for _, b := range []*batch{modules, imports, decls, uses} {
-		if err := b.flush(ctx); err != nil {
-			return err
+	// Each source below holds one row at a time: a refresh of a whole project writes millions of them.
+	imports, decls, uses := make([]any, 2), make([]any, 6), make([]any, 7)
+	for _, c := range []struct {
+		table string
+		cols  []string
+		rows  pgx.CopyFromSource
+	}{
+		{"modules", []string{"rel", "module", "ilean_key", "olean_key"}, pgx.CopyFromRows(moduleRows)},
+		{"imports", []string{"module", "imported"}, copyFrom(func(yield func([]any) bool) {
+			for i, md := range r.results {
+				if r.errs[i] != nil {
+					continue
+				}
+				for _, imported := range md.Imports {
+					imports[0], imports[1] = md.Module, imported
+					if !yield(imports) {
+						return
+					}
+				}
+			}
+		})},
+		{"decls", []string{"name", "short", "module", "kind", "line", "stmt_hash"}, copyFrom(func(yield func([]any) bool) {
+			for i, md := range r.results {
+				if r.errs[i] != nil {
+					continue
+				}
+				for _, d := range md.Decls {
+					decls[0], decls[1], decls[2], decls[3], decls[4], decls[5] = d.Name, d.Short, d.Module, d.Kind, d.Line, d.StmtHash
+					if !yield(decls) {
+						return
+					}
+				}
+			}
+		})},
+		{"uses", []string{"target", "tmodule", "module", "line", "col", "parent", "cls"}, copyFrom(func(yield func([]any) bool) {
+			for i, md := range r.results {
+				if r.errs[i] != nil {
+					continue
+				}
+				for _, u := range md.Uses {
+					uses[0], uses[1], uses[2], uses[3], uses[4], uses[5], uses[6] = u.Target, u.TargetModule, u.Module, u.Line, u.Col, u.Parent, u.Class
+					if !yield(uses) {
+						return
+					}
+				}
+			}
+		})},
+	} {
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{c.table}, c.cols, c.rows); err != nil {
+			return fmt.Errorf("write the index's %s: %w", c.table, err)
 		}
 	}
 	return insertEdges(ctx, tx, r.results, r.errs)
 }
 
-// writeMeta records the refresh in the meta table, and a change of commit as a landing. It gives the graph's
-// generation token: a new one when a module changed or is gone, or when the index has none.
-func (s *Store) writeMeta(ctx context.Context, tx *sql.Tx, r reference, commit string, unreadable int) (string, error) {
+// writeMeta records the refresh in the meta table, and a change of commit as a landing.
+func (s *Store) writeMeta(ctx context.Context, tx pgx.Tx, r reference, commit string, unreadable int) error {
 	meta := map[string]string{
 		"commit":  commit,
 		"built":   time.Now().UTC().Format("2006-01-02T15:04Z"),
@@ -444,87 +490,40 @@ func (s *Store) writeMeta(ctx context.Context, tx *sql.Tx, r reference, commit s
 		meta["sources"] = "git"
 	}
 	if commit != "" && commit != r.previousCommit {
-		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO landings (landed, previous) VALUES (?, ?)`,
-			commit, r.previousCommit); err != nil {
-			return "", err
+		if _, err := tx.Exec(ctx, `INSERT INTO landings (landed, previous) VALUES ($1, $2)
+			ON CONFLICT (landed) DO UPDATE SET previous = EXCLUDED.previous`, commit, r.previousCommit); err != nil {
+			return err
 		}
-	}
-	token, err := s.Meta(ctx, "graph")
-	if err != nil {
-		return "", err
-	}
-	if len(r.changed) > 0 || len(r.gone) > 0 || token == "" {
-		var b [8]byte
-		if _, err := rand.Read(b[:]); err != nil {
-			return "", err
-		}
-		token = hex.EncodeToString(b[:])
-		meta["graph"] = token
 	}
 	for k, v := range meta {
-		if err := s.setMeta(ctx, tx, k, v); err != nil {
-			return "", err
+		if err := setMeta(ctx, tx, k, v); err != nil {
+			return err
 		}
 	}
-	return token, nil
-}
-
-// writeGraph writes the graph file of generation token from tx's rows, unless the file in place is of it. It runs
-// just before tx commits, so a reader whose snapshot begins after the commit finds its graph in place. A reader
-// refuses a graph of another generation than the index's (graph), and a graph write or commit that fails leaves the
-// two of different generations, which the next refresh repairs.
-func (s *Store) writeGraph(ctx context.Context, tx *sql.Tx, token string, log io.Writer) error {
-	if graphToken(s.path+".graph") == token {
-		return nil
-	}
-	t0 := time.Now()
-	g, err := buildGraph(ctx, tx)
-	if err != nil {
-		return fmt.Errorf("build the declaration graph: %w", err)
-	}
-	g.token = token
-	if err := g.write(s.path + ".graph"); err != nil {
-		return fmt.Errorf("write the declaration graph: %w", err)
-	}
-	logf(log, "index: declaration graph of %d declarations and %d edges written in %s", len(g.names), len(g.dst),
-		time.Since(t0).Round(time.Millisecond))
 	return nil
 }
 
-// deleteModules deletes the reference rows of the modules at rels: the imports, declarations, uses and edges of each
-// one's old module name, and its modules row. A refresh that re-reads every module runs these statements once for
-// each, so each is prepared once.
-func deleteModules(ctx context.Context, tx *sql.Tx, rels []string, old map[string]stored) error {
+// deleteModules deletes the reference rows of the modules at rels: the imports, declarations, uses and edges of
+// each one's old module name, and its modules row. One statement per table takes every module of the refresh.
+func deleteModules(ctx context.Context, tx pgx.Tx, rels []string, old map[string]stored) error {
 	if len(rels) == 0 {
 		return nil
 	}
-	var byModule []*sql.Stmt
-	for _, t := range []string{"imports", "decls", "uses", "edges"} {
-		stmt, err := tx.PrepareContext(ctx, "DELETE FROM "+t+" WHERE module = ?")
-		if err != nil {
-			return err
-		}
-		defer stmt.Close()
-		byModule = append(byModule, stmt)
-	}
-	byRel, err := tx.PrepareContext(ctx, `DELETE FROM modules WHERE rel = ?`)
-	if err != nil {
-		return err
-	}
-	defer byRel.Close()
+	modules := make([]string, 0, len(rels))
 	for _, rel := range rels {
 		if o, ok := old[rel]; ok {
-			for _, stmt := range byModule {
-				if _, err := stmt.ExecContext(ctx, o.module); err != nil {
-					return err
-				}
-			}
-		}
-		if _, err := byRel.ExecContext(ctx, rel); err != nil {
-			return err
+			modules = append(modules, o.module)
 		}
 	}
-	return nil
+	if len(modules) > 0 {
+		for _, t := range []string{"imports", "decls", "uses", "edges"} {
+			if _, err := tx.Exec(ctx, "DELETE FROM "+t+" WHERE module = ANY($1)", modules); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM modules WHERE rel = ANY($1)`, rels)
+	return err
 }
 
 func relsOf(files []moduleFile) []string {
