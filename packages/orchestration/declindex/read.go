@@ -74,13 +74,15 @@ func (s *Store) declsWhere(ctx context.Context, column string, values []string) 
 }
 
 // UsesOf gives the recorded uses of each named declaration and of the constants Lean made from it: those whose
-// target is the name, or begins with the name and a dot (a field, a constructor) or a slash (an auxiliary). It is
-// the range that usersOf reads, without its owner resolution: a graph check compares the targets themselves.
+// target is the name, or begins with the name and a dot (a field, a constructor, an equation lemma) or a slash (a
+// name a macro made). The range is from the name and a dot to the name and the character after a slash, which are
+// the only two characters between them, so one index range holds both and nothing else. A graph check compares the
+// targets themselves, so this read does not resolve which declaration a target belongs to, as usersOf does.
 func (s *Store) UsesOf(ctx context.Context, names []string) ([]Use, error) {
 	var out []Use
 	for _, name := range distinct(names) {
 		rows, err := s.q.QueryContext(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
-			WHERE target = ? OR (target >= ? AND target < ?)`, name, name+".", name+"/")
+			WHERE target = ? OR (target >= ? AND target < ?)`, name, name+".", name+"0")
 		err = eachRow(rows, err, func(r *sql.Rows) error {
 			var u Use
 			if err := r.Scan(&u.Target, &u.TargetModule, &u.Module, &u.Line, &u.Col, &u.Parent, &u.Class); err != nil {
