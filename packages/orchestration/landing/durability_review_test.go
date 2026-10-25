@@ -116,6 +116,8 @@ func (f *flakyLedger) ReturnMember(context.Context, RoundRequest) error { return
 
 func (f *flakyLedger) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
 
+func (f *flakyLedger) Escalate(context.Context, string, string, string) error { return nil }
+
 func (f *flakyLedger) MigrationState(context.Context, string, string) (string, string, error) {
 	return "open", "", nil
 }

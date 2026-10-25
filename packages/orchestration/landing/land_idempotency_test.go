@@ -44,6 +44,8 @@ func (l *observedLedger) ReturnMember(context.Context, RoundRequest) error {
 }
 func (l *observedLedger) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
 
+func (l *observedLedger) Escalate(context.Context, string, string, string) error { return nil }
+
 func (l *observedLedger) MigrationState(context.Context, string, string) (string, string, error) {
 	if l.lands > 0 {
 		return "landed", "merged", nil

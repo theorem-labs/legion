@@ -45,6 +45,9 @@ type Ledger interface {
 	ReturnMember(context.Context, RoundRequest) error
 	Contracts(context.Context, string) ([]Contract, error)
 	MigrationState(context.Context, string, string) (state string, landedCommit string, err error)
+	// Escalate enqueues the work item for the owner. A repeated call for an
+	// open item of the same owner does nothing.
+	Escalate(ctx context.Context, repository, item, owner string) error
 }
 
 // Review is an owner's review of one contract's statement change at a head.
@@ -148,6 +151,12 @@ func (h StatementHash) Ambiguous() bool { return len(h.Paths) > 1 }
 type Hasher interface {
 	Hashes(context.Context, HashInput) (map[string]StatementHash, error)
 }
+
+// HashRetryError says the hasher could not reach a resource it needs, such as
+// the index database (its exit 75). The step is retried later.
+type HashRetryError struct{ Output string }
+
+func (e HashRetryError) Error() string { return "hasher must retry: " + e.Output }
 
 // HashUnableError says the hasher could not check a tree (its exit 3).
 type HashUnableError struct{ Output string }
@@ -345,6 +354,7 @@ type Batch struct {
 	State             State                `json:"state"`
 	Reason            string               `json:"reason"`
 	Round             int                  `json:"round"`
+	HashAttempts      int                  `json:"hashAttempts,omitempty"`
 	CheckPolicyDigest string               `json:"checkPolicyDigest"`
 	Checks            []CheckVerdict       `json:"checks"`
 	ChecksKey         string               `json:"checksKey"`
@@ -431,6 +441,13 @@ type Runner struct {
 	InfraRetries int
 	ConfigDigest string
 	Toolchain    func(context.Context, Tree) (string, error)
+	// EscalateTo is the escalations owner. A step that is retried (a hasher
+	// exit 75) is escalated to it when its attempts reach EscalateAfter
+	// (default 10). RetryBackoff is the first wait between attempts (default
+	// 10 seconds); each wait doubles, up to five minutes.
+	EscalateTo    string
+	EscalateAfter int
+	RetryBackoff  time.Duration
 }
 
 // Run freezes one batch and advances it until it is green or failed.
@@ -547,6 +564,8 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 				var unable HashUnableError
 				var unattributed statementUnattributed
 				switch {
+				case errors.Is(err, errHashRetryLater):
+					return *batch, r.transition(ctx, batch, batch.State, "hash-retry")
 				case errors.As(err, &unable):
 					return r.fail(ctx, batch, "hash-unable")
 				case errors.As(err, &unattributed):
@@ -747,11 +766,11 @@ func (r Runner) checkStatements(ctx context.Context, batch *Batch, build KeptBui
 	if err != nil {
 		return false, fmt.Errorf("read base tree: %w", err)
 	}
-	before, err := r.Hasher.Hashes(ctx, HashInput{Tree: Tree(base.Tree), Names: names})
+	before, err := r.hashes(ctx, batch, HashInput{Tree: Tree(base.Tree), Names: names})
 	if err != nil {
 		return false, fmt.Errorf("hash base tree: %w", err)
 	}
-	after, err := r.Hasher.Hashes(ctx, HashInput{Tree: Tree(batch.Candidate.Tree), BuildDirectory: build.Directory, Names: names})
+	after, err := r.hashes(ctx, batch, HashInput{Tree: Tree(batch.Candidate.Tree), BuildDirectory: build.Directory, Names: names})
 	build.Release()
 	if err != nil {
 		return false, fmt.Errorf("hash candidate tree: %w", err)
@@ -848,6 +867,70 @@ func (r Runner) checkStatements(ctx context.Context, batch *Batch, build KeptBui
 		}
 	}
 	return returned, nil
+}
+
+// errHashRetryLater stops a run whose hasher keeps asking for a retry (exit
+// 75) after the escalation threshold: the batch stays active, and the next
+// reconcile tries again.
+var errHashRetryLater = errors.New("hasher retry pending")
+
+// hashes calls the hasher and retries an exit 75 with a doubling backoff. Each
+// failed attempt is counted on the batch and saved. When the count reaches the
+// escalation threshold, the batch is escalated to the escalations owner as
+// landing:<batch>:hash@<threshold>, once, and the run stops with
+// errHashRetryLater; after that, each run makes one attempt. A hasher that
+// answers resets the count.
+func (r Runner) hashes(ctx context.Context, batch *Batch, input HashInput) (map[string]StatementHash, error) {
+	for {
+		hashes, err := r.Hasher.Hashes(ctx, input)
+		var retry HashRetryError
+		if !errors.As(err, &retry) {
+			if err == nil && batch.HashAttempts != 0 {
+				batch.HashAttempts = 0
+				if err := r.Store.Save(ctx, *batch); err != nil {
+					return nil, fmt.Errorf("record hasher attempts: %w", err)
+				}
+			}
+			return hashes, err
+		}
+		batch.HashAttempts++
+		if err := r.Store.Save(ctx, *batch); err != nil {
+			return nil, fmt.Errorf("record hasher attempt: %w", err)
+		}
+		threshold := r.escalateAfter()
+		if batch.HashAttempts >= threshold {
+			item := fmt.Sprintf("landing:%s:hash@%d", batch.ID, threshold)
+			if err := r.Ledger.Escalate(ctx, batch.Repository, item, r.EscalateTo); err != nil {
+				return nil, fmt.Errorf("escalate hasher retries: %w", err)
+			}
+			return nil, errHashRetryLater
+		}
+		wait := r.retryBackoff() << (batch.HashAttempts - 1)
+		if limit := 5 * time.Minute; wait > limit || wait <= 0 {
+			wait = limit
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (r Runner) escalateAfter() int {
+	if r.EscalateAfter > 0 {
+		return r.EscalateAfter
+	}
+	return 10
+}
+
+func (r Runner) retryBackoff() time.Duration {
+	if r.RetryBackoff > 0 {
+		return r.RetryBackoff
+	}
+	return 10 * time.Second
 }
 
 // landRequest is the ledger request for a member: its changed paths, the given

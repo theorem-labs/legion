@@ -127,15 +127,16 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 
 	config := filepath.Join(t.TempDir(), "config.json")
 	raw, err := json.Marshal(map[string]any{
-		"batchId":    "batch",
-		"repository": map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/srv/land/repo.git"},
-		"base":       base,
-		"baseBranch": "trunk",
-		"statePath":  filepath.Join(t.TempDir(), "state.json"),
-		"members":    []map[string]any{{"migration": "one", "generation": 1, "head": head}},
-		"build":      []string{"sh", "-c", "exit 0"},
-		"hasher":     []string{"sh", "-c", "exit 0"},
-		"toolchain":  []string{"sh", "-c", "printf tool"},
+		"batchId":     "batch",
+		"repository":  map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/srv/land/repo.git"},
+		"base":        base,
+		"baseBranch":  "trunk",
+		"statePath":   filepath.Join(t.TempDir(), "state.json"),
+		"members":     []map[string]any{{"migration": "one", "generation": 1, "head": head}},
+		"build":       []string{"sh", "-c", "exit 0"},
+		"hasher":      []string{"sh", "-c", "exit 0"},
+		"toolchain":   []string{"sh", "-c", "printf tool"},
+		"escalations": map[string]any{"owner": "steward"},
 		"ledger": map[string]any{
 			"command":        []string{"sh", "-c", fakeLedger, "ledger"},
 			"status":         []string{"sh", "-c", "printf '{\"complete\":false}\\n'"},
@@ -176,6 +177,16 @@ check)
 	echo '{"outcome":"pass","violations":[]}' ;;
 *) exit 2 ;;
 esac`
+
+// The escalations owner is required: an escalation enqueued for an empty owner
+// wakes nobody.
+func TestConfigRequiresEscalationsOwner(t *testing.T) {
+	cfg := publicationConfig(t)
+	cfg.Escalations.Owner = ""
+	if _, _, _, err := cfg.runner(); err == nil || !strings.Contains(err.Error(), "escalations.owner is required") {
+		t.Fatalf("runner() error = %v, want escalations.owner required", err)
+	}
+}
 
 // The per-operation ledger commands are removed: a configuration that still
 // names one is refused with the key to set instead.

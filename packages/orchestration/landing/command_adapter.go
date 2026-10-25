@@ -80,6 +80,14 @@ func (l CommandLedger) Contracts(ctx context.Context, repository string) ([]Cont
 	return contracts, nil
 }
 
+// Escalate enqueues the item for the owner with the ledger's enqueue.
+func (l CommandLedger) Escalate(ctx context.Context, repository, item, owner string) error {
+	if _, _, err := l.run(ctx, "enqueue", repository, item, owner); err != nil {
+		return fmt.Errorf("run ledger enqueue: %w", err)
+	}
+	return nil
+}
+
 func (l CommandLedger) requestCommand(ctx context.Context, command string, request any) (string, int, error) {
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -238,7 +246,8 @@ const maxNamesEnvironment = 131072
 // array of names) and, when the array fits in 131,072 bytes, LAND_NAMES. It
 // prints name<TAB>hash<TAB>path for each name: a path of "-" means the name is
 // absent, and comma-joined paths mean it is ambiguous. Exit 3 means it could not
-// check the tree.
+// check the tree, and exit 75 that it could not reach a resource it needs,
+// such as the index database, so the step is retried later.
 type CommandHasher struct {
 	Command   []string
 	Directory string
@@ -286,6 +295,9 @@ func (h CommandHasher) Hashes(ctx context.Context, input HashInput) (map[string]
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && exit.ExitCode() == 3 {
 			return nil, HashUnableError{Output: strings.TrimSpace(stderr.String())}
+		}
+		if errors.As(err, &exit) && exit.ExitCode() == 75 {
+			return nil, HashRetryError{Output: strings.TrimSpace(stderr.String())}
 		}
 		return nil, fmt.Errorf("run statement hasher: %w", commandFailure{err: err, output: stderr.String()})
 	}

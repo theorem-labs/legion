@@ -58,6 +58,8 @@ func (f *requestLedgerFake) ReturnMember(context.Context, RoundRequest) error {
 
 func (f *requestLedgerFake) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
 
+func (f *requestLedgerFake) Escalate(context.Context, string, string, string) error { return nil }
+
 func (f *requestLedgerFake) MigrationState(context.Context, string, string) (string, string, error) {
 	return "open", "", nil
 }

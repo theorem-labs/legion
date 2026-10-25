@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sjawhar/legion/orchestration/internal/testpg"
 )
@@ -18,7 +19,9 @@ import (
 // name as the blob of <name>.lean at LAND_TREE in LAND_GIT_DIR, and prints
 // name<TAB>hash<TAB>path, with "-" for an absent name. For the candidate it
 // requires the kept build in LAND_BUILD_DIR, and its "unable" mode exits 3
-// there. It appends each LAND_BUILD_DIR it receives to a log.
+// there. Its "retry-<n>" mode exits 75 on its first n calls and its
+// "retry-always" mode on every call. It appends each LAND_BUILD_DIR it receives
+// to a log.
 const fixtureHasher = `set -eu
 log="$1"
 mode="${2:-}"
@@ -28,6 +31,13 @@ if [ -n "${LAND_BUILD_DIR:-}" ]; then
 	test -f "$LAND_BUILD_DIR/built" || { echo "no build in $LAND_BUILD_DIR" >&2; exit 1; }
 	if [ "$mode" = unable ]; then echo "cannot check the candidate" >&2; exit 3; fi
 fi
+case "$mode" in
+retry-always) echo "index database unreachable" >&2; exit 75 ;;
+retry-*)
+	calls=$(( $(cat "$log.calls" 2>/dev/null || echo 0) + 1 ))
+	echo "$calls" > "$log.calls"
+	if [ "$calls" -le "${mode#retry-}" ]; then echo "index database unreachable" >&2; exit 75; fi ;;
+esac
 for name in $(tr -d '[]"' < "$LAND_NAMES_FILE" | tr ',' ' '); do
 	if hash=$(git --git-dir="$LAND_GIT_DIR" rev-parse -q --verify "$LAND_TREE:$name.lean"); then
 		printf '%s\t%s\t%s\n' "$name" "$hash" "$name.lean"
@@ -144,13 +154,16 @@ func (f *statementFixture) runner(ledger *recordingLedger, hasherMode string) Ru
 		hasher = append(hasher, hasherMode)
 	}
 	return Runner{
-		Store:        &MemoryStore{},
-		Ledger:       ledger,
-		Builder:      CommandBuilder{RepositoryPath: f.repo, Command: []string{"sh", "-c", "touch built"}},
-		Hasher:       CommandHasher{Command: hasher, Directory: f.repo},
-		Git:          RepositoryGit{Path: f.repo},
-		ConfigDigest: "digest",
-		Toolchain:    func(context.Context, Tree) (string, error) { return "tool", nil },
+		Store:         &MemoryStore{},
+		Ledger:        ledger,
+		Builder:       CommandBuilder{RepositoryPath: f.repo, Command: []string{"sh", "-c", "touch built"}},
+		Hasher:        CommandHasher{Command: hasher, Directory: f.repo},
+		Git:           RepositoryGit{Path: f.repo},
+		ConfigDigest:  "digest",
+		Toolchain:     func(context.Context, Tree) (string, error) { return "tool", nil },
+		EscalateTo:    "steward",
+		EscalateAfter: 3,
+		RetryBackoff:  time.Millisecond,
 	}
 }
 
@@ -368,5 +381,74 @@ func assertBuildDirectoriesGone(t *testing.T, log string) {
 	}
 	if empty == 0 || kept == 0 {
 		t.Fatalf("hasher calls: %d without a build directory, %d with one; want both", empty, kept)
+	}
+}
+
+// A hasher exit 75 (the index database cannot be reached) is retried with
+// backoff: a hasher that exits 75 twice and then answers lands the batch.
+func TestHasherRetryThenLands(t *testing.T) {
+	f := newStatementFixture(t)
+	head := f.member("M-change", "C.lean", "def C : Int := 1\n")
+	changed := gitRun(t, f.repo, "rev-parse", head+":C.lean")
+	member := reviewed(f, "M-change", head)
+	member.ReadyEvent = f.ready("M-change", "k-1", head, "--changed-contract", "C="+changed, "--review", "C=alice@"+head)
+	ledger := &recordingLedger{}
+	runner := f.runner(ledger, "retry-2")
+
+	batch := f.runBatch(runner, member)
+	if batch.State != Green || len(batch.ActiveMembers) != 1 || len(ledger.rounds) != 0 || batch.HashAttempts != 0 {
+		t.Fatalf("batch = %s (%s), active %d, rounds %+v, attempts %d; want green with the member", batch.State, batch.Reason, len(batch.ActiveMembers), ledger.rounds, batch.HashAttempts)
+	}
+	runner.GitHub = &githubFake{wait: PullRequest{Number: 1, Head: batch.Candidate.Commit, MergedCommit: batch.Candidate.Commit, State: PullRequestMerged}}
+	landed, err := runner.Publish(context.Background(), batch)
+	if err != nil || landed.State != Landed {
+		t.Fatalf("Publish() = %s (%s), %v; want landed", landed.State, landed.Reason, err)
+	}
+	if items := f.run("items", "R", "--owner", "steward"); strings.Contains(items, "landing:") {
+		t.Fatalf("escalations = %s, want none", items)
+	}
+	assertBuildDirectoriesGone(t, f.hashLog)
+}
+
+// A hasher that always exits 75 escalates once, at the threshold, to the
+// escalations owner. The batch neither fails nor returns a member: it stays
+// active for a later retry, and its member stays ready.
+func TestHasherAlwaysRetryEscalatesAtThreshold(t *testing.T) {
+	f := newStatementFixture(t)
+	head := f.member("M-change", "C.lean", "def C : Int := 1\n")
+	changed := gitRun(t, f.repo, "rev-parse", head+":C.lean")
+	member := reviewed(f, "M-change", head)
+	member.ReadyEvent = f.ready("M-change", "k-1", head, "--changed-contract", "C="+changed, "--review", "C=alice@"+head)
+	scratch := t.TempDir()
+	t.Setenv("TMPDIR", scratch)
+	ledger := &recordingLedger{}
+	runner := f.runner(ledger, "retry-always")
+
+	batch := f.runBatch(runner, member)
+	if batch.State == Failed || batch.Reason != "hash-retry" || batch.HashAttempts != 3 {
+		t.Fatalf("batch = %s (%s), attempts %d; want active hash-retry after 3 attempts", batch.State, batch.Reason, batch.HashAttempts)
+	}
+	if len(ledger.rounds) != 0 || len(batch.Dropped) != 0 || len(batch.ActiveMembers) != 1 {
+		t.Fatalf("rounds %+v, dropped %+v; want no member returned", ledger.rounds, batch.Dropped)
+	}
+	if _, ready := f.readyEvents()["M-change"]; !ready {
+		t.Fatal("M-change left the ready list, want it still ready")
+	}
+	if items := f.run("items", "R", "--owner", "steward"); !strings.Contains(items, `"landing:batch:hash@3"`) {
+		t.Fatalf("escalations = %s, want landing:batch:hash@3", items)
+	}
+	active, err := runner.Store.ListActive(context.Background())
+	if err != nil || len(active) != 1 {
+		t.Fatalf("active batches = %+v, %v; want the batch still active", active, err)
+	}
+	resumed, err := runner.Reconcile(context.Background())
+	if err != nil || len(resumed) != 1 || resumed[0].Reason != "hash-retry" || resumed[0].HashAttempts != 4 {
+		t.Fatalf("Reconcile() = %+v, %v; want one more attempt and still hash-retry", resumed, err)
+	}
+	if items := f.run("items", "R", "--owner", "steward"); strings.Count(items, "landing:batch:hash@") != 1 {
+		t.Fatalf("escalations = %s, want exactly one", items)
+	}
+	if left, _ := filepath.Glob(filepath.Join(scratch, "landing-build-*")); len(left) != 0 {
+		t.Fatalf("build directories left: %v", left)
 	}
 }

@@ -278,6 +278,8 @@ func (f *ledgerFake) ReturnMember(_ context.Context, round RoundRequest) error {
 }
 
 // MigrationState reports what Land recorded, as the real ledger does.
+func (f *ledgerFake) Escalate(context.Context, string, string, string) error { return nil }
+
 func (f *ledgerFake) MigrationState(_ context.Context, _ string, migration string) (string, string, error) {
 	if commit, landed := f.commits[migration]; landed {
 		return "landed", commit, nil
