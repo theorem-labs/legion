@@ -52,9 +52,23 @@ func refusals(m *Module, cfg Config) ([]landing.Finding, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, unable("%s does not compile and Lean's output names no declaration: %s", m.Path, firstLine(leanReason(m)))
+		return nil, unable("%s does not compile and Lean's output names no declaration: %s", m.Path, leanOutput(m))
 	}
 	return out, nil
+}
+
+// leanOutput is what Lean said, on one line, for a reason the landing program records: the command it ran is the
+// first line and says nothing, so the end of the output is kept, where a diagnostic is.
+func leanOutput(m *Module) string {
+	text := strings.TrimSpace(m.Output)
+	if text == "" {
+		return "Lean wrote nothing"
+	}
+	const keep = 2000
+	if len(text) > keep {
+		text = "…" + text[len(text)-keep:]
+	}
+	return strings.Join(strings.Fields(text), " ")
 }
 
 // blameLog renders one of Lean's errors as a build log carries it, which is what blame.Parse reads: the module

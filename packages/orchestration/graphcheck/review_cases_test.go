@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/graphcheck"
@@ -33,6 +34,22 @@ func TestAMissingBaseLibraryIsUnable(t *testing.T) {
 	tree := f.Edit(t, "Lib/Core.lean", "def helper", "private def helper")
 	_, _, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, tree)
 	isUnable(t, err)
+}
+
+// A compile that names no declaration leaves the check unable, and the reason carries what Lean said, not only the
+// command it ran: a failure is never silent about its cause.
+func TestUnableCarriesLeansOwnOutput(t *testing.T) {
+	f := graphchecktest.New(t)
+	tree := f.Edit(t, "Lib/Open.lean", "def viaOpen : Nat := helper 2", "def viaOpen : Nat := helper 2\n\ndef broken : Nat := (")
+	c, idx := open(t, f, tree)
+	_, err := graphcheck.Names(context.Background(), c, idx, f.Cfg)
+	var unable *graphcheck.UnableError
+	if !errors.As(err, &unable) {
+		t.Fatalf("Names error %v, want *UnableError", err)
+	}
+	if !strings.Contains(unable.Reason, "unexpected") || strings.Contains(unable.Reason, "\n") {
+		t.Fatalf("reason %q, want Lean's own diagnostic on one line", unable.Reason)
+	}
 }
 
 // An unchanged module between two changed ones is rebuilt as the build rebuilds it: its base .olean was elaborated

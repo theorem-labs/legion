@@ -73,10 +73,9 @@ func landConfig(t *testing.T, f *graphchecktest.Fixture, members []map[string]an
 	t.Helper()
 	return writeJSON(t, map[string]any{
 		"batchId": "e2e", "repository": map[string]any{"name": "fixture", "path": f.Repo, "git_dir": filepath.Join(f.Repo, ".git")},
-		"base": f.Base, "baseBranch": "main", "statePath": filepath.Join(t.TempDir(), "state.json"), "members": members,
+		"base": f.Base, "baseBranch": "main", "members": members,
 		"build": []string{"sh", "-c", "exit 99"}, "hasher": []string{"true"}, "toolchain": []string{"true"},
 		"escalations": map[string]any{"owner": "steward"},
-		"ledger":      map[string]any{"command": []string{"true"}, "status": []string{"true"}, "migrationState": []string{"true"}},
 		"checks": []map[string]any{{"name": "names", "format": "graph",
 			"command": []string{graphcheckBin, "names", "--config", f.ConfigPath}}},
 	})
