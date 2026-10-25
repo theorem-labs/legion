@@ -43,11 +43,13 @@ func admittedFixture(t *testing.T) fenceFixture {
 	return fenceFixture{s: s, dsn: dsn, members: members}
 }
 
-// release ends batch-1's admission as DeclineBatch does: its members are no longer admitted.
+// release ends batch-1's admission with DeclineBatch, with no member returned: its members keep their ready records.
 func (f fenceFixture) release(t *testing.T) {
 	t.Helper()
-	batchSQL(t, f.dsn, `UPDATE batch_members SET admitted = false WHERE repo = 'r' AND batch = 'batch-1'`)
-	setAdmission(t, f.dsn, "batch-1", "declined", "")
+	ctx := context.Background()
+	batch := must(f.s.LoadBatch(ctx, "r", "batch-1"))
+	must(f.s.DeclineBatch(ctx, ledger.DeclineRequest{Repo: "r", ID: "batch-1", Reason: "queue_removed",
+		ExpectedVersion: batch.RecordVersion, Record: batchRecord("declined")}))
 }
 
 // land lands migration id as a single migration with changes, from its declared writes and reads.

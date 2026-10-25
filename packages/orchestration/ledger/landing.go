@@ -100,6 +100,20 @@ type batchMember struct {
 	readyEvent int64
 }
 
+// admittedMembers reads the members that batch id admits, in position order.
+func admittedMembers(ctx context.Context, tx pgx.Tx, repo, id string) ([]batchMember, error) {
+	rows, err := tx.Query(ctx, `SELECT migration, generation, head, ready_event FROM batch_members
+		WHERE repo = $1 AND batch = $2 AND admitted ORDER BY position`, repo, id)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (batchMember, error) {
+		var m batchMember
+		err := row.Scan(&m.migration, &m.generation, &m.head, &m.readyEvent)
+		return m, err
+	})
+}
+
 // landBatch makes the writes of a landing of batch, which its caller has locked and version-checked, at mergedCommit
 // with the caller's record:
 //   - each member that the batch admits, in position order, lands as Land lands it, with the generation, head, changed
@@ -111,16 +125,7 @@ type batchMember struct {
 //     {commit: mergedCommit}, so a crash after the landing cannot lose a post-landing effect;
 //   - the record at the next version, admission landed, the merged commit, and kind's event.
 func landBatch(ctx context.Context, tx pgx.Tx, batch Batch, mergedCommit string, record json.RawMessage, kind string) (Batch, error) {
-	rows, err := tx.Query(ctx, `SELECT migration, generation, head, ready_event FROM batch_members
-		WHERE repo = $1 AND batch = $2 AND admitted ORDER BY position`, batch.Repo, batch.ID)
-	if err != nil {
-		return Batch{}, err
-	}
-	members, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (batchMember, error) {
-		var m batchMember
-		err := row.Scan(&m.migration, &m.generation, &m.head, &m.readyEvent)
-		return m, err
-	})
+	members, err := admittedMembers(ctx, tx, batch.Repo, batch.ID)
 	if err != nil {
 		return Batch{}, err
 	}

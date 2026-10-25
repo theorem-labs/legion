@@ -170,8 +170,8 @@ func (cli batchCLI) events(subject string) []string {
 	return kinds
 }
 
-// sql runs statement on its own connection, for the columns that only later calls write (AdmitBatch, LandBatch,
-// DeclineBatch and the effect log).
+// sql runs statement on its own connection, to set the columns and rows that the batch commands write (an admission,
+// a landing, a decline, an effect) without running them.
 func (cli batchCLI) sql(statement string, args ...any) {
 	cli.t.Helper()
 	ctx := context.Background()
@@ -388,7 +388,7 @@ func TestBatchesActiveCommand(t *testing.T) {
 		cli.setAdmission(end.id, end.admission, end.successor)
 	}
 	cli.sql(`UPDATE batches SET successor = '' WHERE repo = 'r' AND id = 'declined-empty-successor'`)
-	// LandBatch records a landed batch's effects in a later task; the test writes one directly.
+	// The test writes a landed batch's effect directly, as land-batch would record it.
 	cli.sql(`INSERT INTO batch_effects (repo, batch, key, op) VALUES ('r', 'effects', 'hook/effects/0/report', 'hook')`)
 	var batches []cliBatch
 	cli.decode(cli.invoke("batches", "r", "--active"), &batches)

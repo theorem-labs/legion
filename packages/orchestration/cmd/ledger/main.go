@@ -463,6 +463,16 @@ func dispatch(ctx context.Context, s *ledger.Store, args []string) (any, bool, e
 		}
 		value, err := s.ResolveBatch(ctx, args[0], args[1], args[2])
 		return value, true, err
+	case "decline-batch":
+		request, jsonInput, err := requestFile[ledger.DeclineRequest](args)
+		if !jsonInput {
+			return nil, true, usagef("decline-batch --request-file <json>")
+		}
+		if err != nil {
+			return nil, true, err
+		}
+		value, err := s.DeclineBatch(ctx, request)
+		return value, true, err
 	case "batch":
 		if len(args) != 2 {
 			return nil, true, usagef("batch <repo> <id>")

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -84,6 +85,28 @@ func batchCrashes() []batchCrash {
 			}
 			if m := must(s.Migration(ctx, "r", "M-2")); m.State != ledger.StateLanded || m.LandedCommit != "merged-9" {
 				t.Fatalf("M-2 after the resolution is %+v", m)
+			}
+		},
+	}, {
+		call: "decline",
+		fixture: func(t *testing.T) (*ledger.Store, string) {
+			f := admittedDecline(t)
+			return f.s, f.dsn
+		},
+		run: func(s *ledger.Store) (ledger.Batch, error) {
+			return s.DeclineBatch(ctx, declineRequest("batch-1", 2, "batch-2", returned("M-3")))
+		},
+		last:    "batch.declined",
+		written: []string{"batch_members", "round_keys", "migrations", "batches"},
+		state: func(t *testing.T, s *ledger.Store, dsn string) landingState {
+			return readLandingState(t, s, dsn, "batch-1", "M-1", "M-2", "M-3")
+		},
+		committed: func(t *testing.T, s *ledger.Store, dsn string, batch ledger.Batch) {
+			if batch.Phase != ledger.PhaseDeclined || batch.Admission != "declined" || batch.Successor != "batch-2" {
+				t.Fatalf("the batch after the decline is %+v", batch)
+			}
+			if ready := readyIDs(t, s); !slices.Equal(ready, []string{"M-1", "M-2"}) {
+				t.Fatalf("ready migrations after the decline = %q", ready)
 			}
 		},
 	}}

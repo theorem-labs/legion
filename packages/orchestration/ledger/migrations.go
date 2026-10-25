@@ -974,67 +974,72 @@ func (s *Store) RecordRound(ctx context.Context, req RoundRequest) (Migration, e
 		if err != nil {
 			return err
 		}
-		cur, err := loadMigration(ctx, tx, req.Repo, req.ID, true)
-		if err != nil {
-			return err
-		}
-
-		var recorded struct {
-			Generation int64
-			Reason     string
-			Batch      string
-		}
-		err = tx.QueryRow(ctx, `SELECT generation, reason, batch FROM round_keys
-			WHERE repo = $1 AND migration = $2 AND key = $3`, req.Repo, req.ID, req.Key).
-			Scan(&recorded.Generation, &recorded.Reason, &recorded.Batch)
-		switch {
-		case err == nil:
-			if recorded.Generation != req.Generation || recorded.Reason != req.Reason || recorded.Batch != req.Batch {
-				return refuse(ReasonRoundKeyConflict, "round key %q for migration %s has a different generation, reason, or batch",
-					req.Key, req.ID)
-			}
-			m = cur
-			return nil
-		case !errors.Is(err, pgx.ErrNoRows):
-			return err
-		}
-
-		if err := requireOpenAt(cur, req.Generation); err != nil {
-			return err
-		}
-		if err := fenceMigration(ctx, tx, req.Repo, req.ID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key, generation, reason, batch)
-			VALUES ($1, $2, $3, $4, $5, $6)`, req.Repo, req.ID, req.Key, req.Generation, req.Reason, req.Batch); err != nil {
-			return err
-		}
-
-		rounds := cur.LandingRounds + 1
-		readyCleared, err := clearReady(ctx, tx, req.Repo, req.ID)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE migrations SET landing_rounds = $3 WHERE repo = $1 AND id = $2`,
-			req.Repo, req.ID, rounds); err != nil {
-			return err
-		}
-		if err := event(ctx, tx, req.Repo, "migration.round_failed", req.ID, "", map[string]any{
-			"generation": req.Generation, "landing_rounds": rounds, "reason": req.Reason, "batch": req.Batch, "key": req.Key,
-			"detail": req.Detail, "log": req.Log, "ready_cleared": readyCleared,
-		}); err != nil {
-			return err
-		}
-		if r.MaxLandingRounds > 0 && rounds >= r.MaxLandingRounds && cur.EscalatedAt == nil {
-			why := fmt.Sprintf("failed %d of %d landing rounds; last: %s", rounds, r.MaxLandingRounds, req.Reason)
-			if err := escalate(ctx, tx, req.Repo, req.ID, why); err != nil {
-				return err
-			}
-		}
-		m, err = loadMigration(ctx, tx, req.Repo, req.ID, false)
+		m, err = recordRound(ctx, tx, r, req)
 		return err
 	})
 	return m, err
+}
+
+// recordRound makes RecordRound's checks and writes in tx, whose caller holds the repository's row lock, and returns the
+// migration after them. DeclineBatch records its returns through it, in its own transaction.
+func recordRound(ctx context.Context, tx pgx.Tx, r Repository, req RoundRequest) (Migration, error) {
+	cur, err := loadMigration(ctx, tx, req.Repo, req.ID, true)
+	if err != nil {
+		return Migration{}, err
+	}
+
+	var recorded struct {
+		Generation int64
+		Reason     string
+		Batch      string
+	}
+	err = tx.QueryRow(ctx, `SELECT generation, reason, batch FROM round_keys
+		WHERE repo = $1 AND migration = $2 AND key = $3`, req.Repo, req.ID, req.Key).
+		Scan(&recorded.Generation, &recorded.Reason, &recorded.Batch)
+	switch {
+	case err == nil:
+		if recorded.Generation != req.Generation || recorded.Reason != req.Reason || recorded.Batch != req.Batch {
+			return Migration{}, refuse(ReasonRoundKeyConflict, "round key %q for migration %s has a different generation, reason, or batch",
+				req.Key, req.ID)
+		}
+		return cur, nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return Migration{}, err
+	}
+
+	if err := requireOpenAt(cur, req.Generation); err != nil {
+		return Migration{}, err
+	}
+	if err := fenceMigration(ctx, tx, req.Repo, req.ID); err != nil {
+		return Migration{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO round_keys (repo, migration, key, generation, reason, batch)
+		VALUES ($1, $2, $3, $4, $5, $6)`, req.Repo, req.ID, req.Key, req.Generation, req.Reason, req.Batch); err != nil {
+		return Migration{}, err
+	}
+
+	rounds := cur.LandingRounds + 1
+	readyCleared, err := clearReady(ctx, tx, req.Repo, req.ID)
+	if err != nil {
+		return Migration{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE migrations SET landing_rounds = $3 WHERE repo = $1 AND id = $2`,
+		req.Repo, req.ID, rounds); err != nil {
+		return Migration{}, err
+	}
+	if err := event(ctx, tx, req.Repo, "migration.round_failed", req.ID, "", map[string]any{
+		"generation": req.Generation, "landing_rounds": rounds, "reason": req.Reason, "batch": req.Batch, "key": req.Key,
+		"detail": req.Detail, "log": req.Log, "ready_cleared": readyCleared,
+	}); err != nil {
+		return Migration{}, err
+	}
+	if r.MaxLandingRounds > 0 && rounds >= r.MaxLandingRounds && cur.EscalatedAt == nil {
+		why := fmt.Sprintf("failed %d of %d landing rounds; last: %s", rounds, r.MaxLandingRounds, req.Reason)
+		if err := escalate(ctx, tx, req.Repo, req.ID, why); err != nil {
+			return Migration{}, err
+		}
+	}
+	return loadMigration(ctx, tx, req.Repo, req.ID, false)
 }
 
 func escalate(ctx context.Context, tx pgx.Tx, repo, id, why string) error {
