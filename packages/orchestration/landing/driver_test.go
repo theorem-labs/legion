@@ -2,6 +2,7 @@ package landing
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -211,6 +212,7 @@ func testRunner(ledger *ledgerFake, builder *builderFake) Runner {
 	return Runner{
 		Store:        &storeFake{},
 		Ledger:       ledger,
+		Admission:    &batchLedgerFake{ledger: ledger},
 		Builder:      builder,
 		Hasher:       hasherFake{},
 		Git:          newGitFake(),
@@ -232,6 +234,7 @@ type ledgerFake struct {
 	checks   []CheckRequest
 	rounds   []RoundRequest
 	returned []returned
+	checked  []string
 	landed   []string
 	commits  map[string]string
 }
@@ -262,6 +265,7 @@ func passed(request CheckRequest) CheckResult {
 
 func (f *ledgerFake) Contracts(context.Context, string) ([]Contract, error) { return nil, nil }
 
+// Land records a member landing, which the batch ledger fake sends for each member its LandBatch lands.
 func (f *ledgerFake) Land(_ context.Context, request LandRequest) error {
 	f.landed = append(f.landed, request.Migration)
 	if f.commits == nil {
@@ -277,15 +281,7 @@ func (f *ledgerFake) ReturnMember(_ context.Context, round RoundRequest) error {
 	return nil
 }
 
-// MigrationState reports what Land recorded, as the real ledger does.
 func (f *ledgerFake) Escalate(context.Context, string, string, string) error { return nil }
-
-func (f *ledgerFake) MigrationState(_ context.Context, _ string, migration string) (string, string, error) {
-	if commit, landed := f.commits[migration]; landed {
-		return "landed", commit, nil
-	}
-	return "open", "", nil
-}
 
 type builderFake struct {
 	results map[string]blame.BuildResult
@@ -338,11 +334,17 @@ type gitFake struct {
 	changes     map[string]gitx.Change
 	evidence    map[string]blame.Evidence
 	conflicts   map[string]bool
+	commits     map[string]Commit
+	merges      map[string]string
+	ancestors   map[string]bool
 	changeBases []string
 }
 
 func newGitFake() *gitFake {
-	return &gitFake{changes: map[string]gitx.Change{}, evidence: map[string]blame.Evidence{}, conflicts: map[string]bool{}}
+	return &gitFake{
+		changes: map[string]gitx.Change{}, evidence: map[string]blame.Evidence{}, conflicts: map[string]bool{},
+		commits: map[string]Commit{}, merges: map[string]string{}, ancestors: map[string]bool{},
+	}
 }
 
 func (f *gitFake) Resolve(_ context.Context, _ string, rev string) (string, error) {
@@ -388,18 +390,40 @@ func (f *gitFake) TreeDeclarations(context.Context, string, Tree) ([]blame.Decla
 	return nil, nil
 }
 
+// ReadCommit reports the shape the fake holds for a commit. An unknown commit is no commit, as it is for git.
+func (f *gitFake) ReadCommit(_ context.Context, _ string, commit string) (Commit, error) {
+	held, found := f.commits[commit]
+	if !found {
+		return Commit{}, fmt.Errorf("unknown commit %q", commit)
+	}
+	return held, nil
+}
+
+// MergeTree merges two commits. A pair the fake holds no tree for conflicts, as git reports a conflict.
+func (f *gitFake) MergeTree(_ context.Context, _ string, left, right string) (string, error) {
+	tree, found := f.merges[left+" "+right]
+	if !found {
+		return "", fmt.Errorf("merge of %q and %q conflicts", left, right)
+	}
+	return tree, nil
+}
+
+func (f *gitFake) Ancestor(_ context.Context, _ string, commit, descendant string) (bool, error) {
+	return f.ancestors[commit+" "+descendant], nil
+}
+
 type storeFake struct {
 	states []State
 }
 
-func (f *storeFake) Save(_ context.Context, batch Batch) error {
+func (f *storeFake) Save(_ context.Context, batch *Batch) error {
 	f.states = append(f.states, batch.State)
 	return nil
 }
 
 func (f *storeFake) Load(context.Context, string) (Batch, bool, error) { return Batch{}, false, nil }
 
-func (f *storeFake) Create(ctx context.Context, batch Batch) (bool, error) {
+func (f *storeFake) Create(ctx context.Context, batch *Batch) (bool, error) {
 	return true, f.Save(ctx, batch)
 }
 func (f *storeFake) ListActive(context.Context) ([]Batch, error) { return nil, nil }

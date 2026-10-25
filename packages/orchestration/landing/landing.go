@@ -38,13 +38,13 @@ type KeptBuild struct {
 
 func noRelease() {}
 
-// Ledger is the landing-facing contract with the durable ledger.
+// Ledger is the member half of the ledger, in the order the runner calls it: the deferred check before the build,
+// the contract list and the full check after it, each member's return, and the escalation of a step that is
+// retried. The landing itself is the batch half's (BatchLedger.LandBatch).
 type Ledger interface {
 	Check(context.Context, CheckRequest) (CheckResult, error)
-	Land(context.Context, LandRequest) error
 	ReturnMember(context.Context, RoundRequest) error
 	Contracts(context.Context, string) ([]Contract, error)
-	MigrationState(context.Context, string, string) (state string, landedCommit string, err error)
 	// Escalate enqueues the work item for the owner. A repeated call for an
 	// open item of the same owner does nothing.
 	Escalate(ctx context.Context, repository, item, owner string) error
@@ -58,7 +58,8 @@ type Review struct {
 }
 
 // LandRequest is the ledger's LandRequest, field for field: the candidate, the
-// current hash of each read, and the member's statement records.
+// current hash of each read, and the member's statement records. The checks
+// send it, and it is the request the ledger lands each member with.
 type LandRequest struct {
 	Repo               string            `json:"repo"`
 	Migration          string            `json:"migration"`
@@ -72,6 +73,7 @@ type LandRequest struct {
 	ReviewedHead       string            `json:"reviewed_head"`
 	Reviews            []Review          `json:"reviews"`
 	ApprovedPinned     []string          `json:"approved_pinned"`
+	Upstream           string            `json:"upstream"`
 }
 
 // CheckRequest is the ledger's CheckRequest. DeferReads asks for the check
@@ -136,6 +138,12 @@ type HashInput struct {
 	Names          []string
 }
 
+// Commit is the shape of one commit in the repository: the tree it holds and its parents, in their order.
+type Commit struct {
+	Tree    string
+	Parents []string
+}
+
 // StatementHash is one name's statement at a tree and the paths that declare
 // it. No path means the name is absent, with the empty hash; more than one
 // path means the name is ambiguous, and its hash cannot be used.
@@ -171,6 +179,12 @@ type Git interface {
 	ChangeSet(context.Context, string, string, Member) (gitx.Change, error)
 	DeclarationEvidence(context.Context, string, string, Member, blame.InstanceNames) (blame.Evidence, error)
 	TreeDeclarations(context.Context, string, Tree) ([]blame.Declaration, error)
+	// ReadCommit reads a commit's tree and parents.
+	ReadCommit(context.Context, string, string) (Commit, error)
+	// MergeTree merges two commits without a working copy and is the tree the merge writes. A conflict is an error.
+	MergeTree(context.Context, string, string, string) (string, error)
+	// Ancestor reports whether the first commit is an ancestor of the second.
+	Ancestor(context.Context, string, string, string) (bool, error)
 }
 
 // CheckInput is what a configured check reads: the candidate tree and the
@@ -245,7 +259,23 @@ const (
 	Publishing State = "publishing"
 	Landed     State = "landed"
 	Failed     State = "failed"
+	// Declined ends a batch that was admitted and did not land: its returned members are back with their owners and
+	// its other members go to its successor.
+	Declined State = "declined"
+	// Empty ends a batch that lost every member.
+	Empty State = "empty"
+	// LandedUnrecorded ends a batch that GitHub merged and the ledger did not land. An operator resolves it.
+	LandedUnrecorded State = "landed_unrecorded"
 )
+
+// terminal reports whether a state ends a batch: the runner never advances, admits or saves it again.
+func (s State) terminal() bool {
+	switch s {
+	case Landed, Failed, Declined, Empty, LandedUnrecorded:
+		return true
+	}
+	return false
+}
 
 // Member is the frozen identity of one proposed migration. Changed is read once,
 // when the batch freezes. The statement records (ChangedContracts as the owner
@@ -271,6 +301,9 @@ type Member struct {
 	ReviewedHead       string            `json:"reviewedHead"`
 	CompatibilityProof string            `json:"compatibilityProof"`
 	ApprovedPinned     []string          `json:"approvedPinned"`
+	// Upstream is the commit that an upstream sync carries, from the member's ready record, and is empty for an
+	// ordinary migration. The program verifies the member's head against it before the ledger checks the member.
+	Upstream string `json:"upstream"`
 }
 
 // DroppedMember records why a frozen member left the candidate.
@@ -336,10 +369,31 @@ type Operation struct {
 // candidate, each member's current hashes and ledger decision, the repository
 // checks and the receipt) is stored with the key it was derived at, and it is
 // recomputed before the next side effect whenever that key differs from the
-// batch's current key. A batch that GitHub merged (MergeValidated) is the one
-// exception: it completes under the receipt, and so the policy, that the merge
-// validated, whatever policy the runner has later.
+// batch's current key. A batch that the ledger admitted is the one exception:
+// it is in the merge queue, so it completes under the receipt, and so the
+// policy, that its admission checked, whatever policy the runner has later.
 type Batch struct {
+	// SchemaVersion is the version of this record's shape, which the ledger stores as the program sends it.
+	SchemaVersion int `json:"schema_version"`
+	// RecordVersion is the ledger's version of the stored record. It orders every write: a save names the version it
+	// read, and the store replaces it with the version the write produced. It is not part of the stored record.
+	RecordVersion int64 `json:"record_version,omitempty"`
+	// Successor is the batch that the members of a declined batch go to next.
+	Successor string `json:"successor,omitempty"`
+	// EscalateTo is the owner that the ledger escalates a landed_unrecorded batch to.
+	EscalateTo string `json:"escalate_to,omitempty"`
+	// PublishAttempts counts the failed enqueues and waits of an admitted batch.
+	PublishAttempts int `json:"publish_attempts,omitempty"`
+	// Withdraw is the publishing step whose failures started the batch's withdraw, and empty while none is started.
+	Withdraw string `json:"withdraw,omitempty"`
+	// Admission is the ledger's admission of this batch, which the store fills on every read. It is the ledger's
+	// column, not part of the record.
+	Admission string `json:"-"`
+	// PostLandEffects are the effects that the landing records as intents in its own transaction.
+	PostLandEffects []PostLandEffect `json:"post_land_effects,omitempty"`
+	// PendingEffects are the keys of this batch's effects still to do, which the store fills on every read from the
+	// ledger's own rows.
+	PendingEffects    []string             `json:"-"`
 	ID                string               `json:"id"`
 	Repository        string               `json:"repository"`
 	Base              string               `json:"base"`
@@ -350,8 +404,6 @@ type Batch struct {
 	InitialCandidate  gitx.Result          `json:"initialCandidate"`
 	FrozenMembers     []Member             `json:"frozenMembers"`
 	ActiveMembers     []Member             `json:"activeMembers"`
-	LandedMembers     []Member             `json:"landedMembers"`
-	NotifiedMembers   []string             `json:"notifiedMembers"`
 	Dropped           []DroppedMember      `json:"dropped"`
 	Operations        map[string]Operation `json:"operations"`
 	State             State                `json:"state"`
@@ -361,9 +413,7 @@ type Batch struct {
 	CheckPolicyDigest string               `json:"checkPolicyDigest"`
 	Checks            []CheckVerdict       `json:"checks"`
 	ChecksKey         string               `json:"checksKey"`
-	Score             CheckVerdict         `json:"score"`
 	PullRequest       PullRequest          `json:"pullRequest"`
-	MergeValidated    bool                 `json:"mergeValidated"`
 	Receipt           *Receipt             `json:"receipt"`
 }
 
@@ -419,38 +469,64 @@ type Input struct {
 	Members    []Member `json:"members"`
 }
 
-// BatchStore persists each state transition before its following side effect.
+// BatchSchemaVersion is the version of the batch record that this program writes.
+const BatchSchemaVersion = 1
+
+// BatchStore persists each state transition before its following side effect. Create and Save take the batch so that
+// the store can replace its record version with the version its write produced.
 type BatchStore interface {
-	Create(context.Context, Batch) (bool, error)
-	Save(context.Context, Batch) error
+	Create(context.Context, *Batch) (bool, error)
+	Save(context.Context, *Batch) error
 	Load(context.Context, string) (Batch, bool, error)
 	ListActive(context.Context) ([]Batch, error)
 }
 
 // Runner owns the dependencies and policy for one batch run.
 type Runner struct {
-	Store        BatchStore
-	Ledger       Ledger
+	Store     BatchStore
+	Ledger    Ledger
+	Admission BatchLedger
+	// Heads fetches each ready member's head before a serving program forms a batch from it.
+	Heads        Heads
 	Builder      Builder
 	Hasher       Hasher
 	Git          Git
 	GitHub       GitHub
-	Score        Scorer
 	Events       EventPublisher
-	ScorePath    string
 	Checks       []Checker
 	ModuleRoots  []string
 	MaxRounds    int
 	InfraRetries int
 	ConfigDigest string
-	Toolchain    func(context.Context, Tree) (string, error)
+	// Effects is the ledger's log of a landing's effects, which every executor writes through.
+	Effects EffectLog
+	// Containers runs each hook on the build VM, and Trees gives it the landed commit's worktree.
+	Containers ContainerRunner
+	Trees      LandedTrees
+	// Scores is the remote score ref a score apply reads and pushes, and Defects publishes a hook's defect.
+	Scores  ScoreStore
+	Defects DefectPublisher
+	// PostLanding is the configured, ordered list of hooks and the parts they run for, which admission freezes
+	// into the batch's record.
+	PostLanding PostLanding
+	// Container is the image, user and declared mounts that a frozen hook definition copies.
+	Container Container
+	// Librarian is the argv that a contracts apply's deliveries run.
+	Librarian []string
+	Toolchain func(context.Context, Tree) (string, error)
 	// EscalateTo is the escalations owner. A step that is retried (a hasher
-	// exit 75) is escalated to it when its attempts reach EscalateAfter
-	// (default 10). RetryBackoff is the first wait between attempts (default
-	// 10 seconds); each wait doubles, up to five minutes.
+	// exit 75, a hook, an apply, a publication or a delivery) is escalated to
+	// it when its attempts reach EscalateAfter (default 10). RetryBackoff is
+	// the first wait between attempts (default 10 seconds); each wait doubles,
+	// up to five minutes.
 	EscalateTo    string
 	EscalateAfter int
 	RetryBackoff  time.Duration
+	// PublishingRetryLimit is the number of failed enqueues and waits after which an admitted batch is withdrawn.
+	PublishingRetryLimit int
+	// PublishingBackoff is the first pause after a failed publishing step, doubled after each failure. Zero is 30
+	// seconds.
+	PublishingBackoff time.Duration
 }
 
 // Run freezes one batch and advances it until it is green or failed.
@@ -491,7 +567,7 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 	}
 	r.setCandidate(&batch, candidate)
 	batch.InitialCandidate = candidate
-	created, err := r.Store.Create(ctx, batch)
+	created, err := r.Store.Create(ctx, &batch)
 	if err != nil {
 		return Batch{}, fmt.Errorf("create batch %q: %w", batch.ID, err)
 	}
@@ -517,17 +593,42 @@ func (r Runner) Run(ctx context.Context, input Input) (Batch, error) {
 func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 	if policy := r.policyDigest(); batch.CheckPolicyDigest != policy {
 		batch.CheckPolicyDigest = policy
-		if err := r.Store.Save(ctx, *batch); err != nil {
+		if err := r.Store.Save(ctx, batch); err != nil {
 			return *batch, fmt.Errorf("record check policy: %w", err)
 		}
 	}
 	for {
 		if err := r.ensureCandidate(ctx, batch); err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
 			return r.fail(ctx, batch, "candidate")
 		}
-		returned, err := r.deferredCheck(ctx, batch)
+		if batch.State.terminal() {
+			return *batch, nil
+		}
+		returned, err := r.checkUpstream(ctx, batch)
 		if err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
+			return r.fail(ctx, batch, "upstream")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
+		}
+		if returned {
+			continue
+		}
+		returned, err = r.deferredCheck(ctx, batch)
+		if err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
 			return r.fail(ctx, batch, "ledger")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
 		}
 		if returned {
 			continue
@@ -538,7 +639,13 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 			if errors.As(err, &unable) {
 				return r.fail(ctx, batch, "check-unable")
 			}
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
 			return r.fail(ctx, batch, "return")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
 		}
 		if returned {
 			continue
@@ -573,8 +680,13 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 					return r.fail(ctx, batch, "hash-unable")
 				case errors.As(err, &unattributed):
 					return r.fail(ctx, batch, "statement-unattributed")
+				case r.reloaded(ctx, batch, err):
+					return *batch, nil
 				}
 				return r.fail(ctx, batch, "ledger")
+			}
+			if batch.State.terminal() {
+				return *batch, nil
 			}
 			if returned {
 				continue
@@ -605,8 +717,14 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 			return r.fail(ctx, batch, "base-broken")
 		}
 		batch.Round++
-		if err := r.returnMembers(ctx, batch, culprits); err != nil {
+		if err := r.dropMembers(ctx, batch, culprits); err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
 			return r.fail(ctx, batch, "return")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
 		}
 	}
 }
@@ -672,16 +790,15 @@ func (r Runner) ensureCandidate(ctx context.Context, batch *Batch) error {
 			return fmt.Errorf("rebuild candidate: %w", err)
 		}
 		r.setCandidate(batch, candidate)
-		if err := r.Store.Save(ctx, *batch); err != nil {
+		if err := r.Store.Save(ctx, batch); err != nil {
 			return fmt.Errorf("record rebuilt candidate: %w", err)
 		}
 	}
+	drops := make(map[string]string, len(batch.Candidate.Dropped))
 	for _, drop := range batch.Candidate.Dropped {
-		if err := r.returnMember(ctx, batch, drop.ID, drop.Reason, ""); err != nil {
-			return err
-		}
+		drops[drop.ID] = drop.Reason
 	}
-	return nil
+	return r.dropMembers(ctx, batch, drops)
 }
 
 // candidateMembers is the active members less those the stored candidate dropped.
@@ -721,8 +838,11 @@ func (r Runner) deferredCheck(ctx context.Context, batch *Batch) (bool, error) {
 		}
 		if result.Outcome == CheckRefused {
 			reason, detail := refusal(result)
-			if err := r.returnMember(ctx, batch, snapshot.Migration, reason, detail); err != nil {
+			if err := r.dropMember(ctx, batch, snapshot.Migration, reason, detail); err != nil {
 				return returned, err
+			}
+			if batch.State.terminal() {
+				return true, nil
 			}
 			returned = true
 			continue
@@ -732,7 +852,7 @@ func (r Runner) deferredCheck(ctx context.Context, batch *Batch) (bool, error) {
 		}
 		if index := memberIndex(batch.ActiveMembers, snapshot.Migration); index >= 0 {
 			batch.ActiveMembers[index].DeferredKey = key
-			if err := r.Store.Save(ctx, *batch); err != nil {
+			if err := r.Store.Save(ctx, batch); err != nil {
 				return returned, fmt.Errorf("record deferred decision for %q: %w", snapshot.Migration, err)
 			}
 		}
@@ -820,8 +940,11 @@ func (r Runner) checkStatements(ctx context.Context, batch *Batch, build KeptBui
 	returned := false
 	for _, snapshot := range cloneMembers(batch.ActiveMembers) {
 		if name, found := unable[snapshot.Migration]; found {
-			if err := r.returnMember(ctx, batch, snapshot.Migration, "hash_unable", fmt.Sprintf("%s is declared at more than one path", name)); err != nil {
+			if err := r.dropMember(ctx, batch, snapshot.Migration, "hash_unable", fmt.Sprintf("%s is declared at more than one path", name)); err != nil {
 				return returned, err
+			}
+			if batch.State.terminal() {
+				return true, nil
 			}
 			returned = true
 			continue
@@ -829,8 +952,11 @@ func (r Runner) checkStatements(ctx context.Context, batch *Batch, build KeptBui
 		changes := derived[snapshot.Migration]
 		if declared, found := sortedKeys(snapshot.ChangedContracts), sortedKeys(changes); !equalStrings(declared, found) {
 			detail := fmt.Sprintf("declared %s; derived %s", formatSet(declared), formatSet(found))
-			if err := r.returnMember(ctx, batch, snapshot.Migration, "undeclared_statement_change", detail); err != nil {
+			if err := r.dropMember(ctx, batch, snapshot.Migration, "undeclared_statement_change", detail); err != nil {
 				return returned, err
+			}
+			if batch.State.terminal() {
+				return true, nil
 			}
 			returned = true
 			continue
@@ -852,8 +978,11 @@ func (r Runner) checkStatements(ctx context.Context, batch *Batch, build KeptBui
 				return returned, fmt.Errorf("check %q: outcome %q", snapshot.Migration, result.Outcome)
 			}
 			reason, detail := refusal(result)
-			if err := r.returnMember(ctx, batch, snapshot.Migration, reason, detail); err != nil {
+			if err := r.dropMember(ctx, batch, snapshot.Migration, reason, detail); err != nil {
 				return returned, err
+			}
+			if batch.State.terminal() {
+				return true, nil
 			}
 			returned = true
 			continue
@@ -864,7 +993,7 @@ func (r Runner) checkStatements(ctx context.Context, batch *Batch, build KeptBui
 			member.DerivedContracts = cloneHashes(changes)
 			member.HashesKey = key
 			member.LedgerKey = key
-			if err := r.Store.Save(ctx, *batch); err != nil {
+			if err := r.Store.Save(ctx, batch); err != nil {
 				return returned, fmt.Errorf("record ledger decision for %q: %w", snapshot.Migration, err)
 			}
 		}
@@ -890,14 +1019,14 @@ func (r Runner) hashes(ctx context.Context, batch *Batch, input HashInput) (map[
 		if !errors.As(err, &retry) {
 			if err == nil && batch.HashAttempts != 0 {
 				batch.HashAttempts = 0
-				if err := r.Store.Save(ctx, *batch); err != nil {
+				if err := r.Store.Save(ctx, batch); err != nil {
 					return nil, fmt.Errorf("record hasher attempts: %w", err)
 				}
 			}
 			return hashes, err
 		}
 		batch.HashAttempts++
-		if err := r.Store.Save(ctx, *batch); err != nil {
+		if err := r.Store.Save(ctx, batch); err != nil {
 			return nil, fmt.Errorf("record hasher attempt: %w", err)
 		}
 		threshold := r.escalateAfter()
@@ -1020,47 +1149,6 @@ func touchesAny(changed, paths []string) bool {
 	return false
 }
 
-func (r Runner) returnMembers(ctx context.Context, batch *Batch, culprits map[string]string) error {
-	ids := make([]string, 0, len(culprits))
-	for id := range culprits {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		if err := r.returnMember(ctx, batch, id, culprits[id], ""); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// returnMember removes an active member and records the intent to return it in
-// one save, so the current key changes before the ledger hears of it.
-func (r Runner) returnMember(ctx context.Context, batch *Batch, migration, reason, detail string) error {
-	member, found := findMember(batch.ActiveMembers, migration)
-	if !found {
-		return nil
-	}
-	key := "return/" + migration
-	batch.ActiveMembers = withoutMember(batch.ActiveMembers, migration)
-	if !containsDropped(batch.Dropped, migration) {
-		batch.Dropped = append(batch.Dropped, DroppedMember{Migration: migration, Reason: reason})
-	}
-	operation := Operation{Key: key, Kind: "return", Batch: batch.ID, Repository: batch.Repository, Member: migration, Generation: member.Generation, Reason: reason, Detail: detail}
-	batch.startOperation(operation)
-	if err := r.Store.Save(ctx, *batch); err != nil {
-		return fmt.Errorf("record return intent for %q: %w", migration, err)
-	}
-	if err := r.Ledger.ReturnMember(ctx, roundRequest(operation, member)); err != nil {
-		return fmt.Errorf("return %q: %w", migration, err)
-	}
-	batch.completeOperation(key)
-	if err := r.Store.Save(ctx, *batch); err != nil {
-		return fmt.Errorf("record returned member %q: %w", migration, err)
-	}
-	return nil
-}
-
 // roundRequest is the ledger round for a return: its key is
 // <batch>/<member>/<generation>, since a member leaves one batch at most once
 // at one generation, so a retry after a crash replays the same round.
@@ -1093,13 +1181,13 @@ func (r Runner) runChecks(ctx context.Context, batch *Batch) (bool, error) {
 	verdicts, culprits, err := r.evaluateChecks(ctx, batch, false)
 	batch.Checks = verdicts
 	if err != nil {
-		if saveErr := r.Store.Save(ctx, *batch); saveErr != nil {
+		if saveErr := r.Store.Save(ctx, batch); saveErr != nil {
 			return false, fmt.Errorf("record failed check: %w", saveErr)
 		}
 		return false, err
 	}
 	if len(culprits) != 0 {
-		if err := r.returnMembers(ctx, batch, culprits); err != nil {
+		if err := r.dropMembers(ctx, batch, culprits); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -1566,7 +1654,7 @@ func (r Runner) fail(ctx context.Context, batch *Batch, reason string) (Batch, e
 func (r Runner) transition(ctx context.Context, batch *Batch, state State, reason string) error {
 	batch.State = state
 	batch.Reason = reason
-	if err := r.Store.Save(ctx, *batch); err != nil {
+	if err := r.Store.Save(ctx, batch); err != nil {
 		return fmt.Errorf("store %s state: %w", state, err)
 	}
 	return nil
@@ -1697,27 +1785,30 @@ type MemoryStore struct {
 }
 
 // Create stores a batch only when its identity is not already present.
-func (s *MemoryStore) Create(_ context.Context, batch Batch) (bool, error) {
+func (s *MemoryStore) Create(_ context.Context, batch *Batch) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.batches == nil {
 		s.batches = make(map[string]Batch)
 	}
-	if _, found := s.batches[batch.ID]; found {
+	if stored, found := s.batches[batch.ID]; found {
+		batch.RecordVersion = stored.RecordVersion
 		return false, nil
 	}
-	s.batches[batch.ID] = cloneBatch(batch)
+	batch.SchemaVersion, batch.RecordVersion = BatchSchemaVersion, 1
+	s.batches[batch.ID] = cloneBatch(*batch)
 	return true, nil
 }
 
 // Save writes a deep copy of a batch.
-func (s *MemoryStore) Save(_ context.Context, batch Batch) error {
+func (s *MemoryStore) Save(_ context.Context, batch *Batch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.batches == nil {
 		s.batches = make(map[string]Batch)
 	}
-	s.batches[batch.ID] = cloneBatch(batch)
+	batch.SchemaVersion, batch.RecordVersion = BatchSchemaVersion, batch.RecordVersion+1
+	s.batches[batch.ID] = cloneBatch(*batch)
 	return nil
 }
 
@@ -1735,7 +1826,7 @@ func (s *MemoryStore) ListActive(_ context.Context) ([]Batch, error) {
 	defer s.mu.Unlock()
 	out := make([]Batch, 0, len(s.batches))
 	for _, batch := range s.batches {
-		if batch.State != Failed && batch.State != Landed {
+		if !batch.State.terminal() || (batch.State == Declined && batch.Successor != "" && !s.has(batch.Successor)) {
 			out = append(out, cloneBatch(batch))
 		}
 	}
@@ -1743,11 +1834,17 @@ func (s *MemoryStore) ListActive(_ context.Context) ([]Batch, error) {
 	return out, nil
 }
 
+// has reports whether the store holds the batch id. The caller holds the lock.
+func (s *MemoryStore) has(id string) bool {
+	_, found := s.batches[id]
+	return found
+}
+
 func cloneBatch(batch Batch) Batch {
 	batch.FrozenMembers = cloneMembers(batch.FrozenMembers)
 	batch.ActiveMembers = cloneMembers(batch.ActiveMembers)
-	batch.LandedMembers = cloneMembers(batch.LandedMembers)
-	batch.NotifiedMembers = append([]string(nil), batch.NotifiedMembers...)
+	batch.PostLandEffects = append([]PostLandEffect(nil), batch.PostLandEffects...)
+	batch.PendingEffects = append([]string(nil), batch.PendingEffects...)
 	batch.Dropped = append([]DroppedMember(nil), batch.Dropped...)
 	batch.Candidate.Dropped = append([]gitx.Drop(nil), batch.Candidate.Dropped...)
 	batch.InitialCandidate.Dropped = append([]gitx.Drop(nil), batch.InitialCandidate.Dropped...)

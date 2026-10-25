@@ -48,14 +48,6 @@ func TestReviewCommandBuilderMaterializesSymlink(t *testing.T) {
 	}
 }
 
-func TestReviewCommandLedgerRejectsEmptyCheckDecision(t *testing.T) {
-	ledger := CommandLedger{Command: []string{"sh", "-c", "exit 0"}}
-
-	if _, err := ledger.Check(context.Background(), CheckRequest{LandRequest: LandRequest{Repo: "repo", Migration: "member", Generation: 1}}); err == nil {
-		t.Fatal("Check() error = nil, want explicit-decision error")
-	}
-}
-
 func TestReviewCommandHasherRequiresEveryStructuredHash(t *testing.T) {
 	hasher := CommandHasher{Command: []string{"sh", "-c", "printf 'Alpha.One\\thash-one\\tAlpha.lean\\n'"}}
 

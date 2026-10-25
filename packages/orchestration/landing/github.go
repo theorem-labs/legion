@@ -23,13 +23,14 @@ type GitHubCLI struct {
 	PollInterval   time.Duration
 }
 
-// Push pushes only the candidate commit to its queue branch.
+// Push puts the candidate commit on its queue branch. The push is forced: after a member is dropped, the batch's
+// rebuilt candidate replaces the one the branch held.
 func (c GitHubCLI) Push(ctx context.Context, _ string, branch, commit string) error {
 	remote := c.Remote
 	if remote == "" {
 		remote = "origin"
 	}
-	if _, err := c.run(ctx, c.RepositoryPath, "git", "-C", c.RepositoryPath, "push", remote, commit+":refs/heads/"+branch); err != nil {
+	if _, err := c.run(ctx, c.RepositoryPath, "git", "-C", c.RepositoryPath, "push", remote, "+"+commit+":refs/heads/"+branch); err != nil {
 		return fmt.Errorf("push candidate branch: %w", err)
 	}
 	return nil
@@ -76,6 +77,59 @@ func (c GitHubCLI) Enqueue(ctx context.Context, repository string, number int) e
 	return nil
 }
 
+// Withdraw takes the pull request out of the merge queue, when it is queued, and closes it. A pull request that is
+// already closed or merged is left as it is.
+func (c GitHubCLI) Withdraw(ctx context.Context, repository string, number int) error {
+	owner, name, err := splitRepository(repository)
+	if err != nil {
+		return err
+	}
+	query := `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id state mergeQueueEntry{id}}}}`
+	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "api", "graphql", "-f", "query="+query, "-F", "owner="+owner, "-F", "name="+name, "-F", fmt.Sprintf("number=%d", number))
+	if err != nil {
+		return fmt.Errorf("read pull request %d before the withdraw: %w", number, err)
+	}
+	var current struct {
+		Data struct {
+			Repository struct {
+				PullRequest struct {
+					ID              string `json:"id"`
+					State           string `json:"state"`
+					MergeQueueEntry *struct {
+						ID string `json:"id"`
+					} `json:"mergeQueueEntry"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(output), &current); err != nil {
+		return fmt.Errorf("decode pull request %d before the withdraw: %w", number, err)
+	}
+	pull := current.Data.Repository.PullRequest
+	switch strings.ToUpper(pull.State) {
+	case "MERGED", "CLOSED":
+		return nil
+	}
+	if pull.MergeQueueEntry != nil {
+		mutation := `mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}`
+		if _, err := c.run(ctx, c.RepositoryPath, c.gh(), "api", "graphql", "-f", "query="+mutation, "-f", "id="+pull.ID); err != nil {
+			return fmt.Errorf("remove pull request %d from the merge queue: %w", number, err)
+		}
+	}
+	if _, err := c.run(ctx, c.RepositoryPath, c.gh(), "pr", "close", fmt.Sprint(number), "--repo", repository); err != nil {
+		return fmt.Errorf("close pull request %d: %w", number, err)
+	}
+	return nil
+}
+
+func splitRepository(repository string) (string, string, error) {
+	owner, name, found := strings.Cut(repository, "/")
+	if !found || owner == "" || name == "" {
+		return "", "", fmt.Errorf("repository %q is not owner/name", repository)
+	}
+	return owner, name, nil
+}
+
 // Wait waits until GitHub merges, closes, or removes the expected head.
 func (c GitHubCLI) Wait(ctx context.Context, repository string, number int, expectedHead string) (PullRequest, error) {
 	interval := c.PollInterval
@@ -100,6 +154,11 @@ func (c GitHubCLI) Wait(ctx context.Context, repository string, number int, expe
 		case <-timer.C:
 		}
 	}
+}
+
+// Read reads the pull request once, without waiting for an outcome.
+func (c GitHubCLI) Read(ctx context.Context, repository string, number int) (PullRequest, error) {
+	return c.view(ctx, repository, fmt.Sprint(number))
 }
 
 type pullRequestWire struct {
@@ -130,9 +189,9 @@ type pullRequestDetails struct {
 }
 
 func (c GitHubCLI) enrich(ctx context.Context, repository string, wire pullRequestWire) (PullRequest, error) {
-	owner, name, found := strings.Cut(repository, "/")
-	if !found || owner == "" || name == "" {
-		return PullRequest{}, fmt.Errorf("repository %q is not owner/name", repository)
+	owner, name, err := splitRepository(repository)
+	if err != nil {
+		return PullRequest{}, err
 	}
 	query := `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){mergeQueueEntry{state} mergeCommit{oid} timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{... on RemovedFromMergeQueueEvent{reason}}}}}}`
 	output, err := c.run(ctx, c.RepositoryPath, c.gh(), "api", "graphql", "-f", "query="+query, "-F", "owner="+owner, "-F", "name="+name, "-F", fmt.Sprintf("number=%d", wire.Number))

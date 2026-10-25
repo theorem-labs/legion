@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/internal/testpg"
+	"github.com/sjawhar/legion/orchestration/ledger"
 )
 
 func TestBlameCommandPrintsEvidenceBackedMember(t *testing.T) {
@@ -131,17 +134,12 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 		"repository":  map[string]any{"name": "owner/repo", "path": repo, "git_dir": "/srv/land/repo.git"},
 		"base":        base,
 		"baseBranch":  "trunk",
-		"statePath":   filepath.Join(t.TempDir(), "state.json"),
 		"members":     []map[string]any{{"migration": "one", "generation": 1, "head": head}},
 		"build":       []string{"sh", "-c", "exit 0"},
 		"hasher":      []string{"sh", "-c", "exit 0"},
 		"toolchain":   []string{"sh", "-c", "printf tool"},
 		"escalations": map[string]any{"owner": "steward"},
-		"ledger": map[string]any{
-			"command":        []string{"sh", "-c", fakeLedger, "ledger"},
-			"status":         []string{"sh", "-c", "printf '{\"complete\":false}\\n'"},
-			"migrationState": []string{"sh", "-c", "printf '{\"state\":\"open\"}\\n'"},
-		},
+		"ledger":      map[string]any{"dsn_file": ledgerDSNFile(t, "owner/repo", "one", head)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -164,37 +162,48 @@ func TestRunCommandBuildsConfiguredBatch(t *testing.T) {
 	}
 }
 
-// fakeLedger answers the ledger CLI's contract list with no contracts and its
-// check with no violations: incomplete for a deferred check (exit 5), pass for
-// a full one.
-const fakeLedger = `case "$1" in
-contract) echo '[]' ;;
-check)
-	if grep -q '"defer_reads":true' "$3"; then
-		echo '{"outcome":"incomplete","violations":[]}'
-		exit 5
-	fi
-	echo '{"outcome":"pass","violations":[]}' ;;
-*) exit 2 ;;
-esac`
+// ledgerDSNFile is a file naming a fresh ledger database with repository repo and migration id open for head and
+// readied, as its owner leaves it before a batch picks it up.
+func ledgerDSNFile(t *testing.T, repo, id, head string) string {
+	t.Helper()
+	ctx := context.Background()
+	dsn := testpg.Database(t, "land_run")
+	store, err := ledger.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.EnsureRepo(ctx, repo, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.OpenMigration(ctx, ledger.OpenRequest{Repo: repo, ID: id, Owner: "alice", BaseCommit: "base", Branch: "branch/" + id, Writes: []string{"Alpha.lean"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ready(ctx, ledger.ReadyRequest{Repo: repo, ID: id, Generation: 1, Head: head, Key: "ready-" + id}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ledger.dsn")
+	write(t, path, dsn+"\n")
+	return path
+}
 
 // The escalations owner is required: an escalation enqueued for an empty owner
 // wakes nobody.
-func TestConfigRequiresEscalationsOwner(t *testing.T) {
+func TestConfigRequiresEscalateTo(t *testing.T) {
 	cfg := publicationConfig(t)
 	cfg.Escalations.Owner = ""
-	if _, _, _, err := cfg.runner(); err == nil || !strings.Contains(err.Error(), "escalations.owner is required") {
-		t.Fatalf("runner() error = %v, want escalations.owner required", err)
+	if _, err := cfg.program(context.Background()); err == nil || !strings.Contains(err.Error(), "escalations.owner is required") {
+		t.Fatalf("program() error = %v, want escalations.owner required", err)
 	}
 }
 
-// The per-operation ledger commands are removed: a configuration that still
-// names one is refused with the key to set instead.
+// The ledger commands are removed: the program calls the ledger directly, so a
+// configuration that still names one is refused with the key to set instead.
 func TestConfigRefusesRemovedLedgerCommands(t *testing.T) {
-	for _, key := range []string{"check", "land", "return"} {
+	for _, key := range []string{"check", "land", "return", "command", "status", "migrationState"} {
 		path := filepath.Join(t.TempDir(), "config.json")
 		write(t, path, `{"ledger": {"`+key+`": ["true"]}}`)
-		if _, err := readConfig(path); err == nil || !strings.Contains(err.Error(), "ledger."+key+" is removed; set ledger.command") {
+		if _, err := readConfig(path); err == nil || !strings.Contains(err.Error(), "ledger."+key+" is removed; set ledger.dsn_file") {
 			t.Fatalf("readConfig() with ledger.%s error = %v, want it refused", key, err)
 		}
 	}

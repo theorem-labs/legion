@@ -3,6 +3,7 @@ package landing
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os/exec"
@@ -21,6 +22,33 @@ import (
 // path while callers may keep a distinct repository identity in batch records.
 type RepositoryGit struct {
 	Path string
+	// FetchURL is where owners push their heads, from which FetchHead fetches a head by its SHA. Empty means the
+	// repository's path.
+	FetchURL string
+}
+
+// FetchHead brings commit sha into the repository from FetchURL, by the SHA itself, so a head that no ref of the
+// source names still arrives. A head already present needs no fetch.
+func (g RepositoryGit) FetchHead(ctx context.Context, repository, sha string) error {
+	path := g.path(repository)
+	if _, err := repositoryGit(ctx, path, "cat-file", "-e", sha+"^{commit}"); err == nil {
+		return nil
+	}
+	if _, err := repositoryGit(ctx, path, "fetch", "--quiet", "--no-tags", g.fetchURL(repository), sha); err != nil {
+		return fmt.Errorf("fetch %s: %w", sha, err)
+	}
+	if _, err := repositoryGit(ctx, path, "cat-file", "-e", sha+"^{commit}"); err != nil {
+		return fmt.Errorf("fetch %s: the commit did not arrive: %w", sha, err)
+	}
+	return nil
+}
+
+// fetchURL is where heads are fetched from: FetchURL, or the repository's path when it is empty.
+func (g RepositoryGit) fetchURL(repository string) string {
+	if g.FetchURL != "" {
+		return g.FetchURL
+	}
+	return g.path(repository)
 }
 
 // Resolve freezes a ref as an immutable commit ID.
@@ -66,6 +94,55 @@ func (g RepositoryGit) ChangeSet(ctx context.Context, repository, base string, m
 		return gitx.Change{}, fmt.Errorf("read change set: %w", err)
 	}
 	return change, nil
+}
+
+// ReadCommit reads a commit's tree and its parents, in their order, from the commit object itself.
+func (g RepositoryGit) ReadCommit(ctx context.Context, repository, commit string) (Commit, error) {
+	body, err := repositoryGit(ctx, g.path(repository), "cat-file", "commit", commit)
+	if err != nil {
+		return Commit{}, fmt.Errorf("read commit %q: %w", commit, err)
+	}
+	var read Commit
+	for _, line := range strings.Split(body, "\n") {
+		name, value, found := strings.Cut(line, " ")
+		if !found {
+			break
+		}
+		switch name {
+		case "tree":
+			read.Tree = value
+		case "parent":
+			read.Parents = append(read.Parents, value)
+		}
+	}
+	if read.Tree == "" {
+		return Commit{}, fmt.Errorf("read commit %q: it names no tree", commit)
+	}
+	return read, nil
+}
+
+// MergeTree merges two commits without a working copy and is the tree the merge writes. A merge that conflicts is
+// an error, as is a merge git cannot make.
+func (g RepositoryGit) MergeTree(ctx context.Context, repository, left, right string) (string, error) {
+	tree, err := repositoryGit(ctx, g.path(repository), "merge-tree", "--write-tree", "--no-messages", left, right)
+	if err != nil {
+		return "", fmt.Errorf("merge %q with %q: %w", left, right, err)
+	}
+	return tree, nil
+}
+
+// Ancestor reports whether commit is an ancestor of descendant.
+func (g RepositoryGit) Ancestor(ctx context.Context, repository, commit, descendant string) (bool, error) {
+	command := exec.CommandContext(ctx, "git", "-C", g.path(repository), "merge-base", "--is-ancestor", commit, descendant)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("check whether %q is behind %q: %w: %s", commit, descendant, err, strings.TrimSpace(string(output)))
 }
 
 // DeclarationEvidence indexes a member's changed Lean declarations from its
