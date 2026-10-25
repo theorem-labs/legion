@@ -462,33 +462,6 @@ func changedDefs(before map[declRef]string, consts []Constant) []declRef {
 	return out
 }
 
-// reachedModules are the modules, other than skip, of the statements that a change to defs changes.
-func (s *Store) reachedModules(defs []declRef, skip []string) ([]string, error) {
-	if len(defs) == 0 {
-		return nil, nil
-	}
-	g, err := s.graph()
-	if err != nil {
-		return nil, err
-	}
-	done := map[string]bool{}
-	for _, m := range skip {
-		done[m] = true
-	}
-	var out []string
-	for _, d := range defs {
-		changed, _, _ := g.walk(d)
-		for r := range changed {
-			if !done[r.module] {
-				done[r.module] = true
-				out = append(out, r.module)
-			}
-		}
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
 // Compiled is what the index read about one compiled constant.
 type Compiled struct {
 	Name   string `json:"name"`
