@@ -95,7 +95,7 @@ To record in front of a real librarian, configure `librarian: [record-librarian,
 
 ## Ledger join
 
-Run the ledger join where `declindex`, `ledger`, Python 3, the configuration's indexed tree, and the ledger DSN are reachable. `JOIN_CANDIDATE_COMMIT` and `JOIN_CHANGED_HASH` must name the already prepared, real candidate; the driver does not invent a source mutation.
+Run the ledger join where `declindex`, `ledger`, Python 3, the configuration's indexed tree, the index's Postgres server and the ledger DSN are reachable. The configuration names the index's schema with `index:`; the last two arguments are the two connection strings, the ledger's and the index's. `JOIN_CANDIDATE_COMMIT` and `JOIN_CHANGED_HASH` must name the already prepared, real candidate; the driver does not invent a source mutation.
 
 ```sh
 JOIN_CANDIDATE_COMMIT=<40-lowercase-hex-commit> \
@@ -105,10 +105,41 @@ packages/orchestration/declindex/e2e/ledger-join.sh \
   <ledger-repository> \
   Example.Concept \
   function:alloc_mnt_ns \
-  /path/to/ledger-dsn
+  /path/to/ledger-dsn \
+  /path/to/index-dsn
 ```
 
-The driver ensures the repository with a three-round limit, then runs steps 1 through 6 in order: register, open and verify `join-a`, open `join-b`, land `join-a` at version 2, open and verify `join-c` at version 2, then require the stale-read refusal for `join-b`. It exits at the first deviation. `DECLINDEX_BIN` and `LEDGER_BIN` may override the commands on `PATH`.
+The driver prints the index's schema, ensures the repository with a three-round limit, then runs steps 1 through 6 in order: register, open and verify `join-a`, open `join-b`, land `join-a` at version 2, open and verify `join-c` at version 2, then require the stale-read refusal for `join-b`. It exits at the first deviation. `DECLINDEX_BIN` and `LEDGER_BIN` may override the commands on `PATH`.
+
+## Query timings
+
+`timings.sh` holds the commands to the acceptance bars of one index. It runs `where`, `users`, `states`, `same`, `land-hash`, `gate` and `ledger` for each declaration of the sample, each under `/usr/bin/time`, and prints one `run` line for each run (command, declaration, seconds, exit status) and a `summary` line for each command (runs, how many exited 0, median, 95th percentile, worst). It exits 1 when the median of `users` reaches 1 s or its 95th percentile reaches 3 s, or when the median of `where`, `states` or `same` reaches 1 s. `land-hash`, `gate` and `ledger` are reported with no bar.
+
+Write the sample first. It is 50 declarations drawn with a fixed seed and the 50 declarations that most statements use, so that two runs of one index measure the same work:
+
+```sh
+go run ./packages/orchestration/declindex/e2e/sample \
+  --config /path/to/declindex.yaml \
+  --index-dsn-file /path/to/index-dsn \
+  --out sample.txt
+```
+
+```sh
+packages/orchestration/declindex/e2e/timings.sh \
+  --index-dsn-file /path/to/index-dsn \
+  /path/to/declindex.yaml sample.txt
+```
+
+`--limit N` measures the sample's first N declarations, for a quick run. Without `--gate-proposal FILE` the driver writes a fresh proposal for each declaration, so that the gate does its whole work; with it, every gate run reads that one proposal. `--proposer OWNER` names the gate's proposer. `DECLINDEX_DSN` in the environment replaces `--index-dsn-file`, and `DECLINDEX_BIN` the command on `PATH`.
+
+The refresh bar is a mode of its own: it times a refresh to an already landed commit that changes one module and no definition, and holds the index's own work, which the refresh reports as `elapsed_ns` and which excludes the fetch, the checkout and the build, under 30 s.
+
+```sh
+TIMINGS_LAND_COMMIT=<40-lowercase-hex-commit> \
+packages/orchestration/declindex/e2e/timings.sh \
+  --index-dsn-file /path/to/index-dsn \
+  --refresh-landing /path/to/declindex.yaml
+```
 
 ## Driver tests
 
