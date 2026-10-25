@@ -460,8 +460,10 @@ func (s *Store) Landing(ctx context.Context, landed string) (previous string, re
 // CompiledCommit is the index's commit, when the index's compiled part (types, compiled hashes, atoms and facts) is
 // of that commit. A refresh writes the compiled part after the reference part, in a second transaction, and a
 // compiled step that fails leaves the compiled part of an earlier commit; a reader that joined the two parts would
-// join two commits' rows, so it is refused. An index read without its compiled part (lean.export off) has none:
-// required refuses it; else it is accepted, and its compiled answers are empty.
+// join two commits' rows, so it is refused. A refresh that reads the compiled part records that the index owes
+// one, so a first compiled step that never wrote anything is refused too, rather than answered as an index read
+// without a compiled part. An index that owes none (lean.export off) has none: required refuses it; else it is
+// accepted, and its compiled answers are empty.
 func (s *Store) CompiledCommit(ctx context.Context, required bool) (string, error) {
 	commit, err := s.Meta(ctx, "commit")
 	if err != nil {
@@ -471,8 +473,16 @@ func (s *Store) CompiledCommit(ctx context.Context, required bool) (string, erro
 	if err != nil {
 		return "", err
 	}
+	owed, err := s.Meta(ctx, "compiled_owed")
+	if err != nil {
+		return "", err
+	}
 	switch {
-	case compiled == commit, compiled == "" && !required:
+	case compiled == commit:
+		return commit, nil
+	case compiled == "" && owed == "1":
+		return "", fmt.Errorf("the index's refresh of %s read no compiled part: its compiled step did not finish, so the index states no fact; refresh the index", commit)
+	case compiled == "" && !required:
 		return commit, nil
 	case compiled == "":
 		return "", errors.New("the index was read without its compiled part: refresh it with lean.export on")

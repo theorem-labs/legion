@@ -3,6 +3,7 @@ package declindex
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"github.com/jackc/pgx/v5"
 	"io"
 	"net"
@@ -215,5 +216,30 @@ func TestAWriteTransactionHoldsTheIndexLockUntilItCommits(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the second write did not run after the first transaction committed")
+	}
+}
+
+// A refresh with lean.export whose compiled step never finishes leaves an index with no compiled part at all,
+// not one of an earlier commit: states and same would then answer that nothing states a concept, which a caller
+// cannot tell from an index that is complete. Such an index is refused, and the refusal names what to run. The
+// acceptance tester met this on the shared server, where the first compiled step of a new index failed.
+func TestAnIndexWhoseFirstCompiledStepFailedIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := refreshed(t, goldenTree(t))
+	if _, err := s.CompiledCommit(ctx, false); err != nil {
+		t.Fatalf("an index read without a compiled part (lean.export off): %v", err)
+	}
+	// A refresh that reads the compiled part and fails there: its reference part commits, its compiled part
+	// never does.
+	compiled := func(context.Context) (*CompiledOptions, error) { return nil, errors.New("no toolchain here") }
+	if _, err := s.Refresh(ctx, goldenTree(t), RefreshOptions{Commit: "beef", Compiled: compiled}); err == nil {
+		t.Fatal("a refresh whose compiled step failed reported no error")
+	}
+	got, err := s.CompiledCommit(ctx, false)
+	if err == nil {
+		t.Fatalf("an index whose compiled step never wrote a compiled part was accepted at %q", got)
+	}
+	if !strings.Contains(err.Error(), "no compiled part") {
+		t.Errorf("the refusal does not say that the compiled part is missing: %v", err)
 	}
 }

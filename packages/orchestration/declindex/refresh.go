@@ -270,7 +270,17 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, opt RefreshOptions
 		if err := reresolveOwners(ctx, tx, r, before, opt.Log); err != nil {
 			return err
 		}
-		return s.writeMeta(ctx, tx, r, opt.Commit, st.Unreadable)
+		if err := s.writeMeta(ctx, tx, r, opt.Commit, st.Unreadable); err != nil {
+			return err
+		}
+		// What this refresh owes: with lean.export it reads the compiled part next, in a second
+		// transaction. A reader between them, or after a compiled step that failed, must be told that the
+		// compiled part is missing, also when the index never had one (compiled_commit is then empty).
+		owed := ""
+		if opt.Compiled != nil {
+			owed = "1"
+		}
+		return setMeta(ctx, tx, "compiled_owed", owed)
 	}); err != nil {
 		return st, err
 	}
