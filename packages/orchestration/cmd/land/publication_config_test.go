@@ -22,7 +22,7 @@ func publicationConfig(t *testing.T) config {
 		Build:       []string{"sh", "-c", "true"},
 		Hasher:      []string{"sh", "-c", "true"},
 		Toolchain:   []string{"sh", "-c", "printf tool"},
-		Escalations: escalations{Owner: "landing-operator"},
+		Escalations: escalationsConfig{Owner: "landing-operator"},
 		Ledger:      ledgerConfig{DSNFile: dsnFile},
 		GitHub:      githubConfig{Remote: "origin"},
 	}
@@ -45,41 +45,35 @@ func buildProgram(t *testing.T, cfg config) (program, error) {
 	return built, err
 }
 
-func TestReviewConfiguredPublicationWiresScoreAndEvents(t *testing.T) {
+func TestReviewConfiguredPublicationWiresTheMemberEvent(t *testing.T) {
 	cfg := publicationConfig(t)
-	cfg.Score = scoreConfig{Command: []string{"sh", "-c", "printf score"}, Commit: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}, Path: "scores/out"}
 	cfg.Event = eventConfig{Command: []string{"sh", "-c", "true"}, Status: []string{"sh", "-c", "printf '{\"complete\":false}'"}}
 	built, err := buildProgram(t, withLedger(t, cfg))
 	if err != nil {
 		t.Fatalf("program() error = %v", err)
 	}
 	runner := built.runner
-	if runner.GitHub == nil || runner.Score == nil || runner.Events == nil {
-		t.Fatalf("publication dependencies = GitHub:%T Score:%T Events:%T, want all configured", runner.GitHub, runner.Score, runner.Events)
+	if runner.GitHub == nil || runner.Events == nil {
+		t.Fatalf("publication dependencies = GitHub:%T Events:%T, want both configured", runner.GitHub, runner.Events)
 	}
 }
 
-// With GitHub publication configured, the score and the event are optional:
-// without them the program publishes no score status and runs no member
-// event, and the ledger's migration.landed is the record.
-func TestConfiguredPublicationStartsWithoutScoreOrEvent(t *testing.T) {
+// With GitHub publication configured, the member event is optional: without
+// it the program runs no member event, and the ledger's migration.landed is
+// the record. The score is a post-landing hook like any other.
+func TestConfiguredPublicationStartsWithoutTheMemberEvent(t *testing.T) {
 	built, err := buildProgram(t, withLedger(t, publicationConfig(t)))
 	if err != nil {
 		t.Fatalf("program() error = %v", err)
 	}
 	runner := built.runner
-	if runner.GitHub == nil || runner.Score != nil || runner.Events != nil {
-		t.Fatalf("publication dependencies = GitHub:%T Score:%T Events:%T, want GitHub only", runner.GitHub, runner.Score, runner.Events)
+	if runner.GitHub == nil || runner.Events != nil {
+		t.Fatalf("publication dependencies = GitHub:%T Events:%T, want GitHub only", runner.GitHub, runner.Events)
 	}
 }
 
-// A partly configured score or event is refused rather than run half-wired.
-func TestConfiguredPublicationRefusesPartialScoreOrEvent(t *testing.T) {
-	score := publicationConfig(t)
-	score.Score = scoreConfig{Command: []string{"sh", "-c", "printf score"}}
-	if _, err := buildProgram(t, score); err == nil || !strings.Contains(err.Error(), "score") {
-		t.Fatalf("runner() error = %v, want the incomplete score refused", err)
-	}
+// A partly configured member event is refused rather than run half-wired.
+func TestConfiguredPublicationRefusesAPartialMemberEvent(t *testing.T) {
 	event := publicationConfig(t)
 	event.Event = eventConfig{Command: []string{"sh", "-c", "true"}}
 	if _, err := buildProgram(t, event); err == nil || !strings.Contains(err.Error(), "event") {

@@ -67,10 +67,6 @@ func (l *readyLedger) EndWithdraw(_ context.Context, _, batch string) error {
 	*l.touched = append(*l.touched, "withdrawn "+batch)
 	return nil
 }
-func (l *readyLedger) EffectDone(_ context.Context, _, batch, key string, _ []byte) error {
-	*l.touched = append(*l.touched, "effect "+batch+" "+key)
-	return nil
-}
 func (l *readyLedger) ReadyMembers(context.Context, string) ([]Member, error) {
 	return cloneMembers(l.ready), nil
 }

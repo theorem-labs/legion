@@ -138,6 +138,12 @@ type HashInput struct {
 	Names          []string
 }
 
+// Commit is the shape of one commit in the repository: the tree it holds and its parents, in their order.
+type Commit struct {
+	Tree    string
+	Parents []string
+}
+
 // StatementHash is one name's statement at a tree and the paths that declare
 // it. No path means the name is absent, with the empty hash; more than one
 // path means the name is ambiguous, and its hash cannot be used.
@@ -173,6 +179,12 @@ type Git interface {
 	ChangeSet(context.Context, string, string, Member) (gitx.Change, error)
 	DeclarationEvidence(context.Context, string, string, Member, blame.InstanceNames) (blame.Evidence, error)
 	TreeDeclarations(context.Context, string, Tree) ([]blame.Declaration, error)
+	// ReadCommit reads a commit's tree and parents.
+	ReadCommit(context.Context, string, string) (Commit, error)
+	// MergeTree merges two commits without a working copy and is the tree the merge writes. A conflict is an error.
+	MergeTree(context.Context, string, string, string) (string, error)
+	// Ancestor reports whether the first commit is an ancestor of the second.
+	Ancestor(context.Context, string, string, string) (bool, error)
 }
 
 // CheckInput is what a configured check reads: the candidate tree and the
@@ -289,6 +301,9 @@ type Member struct {
 	ReviewedHead       string            `json:"reviewedHead"`
 	CompatibilityProof string            `json:"compatibilityProof"`
 	ApprovedPinned     []string          `json:"approvedPinned"`
+	// Upstream is the commit that an upstream sync carries, from the member's ready record, and is empty for an
+	// ordinary migration. The program verifies the member's head against it before the ledger checks the member.
+	Upstream string `json:"upstream"`
 }
 
 // DroppedMember records why a frozen member left the candidate.
@@ -475,19 +490,33 @@ type Runner struct {
 	Hasher       Hasher
 	Git          Git
 	GitHub       GitHub
-	Score        Scorer
 	Events       EventPublisher
-	ScorePath    string
 	Checks       []Checker
 	ModuleRoots  []string
 	MaxRounds    int
 	InfraRetries int
 	ConfigDigest string
-	Toolchain    func(context.Context, Tree) (string, error)
+	// Effects is the ledger's log of a landing's effects, which every executor writes through.
+	Effects EffectLog
+	// Containers runs each hook on the build VM, and Trees gives it the landed commit's worktree.
+	Containers ContainerRunner
+	Trees      LandedTrees
+	// Scores is the remote score ref a score apply reads and pushes, and Defects publishes a hook's defect.
+	Scores  ScoreStore
+	Defects DefectPublisher
+	// PostLanding is the configured, ordered list of hooks and the parts they run for, which admission freezes
+	// into the batch's record.
+	PostLanding PostLanding
+	// Container is the image, user and declared mounts that a frozen hook definition copies.
+	Container Container
+	// Librarian is the argv that a contracts apply's deliveries run.
+	Librarian []string
+	Toolchain func(context.Context, Tree) (string, error)
 	// EscalateTo is the escalations owner. A step that is retried (a hasher
-	// exit 75) is escalated to it when its attempts reach EscalateAfter
-	// (default 10). RetryBackoff is the first wait between attempts (default
-	// 10 seconds); each wait doubles, up to five minutes.
+	// exit 75, a hook, an apply, a publication or a delivery) is escalated to
+	// it when its attempts reach EscalateAfter (default 10). RetryBackoff is
+	// the first wait between attempts (default 10 seconds); each wait doubles,
+	// up to five minutes.
 	EscalateTo    string
 	EscalateAfter int
 	RetryBackoff  time.Duration
@@ -576,7 +605,20 @@ func (r Runner) advance(ctx context.Context, batch *Batch) (Batch, error) {
 		if batch.State.terminal() {
 			return *batch, nil
 		}
-		returned, err := r.deferredCheck(ctx, batch)
+		returned, err := r.checkUpstream(ctx, batch)
+		if err != nil {
+			if r.reloaded(ctx, batch, err) {
+				return *batch, nil
+			}
+			return r.fail(ctx, batch, "upstream")
+		}
+		if batch.State.terminal() {
+			return *batch, nil
+		}
+		if returned {
+			continue
+		}
+		returned, err = r.deferredCheck(ctx, batch)
 		if err != nil {
 			if r.reloaded(ctx, batch, err) {
 				return *batch, nil

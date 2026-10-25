@@ -52,7 +52,13 @@ func (l *Ledger) Admit(ctx context.Context, batch *landing.Batch, members []land
 	if err != nil {
 		return refusal(err)
 	}
-	apply(batch, admitted)
+	// A replayed admission (a retry after a lost response) returns the record the ledger stored, which the runner
+	// adopts: its next save carries the admitted effects and never a list rebuilt from a changed configuration.
+	stored, err := decode(admitted)
+	if err != nil {
+		return err
+	}
+	*batch = stored
 	return nil
 }
 
@@ -134,19 +140,6 @@ func (l *Ledger) EndWithdraw(ctx context.Context, repo, batch string) error {
 	return nil
 }
 
-// EffectDone records a post-landing effect done with result. A repeat finds it done and succeeds.
-func (l *Ledger) EffectDone(ctx context.Context, repo, batch, key string, result []byte) error {
-	_, err := l.ledger.BatchEffectDone(ctx, repo, batch, key, ledger.DoneRequest{Result: result})
-	var refused *ledger.Refusal
-	if errors.As(err, &refused) && refused.Reason == ledger.ReasonEffectDone {
-		return nil
-	}
-	if err != nil {
-		return refusal(err)
-	}
-	return nil
-}
-
 // ReadyMembers lists the repository's ready migrations, in the order their ready records were published, each as the
 // member a batch freezes from it.
 func (l *Ledger) ReadyMembers(ctx context.Context, repo string) ([]landing.Member, error) {
@@ -163,6 +156,7 @@ func (l *Ledger) ReadyMembers(ctx context.Context, repo string) ([]landing.Membe
 			ReadyEvent:       record.ReadyEvent,
 			ChangedContracts: record.ChangedContracts,
 			ApprovedPinned:   record.ApprovedPinned,
+			Upstream:         record.Upstream,
 		})
 	}
 	return members, nil

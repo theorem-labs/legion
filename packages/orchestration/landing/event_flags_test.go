@@ -20,7 +20,9 @@ func TestLandingEventCarriesTheMemberFlags(t *testing.T) {
 			t.Setenv("WANT", test.want)
 			github := &githubFake{wait: PullRequest{Number: 7, Head: "candidate", MergedCommit: "merged", State: PullRequestMerged}}
 			ledger := &ledgerFake{}
-			runner := Runner{Store: &storeFake{}, Ledger: ledger, Admission: &batchLedgerFake{ledger: ledger}, GitHub: github,
+			effects := newEffectLog()
+			runner := Runner{Store: &storeFake{}, Ledger: ledger, Admission: &batchLedgerFake{ledger: ledger, effects: effects},
+				Effects: effects, GitHub: github,
 				Events: CommandEvents{Command: []string{"sh", "-c", `test "$LAND_FLAGS" = "$WANT"`}}}
 			batch := greenBatch()
 			batch.FrozenMembers = []Member{member(test.member)}

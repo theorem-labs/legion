@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +44,9 @@ type usageError struct{ error }
 func (e usageError) Unwrap() error { return e.error }
 
 func run(ctx context.Context, args []string, output io.Writer) error {
+	if err := requireGit(ctx); err != nil {
+		return err
+	}
 	if len(args) == 0 {
 		return usageError{fmt.Errorf("usage: land <run|serve|status|blame|check|replay>")}
 	}
@@ -58,6 +62,51 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	default:
 		return usageError{fmt.Errorf("unknown command %q", args[0])}
 	}
+}
+
+// minimumGitMajor and minimumGitMinor are the oldest git the program runs on. Its merge-tree writes the tree of a
+// merge, which is how the program confirms an upstream sync's head.
+const (
+	minimumGitMajor = 2
+	minimumGitMinor = 38
+)
+
+// requireGit refuses a git older than 2.38 before any command reads a repository.
+func requireGit(ctx context.Context) error {
+	output, err := exec.CommandContext(ctx, "git", "--version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git --version: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	major, minor, err := gitVersion(string(output))
+	if err != nil {
+		return err
+	}
+	if major < minimumGitMajor || (major == minimumGitMajor && minor < minimumGitMinor) {
+		return fmt.Errorf("git %d.%d is too old: land needs git %d.%d or later, whose merge-tree writes the tree of a merge",
+			major, minor, minimumGitMajor, minimumGitMinor)
+	}
+	return nil
+}
+
+// gitVersion reads the major and minor version from the line `git --version` prints.
+func gitVersion(line string) (int, int, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 || fields[0] != "git" || fields[1] != "version" {
+		return 0, 0, fmt.Errorf("git --version printed %q, which names no version", strings.TrimSpace(line))
+	}
+	parts := strings.SplitN(fields[2], ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("git --version printed version %q, which has no major and minor part", fields[2])
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("git --version printed version %q: %w", fields[2], err)
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("git --version printed version %q: %w", fields[2], err)
+	}
+	return major, minor, nil
 }
 
 func runBatchCommand(ctx context.Context, command string, args []string, output io.Writer) error {
@@ -149,40 +198,36 @@ func attestMergeGroups(ctx context.Context, runner landing.Runner, queue landing
 }
 
 type config struct {
-	BatchID      string           `json:"batchId"`
-	Repository   repositoryConfig `json:"repository"`
-	Base         string           `json:"base"`
-	BaseBranch   string           `json:"baseBranch"`
-	Members      []landing.Member `json:"members"`
-	Build        []string         `json:"build"`
-	Hasher       []string         `json:"hasher"`
-	Checks       []checkConfig    `json:"checks"`
-	Ledger       ledgerConfig     `json:"ledger"`
-	Publishing   publishingConfig `json:"publishing"`
-	Toolchain    []string         `json:"toolchain"`
-	Score        scoreConfig      `json:"score"`
-	Event        eventConfig      `json:"event"`
-	ModuleRoots  []string         `json:"moduleRoots"`
-	MaxRounds    int              `json:"maxRounds"`
-	InfraRetries int              `json:"infraRetries"`
-	Interval     time.Duration    `json:"interval"`
-	GitHub       githubConfig     `json:"github"`
-	Escalations  escalations      `json:"escalations"`
-	Effects      effectsConfig    `json:"effects"`
-	Digest       string           `json:"-"`
+	BatchID      string              `json:"batchId"`
+	Repository   repositoryConfig    `json:"repository"`
+	Base         string              `json:"base"`
+	BaseBranch   string              `json:"baseBranch"`
+	Members      []landing.Member    `json:"members"`
+	Build        []string            `json:"build"`
+	Hasher       []string            `json:"hasher"`
+	Checks       []checkConfig       `json:"checks"`
+	Ledger       ledgerConfig        `json:"ledger"`
+	Publishing   publishingConfig    `json:"publishing"`
+	Toolchain    []string            `json:"toolchain"`
+	Event        eventConfig         `json:"event"`
+	Container    containerConfig     `json:"container"`
+	PostLanding  landing.PostLanding `json:"post_landing"`
+	Librarian    librarianConfig     `json:"librarian"`
+	Publish      publishConfig       `json:"publish"`
+	ModuleRoots  []string            `json:"moduleRoots"`
+	MaxRounds    int                 `json:"maxRounds"`
+	InfraRetries int                 `json:"infraRetries"`
+	Interval     time.Duration       `json:"interval"`
+	GitHub       githubConfig        `json:"github"`
+	Escalations  escalationsConfig   `json:"escalations"`
+	Effects      effectsConfig       `json:"effects"`
+	Digest       string              `json:"-"`
 }
 
-// escalations names the owner for whom every escalation of the program is
+// escalationsConfig names the owner for whom every escalation of the program is
 // enqueued.
-type escalations struct {
+type escalationsConfig struct {
 	Owner string `json:"owner"`
-}
-
-// effectsConfig is the attempt threshold for a retried step (default 10) and
-// the first wait between its attempts (default 10s).
-type effectsConfig struct {
-	EscalateAfter int           `json:"escalate_after"`
-	Backoff       time.Duration `json:"backoff"`
 }
 
 type checkConfig struct {
@@ -243,11 +288,46 @@ type githubConfig struct {
 	PollInterval time.Duration `json:"pollInterval"`
 }
 
-type scoreConfig struct {
+// containerConfig is the container boundary every command that reads candidate or landed content runs behind: the
+// image pinned by digest, the uid:gid of the VM user that owns the mounted paths, and the named mounts a hook, a
+// build or the hasher may be given.
+type containerConfig struct {
+	Image  string        `json:"image"`
+	User   string        `json:"user"`
+	Mounts []mountConfig `json:"mounts"`
+}
+
+// mountConfig declares one named path of the build VM, mounted at that same path inside a container.
+type mountConfig struct {
+	Name     string `json:"name"`
+	HostPath string `json:"host_path"`
+}
+
+// publishConfig is the argv that a hook defect is published with, for a hook that names a topic.
+type publishConfig struct {
 	Command []string `json:"command"`
-	Commit  []string `json:"commit"`
-	Status  []string `json:"status"`
-	Path    string   `json:"path"`
+}
+
+// librarianConfig is the argv that each near pair of a contracts apply is delivered with.
+type librarianConfig struct {
+	Command []string `json:"command"`
+}
+
+// effectsConfig is the attempt threshold at which a retried effect is escalated (default 10) and the first wait
+// between two of its attempts (default 10 seconds).
+type effectsConfig struct {
+	EscalateAfter int           `json:"escalate_after"`
+	Backoff       time.Duration `json:"backoff"`
+}
+
+// container is the part of the container configuration that a frozen hook definition copies, with the declared
+// mounts by name.
+func (c config) container() landing.Container {
+	mounts := make(map[string]landing.Mount, len(c.Container.Mounts))
+	for _, mount := range c.Container.Mounts {
+		mounts[mount.Name] = landing.Mount{Name: mount.Name, HostPath: mount.HostPath}
+	}
+	return landing.Container{Image: c.Container.Image, User: c.Container.User, GitDir: c.Repository.GitDir, Mounts: mounts}
 }
 
 type eventConfig struct {
@@ -319,6 +399,13 @@ func (c config) program(ctx context.Context) (program, error) {
 		input: landing.Input{ID: c.BatchID, Repository: c.Repository.Name, Base: c.Base, BaseBranch: c.BaseBranch, Members: c.Members},
 		close: func() {},
 	}
+	container := c.container()
+	if err := c.PostLanding.Validate(container.Mounts); err != nil {
+		return program{}, err
+	}
+	if len(c.PostLanding.Hooks) != 0 && strings.TrimSpace(c.Escalations.Owner) == "" {
+		return program{}, fmt.Errorf("escalations.owner is required: the ledger enqueues every escalation for it")
+	}
 	runner := landing.Runner{
 		Builder:              landing.CommandBuilder{RepositoryPath: path, Command: c.Build},
 		Hasher:               landing.CommandHasher{Command: c.Hasher, Directory: path},
@@ -327,27 +414,26 @@ func (c config) program(ctx context.Context) (program, error) {
 		MaxRounds:            c.MaxRounds,
 		InfraRetries:         c.InfraRetries,
 		ConfigDigest:         c.Digest,
-		Toolchain:            commandToolchain(path, c.Toolchain),
+		PublishingRetryLimit: c.Publishing.RetryLimit,
 		EscalateTo:           strings.TrimSpace(c.Escalations.Owner),
 		EscalateAfter:        c.Effects.EscalateAfter,
 		RetryBackoff:         c.Effects.Backoff,
-		PublishingRetryLimit: c.Publishing.RetryLimit,
+		PostLanding:          c.PostLanding,
+		Container:            container,
+		Librarian:            c.Librarian.Command,
+		Scores:               landing.RepositoryScore{Path: path},
+		Toolchain:            commandToolchain(path, c.Toolchain),
 	}
 	runner.Checks = c.checkers()
+	if len(c.Publish.Command) != 0 {
+		runner.Defects = landing.CommandDefects{Directory: path, Command: c.Publish.Command}
+	}
 	if publishing {
 		github := landing.GitHubCLI{RepositoryPath: path, Remote: c.GitHub.Remote, Executable: c.GitHub.Executable, PollInterval: c.GitHub.PollInterval}
 		runner.GitHub = github
 		out.queue = github
-		// The score and the member event are optional: without them the
-		// program publishes no score status and runs no event, and the
-		// ledger's migration.landed is the record. A partial one is refused.
-		if score := c.Score; len(score.Command) != 0 || len(score.Commit) != 0 || len(score.Status) != 0 || score.Path != "" {
-			if len(score.Command) == 0 || len(score.Commit) == 0 || len(score.Status) == 0 || score.Path == "" {
-				return program{}, fmt.Errorf("score needs command, commit, status, and path")
-			}
-			runner.Score = landing.CommandScorer{Directory: path, ScoreCommand: score.Command, CommitCommand: score.Commit, StatusCommand: score.Status}
-			runner.ScorePath = score.Path
-		}
+		// The member event is optional: without it no member event runs, and the ledger's migration.landed is the
+		// record. A partial one is refused. The score is a post-landing hook like any other.
 		if event := c.Event; len(event.Command) != 0 || len(event.Status) != 0 {
 			if len(event.Command) == 0 || len(event.Status) == 0 {
 				return program{}, fmt.Errorf("event needs command and status")
@@ -372,6 +458,7 @@ func (c config) program(ctx context.Context) (program, error) {
 	runner.Store = batches
 	runner.Ledger = calls
 	runner.Admission = calls
+	runner.Effects = calls
 	out.list = batches.ListActive
 	out.close = store.Close
 	out.runner = runner

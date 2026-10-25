@@ -17,9 +17,11 @@ type batchLedgerFake struct {
 	landings  []string
 	declines  []declined
 	withdraws []string
-	done      []string
-	refuse    error
-	landErr   error
+	// effects, when set, receives one intent per entry of the landed record, as the landing's own transaction
+	// records them.
+	effects *effectLogFake
+	refuse  error
+	landErr error
 }
 
 // lander is a member ledger fake that records a landing.
@@ -81,6 +83,9 @@ func (f *batchLedgerFake) LandBatch(_ context.Context, batch *Batch, mergedCommi
 	batch.PendingEffects = nil
 	for _, effect := range batch.PostLandEffects {
 		batch.PendingEffects = append(batch.PendingEffects, effect.Key)
+		if f.effects != nil {
+			f.effects.create(effect.Key, effect.Op, "", effect.Member, map[string]any{"commit": mergedCommit})
+		}
 	}
 	slices.Sort(batch.PendingEffects)
 	return f.write(batch)
@@ -98,11 +103,6 @@ func (f *batchLedgerFake) BeginWithdraw(_ context.Context, _, batch string) erro
 }
 
 func (f *batchLedgerFake) EndWithdraw(context.Context, string, string) error { return nil }
-
-func (f *batchLedgerFake) EffectDone(_ context.Context, _, _, key string, _ []byte) error {
-	f.done = append(f.done, key)
-	return nil
-}
 
 func (f *batchLedgerFake) ReadyMembers(context.Context, string) ([]Member, error) { return nil, nil }
 
