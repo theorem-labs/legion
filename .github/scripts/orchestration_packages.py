@@ -5,17 +5,23 @@ they change and every package whose build or tests depend on one of them.
 Usage: .github/scripts/orchestration_packages.py <base> <head>
 Run from the repository root. It prints one import path per line, sorted, and nothing when the
 commits change no package. It prints every package of the module when it cannot tell what changed:
-an empty base, a base that is not an ancestor of head (a force push), or a change to go.mod, go.sum,
-the workflow that runs it, or this script.
+an empty base, a base that is not an ancestor of head (a force push), a changed file inside the
+module that belongs to no package at head (a deleted or moved package, whose old importers it cannot
+name), or a change to what the module builds against (its go.mod or go.sum, the root go.work or
+go.work.sum, any other workspace module's go.mod or go.sum) or to the workflow, this script or its
+test.
 
 A package depends on another through its imports, its test imports, and any directory that a test
-file names as a relative path literal and that holds a package of the module (a test that runs
-`go build ../cmd/ledger` depends on cmd/ledger without importing it). The dependency is transitive.
+file names as a relative path and that holds a package of the module: a literal such as
+"../cmd/ledger", or a filepath.Join of string literals that starts with "." or "..". A test that
+runs `go build ../cmd/ledger` depends on cmd/ledger without importing it. The dependency is
+transitive.
 
 The orchestration-branches workflow runs it (.github/workflows/orchestration-branches.yaml), and
 orchestration_packages.test.sh tests it.
 """
 
+import fnmatch
 import json
 import re
 import subprocess
@@ -23,15 +29,23 @@ import sys
 from pathlib import Path
 
 MODULE_DIR = Path("packages/orchestration")
-# A change to any of these can change the result of every package, so it selects them all.
-WHOLE_MODULE = {
-    "packages/orchestration/go.mod",
-    "packages/orchestration/go.sum",
+# A change to any of these can change the result of every package, so it selects them all. The
+# workspace files are here because CI builds the module inside the root go.work, where every
+# workspace module's requirements choose the versions it compiles against.
+WHOLE_MODULE = (
+    "go.work",
+    "go.work.sum",
+    "packages/*/go.mod",
+    "packages/*/go.sum",
     ".github/workflows/orchestration-branches.yaml",
     ".github/scripts/orchestration_packages.py",
     ".github/scripts/orchestration_packages.test.sh",
-}
+    ".github/scripts/test-lib.sh",
+)
 RELATIVE_LITERAL = re.compile(r'"(\.\.?/[^"\s]*)"')
+# filepath.Join("..", "cmd", "ledger"): string literals only, the first "." or "..".
+RELATIVE_JOIN = re.compile(r'filepath\.Join\(\s*("\.\.?"(?:\s*,\s*"[^"\s]*")*)\s*[,)]')
+JOIN_PART = re.compile(r'"([^"]*)"')
 
 
 def git(*args: str) -> subprocess.CompletedProcess:
@@ -68,11 +82,18 @@ def dependencies(package: dict, by_dir: dict[str, str]) -> set[str]:
     found = set(package.get("Imports", [])) | set(package.get("TestImports", [])) | set(package.get("XTestImports", []))
     directory = Path(package["Dir"])
     for name in package.get("TestGoFiles", []) + package.get("XTestGoFiles", []):
-        for literal in RELATIVE_LITERAL.findall((directory / name).read_text(errors="replace")):
-            target = str((directory / literal).resolve())
+        source = (directory / name).read_text(errors="replace")
+        paths = RELATIVE_LITERAL.findall(source)
+        paths += ["/".join(JOIN_PART.findall(arguments)) for arguments in RELATIVE_JOIN.findall(source)]
+        for path in paths:
+            target = str((directory / path).resolve())
             if target in by_dir:
                 found.add(by_dir[target])
     return found
+
+
+def whole_module(path: str) -> bool:
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in WHOLE_MODULE)
 
 
 def owner(path: str, by_dir: dict[str, str], root: Path) -> str | None:
@@ -89,11 +110,15 @@ def select(base: str, head: str) -> list[str]:
     listed = packages()
     every = {package["ImportPath"] for package in listed}
     changed = changed_files(base, head)
-    if changed is None or any(path in WHOLE_MODULE for path in changed):
+    if changed is None or any(whole_module(path) for path in changed):
         return sorted(every)
     by_dir = {str(Path(package["Dir"]).resolve()): package["ImportPath"] for package in listed}
     root = MODULE_DIR.resolve()
-    selected = {found for path in changed if (found := owner(path, by_dir, root))}
+    inside = [path for path in changed if path.startswith(f"{MODULE_DIR.as_posix()}/")]
+    owners = [owner(path, by_dir, root) for path in inside]
+    if None in owners:
+        return sorted(every)
+    selected = set(owners)
     direct = {package["ImportPath"]: dependencies(package, by_dir) & every for package in listed}
     grew = True
     while grew:

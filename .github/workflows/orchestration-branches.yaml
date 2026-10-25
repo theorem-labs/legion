@@ -4,19 +4,40 @@ name: orchestration-branches
 # branches): gofmt, go vet and go test on the packages of packages/orchestration that the push can
 # break, so the agents that share a branch read one result instead of each running the suite after
 # every peer's push. Read it with:
-#   gh run list -R theorem-labs/legion --branch <branch> --workflow orchestration-branches --limit 1
+#   gh run list -R theorem-labs/legion --branch <branch> --workflow orchestration-branches \
+#     --limit 1 --json headSha,status,conclusion,url
+# The run is about your tree only when its headSha is `git rev-parse origin/<branch>`: a push outside
+# the paths below starts no run, and a newer push cancels an older run.
 #
-# A branch with an open pull request is tested by pr-and-main.yaml on that pull request, so here its
-# run tests nothing and is cancelled, which no reader takes for a pass.
+# A branch with an open pull request that can merge is tested by pr-and-main.yaml on that pull
+# request, so here its run tests nothing and ends cancelled (or failed, if the cancel does not land),
+# never as a pass. A pull request that conflicts with main cannot be tested there, so its branch is
+# tested here.
+#
+# On a pull request that changes the package selection, the selection's own test runs here too: it
+# is the one part of this workflow that pr-and-main.yaml does not run.
 on:
   push:
     branches:
       - "orchestration-*"
     paths:
       - "packages/orchestration/**"
+      # CI builds the module inside the root go.work, where every workspace module's requirements
+      # choose the versions it compiles against.
+      - "go.work"
+      - "go.work.sum"
+      - "packages/*/go.mod"
+      - "packages/*/go.sum"
       - ".github/workflows/orchestration-branches.yaml"
       - ".github/scripts/orchestration_packages.py"
       - ".github/scripts/orchestration_packages.test.sh"
+      - ".github/scripts/test-lib.sh"
+  pull_request:
+    paths:
+      - ".github/workflows/orchestration-branches.yaml"
+      - ".github/scripts/orchestration_packages.py"
+      - ".github/scripts/orchestration_packages.test.sh"
+      - ".github/scripts/test-lib.sh"
 
 # A newer push to the branch cancels the older run. The next run then tests every change since the
 # branch's last passing run, so a cancelled push is never left untested.
@@ -28,9 +49,26 @@ permissions:
   contents: read
 
 jobs:
+  # The package selection's test, on a pull request that changes it.
+  selection:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: packages/orchestration/go.mod
+          cache: false
+      - name: Test the package selection
+        run: .github/scripts/orchestration_packages.test.sh
+
   # Runs no repository code: it reads the branch's pull requests and runs, and cancels this run when a
-  # pull request already tests the branch.
+  # pull request that can merge already tests the branch.
   decide:
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -47,13 +85,19 @@ jobs:
           BRANCH: ${{ github.ref_name }}
           WORKFLOW: ${{ github.workflow }}
         run: |
-          pull_request=$(gh pr list -R "$REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          pull_request=$(gh pr list -R "$REPOSITORY" --head "$BRANCH" --state open --json number,mergeable \
+            --jq '[.[] | select(.mergeable != "CONFLICTING")][0].number // empty')
           base=$(gh run list -R "$REPOSITORY" --workflow "$WORKFLOW" --branch "$BRANCH" --status success --limit 1 --json headSha --jq '.[0].headSha // empty')
           echo "pull_request=$pull_request" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
           if [ -n "$pull_request" ]; then
             echo "::notice::Pull request #$pull_request tests this branch (pr-and-main.yaml); this run is cancelled."
             gh run cancel -R "$REPOSITORY" "$GITHUB_RUN_ID"
+            # The cancel is asynchronous. Until it lands, this job must not end, because a run whose
+            # test job is skipped would otherwise conclude as a pass.
+            sleep 240
+            echo "::error::The cancel did not land; this run fails so no reader takes it for a pass."
+            exit 1
           fi
 
   test:
@@ -133,3 +177,13 @@ jobs:
         run: |
           mapfile -t packages <<<"$PACKAGES"
           go test -count=1 "${packages[@]}"
+
+      # pr-and-main.yaml runs this module under the race detector too, so a push here does.
+      - name: Test the selected packages under the race detector
+        if: steps.select.outputs.packages != ''
+        working-directory: packages/orchestration
+        env:
+          PACKAGES: ${{ steps.select.outputs.packages }}
+        run: |
+          mapfile -t packages <<<"$PACKAGES"
+          go test -count=1 -race "${packages[@]}"

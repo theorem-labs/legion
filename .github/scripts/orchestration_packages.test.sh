@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests for `orchestration_packages.py`: which packages of packages/orchestration a range of commits
 # selects. Each case runs the real script in a miniature repository with a three-package module:
-# lib, app (imports lib) and cli, whose test builds ../app by a relative path and imports nothing.
+# lib, app (imports lib), cli, whose test builds ../app by a relative path literal, and tool, whose
+# test names ../cli with filepath.Join; neither test imports the package it names.
 #
 # Run from anywhere: .github/scripts/orchestration_packages.test.sh
 # CI runs it in the orchestration-branches workflow (job test).
@@ -18,7 +19,7 @@ source "$script_dir/test-lib.sh"
 
 repo="$work/repo"
 module="$repo/packages/orchestration"
-mkdir -p "$module/lib/testdata" "$module/app" "$module/cli" "$repo/docs"
+mkdir -p "$module/lib/testdata" "$module/app" "$module/cli" "$module/tool" "$repo/docs" "$repo/packages/other"
 git -C "$repo" init -q
 git -C "$repo" config user.email test@example.invalid
 git -C "$repo" config user.name Test
@@ -28,7 +29,12 @@ printf 'fixture\n' > "$module/lib/testdata/input.txt"
 printf 'package app\n\nimport "example.com/orch/lib"\n\nfunc Value() int { return lib.Value() }\n' > "$module/app/app.go"
 printf 'package cli\n' > "$module/cli/cli.go"
 printf 'package cli\n\nimport "testing"\n\nfunc TestBuild(t *testing.T) { _ = "../app" }\n' > "$module/cli/cli_test.go"
+printf 'package tool\n' > "$module/tool/tool.go"
+printf 'package tool\n\nimport (\n\t"path/filepath"\n\t"testing"\n)\n\nfunc TestBuild(t *testing.T) { _ = filepath.Join("..", "cli") }\n' > "$module/tool/tool_test.go"
 printf 'docs\n' > "$repo/docs/readme.md"
+printf 'notes\n' > "$module/NOTES.md"
+printf 'go 1.22\n\nuse ./packages/orchestration\n' > "$repo/go.work"
+printf 'module example.com/other\n\ngo 1.22\n' > "$repo/packages/other/go.mod"
 git -C "$repo" add -A
 git -C "$repo" commit -qm base
 base=$(git -C "$repo" rev-parse HEAD)
@@ -42,23 +48,29 @@ commit() {
 
 selected() { (cd "$repo" && "$select_script" "$1" "$2" | tr '\n' ' ' | sed 's/ $//'); }
 
-all="example.com/orch/app example.com/orch/cli example.com/orch/lib"
+all="example.com/orch/app example.com/orch/cli example.com/orch/lib example.com/orch/tool"
 
 head=$(commit docs/readme.md more)
 check "a change outside the module selects nothing" "$(is "$(selected "$base" "$head")" "")"
 
 base=$head
 head=$(commit packages/orchestration/lib/lib.go '// more')
-check "a change to lib selects lib, app (imports it) and cli (its test builds ../app)" \
+check "a change to lib selects lib, app (imports it), cli (its test builds ../app) and tool" \
   "$(is "$(selected "$base" "$head")" "$all")"
 
 base=$head
 head=$(commit packages/orchestration/app/app.go '// more')
-check "a change to app selects app and cli" "$(is "$(selected "$base" "$head")" "example.com/orch/app example.com/orch/cli")"
+check "a change to app selects app, cli and tool" \
+  "$(is "$(selected "$base" "$head")" "example.com/orch/app example.com/orch/cli example.com/orch/tool")"
 
 base=$head
 head=$(commit packages/orchestration/cli/cli.go '// more')
-check "a change to cli selects cli alone" "$(is "$(selected "$base" "$head")" "example.com/orch/cli")"
+check "a change to cli selects cli and tool (its test names ../cli with filepath.Join)" \
+  "$(is "$(selected "$base" "$head")" "example.com/orch/cli example.com/orch/tool")"
+
+base=$head
+head=$(commit packages/orchestration/tool/tool.go '// more')
+check "a change to tool selects tool alone" "$(is "$(selected "$base" "$head")" "example.com/orch/tool")"
 
 base=$head
 head=$(commit packages/orchestration/lib/testdata/input.txt more)
@@ -67,6 +79,27 @@ check "a testdata change selects its package and its dependents" "$(is "$(select
 base=$head
 head=$(commit packages/orchestration/go.mod '// more')
 check "a go.mod change selects every package" "$(is "$(selected "$base" "$head")" "$all")"
+
+base=$head
+head=$(commit go.work '// more')
+check "a go.work change selects every package" "$(is "$(selected "$base" "$head")" "$all")"
+
+base=$head
+head=$(commit packages/other/go.mod '// more')
+check "another workspace module's go.mod change selects every package" "$(is "$(selected "$base" "$head")" "$all")"
+
+base=$head
+head=$(commit packages/orchestration/NOTES.md more)
+check "a module file in no package selects every package" "$(is "$(selected "$base" "$head")" "$all")"
+
+base=$head
+git -C "$repo" rm -rq packages/orchestration/lib
+git -C "$repo" commit -qm "delete lib"
+head=$(git -C "$repo" rev-parse HEAD)
+remaining="example.com/orch/app example.com/orch/cli example.com/orch/tool"
+check "deleting a package selects every remaining package, its importers included" \
+  "$(is "$(selected "$base" "$head")" "$remaining")"
+git -C "$repo" reset -q --hard "$base"
 
 check "an empty base selects every package" "$(is "$(selected "" "$head")" "$all")"
 
