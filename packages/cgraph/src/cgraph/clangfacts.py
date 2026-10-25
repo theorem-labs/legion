@@ -4036,6 +4036,10 @@ class _FunctionWalk:
                         later.update(places)  # a computed goto may reach any label
                         later.add("*")
                     gotos += [(target, node.extent.start.offset) for target in targets]
+                elif node.kind == K.ASM_STMT:
+                    # An asm goto's labels, which libclang shows only as its tokens: one it names that is
+                    # already placed is reached from after it.
+                    gotos += [(target, node.extent.start.offset) for target in self.asm_labels(node)]
             later |= {target for target, offset in gotos if target in places and offset > places[target]}
             self.jumps = {"later": later}
         name = label.spelling

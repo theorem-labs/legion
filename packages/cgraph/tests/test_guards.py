@@ -1644,6 +1644,28 @@ def test_an_asm_goto_to_an_earlier_label_jumps_back(tmp_path: Path) -> None:
     assert "counter" in {item["unit"]["name"] for item in accesses if item["unit"]["kind"] == "global"}
 
 
+BACK_ASM = """
+    static inline void back(int x)
+    {
+        if (x)
+            goto after;
+    again:
+        warn();
+    after:
+        asm goto("j %l0" :::: again);
+        kept();
+    }
+    void back_one(void) { back(1); }
+"""
+
+
+def test_an_asm_goto_back_to_a_guarded_label_reaches_it(tmp_path: Path) -> None:
+    """`if (x) goto after; again: warn(); after: asm goto("j %l0" :::: again);`: back(1) jumps from the
+    asm to `again`, so warn() is compiled (clang-21 -O2 emits the backward jump and `call warn`)."""
+    facts = facts_of(tmp_path, BACK_ASM)
+    assert "warn" in {call["callee"] for call in fold(facts, "back_one", "back").calls}
+
+
 @pytest.mark.parametrize("function", ["vol_init", "vol_store", "vol_helper"])
 def test_a_volatile_local_is_read_each_time(tmp_path: Path, function: str) -> None:
     """A volatile local's read may give any value, so `if (x) warn();` is compiled after `x = 0` (clang-21
