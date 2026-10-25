@@ -1750,6 +1750,19 @@ def _is_inline(definition: ci.Cursor) -> bool:
     return libclang.is_function_inlined(definition)
 
 
+def _is_noinline(definition: ci.Cursor) -> bool:
+    """A definition marked ``noinline`` (the kernel's ``noinline``, ``__attribute__((noinline))``): the
+    compiler calls it, so its returns do not fold into the caller's code."""
+    body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
+    end = body.extent.start.offset if body is not None else None
+    for token in definition.get_tokens():
+        if end is not None and token.extent.start.offset >= end:
+            break
+        if token.spelling in ("noinline", "__noinline__", "__noinline"):
+            return True
+    return False
+
+
 def _is_noreturn(function: ci.Cursor | None) -> bool:
     """A function declared ``__noreturn`` (``__attribute__((noreturn))``: panic, do_exit)."""
     return function is not None and function.kind == K.FUNCTION_DECL and "noreturn" in function.type.spelling
@@ -2331,7 +2344,7 @@ class _Evaluator:
             # Too deep to fold here; a shallower use may still fold it, so nothing is kept.
             return (None, None)
         self.helpers[name] = (None, None)
-        if definition is None or self.weak(definition):
+        if definition is None or self.weak(definition) or _is_noinline(definition):
             return (None, None)
         body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
         returns = self.live_returns(body) if body is not None else []
@@ -2412,12 +2425,11 @@ class _Evaluator:
             assembled: set[int] = set()
             for node in function.walk_preorder():
                 if node.kind == K.ASM_STMT:
-                    # An asm's operands: one it writes ("=r", "+r") is a store the facts cannot state.
-                    assembled.update(
-                        part.referenced.hash
-                        for part in node.walk_preorder()
-                        if part.kind == K.DECL_REF_EXPR and part.referenced is not None
-                    )
+                    # An asm's operands: one it writes ("=r", "+r", "=m") is a store the facts cannot
+                    # state. A static declared before its definition is one variable under both hashes.
+                    for part in node.walk_preorder():
+                        if part.kind == K.DECL_REF_EXPR and part.referenced is not None:
+                            assembled.update({part.referenced.hash, part.referenced.canonical.hash})
                     continue
                 if node.kind not in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR, K.UNARY_OPERATOR):
                     continue
@@ -2784,7 +2796,7 @@ class _Evaluator:
             return self.templates[name]
         self.templates[name] = None
         definition = self.definitions.get(name)
-        if definition is None or self.weak(definition):
+        if definition is None or self.weak(definition) or _is_noinline(definition):
             return None
         typed = _integer_type(definition.result_type)
         body = next((child for child in _children(definition) if child.kind == K.COMPOUND_STMT), None)
