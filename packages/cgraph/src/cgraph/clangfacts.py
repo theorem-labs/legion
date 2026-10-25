@@ -1605,6 +1605,20 @@ def _kept_value(node: ci.Cursor) -> ci.Cursor | None:
     return inner
 
 
+def _kept_value_type(outer_type: ci.Type, inner_type: ci.Type) -> bool:
+    """A conversion from ``inner_type`` to ``outer_type`` keeps every value: the same type, an integer
+    type of the same signedness at least as wide, or a signed one wider than an unsigned one, never
+    _Bool."""
+    if outer_type.get_canonical().spelling == inner_type.get_canonical().spelling:
+        return True
+    outer, under = _integer_type(outer_type), _integer_type(inner_type)
+    if outer is None or under is None or outer.get("b"):
+        return False
+    same_sign = bool(outer["s"]) == bool(under["s"]) and outer["w"] >= under["w"]
+    widened = bool(outer["s"]) and not under["s"] and outer["w"] > under["w"]
+    return same_sign or widened
+
+
 def _continues(body: ci.Cursor) -> bool:
     """A ``continue`` of the loop whose body this is (not one of a loop inside it)."""
     pending = [body]
@@ -1637,6 +1651,9 @@ def _generic_callee(call: ci.Cursor) -> ci.Cursor | None:
 _IMAGE_DECIDES = frozenset({"__builtin_constant_p", "__builtin_object_size", "__builtin_dynamic_object_size"})
 _UNREACHABLE = frozenset({"__builtin_unreachable", "__builtin_trap"})
 _ENTRIES = (K.LABEL_STMT, K.CASE_STMT, K.DEFAULT_STMT)
+# The reasons for code no path reaches (a branch a constant rules out, statements after an exit): a
+# goto in code may still enter it at a label.
+_UNREACHED = frozenset({"dead_branch", "after_exit"})
 _EXITS = (K.RETURN_STMT, K.GOTO_STMT, K.BREAK_STMT, K.CONTINUE_STMT)
 _LOOP_EXITS = (K.BREAK_STMT, K.CONTINUE_STMT)
 _BRANCHES = (K.IF_STMT, K.CONDITIONAL_OPERATOR, K.SWITCH_STMT, K.WHILE_STMT, K.FOR_STMT, K.DO_STMT, K.GOTO_STMT)
@@ -1656,7 +1673,9 @@ _SHIFT_LEFT = 8
 
 def _shifted_out(node: ci.Cursor) -> bool:
     """``(x << a) << b`` whose constant counts add up to at least the bits of its type: every bit of
-    ``x`` is shifted out (fs/read_write.c pos_from_hilo's ``((loff_t)high << 32) << 32`` on rv64)."""
+    ``x`` is shifted out (fs/read_write.c pos_from_hilo's ``((loff_t)high << 32) << 32`` on rv64). An
+    integer conversion between the shifts keeps bits at their positions; one to _Bool or a non-integer
+    type does not, so the shifts are not added across it (``(_Bool)(x << 32) << 32`` keeps bit 32)."""
     if node.kind != K.BINARY_OPERATOR or libclang.binary_kind(node) != _SHIFT_LEFT:
         return False
     width: int = node.type.get_canonical().get_size() * 8
@@ -1667,7 +1686,12 @@ def _shifted_out(node: ci.Cursor) -> bool:
         if count is None or count < 0:
             return False
         total += count
-        node = _strip(operands[0])
+        node = _strip_parens(operands[0])
+        while node.kind in (K.UNEXPOSED_EXPR, K.CSTYLE_CAST_EXPR) and (below := _operand(node)) is not None:
+            typed = _integer_type(node.type)
+            if typed is None or typed.get("b"):
+                return False
+            node = _strip_parens(below)
     return width > 0 and total >= width
 
 
@@ -2020,13 +2044,15 @@ def _asm_statements(tokens: list[str]) -> Iterator[bool]:
 
 
 def _without_casts(expression: Any) -> Any:
-    """An expression without the casts to the width and signedness its operand already has."""
+    """An expression without the casts to the width and signedness its operand already has. A cast to
+    _Bool normalizes its operand to 0 or 1 and stays (bool_same_store's `(_Bool)n` against `n`)."""
     if not isinstance(expression, dict):
         return expression
     operands = [_without_casts(operand) for operand in expression.get("a", [])]
     if expression.get("op") == "cast" and len(operands) == 1 and isinstance(operands[0], dict):
         inner = operands[0]
-        if inner.get("w") == expression.get("w") and inner.get("s") == expression.get("s"):
+        same = all(inner.get(key) == expression.get(key) for key in ("w", "s", "b"))
+        if same:
             return inner
     return {**expression, "a": operands} if "a" in expression else expression
 
@@ -2121,16 +2147,18 @@ _ENDS: Any = object()
 @dataclass(frozen=True)
 class _Writes:
     """How a function writes its variables, by each one's hash: the values plain assignments store,
-    the ``|=``, ``&=`` and ``^=`` it makes (the operator and the value), and the variables it changes
-    otherwise (``+=``, ``++``) or whose address it takes."""
+    the ``|=``, ``&=`` and ``^=`` it makes (the operator and the value), the variables it changes
+    otherwise (``+=``, ``++``) or whose address it takes, and those an asm may write (an operand of
+    one, which the facts cannot read)."""
 
     stores: dict[int, list[ci.Cursor]]
     combined: dict[int, list[tuple[str, ci.Cursor]]]
     opaque: frozenset[int]
+    assembled: frozenset[int] = frozenset()
 
     def changed(self, key: int) -> bool:
         """Written other than by plain assignments."""
-        return key in self.opaque or key in self.combined
+        return key in self.opaque or key in self.combined or key in self.assembled
 
 
 @dataclass(frozen=True)
@@ -2381,7 +2409,16 @@ class _Evaluator:
             stores: dict[int, list[ci.Cursor]] = collections.defaultdict(list)
             combined: dict[int, list[tuple[str, ci.Cursor]]] = collections.defaultdict(list)
             opaque: set[int] = set()
+            assembled: set[int] = set()
             for node in function.walk_preorder():
+                if node.kind == K.ASM_STMT:
+                    # An asm's operands: one it writes ("=r", "+r") is a store the facts cannot state.
+                    assembled.update(
+                        part.referenced.hash
+                        for part in node.walk_preorder()
+                        if part.kind == K.DECL_REF_EXPR and part.referenced is not None
+                    )
+                    continue
                 if node.kind not in (K.BINARY_OPERATOR, K.COMPOUND_ASSIGNMENT_OPERATOR, K.UNARY_OPERATOR):
                     continue
                 operands = _children(node)
@@ -2404,7 +2441,7 @@ class _Evaluator:
                             combined[variable].append((operator, operands[1]))
                 elif node.kind == K.UNARY_OPERATOR and (libclang.is_increment(node) or libclang.is_address_of(node)):
                     opaque.update(variables)
-            self.written[key] = _Writes(dict(stores), dict(combined), frozenset(opaque))
+            self.written[key] = _Writes(dict(stores), dict(combined), frozenset(opaque), frozenset(assembled))
         return self.written[key]
 
     def local(self, variable: ci.Cursor, depth: int) -> int | None:
@@ -2903,7 +2940,8 @@ class _Evaluator:
         typed = _integer_type(variable.type)
         if key in writes.opaque or len(combined) > _COMBINED_LIMIT or (combined and typed is None):
             return None
-        if variable.type.is_volatile_qualified():
+        if variable.type.is_volatile_qualified() or key in writes.assembled:
+            # A volatile read, or an asm's operand, may give any value.
             return None
         sources: list[dict[str, Any] | None] = [first] if first is not None else []
         initializer = libclang.var_initializer(variable) if variable.kind == K.VAR_DECL else None
@@ -2989,6 +3027,8 @@ class _FunctionWalk:
         # nothing reads is not code. The walk counts the reads of each variable in code, and the
         # labels the gotos in code target, for the next walk (``_Extractor.analysis``).
         self.live_labels = live_labels
+        # The blocks a walk enters past their start, through a live label inside (``holds_live_label``).
+        self.entered_dead: set[int] = set()
         self.dead_variables = dead_variables
         self.decided_variables = decided_variables
         self.decided_reads: collections.Counter[int] = collections.Counter()  # reads the image decides
@@ -3333,9 +3373,11 @@ class _FunctionWalk:
             depth > _EXPRESSION_DEPTH
             or variable.type.is_volatile_qualified()
             or (variable.kind == K.VAR_DECL and not _is_local(variable))
+            or key in self.x.evaluator.stores_in(self.cursor).assembled
         ):
-            # A volatile variable may change between reads, and a static local keeps its value between
-            # calls (__ONCE_LITE_IF's __already_done): unknown.
+            # A volatile variable may change between reads, a static local keeps its value between
+            # calls (__ONCE_LITE_IF's __already_done), and an asm's operand or a `*=` the facts cannot
+            # state may leave any value: unknown.
             return None
         uses = self.local_uses()
         index = self.parameters.get(key) if variable.kind == K.PARM_DECL else None
@@ -3537,8 +3579,13 @@ class _FunctionWalk:
         other one is stated as ``held`` states it."""
         key = variable.hash
         writes = self.x.evaluator.stores_in(self.cursor)
-        if variable.type.is_volatile_qualified() or (variable.kind == K.VAR_DECL and not _is_local(variable)):
-            # A volatile variable may change between reads; a static local keeps its value between calls.
+        if (
+            variable.type.is_volatile_qualified()
+            or (variable.kind == K.VAR_DECL and not _is_local(variable))
+            or key in writes.assembled
+        ):
+            # A volatile variable may change between reads, a static local keeps its value between
+            # calls, and an asm may write any value into its operand.
             return None
         written = key in writes.stores or key in writes.combined or key in writes.opaque
         if (
@@ -4114,6 +4161,12 @@ class _FunctionWalk:
         finally:
             if pushed:
                 self.guard_stack.pop()
+
+    def holds_live_label(self, node: ci.Cursor) -> bool:
+        """A label a goto in code targets is inside ``node`` (or is it)."""
+        return bool(self.live_labels) and any(
+            part.kind == K.LABEL_STMT and part.spelling in self.live_labels for part in node.walk_preorder()
+        )
 
     def discard(
         self, node: ci.Cursor, parent: ci.Cursor | None, index: int, generic: bool, reason: str = "discarded"
@@ -4916,9 +4969,12 @@ class _FunctionWalk:
         if initializer is not None:
             values.append(initializer)
         return bool(values) and all(
-            _bare(value).kind == K.DECL_REF_EXPR
-            and _bare(value).referenced is not None
-            and _bare(value).referenced.hash == source.hash
+            # The destination keeps every value of the source: `unsigned char y = x` does not.
+            (named := _kept_value(value)) is not None
+            and _kept_value_type(copy.type, named.type)
+            and named.kind == K.DECL_REF_EXPR
+            and named.referenced is not None
+            and named.referenced.hash == source.hash
             for value in values
         )
 
@@ -5624,6 +5680,17 @@ class _FunctionWalk:
         self, node: ci.Cursor, parent: ci.Cursor | None, index: int, reason: str | None, generic: bool = False
     ) -> None:
         kind = node.kind
+        if reason in _UNREACHED and self.holds_live_label(node):
+            # goto_live_branch's `goto L; if (0) { L: warn(); }`: a goto in code enters the statement at a
+            # label, so what follows the label is code. A block walks its statements from the label on as
+            # code; a label of a live goto, and a loop or switch around one, is walked as code whole.
+            if kind == K.COMPOUND_STMT:
+                self.entered_dead.add(node.hash)
+                reason = None
+            elif kind in (*_LOOPS, K.SWITCH_STMT) or (
+                kind == K.LABEL_STMT and any(name in self.live_labels for name in _label_chain(node))
+            ):
+                reason = None
         if (
             reason is None
             and parent is not None
@@ -6050,7 +6117,7 @@ class _FunctionWalk:
             # Statements after a return, a goto, a break, a continue or a noreturn call are reached
             # only through a label or a case. After an `if (__builtin_constant_p(...)) return ...;`
             # the machine code decides whether the rest was compiled.
-            dead = False
+            dead = node.hash in self.entered_dead
             builtin_exits = 0
             exit_guards = 0  # guards on the rest of the block, from `if (C) return;` before it
             value_last = parent is not None and parent.kind == K.StmtExpr

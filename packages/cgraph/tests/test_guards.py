@@ -1679,3 +1679,61 @@ def test_a_volatile_local_is_read_each_time(tmp_path: Path, function: str) -> No
     -O2: sw zero; lw; beqz; call warn), also through an inline helper that returns it."""
     facts = facts_of(tmp_path, MORE_VOLATILE)
     assert "warn" in {call["callee"] for call in facts["functions"][function]["events"]["calls"]}
+
+
+EXTERNAL_REVIEW = """
+    extern int g;
+    struct S7 { long pad; long field; };
+    struct S2 { int field; };
+    struct S4 { unsigned long field; };
+    void volatile_local(void) { volatile int v = 0; if (v) warn(); }
+    void volatile_twice(volatile int v) { if (v != v) warn(); }
+    void volatile_access(void) { volatile int v = 0; if (v) g = 1; }
+    void volatile_loop(void) { for (volatile int i = 0; i; i--) warn(); }
+    void volatile_pointer(int *volatile p) { if (p != p) warn(); }
+    void volatile_struct(struct S7 *p) { volatile int ready = 0; if (ready) p->field = 7; }
+    void volatile_struct_loop(struct S7 *p) { for (volatile int ready = 0; ready; ready = 0) p->field = 7; }
+    int narrow_copy(struct S2 *p) { int x = p->field; unsigned char y = x; return x - y; }
+    unsigned char bool_same_store(unsigned char n) { unsigned char x; if (g) x = n; else x = (_Bool)n; return x; }
+    unsigned long bool_between_shifts(struct S4 *p)
+    {
+        unsigned long x = p->field;
+        return ((unsigned long)(_Bool)(x << 32)) << 32;
+    }
+    void nonvolatile_asm(void) { int v = 0; __asm__ volatile("li %0,1" : "+r"(v)); if (v) warn(); }
+    void goto_live_branch(void) { goto L; if (0) { L: warn(); } }
+"""
+
+
+def _compiled(facts: dict[str, Any], function: str) -> set[str]:
+    """What the facts say the function's compiled code does: calls, globals and fields it touches."""
+    events = facts["functions"][function]["events"]
+    found = {call["callee"] for call in events["calls"]}
+    found |= {item["unit"]["name"] for item in events["accesses"] if item["unit"]["kind"] == "global"}
+    return found | {item["field"] for item in events["field_accesses"]}
+
+
+@pytest.mark.parametrize(
+    ("function", "kept_event"),
+    [
+        ("volatile_local", "warn"),
+        ("volatile_twice", "warn"),
+        ("volatile_access", "g"),
+        ("volatile_loop", "warn"),
+        ("volatile_pointer", "warn"),
+        ("volatile_struct", "field"),
+        ("volatile_struct_loop", "field"),
+        ("narrow_copy", "field"),
+        ("bool_same_store", "g"),
+        ("bool_between_shifts", "field"),
+        ("nonvolatile_asm", "warn"),
+        ("goto_live_branch", "warn"),
+    ],
+)
+def test_the_external_reviews_cases_keep_what_the_compiler_keeps(
+    tmp_path: Path, function: str, kept_event: str
+) -> None:
+    """The C inputs of the two external reviews of legion#5 at 1b55b25b (LegionReviewB F1-F6,
+    LegionR6ReviewAstra finding 1): clang-21 -O2 keeps each call, global and field named here."""
+    facts = facts_of(tmp_path, EXTERNAL_REVIEW)
+    assert kept_event in _compiled(facts, function)
