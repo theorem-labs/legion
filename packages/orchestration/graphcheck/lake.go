@@ -72,39 +72,46 @@ func (c *Candidate) leanArgs(m *Module) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	options := own
-	if options == nil {
-		if options, err = s.inheritedOptions(m); err != nil {
+	opts := own
+	if opts == nil {
+		if opts, err = s.inheritedOptions(m); err != nil {
 			return nil, err
 		}
 	}
-	plugins, err := s.importPlugins(m.Module, m.Imports)
-	if err != nil {
-		return nil, err
-	}
-	if own != nil {
-		for _, p := range own.Plugins {
+	// Lake writes the whole plugin list of a module's compile into its own setup, in load order, so the setup is
+	// the list: an added module takes the one of the import whose options it inherits.
+	var plugins []string
+	if opts != nil {
+		for _, p := range opts.Plugins {
 			plugins = append(plugins, p.Path)
 		}
 	}
-	var args []string
-	if options != nil {
-		for name, raw := range options.Options {
+	var options []string
+	if opts != nil {
+		for name, raw := range opts.Options {
 			value, err := optionValue(raw)
 			if err != nil {
 				return nil, unable("the base build's setup of %s has option %s: %v", m.Module, name, err)
 			}
-			args = append(args, "-D"+name+"="+value)
+			options = append(options, "-D"+name+"="+value)
 		}
 	}
+	sort.Strings(options)
+	args := slices.Compact(options)
+	// The plugins keep Lake's order, each the first time it appears: one plugin's symbols resolve against those
+	// loaded before it, so a sorted list fails to load.
+	seen := make(map[string]bool, len(plugins))
 	for _, p := range plugins {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
 		if module, ok := s.stale[p]; ok {
 			return nil, staleLibrary(module, m.Module)
 		}
 		args = append(args, "--plugin="+p)
 	}
-	sort.Strings(args)
-	return slices.Compact(args), nil
+	return args, nil
 }
 
 func staleLibrary(module, importer string) error {

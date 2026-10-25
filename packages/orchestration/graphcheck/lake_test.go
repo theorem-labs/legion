@@ -81,18 +81,18 @@ func sorted(args ...string) []string {
 	return slices.Compact(args)
 }
 
-func TestLeanArgsFormatsOptionsAndDeduplicatesPlugins(t *testing.T) {
+func TestLeanArgsFormatsOptionsAndKeepsThePluginOrder(t *testing.T) {
 	l := newLakeTree(t)
-	l.setup("Lib.A", map[string]any{"maxRecDepth": 8192, "linter.unusedVariables": false, "pp.width": 1.5, "trace.x": "a b"},
-		"/tc/libLake_shared.so", "/tc/libLake_shared.so")
-	l.setup("Lib.B", map[string]any{"maxRecDepth": 8192}, "/tc/libLake_shared.so", "/dep/libDep.so")
 	b := l.precompiled("Lib.B")
+	l.setup("Lib.A", map[string]any{"maxRecDepth": 8192, "linter.unusedVariables": false, "pp.width": 1.5, "trace.x": "a b"},
+		"/tc/libLake_shared.so", "/tc/libLake_shared.so", "/dep/libDep.so", b)
+	l.setup("Lib.B", map[string]any{"maxRecDepth": 8192}, "/tc/libLake_shared.so", "/dep/libDep.so")
 	c := l.candidate(map[string][]string{"Lib.A": {"Lib.B"}})
 	args, err := c.leanArgs(c.modules["Lib.A"])
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := sorted("-DmaxRecDepth=8192", "-Dlinter.unusedVariables=false", "-Dpp.width=1.5", "-Dtrace.x=a b",
+	want := append(sorted("-DmaxRecDepth=8192", "-Dlinter.unusedVariables=false", "-Dpp.width=1.5", "-Dtrace.x=a b"),
 		"--plugin=/tc/libLake_shared.so", "--plugin=/dep/libDep.so", "--plugin="+b)
 	if !slices.Equal(args, want) {
 		t.Fatalf("leanArgs = %q, want %q", args, want)
@@ -130,7 +130,7 @@ func TestLeanArgsTakesThePluginsOfAChangedImport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := sorted("--plugin=/tc/libLake_shared.so", "--plugin=/dep/libDep.so", "--plugin="+base)
+	want := []string{"--plugin=/tc/libLake_shared.so", "--plugin=/dep/libDep.so", "--plugin=" + base}
 	if !slices.Equal(args, want) {
 		t.Fatalf("leanArgs = %q, want %q", args, want)
 	}
@@ -139,8 +139,8 @@ func TestLeanArgsTakesThePluginsOfAChangedImport(t *testing.T) {
 func TestLeanArgsIsUnableForAChangedPrecompiledImport(t *testing.T) {
 	l := newLakeTree(t)
 	l.setup("Lib.Pre", nil, "/tc/libLake_shared.so")
-	l.precompiled("Lib.Pre")
-	l.setup("Lib.User", nil, "/tc/libLake_shared.so")
+	pre := l.precompiled("Lib.Pre")
+	l.setup("Lib.User", nil, "/tc/libLake_shared.so", pre)
 	c := l.candidate(map[string][]string{"Lib.User": {"Lib.Pre"}, "Lib.Pre": nil})
 	_, err := c.leanArgs(c.modules["Lib.User"])
 	var u *UnableError
@@ -176,7 +176,7 @@ func TestLeanArgsWithoutSetupDirectoryGivesNothing(t *testing.T) {
 
 func TestInitializationStemIsLeans(t *testing.T) {
 	for _, c := range []struct{ module, pkg, want string }{
-		{"MachCSLMeta.StepOpts", "machcsl", "machcsl_MachCSLMeta_StepOpts"},
+		{"Acme.Meta.StepOpts", "acme", "acme_Acme_Meta_StepOpts"},
 		{"Lib.Core", "lib", "lib_Lib_Core"},
 		{"Lib.x12", "lib", "lib_Lib_00x12"},
 		{"Lib.A_.B", "my_pkg", "my__pkg_Lib_A___00B"},

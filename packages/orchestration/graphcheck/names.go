@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
 	"github.com/sjawhar/legion/orchestration/landing"
@@ -21,24 +22,26 @@ import (
 // Both sides are compiled output: the base's from the declaration index, the candidate's from the modules that
 // Open compiled against the base's build.
 func Names(ctx context.Context, c *Candidate, idx *declindex.Store, cfg Config) ([]landing.Finding, error) {
-	out, err := compileFindings(c, cfg)
+	n, err := readNames(ctx, c, idx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	n, err := readNames(ctx, c, idx)
+	out, err := n.removedUses(ctx)
 	if err != nil {
 		return nil, err
 	}
-	uses, err := n.removedUses(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out = append(out, uses...)
 	duplicates, err := n.duplicates(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out = append(out, duplicates...)
+	// C1 runs last: N1's confirming compiles are part of what Lean has said by now, so a module another member
+	// broke is reported with the names Lean's own errors carry.
+	refused, err := compileFindings(c, cfg)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, refused...)
 	sortFindings(out)
 	return out, nil
 }
@@ -48,6 +51,7 @@ func Names(ctx context.Context, c *Candidate, idx *declindex.Store, cfg Config) 
 type nameState struct {
 	c   *Candidate
 	idx *declindex.Store
+	cfg Config
 	// paths maps each module of the index to its file, and modules each file to the index's module name.
 	paths, modules map[string]string
 	// baseDecls are the index's declarations of the modified and deleted files, by file.
@@ -126,12 +130,12 @@ func (r *removal) doubt() string {
 // structureKinds are the kinds whose compiled constants below their own name are their constructor and fields.
 var structureKinds = map[string]bool{"structure": true, "class": true}
 
-func readNames(ctx context.Context, c *Candidate, idx *declindex.Store) (*nameState, error) {
+func readNames(ctx context.Context, c *Candidate, idx *declindex.Store, cfg Config) (*nameState, error) {
 	paths, err := idx.ModulePaths(ctx)
 	if err != nil {
 		return nil, err
 	}
-	n := &nameState{c: c, idx: idx, paths: map[string]string{}, modules: map[string]string{},
+	n := &nameState{c: c, idx: idx, cfg: cfg, paths: map[string]string{}, modules: map[string]string{},
 		baseDecls: map[string][]declindex.Decl{}, public: map[string][]located{}, closures: map[string]map[string]bool{},
 		private: map[string]bool{}, unchanged: map[string][]declindex.Decl{}}
 	for module, file := range paths {
@@ -550,10 +554,16 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 	}
 	counts := map[*removal][2]int{} // uses and modules of the groups kept
 	order = slices.DeleteFunc(order, func(key [2]string) bool {
-		if m := n.c.Module(key[1]); m != nil && m.State == Compiled {
+		m := n.c.Module(key[1])
+		if m != nil && m.State == Compiled {
 			return true
 		}
 		g := groups[key]
+		// A module Lean refused for something else is another member's doing, not this removal's: C1 reports the
+		// names Lean's own errors carry, and N1 keeps quiet about it.
+		if m != nil && m.State == Failed && !n.blamed(m, g.r) {
+			return true
+		}
 		c := counts[g.r]
 		counts[g.r] = [2]int{c[0] + g.count, c[1] + 1}
 		return false
@@ -574,6 +584,49 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 				plural(c[1], "unchanged module"), doubt)})
 	}
 	return out, nil
+}
+
+// blamed reports whether a module's compile failed over the removed declaration: one of the names the landing
+// program's blame reads out of Lean's errors is it, or Lean's text names it, its last component or the module it
+// came from (a missing module, a field Lean reports under its structure). A module that fails for another reason
+// is another member's, and C1 names it.
+func (n *nameState) blamed(m *Module, r *removal) bool {
+	short := lastComponent(r.Name)
+	for _, e := range m.Errors {
+		for _, block := range blame.Parse(blameLog(m.Module, e), n.cfg.Roots).Blocks {
+			for _, name := range blame.Names(block.Message) {
+				if name.Value == r.Name || name.Value == short || strings.HasSuffix(name.Value, "."+short) {
+					return true
+				}
+			}
+		}
+		if namesWord(e.Message, r.Name) || namesWord(e.Message, short) || namesWord(e.Message, normalName(r.Module)) {
+			return true
+		}
+	}
+	return false
+}
+
+// namesWord reports whether text holds the name as a whole identifier, not inside a longer one.
+func namesWord(text, name string) bool {
+	for i := 0; ; {
+		at := strings.Index(text[i:], name)
+		if at < 0 {
+			return false
+		}
+		at += i
+		before, after := ' ', ' '
+		if at > 0 {
+			before, _ = utf8.DecodeLastRuneInString(text[:at])
+		}
+		if end := at + len(name); end < len(text) {
+			after, _ = utf8.DecodeRuneInString(text[end:])
+		}
+		if !identRune(before) && before != '.' && !identRune(after) && after != '.' {
+			return true
+		}
+		i = at + 1
+	}
 }
 
 // reachable reports whether a user module's candidate import closure, the user included, holds a public

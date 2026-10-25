@@ -637,6 +637,19 @@ func (c *Candidate) compileBuilt(ctx context.Context, changed []*Module) error {
 	for _, r := range c.icfg.Roots {
 		roots[r] = true
 	}
+	// Every changed module that one of these imports is compiled too, whether or not a build root reaches it: its
+	// base output is of the old source, and Lean reads the .olean of every module in the import closure.
+	for grown := true; grown; {
+		grown = false
+		for _, m := range pending {
+			for _, d := range c.changedDeps(m) {
+				if dep := c.modules[d]; pending[d] == nil && dep != nil && dep.State == NotBuilt {
+					pending[d] = dep
+					grown = true
+				}
+			}
+		}
+	}
 	// deps are the changed modules in each module's closure, waits how many of them are still pending, and users
 	// the pending modules that wait for each one.
 	deps := make(map[string][]string, len(pending))

@@ -52,6 +52,27 @@ func TestUnableCarriesLeansOwnOutput(t *testing.T) {
 	}
 }
 
+// Two members break one unchanged module: one removes a name the module uses only in a tactic fallback, the other
+// changes a type the same module uses. The fallback module no longer compiles, but not for the removal, so N1 says
+// nothing about it and C1 reports the names Lean's errors carry.
+func TestNamesDoesNotRefuseARemovalForAnotherMembersBreak(t *testing.T) {
+	f := graphchecktest.NewVariant(t, graphchecktest.Variant{Files: map[string]string{
+		"Lib/Fb.lean":    "namespace Lib.Fb\ndef fb : Nat := 1\nend Lib.Fb\n",
+		"Lib/Other.lean": "namespace Lib.Other\ndef other : Nat := 2\nend Lib.Other\n",
+		"Lib/User.lean":  "import Lib.Fb\nimport Lib.Other\n\ntheorem user : Lib.Other.other = 2 := by\n  first\n  | have h := Lib.Fb.fb\n    rfl\n  | rfl\n",
+		"Lib.lean":       libRoot + "import Lib.User\n",
+	}})
+	tree := f.EditMany(t, map[string][2]string{
+		"Lib/Fb.lean":    {"def fb : Nat := 1", "private def fb : Nat := 1"},
+		"Lib/Other.lean": {"def other : Nat := 2", "def other : String := \"2\""},
+	})
+	for _, h := range names(t, f, tree) {
+		if h.Declaration == "Lib.Fb.fb" && h.Verdict == landing.VerdictRefuse {
+			t.Fatalf("refusal %+v: the module fails on the other member's change, not on this removal", h)
+		}
+	}
+}
+
 // An unchanged module between two changed ones is rebuilt as the build rebuilds it: its base .olean was elaborated
 // against the old version of the module it imports, and compiling the downstream changed module against that stale
 // output would fail where the build succeeds.
