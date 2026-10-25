@@ -371,13 +371,6 @@ def test_an_assignment_does_not_reach_its_own_right_side(fold_build: dict[str, A
     assert "function:fd_class_to_subsys" not in {entry["function"] for entry in offsets["misses"]}
 
 
-def test_stores_into_a_static_nothing_reads_are_not_code(fold_build: dict[str, Any]) -> None:
-    """fd_notes_init (llvm-objdump): box_size, obj_free on error, no reference to all_bags or tree_sem:
-    fd_notes_attr is given only to a stub that ignores it."""
-    targets = {edge["target"] for edge in fold_build["graph"]["edges"] if edge["source"] == "function:fd_notes_init"}
-    assert not targets & {"global:all_bags", "global:tree_sem", "global:fd_notes_attr@src/fold.c"}
-
-
 def test_a_member_at_offset_zero_of_a_held_address_is_that_address(fold_build: dict[str, Any]) -> None:
     """fd_put_first (llvm-objdump: jal fd_find_kset; beqz a0; j obj_free): &k->list is the pointer
     fd_find_kset returns, and the check takes it as that pointer, not as an address 32 below it. The
@@ -408,3 +401,8 @@ def test_a_zero_helper_the_image_calls_stays_a_call(fold_facts: dict[str, Any], 
     assert {"box_size", "fd_zero_called"} <= calls
     pairs = fold_build["checks"]["call_layer"]["pairs"]
     assert "function:fd_accumulate_called" not in {pair["source"] for pair in pairs["only_image"] + pairs["only_c"]}
+
+
+def test_a_helper_that_changes_its_parameter_does_not_return_it_unchanged(fold_build: dict[str, Any]) -> None:
+    """fd_case_cmp: the table load that decides fd_lower's + 32 stays (llvm-objdump: lbu from upper)."""
+    assert folded_fields(fold_build, "fd_case_cmp") == {"upper"}

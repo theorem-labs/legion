@@ -1024,46 +1024,6 @@ done:
 	return sp;
 }
 
-/* kernel/ksysfs.c ksysfs_init without CONFIG_SYSFS: if (notes_size > 0) { bin_attr_notes.private =
- * (void *)&__start_notes; bin_attr_notes.size = notes_size; error = sysfs_create_bin_file(kernel_kobj,
- * &bin_attr_notes); if (error) goto group_exit; } return;, where the stub ignores bin_attr_notes,
- * which nothing else reads: the if is not code (llvm-objdump: no reference to all_bags or tree_sem,
- * which stand for __start_notes and __stop_notes). */
-struct fd_bin_attr {
-	const void *private;
-	long size;
-};
-static struct fd_bin_attr fd_notes_attr;
-#define fd_notes_start ((const char *)&all_bags)
-#define fd_notes_stop ((const char *)&tree_sem)
-
-static inline int fd_create_bin(struct box *b, const struct fd_bin_attr *attr)
-{
-	return 0;
-}
-
-void fd_notes_init(struct box *b)
-{
-	int error;
-
-	error = box_size(b);
-	if (error)
-		goto exit;
-	if (fd_notes_stop - fd_notes_start > 0) {
-		fd_notes_attr.private = fd_notes_start;
-		fd_notes_attr.size = fd_notes_stop - fd_notes_start;
-		error = fd_create_bin(b, &fd_notes_attr);
-		if (error)
-			goto group_exit;
-	}
-	return;
-
-group_exit:
-	obj_free(b);
-exit:
-	obj_free((void *)(long)error);
-}
-
 /* drivers/base/swnode.c software_node_unregister: swnode = software_node_to_swnode(node), an out of
  * line call that returns a container_of of a list entry, then kobject_put(&swnode->kobj), kobj at
  * offset 0: the code passes the returned pointer itself (llvm-objdump: jal fd_find_kset; beqz a0;
@@ -1137,4 +1097,23 @@ int fd_accumulate_called(struct box *b)
 
 	total += fd_zero_called(b);
 	return total;
+}
+
+/* lib/string.c strncasecmp: c1 = tolower(c1), where __tolower changes c before return c;: the store
+ * changes c1, so the table read that decides it is code (llvm-objdump: lbu from the table). */
+struct fd_case {
+	unsigned char upper[4];
+};
+
+static inline unsigned char fd_lower(const struct fd_case *t, unsigned char c)
+{
+	if (t->upper[c & 3])
+		c += 32;
+	return c;
+}
+
+int fd_case_cmp(const struct fd_case *t, unsigned char c1, unsigned char c2)
+{
+	c1 = fd_lower(t, c1);
+	return c1 - c2;
 }

@@ -465,7 +465,6 @@ class _Extractor:
         }
         self.macro_cache: dict[str, tuple[frozenset[str], list[str]] | None] = {}
         self.weak_cache: dict[int, bool] = {}
-        self.unread_statics: dict[int, bool] = {}  # per static global: nothing in the unit reads it
         self.evaluator = _Evaluator(
             {cursor.spelling: cursor for cursor in tu.cursor.get_children()
              if cursor.kind == K.FUNCTION_DECL and cursor.is_definition() and cursor.spelling},
@@ -531,87 +530,6 @@ class _Extractor:
 
     def token_error(self, cursor: ci.Cursor, error: RuntimeError) -> ExtractionError:
         return ExtractionError(f"{self.source}: {self.where(cursor)}: cannot read tokens: {error}")
-
-    def unread_static(self, variable: ci.Cursor) -> bool:
-        """A static global of the unit's own file, not volatile, that the unit only stores into (``g =
-        e``, ``g.m = e``) or passes the address of to a parameter an inline callee ignores
-        (ksysfs_init's ``bin_attr_notes``, given to sysfs_create_bin_file, a stub without CONFIG_SYSFS):
-        nothing reads it, so its stores are not code. The file must include nothing after the
-        definition, so that every use is in the file's own text."""
-        if variable.kind != K.VAR_DECL or variable.linkage != ci.LinkageKind.INTERNAL or not _is_global_var(variable):
-            return False
-        key = variable.hash
-        if key in self.unread_statics:
-            return self.unread_statics[key]
-        self.unread_statics[key] = False
-        location = variable.location
-        main = Path(self.tu.spelling).resolve()
-        if (
-            location.file is None
-            or Path(location.file.name).resolve() != main
-            or variable.type.is_volatile_qualified()
-            or any(
-                include.location.file is not None
-                and Path(include.location.file.name).resolve() == main
-                and include.location.line > location.line
-                for include in self.tu.get_includes()
-            )
-        ):
-            return False
-        result = True
-        for cursor in self.tu.cursor.get_children():
-            if cursor.location.file is None or Path(cursor.location.file.name).resolve() != main:
-                continue
-            if cursor.extent.end.line < location.line:
-                continue
-            if not self.only_stored(cursor, variable.hash):
-                result = False
-                break
-        self.unread_statics[key] = result
-        return result
-
-    def only_stored(self, node: ci.Cursor, key: int) -> bool:
-        """Every reference under ``node`` to the variable ``key`` is a store into it or its address
-        given to an ignored parameter of an inline callee (``unread_static``)."""
-        if node.kind in (K.CXX_UNARY_EXPR, K.STATIC_ASSERT) or (node.kind == K.VAR_DECL and node.hash == key):
-            # sizeof and typeof read nothing; the definition's initializer is no read.
-            return True
-        if node.kind == K.CALL_EXPR and node.referenced is not None and self.inline_function(node.referenced.spelling):
-            ignored = self.ignored_parameters(node.referenced)
-            arguments = list(node.get_arguments() or [])
-            for position, argument in enumerate(arguments):
-                address = _bare(argument)
-                if (
-                    position in ignored
-                    and address.kind == K.UNARY_OPERATOR
-                    and libclang.is_address_of(address)
-                    and _children(address)
-                    and (target := _bare(_children(address)[0])).kind == K.DECL_REF_EXPR
-                    and target.referenced is not None
-                    and target.referenced.hash == key
-                ):
-                    continue
-                if not self.only_stored(argument, key):
-                    return False
-            head = next(iter(node.get_children()), None)
-            return head is None or self.only_stored(head, key)
-        if node.kind == K.BINARY_OPERATOR and _is_plain_assignment(node):
-            target, value = _children(node)
-            base = _bare(target)
-            while base.kind in (K.MEMBER_REF_EXPR, K.ARRAY_SUBSCRIPT_EXPR) and _children(base):
-                inner = _bare(_children(base)[0])
-                if base.kind == K.MEMBER_REF_EXPR and inner.type.get_canonical().kind == TK.POINTER:
-                    break
-                if base.kind == K.ARRAY_SUBSCRIPT_EXPR and (
-                    inner.type.get_canonical().kind not in _ARRAY_TYPES or not self.only_stored(_children(base)[1], key)
-                ):
-                    break
-                base = inner
-            if base.kind == K.DECL_REF_EXPR and base.referenced is not None and base.referenced.hash == key:
-                return self.only_stored(value, key)
-        if node.kind == K.DECL_REF_EXPR and node.referenced is not None and node.referenced.hash == key:
-            return False
-        return all(self.only_stored(child, key) for child in _children(node))
 
     def is_weak(self, definition: ci.Cursor) -> bool:
         key = definition.hash
@@ -1061,7 +979,9 @@ class _Extractor:
 
     def returned_parameter(self, callee: ci.Cursor | None) -> int | None:
         """The parameter an inline function without effect returns unchanged on every return (riscv's
-        arch_untagged_si_addr: ``return addr;``), by position, or None."""
+        arch_untagged_si_addr: ``return addr;``), by position, or None. A parameter the function
+        writes or whose address it takes is not returned unchanged (__tolower's ``c -= 'A' - 'a';
+        return c;``)."""
         if callee is None or callee.kind != K.FUNCTION_DECL or not self.inline_function(callee.spelling):
             return None
         name = callee.spelling
@@ -1071,7 +991,8 @@ class _Extractor:
         definition = self.evaluator.definitions.get(name)
         if definition is None or self.is_weak(definition) or not self.function_effect_free(name):
             return None
-        positions = {parameter.hash: index for index, parameter in enumerate(definition.get_arguments() or [])}
+        parameters = list(definition.get_arguments() or [])
+        positions = {parameter.hash: index for index, parameter in enumerate(parameters)}
         found: set[int | None] = set()
         for node in definition.walk_preorder():
             if node.kind == K.RETURN_STMT:
@@ -1080,6 +1001,22 @@ class _Extractor:
                 referenced = returned.referenced if returned is not None and returned.kind == K.DECL_REF_EXPR else None
                 found.add(positions.get(referenced.hash) if referenced is not None else None)
         position = found.pop() if len(found) == 1 else None
+        if position is not None:
+            key = parameters[position].hash
+            for node in definition.walk_preorder():
+                target = _store_target(node)
+                stored = _bare(target) if target is not None else None
+                address = node.kind == K.UNARY_OPERATOR and libclang.is_address_of(node) and _children(node)
+                taken = _bare(_children(node)[0]) if address else None
+                if any(
+                    part is not None
+                    and part.kind == K.DECL_REF_EXPR
+                    and part.referenced is not None
+                    and part.referenced.hash == key
+                    for part in (stored, taken)
+                ):
+                    position = None
+                    break
         self.returned_parameters[name] = position
         return position
 
@@ -3587,34 +3524,19 @@ class _FunctionWalk:
         return kept
 
     def if_without_effect(self, statement: ci.Cursor) -> bool:
-        """``branches_without_effect`` for an ``if`` whose condition the evaluator does not decide, with
-        the stores the walk finds no read sees (``overwritten``), the stores into statics nothing reads
-        (``unread_static``) and the conditions the walk decides: transport_add_class_device's ``if
-        (tcont->statistics) { error = sysfs_create_group(...); if (error) goto err_del; }``, ksysfs_init's
-        ``if (notes_size > 0) { bin_attr_notes.private = ...; ... }``."""
+        """``branches_without_effect``, with the stores the walk finds no read sees (``overwritten``)
+        and the conditions it decides: transport_add_class_device's ``if (tcont->statistics) { error =
+        sysfs_create_group(...); if (error) goto err_del; }``."""
         children = _children(statement)
-        if (
-            statement.kind != K.IF_STMT
-            or len(children) < 2
-            or self.x.evaluator.evaluate(children[0], truth=True) is not None
-            or _jumps_out(statement, 0, self.held_live)
-        ):
-            return False
-        skip = frozenset(self.overwritten | self.static_stores(statement))
-        return all(
-            self.x.effect_free(branch, self.dead_variables, live=self.held_live, skip=skip) for branch in children[1:]
+        return (
+            statement.kind == K.IF_STMT
+            and len(children) >= 2
+            and not _jumps_out(statement, 0, self.held_live)
+            and all(
+                self.x.effect_free(branch, self.dead_variables, live=self.held_live, skip=self.overwritten)
+                for branch in children[1:]
+            )
         )
-
-    def static_stores(self, node: ci.Cursor) -> set[int]:
-        """The plain assignments under ``node`` into a static nothing reads (``unread_static``)."""
-        return {
-            part.hash
-            for part in node.walk_preorder()
-            if _is_plain_assignment(part)
-            and (target := _store_target(part)) is not None
-            and (variable := _stored_variable(target)) is not None
-            and self.x.unread_static(variable)
-        }
 
     def stored_again_before(self, read: ci.Cursor, store: ci.Cursor, kills: set[int]) -> bool:
         """A block around ``read`` without a label or a case has one of ``kills`` (assignments of the
@@ -3793,11 +3715,7 @@ class _FunctionWalk:
         body = children[-1]
         if not self.x.effect_free(children[0], self.dead_variables) or _leaves_switch(body, 0, self.held_live):
             return False
-        skip = (
-            self.overwritten
-            | {node.hash for node in body.walk_preorder() if self.self_store(node)}
-            | self.static_stores(body)
-        )
+        skip = self.overwritten | {node.hash for node in body.walk_preorder() if self.self_store(node)}
         return self.x.effect_free(body, self.dead_variables, live=self.held_live, skip=frozenset(skip))
 
     def same_store(self, statement: ci.Cursor) -> bool:
@@ -6646,22 +6564,6 @@ class _FunctionWalk:
                     self.walk(children[1], node, 1, reason, generic)
                 finally:
                     self.conditional -= 1
-            return
-        if (
-            stored is not None
-            and reason is None
-            and _is_plain_assignment(node)
-            and len(children) == 2
-            and parent is not None
-            and _statement_position(parent, index)
-            and (whole := _stored_variable(stored)) is not None
-            and self.x.unread_static(whole)
-        ):
-            # A store into a static global nothing reads (ksysfs_init's bin_attr_notes.private =
-            # (void *)&__start_notes without CONFIG_SYSFS): only what computing the value does besides
-            # is code.
-            self.walk(children[0], node, 0, "discarded", generic)
-            self.discard(children[1], node, 1, generic)
             return
         if kind == K.CALL_EXPR and reason is None and self.zero_size_copy(node):
             # memcpy(d, s, 0) copies nothing, and the compiler drops it with its arguments

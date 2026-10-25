@@ -63,10 +63,7 @@ written); 2 a usage or configuration error; 3 an input cannot be read.
   at the top of the loop), a store from which control reaches no read (`transport_add_class_device`'s
   `error = sysfs_create_group(...)`, read only past `return 0;` at a label only an earlier goto
   reaches; a constant condition without a call reads no local, and an `if` whose branches hold only
-  such stores, stores into a static of the unit's file that the unit only stores into or gives to a
-  parameter an inline callee ignores (`ksysfs_init`'s `bin_attr_notes`, given to
-  `sysfs_create_bin_file`, a stub), and conditions the walk decides, has no effect, nor is such a
-  store code where it stands alone), a store of what the lvalue holds already
+  such stores and conditions the walk decides has no effect), a store of what the lvalue holds already
   (`L = E`, where `E` is `L` itself, an inline helper that returns its parameter given it, or a local
   nothing writes but its initializer, `L` again, with nothing between that may change `L`:
   `hide_si_addr_tag_bits`' `arch_untagged_si_addr`, `io_remap_pfn_range_prepare`'s `orig_pfn`), and
