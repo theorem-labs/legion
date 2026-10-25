@@ -140,9 +140,15 @@ jobs:
       pi_envoy: ${{ steps.filter.outputs.pi_envoy }}
       pi_legion: ${{ steps.filter.outputs.pi_legion }}
       dispatch: ${{ steps.filter.outputs.dispatch }}
+      # Unset unless the build-list step below ran, so a job that names it falls back to its own
+      # path filter.
+      workspace_versions: ${{ steps.versions.outputs.moved }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The build-list step reads the manifests of the first parent: the base of a pull
+          # request's merge commit, of a merge group's head, or of a push to main.
+          fetch-depth: 2
           persist-credentials: false
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
@@ -158,6 +164,12 @@ jobs:
             bun_toolchain: &bun_toolchain
               - '.bun-version'
               - '.github/actions/setup-bun/**'
+            # No job's gate: it decides whether the build-list step below runs. The orchestration
+            # module's manifests are the only ones that can move another module's selected
+            # versions without naming a file any Go job's filter already carries.
+            workspace_modules:
+              - 'packages/orchestration/go.mod'
+              - 'packages/orchestration/go.sum'
             contracts:
               - 'packages/contracts/**'
               - 'skills/dispatch/**'
@@ -185,13 +197,15 @@ jobs:
               - 'packages/contracts/**'
               - 'skills/dispatch/**'
               - 'go.work'
-              - 'go.work.sum'
               # The Go builds run in workspace mode, where the daemon module's requirements raise
-              # the versions envoy compiles with.
+              # the versions envoy compiles with. go.work.sum and the orchestration module's own
+              # manifests are not here: the first carries checksums only, which pr-and-main.yaml's
+              # required typecheck job verifies on every pull request by resolving each module's
+              # test graph, and the second reaches this job's builds only through the versions and
+              # replacements the workspace selects, which the `changes` job's build-list step
+              # answers (`workspace_versions`, in this job's `if:`).
               - 'packages/daemon/go.mod'
               - 'packages/daemon/go.sum'
-              - 'packages/orchestration/go.mod'
-              - 'packages/orchestration/go.sum'
               # The daemon's generated body cap: the envoy job runs bun run check:go, the only
               # check that catches a hand-edit of it.
               - 'packages/daemon/internal/dispatch/generated.go'
@@ -254,12 +268,10 @@ jobs:
               - 'packages/envoy-client/**'
               - 'packages/contracts/**'
               - 'go.work'
-              - 'go.work.sum'
-              # The listener it builds compiles in workspace mode (envoy's note above).
+              # The listener it builds compiles in workspace mode (envoy's note above), and the
+              # same two entries are left out here for the same reason.
               - 'packages/daemon/go.mod'
               - 'packages/daemon/go.sum'
-              - 'packages/orchestration/go.mod'
-              - 'packages/orchestration/go.sum'
               - 'package.json'
               - 'bun.lock'
               - *bun_toolchain
@@ -373,11 +385,8 @@ jobs:
               - '.github/actions/install-omp/**'
               - 'packages/daemon/**'
               - 'go.work'
-              - 'go.work.sum'
               - 'packages/envoy/go.mod'
               - 'packages/envoy/go.sum'
-              - 'packages/orchestration/go.mod'
-              - 'packages/orchestration/go.sum'
               - '.github/actions/install-jj/**'
               - 'AGENTS.md'
               - 'README.md'
@@ -413,9 +422,6 @@ jobs:
               - 'packages/daemon/go.mod'
               - 'packages/daemon/go.sum'
               - 'go.work'
-              - 'go.work.sum'
-              - 'packages/orchestration/go.mod'
-              - 'packages/orchestration/go.sum'
               # The editor's source pin and its remaining patches can change document rendering,
               # including the Dark Reader inline-style guard.
               - 'patches/**'
@@ -424,6 +430,67 @@ jobs:
               - *bun_toolchain
               # The SPA build writes dist/THIRD_PARTY_NOTICES.txt.
               - 'scripts/third-party-notices.ts'
+
+      # packages/orchestration is in go.work, and no other module imports it, so its own go.mod
+      # and go.sum reach an envoy or daemon build through module selection alone: a requirement
+      # of its own can raise a version the other modules compile with, and a `replace` of its own
+      # applies to the whole workspace. Their file names cannot say whether either happened; the
+      # workspace build list can, and the list below carries each module's replacement as well as
+      # its selected version, so a replace-only edit moves it (`go list -m` keeps the replacement
+      # in .Replace, which a path-and-version line alone would drop). When the list is the base's,
+      # every other module compiles exactly what it compiled at the base, so a Go job below has
+      # nothing new to check and skips. Anything this step cannot answer — an unreachable base, a
+      # proxy failure, a module that will not load — leaves `moved` true and every job runs, as
+      # they did before this step existed.
+      #
+      # The base is the event's own base, not HEAD^1: a push of several commits to main carries
+      # the manifest change in an earlier commit, and `github.event.before` is where the branch
+      # stood before the push. It is read in a worktree of its own, so the job's checkout is never
+      # modified and a later step cannot inherit a half-restored tree.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.filter.outputs.workspace_modules == 'true'
+        with:
+          go-version-file: packages/daemon/go.mod
+          cache-dependency-path: |
+            packages/daemon/go.sum
+            packages/envoy/go.sum
+      - name: Does the workspace build list move?
+        id: versions
+        if: steps.filter.outputs.workspace_modules == 'true'
+        env:
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          set -uo pipefail
+          fmt='{{.Path}} {{.Version}}{{with .Replace}} => {{.Path}} {{.Version}}{{end}}'
+          work="$RUNNER_TEMP/workspace-base"
+          moved=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            base=$(git rev-parse HEAD^1)
+          else
+            base=$BASE_SHA
+          fi
+          case "$base" in
+            *[!0]*)
+              git cat-file -e "$base^{commit}" 2> /dev/null ||
+                git fetch --quiet --no-tags --depth 1 origin "$base" 2> /dev/null || true
+              ;;
+            *) base= ;;
+          esac
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2> /dev/null &&
+             git worktree add --quiet --detach "$work" "$base" &&
+             head=$(go list -m -f "$fmt" all 2>&1) &&
+             base_list=$(cd "$work" && go list -m -f "$fmt" all 2>&1); then
+            if [ "$head" = "$base_list" ]; then
+              moved=false
+              echo "the workspace build list is the base's ($base); the Go jobs have nothing new to compile"
+            else
+              diff <(printf '%s\n' "$base_list") <(printf '%s\n' "$head") || true
+            fi
+          else
+            echo "::notice::the workspace build list at base '${base:-unknown}' could not be read; every Go job runs"
+          fi
+          echo "moved=$moved" >> "$GITHUB_OUTPUT"
+          git worktree remove --force "$work" 2> /dev/null || true
 
   contracts:
     needs: changes
@@ -590,7 +657,7 @@ jobs:
 
   pi-legion:
     needs: changes
-    if: needs.changes.outputs.pi_legion == 'true'
+    if: needs.changes.outputs.pi_legion == 'true' || needs.changes.outputs.workspace_versions == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -651,7 +718,7 @@ jobs:
 
   dispatch:
     needs: changes
-    if: needs.changes.outputs.dispatch == 'true'
+    if: needs.changes.outputs.dispatch == 'true' || needs.changes.outputs.workspace_versions == 'true'
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -788,7 +855,7 @@ jobs:
 
   envoy-go:
     needs: changes
-    if: needs.changes.outputs.envoy == 'true'
+    if: needs.changes.outputs.envoy == 'true' || needs.changes.outputs.workspace_versions == 'true'
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -895,7 +962,7 @@ jobs:
   # pr-and-main.yaml's required lint job.
   envoy-infra-go:
     needs: changes
-    if: needs.changes.outputs.envoy == 'true'
+    if: needs.changes.outputs.envoy == 'true' || needs.changes.outputs.workspace_versions == 'true'
     runs-on: ubuntu-24.04
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
@@ -951,7 +1018,7 @@ jobs:
   # and pulls that image first, for the reason .github/actions/pull-test-images gives.
   envoy-go-race:
     needs: changes
-    if: needs.changes.outputs.envoy == 'true'
+    if: needs.changes.outputs.envoy == 'true' || needs.changes.outputs.workspace_versions == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     services:
@@ -992,7 +1059,7 @@ jobs:
   # envoy-go's unit run leaves them out and this job runs them with a deadline of its own.
   dispatch-memory:
     needs: changes
-    if: needs.changes.outputs.envoy == 'true'
+    if: needs.changes.outputs.envoy == 'true' || needs.changes.outputs.workspace_versions == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     services:
@@ -1143,7 +1210,7 @@ jobs:
   # Deliverer.Text) and checked against the acceptance contract.
   envoy-e2e-local:
     needs: changes
-    if: needs.changes.outputs.envoy_e2e_local == 'true'
+    if: needs.changes.outputs.envoy_e2e_local == 'true' || needs.changes.outputs.workspace_versions == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:

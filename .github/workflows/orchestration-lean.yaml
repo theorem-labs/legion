@@ -3,17 +3,41 @@ name: orchestration-lean
 # The declaration index's Lean exporter and the similarity gate: their tests compile Lean fixtures, so they run
 # where a Lean toolchain is installed. The rest of packages/orchestration is tested by pr-and-main.yaml, where these
 # tests skip for want of lake.
+# Only the packages this job's `go test` loads start it: declindex and conceptgate, the declindex
+# command, and the two packages they import (ledger, internal/testpg). A change to another
+# package of packages/orchestration compiles nothing this job runs, and pr-and-main.yaml tests the
+# whole module on every pull request anyway.
 on:
   pull_request:
     paths:
-      - "packages/orchestration/**"
+      - "packages/orchestration/declindex/**"
+      - "packages/orchestration/conceptgate/**"
+      - "packages/orchestration/cmd/declindex/**"
+      - "packages/orchestration/ledger/**"
+      - "packages/orchestration/internal/testpg/**"
+      - "packages/orchestration/go.mod"
+      - "packages/orchestration/go.sum"
       - ".github/workflows/orchestration-lean.yaml"
   push:
     branches:
       - main
+    # The same list: GitHub Actions reads no YAML anchor in a workflow file.
     paths:
-      - "packages/orchestration/**"
+      - "packages/orchestration/declindex/**"
+      - "packages/orchestration/conceptgate/**"
+      - "packages/orchestration/cmd/declindex/**"
+      - "packages/orchestration/ledger/**"
+      - "packages/orchestration/internal/testpg/**"
+      - "packages/orchestration/go.mod"
+      - "packages/orchestration/go.sum"
       - ".github/workflows/orchestration-lean.yaml"
+
+# A new push to a pull request cancels that pull request's still-running run here; outside
+# pull_request the key is github.sha, so a push to main never drops the run that saves the Lean
+# stage2 cache every pull request restores.
+concurrency:
+  group: orchestration-lean-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -62,6 +86,9 @@ jobs:
           tar -xzf elan-x86_64-unknown-linux-gnu.tar.gz
           ./elan-init -y --no-modify-path --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      # Saved on every miss, a pull request's included: a pull request that has to build Lean can
+      # read its own copy on its next run, and the copy on main is what every other pull request
+      # restores.
       - name: Restore Lean stage2
         id: lean-stage2
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
