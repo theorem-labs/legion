@@ -25,6 +25,9 @@ SAMPLE = 50
 # What a field miss at a frame slot gives besides its offset: the slot, the field's displacement
 # from it and bytes, and the local object.
 _FRAME_MISS_KEYS = ("frame_slot", "displacement", "size", "object")
+# How many elements away from the address a loop keeps a field may be: SB_FREEZE_LEVELS is 3, and
+# rcu_for_each_leaf_node walks one node at a time (``walked_element_displacement``).
+_WALKED_ELEMENTS = 4
 
 
 def _pairs_examples(values: set[tuple[str, str]], limit: int = 5) -> list[dict[str, str]]:
@@ -376,16 +379,28 @@ def structure(graph: dict[str, Any]) -> dict[str, Any]:
                 for place in at
             ):
                 method = "global_object_narrower_access"
-            elif base == "pointer" and any(
-                _register_relative(own - step, size, item, displacements, [])
-                or (item.get("address") and own - step in constants.get(function, []))
-                for own in [item["offset"] if item.get("offset", -1) >= 0 else offset]
-                for step in struct_sizes.get(item["struct"], ())
-                if step in constants.get(function, [])
+            elif (
+                base == "pointer"
+                and (
+                    steps := [
+                        step
+                        for step in {*struct_sizes.get(item["struct"], ()), item.get("element_size") or 0}
+                        if step > 0 and ({step, -step} & set(constants.get(function, [])))
+                    ]
+                )
+                and any(
+                    _register_relative(own + count * step, size, item, displacements, [])
+                    or (item.get("address") and own + count * step in constants.get(function, []))
+                    for own in [item["offset"] if item.get("offset", -1) >= 0 else offset]
+                    for step in steps
+                    for count in range(-_WALKED_ELEMENTS, _WALKED_ELEMENTS + 1)
+                    if count
+                )
             ):
-                # A loop walking an array (for (i = table; …; i++) i->data) whose code keeps i + 1 in a
-                # register and steps it by the element's size: the field is that size before it.
-                method = "next_element_displacement"
+                # A loop walking an array (for (i = table; …; i++) i->data, rcu_for_each_leaf_node,
+                # sb_freeze_unlock's `rw_sem + level`) keeps one element's address in a register and
+                # steps it by the element's size: the field is a whole number of elements from it.
+                method = "walked_element_displacement"
             elif offset >= 2048:
                 method = "no_match_beyond_12_bit_displacement"
             else:
