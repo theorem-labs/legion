@@ -387,3 +387,44 @@ func TestLandReplayAsksOnlyTheMembersThatChangedTheFile(t *testing.T) {
 		}
 	}
 }
+
+// A field that a structure of the base or the candidate declares is no
+// generated name: the build blame names a field error, which the checks can
+// see. Round 304 of the corpus named `free` and `nbr` of a structure.
+func TestLandReplayDoesNotCallAFieldAGeneratedName(t *testing.T) {
+	repo, base, heads := scratchRepository(t, map[string]string{"culprit": "+structure Box where\n  free : Nat"})
+	dir := t.TempDir()
+	writeFile(t, dir, "build-round-1.log", "✖ [1/1] Building Alpha.Use\nerror: Alpha/Use.lean:2:12: Fields missing: `free`\n")
+	manifest := writeManifest(t, dir, replay.Manifest{Repository: repo, Base: base,
+		Members:     []replay.Member{{ID: "culprit", Head: heads["culprit"]}},
+		BuildRounds: []replay.BuildRound{{Round: 1, Log: "build-round-1.log"}}})
+	got := runReplay(t, manifest, replayConfig(t, repo))
+	if got.err != nil {
+		t.Fatalf("replay: %v", got.err)
+	}
+	for _, miss := range got.summary[0].Missed {
+		if miss.Name == "free" && miss.Cause == "generated name" {
+			t.Fatalf("missed = %+v: a declared field is no generated name", got.summary[0].Missed)
+		}
+	}
+}
+
+// When a check was unable in a build round, it decided nothing there, so a
+// name it did not refuse is no defect of the checks: its cause is "check
+// unable".
+func TestLandReplayGivesAMissUnderAnUnableCheckItsCause(t *testing.T) {
+	repo, base, heads := scratchRepository(t, map[string]string{"culprit": "-def gone := 0"})
+	dir := t.TempDir()
+	writeFile(t, dir, "build-round-1.log", goneLog)
+	manifest := writeManifest(t, dir, replay.Manifest{Repository: repo, Base: base,
+		Members:     []replay.Member{{ID: "culprit", Head: heads["culprit"]}},
+		BuildRounds: []replay.BuildRound{{Round: 1, Log: "build-round-1.log"}}})
+	unable := map[string]any{"name": "names", "command": []string{writeScript(t, "echo 'no toolchain' >&2; exit 3")}, "format": "graph"}
+	got := runReplay(t, manifest, replayConfig(t, repo, unable))
+	if got.err != nil {
+		t.Fatalf("replay: %v", got.err)
+	}
+	if want := []SummaryMiss{{Member: "culprit", Name: "gone", Cause: "check unable"}}; !reflect.DeepEqual(got.summary[0].Missed, want) {
+		t.Fatalf("missed = %+v, want %+v", got.summary[0].Missed, want)
+	}
+}

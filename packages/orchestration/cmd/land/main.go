@@ -126,6 +126,9 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 	if command == "serve" && strings.TrimSpace(config.Escalations.Owner) == "" {
 		return fmt.Errorf("escalations.owner is required to serve: an escalation enqueued for an empty owner wakes nobody")
 	}
+	if command == "run" && (config.BatchID == "" || config.Base == "") {
+		return fmt.Errorf("batchId and base are required to run a single batch; land serve forms its batches from the ledger's ready migrations")
+	}
 	program, err := config.program(ctx)
 	if err != nil {
 		return err
@@ -169,7 +172,12 @@ func runBatchCommand(ctx context.Context, command string, args []string, output 
 		}
 		return writeJSON(output, batches)
 	case "serve":
-		return serve(ctx, runner, program.input, config.Interval, output)
+		return serve(ctx, runner, serving{
+			repository: config.Repository.Name,
+			baseBranch: config.BaseBranch,
+			maxMembers: config.Batch.MaxMembers,
+			interval:   config.Interval,
+		}, output)
 	default:
 		return fmt.Errorf("unknown batch command %q", command)
 	}
@@ -221,7 +229,13 @@ type config struct {
 	GitHub       githubConfig        `json:"github"`
 	Escalations  escalationsConfig   `json:"escalations"`
 	Effects      effectsConfig       `json:"effects"`
+	Batch        batchConfig         `json:"batch"`
 	Digest       string              `json:"-"`
+}
+
+// batchConfig caps how many ready migrations one batch takes. Zero is the runner's default.
+type batchConfig struct {
+	MaxMembers int `json:"max_members"`
 }
 
 // escalationsConfig names the owner for whom every escalation of the program is
@@ -374,12 +388,12 @@ type program struct {
 	close  func()
 }
 
+// program wires one configuration. It needs no configured batch: `land serve` has none, and forms each batch from
+// the ledger's ready migrations on the current tip of the base branch. `land run`, which keeps its fixed member
+// list for a single batch, checks its own keys before it calls this.
 func (c config) program(ctx context.Context) (program, error) {
-	if c.BatchID == "" {
-		return program{}, fmt.Errorf("batchId is required")
-	}
-	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.Base == "" || c.BaseBranch == "" {
-		return program{}, fmt.Errorf("repository.name, repository.path, repository.git_dir, base, and baseBranch are required")
+	if c.Repository.Name == "" || c.Repository.Path == "" || c.Repository.GitDir == "" || c.BaseBranch == "" {
+		return program{}, fmt.Errorf("repository.name, repository.path, repository.git_dir, and baseBranch are required")
 	}
 	if c.Ledger.DSNFile == "" {
 		return program{}, fmt.Errorf("ledger.dsn_file is required: the batches are kept in the ledger")
@@ -481,9 +495,20 @@ func commandToolchain(directory string, command []string) func(context.Context, 
 	}
 }
 
-// serve reconciles and publishes until ctx ends. A StopError (an unclassified ledger refusal) stops it, and the batch
-// stays for an operator.
-func serve(ctx context.Context, runner landing.Runner, input landing.Input, interval time.Duration, output io.Writer) error {
+// serving is what the serve loop forms each batch from: the repository, the branch it lands on, the cap on a
+// batch's members and how long it waits between rounds.
+type serving struct {
+	repository string
+	baseBranch string
+	maxMembers int
+	interval   time.Duration
+}
+
+// serve reconciles and publishes until ctx ends. With no batch left to do, it forms the next one from the ledger's
+// ready migrations, on the current tip of the base branch; a round with no ready migration does nothing and waits.
+// A StopError (an unclassified ledger refusal) stops it, and the batch stays for an operator.
+func serve(ctx context.Context, runner landing.Runner, configured serving, output io.Writer) error {
+	interval := configured.interval
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
@@ -493,11 +518,18 @@ func serve(ctx context.Context, runner landing.Runner, input landing.Input, inte
 			return err
 		}
 		if len(batches) == 0 {
-			batch, err := runner.Run(ctx, input)
-			if err != nil {
+			input, err := runner.ReadyInput(ctx, configured.repository, configured.baseBranch, configured.maxMembers)
+			switch {
+			case errors.Is(err, landing.ErrNoReadyMembers):
+			case err != nil:
 				return err
+			default:
+				batch, err := runner.Run(ctx, input)
+				if err != nil {
+					return err
+				}
+				batches = []landing.Batch{batch}
 			}
-			batches = []landing.Batch{batch}
 		}
 		for index := range batches {
 			if (batches[index].State == landing.Green || batches[index].State == landing.Publishing) && runner.GitHub != nil {
@@ -589,7 +621,7 @@ func runBlame(ctx context.Context, args []string, output io.Writer) error {
 	// The trees are scanned first: their candidate names the generated
 	// instance names that no declaration may keep, and each member's
 	// evidence must use the same set as the trees.
-	lines, ambiguous, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
+	lines, ambiguous, _, err := collectTreeLines(ctx, *repository, blame.Tree(*base), candidateTree, report)
 	if err != nil {
 		return err
 	}
@@ -672,16 +704,17 @@ func collectEvidence(ctx context.Context, repository, base string, members []bla
 // collectTreeLines groups, by each name the report mentions, the declarations
 // of the base and candidate trees that carry it. It also returns the round's
 // ambiguous generated instance names, which it has resolved in both trees and
-// which every scan of the round must use.
-func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, blame.InstanceNames, error) {
+// which every scan of the round must use, and the qualified names of the
+// fields that a structure or class of either tree declares.
+func collectTreeLines(ctx context.Context, repository string, base, candidate blame.Tree, report blame.Report) (map[string]blame.TreeLines, blame.InstanceNames, map[string]struct{}, error) {
 	git := landing.RepositoryGit{}
 	baseDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(base))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read declarations at base: %w", err)
+		return nil, nil, nil, fmt.Errorf("read declarations at base: %w", err)
 	}
 	candidateDeclarations, err := git.TreeDeclarations(ctx, repository, landing.Tree(candidate))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
+		return nil, nil, nil, fmt.Errorf("read declarations at candidate: %w", err)
 	}
 	ambiguous := blame.AmbiguousInstanceNames(candidateDeclarations)
 	blame.ResolveInstanceNames(candidateDeclarations, ambiguous)
@@ -699,7 +732,15 @@ func collectTreeLines(ctx context.Context, repository string, base, candidate bl
 			Candidate: blame.DeclarationsFor(name, candidateDeclarations),
 		}
 	}
-	return declarations, ambiguous, nil
+	fields := make(map[string]struct{})
+	for _, tree := range [][]blame.Declaration{baseDeclarations, candidateDeclarations} {
+		for _, declaration := range tree {
+			for _, field := range declaration.Fields {
+				fields[declaration.Name+"."+field] = struct{}{}
+			}
+		}
+	}
+	return declarations, ambiguous, fields, nil
 }
 
 func confirmAttributions(ctx context.Context, repository, base string, members []blame.Member, modules []string, attributions []blame.Attribution, command string) ([]blame.Attribution, error) {
