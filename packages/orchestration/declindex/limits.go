@@ -100,7 +100,11 @@ func checkReference(results []ModuleData, errs []error) error {
 		if errs[i] != nil {
 			continue
 		}
-		if err := checkName("the module", md.Module, ""); err != nil {
+		// modules keys a module by the path of its source below the library directory, and indexes its name.
+		if err := checkName("the module", md.Module); err != nil {
+			return err
+		}
+		if err := checkName("the module file", md.Rel+".lean"); err != nil {
 			return err
 		}
 		// imports_imported indexes the imported module's name, and imports_module the importer's.

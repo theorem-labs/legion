@@ -174,6 +174,7 @@ func TestEveryIndexedNameIsMeasuredWhereTheIndexHoldsIt(t *testing.T) {
 		err  error
 	}{
 		{"an imported module", checkReference([]ModuleData{{Module: "M", Imports: []string{huge}}}, []error{nil})},
+		{"a module's own file", checkReference([]ModuleData{{Module: "C", Rel: huge}}, []error{nil})},
 		{"a declaration", checkReference([]ModuleData{{Module: "M", Decls: []Decl{{Name: huge}}}}, []error{nil})},
 		{"a use's constant", checkReference([]ModuleData{{Module: "M",
 			Uses: []Use{{Target: huge, TargetModule: "M", Parent: "p", Class: "stmt"}}}}, []error{nil})},
