@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -50,12 +49,7 @@ func gateAddition(t *testing.T, config, id, name, home, source string) conceptga
 }
 
 func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 
 	dir := t.TempDir()
 	tree := filepath.Join(dir, "tree")
@@ -92,10 +86,8 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := filepath.Join(dir, "index.yaml")
-	body := "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nrepo: r\ncontracts:\n  paths: [NoSuch/**]\n  kinds: [def]\nlibrarian:\n  - " + librarian + "\nlean:\n  export: true\n  jobs: 1\n"
-	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	body := "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nrepo: r\ncontracts:\n  paths: [NoSuch/**]\n  kinds: [def]\nlibrarian:\n  - " + librarian + "\nlean:\n  export: true\n  jobs: 1\n"
+	writeIndexConfig(t, config, body)
 
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
@@ -129,16 +121,17 @@ func TestLedgerRechecksAddedNearConcepts(t *testing.T) {
 	if result := invoke(t, "--config", config, "refresh"); result.code != 0 {
 		t.Fatalf("refresh additions: %+v", result)
 	}
-	if err := os.WriteFile(config, []byte(strings.Replace(body, "tree: tree\n", "tree: tree-link\n", 1)), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, strings.Replace(body, "tree: tree\n", "tree: tree-link\n", 1))
 
 	contracts := filepath.Join(dir, "contracts.json")
 	if err := os.WriteFile(contracts, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// The landing hook mounts the index directory read-only; the recheck works in the temporary directory.
+	// The landing hook mounts the state directory read-only; the recheck works in the temporary directory.
 	state := filepath.Join(dir, "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(state, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +276,7 @@ func leanRegistryTree(t *testing.T, roots ...string) (config, tree string, lean 
 		t.Fatal(err)
 	}
 	config = filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: ["+strings.Join(append([]string{"Fixture"}, roots...), ", ")+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: ["+strings.Join(append([]string{"Fixture"}, roots...), ", ")+
 		"]\nregistry: registry\nrepo: r\ncontracts:\n  paths: [NoSuch/**]\n  kinds: [def]\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")
@@ -299,12 +292,7 @@ func leanRegistryTree(t *testing.T, roots ...string) (config, tree string, lean 
 // its recorded hash and with the registry: alone, the addition is clean; landed in one home file with a concept
 // whose fact it states, the two are a near pair.
 func TestLedgerRechecksAnAdditionLandedWithItsDeclaration(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	t.Run("one concept in a new home file", func(t *testing.T) {
 		config, tree, lean := leanRegistryTree(t, "Fresh")
 		source := "import Fixture\n\ndef Fx.Fresh (n : Nat) : Prop := n < 3\n"
@@ -359,12 +347,7 @@ func TestLedgerRechecksAnAdditionLandedWithItsDeclaration(t *testing.T) {
 // lands with its declaration, also when the first states that fact through a helper that its proposal declares,
 // public or private, before and after that proposal lands.
 func TestLedgerRechecksALandedAdditionAgainstEveryConcept(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	const theorem = "theorem Fx.First (x : Nat) (_h : x < 3) : True := trivial\n"
 	const helper = "def Fx.Helper (n : Nat) : Prop := n < 3\n\ndef Fx.First (n : Nat) : Prop := Fx.Helper n\n"
 	// A private name holds its module's: the proposal's when the gate compiles it, the home file's once it lands.
@@ -423,12 +406,7 @@ func TestLedgerRechecksALandedAdditionAgainstEveryConcept(t *testing.T) {
 //   - not landed, the stored source is compiled, and the forms import no module whose imports declare the concept,
 //     here a registry import that imports a file that declares it outside its home.
 func TestLedgerRechecksAnAdditionFromItsLandedDeclaration(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	ctx := context.Background()
 	compile := func(t *testing.T, lean declindex.Lean, tree string, modules ...string) {
 		t.Helper()

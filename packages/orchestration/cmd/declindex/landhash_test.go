@@ -36,7 +36,7 @@ func TestLandHashBaseSnapshotPrintsModulePath(t *testing.T) {
 		"LAND_NAMES":   string(names),
 	}
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", config, "land-hash"}, values.get, &out, &errOut)
+	code := run(context.Background(), withIndexDSN([]string{"--config", config, "land-hash"}), values.get, &out, &errOut)
 	const want = "Gold.frame_lo\t9d9fba31f41fc258\tGolden.lean\nGold2.FrameAt\t7f52be71a38bde18\tSub/Wrap.lean\n"
 	if code != 0 || out.String() != want {
 		t.Fatalf("base land-hash = (%d, %q, %q), want (0, %q, any stderr)", code, out.String(), errOut.String(), want)
@@ -46,7 +46,7 @@ func TestLandHashBaseSnapshotPrintsModulePath(t *testing.T) {
 func invokeLandHash(t *testing.T, config string, values envValues, args ...string) result {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), append([]string{"--config", config, "land-hash"}, args...), values.get, &out, &errOut)
+	code := run(context.Background(), withIndexDSN(append([]string{"--config", config, "land-hash"}, args...)), values.get, &out, &errOut)
 	return result{code: code, out: out.String(), errOut: errOut.String()}
 }
 
@@ -391,11 +391,12 @@ func TestLandHashAnswersFromTheIndexOnlyForASourceLandTreeHas(t *testing.T) {
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}
-	cfg, err := declindex.LoadConfig(config)
+	cfg := indexConfig(t, config)
+	target, err := cfg.TreeTarget()
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := declindex.OpenReadOnly(context.Background(), cfg.DB, declindex.IndexOnly)
+	store, err := declindex.OpenReadOnly(context.Background(), target, declindex.IndexOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,9 +480,7 @@ func rewriteConfig(t *testing.T, config, old, new string) {
 	if body == string(raw) {
 		t.Fatalf("configuration %q has no %q", raw, old)
 	}
-	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, body)
 }
 
 // TestLandHashListsTheSourcesRefreshRecorded catches a hasher whose LAND_TREE pathspecs differ from the ones
@@ -565,11 +564,9 @@ func TestLandHashRefusesAnIndexWithoutGitSources(t *testing.T) {
 // transactions, which could combine an old source blob with a later refresh's declarations.
 func TestLandHashReadsOneSnapshotWhileRefreshWaits(t *testing.T) {
 	config, tree, baseTree := landBase(t)
-	cfg, err := declindex.LoadConfig(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := declindex.Open(cfg.DB)
+	cfg := indexConfig(t, config)
+	tgt := cfg.Target()
+	store, err := declindex.Open(context.Background(), tgt)
 	if err != nil {
 		t.Fatal(err)
 	}

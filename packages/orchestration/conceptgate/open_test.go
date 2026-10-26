@@ -9,10 +9,12 @@ import (
 	"testing"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
+	"github.com/sjawhar/legion/orchestration/internal/indextest"
 )
 
 // openFixture is the golden tree of the declindex package as a Git work tree with an empty format-2 registry, a
-// configuration whose index is outside the tree, and that index refreshed at the tree's commit. It needs no Lean.
+// configuration whose state directory is outside the tree, and the index of its schema refreshed at the tree's
+// commit. It needs no Lean.
 func openFixture(t *testing.T) (cfg declindex.Config, tree string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -47,14 +49,23 @@ func openFixture(t *testing.T) (cfg declindex.Config, tree string) {
 	runGit(t, tree, "add", ".")
 	runGit(t, tree, "commit", "-qm", "fixture")
 	config := filepath.Join(dir, "index.yaml")
-	body := "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Golden, Sub]\nregistry: registry\n"
+	body := "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Golden, Sub]\nregistry: registry\n"
 	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The state directory of a configuration holds the exporter and the forms module; nothing else makes it here.
+	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if cfg, err = declindex.LoadConfig(config); err != nil {
 		t.Fatal(err)
 	}
-	s, err := declindex.Open(cfg.DB)
+	cfg.DSN = indextest.DSN(t)
+	target, err := cfg.TreeTarget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := declindex.Open(context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +87,7 @@ func TestGateRejectsRegistryMutationAfterInitialStatus(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	g, err := OpenGate(context.Background(), cfg, Options{SandboxAvailable: func() error { return nil }})
+	g, err := OpenGate(context.Background(), cfg, Options{})
 	if g != nil {
 		g.Close()
 	}

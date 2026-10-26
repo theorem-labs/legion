@@ -25,17 +25,14 @@ type RecheckReport struct {
 // Recheck checks each added concept against its recorded hash and the registry, and sends each near pair to the
 // librarian once. The caller supplies paths added by the landing diff and the loaded registry. When the landed build
 // declares the concept in the module of its home file, that declaration is the concept: its compiled hash must be
-// the recorded one, and that module is read in the sandbox as the gate reads a proposal, with the registry's forms
-// and the compiled sources of its pending concepts, so that the facts of the concept and of the other declarations
-// of its proposal (the concept file's declarations) are compared with every registered concept. Else the stored
-// source is recompiled in the sandbox and compared so. An added file that is not a loaded concept, a landed
-// declaration with another hash, a stored source that Lean refuses or does not compile, and a pending concept left
-// out of the forms are defects; an error means that the recheck could not run.
+// the recorded one, and that module is read as the gate reads a proposal, with the registry's forms and the compiled
+// sources of its pending concepts, so that the facts of the concept and of the other declarations of its proposal
+// (the concept file's declarations) are compared with every registered concept. Else the stored source is checked
+// and recompiled as the gate does a proposal's, and compared so. An added file that is not a loaded concept, a
+// landed declaration with another hash, a stored source that Lean refuses or does not compile, and a pending
+// concept left out of the forms are defects; an error means that the recheck could not run.
 func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (RecheckReport, error) {
 	var report RecheckReport
-	if err := g.checkSandbox(ctx); err != nil {
-		return report, fmt.Errorf("the recheck compiles stored source only in the sandbox: %w", err)
-	}
 	if _, err := g.Index.CompiledCommit(ctx, true); err != nil {
 		return report, err
 	}

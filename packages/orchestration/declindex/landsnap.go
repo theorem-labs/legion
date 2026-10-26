@@ -2,7 +2,8 @@ package declindex
 
 import (
 	"context"
-	"database/sql"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // LandSnapshot is the index state land-hash needs to answer one candidate tree. Its maps are read through the
@@ -34,8 +35,8 @@ func (s *Store) LandSnapshot(ctx context.Context, names []string) (LandSnapshot,
 	if snapshot.Sources, err = s.sourceBlobs(ctx); err != nil {
 		return LandSnapshot{}, err
 	}
-	rows, err := s.q.QueryContext(ctx, `SELECT rel FROM modules`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT rel FROM modules`)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var rel string
 		if err := r.Scan(&rel); err != nil {
 			return err

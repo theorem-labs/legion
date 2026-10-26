@@ -9,10 +9,9 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
-
-	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // leanForTest finds a Lean toolchain on PATH. The exporter tests need one: CI installs it and sets
@@ -170,6 +169,43 @@ func TestExporterExportsNoMatcher(t *testing.T) {
 	}
 }
 
+// A toolchain process takes the thread count of the build that runs it (LEAN_NUM_THREADS), so that many of them
+// together keep to the cores that build was given; nothing else of the caller's environment reaches it.
+func TestLeanEnvPassesTheThreadCount(t *testing.T) {
+	l := Lean{Prefix: t.TempDir()}
+	t.Setenv("LEAN_NUM_THREADS", "3")
+	if env := l.env(nil, t.TempDir()); !slices.Contains(env, "LEAN_NUM_THREADS=3") {
+		t.Errorf("env with LEAN_NUM_THREADS=3 set = %v; want it among them", env)
+	}
+	t.Setenv("LEAN_NUM_THREADS", "")
+	for _, v := range l.env(nil, t.TempDir()) {
+		if strings.HasPrefix(v, "LEAN_NUM_THREADS=") {
+			t.Errorf("env with LEAN_NUM_THREADS unset gave %q", v)
+		}
+	}
+}
+
+// A build passes its own options to each `lean` (a package's options, as `-Dname=value`): CompileModule gives them
+// to Lean, so a module that builds only with them compiles here too.
+func TestCompileModulePassesTheCallersLeanArguments(t *testing.T) {
+	l := leanForTest(t)
+	dir := t.TempDir()
+	src := "theorem big : (List.replicate 2000 1).length = 2000 := by decide\n"
+	if err := os.WriteFile(filepath.Join(dir, "Deep.lean"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := CompileModule(ctx, l, nil, dir, "Deep"); err == nil || !strings.Contains(err.Error(), "maximum recursion depth") {
+		t.Fatalf("compile without the option: %v; want Lean's recursion depth error", err)
+	}
+	if err := CompileModule(ctx, l, nil, dir, "Deep", "-DmaxRecDepth=8192"); err != nil {
+		t.Fatalf("compile with -DmaxRecDepth=8192: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "Deep.olean")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestExporterHashesACopyAsTheOriginal(t *testing.T) {
 	consts := exportFixture(t)
 	orig := consts["Fx.SpAligned"]
@@ -277,66 +313,15 @@ func TestCompileModuleRunsLeanInAMinimalEnvironment(t *testing.T) {
 	}
 }
 
-// Code that a confined compile runs (here an `#eval`) cannot write outside its scratch directory, read the caller's
-// home, start another program, or start Lean itself again.
-func TestCompileConfinedKeepsTheModulesCodeIn(t *testing.T) {
-	l := leanForTest(t)
-	if err := CheckSandbox(context.Background(), l); err != nil {
-		if os.Getenv("DECLINDEX_REQUIRE_SANDBOX") != "" {
-			t.Fatal(err)
-		}
-		t.Skip(err)
-	}
-	dir, err := confine.NewScratch(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	outside := t.TempDir()
-	target := filepath.Join(outside, "written")
-	spawn := func(cmd string) string {
-		return "  let r ← (IO.Process.output { cmd := \"" + cmd + "\", args := #[\"--version\"] }).toBaseIO\n" +
-			"  if let .ok o := r then if o.exitCode == 0 then throw (IO.userError s!\"ran " + cmd + ": {o.stdout}\")\n"
-	}
-	probe := "def probe : IO Unit := do\n" +
-		"  try IO.FS.writeFile \"" + target + "\" \"x\" catch _ => pure ()\n" +
-		"  let home ← (IO.FS.readFile \"" + filepath.Join(os.Getenv("HOME"), ".bashrc") + "\").toBaseIO\n" +
-		"  if home matches .ok _ then throw (IO.userError \"read the home directory\")\n" +
-		spawn("/bin/sh") + spawn(l.bin("lean")) +
-		"  IO.FS.writeFile \"inside\" \"x\"\n" +
-		"#eval probe\n"
-	if err := CompileConfined(context.Background(), l, nil, dir, "Probe", []byte(probe)); err != nil {
-		t.Fatalf("%v", err)
-	}
-	if _, err := os.Stat(target); err == nil {
-		t.Fatal("the confined module wrote outside its directory")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "inside")); err != nil {
-		t.Fatalf("the confined module could not write in its own directory: %v", err)
-	}
-	if err := CompileConfined(context.Background(), l, nil, dir, "Probe", []byte(probe)); err == nil {
-		t.Fatal("a scratch directory that a run already used was accepted")
-	}
-}
-
 // Lean's own parser decides what a proposal holds: text that hides a command from a text filter does not hide it
 // from the parser.
 func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 	l := leanForTest(t)
-	if err := CheckSandbox(context.Background(), l); err != nil {
-		if os.Getenv("DECLINDEX_REQUIRE_SANDBOX") != "" {
-			t.Fatal(err)
-		}
-		t.Skip(err)
-	}
 	dir, _ := compiledFixture(t, l)
 	x := &Exporter{Lean: l, Bin: exporterForTest(t, l)}
 	check := func(body string) error {
 		t.Helper()
-		work, err := confine.NewScratch(t.TempDir())
-		if err != nil {
-			t.Fatal(err)
-		}
-		return x.CheckSource(context.Background(), []byte("import Fixture\n"+body), []string{dir}, work)
+		return x.CheckSource(context.Background(), []byte("import Fixture\n"+body), []string{dir}, t.TempDir())
 	}
 	for _, ok := range []string{
 		"namespace Fx\nopen Fx\n/-- doc -/\n@[simp] def MySp (R : BitVec 5 → BitVec 64) : Prop := R 2#5 &&& 7#64 = 0#64\nend Fx\n",

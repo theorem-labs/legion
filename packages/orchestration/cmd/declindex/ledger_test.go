@@ -18,9 +18,7 @@ func TestLedgerEmitsRegistrationsFromContractsFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	body = append(body, []byte("repo: r\nowners: owners.json\nowners_format: cgraph/owners/v1\ncontracts:\n  paths: [\"Sub/**\"]\n  kinds: [def]\n  name: \"^[A-Z]\"\n")...)
-	if err := os.WriteFile(config, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body))
 	owners := `{"format":"cgraph/owners/v1","owners":[{"id":"function:frame_at","contract":"Sub"}]}`
 	if err := os.WriteFile(filepath.Join(tree, "owners.json"), []byte(owners), 0o644); err != nil {
 		t.Fatal(err)
@@ -37,7 +35,7 @@ func TestLedgerEmitsRegistrationsFromContractsFile(t *testing.T) {
 	}
 	emit := filepath.Join(filepath.Dir(config), "operations.jsonl")
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", config, "ledger", "--contracts-file", contracts, "--emit", emit}, func(k string) string {
+	code := run(context.Background(), withIndexDSN([]string{"--config", config, "ledger", "--contracts-file", contracts, "--emit", emit}), func(k string) string {
 		if k == "LEDGER_DSN" {
 			return "postgres://127.0.0.1:1/unused"
 		}
@@ -85,9 +83,7 @@ func TestLedgerClassifiesConnectionFailureAsTemporary(t *testing.T) {
 		t.Fatal(err)
 	}
 	body = append(body, []byte("repo: r\ncontracts:\n  paths: [\"Sub/**\"]\n  kinds: [def]\n")...)
-	if err := os.WriteFile(config, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body))
 	// The ledger compares the index's commit with the tree's, so the tree is a Git work tree.
 	tree := filepath.Join(filepath.Dir(config), "tree")
 	git(t, tree, "init", "-q")
@@ -97,7 +93,7 @@ func TestLedgerClassifiesConnectionFailureAsTemporary(t *testing.T) {
 		t.Fatalf("refresh: %+v", r)
 	}
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", config, "ledger"}, func(k string) string {
+	code := run(context.Background(), withIndexDSN([]string{"--config", config, "ledger"}), func(k string) string {
 		if k == "LEDGER_DSN" {
 			return "postgres://127.0.0.1:1/ledger"
 		}
@@ -123,9 +119,7 @@ func TestLedgerIsUnableOnATreeThatIsNotAGitWorkTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config, append(body, []byte("repo: r\ncontracts:\n  paths: [\"Sub/**\"]\n  kinds: [def]\n")...), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body)+"repo: r\ncontracts:\n  paths: [\"Sub/**\"]\n  kinds: [def]\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}

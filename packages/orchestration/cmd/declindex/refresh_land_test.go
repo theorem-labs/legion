@@ -44,10 +44,7 @@ func newLandingFixture(t *testing.T) landingFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body = []byte(strings.Replace(string(body), "tree: tree\n", "tree: landing-tree\n", 1) + "remote: " + remote + "\nbuild: [\"true\"]\nbuild_timeout: 1s\n")
-	if err := os.WriteFile(config, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, strings.Replace(string(body), "tree: tree\n", "tree: landing-tree\n", 1)+"remote: "+remote+"\nbuild: [\"true\"]\nbuild_timeout: 1s\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("initial refresh: %+v", r)
 	}
@@ -57,7 +54,7 @@ func newLandingFixture(t *testing.T) landingFixture {
 func (f landingFixture) refreshAt(t *testing.T, commit string) result {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", f.config, "refresh"}, func(key string) string {
+	code := run(context.Background(), withIndexDSN([]string{"--config", f.config, "refresh"}), func(key string) string {
 		if key == "LAND_COMMIT" {
 			return commit
 		}
@@ -68,11 +65,9 @@ func (f landingFixture) refreshAt(t *testing.T, commit string) result {
 
 func assertIndexCommit(t *testing.T, config, want string) {
 	t.Helper()
-	cfg, err := declindex.LoadConfig(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := declindex.Open(cfg.DB)
+	cfg := indexConfig(t, config)
+	tgt := cfg.Target()
+	s, err := declindex.Open(context.Background(), tgt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,11 +144,9 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		if got := git(t, f.tree, "rev-parse", "HEAD"); got != f.second {
 			t.Fatalf("tree HEAD %s, want landed commit %s", got, f.second)
 		}
-		cfg, err := declindex.LoadConfig(f.config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		s, err := declindex.Open(cfg.DB)
+		cfg := indexConfig(t, f.config)
+		tgt := cfg.Target()
+		s, err := declindex.Open(context.Background(), tgt)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -188,9 +181,7 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "remote: "+filepath.Join(filepath.Dir(f.config), "remote.git"), "remote: /does-not-exist", 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, f.config, strings.Replace(string(body), "remote: "+filepath.Join(filepath.Dir(f.config), "remote.git"), "remote: /does-not-exist", 1))
 		if r := f.refreshAt(t, f.second); r.code != 75 {
 			t.Fatalf("missing-remote refresh: %+v", r)
 		}
@@ -201,9 +192,7 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "remote: "+filepath.Join(filepath.Dir(f.config), "remote.git")+"\n", "", 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, f.config, strings.Replace(string(body), "remote: "+filepath.Join(filepath.Dir(f.config), "remote.git")+"\n", "", 1))
 		if r := f.refreshAt(t, f.second); r.code != 3 {
 			t.Fatalf("missing-commit refresh: %+v", r)
 		}
@@ -214,16 +203,12 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", "build: [\"false\"]", 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, f.config, strings.Replace(string(body), "build: [\"true\"]", "build: [\"false\"]", 1))
 		if r := f.refreshAt(t, f.second); r.code != 3 {
 			t.Fatalf("failed-build refresh: %+v", r)
 		}
 		retryBuild := "build:\n  - sh\n  - -c\n  - 'echo retry-build > retry-build'"
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, f.config, strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1))
 		if r := f.refreshAt(t, f.second); r.code != 0 {
 			t.Fatalf("failed-build retry: %+v", r)
 		}
@@ -239,9 +224,7 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 		build := "build:\n  - sh\n  - -c\n  - 'sleep 30 & echo $! > pid; wait'"
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", build, 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, f.config, strings.Replace(string(body), "build: [\"true\"]", build, 1))
 		if r := f.refreshAt(t, f.second); r.code != 75 {
 			t.Fatalf("timed-out build: %+v", r)
 		}
@@ -255,9 +238,7 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		}
 		assertProcessGone(t, pid)
 		retryBuild := "build:\n  - sh\n  - -c\n  - 'echo retry-timeout > retry-timeout'"
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, f.config, strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1))
 		if r := f.refreshAt(t, f.second); r.code != 0 {
 			t.Fatalf("timed-out build retry: %+v", r)
 		}
@@ -272,16 +253,12 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "lib: .\n", "lib: missing\n", 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, f.config, strings.Replace(string(body), "lib: .\n", "lib: missing\n", 1))
 		if r := f.refreshAt(t, f.second); r.code != 3 {
 			t.Fatalf("failed index refresh: %+v", r)
 		}
 		retryBuild := "build:\n  - sh\n  - -c\n  - 'echo retry-refresh > retry-refresh'"
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, f.config, strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1))
 		if r := f.refreshAt(t, f.second); r.code != 0 {
 			t.Fatalf("failed index refresh retry: %+v", r)
 		}
@@ -289,43 +266,6 @@ func TestRefreshAtLandedCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertIndexCommit(t, f.config, f.second)
-	})
-	t.Run("repairs a graph write that failed after the index commit", func(t *testing.T) {
-		f := newLandingFixture(t)
-		cfg, err := declindex.LoadConfig(f.config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Remove(cfg.DB + ".graph"); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Mkdir(cfg.DB+".graph.tmp", 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if r := f.refreshAt(t, f.second); r.code != 3 {
-			t.Fatalf("graph write failure: %+v", r)
-		}
-		if err := os.Remove(cfg.DB + ".graph.tmp"); err != nil {
-			t.Fatal(err)
-		}
-		body, err := os.ReadFile(f.config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		retryBuild := "build:\n  - sh\n  - -c\n  - 'echo retry-graph > retry-graph'"
-		if err := os.WriteFile(f.config, []byte(strings.Replace(string(body), "build: [\"true\"]", retryBuild, 1)), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if r := f.refreshAt(t, f.second); r.code != 0 {
-			t.Fatalf("graph write retry: %+v", r)
-		}
-		if _, err := os.Stat(filepath.Join(f.tree, "retry-graph")); err != nil {
-			t.Fatal(err)
-		}
-		assertIndexCommit(t, f.config, f.second)
-		if r := invoke(t, "--config", f.config, "users", "Frame"); r.code != 0 {
-			t.Fatalf("query after graph repair: %+v", r)
-		}
 	})
 	t.Run("leaves a clean older tree untouched when the index is already current", func(t *testing.T) {
 		f := newLandingFixture(t)

@@ -19,24 +19,16 @@ import (
 //   - With the forms importing M (A's T only), H is read with them: its own closure already holds A's and B's T.
 func TestExportGroupsReadsWithTheFormsADuplicateThatTheFormsImportsHold(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(filepath.Join(t.TempDir(), "index.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	s := openStore(t)
 	for _, d := range [][]string{
 		{"T", "A", "theorem", "h1"}, {"T", "B", "theorem", "h1"}, {"T", "C", "def", "h2"},
 		{"H.x", "H", "def", "h3"}, {"M.y", "M", "def", "h4"}, {"N.y", "N", "def", "h5"}, {"K.y", "K", "def", "h6"},
 	} {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO decls (name, short, module, kind, line, stmt_hash) VALUES (?, ?, ?, ?, 1, ?)`,
-			d[0], d[0], d[1], d[2], d[3]); err != nil {
-			t.Fatal(err)
-		}
+		execIndex(t, s, `INSERT INTO decls (name, short, module, kind, line, stmt_hash) VALUES ($1, $1, $2, $3, 1, $4)`,
+			d[0], d[1], d[2], d[3])
 	}
 	for _, e := range [][2]string{{"H", "A"}, {"H", "B"}, {"M", "A"}, {"N", "B"}, {"K", "C"}} {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO imports (module, imported) VALUES (?, ?)`, e[0], e[1]); err != nil {
-			t.Fatal(err)
-		}
+		execIndex(t, s, `INSERT INTO imports (module, imported) VALUES ($1, $2)`, e[0], e[1])
 	}
 	plan, err := exportGroups(ctx, s.q, []string{"K", "M", "N"}, []string{"H"}, nil)
 	if err != nil {
@@ -58,22 +50,14 @@ func TestExportGroupsReadsWithTheFormsADuplicateThatTheFormsImportsHold(t *testi
 // in that order.
 func indexWith(t *testing.T, decls [][3]string, imports [][2]string) *Store {
 	t.Helper()
-	ctx := context.Background()
-	s, err := Open(filepath.Join(t.TempDir(), "index.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
+	s := openStore(t)
+
 	for _, d := range decls {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO decls (name, short, module, kind, line, stmt_hash) VALUES (?, ?, ?, ?, 1, '')`,
-			d[0], d[0], d[1], d[2]); err != nil {
-			t.Fatal(err)
-		}
+		execIndex(t, s, `INSERT INTO decls (name, short, module, kind, line, stmt_hash) VALUES ($1, $1, $2, $3, 1, '')`,
+			d[0], d[1], d[2])
 	}
 	for _, e := range imports {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO imports (module, imported) VALUES (?, ?)`, e[0], e[1]); err != nil {
-			t.Fatal(err)
-		}
+		execIndex(t, s, `INSERT INTO imports (module, imported) VALUES ($1, $2)`, e[0], e[1])
 	}
 	return s
 }
@@ -155,22 +139,16 @@ func TestAModuleThatBecomesUnreadableLeavesNoCompiledRows(t *testing.T) {
 	if err := os.WriteFile(ilean, []byte(`{"version":5,"module":"M","directImports":[],"decls":{},"references":{}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(filepath.Join(dir, "index.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	s := openStore(t)
 	tree := Tree{Source: dir, Lib: lib, Roots: Roots{"M": true}}
 	if st, err := s.Refresh(ctx, tree, RefreshOptions{Jobs: 1}); err != nil || st.Reread != 1 {
 		t.Fatalf("first refresh: %+v, %v", st, err)
 	}
 	for _, q := range []string{
-		`INSERT INTO consts (name, module, kind, type, cstmt) VALUES ('M.x', 'M', 'def', 'Nat', 'h')`,
-		`INSERT INTO without_forms (module, name, declarer, forms) VALUES ('M', 'dup', 'A', 0), ('M', 'dup', 'B', 1)`,
+		`INSERT INTO consts (name, module, kind, type, cstmt, binders, conclusion) VALUES ('M.x', 'M', 'def', 'Nat', 'h', '[]', 'Nat')`,
+		`INSERT INTO without_forms (module, name, declarer, forms) VALUES ('M', 'dup', 'A', false), ('M', 'dup', 'B', true)`,
 	} {
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
-			t.Fatal(err)
-		}
+		execIndex(t, s, q)
 	}
 	if err := os.WriteFile(ilean, []byte(`{broken`), 0o644); err != nil {
 		t.Fatal(err)
@@ -183,7 +161,7 @@ func TestAModuleThatBecomesUnreadableLeavesNoCompiledRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	var consts int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM consts WHERE module = 'M'`).Scan(&consts); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM idx.consts WHERE module = 'M'`).Scan(&consts); err != nil {
 		t.Fatal(err)
 	}
 	if len(clashes) != 0 || consts != 0 {
