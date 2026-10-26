@@ -13,8 +13,8 @@ import (
 //
 // The entry that holds the most names is edges_owner's, which the reach walk reads alone: the user's module and
 // name, and the owner's module and name, and the kind (edgeEntryBytes). Two names of about 1.3 KB fill it. The
-// longest edge of the copy's index on 2026-10-25 held 474 bytes of names, so a tree reaches the limit only with
-// names several times longer than any it holds today. The others hold a name with one module (decls, consts,
+// longest edge of the copy's index on 2026-10-25 held 479 bytes, so a tree reaches the limit only with names
+// several times longer than any it holds today. The others hold a name with one module (decls, consts,
 // uses, atoms, facts), or, in without_forms, a name with the module that reads it and the module that declares
 // it; each of those is measured where it is written (checkName).
 const indexEntryLimit = 2600
@@ -92,8 +92,9 @@ func checkSources(paths []string) error {
 	return nil
 }
 
-// checkReference refuses a reference read whose names the index cannot hold: each declaration with its module,
-// and each use's constant and user. It runs before the reference write, so a refused tree writes nothing.
+// checkReference refuses a reference read whose names the index cannot hold: each module, each module it
+// imports, each declaration with its module, and each use's constant and user. It runs before the reference
+// write, so a refused tree writes nothing. The source paths are measured beside it (checkSources).
 func checkReference(results []ModuleData, errs []error) error {
 	for i, md := range results {
 		if errs[i] != nil {

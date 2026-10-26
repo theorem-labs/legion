@@ -109,8 +109,8 @@ func TestReachCountsAreTheSameWithAndWithoutWhy(t *testing.T) {
 // Lean puts no bound on a declaration's name, and edges_owner holds four names in one B-tree entry, which
 // Postgres refuses past 2,704 bytes. A tree whose edge would exceed that is refused by name, as an index defect,
 // before the refresh writes anything, and never as a failure inside the database (SQLSTATE 54000), which would
-// stop a landing with no way to read what was wrong. The longest edge of the copy's index holds 474 bytes of
-// names, so the limit is about three times the longest name that tree has.
+// stop a landing with no way to read what was wrong. The longest edge of the copy's index holds 479 bytes, so
+// the limit is more than five times the longest entry that tree has.
 func TestARefreshRefusesByNameAnEdgeThatOneIndexEntryCannotHold(t *testing.T) {
 	// Postgres compresses what it puts in an index, so a name of one letter repeated would fit however long it
 	// is. Lean's generated names are not of one letter: these are drawn from a fixed seed.
@@ -160,5 +160,48 @@ func TestARefreshRefusesByNameAnEdgeThatOneIndexEntryCannotHold(t *testing.T) {
 	}
 	if got.Reach.StatementsChanged != 1 {
 		t.Errorf("the statement that uses it changes %d statements, want 1: %+v", got.Reach.StatementsChanged, got.Reach.ReachCounts)
+	}
+}
+
+// The names the review reproduced as failures inside the database, each measured where the index holds it: a
+// module it imports (imports_imported), a declaration (decls_name), a use's constant (uses_target), a source
+// file's path (sources), a constant and the head of its conclusion (consts, consts_conclusion), an atom
+// (atoms_atom), a concept (facts_concept), a clash of a name two modules declare (without_forms), and an edge.
+func TestEveryIndexedNameIsMeasuredWhereTheIndexHoldsIt(t *testing.T) {
+	huge := strings.Repeat("n", 3000)
+	for _, c := range []struct {
+		what string
+		err  error
+	}{
+		{"an imported module", checkReference([]ModuleData{{Module: "M", Imports: []string{huge}}}, []error{nil})},
+		{"a declaration", checkReference([]ModuleData{{Module: "M", Decls: []Decl{{Name: huge}}}}, []error{nil})},
+		{"a use's constant", checkReference([]ModuleData{{Module: "M",
+			Uses: []Use{{Target: huge, TargetModule: "M", Parent: "p", Class: "stmt"}}}}, []error{nil})},
+		{"a source path", checkSources([]string{huge + ".lean"})},
+		{"a constant", checkName("the constant", huge, "M")},
+		{"a conclusion", checkName("the conclusion of X", huge)},
+		{"an atom", checkName("the atom of X", huge)},
+		{"a concept", checkName("the concept", huge)},
+		{"a clash", checkName("the clash of", huge, "M", "Other")},
+		{"an edge", checkEdge("M", huge, "u", "U", "theorem")},
+	} {
+		var defect *NameTooLongError
+		if !errors.As(c.err, &defect) {
+			t.Errorf("%s of 3,000 bytes: %v; want an index defect that names it", c.what, c.err)
+			continue
+		}
+		if !strings.Contains(defect.Error(), "shorten") {
+			t.Errorf("%s: the refusal does not say what to do: %v", c.what, defect)
+		}
+	}
+	// A tree of ordinary names passes every one of them.
+	if err := checkReference([]ModuleData{{Module: "Linux.fs.namespace", Imports: []string{"Linux.fs.mount"},
+		Decls: []Decl{{Name: "Linux.fs.namespace.alloc_mnt_ns"}},
+		Uses:  []Use{{Target: "Linux.fs.mount.mnt_init", TargetModule: "Linux.fs.mount", Parent: "alloc", Class: "stmt"}}}},
+		[]error{nil}); err != nil {
+		t.Errorf("a tree of ordinary names: %v", err)
+	}
+	if err := checkSources([]string{"Linux/fs/namespace/AllocMntNs/Spec.lean"}); err != nil {
+		t.Errorf("an ordinary source path: %v", err)
 	}
 }

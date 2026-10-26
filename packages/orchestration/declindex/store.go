@@ -61,8 +61,8 @@ CREATE INDEX edges_module ON edges (module);
 -- declaration of the copy's tree: 3.27 s to 2.63 s).
 -- One entry of it therefore holds four names and a kind, and a btree entry holds at most 2704 bytes. A tree
 -- whose edge would exceed that is refused as an index defect, which names it, before anything is written
--- (NameTooLongError, indexEntryLimit): the longest edge of the copy's index holds 474 bytes of names, so the
--- limit is about three times the longest name that tree has.
+-- (NameTooLongError, indexEntryLimit): the longest edge of the copy's index holds 479 bytes, so the limit is
+-- more than five times the longest entry that tree has.
 CREATE INDEX edges_owner ON edges (owner_module, owner) INCLUDE (dst, module, stmt, kind);
 CREATE INDEX edges_target ON edges (target);
 CREATE INDEX edges_closure ON edges (tmodule) WHERE by_closure;
