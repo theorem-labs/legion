@@ -483,14 +483,26 @@ func startsUpper(s string) bool {
 	return s != "" && unicode.IsUpper(firstRune(s))
 }
 
-// group is the recorded uses of one removed name in one module: how many, which is first, and the lines they sit
-// on, which is where Lean's own error must sit for N1 to refuse.
+// group is the recorded uses of one removed name in one module: how many, which is first, and the positions they
+// sit at, which is where Lean's own error must sit for N1 to refuse.
 type group struct {
 	r      *removal
 	module string
 	first  declindex.Use
 	count  int
+	at     map[[2]int]bool
 	lines  map[int]bool
+}
+
+// holds reports whether the base recorded a use of this removal where Lean's error sits. Lean reports a name at
+// its first character, as the reference file records a use, so the column tells two uses on one line apart. It
+// reports a removed field under the term whose structure it cannot find the field in, at that term's position
+// rather than the field's, so a field matches on the line alone.
+func (g *group) holds(e LeanError) bool {
+	if g.r.Field != "" {
+		return g.lines[e.Line]
+	}
+	return g.at[[2]int{e.Line, e.Col}]
 }
 
 // removedUses runs N1: a built module whose file no changes uses a name its own import closure no longer declares.
@@ -542,12 +554,13 @@ func (n *nameState) removedUses(ctx context.Context) ([]landing.Finding, error) 
 		key := [2]string{r.Target, module}
 		g, ok := groups[key]
 		if !ok {
-			g = &group{r: r, module: module, first: u, lines: map[int]bool{}}
+			g = &group{r: r, module: module, first: u, at: map[[2]int]bool{}, lines: map[int]bool{}}
 			groups[key] = g
 			order = append(order, key)
 		} else if u.Line < g.first.Line || (u.Line == g.first.Line && u.Col < g.first.Col) {
 			g.first = u
 		}
+		g.at[[2]int{u.Line, u.Col}] = true
 		g.lines[u.Line] = true
 		g.count++
 	}
@@ -609,7 +622,7 @@ func (n *nameState) blamed(m *Module, g *group) bool {
 		if gone && namesWord(e.Message, normalName(r.Module)) {
 			return true
 		}
-		if !g.lines[e.Line] {
+		if !g.holds(e) {
 			continue
 		}
 		for _, block := range blame.Parse(blameLog(m.Module, e), n.cfg.Roots).Blocks {

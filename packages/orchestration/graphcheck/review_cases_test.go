@@ -167,6 +167,39 @@ func TestAChangedDependencyPackageIsUnable(t *testing.T) {
 	}
 }
 
+// A second library of the root package that `roots` does not name is outside what the check reads, and its base
+// build goes stale exactly as another package's does. Both directions must be unable: a name added there and
+// used, which the build accepts, and a name made private there, which the build refuses.
+func TestAChangedLibraryOutsideTheRootsIsUnable(t *testing.T) {
+	extra := graphchecktest.Variant{
+		Lakefile: "\n[[lean_lib]]\nname = \"Extra\"\n",
+		Files: map[string]string{
+			"Extra.lean":         "def Extra.util : Nat := 7\n",
+			"Lib/ExtraUser.lean": "import Extra\n\ndef Lib.useExtra : Nat := Extra.util\n",
+			"Lib.lean":           libRoot + "import Lib.ExtraUser\n",
+		},
+	}
+	for name, edits := range map[string]map[string][2]string{
+		"a name added there and used": {
+			"Extra.lean":         {"def Extra.util : Nat := 7", "def Extra.util : Nat := 7\ndef Extra.util2 : Nat := 8"},
+			"Lib/ExtraUser.lean": {"def Lib.useExtra : Nat := Extra.util", "def Lib.useExtra : Nat := Extra.util2"},
+		},
+		"a name made private there": {
+			"Extra.lean": {"def Extra.util : Nat := 7", "private def Extra.util : Nat := 7"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := graphchecktest.NewVariant(t, extra)
+			tree := f.EditMany(t, edits)
+			c, idx, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, tree)
+			if err == nil {
+				_, err = graphcheck.Names(context.Background(), c, idx, f.Cfg)
+			}
+			isUnable(t, err)
+		})
+	}
+}
+
 // A module whose name has a dot inside one component (`Lib.«Foo.Bar»`, file Lib/Foo.Bar.lean) is one graphcheck
 // cannot name as Lean and Lake do: the check is unable rather than compiling it under a wrong name.
 func TestADottedModuleNameIsUnable(t *testing.T) {

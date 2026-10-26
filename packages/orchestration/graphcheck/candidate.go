@@ -599,10 +599,12 @@ func moduleOfOutput(rel string) string {
 	return strings.ReplaceAll(rel, "/", ".")
 }
 
-// checkOtherPackages refuses to decide a batch that changes a Lean file of another package of the project: an
-// in-repo dependency's module is built in its own package's context, before the modules that import it, and the
-// check does not reproduce that. Compiling the importers against the old build of it would refuse a change the
-// build accepts, or miss one it refuses, so the check says it cannot decide.
+// checkOtherPackages refuses to decide a batch that changes a Lean file the check does not read: a module of
+// another package of the project, or of another library of the root package that `roots` does not name. The build
+// builds such a module before the modules that import it, and the check neither compiles it nor sees its
+// declarations, so compiling its importers against the base's build of it would refuse a change the build accepts
+// or miss one it refuses. A file with no base object file is a new module of such a library, which the build
+// builds the same way, so it counts too.
 func (c *Candidate) checkOtherPackages(ctx context.Context) error {
 	if len(c.otherLean) == 0 {
 		return nil
@@ -610,17 +612,20 @@ func (c *Candidate) checkOtherPackages(ctx context.Context) error {
 	if err := c.ensureScratch(ctx); err != nil {
 		return err
 	}
-	for _, lib := range c.leanPath {
-		pkg, err := filepath.Rel(c.icfg.Tree, filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(lib)))))
-		if err != nil || pkg == "." || strings.HasPrefix(pkg, "..") {
-			continue
-		}
-		for _, file := range c.otherLean {
+	for _, file := range c.otherLean {
+		where := "a library of this package that the configured roots do not name"
+		for _, lib := range c.leanPath {
+			pkg, err := filepath.Rel(c.icfg.Tree, filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(lib)))))
+			if err != nil || pkg == "." || strings.HasPrefix(pkg, "..") {
+				continue
+			}
 			if rel, err := filepath.Rel(pkg, file); err == nil && !strings.HasPrefix(rel, "..") {
-				return unable("the batch changes %s, a Lean file of the package at %s, which the build builds in "+
-					"its own context before the modules that import it; the check does not reproduce that", file, pkg)
+				where = "the package at " + pkg
+				break
 			}
 		}
+		return unable("the batch changes %s, a Lean file of %s, which the build builds before the modules that "+
+			"import it; the check does not read it", file, where)
 	}
 	return nil
 }

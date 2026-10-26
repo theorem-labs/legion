@@ -48,28 +48,32 @@ costs minutes rather than a second. It prints no timing: the landing program rec
 
 | Rule | Verdict | What it says |
 | --- | --- | --- |
-| C1 | refuse | A changed module the build builds does not compile. |
+| C1 | refuse | A module the build builds and the check compiled does not compile. |
 | N1 | refuse | A built module that the batch does not change uses a name the candidate no longer declares. |
 | N2 | refuse | A name the candidate adds is declared by another built module too. |
 | S2 | flag | A new declaration restates one the candidate already has. |
 | L1 | flag | A link's theorem keeps a contract hypothesis that another directory's link concludes. |
 | P1 | flag | A binder names an interface that no producer has. |
 
-**C1** (`compile.go`). A changed module that Lean refuses is a certain build failure. `blame.Parse` reads the
-compile output with the configured roots, and every declaration it names becomes one refusal, with blame's kind,
-at the error's file, line and column, and the rule text `C1:` followed by Lean's first error line. The landing
-program then attributes it with `SelectFor` exactly as it attributes its build blame, because the name and the
-kind are the same ones its build blame would carry — which is why C1 reports the identifier as Lean wrote it, not
-a name of ours. A failure that names no declaration makes the check unable (exit 3) for that module: never a
-silent pass. C1 covers what a changed module does with a removed name, so there is no separate rule for it.
+**C1** (`compile.go`). A module that Lean refuses is a certain build failure. `blame.Parse` reads the compile
+output with the configured roots, and every declaration it names becomes one refusal, with blame's kind, at the
+error's file, line and column, and the rule text `C1:` followed by Lean's first error line. The landing program
+then attributes it with `SelectFor` exactly as it attributes its build blame, because the name and the kind are
+the same ones its build blame would carry — which is why C1 reports the identifier as Lean wrote it, not a name
+of ours. A failure that names no declaration makes the check unable (exit 3) for that module: never a silent
+pass. It covers the batch's changed modules and the unchanged ones the check compiled, and leaves to N1 the
+unchanged modules N1 reported. C1 covers what a changed module does with a removed name, so there is no separate
+rule for it.
 
 **N1** (`names.go`). A declaration the base had in a changed file, and the compiled candidate no longer has, is
-removed. Each built module whose file the batch does not change and whose recorded uses name it gives one finding,
-at that module's first use, counting the uses and the modules. A removed field is a removed declaration `S.f` of
-a base structure or class `S` that the candidate still declares: compiled output has no notion of a field list, so
-there is no text field list and no table of exceptions. A removal is a **flag** instead of a refusal when a use
-may still resolve: another declaration of the candidate has the removed name's last component, or the structure of
-a removed field now extends another structure, which may give the field back.
+removed. A built module whose file the batch does not change, whose recorded uses name it, and whose own import
+closure no longer declares it, is a candidate for a finding. Lean then decides: the check compiles that module
+against the candidate, and reports it only when the compile fails over this removal — Lean's error sits where the
+base recorded a use of the name, and the landing program's blame reads that declaration there, or the module the
+name came from is gone and Lean says so. A module that compiles gives no finding; one that fails for another
+member's change is C1's; one Lean could not compile is a **flag**, saying so. A removed field is a removed
+declaration `S.f` of a base structure or class `S` that the candidate still declares: compiled output has no
+notion of a field list, so there is no text field list and no table of exceptions.
 
 **N2** (`names.go`). A name a compiled candidate module declares that the base did not declare in that module, and
 that another module declares too, is a refusal at the new declaration when some built module's import closure holds
