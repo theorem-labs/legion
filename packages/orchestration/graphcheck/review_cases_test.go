@@ -236,6 +236,27 @@ func TestAChangedLeanFileNoLibraryBuildsCostsNothing(t *testing.T) {
 	}
 }
 
+// A module that compiles only under an argument the package's configuration gives its library compiles here
+// too: the check passes what the build passes, so a batch is never refused for an argument it was denied.
+func TestACandidateModuleCompilesUnderTheConfiguredArguments(t *testing.T) {
+	deep := "theorem deep : (List.replicate 2000 1).length = 2000 := by decide\n"
+	f := graphchecktest.NewVariant(t, graphchecktest.Variant{
+		Lakefile: "\n[[lean_lib]]\nname = \"Deep\"\nmoreLeanArgs = [\"-DmaxRecDepth=8192\"]\n",
+		Files: map[string]string{
+			"Deep.lean":         "import Deep.Big\n",
+			"Deep/Big.lean":     deep,
+			"Lib/UsesDeep.lean": "import Deep.Big\n\ndef Lib.usesDeep : Nat := 1\n",
+			"Lib.lean":          libRoot + "import Lib.UsesDeep\n",
+		},
+	})
+	tree := f.Edit(t, "Lib/UsesDeep.lean", "def Lib.usesDeep : Nat := 1", "def Lib.usesDeep : Nat := 2")
+	c, idx := open(t, f, tree)
+	hits, err := graphcheck.Names(context.Background(), c, idx, f.Cfg)
+	if err != nil || len(ruleHits(hits, "C1")) != 0 {
+		t.Fatalf("Names = %v, %v; want a decided check with no C1 finding", hits, err)
+	}
+}
+
 // A module whose name has a dot inside one component (`Lib.«Foo.Bar»`, file Lib/Foo.Bar.lean) is one graphcheck
 // cannot name as Lean and Lake do: the check is unable rather than compiling it under a wrong name.
 func TestADottedModuleNameIsUnable(t *testing.T) {

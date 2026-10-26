@@ -55,19 +55,34 @@ func (l *lakeTree) olean(module string) {
 // setup writes a module's setup file as Lake writes it, importArts included.
 func (l *lakeTree) setup(module string, options map[string]any, plugins ...string) {
 	l.t.Helper()
-	type plugin struct {
+	l.setupWith(module, options, plugins, nil)
+}
+
+// setupWith writes a module's setup file with its dynamic libraries as well as its plugins.
+func (l *lakeTree) setupWith(module string, options map[string]any, plugins, dynlibs []string) {
+	l.t.Helper()
+	type path struct {
 		Path string `json:"path"`
 	}
-	ps := []plugin{}
+	ps, ds := []path{}, []path{}
 	for _, p := range plugins {
-		ps = append(ps, plugin{p})
+		ps = append(ps, path{p})
+	}
+	for _, d := range dynlibs {
+		ds = append(ds, path{d})
 	}
 	raw, err := json.Marshal(map[string]any{"name": module, "package": "lib", "isModule": false, "options": options,
-		"plugins": ps, "importArts": map[string]any{"Init": map[string]any{"olean": "/x/Init.olean"}}})
+		"plugins": ps, "dynlibs": ds, "importArts": map[string]any{"Init": map[string]any{"olean": "/x/Init.olean"}}})
 	if err != nil {
 		l.t.Fatal(err)
 	}
 	l.write(filepath.Join(l.ir, strings.ReplaceAll(module, ".", "/")+".setup.json"), raw)
+}
+
+// lakefile writes the package's configuration, which gives the libraries their extra arguments.
+func (l *lakeTree) lakefile(text string) {
+	l.t.Helper()
+	l.write(filepath.Join(l.root, "lakefile.toml"), []byte(text))
 }
 
 // precompiled writes a module's shared library and gives its path.
@@ -90,7 +105,8 @@ func (l *lakeTree) write(path string, raw []byte) {
 
 // candidate is a candidate over the tree whose changed modules are changed, each with its imports.
 func (l *lakeTree) candidate(changed map[string][]string) *Candidate {
-	c := &Candidate{icfg: declindex.Config{Lib: l.lib, Roots: []string{"Lib", "Fresh"}}, modules: map[string]*Module{}, leanPath: []string{l.lib}}
+	c := &Candidate{icfg: declindex.Config{Tree: l.root, Lib: l.lib, Roots: []string{"Lib", "Fresh"}},
+		modules: map[string]*Module{}, leanPath: []string{l.lib}}
 	for _, dep := range l.deps {
 		c.leanPath = append(c.leanPath, dep.lib)
 	}
@@ -98,6 +114,78 @@ func (l *lakeTree) candidate(changed map[string][]string) *Candidate {
 		c.modules[name] = &Module{Change: Change{Module: name, Status: Modified}, Imports: imports}
 	}
 	return c
+}
+
+// A module's compile carries the dynamic libraries its setup lists, after its plugins, as Lake passes them, and
+// the extra arguments the package and its library give it, the package's first.
+func TestLeanArgsPassesDynamicLibrariesAndTheConfiguredArguments(t *testing.T) {
+	l := newLakeTree(t)
+	l.lakefile("moreLeanArgs = [\"-DwarningAsError=true\"]\n\n[[lean_lib]]\nname = \"Lib\"\nmoreLeanArgs = [\"-DmaxRecDepth=8192\"]\nweakLeanArgs = [\"--quiet\"]\n")
+	l.setupWith("Lib.A", map[string]any{"pp.width": 100}, []string{"/tc/libLake_shared.so"}, []string{"/dyn/libOne.so", "/dyn/libTwo.so", "/dyn/libOne.so"})
+	c := l.candidate(map[string][]string{"Lib.A": nil})
+	args, err := c.leanArgs(c.modules["Lib.A"])
+	want := []string{"-Dpp.width=100", "--plugin=/tc/libLake_shared.so", "--load-dynlib=/dyn/libOne.so",
+		"--load-dynlib=/dyn/libTwo.so", "-DwarningAsError=true", "-DmaxRecDepth=8192", "--quiet"}
+	if err != nil || !slices.Equal(args, want) {
+		t.Fatalf("leanArgs = %q, %v; want %q", args, err, want)
+	}
+}
+
+// A module of a library the configuration does not declare takes no extra arguments, and a configuration only
+// Lake can read makes the check unable rather than compile without the arguments it would pass.
+func TestLeanArgsAndTheConfigurationItCannotRead(t *testing.T) {
+	for name, test := range map[string]struct {
+		lakefile string
+		want     []string
+		unable   bool
+	}{
+		"no configuration at all":        {"", nil, false},
+		"a library that is not this one": {"[[lean_lib]]\nname = \"Other\"\nmoreLeanArgs = [\"-Dx=1\"]\n", nil, false},
+		"a configuration it cannot read": {"[[lean_lib]]\nname\n", nil, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := newLakeTree(t)
+			if test.lakefile != "" {
+				l.lakefile(test.lakefile)
+			}
+			l.setup("Lib.A", nil)
+			c := l.candidate(map[string][]string{"Lib.A": nil})
+			args, err := c.leanArgs(c.modules["Lib.A"])
+			var unable *UnableError
+			if errors.As(err, &unable) != test.unable {
+				t.Fatalf("leanArgs error = %v, want unable = %v", err, test.unable)
+			}
+			if !test.unable && !slices.Equal(args, test.want) {
+				t.Fatalf("leanArgs = %q, want %q", args, test.want)
+			}
+		})
+	}
+}
+
+// A library the build precompiles is linked into every module that imports it under one name,
+// `lib<package>_<Library>.so`, beside the per-module `<package>_<Module>.so`. A changed module of that library
+// makes both stale, so a compile that would load either is unable rather than reading the old code.
+func TestLeanArgsIsUnableForAChangedModuleOfAPrecompiledLibrary(t *testing.T) {
+	for name, plugin := range map[string]string{
+		"the library's own shared library": "/p/.lake/build/lib/liblib_Meta.so",
+		"the module's shared library":      "/p/.lake/build/lib/lean/lib_Meta_Fast.so",
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := newLakeTree(t)
+			l.lakefile("[[lean_lib]]\nname = \"Meta\"\nprecompileModules = true\n\n[[lean_lib]]\nname = \"Lib\"\n")
+			l.setupWith("Meta.Fast", nil, []string{"/tc/libLake_shared.so"}, nil)
+			l.setupWith("Lib.A", nil, []string{"/tc/libLake_shared.so", plugin}, nil)
+			c := l.candidate(map[string][]string{"Meta.Fast": nil, "Lib.A": {"Meta.Fast"}})
+			c.icfg.Roots = []string{"Lib", "Meta"}
+			for i := range c.modules {
+				c.modules[i].Change.Path = strings.ReplaceAll(i, ".", "/") + ".lean"
+			}
+			var unable *UnableError
+			if _, err := c.leanArgs(c.modules["Lib.A"]); !errors.As(err, &unable) || !strings.Contains(unable.Reason, "Meta.Fast") {
+				t.Fatalf("leanArgs error = %v, want *UnableError naming Meta.Fast", err)
+			}
+		})
+	}
 }
 
 func sorted(args ...string) []string {

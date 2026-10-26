@@ -17,14 +17,37 @@ import (
 )
 
 // lakeSetup is the part of a module's setup file (`<build>/ir/<Module>.setup.json`) that Lake hands Lean: the
-// package the module belongs to, the options of its package and library, and the shared libraries Lean loads as
-// plugins (the toolchain's, the dependencies', and the precompiled modules' of its import closure).
+// package the module belongs to, the options of its package and library, the shared libraries Lean loads as
+// plugins (the toolchain's, the dependencies', and the precompiled modules' of its import closure), and the
+// dynamic libraries it loads beside them.
 type lakeSetup struct {
 	Package string                     `json:"package"`
 	Options map[string]json.RawMessage `json:"options"`
 	Plugins []struct {
 		Path string `json:"path"`
 	} `json:"plugins"`
+	Dynlibs []struct {
+		Path string `json:"path"`
+	} `json:"dynlibs"`
+}
+
+// dynlibPaths is a setup's dynamic libraries, each path once, in its order.
+func (setup *lakeSetup) dynlibPaths() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, l := range setup.Dynlibs {
+		if !seen[l.Path] {
+			seen[l.Path] = true
+			out = append(out, l.Path)
+		}
+	}
+	return out
+}
+
+// lakeArgs are the extra arguments a package's configuration gives every compile of a library: `moreLeanArgs`
+// are part of the build's trace, `weakLeanArgs` are not, and Lake passes both to `lean`.
+type lakeArgs struct {
+	More, Weak []string
 }
 
 // lakeLibrary is one `[[lean_lib]]` of the root package, as `lakefile.toml` declares it: where its sources are,
@@ -38,6 +61,8 @@ type lakeLibrary struct {
 	Roots []string
 	// Globs are the library's globs, each a root (`Extra`), its submodules (`Extra.*`) or both (`Extra.+`).
 	Globs []string
+	// Args are the extra arguments the package and the library give every compile of the library's modules.
+	Args lakeArgs
 }
 
 // owns reports whether a library builds a module: one of its roots is the module or a prefix of it, or one of
@@ -138,6 +163,7 @@ func (c *Candidate) lakeLibraries() ([]lakeLibrary, bool) {
 func parseLakefile(text string) ([]lakeLibrary, bool) {
 	var libraries []lakeLibrary
 	var packageSrcDir string
+	var packageArgs lakeArgs
 	table, lines := "", strings.Split(text, "\n")
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(stripTOMLComment(lines[i]))
@@ -176,10 +202,11 @@ func parseLakefile(text string) ([]lakeLibrary, bool) {
 		// value the reader does not need (`linter.unusedVariables` in the options), and the switch below skips it.
 		odd := key == "" || strings.ContainsAny(key, `".'`)
 		first := strings.Trim(strings.SplitN(key, ".", 2)[0], `"' `)
+		extra := key == "moreLeanArgs" || key == "weakLeanArgs"
 		switch {
 		case odd && table == "lean_lib":
 			return nil, false
-		case table == "" && (first == "lean_lib" || first == "lean_libs" || (odd && first == "srcDir")):
+		case table == "" && (first == "lean_lib" || first == "lean_libs" || (odd && (first == "srcDir" || first == "moreLeanArgs" || first == "weakLeanArgs"))):
 			return nil, false
 		}
 		// An array over several lines runs to the line that closes it.
@@ -192,8 +219,28 @@ func parseLakefile(text string) ([]lakeLibrary, bool) {
 			if packageSrcDir, ok = tomlString(value); !ok {
 				return nil, false
 			}
+		case table == "" && extra:
+			items, ok := tomlStrings(value)
+			if !ok {
+				return nil, false
+			}
+			if key == "moreLeanArgs" {
+				packageArgs.More = items
+			} else {
+				packageArgs.Weak = items
+			}
 		case table != "lean_lib":
 			continue
+		case extra:
+			items, ok := tomlStrings(value)
+			if !ok {
+				return nil, false
+			}
+			if key == "moreLeanArgs" {
+				libraries[len(libraries)-1].Args.More = items
+			} else {
+				libraries[len(libraries)-1].Args.Weak = items
+			}
 		case key == "name", key == "srcDir":
 			text, ok := tomlString(value)
 			if !ok {
@@ -220,9 +267,12 @@ func parseLakefile(text string) ([]lakeLibrary, bool) {
 		if libraries[i].Name == "" {
 			return nil, false
 		}
-		// Lake joins the package's source directory with the library's own, and defaults the library's roots to
-		// its name. A name or a root may be written in guillemets, which are no part of the module's name.
+		// Lake joins the package's source directory with the library's own, gives every library the package's
+		// extra arguments before its own, and defaults the library's roots to its name. A name or a root may be
+		// written in guillemets, which are no part of the module's name.
 		libraries[i].SrcDir = filepath.Join(packageSrcDir, libraries[i].SrcDir)
+		libraries[i].Args.More = append(slices.Clone(packageArgs.More), libraries[i].Args.More...)
+		libraries[i].Args.Weak = append(slices.Clone(packageArgs.Weak), libraries[i].Args.Weak...)
 		libraries[i].Name = unquoteName(libraries[i].Name)
 		if len(libraries[i].Roots) == 0 {
 			libraries[i].Roots = []string{libraries[i].Name}
@@ -322,6 +372,9 @@ type lakeState struct {
 	plugins map[string][]string   // module without a setup of its own -> the plugin list worked out for it
 	pending map[string]bool       // modules whose plugin list is being worked out
 	stale   map[string]string     // shared library path -> the changed precompiled module it belongs to
+	// staleStem maps the build's own name for such a library, without its `lib` prefix and `.so` suffix, to the
+	// changed module that makes it stale: a module's own library, and the library it belongs to.
+	staleStem map[string]string
 }
 
 // leanArgs gives the arguments Lake gives a module's compile, read from the base build's setup files:
@@ -378,15 +431,45 @@ func (c *Candidate) leanArgs(m *Module) ([]string, error) {
 	}
 	sort.Strings(options)
 	args := slices.Compact(options)
-	// The plugins keep Lake's order: one plugin's symbols resolve against those loaded before it, so a sorted list
-	// fails to load.
+	// The plugins keep Lake's order: one plugin's symbols resolve against those loaded before it, so a sorted
+	// list fails to load. The dynamic libraries of the module's own setup follow them, as Lake passes them.
 	for _, p := range plugins {
-		if module, ok := s.stale[p]; ok {
+		if module, ok := s.staleOf(p); ok {
 			return nil, staleLibrary(module, m.Module)
 		}
 		args = append(args, "--plugin="+p)
 	}
-	return args, nil
+	if own != nil {
+		for _, l := range own.dynlibPaths() {
+			if module, ok := s.staleOf(l); ok {
+				return nil, staleLibrary(module, m.Module)
+			}
+			args = append(args, "--load-dynlib="+l)
+		}
+	}
+	extra, err := c.libraryArgs(m)
+	if err != nil {
+		return nil, err
+	}
+	return append(args, extra...), nil
+}
+
+// libraryArgs are the extra arguments the package's configuration gives every compile of the module's library,
+// in Lake's order: the package's, then the library's. A module of no library of this package — one whose library
+// the configured roots do name, so it is the check's own — takes the arguments of the library that owns it, and
+// none when none does. A configuration only Lake can read makes the check unable, as it does elsewhere.
+func (c *Candidate) libraryArgs(m *Module) ([]string, error) {
+	libraries, known := c.lakeLibraries()
+	if !known {
+		return nil, unable("only Lake can say which arguments %s compiles with: the package's configuration is "+
+			"one this check does not read", m.Module)
+	}
+	for _, lib := range libraries {
+		if lib.owns(m.Module) {
+			return append(slices.Clone(lib.Args.More), lib.Args.Weak...), nil
+		}
+	}
+	return nil, nil
 }
 
 // pluginsOf is a module's plugin list in load order: its own setup's, else the merge of what its imports bring.
@@ -541,8 +624,18 @@ func staleLibrary(module, importer string) error {
 		"the check cannot rebuild a precompiled module's shared library", module, importer)
 }
 
-// findStale records the base shared library of every changed module that has one.
+// findStale records the base shared libraries that a changed module makes stale: the module's own, where the
+// build compiled one for it, and the one of a library a changed module belongs to, which the build links from
+// every module of that library.
+//
+// The names are the build's own, read off its setup files rather than guessed: a module's library is
+// `<package>_<Module>.so` beside the object files, and a library's is `lib<package>_<Library>.so` in the
+// directory above, both mangled as Lean mangles a module name. Every plugin path of every setup file is matched
+// against those two shapes, so a name the build spells differently is found all the same, and a compile cannot
+// load a stale library in silence.
 func (s *lakeState) findStale() error {
+	byStem := map[string]string{}
+	libraries, _ := s.c.lakeLibraries()
 	for name := range s.c.modules {
 		setup, err := s.setup(name)
 		if err != nil {
@@ -554,8 +647,32 @@ func (s *lakeState) findStale() error {
 		if lib, ok := s.sharedLibrary(name, setup.Package); ok {
 			s.stale[lib] = name
 		}
+		byStem[initializationStem(name, setup.Package)] = name
+		for _, library := range libraries {
+			if library.owns(name) {
+				byStem[initializationStem(library.Name, setup.Package)] = name
+			}
+		}
 	}
+	s.staleStem = byStem
 	return nil
+}
+
+// staleOf is the changed module whose shared library a path names, when it names one. The name is matched on
+// the build's own spelling: `<package>_<Module>.so` for a module's library, `lib<package>_<Library>.so` for a
+// library's, each mangled as Lean mangles a module name.
+func (s *lakeState) staleOf(path string) (string, bool) {
+	if module, ok := s.stale[path]; ok {
+		return module, true
+	}
+	// A module's library is named by the stem itself, a library's by the stem with Lake's `lib` before it.
+	name := strings.TrimSuffix(filepath.Base(path), ".so")
+	for _, stem := range []string{name, strings.TrimPrefix(name, "lib")} {
+		if module, ok := s.staleStem[stem]; ok {
+			return module, true
+		}
+	}
+	return "", false
 }
 
 // setup reads a module's base setup file from the build of the package that builds it, or gives nil when none of
