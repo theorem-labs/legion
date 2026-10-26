@@ -268,6 +268,10 @@ func (s *Store) refreshLocked(ctx context.Context, tree Tree, generation int64, 
 	if err := checkReference(r.results, r.errs); err != nil {
 		return st, err
 	}
+	// sources keys a file by its path, and modules by the path of its module's source.
+	if err := checkSources(slices.Sorted(maps.Keys(r.sources))); err != nil {
+		return st, err
+	}
 	if err := s.writeTxFrom(ctx, generation, func(tx pgx.Tx) error {
 		if err := writeSources(ctx, tx, r.storedSources, r.sources); err != nil {
 			return err

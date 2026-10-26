@@ -81,6 +81,17 @@ func checkName(what string, names ...string) error {
 	return nil
 }
 
+// checkSources refuses a source whose path the index cannot hold: sources has the path as its primary key, and
+// modules keys a module by its path.
+func checkSources(paths []string) error {
+	for _, p := range paths {
+		if err := checkName("the source file", p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // checkReference refuses a reference read whose names the index cannot hold: each declaration with its module,
 // and each use's constant and user. It runs before the reference write, so a refused tree writes nothing.
 func checkReference(results []ModuleData, errs []error) error {
@@ -90,6 +101,12 @@ func checkReference(results []ModuleData, errs []error) error {
 		}
 		if err := checkName("the module", md.Module, ""); err != nil {
 			return err
+		}
+		// imports_imported indexes the imported module's name, and imports_module the importer's.
+		for _, imp := range md.Imports {
+			if err := checkName("the module imported by "+md.Module, imp); err != nil {
+				return err
+			}
 		}
 		for _, d := range md.Decls {
 			if err := checkName("the declaration", d.Name, md.Module); err != nil {
