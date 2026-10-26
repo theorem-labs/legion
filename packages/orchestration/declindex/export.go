@@ -270,6 +270,15 @@ type Manifest struct {
 	// compiled as a module of its own, is hashed as of the module of its home file, where it lands. Else each
 	// constant counts with the module that declares it.
 	Home string `json:"home"`
+	// Homes are modules counted as declared in a home of their own, whether in Modules or not, over Home: a pending
+	// concept's compiled source, hashed as of the module of its home file.
+	Homes []ModuleHome `json:"homes"`
+}
+
+// ModuleHome is a module that the hashes count as declared in Home.
+type ModuleHome struct {
+	Module string `json:"module"`
+	Home   string `json:"home"`
 }
 
 // DefaultBudget is the node budget of one constant's walk.
@@ -286,7 +295,7 @@ func nonNil[T any](s []T) []T {
 // complete gives every field a JSON value: the exporter reads no null.
 func (m Manifest) complete() Manifest {
 	m.Modules, m.Imports, m.Roots = nonNil(m.Modules), nonNil(m.Imports), nonNil(m.Roots)
-	m.Forms, m.Concepts = nonNil(m.Forms), nonNil(m.Concepts)
+	m.Forms, m.Concepts, m.Homes = nonNil(m.Forms), nonNil(m.Concepts), nonNil(m.Homes)
 	m.Budget = DefaultBudget
 	return m
 }
@@ -299,14 +308,17 @@ type Fact struct {
 
 // Constant is what the exporter read about one compiled constant.
 type Constant struct {
-	Name      string   `json:"n"`
-	Module    string   `json:"m"`
-	Kind      string   `json:"k"`
-	Type      string   `json:"t"`
-	Hash      string   `json:"h"`
-	Atoms     []string `json:"a"`
-	Facts     []Fact   `json:"f"`
-	Truncated bool     `json:"tr"`
+	Name   string `json:"n"`
+	Module string `json:"m"`
+	Kind   string `json:"k"`
+	Type   string `json:"t"`
+	Hash   string `json:"h"`
+	// LegacyHash is the hash by the formula before an inductive's constructor names and a literal definition's own
+	// name counted, set only where it differs from Hash: a concept file recorded by that formula holds it.
+	LegacyHash string   `json:"h0,omitempty"`
+	Atoms      []string `json:"a"`
+	Facts      []Fact   `json:"f"`
+	Truncated  bool     `json:"tr"`
 	// Binders are the heads of the types of the constant's explicit binders, in order, and Conclusion the head of its
 	// type past every binder and every `let` or `have` among them. A head is the constant at the bottom of the
 	// application at the top of a type, past the type's own binders, metadata and type annotations (a default

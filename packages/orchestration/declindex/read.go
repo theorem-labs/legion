@@ -142,7 +142,7 @@ func (s *Store) Imports(ctx context.Context) (map[string][]string, error) {
 }
 
 // ConstantsIn gives the compiled constants of the modules as the index's compiled part holds them: what the
-// exporter gave (Constant), without Atoms, Facts and Truncated, sorted by module and name. A module that a graph
+// exporter gave (Constant), without Atoms, Facts, Truncated and LegacyHash, sorted by module and name. A module that a graph
 // check compiles itself gives the same rows from Exporter.Run with Manifest.Types. The rows are of the index's commit
 // only when CompiledCommit(ctx, true) accepts the index; else a module has none, or another commit's.
 func (s *Store) ConstantsIn(ctx context.Context, modules []string) ([]Constant, error) {

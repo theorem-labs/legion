@@ -262,7 +262,7 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	if err != nil {
 		return v, err
 	}
-	consts, pending, err := g.export(ctx, reg, p, home)
+	consts, fresh, pending, err := g.export(ctx, reg, p, home)
 	v.Defects = append(v.Defects, pending...)
 	if err != nil {
 		return v, err
@@ -287,7 +287,10 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 		case err != nil:
 			return v, err
 		}
-		if (rc.Hash != "" && rc.Hash == decl.Hash) || (c.CompiledHash != "" && c.CompiledHash == decl.Hash) {
+		// A pending concept is compared by what its stored source compiles to now as well as by the hash its file
+		// recorded, which a change of the hash's formula leaves stale.
+		if (rc.Hash != "" && rc.Hash == decl.Hash) || (c.CompiledHash != "" && c.CompiledHash == decl.Hash) ||
+			(fresh[c.Name].Hash != "" && fresh[c.Name].Hash == decl.Hash) {
 			return decided(Refused, c.Name, c.Home, "the compiled statement equals the registered concept's")
 		}
 		if rc.Hash == "" && c.CompiledHash == "" && len(c.Forms) == 0 && c.Source == "" {
@@ -427,25 +430,32 @@ func admit(ctx context.Context, ex *declindex.Exporter, run, module, source stri
 	return dir, nil
 }
 
+// pendingSource is a pending concept's compiled source: the module it is compiled as, and the module of its home file,
+// which its constants are hashed as of, so that they hash as the declaration that lands there.
+type pendingSource struct {
+	Concept, Module, Home string
+}
+
 // pendingForms gives the forms module of a decision on the proposal of the concept exclude, or of the recheck of a
 // landed declaration when exclude is empty, with the compiled sources of the registry concepts that the index does
-// not yet declare. It runs only from the gate's export path (read); refresh and FormsModule never receive those
-// source bytes. A pending concept whose source the text filter or Lean refuses is a defect of that concept, left out
-// of the forms. The proposal supplies exclude, also when the index declares it outside its home file. Lean refuses
-// two definitions of one name, so the forms then import no module whose imports declare exclude (hiddenModules),
-// and a concept whose compiled constant is in such a module is pending.
-func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exporter, run, exclude string) (declindex.FormsModule, []Defect, error) {
+// not yet declare, and those sources' modules. It runs only from the gate's export path (read); refresh and
+// FormsModule never receive those source bytes. A pending concept whose source the text filter or Lean refuses is a
+// defect of that concept, left out of the forms. The proposal supplies exclude, also when the index declares it
+// outside its home file. Lean refuses two definitions of one name, so the forms then import no module whose imports
+// declare exclude (hiddenModules), and a concept whose compiled constant is in such a module is pending.
+func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exporter, run, exclude string) (declindex.FormsModule, []pendingSource, []Defect, error) {
 	var hidden map[string]bool
 	if exclude != "" {
 		var err error
 		if hidden, err = hiddenModules(ctx, g.Index, exclude); err != nil {
-			return declindex.FormsModule{}, nil, err
+			return declindex.FormsModule{}, nil, nil, err
 		}
 	}
 	fm, err := forms(ctx, g.Index, reg, hidden)
 	if err != nil {
-		return fm, nil, err
+		return fm, nil, nil, err
 	}
+	var sources []pendingSource
 	var defects []Defect
 	defect := func(c Concept, format string, args ...any) {
 		defects = append(defects, Defect{Path: conceptFile(c), Message: fmt.Sprintf("pending concept %s: ", c.Name) + fmt.Sprintf(format, args...)})
@@ -457,7 +467,7 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		compiled, err := conceptConstant(ctx, g.Index, c)
 		var nf *declindex.NotFoundError
 		if err != nil && !errors.As(err, &nf) {
-			return fm, defects, err
+			return fm, sources, defects, err
 		}
 		if err == nil && compiled.Hash != "" && !hidden[compiled.Module] {
 			continue
@@ -477,7 +487,7 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		dir, err := admit(ctx, ex, run, module, c.Source)
 		if err != nil {
 			if !sourceFailed(err) {
-				return fm, defects, fmt.Errorf("pending concept %s: %w", c.Name, err)
+				return fm, sources, defects, fmt.Errorf("pending concept %s: %w", c.Name, err)
 			}
 			defect(c, "%v", err)
 			continue
@@ -485,10 +495,15 @@ func (g *Gate) pendingForms(ctx context.Context, reg Registry, ex *declindex.Exp
 		ex.SearchPath = append(ex.SearchPath, dir)
 		if !slices.Contains(fm.Imports, module) {
 			fm.Imports = append(fm.Imports, module)
+			home, err := homeModule(ctx, g.Index, c)
+			if err != nil {
+				return fm, sources, defects, err
+			}
+			sources = append(sources, pendingSource{Concept: c.Name, Module: module, Home: home})
 		}
 		fm.Concepts = append(fm.Concepts, declindex.ConceptForms{Concept: c.Name, Forms: c.Forms})
 	}
-	return fm, defects, nil
+	return fm, sources, defects, nil
 }
 
 // hiddenModules are the modules in which the index declares name, and every module that imports one of them.
@@ -538,7 +553,7 @@ func (g *Gate) landedConstants(ctx context.Context, reg Registry, d declindex.Fo
 	if !slices.Contains(parts, d.Name) {
 		return nil, nil, fmt.Errorf("the index declares %s in %s but holds no compiled constant of it: refresh the index with lean.export on", d.Name, d.At())
 	}
-	consts, defects, err := g.read(ctx, reg, nil, d.Module, "")
+	consts, _, defects, err := g.read(ctx, reg, nil, d.Module, "")
 	if err != nil {
 		return nil, defects, err
 	}
@@ -546,8 +561,9 @@ func (g *Gate) landedConstants(ctx context.Context, reg Registry, d declindex.Fo
 }
 
 // export checks the proposal, compiles it against the build and reads it with the registry's forms (read), hashed
-// as of home, the module of the proposal's home file (homeModule).
-func (g *Gate) export(ctx context.Context, reg Registry, p Proposal, home string) ([]declindex.Constant, []Defect, error) {
+// as of home, the module of the proposal's home file (homeModule). It also gives the compiled constant of each
+// pending concept, by name.
+func (g *Gate) export(ctx context.Context, reg Registry, p Proposal, home string) ([]declindex.Constant, map[string]declindex.Constant, []Defect, error) {
 	return g.read(ctx, reg, &p, ProposalModule, home)
 }
 
@@ -579,16 +595,18 @@ func landedNames(own map[string]bool, home string) []string {
 // read reads module with the registry's forms, each step in a fresh directory of its own below one run directory
 // that the gate owns and removes. With a proposal p, it first checks p's source and compiles it as module against
 // the build, and the forms leave p's concept out (pendingForms); without one, module is the landed build's. home,
-// when set, is the module that module's constants are hashed as of. It also gives the defects of the pending
-// concepts it left out of the forms. When the proposal's own source is refused or does not compile, the error
-// satisfies sourceFailed.
-func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module, home string) ([]declindex.Constant, []Defect, error) {
+// when set, is the module that module's constants are hashed as of. It reads the pending concepts' compiled sources
+// in the same run, each hashed as of its own home file's module, and gives the constant of each pending concept by
+// name: what its stored source compiles to now, which the hash its file recorded may no longer be. It also gives the
+// defects of the pending concepts it left out of the forms. When the proposal's own source is refused or does not
+// compile, the error satisfies sourceFailed.
+func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module, home string) ([]declindex.Constant, map[string]declindex.Constant, []Defect, error) {
 	if err := os.MkdirAll(g.WorkDir, 0o700); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	run, err := os.MkdirTemp(g.WorkDir, "read-")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer os.RemoveAll(run)
 	exclude := ""
@@ -599,15 +617,15 @@ func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module, home
 	// never in the forms directory that refresh shares.
 	formsDir, err := os.MkdirTemp(run, "forms-")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	ex := *g.Compiled.Exporter
 	ex.ScratchDir = run
 	co := *g.Compiled
 	co.Exporter, co.Dir = &ex, formsDir
-	forms, defects, err := g.pendingForms(ctx, reg, &ex, run, exclude)
+	forms, sources, defects, err := g.pendingForms(ctx, reg, &ex, run, exclude)
 	if err != nil {
-		return nil, defects, err
+		return nil, nil, defects, err
 	}
 	co.Forms = forms
 	roots := declindex.Roots{}
@@ -618,11 +636,29 @@ func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module, home
 	if p != nil {
 		compiled, err := admit(ctx, &ex, run, module, p.Source)
 		if err != nil {
-			return nil, defects, err
+			return nil, nil, defects, err
 		}
 		roots[module] = true
 		extra = []string{compiled}
 	}
-	consts, err := co.Export(ctx, roots, []string{module}, extra, home)
-	return consts, defects, err
+	modules := []string{module}
+	var homes []declindex.ModuleHome
+	for _, s := range sources {
+		modules = append(modules, s.Module)
+		homes = append(homes, declindex.ModuleHome{Module: s.Module, Home: s.Home})
+	}
+	all, err := co.Export(ctx, roots, modules, extra, home, homes)
+	if err != nil {
+		return nil, nil, defects, err
+	}
+	pending := map[string]declindex.Constant{}
+	for _, s := range sources {
+		for _, c := range all {
+			if c.Module == s.Module && c.Name == s.Concept {
+				pending[s.Concept] = c
+			}
+		}
+	}
+	consts := slices.DeleteFunc(all, func(c declindex.Constant) bool { return c.Module != module })
+	return consts, pending, defects, nil
 }

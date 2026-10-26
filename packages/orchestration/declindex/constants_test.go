@@ -31,7 +31,7 @@ func writeConstants(t *testing.T, s *Store, modules []string, consts []Constant)
 }
 
 // ConstantsIn gives the compiled rows of modules, and ConstantsConcluding the rows whose conclusion head is one of
-// heads: each as the exporter gave it, without its atoms and facts, sorted by module and name.
+// heads: each as the exporter gave it, without its atoms, facts and previous formula's hash, sorted by module and name.
 func TestConstantsReadTheCompiledRows(t *testing.T) {
 	s := refreshedGolden(t)
 	ctx := context.Background()
@@ -79,7 +79,7 @@ func builtGolden(t *testing.T) (Tree, *Exporter) {
 func byModuleAndName(consts []Constant) []Constant {
 	out := slices.Clone(consts)
 	for i := range out {
-		out[i].Atoms, out[i].Facts, out[i].Truncated = nil, nil, false
+		out[i].Atoms, out[i].Facts, out[i].Truncated, out[i].LegacyHash = nil, nil, false, ""
 	}
 	slices.SortFunc(out, func(a, b Constant) int { return cmp.Or(cmp.Compare(a.Module, b.Module), cmp.Compare(a.Name, b.Name)) })
 	return out

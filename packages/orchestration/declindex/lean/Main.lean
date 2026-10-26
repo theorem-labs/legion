@@ -4,15 +4,23 @@ open Lean Meta DeclExport
 
 /-! `declexport MANIFEST.json`: load compiled modules (no elaboration, no build) and print one JSON line for each
 constant of the target modules: its name `n`, module `m`, kind `k`, printed type `t`, compiled statement hash `h`,
-relation atom hashes `a`, the registered facts it states `f`, the heads of its explicit binders' types `b` and of its
-conclusion `c` (`headsOf`), and `tr` when the walk hit its node budget. The manifest names the target modules, extra
-modules to import, the project's roots, the forms (`{concept, const}`: a constant whose value is a form lambda), the
-concepts' own declarations, and the module that the hashes count the target modules' constants as declared in
-(`home`). -/
+the hash by the formula before constructor and literal names counted `h0` when it differs from `h`, relation atom
+hashes `a`, the registered facts it states `f`, the heads of its explicit binders' types `b` and of its conclusion `c`
+(`headsOf`), and `tr` when the walk hit its node budget. The manifest names the target modules, extra modules to
+import, the project's roots, the forms (`{concept, const}`: a constant whose value is a form lambda), the concepts'
+own declarations, the module that the hashes count the target modules' constants as declared in (`home`), and
+modules counted as declared in a home of their own (`homes`). -/
 
 structure ConstRef where
   concept : String
   const : String
+  deriving FromJson
+
+/-- A module whose constants the hashes count as declared in `home`: a pending concept's compiled source, hashed as
+of the module of its home file, where it lands. -/
+structure ModuleHome where
+  module : String
+  home : String
   deriving FromJson
 
 structure Manifest where
@@ -26,6 +34,9 @@ structure Manifest where
   /-- When not empty, the module that the hashes count the constants of the target modules as declared in: a
   proposal, compiled as a module of its own, is hashed as of the module of its home file, where it lands. -/
   home : String := ""
+  /-- Modules counted as declared in a home of their own (`ModuleHome`), whether target modules or not; they win
+  over `home`. -/
+  homes : Array ModuleHome := #[]
   deriving FromJson
 
 /-- A dotted name as Lean prints it: a component in `«…»` may hold dots and other characters. -/
@@ -107,6 +118,40 @@ partial def binderNames : Expr → List String
   | .forallE n _ b _ => n.toString :: binderNames b
   | _ => []
 
+/-- What the hash of an inductive counts beside its type and its constructors' types, constructor by constructor:
+the constructor's own name past the inductive's (`ctor:walk` for `Mode.walk`), then its fields' names past the
+inductive's parameters. Without the constructors' names, every enumeration would hash as any other with as many
+constructors, since each of their constructors has no field and the same type. -/
+def inductiveNames (env : Environment) (v : InductiveVal) : List String :=
+  v.ctors.flatMap fun k =>
+    let own := s!"ctor:{k.replacePrefix v.name .anonymous}"
+    match env.find? k with
+    | some kc => own :: (binderNames kc.type).drop v.numParams
+    | none => [own]
+
+/-- `e` is a numeral or a literal and nothing else: a literal, or `OfNat.ofNat`, `OfScientific.ofScientific`,
+`Neg.neg`, `BitVec.ofNat` (`n#w`) or `Char.ofNat` of literals, whatever the instance. -/
+partial def isLiteral (e : Expr) : Bool :=
+  match withoutAnnotations e with
+  | .lit _ => true
+  | e =>
+    let args := e.getAppArgs
+    match e.getAppFn with
+    | .const ``OfNat.ofNat _ => args.size == 3 && isLiteral args[1]!
+    | .const ``OfScientific.ofScientific _ => args.size == 5 && isLiteral args[2]! && isLiteral args[4]!
+    | .const ``Neg.neg _ => args.size == 3 && isLiteral args[2]!
+    | .const ``BitVec.ofNat _ => args.size == 2 && isLiteral args[0]! && isLiteral args[1]!
+    | .const ``Char.ofNat _ => args.size == 1 && isLiteral args[0]!
+    | _ => false
+
+/-- A definition with no parameters whose value is a numeral or a literal (`isLiteral`), such as
+`def size : Nat := 16`. Its type and value say nothing of what it denotes, and every other constant of that type and
+value would hash as it does, so its hash counts its own name too (`record`): it matches a declaration of its own name
+only. -/
+def literalDef : ConstantInfo → Bool
+  | .defnInfo d => !(withoutAnnotations d.type).isForall && isLiteral d.value
+  | _ => false
+
 mutual
 /-- Records in `ids` the identity that a reference to each constant of `e` counts in the hashes (`identify`), and,
 for an auxiliary definition that the hash reads by content, of the constants of the parts it reads (`auxParts`: an
@@ -162,13 +207,22 @@ def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Na
   let tbl ← ids.get
   let moduleOf : Name → Name := fun c => tbl.getD c (base c)
   let hctx : HashCtx := { levels := ci.levelParams, self := selfNames ci, env? := some env, moduleOf := moduleOf }
-  let fields : List String := match ci with
+  -- Beside the statement: an inductive's constructor and field names (`inductiveNames`), and a literal definition's
+  -- own name as its user wrote it (`literalDef`), so that a proposal hashes as the constant it lands as.
+  let names : List String := match ci with
+    | .inductInfo v => inductiveNames env v
+    | _ => if literalDef ci then [s!"name:{(privateToUserName? c).getD c}"] else []
+  -- The hash by the formula before constructor and literal names counted: field names alone. `h0` carries it when it
+  -- differs, so that a hash a concept file recorded by that formula is still known for this constant's.
+  let legacy : List String := match ci with
     | .inductInfo v => v.ctors.flatMap fun k =>
         match env.find? k with
         | some kc => (binderNames kc.type).drop v.numParams
         | none => []
     | _ => []
-  let h := fields.foldl (fun h n => H.mix h (H.ofString n)) (hashOf hctx exprs)
+  let statement := hashOf hctx exprs
+  let h := names.foldl (fun h n => H.mix h (H.ofString n)) statement
+  let h0 := legacy.foldl (fun h n => H.mix h (H.ofString n)) statement
   let fs := facts cfg w
   let mut atoms : Array String := #[]
   for a in w.atoms do
@@ -184,6 +238,7 @@ def record (cfg : MatchConfig) (ids : IO.Ref (Std.HashMap Name Name)) (base : Na
     ("h", toJson h.hex), ("a", toJson atoms),
     ("f", Json.arr (fs.map fun f => Json.mkObj [("c", toJson f.concept), ("how", toJson f.how)])),
     ("b", toJson binders), ("c", toJson conclusion)]
+  if h0.hex != h.hex then fields := fields ++ [("h0", toJson h0.hex)]
   if w.truncated then fields := fields ++ [("tr", toJson true)]
   return Json.mkObj fields
 
@@ -225,11 +280,14 @@ def main (args : List String) : IO UInt32 := do
   -- The module of a constant that Lean does not merge, as the hashes count it: the one that declares it, or `home`
   -- for a target module. A merged one counts by its type (`identify`).
   let targets : NameSet := manifest.modules.foldl (fun s t => s.insert (toName t)) {}
+  let homes : Std.HashMap Name Name := manifest.homes.foldl (fun m h => m.insert (toName h.module) (toName h.home)) {}
   let base : Name → Name := fun n =>
     let m := match env.getModuleIdxFor? n with
       | some idx => env.header.moduleNames[idx.toNat]!
       | none => env.mainModule
-    if !manifest.home.isEmpty && targets.contains m then toName manifest.home else m
+    match homes.get? m with
+    | some h => h
+    | none => if !manifest.home.isEmpty && targets.contains m then toName manifest.home else m
   let ids ← IO.mkRef ({} : Std.HashMap Name Name)
   let ctx : Core.Context := { fileName := "<declexport>", fileMap := default, maxHeartbeats := 0 }
   let out ← IO.getStdout
