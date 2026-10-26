@@ -1304,10 +1304,12 @@ func secretFiles(t *testing.T, dir string) []string {
 // recovering legion/<issue>, and a suspended worker of the same issue drops the session that volume
 // held, so its resume is a fresh launch recovering the issue's branch rather than a resume that
 // would fail until its budget ran out. A worker of another issue of the tree keeps its session: its
-// issue's volume is its own, and the loss was not its.
+// issue's volume is its own, and the loss was not its. An issue volume is a pod's, so the runtime
+// is one that provisions its own workspaces (a Sandbox pod's init containers).
 func TestRunRelaunchesAFreshSessionWhenTheIssueVolumeIsLostAndTellsTheIssue(t *testing.T) {
 	cfg := testConfig(t)
 	rt := fake.NewRuntime()
+	rt.InPod = true
 	d := startDaemon(t, cfg, fakeRuntime(rt, &built{}))
 	root := d.spawn(architect())
 	readyClaim(t, d, rt, root)
