@@ -325,3 +325,23 @@ func TestAMalformedConceptFileStopsNeitherRefreshNorTheGate(t *testing.T) {
 		t.Fatalf("gate with one malformed concept file: want exit 0 and a defect note naming it, got %+v", r)
 	}
 }
+
+// The numeral case as an owner meets it: a new named constant whose value is a numeral, proposed while the index
+// holds an unrelated constant of the same type and value (Fixture's `Fx.Q.base : Nat := 1`), is added with an
+// addition file, not refused as a copy of that constant with exit 1.
+func TestGateAddsANumeralConstantThatAnUnrelatedConstantsValueEquals(t *testing.T) {
+	dir, _, config := leanGateFixture(t, nil)
+	proposal := filepath.Join(dir, "proposal.json")
+	writeTestFile(t, proposal, `{"id":"p-size","concept":{"name":"Frame.size","home":"Frame.lean","meaning":"The size of a frame record, in words."},"source":"def Frame.size : Nat := 1\n"}`)
+	r := invoke(t, "--config", config, "gate", "--proposer", "function:open_file", proposal)
+	var verdict struct {
+		Outcome  string `json:"outcome"`
+		Existing string `json:"existing"`
+		Addition *struct {
+			Path string `json:"path"`
+		} `json:"addition"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &verdict); r.code != 0 || err != nil || verdict.Outcome != "added" || verdict.Addition == nil {
+		t.Fatalf("a numeral constant equal in value to Fx.Q.base: want exit 0 and an addition, got %+v (%v)", r, err)
+	}
+}

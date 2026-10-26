@@ -542,7 +542,9 @@ type Compiled struct {
 	// Hash is the compiled statement hash: equal for two declarations whose elaborated statements are equal up to
 	// the names of their binders and of the declaration itself, and up to how a numeral of core Lean's Nat and
 	// BitVec instances is written. Any other numeral counts with its type and instance, which give its value. Each
-	// constant that a statement names counts with the module that declares it.
+	// constant that a statement names counts with the module that declares it. An inductive counts its constructors'
+	// names too, and a definition whose value is a numeral or a literal alone its own name, so it equals no
+	// declaration of another name (README.md, "Similarity gate and librarian route").
 	Hash  string   `json:"compiled_hash"`
 	Atoms []string `json:"atoms,omitempty"`
 	Facts []Fact   `json:"facts,omitempty"`

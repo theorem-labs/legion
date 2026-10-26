@@ -225,40 +225,108 @@ func TestGateDecidesEachKindOfProposal(t *testing.T) {
 	}
 }
 
-// A numeral's value is its instance's: `@OfNat.ofNat Nat 7 ⟨10⟩` is 10. A proposal of it is therefore not an exact
-// duplicate of an indexed `@OfNat.ofNat Nat 7 ⟨9⟩`, which Lean proves unequal to it, although both write 7. The
-// same numeral by the same instance is an exact duplicate, and so is a numeral of core Lean's Nat and BitVec
-// instances however it is written (`2`, `7#64` and a `7` of type `BitVec 64`).
+// A numeral's value is its instance's: `@OfNat.ofNat Nat 7 ⟨10⟩` is 10. A proposal that uses it is therefore not an
+// exact duplicate of an indexed declaration that uses `@OfNat.ofNat Nat 7 ⟨9⟩`, which Lean proves unequal to it,
+// although both write 7. The same numeral by the same instance is an exact duplicate, and so is a numeral of core
+// Lean's Nat and BitVec instances however it is written (`2`, `7#64` and a `7` of type `BitVec 64`). The numerals
+// sit in statements with parameters: a definition whose value is a numeral alone matches only its own name
+// (TestGateMatchesALiteralDefinitionOnlyByItsName).
 func TestGateTellsNumeralsApartByTheirInstance(t *testing.T) {
 	g, _ := gateForTest(t)
-	ctx := context.Background()
-	indexModule(t, g, "Numerals", "def Original : Nat := @OfNat.ofNat Nat 7 ⟨9⟩\ndef Two : Nat := 2\n")
-	decide := func(name, body string) Verdict {
-		t.Helper()
-		p := Proposal{ID: name, Concept: Concept{Name: name, Home: "New.lean", Meaning: "A proposed concept."},
-			Source: "import Fixture\nimport Numerals\n\n" + body + "\n"}
-		v, err := g.Decide(ctx, p, DecideOptions{Proposer: "role"})
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		return v
-	}
-	same := decide("Same", "def Same : Nat := @OfNat.ofNat Nat 7 ⟨9⟩")
+	indexModule(t, g, "Numerals", "def Original (n : Nat) : Nat := n + @OfNat.ofNat Nat 7 ⟨9⟩\ndef Two (n : Nat) : Nat := n + 2\n")
+	same := decideWith(t, g, "Numerals", "Same", "def Same (m : Nat) : Nat := m + @OfNat.ofNat Nat 7 ⟨9⟩")
 	if same.Outcome != Refused || same.Existing != "Original" {
 		t.Fatalf("the same instance: %s naming %q (%s), want refused naming Original", same.Outcome, same.Existing, same.Reason)
 	}
-	different := decide("Different", "def Different : Nat := @OfNat.ofNat Nat 7 ⟨10⟩\ntheorem reallyDifferent : Different ≠ Original := by decide")
+	different := decideWith(t, g, "Numerals", "Different", "def Different (m : Nat) : Nat := m + @OfNat.ofNat Nat 7 ⟨10⟩\n"+
+		"theorem reallyDifferent : Different 0 ≠ Original 0 := by decide")
 	if different.Outcome != Added || different.CompiledHash == same.CompiledHash {
 		t.Errorf("another instance: %s naming %q (%s) with compiled hash %s, Original's %s; want added with another hash",
 			different.Outcome, different.Existing, different.Reason, different.CompiledHash, same.CompiledHash)
 	}
 	for _, c := range []struct{ name, body, existing string }{
-		{"MyTwo", "def MyTwo : Nat := 2", "Two"},
+		{"MyTwo", "def MyTwo (m : Nat) : Nat := m + 2", "Two"},
 		{"MyWord", "theorem MyWord (y : BitVec 64) (_h : y &&& 7 = 0) : True := trivial", "Fx.other_word"},
 	} {
-		if v := decide(c.name, c.body); v.Outcome != Refused || v.Existing != c.existing {
+		if v := decideWith(t, g, "Numerals", c.name, c.body); v.Outcome != Refused || v.Existing != c.existing {
 			t.Errorf("%s: %s naming %q (%s), want refused naming %s", c.name, v.Outcome, v.Existing, v.Reason, c.existing)
 		}
+	}
+}
+
+// decideWith is a decision on a proposal that imports Fixture and the given indexed module.
+func decideWith(t *testing.T, g *Gate, module, name, body string) Verdict {
+	t.Helper()
+	p := Proposal{ID: name, Concept: Concept{Name: name, Home: "New.lean", Meaning: "A proposed concept."},
+		Source: "import Fixture\nimport " + module + "\n\n" + body + "\n"}
+	v, err := g.Decide(context.Background(), p, DecideOptions{Proposer: "role"})
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	return v
+}
+
+// An enumeration is told apart from another by its constructors' names. Every constructor of an enumeration has no
+// field and the same type, so two unrelated enumerations with the same number of constructors state the same
+// constructor types: counted alone, those made each new enumeration a copy of any indexed one of its size. A copy
+// under another type name with the same constructors is still an exact duplicate.
+func TestGateTellsEnumerationsApartByTheirConstructors(t *testing.T) {
+	g, _ := gateForTest(t)
+	indexModule(t, g, "Enums", "namespace Fmt\ninductive Kind where\n  | int | str | pa | hex | ofn\nend Fmt\n\n"+
+		"namespace Rows\ninductive RowKind where\n  | cell | words | blob\nend Rows\n")
+	for _, c := range []struct{ name, body, sameSize string }{
+		{"Irq.TfBit", "namespace Irq\ninductive TfBit where\n  | runthread | warned | affinity | forcedThread | ready\nend Irq", "Fmt.Kind"},
+		{"Irq.LineKind", "namespace Irq\ninductive LineKind where\n  | chain | percpuDevid | nmi\nend Irq", "Rows.RowKind"},
+	} {
+		if v := decideWith(t, g, "Enums", c.name, c.body); v.Outcome != Added {
+			t.Errorf("%s, of %s's size with other constructors: %s naming %q (%s), want added", c.name, c.sameSize, v.Outcome, v.Existing, v.Reason)
+		}
+	}
+	v := decideWith(t, g, "Enums", "Fmt.Format", "namespace Fmt\ninductive Format where\n  | int | str | pa | hex | ofn\nend Fmt")
+	if v.Outcome != Refused || v.Existing != "Fmt.Kind" {
+		t.Errorf("a copy of Fmt.Kind under another name: %s naming %q (%s), want refused naming Fmt.Kind", v.Outcome, v.Existing, v.Reason)
+	}
+}
+
+// A definition whose value is a numeral or a literal and nothing else matches only a declaration of its own name:
+// `def size : Nat := 16` is not a copy of every other Nat constant of 16, whatever that one means. So a proposal of
+// one is never an exact duplicate of a declaration of another name, and goes on to the name check and the
+// registered facts; two such proposals of one value get two addition paths. A definition whose value is not a
+// literal is still an exact duplicate of another that states it under another name.
+func TestGateMatchesALiteralDefinitionOnlyByItsName(t *testing.T) {
+	g, _ := gateForTest(t)
+	indexModule(t, g, "Sizes", "namespace Sym\ndef aplicList : Nat := 16\ndef hMagic : Nat := 0\ndef juartBase : Nat := 8\n"+
+		"def zero64 : BitVec 64 := 0#64\ndef mask : UInt64 := 255\ndef tag : String := \"irq\"\ndef neg : Int := -3\n"+
+		"def ch : Char := 'a'\ndef half : Float := 0.5\nend Sym\n\n"+
+		"namespace Bus\ndef slotOk (P : BitVec 64 → Prop) (s : BitVec 64) : Prop := s = 0#64 ∨ P s\nend Bus\n")
+	hashes := map[string]string{}
+	for _, c := range []struct{ name, body string }{
+		{"Frame.size", "def Frame.size : Nat := 16"},
+		{"Frame.fpOff", "def Frame.fpOff : Nat := 0"},
+		{"Frame.raOff", "def Frame.raOff : Nat := 8"},
+		{"Frame.width", "def Frame.width : Nat := 16"},
+		{"Frame.zero", "def Frame.zero : BitVec 64 := 0#64"},
+		{"Frame.mask", "def Frame.mask : UInt64 := 255"},
+		{"Frame.tag", "def Frame.tag : String := \"irq\""},
+		{"Frame.neg", "def Frame.neg : Int := -3"},
+		{"Frame.ch", "def Frame.ch : Char := 'a'"},
+		{"Frame.half", "def Frame.half : Float := 0.5"},
+	} {
+		v := decideWith(t, g, "Sizes", c.name, c.body)
+		if v.Outcome != Added {
+			t.Errorf("%s: %s naming %q (%s), want added", c.name, v.Outcome, v.Existing, v.Reason)
+		}
+		hashes[c.name] = v.CompiledHash
+	}
+	if hashes["Frame.size"] == hashes["Frame.width"] {
+		t.Errorf("Frame.size and Frame.width, both 16, hash alike (%s): their additions would share one path", hashes["Frame.size"])
+	}
+	if v := decideWith(t, g, "Sizes", "Sym.aplicList", "def Sym.aplicList : Nat := 16"); v.Outcome != NameTaken || v.Existing != "Sym.aplicList" {
+		t.Errorf("the indexed constant again: %s naming %q (%s), want name-taken naming Sym.aplicList", v.Outcome, v.Existing, v.Reason)
+	}
+	v := decideWith(t, g, "Sizes", "Irq.nextOk", "def Irq.nextOk (P : BitVec 64 → Prop) (nxt : BitVec 64) : Prop := nxt = 0#64 ∨ P nxt")
+	if v.Outcome != Refused || v.Existing != "Bus.slotOk" {
+		t.Errorf("Bus.slotOk under another name: %s naming %q (%s), want refused naming Bus.slotOk", v.Outcome, v.Existing, v.Reason)
 	}
 }
 
