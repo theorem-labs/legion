@@ -73,14 +73,15 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 
 // Export reads the given compiled modules with the registry's forms: the gate's view of a proposal or of a landed
 // module. extra lists further library directories (the proposal's), roots the project's roots plus the proposal's,
-// and home, when set, the module that the hashes count the modules' constants as declared in (Manifest.Home).
-func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, extra []string, home string) ([]Constant, error) {
+// home, when set, the module that the hashes count the modules' constants as declared in (Manifest.Home), and homes
+// the modules counted as declared in a home of their own (Manifest.Homes).
+func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, extra []string, home string, homes []ModuleHome) ([]Constant, error) {
 	x, m, _, err := co.prepare(ctx, roots)
 	if err != nil {
 		return nil, err
 	}
 	x.SearchPath = slices.Concat(x.SearchPath, extra)
-	m.Modules, m.Home = modules, home
+	m.Modules, m.Home, m.Homes = modules, home, homes
 	return x.Run(ctx, m)
 }
 
@@ -540,7 +541,7 @@ type Compiled struct {
 	Kind   string `json:"kind"`
 	Type   string `json:"type"`
 	// Hash is the compiled statement hash: equal for two declarations whose elaborated statements are equal up to
-	// the names of their binders and of the declaration itself, and up to how a numeral of core Lean's Nat and
+	// the names of their binders and of the declaration itself (except a literal definition's, below), and up to how a numeral of core Lean's Nat and
 	// BitVec instances is written. Any other numeral counts with its type and instance, which give its value. Each
 	// constant that a statement names counts with the module that declares it. An inductive counts its constructors'
 	// names too, and a definition whose value is a numeral or a literal alone its own name, so it equals no

@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
 func TestRecheckReportsNearAddedConceptsAndHashDefects(t *testing.T) {
@@ -181,20 +183,86 @@ func TestRecheckIDsMatchTheLedgerRuleForAnyName(t *testing.T) {
 // exportedHash is the compiled hash that the gate gives p's concept: hashed as of the module of its home file.
 func exportedHash(t *testing.T, g *Gate, reg Registry, p Proposal) string {
 	t.Helper()
+	return exportedConstant(t, g, reg, p).Hash
+}
+
+// exportedConstant is the compiled constant that the gate reads for p's concept, hashed as of the module of its home
+// file.
+func exportedConstant(t *testing.T, g *Gate, reg Registry, p Proposal) declindex.Constant {
+	t.Helper()
 	ctx := context.Background()
 	home, err := homeModule(ctx, g.Index, p.Concept)
 	if err != nil {
 		t.Fatal(err)
 	}
-	constants, _, err := g.export(ctx, reg, p, home)
+	constants, _, _, err := g.export(ctx, reg, p, home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range constants {
 		if c.Name == p.Concept.Name {
-			return c.Hash
+			return c
 		}
 	}
 	t.Fatalf("%s was not exported", p.Concept.Name)
-	return ""
+	return declindex.Constant{}
+}
+
+// A concept file that the gate wrote before the hash counted constructor names records the hash by the formula
+// before: the recheck accepts it, landed or not, since the declaration still hashes to it by that formula. A recorded
+// hash that the declaration hashes to by neither formula is still not the gate's.
+func TestRecheckAcceptsAHashRecordedByThePreviousFormula(t *testing.T) {
+	g, _ := gateForTest(t)
+	ctx := context.Background()
+	reg, _, err := Load(g.Registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recheck := func(c Concept) RecheckReport {
+		t.Helper()
+		body, err := Render(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(g.Registry, "concepts", Key(c)+".yaml")
+		if err := os.WriteFile(path, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(path)
+		reg, _, err := Load(g.Registry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		report, err := Recheck(ctx, g, reg, []string{path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return report
+	}
+	source := "inductive Fx.Mode where\n  | walk\n  | held"
+	for _, landed := range []bool{false, true} {
+		home := "Pending.lean"
+		if landed {
+			home = "Mode.lean"
+			indexModule(t, g, "Mode", "import Fixture\n\n"+source+"\n")
+		}
+		p := proposal("p-mode", "Fx.Mode", source)
+		p.Concept.Home = home
+		c := exportedConstant(t, g, reg, p)
+		if c.LegacyHash == "" || c.LegacyHash == c.Hash {
+			t.Fatalf("Fx.Mode: hash %s, previous formula's %q: an inductive's must differ", c.Hash, c.LegacyHash)
+		}
+		concept := p.Concept
+		concept.Proposer, concept.Source = "role", p.Source
+		for _, recorded := range []string{c.Hash, c.LegacyHash} {
+			concept.CompiledHash = recorded
+			if report := recheck(concept); len(report.Defects) != 0 {
+				t.Errorf("landed %v, recorded %s: %+v", landed, recorded, report.Defects)
+			}
+		}
+		concept.CompiledHash = "ffffffffffffffffffffffffffffffff"
+		if report := recheck(concept); len(report.Defects) == 0 || !strings.Contains(report.Defects[0].Message, "differs from recorded") {
+			t.Errorf("landed %v, a hash that is neither formula's: %+v", landed, report.Defects)
+		}
+	}
 }

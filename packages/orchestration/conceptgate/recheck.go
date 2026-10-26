@@ -77,7 +77,7 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 		} else {
 			var home string
 			if home, err = homeModule(ctx, g.Index, concept); err == nil {
-				constants, pending, err = g.export(ctx, reg, proposal, home)
+				constants, _, pending, err = g.export(ctx, reg, proposal, home)
 			}
 		}
 		for _, d := range pending {
@@ -95,8 +95,11 @@ func Recheck(ctx context.Context, g *Gate, reg Registry, added []string) (Rechec
 			defect(Defect{Path: path, Message: "stored source does not declare " + concept.Name})
 			continue
 		}
+		// The recorded hash is the gate's: by this formula, or by the one before constructor and literal names counted
+		// (LegacyHash), for a file the gate wrote before that change. Either still binds the declaration to what the
+		// gate added; a hash that is neither is not the gate's.
 		actual := decl.Hash
-		if actual != concept.CompiledHash {
+		if actual != concept.CompiledHash && (decl.LegacyHash == "" || decl.LegacyHash != concept.CompiledHash) {
 			message := "compiled hash " + actual + " differs from recorded " + concept.CompiledHash
 			if landed {
 				message = "the landed declaration is not the one the gate added: its " + message

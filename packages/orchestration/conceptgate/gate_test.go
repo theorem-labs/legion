@@ -272,19 +272,19 @@ func decideWith(t *testing.T, g *Gate, module, name, body string) Verdict {
 // under another type name with the same constructors is still an exact duplicate.
 func TestGateTellsEnumerationsApartByTheirConstructors(t *testing.T) {
 	g, _ := gateForTest(t)
-	indexModule(t, g, "Enums", "namespace Fmt\ninductive Kind where\n  | int | str | pa | hex | ofn\nend Fmt\n\n"+
-		"namespace Rows\ninductive RowKind where\n  | cell | words | blob\nend Rows\n")
+	indexModule(t, g, "Enums", "namespace Hue\ninductive Kind where\n  | red | green | blue | cyan | teal\nend Hue\n\n"+
+		"namespace Form\ninductive Shape where\n  | circle | square | line\nend Form\n")
 	for _, c := range []struct{ name, body, sameSize string }{
-		{"Irq.TfBit", "namespace Irq\ninductive TfBit where\n  | runthread | warned | affinity | forcedThread | ready\nend Irq", "Fmt.Kind"},
-		{"Irq.LineKind", "namespace Irq\ninductive LineKind where\n  | chain | percpuDevid | nmi\nend Irq", "Rows.RowKind"},
+		{"Greek.Letter", "namespace Greek\ninductive Letter where\n  | alpha | beta | gamma | delta | omega\nend Greek", "Hue.Kind"},
+		{"Pitch.Tone", "namespace Pitch\ninductive Tone where\n  | low | mid | high\nend Pitch", "Form.Shape"},
 	} {
 		if v := decideWith(t, g, "Enums", c.name, c.body); v.Outcome != Added {
 			t.Errorf("%s, of %s's size with other constructors: %s naming %q (%s), want added", c.name, c.sameSize, v.Outcome, v.Existing, v.Reason)
 		}
 	}
-	v := decideWith(t, g, "Enums", "Fmt.Format", "namespace Fmt\ninductive Format where\n  | int | str | pa | hex | ofn\nend Fmt")
-	if v.Outcome != Refused || v.Existing != "Fmt.Kind" {
-		t.Errorf("a copy of Fmt.Kind under another name: %s naming %q (%s), want refused naming Fmt.Kind", v.Outcome, v.Existing, v.Reason)
+	v := decideWith(t, g, "Enums", "Hue.Color", "namespace Hue\ninductive Color where\n  | red | green | blue | cyan | teal\nend Hue")
+	if v.Outcome != Refused || v.Existing != "Hue.Kind" {
+		t.Errorf("a copy of Hue.Kind under another name: %s naming %q (%s), want refused naming Hue.Kind", v.Outcome, v.Existing, v.Reason)
 	}
 }
 
@@ -295,15 +295,15 @@ func TestGateTellsEnumerationsApartByTheirConstructors(t *testing.T) {
 // literal is still an exact duplicate of another that states it under another name.
 func TestGateMatchesALiteralDefinitionOnlyByItsName(t *testing.T) {
 	g, _ := gateForTest(t)
-	indexModule(t, g, "Sizes", "namespace Sym\ndef aplicList : Nat := 16\ndef hMagic : Nat := 0\ndef juartBase : Nat := 8\n"+
+	indexModule(t, g, "Sizes", "namespace Sym\ndef tableSize : Nat := 16\ndef zeroOff : Nat := 0\ndef wordOff : Nat := 8\n"+
 		"def zero64 : BitVec 64 := 0#64\ndef mask : UInt64 := 255\ndef tag : String := \"irq\"\ndef neg : Int := -3\n"+
 		"def ch : Char := 'a'\ndef half : Float := 0.5\nend Sym\n\n"+
-		"namespace Bus\ndef slotOk (P : BitVec 64 → Prop) (s : BitVec 64) : Prop := s = 0#64 ∨ P s\nend Bus\n")
+		"namespace Slot\ndef nullOr (P : BitVec 64 → Prop) (s : BitVec 64) : Prop := s = 0#64 ∨ P s\nend Slot\n")
 	hashes := map[string]string{}
 	for _, c := range []struct{ name, body string }{
 		{"Frame.size", "def Frame.size : Nat := 16"},
-		{"Frame.fpOff", "def Frame.fpOff : Nat := 0"},
-		{"Frame.raOff", "def Frame.raOff : Nat := 8"},
+		{"Frame.lo", "def Frame.lo : Nat := 0"},
+		{"Frame.hi", "def Frame.hi : Nat := 8"},
 		{"Frame.width", "def Frame.width : Nat := 16"},
 		{"Frame.zero", "def Frame.zero : BitVec 64 := 0#64"},
 		{"Frame.mask", "def Frame.mask : UInt64 := 255"},
@@ -321,12 +321,35 @@ func TestGateMatchesALiteralDefinitionOnlyByItsName(t *testing.T) {
 	if hashes["Frame.size"] == hashes["Frame.width"] {
 		t.Errorf("Frame.size and Frame.width, both 16, hash alike (%s): their additions would share one path", hashes["Frame.size"])
 	}
-	if v := decideWith(t, g, "Sizes", "Sym.aplicList", "def Sym.aplicList : Nat := 16"); v.Outcome != NameTaken || v.Existing != "Sym.aplicList" {
-		t.Errorf("the indexed constant again: %s naming %q (%s), want name-taken naming Sym.aplicList", v.Outcome, v.Existing, v.Reason)
+	if v := decideWith(t, g, "Sizes", "Sym.tableSize", "def Sym.tableSize : Nat := 16"); v.Outcome != NameTaken || v.Existing != "Sym.tableSize" {
+		t.Errorf("the indexed constant again: %s naming %q (%s), want name-taken naming Sym.tableSize", v.Outcome, v.Existing, v.Reason)
 	}
-	v := decideWith(t, g, "Sizes", "Irq.nextOk", "def Irq.nextOk (P : BitVec 64 → Prop) (nxt : BitVec 64) : Prop := nxt = 0#64 ∨ P nxt")
-	if v.Outcome != Refused || v.Existing != "Bus.slotOk" {
-		t.Errorf("Bus.slotOk under another name: %s naming %q (%s), want refused naming Bus.slotOk", v.Outcome, v.Existing, v.Reason)
+	v := decideWith(t, g, "Sizes", "Link.zeroOr", "def Link.zeroOr (P : BitVec 64 → Prop) (x : BitVec 64) : Prop := x = 0#64 ∨ P x")
+	if v.Outcome != Refused || v.Existing != "Slot.nullOr" {
+		t.Errorf("Slot.nullOr under another name: %s naming %q (%s), want refused naming Slot.nullOr", v.Outcome, v.Existing, v.Reason)
+	}
+}
+
+// A pending concept (added, not yet landed) is compared by the hash its stored source compiles to now, as well as by
+// the one its file recorded. A file that the gate wrote before a change of the hash records a hash that no exporter
+// computes any more, here one that is simply stale; a copy of its concept must still be refused.
+func TestGateComparesAPendingConceptByItsCompiledSource(t *testing.T) {
+	g, _ := gateForTest(t)
+	pending := Concept{Name: "Fx.Mode", Home: "Mode.lean", Meaning: "A pending enumeration.", Proposal: "p-mode",
+		Proposer: "role", CompiledHash: "0123456789abcdef0123456789abcdef",
+		Source: "import Fixture\n\ninductive Fx.Mode where\n  | walk\n  | held\n"}
+	body, err := Render(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(g.Registry, "concepts", Key(pending)+".yaml"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, g.Tree.Source, "add", "registry")
+	runGit(t, g.Tree.Source, "commit", "-qm", "add pending Fx.Mode")
+	v, err := g.Decide(context.Background(), proposal("p-gait", "Fx.Gait", "inductive Fx.Gait where\n  | walk\n  | held"), DecideOptions{Proposer: "role"})
+	if err != nil || v.Outcome != Refused || v.Existing != "Fx.Mode" {
+		t.Fatalf("a copy of the pending Fx.Mode: %s naming %q (%s), %v; want refused naming Fx.Mode", v.Outcome, v.Existing, v.Reason, err)
 	}
 }
 
