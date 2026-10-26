@@ -599,12 +599,15 @@ func moduleOfOutput(rel string) string {
 	return strings.ReplaceAll(rel, "/", ".")
 }
 
-// checkOtherPackages refuses to decide a batch that changes a Lean file the check does not read: a module of
-// another package of the project, or of another library of the root package that `roots` does not name. The build
-// builds such a module before the modules that import it, and the check neither compiles it nor sees its
-// declarations, so compiling its importers against the base's build of it would refuse a change the build accepts
-// or miss one it refuses. A file with no base object file is a new module of such a library, which the build
-// builds the same way, so it counts too.
+// checkOtherPackages refuses to decide a batch that changes a Lean file the check does not read but the build
+// builds: a module of another package of the project, or of another library of this package that `roots` does not
+// name. The build builds such a module before the modules that import it, and the check neither compiles it nor
+// sees its declarations, so compiling its importers against the base's build of it would refuse a change the
+// build accepts or miss one it refuses.
+//
+// A changed Lean file that no library builds — a script beside the project, an archived tree — is not such a
+// module: it is outside the build as it is outside the check, and it costs the batch nothing. A file counts when
+// it lies under another package's directory, or when the base build has an output for its first name component.
 func (c *Candidate) checkOtherPackages(ctx context.Context) error {
 	if len(c.otherLean) == 0 {
 		return nil
@@ -613,21 +616,46 @@ func (c *Candidate) checkOtherPackages(ctx context.Context) error {
 		return err
 	}
 	for _, file := range c.otherLean {
-		where := "a library of this package that the configured roots do not name"
-		for _, lib := range c.leanPath {
-			pkg, err := filepath.Rel(c.icfg.Tree, filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(lib)))))
-			if err != nil || pkg == "." || strings.HasPrefix(pkg, "..") {
-				continue
-			}
-			if rel, err := filepath.Rel(pkg, file); err == nil && !strings.HasPrefix(rel, "..") {
-				where = "the package at " + pkg
-				break
-			}
+		if pkg, ok := c.packageDirOf(file); ok {
+			return unable("the batch changes %s, a Lean file of the package at %s, which the build builds before "+
+				"the modules that import it; the check does not read it", file, pkg)
 		}
-		return unable("the batch changes %s, a Lean file of %s, which the build builds before the modules that "+
-			"import it; the check does not read it", file, where)
+		if library, ok := c.builtLibraryOf(file); ok {
+			return unable("the batch changes %s, a Lean file of library %s, which the configured roots do not name; "+
+				"the build builds it before the modules that import it, and the check does not read it", file, library)
+		}
 	}
 	return nil
+}
+
+// packageDirOf is the directory of the package of the project that holds a file, when one does.
+func (c *Candidate) packageDirOf(file string) (string, bool) {
+	for _, lib := range c.leanPath {
+		pkg, err := filepath.Rel(c.icfg.Tree, filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(lib)))))
+		if err != nil || pkg == "." || strings.HasPrefix(pkg, "..") {
+			continue
+		}
+		if rel, err := filepath.Rel(pkg, file); err == nil && !strings.HasPrefix(rel, "..") {
+			return pkg, true
+		}
+	}
+	return "", false
+}
+
+// builtLibraryOf is the first name component of a file's module when the base build has an output for it: the
+// mark of a library this package builds. A component with neither an object file nor a directory of its own in
+// the base build is no library of the build.
+func (c *Candidate) builtLibraryOf(file string) (string, bool) {
+	first, _, _ := strings.Cut(filepath.ToSlash(strings.TrimSuffix(file, ".lean")), "/")
+	if first == "" {
+		return "", false
+	}
+	for _, name := range []string{first + ".olean", first} {
+		if _, err := os.Stat(filepath.Join(c.icfg.Lib, name)); err == nil {
+			return first, true
+		}
+	}
+	return "", false
 }
 
 // closure computes the modules the build builds: the closure of build_roots over the candidate's import graph,

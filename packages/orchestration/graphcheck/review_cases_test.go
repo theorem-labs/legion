@@ -200,6 +200,24 @@ func TestAChangedLibraryOutsideTheRootsIsUnable(t *testing.T) {
 	}
 }
 
+// A changed Lean file that no library builds — a script beside the project — is not a module the check reads and
+// not one the build builds, so it costs nothing: the batch's real removal is still refused.
+func TestAChangedLeanFileNoLibraryBuildsCostsNothing(t *testing.T) {
+	for _, file := range []string{"tools/Probe.lean", "scripts/Tool.lean", "archive/Old.lean"} {
+		t.Run(file, func(t *testing.T) {
+			f := graphchecktest.NewVariant(t, graphchecktest.Variant{Files: map[string]string{file: "def probe : Nat := 1\n"}})
+			tree := f.EditMany(t, map[string][2]string{
+				"Lib/Core.lean": {"def helper", "private def helper"},
+				file:            {"def probe : Nat := 1", "def probe : Nat := 2"},
+			})
+			hits := names(t, f, tree)
+			if _, ok := find(hits, landing.VerdictRefuse, blame.Unknown, "Lib.Core.helper", "Lib/Use.lean", "N1"); !ok {
+				t.Fatalf("no N1 refusal at Lib/Use.lean in %v", hits)
+			}
+		})
+	}
+}
+
 // A module whose name has a dot inside one component (`Lib.«Foo.Bar»`, file Lib/Foo.Bar.lean) is one graphcheck
 // cannot name as Lean and Lake do: the check is unable rather than compiling it under a wrong name.
 func TestADottedModuleNameIsUnable(t *testing.T) {
