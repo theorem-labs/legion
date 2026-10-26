@@ -188,20 +188,27 @@ func TestTheIndexMovesThenTheLedgerHookApplies(t *testing.T) {
 	if err != nil || !strings.Contains(string(status), f.second) {
 		t.Fatalf("declindex status: %v: %s; want the landed commit", err, status)
 	}
-	if err := filepath.WalkDir(f.state, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+	// The refresh's container writes the fetched objects and the checkout (landing.txt) into the index tree; the
+	// state directory holds what the host made and anything the container added.
+	if _, err := os.Stat(filepath.Join(f.tree, "landing.txt")); err != nil {
+		t.Fatalf("the refresh did not check out the landed commit's file: %v", err)
+	}
+	for _, written := range []string{f.tree, f.state} {
+		if err := filepath.WalkDir(written, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if owner := info.Sys().(*syscall.Stat_t).Uid; strconv.Itoa(int(owner)) != strconv.Itoa(os.Getuid()) {
+				t.Errorf("%s is owned by %d, not the configured user", path, owner)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
 		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if owner := info.Sys().(*syscall.Stat_t).Uid; strconv.Itoa(int(owner)) != strconv.Itoa(os.Getuid()) {
-			t.Errorf("%s is owned by %d, not the configured user", path, owner)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
 	}
 	if !slices.Equal(effects.applied, []string{"apply/batch/1/slice"}) {
 		t.Fatalf("the applies are %q, want the ledger hook's once", effects.applied)
