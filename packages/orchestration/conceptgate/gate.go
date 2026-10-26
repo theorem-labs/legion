@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
-	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // Proposal is a proposed shared concept: its registry entry, and a Lean module that declares it against the
@@ -111,10 +110,8 @@ type Gate struct {
 	// Compiled reads the proposal; its Forms are replaced by the registry's at each decision.
 	Compiled  *declindex.CompiledOptions
 	Librarian Librarian
-	// WorkDir holds the compiled proposals and librarian request files.
+	// WorkDir holds the compiled proposals and librarian requests.
 	WorkDir string
-	// CheckSandbox is declindex.CheckSandbox, unless a test replaces it: see checkSandbox.
-	CheckSandbox func(context.Context, declindex.Lean) error
 	// release closes what OpenGate opened for the gate (see Close).
 	release func()
 }
@@ -125,7 +122,8 @@ const ProposalModule = "DeclIndexProposal"
 // Forms gives the registry's forms module, importing the module of each registered concept that the index declares
 // in the concept's home file. A concept with forms and no stored source states its fact through those forms, so it
 // is kept whether or not the index declares it. A source-bearing concept that the index does not yet declare is
-// pending; only the gate compiles it, in a sandbox, and then adds it to the forms module for that one decision.
+// pending; only the gate compiles it, after Lean's parser allow-list, and then adds it to the forms module for that
+// one decision.
 func Forms(ctx context.Context, s *declindex.Store, r Registry) (declindex.FormsModule, error) {
 	return forms(ctx, s, r, nil)
 }
@@ -213,9 +211,6 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	}
 	if err := checkProposalSource(p.Source); err != nil {
 		return v, err
-	}
-	if err := g.checkSandbox(ctx); err != nil {
-		return v, fmt.Errorf("the gate compiles a proposal only in the sandbox: %w", err)
 	}
 	// The gate compares compiled statements, so it needs the compiled part of the index's own commit.
 	base, err := g.Index.CompiledCommit(ctx, true)
@@ -369,18 +364,6 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	return v, nil
 }
 
-// checkSandbox is the authoritative sandbox check, which Decide and Recheck run before any untrusted source
-// compiles: the gate's own toolchain runs `lean --version` in the sandbox. Decide and Recheck run it themselves,
-// because a Gate can be built without OpenGate. OpenGate's earlier check (Options.SandboxAvailable) starts no
-// process and only spares a machine without the sandbox the toolchain lookup and the exporter build.
-func (g *Gate) checkSandbox(ctx context.Context) error {
-	check := g.CheckSandbox
-	if check == nil {
-		check = declindex.CheckSandbox
-	}
-	return check(ctx, g.Compiled.Exporter.Lean)
-}
-
 // ownConstants are the names of the constants that a proposal's source declares, and the one named name.
 func ownConstants(consts []declindex.Constant, name string) (map[string]bool, *declindex.Constant) {
 	own := map[string]bool{}
@@ -422,23 +405,23 @@ func sourceFailed(err error) bool {
 	return errors.Is(err, declindex.ErrRefusedSource) || errors.Is(err, declindex.ErrSourceFailed)
 }
 
-// admit runs untrusted source through the gate's two steps for it, each in the sandbox with a fresh scratch
-// directory below run: Lean's parser allow-list (CheckSource), and only once that passed, the compile of source as
-// module against ex's search path. It gives the directory that holds the compiled module. When the source itself is
-// refused or does not compile, the error satisfies sourceFailed.
+// admit runs untrusted source through the gate's two steps for it, each in a fresh directory below run: Lean's
+// parser allow-list (CheckSource), and only once that passed, the compile of source as module against ex's search
+// path, with the rights of the user who runs the gate. It gives the directory that holds the compiled module. When
+// the source itself is refused or does not compile, the error satisfies sourceFailed.
 func admit(ctx context.Context, ex *declindex.Exporter, run, module, source string) (string, error) {
-	check, err := confine.NewScratch(run)
+	check, err := os.MkdirTemp(run, "check-")
 	if err != nil {
 		return "", err
 	}
 	if err := ex.CheckSource(ctx, []byte(source), ex.SearchPath, check); err != nil {
 		return "", err
 	}
-	dir, err := confine.NewScratch(run)
+	dir, err := os.MkdirTemp(run, "module-")
 	if err != nil {
 		return "", err
 	}
-	if err := declindex.CompileConfined(ctx, ex.Lean, ex.SearchPath, dir, module, []byte(source)); err != nil {
+	if err := declindex.CompileSource(ctx, ex.Lean, ex.SearchPath, dir, module, []byte(source)); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -446,7 +429,7 @@ func admit(ctx context.Context, ex *declindex.Exporter, run, module, source stri
 
 // pendingForms gives the forms module of a decision on the proposal of the concept exclude, or of the recheck of a
 // landed declaration when exclude is empty, with the compiled sources of the registry concepts that the index does
-// not yet declare. It runs only from the gate's confined export path; refresh and FormsModule never receive those
+// not yet declare. It runs only from the gate's export path (read); refresh and FormsModule never receive those
 // source bytes. A pending concept whose source the text filter or Lean refuses is a defect of that concept, left out
 // of the forms. The proposal supplies exclude, also when the index declares it outside its home file. Lean refuses
 // two definitions of one name, so the forms then import no module whose imports declare exclude (hiddenModules),
@@ -593,17 +576,17 @@ func landedNames(own map[string]bool, home string) []string {
 	return out
 }
 
-// read reads module with the registry's forms, each step in the sandbox with a fresh scratch directory of its own
-// below one run directory that the gate owns and removes. With a proposal p, it first checks p's source and
-// compiles it as module against the build, and the forms leave p's concept out (pendingForms); without one, module
-// is the landed build's. home, when set, is the module that module's constants are hashed as of. It also gives the
-// defects of the pending concepts it left out of the forms. When the proposal's own source is refused or does not
-// compile, the error satisfies sourceFailed.
+// read reads module with the registry's forms, each step in a fresh directory of its own below one run directory
+// that the gate owns and removes. With a proposal p, it first checks p's source and compiles it as module against
+// the build, and the forms leave p's concept out (pendingForms); without one, module is the landed build's. home,
+// when set, is the module that module's constants are hashed as of. It also gives the defects of the pending
+// concepts it left out of the forms. When the proposal's own source is refused or does not compile, the error
+// satisfies sourceFailed.
 func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module, home string) ([]declindex.Constant, []Defect, error) {
 	if err := os.MkdirAll(g.WorkDir, 0o700); err != nil {
 		return nil, nil, err
 	}
-	run, err := confine.NewScratch(g.WorkDir)
+	run, err := os.MkdirTemp(g.WorkDir, "read-")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -612,11 +595,16 @@ func (g *Gate) read(ctx context.Context, reg Registry, p *Proposal, module, home
 	if p != nil {
 		exclude = p.Concept.Name
 	}
-	// The confined exporter also has the forms module compiled in the sandbox (declindex.Exporter.Confined).
+	// The forms of this one decision, which import its pending concepts' compiled sources, are compiled below run,
+	// never in the forms directory that refresh shares.
+	formsDir, err := os.MkdirTemp(run, "forms-")
+	if err != nil {
+		return nil, nil, err
+	}
 	ex := *g.Compiled.Exporter
-	ex.ScratchDir, ex.Confined = run, true
+	ex.ScratchDir = run
 	co := *g.Compiled
-	co.Exporter = &ex
+	co.Exporter, co.Dir = &ex, formsDir
 	forms, defects, err := g.pendingForms(ctx, reg, &ex, run, exclude)
 	if err != nil {
 		return nil, defects, err

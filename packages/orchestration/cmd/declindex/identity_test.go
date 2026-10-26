@@ -28,7 +28,7 @@ func TestAPartLeanMadeInTheUsingModuleBelongsToTheDeclarationItImports(t *testin
 		`"{\"c\":{\"m\":\"U\",\"n\":\"f.eq_1\"}}":{"definition":null,"usages":[[0,21,0,27,"u"]]}}}`,
 		"theorem u : f = 1 := f.eq_1\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [P, Q, U]\n")
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [P, Q, U]\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}

@@ -24,7 +24,6 @@ RUN apt-get update \
         libgmp10 \
         libuv1t64 \
         python3 \
-        strace \
         zstd \
     && rm -rf /var/lib/apt/lists/* \
     && gmp="$(dpkg-query --showformat '${Version}' --show libgmp10)" \

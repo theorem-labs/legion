@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,9 +22,7 @@ func manualLedgerFixture(t *testing.T, tail, owners string) (config, dsn, tree s
 		t.Fatal(err)
 	}
 	body = append(body, []byte("repo: r\n"+tail)...)
-	if err := os.WriteFile(config, body, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body))
 	if owners != "" {
 		if err := os.WriteFile(filepath.Join(tree, "owners.json"), []byte(owners), 0o644); err != nil {
 			t.Fatal(err)
@@ -52,7 +49,7 @@ func manualLedgerFixture(t *testing.T, tail, owners string) (config, dsn, tree s
 func invokeLedger(t *testing.T, config, dsn string, landCommit string) result {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", config, "ledger"}, func(k string) string {
+	code := run(context.Background(), withIndexDSN([]string{"--config", config, "ledger"}), func(k string) string {
 		switch k {
 		case "LEDGER_DSN":
 			return dsn
@@ -67,11 +64,9 @@ func invokeLedger(t *testing.T, config, dsn string, landCommit string) result {
 
 func declarationForLedger(t *testing.T, config, name string) declindex.Found {
 	t.Helper()
-	cfg, err := declindex.LoadConfig(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := declindex.Open(cfg.DB)
+	cfg := indexConfig(t, config)
+	tgt := cfg.Target()
+	s, err := declindex.Open(context.Background(), tgt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,16 +98,8 @@ func TestLedgerManualContractResults(t *testing.T) {
 	})
 	t.Run("reports rule ambiguity", func(t *testing.T) {
 		config, dsn, _, _ := manualLedgerFixture(t, subContractRule, subOwnerMap)
-		cfg, err := declindex.LoadConfig(config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		db, err := sql.Open("sqlite", cfg.DB)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
-		if _, err := db.Exec(`INSERT INTO decls (name, short, module, kind, line, stmt_hash)
+		conn := indexConn(t, indexConfig(t, config))
+		if _, err := conn.Exec(context.Background(), `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
 			SELECT name, short, module, kind, line, stmt_hash FROM decls WHERE name = 'Gold2.FrameAt'`); err != nil {
 			t.Fatal(err)
 		}
@@ -127,17 +114,9 @@ func TestLedgerManualContractResults(t *testing.T) {
 		if _, err := l.RegisterContract(context.Background(), "r", found.Name, "function:frame_at", found.StmtHash, false); err != nil {
 			t.Fatal(err)
 		}
-		cfg, err := declindex.LoadConfig(config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		db, err := sql.Open("sqlite", cfg.DB)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
-		if _, err := db.Exec(`INSERT INTO decls (name, short, module, kind, line, stmt_hash)
-			VALUES (?, ?, ?, ?, ?, ?)`, found.Name, "Box", "Other.Module", found.Kind, 1, found.StmtHash); err != nil {
+		conn := indexConn(t, indexConfig(t, config))
+		if _, err := conn.Exec(context.Background(), `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
+			VALUES ($1, $2, $3, $4, $5, $6)`, found.Name, "Box", "Other.Module", found.Kind, 1, found.StmtHash); err != nil {
 			t.Fatal(err)
 		}
 		if r := invokeLedger(t, config, dsn, ""); r.code != 1 || !strings.Contains(r.out, `"ambiguous": [`) ||

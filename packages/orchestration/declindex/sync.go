@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -37,6 +38,10 @@ func (e *TempError) Unwrap() error { return e.Err }
 // to move.
 func Sync(cfg Config, commit string, log io.Writer) func(context.Context) error {
 	return func(ctx context.Context) error {
+		// A run that is killed cannot delete its own refs, and a ref pins the objects it names for ever, so
+		// every sync first collects what a killed run of a day ago or more left behind, whether or not this
+		// one fetches. Only a run of the same tree writes these refs, and one of today may still be running.
+		collectOldRefs(cfg.Tree, log)
 		has, err := hasCommit(ctx, cfg.Tree, commit)
 		if err != nil {
 			return err
@@ -80,7 +85,9 @@ func privateRefNamespace() (string, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("refs/declindex/remote/%d-%s/", os.Getpid(), hex.EncodeToString(b[:])), nil
+	// The run's start time leads the name, so another run can tell how old these refs are without asking git
+	// about the commits they point at: a landing of an old commit fetches it today.
+	return fmt.Sprintf("%s%d-%d-%s/", refNamespaceRoot, time.Now().Unix(), os.Getpid(), hex.EncodeToString(b[:])), nil
 }
 
 // deleteRefs deletes every ref below ns. It runs after the checkout, which holds the commit through HEAD; a failure is
@@ -96,6 +103,53 @@ func deleteRefs(tree, ns string, log io.Writer) {
 	if err != nil {
 		logf(log, "sync: could not delete the fetched refs %s: %v", ns, err)
 	}
+}
+
+// refNamespaceRoot holds the namespace of every run's fetched refs.
+const refNamespaceRoot = "refs/declindex/remote/"
+
+// refCollectAge is how old a run's fetched refs must be before another run deletes them: long enough that a
+// slow run of the same tree, whose fetch and build can take hours, never has its refs taken from under it. A
+// namespace whose name does not begin with a time is of a run older than this scheme, and is collected at once.
+const refCollectAge = 24 * time.Hour
+
+// collectOldRefs deletes the fetched refs that runs killed before they could delete their own left behind: a
+// ref pins the objects it names, so a killed run would hold its whole fetch for ever. A failure is logged, as
+// it is for a run's own refs: the fetch that follows does not depend on it.
+func collectOldRefs(tree string, log io.Writer) {
+	ctx := context.Background()
+	out, err := exec.CommandContext(ctx, "git", "-C", tree, "for-each-ref",
+		"--format=%(refname)", refNamespaceRoot).Output()
+	if err != nil {
+		logf(log, "sync: could not list the fetched refs of earlier runs: %v", err)
+		return
+	}
+	var del bytes.Buffer
+	n := 0
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if name == "" {
+			continue
+		}
+		// The namespace begins with the run's start time: <root><unix>-<pid>-<id>/...
+		rest := strings.TrimPrefix(name, refNamespaceRoot)
+		start, _, _ := strings.Cut(rest, "-")
+		at, err := strconv.ParseInt(start, 10, 64)
+		if err == nil && time.Since(time.Unix(at, 0)) < refCollectAge {
+			continue
+		}
+		fmt.Fprintf(&del, "delete %s\n", name)
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", tree, "update-ref", "--stdin")
+	cmd.Stdin = &del
+	if err := cmd.Run(); err != nil {
+		logf(log, "sync: could not delete the %d fetched refs of earlier runs: %v", n, err)
+		return
+	}
+	logf(log, "sync: deleted %d fetched refs that earlier runs left behind", n)
 }
 
 // indexCoversLandedCommit reports whether the complete persisted index has already read commit or a descendant,
@@ -116,19 +170,18 @@ func (s *Store) indexCoversLandedCommit(ctx context.Context, tree, commit string
 	if indexErrors != "0" {
 		return "", nil
 	}
-	graph, err := s.Meta(ctx, "graph")
-	if err != nil {
-		return "", err
-	}
-	if graph == "" || graphToken(s.path+".graph") != graph {
-		return "", nil
-	}
 	if compiled {
+		// The same rule the readers use (CompiledCommit): an index that owes a compiled part has none that
+		// counts, however its markers compare, so this landing is not covered and the refresh runs.
+		owed, err := s.Meta(ctx, "compiled_owed")
+		if err != nil {
+			return "", err
+		}
 		at, err := s.Meta(ctx, "compiled_commit")
 		if err != nil {
 			return "", err
 		}
-		if at != indexed {
+		if owed == "1" || at != indexed {
 			return "", nil
 		}
 	}

@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -38,8 +36,8 @@ func TestSameNamedDeclarationsOfTwoModulesAreAnsweredApart(t *testing.T) {
 		}
 	}
 	config := filepath.Join(dir, "index.yaml")
-	body := "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, UseA, UseB]\n"
-	writeTestFile(t, config, body)
+	body := "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, UseA, UseB]\n"
+	writeIndexConfig(t, config, body)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}
@@ -92,7 +90,7 @@ func TestSameNamedDeclarationsOfTwoModulesAreAnsweredApart(t *testing.T) {
 		}
 	}
 
-	writeTestFile(t, config, body+"lean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, body+"lean:\n  export: true\n  jobs: 1\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh with the compiled part: %+v", r)
 	}
@@ -116,12 +114,7 @@ func TestSameNamedDeclarationsOfTwoModulesAreAnsweredApart(t *testing.T) {
 // defines B's `Value` again is not an exact duplicate of A's definition of A's `Value`, though both read `Value`:
 // the gate adds it. One that defines A's `Value` again is: the gate refuses it.
 func TestTheGateHashesAConstantWithItsModule(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	config, tree, lean := leanRegistryTree(t, "A", "B")
 	for _, m := range []struct{ name, source string }{
 		{"A", "def Value : Nat := 1\ndef Original : Nat := Value\nexample : Original = 1 := rfl\n"},
@@ -149,12 +142,7 @@ func TestTheGateHashesAConstantWithItsModule(t *testing.T) {
 // `dup`, which A declares too. A proposal that imports B and states `Original`'s statement again is an exact
 // duplicate, after a refresh that read A and B in one exporter group and after one that read B alone.
 func TestTheGateRefusesACopyOfAMergedTheoremReferenceHoweverTheIndexWasRead(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	config, tree, lean := leanRegistryTree(t, "A", "B")
 	compile := func(name, source string) {
 		t.Helper()
@@ -207,12 +195,7 @@ func gateRefuses(t *testing.T, config, label, name, source string, existing ...s
 // abstracted proof, of the same type. The hash counts an abstracted proof by its type, so the copy is refused, with
 // or without importing the module, as a copy of `foo` is.
 func TestTheGateRefusesACopyThatUsesAnotherDeclarationsAbstractedProof(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	config, tree, lean := leanRegistryTree(t, "A")
 	writeTestFile(t, filepath.Join(tree, "A.lean"), "def foo (n : Nat) (h : 0 < n) : Fin n := ⟨n - 1, by omega⟩\n"+
 		"def bar (n : Nat) (h : 0 < n) : Fin n := ⟨n - 1, Nat.sub_lt h Nat.one_pos⟩\n")
@@ -231,12 +214,7 @@ func TestTheGateRefusesACopyThatUsesAnotherDeclarationsAbstractedProof(t *testin
 // `Pick.match_left`) keeps its own identity, so a definition that returns another constructor of the same type is a
 // new statement: the gate adds it.
 func TestTheGateAddsADefinitionOfAnotherConstructorWhoseNameLooksGenerated(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	config, tree, lean := leanRegistryTree(t, "A")
 	writeTestFile(t, filepath.Join(tree, "A.lean"), "inductive Choice : Type where\n  | _proof_left\n  | _proof_right\n\n"+
 		"inductive Pick : Type where\n  | match_left\n  | match_right\n\n"+
@@ -271,12 +249,7 @@ func TestTheGateAddsADefinitionOfAnotherConstructorWhoseNameLooksGenerated(t *te
 // imports modules without loading their environment extensions, so the matcher table that `Meta.isMatcherCore` reads
 // is empty there; a matcher is still read by its content, and the copy is refused as `bar`.
 func TestTheGateRefusesACopyThatUsesAnotherDeclarationsMatcher(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	config, tree, lean := leanRegistryTree(t, "A")
 	writeTestFile(t, filepath.Join(tree, "A.lean"), "def foo (n : Nat) : Nat := match n with | 0 => 1 | k + 1 => k\n"+
 		"def bar (n : Nat) : Nat := match n with | 0 => 7 | k + 1 => k + 2\n")
@@ -294,12 +267,7 @@ func TestTheGateRefusesACopyThatUsesAnotherDeclarationsMatcher(t *testing.T) {
 // `Original` restates `t3`'s type; a proposal that imports B and states it again is refused after a refresh that read
 // A and B together and after one that read B alone.
 func TestTheGateRefusesACopyOfAStatementWithAMergedAbstractedProofHoweverTheIndexWasRead(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	config, tree, lean := leanRegistryTree(t, "A", "B")
 	compile := func(name, source string) {
 		t.Helper()
@@ -342,7 +310,7 @@ func TestTwoModulesThatEachDeclareAnUnderscoreNameAreReadApart(t *testing.T) {
 		}
 	}
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B]\nlean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B]\nlean:\n  export: true\n  jobs: 1\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 || !strings.Contains(r.errOut, "2 of 2 module groups") {
 		t.Fatalf("refresh with the compiled part: want exit 0 after two exporter groups, got %+v", r)
 	}
@@ -378,7 +346,7 @@ func TestStatesCountsEachDeclarationByItsModuleAndName(t *testing.T) {
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: A.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh with the compiled part: %+v", r)
 	}

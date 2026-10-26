@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"github.com/sjawhar/legion/orchestration/declindex/confine"
 )
 
 // leanForTest finds a Lean toolchain on PATH. The exporter tests need one: CI installs it and sets
@@ -315,66 +313,15 @@ func TestCompileModuleRunsLeanInAMinimalEnvironment(t *testing.T) {
 	}
 }
 
-// Code that a confined compile runs (here an `#eval`) cannot write outside its scratch directory, read the caller's
-// home, start another program, or start Lean itself again.
-func TestCompileConfinedKeepsTheModulesCodeIn(t *testing.T) {
-	l := leanForTest(t)
-	if err := CheckSandbox(context.Background(), l); err != nil {
-		if os.Getenv("DECLINDEX_REQUIRE_SANDBOX") != "" {
-			t.Fatal(err)
-		}
-		t.Skip(err)
-	}
-	dir, err := confine.NewScratch(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	outside := t.TempDir()
-	target := filepath.Join(outside, "written")
-	spawn := func(cmd string) string {
-		return "  let r ← (IO.Process.output { cmd := \"" + cmd + "\", args := #[\"--version\"] }).toBaseIO\n" +
-			"  if let .ok o := r then if o.exitCode == 0 then throw (IO.userError s!\"ran " + cmd + ": {o.stdout}\")\n"
-	}
-	probe := "def probe : IO Unit := do\n" +
-		"  try IO.FS.writeFile \"" + target + "\" \"x\" catch _ => pure ()\n" +
-		"  let home ← (IO.FS.readFile \"" + filepath.Join(os.Getenv("HOME"), ".bashrc") + "\").toBaseIO\n" +
-		"  if home matches .ok _ then throw (IO.userError \"read the home directory\")\n" +
-		spawn("/bin/sh") + spawn(l.bin("lean")) +
-		"  IO.FS.writeFile \"inside\" \"x\"\n" +
-		"#eval probe\n"
-	if err := CompileConfined(context.Background(), l, nil, dir, "Probe", []byte(probe)); err != nil {
-		t.Fatalf("%v", err)
-	}
-	if _, err := os.Stat(target); err == nil {
-		t.Fatal("the confined module wrote outside its directory")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "inside")); err != nil {
-		t.Fatalf("the confined module could not write in its own directory: %v", err)
-	}
-	if err := CompileConfined(context.Background(), l, nil, dir, "Probe", []byte(probe)); err == nil {
-		t.Fatal("a scratch directory that a run already used was accepted")
-	}
-}
-
 // Lean's own parser decides what a proposal holds: text that hides a command from a text filter does not hide it
 // from the parser.
 func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 	l := leanForTest(t)
-	if err := CheckSandbox(context.Background(), l); err != nil {
-		if os.Getenv("DECLINDEX_REQUIRE_SANDBOX") != "" {
-			t.Fatal(err)
-		}
-		t.Skip(err)
-	}
 	dir, _ := compiledFixture(t, l)
 	x := &Exporter{Lean: l, Bin: exporterForTest(t, l)}
 	check := func(body string) error {
 		t.Helper()
-		work, err := confine.NewScratch(t.TempDir())
-		if err != nil {
-			t.Fatal(err)
-		}
-		return x.CheckSource(context.Background(), []byte("import Fixture\n"+body), []string{dir}, work)
+		return x.CheckSource(context.Background(), []byte("import Fixture\n"+body), []string{dir}, t.TempDir())
 	}
 	for _, ok := range []string{
 		"namespace Fx\nopen Fx\n/-- doc -/\n@[simp] def MySp (R : BitVec 5 → BitVec 64) : Prop := R 2#5 &&& 7#64 = 0#64\nend Fx\n",

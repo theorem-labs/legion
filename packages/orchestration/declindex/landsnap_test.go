@@ -13,12 +13,13 @@ func TestLandSnapshotCarriesSourcesModulesAndRequestedDeclarations(t *testing.T)
 	gitIn(t, tree.Source, "init", "-q")
 	gitIn(t, tree.Source, "add", "-A")
 	gitIn(t, tree.Source, "commit", "-q", "-m", "base")
-	s := openStore(t)
+	tg := indexTarget(t)
+	s := openAt(t, tg)
 	ctx := context.Background()
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "base"}); err != nil {
 		t.Fatal(err)
 	}
-	reader, err := OpenReadOnly(ctx, s.path, IndexOnly)
+	reader, err := OpenReadOnly(ctx, tg, IndexOnly)
 	if err != nil {
 		t.Fatal(err)
 	}

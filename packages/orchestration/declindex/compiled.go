@@ -3,7 +3,6 @@ package declindex
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,18 +17,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sjawhar/legion/orchestration/declindex/confine"
+	"github.com/jackc/pgx/v5"
 )
 
 // CompiledOptions turn on the compiled part of a refresh: types, compiled statement hashes, atoms and the
 // registry's facts, read by the exporter from the .olean files.
 type CompiledOptions struct {
-	// Exporter reads the modules. When it is Confined (the gate's setting, for proposals), the forms module is
-	// compiled in the sandbox too, in a fresh scratch directory below its ScratchDir.
+	// Exporter reads the modules.
 	Exporter *Exporter
 	// Forms are the registry's concepts and forms.
 	Forms FormsModule
-	// Dir holds the compiled forms module of an exporter that is not confined.
+	// Dir holds the compiled forms module. The gate gives each decision a fresh one of its own.
 	Dir string
 }
 
@@ -58,28 +56,14 @@ func (co *CompiledOptions) prepare(ctx context.Context, roots Roots) (*Exporter,
 			return nil, m, "", err
 		}
 		dir := co.Dir
-		if x.Confined {
-			// A fresh scratch below the caller's scratch directory, which the caller removes.
-			if x.ScratchDir == "" {
-				return nil, m, "", errors.New("a confined export needs the exporter's ScratchDir")
-			}
-			var err error
-			if dir, err = confine.NewScratch(x.ScratchDir); err != nil {
-				return nil, m, "", err
-			}
-			if err := CompileConfined(ctx, x.Lean, x.SearchPath, dir, FormsModuleName, []byte(src)); err != nil {
-				return nil, m, "", fmt.Errorf("compile the registry's forms: %w", err)
-			}
-		} else {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return nil, m, "", err
-			}
-			if err := os.WriteFile(filepath.Join(dir, FormsModuleName+".lean"), []byte(src), 0o644); err != nil {
-				return nil, m, "", err
-			}
-			if err := CompileModule(ctx, x.Lean, x.SearchPath, dir, FormsModuleName); err != nil {
-				return nil, m, "", fmt.Errorf("compile the registry's forms: %w", err)
-			}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, m, "", err
+		}
+		if err := os.WriteFile(filepath.Join(dir, FormsModuleName+".lean"), []byte(src), 0o644); err != nil {
+			return nil, m, "", err
+		}
+		if err := CompileModule(ctx, x.Lean, x.SearchPath, dir, FormsModuleName); err != nil {
+			return nil, m, "", fmt.Errorf("compile the registry's forms: %w", err)
 		}
 		x.SearchPath = slices.Concat(x.SearchPath, []string{dir})
 		m.Imports = []string{FormsModuleName}
@@ -103,7 +87,7 @@ func (co *CompiledOptions) Export(ctx context.Context, roots Roots, modules, ext
 // SameCompiled lists the declarations (generated constants counted as their declaration) whose compiled
 // statement hash is hash: exact restatements.
 func (s *Store) SameCompiled(ctx context.Context, hash string) ([]Found, error) {
-	return s.distinctOwners(ctx, `SELECT name, module FROM consts WHERE cstmt = ? ORDER BY name, module`, hash)
+	return s.distinctOwners(ctx, `SELECT name, module FROM consts WHERE cstmt = $1 ORDER BY name, module`, hash)
 }
 
 // FormsClash is why the compiled step reads Module without the registry's forms: its imports declare Name in
@@ -123,8 +107,8 @@ type FormsClash struct {
 // registry's forms: none when every module was read with them.
 func (s *Store) WithoutForms(ctx context.Context) ([]FormsClash, error) {
 	out := []FormsClash{}
-	rows, err := s.q.QueryContext(ctx, `SELECT module, name, declarer, forms FROM without_forms ORDER BY module, name, declarer`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT module, name, declarer, forms FROM without_forms ORDER BY module, name, declarer`)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var module, name, declarer string
 		var forms bool
 		if err := r.Scan(&module, &name, &declarer, &forms); err != nil {
@@ -159,7 +143,11 @@ func ClashModules(clashes []FormsClash) int {
 // the build of a module in the forms' import closure changed), then the statements that a changed definition
 // reaches, since a definition's facts pass to every statement that applies it. It records commit as the commit
 // whose compiled part the index holds.
-func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOptions, files []moduleFile, commit string, log io.Writer) (int, int, error) {
+// refreshCompiled reads the compiled part of the tree and writes it. generation is what the index held before
+// this refresh read anything of it: this step plans its write from the modules its reference part read and from
+// what it reads here, so its write refuses when another writer has moved the index since (writeTxFrom). Its own
+// reference write raised the generation by one, which is what this step passes on.
+func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOptions, files []moduleFile, commit string, generation int64, log io.Writer) (int, int, error) {
 	t0 := time.Now()
 	x, m, src, err := co.prepare(ctx, tree.Roots)
 	if err != nil {
@@ -223,7 +211,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			// Nothing was read with the new exporter or forms: the compiled part is not complete for commit.
 			return 0, 0, nil
 		}
-		return 0, 0, s.write(ctx, log, func() error { return s.setMeta(ctx, s.db, "compiled_commit", commit) })
+		return 0, 0, s.writeTxFrom(ctx, generation, func(tx pgx.Tx) error { return compiledDone(ctx, tx, commit) })
 	}
 	sort.Strings(todo)
 	before, err := s.defHashes(ctx, todo)
@@ -241,7 +229,7 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 	logf(log, "index: %d compiled modules read, %d constants, %s", len(todo), len(consts), time.Since(t0).Round(time.Millisecond))
 	var again []string
 	if !full {
-		again, err = s.reachedModules(changedDefs(before, consts), todo)
+		again, err = s.reachedModules(ctx, changedDefs(before, consts), todo)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -259,8 +247,8 @@ func (s *Store) refreshCompiled(ctx context.Context, tree Tree, co *CompiledOpti
 			logf(log, "index: %d modules re-matched, reached from changed definitions", len(again))
 		}
 	}
-	// The exporter ran without the write lock; only the write of what it read holds it.
-	if err := s.writeTx(ctx, log, func(tx *sql.Tx) error {
+	// The exporter ran outside the write transaction; only the write of what it read is in one.
+	if err := s.writeTxFrom(ctx, generation, func(tx pgx.Tx) error {
 		return s.writeCompiled(ctx, tx, compiledRead{read: todo, rematched: again, oleanKeys: keys, consts: consts,
 			withoutForms: withoutForms, digest: digest, commit: commit})
 	}); err != nil {
@@ -369,66 +357,145 @@ type compiledRead struct {
 // writeCompiled replaces the compiled rows of the modules read (read, and rematched) with consts and their clashes
 // with the forms, records the .olean key now of each module of read, and the digest and the commit that the
 // compiled part is of.
-func (s *Store) writeCompiled(ctx context.Context, tx *sql.Tx, w compiledRead) error {
-	for _, mod := range slices.Concat(w.read, w.rematched) {
-		if err := deleteCompiled(ctx, tx, mod); err != nil {
-			return err
-		}
+func (s *Store) writeCompiled(ctx context.Context, tx pgx.Tx, w compiledRead) error {
+	if err := deleteCompiled(ctx, tx, slices.Concat(w.read, w.rematched)); err != nil {
+		return err
 	}
-	cb := newBatch(tx, "INSERT OR REPLACE", "consts (name, module, kind, type, cstmt, binders, conclusion)", 7)
-	ab, fb := newBatch(tx, "INSERT", "atoms", 3), newBatch(tx, "INSERT", "facts", 4)
+	// consts has (name, module) as its primary key, and a copy cannot replace a row, so the last row of a pair
+	// wins here as INSERT OR REPLACE did; atoms and facts have no key, and keep every row of every constant.
+	constRows := make([][]any, 0, len(w.consts))
+	at := make(map[declRef]int, len(w.consts))
 	for _, c := range w.consts {
-		binders, err := json.Marshal(nonNil(c.Binders))
-		if err != nil {
-			return err
-		}
-		if err := cb.add(ctx, c.Name, c.Module, c.Kind, c.Type, c.Hash, string(binders), c.Conclusion); err != nil {
+		// consts, atoms and facts key a constant by its name and its module, and a fact by its concept: a
+		// name the index cannot hold is an index defect of the tree, named here (checkName).
+		if err := checkName("the constant", c.Name, c.Module); err != nil {
 			return err
 		}
 		for _, a := range c.Atoms {
-			if err := ab.add(ctx, c.Name, c.Module, a); err != nil {
+			if err := checkName("the atom of "+c.Name, a); err != nil {
 				return err
 			}
 		}
 		for _, f := range c.Facts {
-			if err := fb.add(ctx, c.Name, c.Module, f.Concept, f.How); err != nil {
+			if err := checkName("the concept", f.Concept); err != nil {
 				return err
 			}
 		}
+		// consts_conclusion indexes the head of a constant's conclusion, which is a name of the tree.
+		if err := checkName("the conclusion of "+c.Name, c.Conclusion); err != nil {
+			return err
+		}
+		// consts_cstmt indexes the compiled statement hash, which is of a fixed length, and the type is in
+		// no index.
+		// binders is a JSON array, as the graph checks read it back (ConstantsIn).
+		binders, err := json.Marshal(nonNil(c.Binders))
+		if err != nil {
+			return err
+		}
+		row := []any{c.Name, c.Module, c.Kind, c.Type, c.Hash, string(binders), c.Conclusion}
+		if i, ok := at[(declRef{c.Module, c.Name})]; ok {
+			constRows[i] = row
+			continue
+		}
+		at[declRef{c.Module, c.Name}] = len(constRows)
+		constRows = append(constRows, row)
 	}
-	wb := newBatch(tx, "INSERT OR REPLACE", "without_forms", 4)
+	// without_forms has (module, name, forms, declarer) as its primary key: one row for each of them.
+	type clash struct {
+		module, name, declarer string
+		forms                  bool
+	}
+	formRows := make([][]any, 0, len(w.withoutForms))
+	written := map[clash]bool{}
+	add := func(c clash) error {
+		if written[c] {
+			return nil
+		}
+		written[c] = true
+		// The key of without_forms holds the module that read the clash, the name, and the module that
+		// declares it: an index defect names what to shorten (checkName).
+		if err := checkName("the clash of", c.name, c.module, c.declarer); err != nil {
+			return err
+		}
+		formRows = append(formRows, []any{c.module, c.name, c.declarer, c.forms})
+		return nil
+	}
 	for _, c := range w.withoutForms {
 		for _, d := range c.DeclaredIn {
-			if err := wb.add(ctx, c.Module, c.Name, d, false); err != nil {
+			if err := add(clash{c.Module, c.Name, d, false}); err != nil {
 				return err
 			}
 		}
 		for _, d := range c.FormsDeclaredIn {
-			if err := wb.add(ctx, c.Module, c.Name, d, true); err != nil {
+			if err := add(clash{c.Module, c.Name, d, true}); err != nil {
 				return err
 			}
 		}
 	}
-	for _, b := range []*batch{cb, ab, fb, wb} {
-		if err := b.flush(ctx); err != nil {
+	// Each source below holds one row at a time: a project's compiled part is millions of rows.
+	atoms, facts := make([]any, 3), make([]any, 4)
+	for _, c := range []struct {
+		table string
+		cols  []string
+		rows  pgx.CopyFromSource
+	}{
+		{"consts", []string{"name", "module", "kind", "type", "cstmt", "binders", "conclusion"}, pgx.CopyFromRows(constRows)},
+		{"atoms", []string{"name", "module", "atom"}, copyFrom(func(yield func([]any) bool) {
+			for _, c := range w.consts {
+				for _, a := range c.Atoms {
+					atoms[0], atoms[1], atoms[2] = c.Name, c.Module, a
+					if !yield(atoms) {
+						return
+					}
+				}
+			}
+		})},
+		{"facts", []string{"name", "module", "concept", "how"}, copyFrom(func(yield func([]any) bool) {
+			for _, c := range w.consts {
+				for _, f := range c.Facts {
+					facts[0], facts[1], facts[2], facts[3] = c.Name, c.Module, f.Concept, f.How
+					if !yield(facts) {
+						return
+					}
+				}
+			}
+		})},
+		{"without_forms", []string{"module", "name", "declarer", "forms"}, pgx.CopyFromRows(formRows)},
+	} {
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{c.table}, c.cols, c.rows); err != nil {
+			return fmt.Errorf("write the index's %s: %w", c.table, err)
+		}
+	}
+	if len(w.read) > 0 {
+		keys := make([]string, len(w.read))
+		for i, mod := range w.read {
+			keys[i] = w.oleanKeys[mod]
+		}
+		if _, err := tx.Exec(ctx, `UPDATE modules SET olean_key = k.key
+			FROM unnest($1::text[], $2::text[]) AS k(module, key) WHERE modules.module = k.module`, w.read, keys); err != nil {
 			return err
 		}
 	}
-	for _, mod := range w.read {
-		if _, err := tx.ExecContext(ctx, `UPDATE modules SET olean_key = ? WHERE module = ?`, w.oleanKeys[mod], mod); err != nil {
-			return err
-		}
-	}
-	if err := s.setMeta(ctx, tx, "compiled", w.digest); err != nil {
+	if err := setMeta(ctx, tx, "compiled", w.digest); err != nil {
 		return err
 	}
-	return s.setMeta(ctx, tx, "compiled_commit", w.commit)
+	return compiledDone(ctx, tx, w.commit)
+}
+
+// compiledDone records that the index's compiled part is of commit, and that the refresh owes no compiled part
+// any more (CompiledCommit).
+func compiledDone(ctx context.Context, tx pgx.Tx, commit string) error {
+	if err := setMeta(ctx, tx, "compiled_commit", commit); err != nil {
+		return err
+	}
+	return setMeta(ctx, tx, "compiled_owed", "")
 }
 
 // defHashes are the compiled hashes of the definitions of the modules, before they are read again.
 func (s *Store) defHashes(ctx context.Context, modules []string) (map[declRef]string, error) {
 	out := map[declRef]string{}
-	err := eachRowIn(ctx, s.q, `SELECT name, module, cstmt FROM consts WHERE kind = 'def' AND module IN`, modules, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT name, module, cstmt FROM consts WHERE kind = 'def' AND module = ANY($1)`, modules)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var d declRef
 		var h string
 		if err := r.Scan(&d.name, &d.module, &h); err != nil {
@@ -466,33 +533,6 @@ func changedDefs(before map[declRef]string, consts []Constant) []declRef {
 	return out
 }
 
-// reachedModules are the modules, other than skip, of the statements that a change to defs changes.
-func (s *Store) reachedModules(defs []declRef, skip []string) ([]string, error) {
-	if len(defs) == 0 {
-		return nil, nil
-	}
-	g, err := s.graph()
-	if err != nil {
-		return nil, err
-	}
-	done := map[string]bool{}
-	for _, m := range skip {
-		done[m] = true
-	}
-	var out []string
-	for _, d := range defs {
-		changed, _, _ := g.walk(d)
-		for r := range changed {
-			if !done[r.module] {
-				done[r.module] = true
-				out = append(out, r.module)
-			}
-		}
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
 // Compiled is what the index read about one compiled constant.
 type Compiled struct {
 	Name   string `json:"name"`
@@ -511,16 +551,16 @@ type Compiled struct {
 // Constant reads the compiled constant name of module.
 func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, error) {
 	c := Compiled{Name: name, Module: module}
-	err := s.q.QueryRowContext(ctx, `SELECT kind, type, cstmt FROM consts WHERE name = ? AND module = ?`, name, module).
+	err := s.q.QueryRow(ctx, `SELECT kind, type, cstmt FROM consts WHERE name = $1 AND module = $2`, name, module).
 		Scan(&c.Kind, &c.Type, &c.Hash)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return c, &NotFoundError{Name: name}
 	}
 	if err != nil {
 		return c, err
 	}
-	rows, err := s.q.QueryContext(ctx, `SELECT atom FROM atoms WHERE name = ? AND module = ? ORDER BY atom`, name, module)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT atom FROM atoms WHERE name = $1 AND module = $2 ORDER BY atom`, name, module)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var a string
 		if err := r.Scan(&a); err != nil {
 			return err
@@ -531,8 +571,8 @@ func (s *Store) Constant(ctx context.Context, name, module string) (Compiled, er
 	if err != nil {
 		return c, err
 	}
-	rows, err = s.q.QueryContext(ctx, `SELECT concept, how FROM facts WHERE name = ? AND module = ? ORDER BY concept, how`, name, module)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err = s.q.Query(ctx, `SELECT concept, how FROM facts WHERE name = $1 AND module = $2 ORDER BY concept, how`, name, module)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var f Fact
 		if err := r.Scan(&f.Concept, &f.How); err != nil {
 			return err
@@ -553,9 +593,9 @@ func (s *Store) DeclarationParts(ctx context.Context, module string, names []str
 	var consts []declRef
 	for _, n := range names {
 		decls[declRef{module, n}] = true
-		rows, err := s.q.QueryContext(ctx, `SELECT name FROM consts WHERE module = ? AND
-			(name = ? OR (name >= ? AND name < ?)) ORDER BY name`, module, n, n+".", n+"/")
-		err = eachRow(rows, err, func(r *sql.Rows) error {
+		rows, err := s.q.Query(ctx, `SELECT name FROM consts WHERE module = $1 AND
+			(name = $2 OR (name >= $3 AND name < $4)) ORDER BY name`, module, n, n+".", n+"/")
+		err = eachRow(rows, err, func(r pgx.Rows) error {
 			c := declRef{module: module}
 			if err := r.Scan(&c.name); err != nil {
 				return err
@@ -602,7 +642,7 @@ func dottedPrefixes(name string) iter.Seq[string] {
 
 // owners maps each compiled constant to the declaration it belongs to (ownerResolver.owner: `X.mk` is X's
 // constructor), or to the constant itself, with no place, when it belongs to none. It resolves all the constants at
-// once: one query per maxInParams candidate names (each name and its dotted prefixes), not one lookup per constant.
+// once: one query for the candidate names (each name and its dotted prefixes), not one lookup per constant.
 // A wide concept has tens of thousands of statements.
 func (s *Store) owners(ctx context.Context, consts []declRef) (map[declRef]Found, error) {
 	names := make([]string, len(consts))
@@ -621,13 +661,14 @@ func (s *Store) owners(ctx context.Context, consts []declRef) (map[declRef]Found
 		if err != nil {
 			return nil, err
 		}
-		ref[c] = o
-		if slices.Contains(declaring[o.name], o.module) {
-			declared[o.name] = true
+		ref[c] = o.ref
+		if slices.Contains(declaring[o.ref.name], o.ref.module) {
+			declared[o.ref.name] = true
 		}
 	}
 	found := map[declRef]Found{}
-	err = eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, slices.Sorted(maps.Keys(declared)), func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, foundSelect+` WHERE d.name = ANY($1)`, slices.Sorted(maps.Keys(declared)))
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
@@ -656,8 +697,8 @@ func (s *Store) owners(ctx context.Context, consts []declRef) (map[declRef]Found
 // owners), each once, in the order of its first constant.
 func (s *Store) distinctOwners(ctx context.Context, query string, args ...any) ([]Found, error) {
 	var consts []declRef
-	rows, err := s.q.QueryContext(ctx, query, args...)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, query, args...)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var c declRef
 		if err := r.Scan(&c.name, &c.module); err != nil {
 			return err
@@ -700,8 +741,8 @@ type Stating struct {
 func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 	type row struct{ name, module, how string }
 	var rs []row
-	rows, err := s.q.QueryContext(ctx, `SELECT name, module, how FROM facts WHERE concept = ? ORDER BY module, name, how`, concept)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT name, module, how FROM facts WHERE concept = $1 ORDER BY module, name, how`, concept)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var x row
 		if err := r.Scan(&x.name, &x.module, &x.how); err != nil {
 			return err
@@ -736,7 +777,7 @@ func (s *Store) States(ctx context.Context, concept string) ([]Stating, error) {
 // that Resolve gave: who else states one of its facts in the same form.
 func (s *Store) SameAtoms(ctx context.Context, d Found) ([]Found, error) {
 	found, err := s.distinctOwners(ctx, `SELECT DISTINCT b.name, b.module FROM atoms a JOIN atoms b ON b.atom = a.atom
-		WHERE a.name = ? AND a.module = ? AND NOT (b.name = a.name AND b.module = a.module)`, d.Name, d.Module)
+		WHERE a.name = $1 AND a.module = $2 AND NOT (b.name = a.name AND b.module = a.module)`, d.Name, d.Module)
 	if err != nil {
 		return nil, err
 	}

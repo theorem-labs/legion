@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -40,12 +39,7 @@ func TestEdgeOwnersFollowTheModuleOfEachConstant(t *testing.T) {
 		`"{\"c\":{\"m\":\"U\",\"n\":\"A.X.eq_1\"}}":{"definition":null,"usages":[[1,17,1,25,"U.v"]]}}}`,
 		"theorem U.u (h : A.X.wp) : True := trivial\ntheorem U.v (h : A.X.eq_1) : True := trivial\n")
 	tree := Tree{Source: dir, Lib: dir, Roots: Roots{"A": true, "U": true, "B": true, "C": true}}
-	path := filepath.Join(t.TempDir(), "index.sqlite")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	s := openStore(t)
 	ctx := context.Background()
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
 		t.Fatal(err)
@@ -76,58 +70,6 @@ func TestEdgeOwnersFollowTheModuleOfEachConstant(t *testing.T) {
 			t.Errorf("B's A.X.wp: %+v %+v %v; want no use: U uses A's", a.Direct, a.Reach, err)
 		}
 	}
-}
-
-// The graph file is written before the commit of the reference part, so a refresh whose graph write fails commits
-// nothing: the index stays at the commit before, with that commit's graph, and answers from it. The next refresh
-// writes both, though no module changed since the failed one.
-func TestAFailedGraphWriteCommitsNothing(t *testing.T) {
-	tree := goldenTree(t)
-	path := filepath.Join(t.TempDir(), "index.sqlite")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
-		t.Fatal(err)
-	}
-	atOne, err := answerFor(t, s, "Gold.Frame", AnswerOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(filepath.Join(tree.Lib, "Sub", "Wrap.ilean")); err != nil {
-		t.Fatal(err)
-	}
-	// The graph's temporary file cannot be created: the write fails before the commit.
-	if err := os.Mkdir(path+".graph.tmp", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); err == nil {
-		t.Fatal("a refresh whose graph write failed reported success")
-	}
-	s.Close()
-	s, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if commit, err := s.Meta(ctx, "commit"); err != nil || commit != "one" {
-		t.Fatalf("the index after a failed graph write is at %q, %v; want one", commit, err)
-	}
-	if a, err := answerFor(t, s, "Gold.Frame", AnswerOptions{}); err != nil || !reflect.DeepEqual(a, atOne) {
-		t.Fatalf("after a failed graph write: %+v, %v; want the answer at one, %+v", a, err, atOne)
-	}
-	if err := os.Remove(path + ".graph.tmp"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); err != nil {
-		t.Fatal(err)
-	}
-	a, err := answerFor(t, s, "Gold.Frame", AnswerOptions{})
-	if err != nil || a.Reach.StatementsChanged != 2 {
-		t.Fatalf("after the repair: %+v %v", a.Reach, err)
-	}
-	s.Close()
 }
 
 // A reference file older than its source records positions that no longer hold the declarations. Their

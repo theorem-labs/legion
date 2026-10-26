@@ -3,10 +3,11 @@ package declindex
 import (
 	"cmp"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"maps"
 	"slices"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // The reads that graph checks make of an index: a candidate's declarations, uses and imports against the built
@@ -45,7 +46,7 @@ func (s *Store) DeclsShort(ctx context.Context, shorts []string) ([]Decl, error)
 // declColumns are the columns of a Decl, in the order scanDecl reads them.
 const declColumns = `name, short, module, kind, line, stmt_hash`
 
-func scanDecl(r *sql.Rows, out *[]Decl) error {
+func scanDecl(r pgx.Rows, out *[]Decl) error {
 	var d Decl
 	if err := r.Scan(&d.Name, &d.Short, &d.Module, &d.Kind, &d.Line, &d.StmtHash); err != nil {
 		return err
@@ -58,8 +59,8 @@ func scanDecl(r *sql.Rows, out *[]Decl) error {
 // module and line.
 func (s *Store) declsWhere(ctx context.Context, column string, values []string) ([]Decl, error) {
 	var out []Decl
-	err := eachRowIn(ctx, s.q, `SELECT `+declColumns+` FROM decls WHERE `+column+` IN`, distinct(values),
-		func(r *sql.Rows) error { return scanDecl(r, &out) })
+	rows, err := s.q.Query(ctx, `SELECT `+declColumns+` FROM decls WHERE `+column+` = ANY($1)`, distinct(values))
+	err = eachRow(rows, err, func(r pgx.Rows) error { return scanDecl(r, &out) })
 	if err != nil {
 		return nil, err
 	}
@@ -87,9 +88,9 @@ func (s *Store) UsesOf(ctx context.Context, names []string) ([]Use, error) {
 		if partOfAnother(name, asked) {
 			continue
 		}
-		rows, err := s.q.QueryContext(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
-			WHERE target = ? OR (target >= ? AND target < ?)`, name, name+".", name+"0")
-		err = eachRow(rows, err, func(r *sql.Rows) error {
+		rows, err := s.q.Query(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
+			WHERE target = $1 OR (target >= $2 AND target < $3)`, name, name+".", name+"0")
+		err = eachRow(rows, err, func(r pgx.Rows) error {
 			var u Use
 			if err := r.Scan(&u.Target, &u.TargetModule, &u.Module, &u.Line, &u.Col, &u.Parent, &u.Class); err != nil {
 				return err
@@ -119,17 +120,17 @@ func partOfAnother(name string, names map[string]bool) bool {
 // none maps to nil.
 func (s *Store) Imports(ctx context.Context) (map[string][]string, error) {
 	out := map[string][]string{}
-	rows, err := s.q.QueryContext(ctx, `SELECT m.module, i.imported FROM modules m
+	rows, err := s.q.Query(ctx, `SELECT m.module, i.imported FROM modules m
 		LEFT JOIN imports i ON i.module = m.module ORDER BY m.module, i.imported`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var module string
-		var imported sql.NullString
+		var imported *string
 		if err := r.Scan(&module, &imported); err != nil {
 			return err
 		}
 		list := out[module]
-		if imported.Valid {
-			list = append(list, imported.String)
+		if imported != nil {
+			list = append(list, *imported)
 		}
 		out[module] = list
 		return nil
@@ -158,19 +159,20 @@ func (s *Store) ConstantsConcluding(ctx context.Context, heads []string) ([]Cons
 // module and name.
 func (s *Store) constantsWhere(ctx context.Context, column string, values []string) ([]Constant, error) {
 	var out []Constant
-	err := eachRowIn(ctx, s.q, `SELECT name, module, kind, type, cstmt, binders, conclusion FROM consts WHERE `+column+` IN`,
-		distinct(values), func(r *sql.Rows) error {
-			var c Constant
-			var binders string
-			if err := r.Scan(&c.Name, &c.Module, &c.Kind, &c.Type, &c.Hash, &binders, &c.Conclusion); err != nil {
-				return err
-			}
-			if err := json.Unmarshal([]byte(binders), &c.Binders); err != nil {
-				return err
-			}
-			out = append(out, c)
-			return nil
-		})
+	rows, err := s.q.Query(ctx, `SELECT name, module, kind, type, cstmt, binders, conclusion FROM consts WHERE `+column+` = ANY($1)`,
+		distinct(values))
+	err = eachRow(rows, err, func(r pgx.Rows) error {
+		var c Constant
+		var binders string
+		if err := r.Scan(&c.Name, &c.Module, &c.Kind, &c.Type, &c.Hash, &binders, &c.Conclusion); err != nil {
+			return err
+		}
+		if err := json.Unmarshal([]byte(binders), &c.Binders); err != nil {
+			return err
+		}
+		out = append(out, c)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}

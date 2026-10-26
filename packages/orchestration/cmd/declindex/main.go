@@ -15,6 +15,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -24,9 +25,19 @@ import (
 	"github.com/sjawhar/legion/orchestration/declindex"
 )
 
-const usage = "usage: declindex --config FILE [--db FILE] [--json] <refresh|status|where|users|hash|states|same|gate|ledger|land-hash> ..."
+const usage = "usage: declindex --config FILE [--index NAME] [--index-dsn-file FILE] [--state DIR] [--json] <refresh|status|where|users|hash|states|same|gate|ledger|land-hash> ..."
 
 const help = usage + `
+
+The index is one schema of a Postgres database: index: in the configuration (or --index) names the schema, and
+DECLINDEX_DSN or --index-dsn-file gives the connection string. No configuration file holds one.
+
+Global options, before the command:
+  --config FILE                the project's index configuration (or DECLINDEX_CONFIG)
+  --index NAME                 the index's schema, overriding the configuration's index:
+  --index-dsn-file FILE        the index's connection string, read from FILE; it wins over DECLINDEX_DSN
+  --state DIR                  the local directory of the exporter build and the forms module, overriding state:
+  --json                       answer as JSON, where the command answers in JSON
 
 Commands:
   refresh                      bring the index to the tree's build; with LAND_COMMIT, fetch, check out and build
@@ -54,15 +65,16 @@ Commands:
 NAME is a full name or any dotted suffix of one. A name declared twice is answered once per declaration.
 Exit codes:
   refresh: 0 read; 2 usage; 3 unable; 75 retry
-  status: 0 answered; 2 usage; 3 unable
-  where: 0 answered; 1 name not found; 2 usage; 3 unable
-  users: 0 answered; 1 name not found; 2 usage; 3 unable
-  hash: 0 answered; 1 name not found; 2 usage; 3 unable
-  states: 0 answered; 1 name not found; 2 usage; 3 unable
-  same: 0 answered; 1 name not found; 2 usage; 3 unable
-  gate: 0 added; 1 duplicate; 2 usage; 3 unable; 4 near; 5 name taken
+  status: 0 answered; 2 usage; 3 unable; 75 retry
+  where: 0 answered; 1 name not found; 2 usage; 3 unable; 75 retry
+  users: 0 answered; 1 name not found; 2 usage; 3 unable; 75 retry
+  hash: 0 answered; 1 name not found; 2 usage; 3 unable; 75 retry
+  states: 0 answered; 1 name not found; 2 usage; 3 unable; 75 retry
+  same: 0 answered; 1 name not found; 2 usage; 3 unable; 75 retry
+  gate: 0 added; 1 duplicate; 2 usage; 3 unable; 4 near; 5 name taken; 75 retry
   ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry (also when the registry recheck of a landing cannot run)
-  land-hash: 0 answered; 2 usage; 3 unable`
+  land-hash: 0 answered; 2 usage; 3 unable; 75 retry
+75 is a failed connection to the index's database: the command can be run again.`
 
 type usageError struct{ msg string }
 
@@ -84,8 +96,8 @@ func main() {
 }
 
 type globals struct {
-	config, db string
-	json       bool
+	config, index, state, dsnFile string
+	json                          bool
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
@@ -99,17 +111,24 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 			g.json = true
 			args = args[1:]
 			continue
-		case "--config", "--db":
+		case "--config", "--index", "--index-dsn-file", "--state":
 			if len(args) < 2 {
 				return fail(stderr, &usageError{args[0] + " needs a value"})
 			}
-			if args[0] == "--config" {
+			switch args[0] {
+			case "--config":
 				g.config = args[1]
-			} else {
-				g.db = args[1]
+			case "--index":
+				g.index = args[1]
+			case "--index-dsn-file":
+				g.dsnFile = args[1]
+			case "--state":
+				g.state = args[1]
 			}
 			args = args[2:]
 			continue
+		case "--db":
+			return fail(stderr, &usageError{declindex.ErrDBRemoved.Error()})
 		}
 		return fail(stderr, &usageError{"unknown option " + args[0]})
 	}
@@ -126,15 +145,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if _, ok := commands[cmd]; !ok {
 		return fail(stderr, &usageError{fmt.Sprintf("unknown command %q", cmd)})
 	}
-	cfg, err := declindex.LoadConfig(g.config)
+	cfg, err := settings(g, getenv)
 	if err != nil {
-		return fail(stderr, &unableError{err})
-	}
-	if g.db != "" {
-		cfg.DB = g.db
-	}
-	if cfg.DB == "" {
-		return fail(stderr, &usageError{declindex.ErrNoDB.Error()})
+		return fail(stderr, err)
 	}
 	// A command writes its output here and returns, closing the index, before anything reads the output: a
 	// command's snapshot of the index holds up a refresh's write (declindex.OpenReadOnly), so a slow reader of the
@@ -156,19 +169,103 @@ type env struct {
 	store  *declindex.Store
 }
 
-func (e *env) open() error {
-	return e.openWith(false, func() (*declindex.Store, error) { return declindex.Open(e.cfg.DB) })
+// settings is the configuration a command runs with: the file, the overrides of --index and --state, and the
+// index's connection string, which no configuration file holds (P-1).
+func settings(g globals, getenv func(string) string) (declindex.Config, error) {
+	cfg, err := declindex.LoadConfig(g.config)
+	if err != nil {
+		// An old configuration names the index file: its owner must change the file, as for a wrong flag.
+		if errors.Is(err, declindex.ErrDBRemoved) {
+			return cfg, &usageError{err.Error()}
+		}
+		return cfg, &unableError{err}
+	}
+	if g.index != "" {
+		if err := declindex.ValidIndexName(g.index); err != nil {
+			return cfg, &usageError{"--index: " + err.Error()}
+		}
+		cfg.Index = g.index
+	}
+	if g.state != "" {
+		state, err := filepath.Abs(g.state)
+		if err != nil {
+			return cfg, &usageError{"--state " + g.state + ": " + err.Error()}
+		}
+		cfg.State = state
+	}
+	if cfg.DSN, err = indexDSN(g.dsnFile, getenv); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
-// openReadOnly opens the index the configuration names without writing it or its directory, which the landing hooks
-// mount read-only: one snapshot of it, until close (declindex.OpenReadOnlyConfig). scope is what the command reads
-// besides the index.
+// indexDSN is the index's connection string: the contents of the file that --index-dsn-file names, which wins,
+// else DECLINDEX_DSN. So one configuration serves a hook that writes the index with one login and a query that
+// reads it with another.
+func indexDSN(file string, getenv func(string) string) (string, error) {
+	if file == "" {
+		return strings.TrimSpace(getenv("DECLINDEX_DSN")), nil
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return "", &usageError{"--index-dsn-file: " + err.Error()}
+	}
+	dsn := strings.TrimSpace(string(raw))
+	if dsn == "" {
+		return "", &usageError{"--index-dsn-file " + file + ": the file is empty"}
+	}
+	return dsn, nil
+}
+
+// target is the index a command opens. A command that opens the index without a schema name or a connection
+// string is a usage error, as a missing db: was before it (P-1).
+func (e *env) target() (declindex.Target, error) {
+	return e.targetFor(false)
+}
+
+// targetFor is the index a command opens; withTree also names the file whose lock guards the indexed tree, for a
+// command that reads or writes the tree (refresh, gate, ledger). A command that reads the index alone needs no
+// tree on this machine, so it does not resolve the state directory: an owner's pod has the index and no tree.
+func (e *env) targetFor(withTree bool) (declindex.Target, error) {
+	t := e.cfg.Target()
+	if withTree {
+		var err error
+		if t, err = e.cfg.TreeTarget(); err != nil {
+			return declindex.Target{}, &usageError{err.Error()}
+		}
+	}
+	switch {
+	case t.Index == "":
+		return t, &usageError{"index: is required: the index is a schema of a Postgres database (or pass --index NAME)"}
+	case t.DSN == "":
+		return t, &usageError{"no connection string for the index: set DECLINDEX_DSN or pass --index-dsn-file FILE"}
+	}
+	if err := declindex.ValidIndexName(t.Index); err != nil {
+		return t, &usageError{"index: " + err.Error()}
+	}
+	return t, nil
+}
+
+// open opens the index to write it: only refresh and the schema rebuild do, and both read and change the tree,
+// so the target names the tree's lock.
+func (e *env) open(ctx context.Context) error {
+	return e.openWith(ctx, true, false, func(t declindex.Target) (*declindex.Store, error) { return declindex.Open(ctx, t) })
+}
+
+// openReadOnly opens the index for one snapshot of it, until close, and writes nothing (declindex.OpenReadOnly).
+// scope is what the command reads besides the index.
 func (e *env) openReadOnly(ctx context.Context, scope declindex.ReadScope, needIndex bool) error {
-	return e.openWith(needIndex, func() (*declindex.Store, error) { return declindex.OpenReadOnlyConfig(ctx, e.cfg, scope) })
+	return e.openWith(ctx, scope == declindex.IndexAndTree, needIndex, func(t declindex.Target) (*declindex.Store, error) {
+		return declindex.OpenReadOnly(ctx, t, scope)
+	})
 }
 
-func (e *env) openWith(needIndex bool, open func() (*declindex.Store, error)) error {
-	s, err := open()
+func (e *env) openWith(ctx context.Context, withTree, needIndex bool, open func(declindex.Target) (*declindex.Store, error)) error {
+	t, err := e.targetFor(withTree)
+	if err != nil {
+		return err
+	}
+	s, err := open(t)
 	if err != nil {
 		return &unableError{err}
 	}
@@ -176,7 +273,7 @@ func (e *env) openWith(needIndex bool, open func() (*declindex.Store, error)) er
 	if !needIndex {
 		return nil
 	}
-	if err := s.CheckComplete(context.Background()); err != nil {
+	if err := s.CheckComplete(ctx); err != nil {
 		return &unableError{err}
 	}
 	return nil
@@ -202,10 +299,16 @@ var commands = map[string]func(context.Context, *env, []string) int{
 }
 
 func fail(w io.Writer, err error) int {
-	fmt.Fprintln(w, "declindex: "+err.Error())
 	var u *usageError
 	var nf *declindex.NotFoundError
 	var temporary *declindex.TempError
+	// A failed connection to the index's database leaves every question unanswered, and another run can answer
+	// it: the landing program retries 75 and escalates 3 (P-11).
+	if declindex.Unreachable(err) {
+		fmt.Fprintln(w, "declindex: the index's database is unreachable: "+err.Error())
+		return 75
+	}
+	fmt.Fprintln(w, "declindex: "+err.Error())
 	switch {
 	case errors.As(err, &u):
 		fmt.Fprintln(w, usage)
@@ -253,7 +356,7 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 	if len(args) != 0 {
 		return fail(e.stderr, &usageError{"refresh takes no arguments"})
 	}
-	if err := e.open(); err != nil {
+	if err := e.open(ctx); err != nil {
 		return fail(e.stderr, err)
 	}
 	defer e.close()
@@ -288,8 +391,13 @@ func cmdRefresh(ctx context.Context, e *env, args []string) int {
 		return fail(e.stderr, &unableError{err})
 	}
 	writeWithoutForms(e.stderr, declindex.ClashModules(st.WithoutForms), st.WithoutForms)
+	// The refresh has committed; this count is a round trip of its own, so a database that goes away here asks
+	// for a retry (75) and says nothing about what the refresh read.
 	n, err := e.store.ModuleCount(ctx)
-	if err != nil || n == 0 || st.Unreadable > 0 {
+	if err != nil {
+		return fail(e.stderr, &unableError{err})
+	}
+	if n == 0 || st.Unreadable > 0 {
 		fmt.Fprintf(e.stderr, "declindex: the index is incomplete: %d modules, %d unreadable reference files\n", n, st.Unreadable)
 		return 3
 	}

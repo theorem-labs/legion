@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,9 +26,7 @@ func gateFixture(t *testing.T) (string, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config, append(body, []byte("registry: registry\n")...), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, string(body)+"registry: registry\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
 	git(t, tree, "commit", "-qm", "fixture")
@@ -58,9 +55,6 @@ func TestGateRequiresAValidProposer(t *testing.T) {
 }
 
 func TestGateRequiresIndexCommitAndCleanRegistry(t *testing.T) {
-	old := gateSandboxAvailable
-	gateSandboxAvailable = func() error { return nil }
-	t.Cleanup(func() { gateSandboxAvailable = old })
 	t.Run("head", func(t *testing.T) {
 		config, tree, proposal := gateFixture(t)
 		path := filepath.Join(tree, "Golden.lean")
@@ -90,19 +84,13 @@ func TestGateRequiresIndexCommitAndCleanRegistry(t *testing.T) {
 }
 
 func TestGateRejectsInTreeStateAndEscapedRegistry(t *testing.T) {
-	old := gateSandboxAvailable
-	gateSandboxAvailable = func() error { return nil }
-	t.Cleanup(func() { gateSandboxAvailable = old })
 	t.Run("state", func(t *testing.T) {
 		config, tree, proposal := gateFixture(t)
 		body, err := os.ReadFile(config)
 		if err != nil {
 			t.Fatal(err)
 		}
-		body = []byte(strings.Replace(string(body), "db: state/index.sqlite", "db: tree/.declindex/index.sqlite", 1))
-		if err := os.WriteFile(config, body, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, config, strings.Replace(string(body), "state: state", "state: tree/.declindex", 1))
 		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
 		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "outside the tree") {
 			t.Fatalf("in-tree state: %+v", r)
@@ -124,10 +112,7 @@ func TestGateRejectsInTreeStateAndEscapedRegistry(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		body = []byte(strings.Replace(string(body), "registry: registry", "registry: ../outside-registry", 1))
-		if err := os.WriteFile(config, body, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeIndexConfig(t, config, strings.Replace(string(body), "registry: registry", "registry: ../outside-registry", 1))
 		r := invoke(t, "--config", config, "gate", "--proposer", "role", proposal)
 		if r.code != 3 || r.out != "" || !strings.Contains(r.errOut, "registry") {
 			t.Fatalf("escaped registry: %+v", r)
@@ -158,9 +143,6 @@ func TestGateRejectsInTreeStateAndEscapedRegistry(t *testing.T) {
 // A tree that is not a Git work tree has no commit to compare the index's commit with: the gate is unable to
 // decide, rather than comparing two empty commits.
 func TestGateIsUnableOnATreeThatIsNotAGitWorkTree(t *testing.T) {
-	old := gateSandboxAvailable
-	gateSandboxAvailable = func() error { return nil }
-	t.Cleanup(func() { gateSandboxAvailable = old })
 	config := fixture(t)
 	tree := filepath.Join(filepath.Dir(config), "tree")
 	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
@@ -168,7 +150,7 @@ func TestGateIsUnableOnATreeThatIsNotAGitWorkTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, config, string(body)+"registry: registry\n")
+	writeIndexConfig(t, config, string(body)+"registry: registry\n")
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)
 	}
@@ -186,12 +168,7 @@ func TestGateIsUnableOnATreeThatIsNotAGitWorkTree(t *testing.T) {
 // ledger/paths.go), and an absolute path would name the gate's tree, not the proposer's worktree, so two exact
 // duplicates proposed from different trees would not overlap. The gate prints the repository-relative path.
 func TestGatePrintsCanonicalAdditionPathAfterSnapshotCleanup(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("the successful gate path compiles untrusted source: set DECLINDEX_SANDBOX_TEST=1 in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	dir := t.TempDir()
 	tree := filepath.Join(dir, "tree")
 	if err := os.MkdirAll(filepath.Join(tree, "registry", "concepts"), 0o755); err != nil {
@@ -215,10 +192,7 @@ func TestGatePrintsCanonicalAdditionPathAfterSnapshotCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := filepath.Join(dir, "index.yaml")
-	body := "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n"
-	if err := os.WriteFile(config, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
 	git(t, tree, "commit", "-qm", "fixture")
@@ -257,12 +231,7 @@ func TestGatePrintsCanonicalAdditionPathAfterSnapshotCleanup(t *testing.T) {
 // A tree below its repository's root: the addition path is still repository-relative, the tree's path in the
 // repository (which refresh records in the index) followed by the registry's path in the tree.
 func TestGatePrintsTheAdditionPathOfATreeBelowTheRepositoryRoot(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("the successful gate path compiles untrusted source: set DECLINDEX_SANDBOX_TEST=1 in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "repo")
 	tree := filepath.Join(repo, "proj")
@@ -281,7 +250,7 @@ func TestGatePrintsTheAdditionPathOfATreeBelowTheRepositoryRoot(t *testing.T) {
 	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
 	writeTestFile(t, filepath.Join(repo, "README"), "a repository whose Lean project is below its root\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: repo/proj\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, "tree: repo/proj\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, repo, "init", "-q")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
@@ -310,16 +279,10 @@ func TestGatePrintsTheAdditionPathOfATreeBelowTheRepositoryRoot(t *testing.T) {
 }
 
 // leanGateFixture is the Lean fixture tree, compiled, with a format-2 registry holding concepts (file name to
-// content), committed, and a configuration that reads the compiled part; the index is refreshed. It needs Lean and
-// the sandbox.
+// content), committed, and a configuration that reads the compiled part; the index is refreshed. It needs Lean.
 func leanGateFixture(t *testing.T, concepts map[string]string) (dir, tree, config string) {
 	t.Helper()
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("the successful gate path compiles untrusted source: set DECLINDEX_SANDBOX_TEST=1 in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	dir = t.TempDir()
 	tree = filepath.Join(dir, "tree")
 	fixture, err := os.ReadFile(filepath.Join("..", "..", "declindex", "testdata", "lean", "Fixture.lean"))
@@ -339,7 +302,7 @@ func leanGateFixture(t *testing.T, concepts map[string]string) (dir, tree, confi
 		writeTestFile(t, filepath.Join(tree, "registry", "concepts", name), body)
 	}
 	config = filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\nregistry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", ".")
 	git(t, tree, "commit", "-qm", "fixture")

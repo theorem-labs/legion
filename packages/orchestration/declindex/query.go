@@ -3,16 +3,16 @@ package declindex
 import (
 	"cmp"
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
-	"io"
 	"maps"
-	"math"
 	"path"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Found is one declaration that a name resolves to.
@@ -33,8 +33,8 @@ func (f Found) At() string { return f.Path + ":" + strconv.Itoa(f.Line) }
 func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 	short := q[strings.LastIndexByte(q, '.')+1:]
 	var out []Found
-	rows, err := s.q.QueryContext(ctx, foundSelect+` WHERE d.short = ?`, short)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, foundSelect+` WHERE d.short = $1`, short)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
@@ -60,7 +60,8 @@ func (s *Store) Resolve(ctx context.Context, q string) ([]Found, error) {
 // declarationsNamed gives the declarations of each of the full names in names, by name.
 func (s *Store) declarationsNamed(ctx context.Context, names []string) (map[string][]Found, error) {
 	out := make(map[string][]Found, len(names))
-	err := eachRowIn(ctx, s.q, foundSelect+` WHERE d.name IN`, names, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, foundSelect+` WHERE d.name = ANY($1)`, names)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		f, err := scanFound(r)
 		if err != nil {
 			return err
@@ -131,29 +132,50 @@ type AnswerOptions struct {
 	FileKinds []string
 }
 
+// useRow is what the index holds about the uses of one constant by one declaration. With lines it is one use,
+// at line and col; without them it is every use of that constant by that declaration in that class, and n counts
+// them: an answer that prints counts reads a row for each (constant, user, class) instead of one for each use,
+// which for a declaration that a whole tree uses is megabytes instead of hundreds of them.
 type useRow struct {
 	module        string
+	path          string
 	line, col     int
 	parent, class string
+	n             int
 }
 
 // usersOf gives the uses of the declaration d and of its generated parts: the constants Lean made from it that its
 // module never declares (a structure's fields and constructor, equation lemmas). A use of `h.wp` is recorded as
 // `X.wp`; it is a use of X. Each recorded constant counts for the declaration it belongs to (ownerResolver.owner),
-// so a use of another module's declaration of d's name is not d's.
-func (s *Store) usersOf(ctx context.Context, d declRef) ([]useRow, error) {
+// so a use of another module's declaration of d's name is not d's. The owner of a constant does not depend on
+// where it is used, so the rows may be grouped before they cross the network, and lines asks for each use.
+func (s *Store) usersOf(ctx context.Context, d declRef, lines bool) ([]useRow, error) {
 	type recorded struct {
 		target declRef
 		u      useRow
 	}
 	var rs []recorded
-	rows, err := s.q.QueryContext(ctx, `SELECT target, tmodule, module, line, col, parent, cls FROM uses
-		WHERE target = ? OR (target >= ? AND target < ?)`, d.name, d.name+".", d.name+"/")
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	query := `SELECT u.target, u.tmodule, u.module, COALESCE(m.rel, ''), u.parent, u.cls, count(*)
+		FROM uses u LEFT JOIN modules m ON m.module = u.module
+		WHERE u.target = $1 OR (u.target >= $2 AND u.target < $3)
+		GROUP BY u.target, u.tmodule, u.module, m.rel, u.parent, u.cls`
+	if lines {
+		query = `SELECT u.target, u.tmodule, u.module, COALESCE(m.rel, ''), u.parent, u.cls, 1, u.line, u.col
+			FROM uses u LEFT JOIN modules m ON m.module = u.module
+			WHERE u.target = $1 OR (u.target >= $2 AND u.target < $3)`
+	}
+	rows, err := s.q.Query(ctx, query, d.name, d.name+".", d.name+"/")
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var x recorded
-		if err := r.Scan(&x.target.name, &x.target.module, &x.u.module, &x.u.line, &x.u.col, &x.u.parent, &x.u.class); err != nil {
+		var rel string
+		out := []any{&x.target.name, &x.target.module, &x.u.module, &rel, &x.u.parent, &x.u.class, &x.u.n}
+		if lines {
+			out = append(out, &x.u.line, &x.u.col)
+		}
+		if err := r.Scan(out...); err != nil {
 			return err
 		}
+		x.u.path = sourcePath(rel, x.u.module)
 		rs = append(rs, x)
 		return nil
 	})
@@ -178,7 +200,7 @@ func (s *Store) usersOf(ctx context.Context, d declRef) ([]useRow, error) {
 		if err != nil {
 			return nil, err
 		}
-		if owner == d {
+		if owner.ref == d {
 			out = append(out, x.u)
 		}
 	}
@@ -194,8 +216,8 @@ func (s *Store) modulePaths(ctx context.Context) (map[string]string, error) {
 		return s.derived.paths, nil
 	}
 	out := map[string]string{}
-	rows, err := s.q.QueryContext(ctx, `SELECT module, rel FROM modules`)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT module, rel FROM modules`)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var m, rel string
 		if err := r.Scan(&m, &rel); err != nil {
 			return err
@@ -218,8 +240,8 @@ func (s *Store) ModuleAt(ctx context.Context, file string) (string, error) {
 		return "", nil
 	}
 	var m string
-	err := s.q.QueryRowContext(ctx, `SELECT module FROM modules WHERE rel = ?`, rel).Scan(&m)
-	if err == sql.ErrNoRows {
+	err := s.q.QueryRow(ctx, `SELECT module FROM modules WHERE rel = $1`, rel).Scan(&m)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
 	return m, err
@@ -254,13 +276,9 @@ func dirOf(p string) string {
 
 // Answer answers about the declaration d, one that Resolve gave.
 func (s *Store) Answer(ctx context.Context, d Found, opt AnswerOptions) (Answer, error) {
-	paths, err := s.modulePaths(ctx)
-	if err != nil {
-		return Answer{}, err
-	}
 	ref := declRef{d.Module, d.Name}
 	a := Answer{Declaration: d.Name, Module: d.Module, Kind: d.Kind, At: d.At(), StmtHash: d.StmtHash}
-	uses, err := s.usersOf(ctx, ref)
+	uses, err := s.usersOf(ctx, ref, opt.Lines)
 	if err != nil {
 		return a, err
 	}
@@ -275,24 +293,23 @@ func (s *Store) Answer(ctx context.Context, d Found, opt AnswerOptions) (Answer,
 		if (declRef{u.module, u.parent}) == ref {
 			continue
 		}
-		p := pathOf(paths, u.module)
-		a.Direct.Uses++
+		a.Direct.Uses += u.n
 		if u.parent != "" {
 			parents[declRef{u.module, u.parent}] = true
 		}
 		switch u.class {
 		case "stmt":
-			a.Direct.StmtUses++
+			a.Direct.StmtUses += u.n
 		case "proof":
-			a.Direct.ProofUses++
+			a.Direct.ProofUses += u.n
 		}
-		d := dirOf(p)
+		d := dirOf(u.path)
 		if a.Direct.ByDirectory[d] == nil {
 			a.Direct.ByDirectory[d] = map[string]int{}
 		}
-		a.Direct.ByDirectory[d][fileKind(p, opt.FileKinds)+" "+u.class]++
+		a.Direct.ByDirectory[d][fileKind(u.path, opt.FileKinds)+" "+u.class] += u.n
 		if opt.Lines {
-			lines = append(lines, line{p, u})
+			lines = append(lines, line{u.path, u})
 		}
 	}
 	a.Direct.Declarations = len(parents)
@@ -317,100 +334,3 @@ func (s *Store) Answer(ctx context.Context, d Found, opt AnswerOptions) (Answer,
 type NotFoundError struct{ Name string }
 
 func (e *NotFoundError) Error() string { return "no declaration " + e.Name + " in the index" }
-
-// propagates says whether an edge passes a change on: a use in a statement, or any use by a definition (defKinds).
-var propagates = `(e.stmt = 1 OR e.kind IN ('` + strings.Join(defKinds, `', '`) + `'))`
-
-// reach computes the statements a change to root's statement changes, and the proofs at their edge, on the
-// declaration graph that the last refresh wrote.
-func (s *Store) reach(ctx context.Context, root declRef, why bool) (Reach, error) {
-	g, err := s.graph()
-	if err != nil {
-		return Reach{}, err
-	}
-	paths, err := s.modulePaths(ctx)
-	if err != nil {
-		return Reach{}, err
-	}
-	changed, reprove, via := g.walk(root)
-	// byDir groups the reached declarations by the directory of their module's source.
-	byDir := func(set map[declRef]bool) map[string][]declRef {
-		out := map[string][]declRef{}
-		for d := range set {
-			dir := dirOf(pathOf(paths, d.module))
-			out[dir] = append(out[dir], d)
-		}
-		return out
-	}
-	cdirs, rdirs := byDir(changed), byDir(reprove)
-	all := map[string]bool{}
-	for d := range cdirs {
-		all[d] = true
-	}
-	for d := range rdirs {
-		all[d] = true
-	}
-	r := Reach{ReachCounts: ReachCounts{
-		StatementsChanged: len(changed), StatementDirectories: len(cdirs),
-		ProofsToRedo: len(reprove), ProofDirectories: len(rdirs), AllDirectories: len(all),
-	}}
-	if !why {
-		return r, nil
-	}
-	r.Why = map[string]string{}
-	short := root.name[strings.LastIndexByte(root.name, '.')+1:]
-	for d := range all {
-		ds := cdirs[d]
-		if ds == nil {
-			ds = rdirs[d]
-		}
-		chain := []declRef{slices.MinFunc(ds, declRef.compare)}
-		for len(chain) < 50 {
-			v, ok := via[chain[len(chain)-1]]
-			if !ok || v == root {
-				break
-			}
-			chain = append(chain, v)
-		}
-		slices.Reverse(chain)
-		names := make([]string, len(chain))
-		for i, c := range chain {
-			names[i] = c.name
-		}
-		r.Why[d] = short + " -> " + strings.Join(names, " -> ")
-	}
-	return r, nil
-}
-
-// graph loads the declaration graph once for the store (derived), from its graph file: for a store opened read-only,
-// the one in place when its snapshot began, which a later refresh's replacement does not change. A graph of another
-// generation than the index's is refused.
-func (s *Store) graph() (*graph, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.derived.graph != nil || s.derived.graphErr != nil {
-		return s.derived.graph, s.derived.graphErr
-	}
-	data, err := io.ReadAll(io.NewSectionReader(s.graphFile, 0, math.MaxInt64))
-	var g *graph
-	if err == nil {
-		g, err = parseGraph(s.path+".graph", data)
-	}
-	if err == nil {
-		if want, metaErr := s.Meta(context.Background(), "graph"); metaErr != nil {
-			err = metaErr
-		} else if g.token != want {
-			err = fmt.Errorf("the graph file is of generation %q, the index of %q", g.token, want)
-		}
-	}
-	if err != nil {
-		s.derived.graphErr = graphUnreadable(err)
-		return nil, s.derived.graphErr
-	}
-	s.derived.graph = g
-	return g, nil
-}
-
-func graphUnreadable(err error) error {
-	return fmt.Errorf("the declaration graph is missing, unreadable or out of date: run declindex refresh: %w", err)
-}

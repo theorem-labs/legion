@@ -3,7 +3,6 @@ package declindex
 import (
 	"cmp"
 	"context"
-	"database/sql"
 	"maps"
 	"os"
 	"path/filepath"
@@ -11,13 +10,20 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // writeConstants writes consts as the compiled part of modules, as a compiled step does.
 func writeConstants(t *testing.T, s *Store, modules []string, consts []Constant) {
 	t.Helper()
 	ctx := context.Background()
-	if err := s.writeTx(ctx, nil, func(tx *sql.Tx) error {
+	unlock, err := s.lockRefresh(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if err := s.writeTx(ctx, func(tx pgx.Tx) error {
 		return s.writeCompiled(ctx, tx, compiledRead{read: modules, consts: consts, digest: "test", commit: goldenCommit})
 	}); err != nil {
 		t.Fatal(err)

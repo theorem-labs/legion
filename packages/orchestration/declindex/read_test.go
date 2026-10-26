@@ -2,7 +2,6 @@ package declindex
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -177,11 +176,17 @@ func TestImportsGivesEachModulesDirectImports(t *testing.T) {
 // OpenReadOnlyConfig opens the index that a configuration names, read-only, as graph checks do.
 func TestOpenReadOnlyConfigOpensTheConfiguredIndex(t *testing.T) {
 	ctx := context.Background()
-	written := refreshedGolden(t)
-	cfg := Config{DB: written.path}
+	target := indexTarget(t)
+	written := openAt(t, target)
+	if _, err := written.Refresh(ctx, goldenTree(t), RefreshOptions{Commit: goldenCommit}); err != nil {
+		t.Fatal(err)
+	}
 	if err := written.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// A configuration names the index's schema; the connection string comes from the environment or a file, as
+	// every command reads it (Config.DSN).
+	cfg := Config{Index: target.Index, DSN: target.DSN}
 	reader, err := OpenReadOnlyConfig(ctx, cfg, IndexOnly)
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +198,10 @@ func TestOpenReadOnlyConfigOpensTheConfiguredIndex(t *testing.T) {
 	if commit, err := reader.Commit(ctx); err != nil || commit != goldenCommit {
 		t.Fatalf("Commit = %q, %v; want %q", commit, err, goldenCommit)
 	}
-	if _, err := OpenReadOnlyConfig(ctx, Config{}, IndexOnly); !errors.Is(err, ErrNoDB) {
-		t.Fatalf("OpenReadOnlyConfig of a configuration without an index: %v; want ErrNoDB", err)
+	if _, err := OpenReadOnlyConfig(ctx, Config{}, IndexOnly); err == nil {
+		t.Fatal("OpenReadOnlyConfig of a configuration that names no index was accepted")
+	}
+	if _, err := OpenReadOnlyConfig(ctx, Config{Index: target.Index}, IndexOnly); err == nil {
+		t.Fatal("OpenReadOnlyConfig of a configuration with no connection string was accepted")
 	}
 }
