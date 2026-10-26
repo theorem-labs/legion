@@ -14,7 +14,9 @@ import (
 // The entry that holds the most names is edges_owner's, which the reach walk reads alone: the user's module and
 // name, and the owner's module and name, and the kind (edgeEntryBytes). Two names of about 1.3 KB fill it. The
 // longest edge of the copy's index on 2026-10-25 held 474 bytes of names, so a tree reaches the limit only with
-// names several times longer than any it holds today. Every other index holds one name, or one name and a module.
+// names several times longer than any it holds today. The others hold a name with one module (decls, consts,
+// uses, atoms, facts), or, in without_forms, a name with the module that reads it and the module that declares
+// it; each of those is measured where it is written (checkName).
 const indexEntryLimit = 2600
 
 // NameTooLongError is an index defect: the tree declares or uses a name that the index cannot hold in one entry
@@ -48,18 +50,26 @@ func edgeEntryBytes(ownerModule, owner, dst, module, kind string) int {
 	return len(ownerModule) + len(owner) + len(dst) + len(module) + len(kind)
 }
 
-// checkEdge refuses an edge whose names do not fit one entry of edges_owner.
-func checkEdge(target, ownerModule, owner, dst, module, kind string) error {
+// checkEdge refuses an edge whose names do not fit one entry of edges_owner: its key (the owner's module and
+// name) and what it carries (the user's name and module, and the user's kind). The constant's own name is in
+// edges_target and in uses, each of one name, and checkReference has already measured it.
+func checkEdge(ownerModule, owner, dst, module, kind string) error {
 	if n := edgeEntryBytes(ownerModule, owner, dst, module, kind); n > indexEntryLimit {
-		return &NameTooLongError{What: "the use of " + owner + " by", Names: []string{dst, target}, Bytes: n}
+		return &NameTooLongError{What: "the use of " + owner + " by", Names: []string{dst, module}, Bytes: n}
 	}
-	return checkName("the constant", target, module)
+	return nil
 }
 
-// checkName refuses a name that, with its module, does not fit one entry of an index of one name.
-func checkName(what, name, module string) error {
-	if n := len(name) + len(module); n > indexEntryLimit {
-		return &NameTooLongError{What: what, Names: []string{name}, Bytes: n}
+// checkName refuses a name that, with the modules that key it, does not fit one entry of the index that holds
+// it: decls_name and consts hold a name and its module, and without_forms's key holds a name with the module
+// that reads it and the module that declares it.
+func checkName(what string, names ...string) error {
+	n := 0
+	for _, s := range names {
+		n += len(s)
+	}
+	if n > indexEntryLimit {
+		return &NameTooLongError{What: what, Names: names[:1], Bytes: n}
 	}
 	return nil
 }
@@ -84,6 +94,11 @@ func checkReference(results []ModuleData, errs []error) error {
 				return err
 			}
 			if err := checkName("the declaration", u.Parent, md.Module); err != nil {
+				return err
+			}
+			// without_forms keys a clash by the module that read it, the name, and the module that
+			// declares it, so its entry holds two modules and a name.
+			if err := checkName("the clash of", u.Target, u.TargetModule, md.Module); err != nil {
 				return err
 			}
 		}

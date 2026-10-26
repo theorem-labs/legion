@@ -74,7 +74,7 @@ func insertEdges(ctx context.Context, tx pgx.Tx, results []ModuleData, errs []er
 		o := owned[declRef{e.tmodule, e.target}]
 		// A row that does not fit one entry of edges_owner is an index defect of the tree, named here, and
 		// never a failure inside the database (NameTooLongError).
-		if err := checkEdge(e.target, o.ref.module, o.ref.name, e.dst, e.module, e.kind); err != nil {
+		if err := checkEdge(o.ref.module, o.ref.name, e.dst, e.module, e.kind); err != nil {
 			return err
 		}
 		rows[i] = []any{e.target, e.tmodule, e.dst, e.module, e.stmt, e.kind, o.ref.name, o.ref.module, o.byClosure}
