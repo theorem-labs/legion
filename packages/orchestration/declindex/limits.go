@@ -96,11 +96,6 @@ func checkReference(results []ModuleData, errs []error) error {
 			if err := checkName("the declaration", u.Parent, md.Module); err != nil {
 				return err
 			}
-			// without_forms keys a clash by the module that read it, the name, and the module that
-			// declares it, so its entry holds two modules and a name.
-			if err := checkName("the clash of", u.Target, u.TargetModule, md.Module); err != nil {
-				return err
-			}
 		}
 	}
 	return nil

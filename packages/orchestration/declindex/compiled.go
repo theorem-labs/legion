@@ -366,6 +366,21 @@ func (s *Store) writeCompiled(ctx context.Context, tx pgx.Tx, w compiledRead) er
 	constRows := make([][]any, 0, len(w.consts))
 	at := make(map[declRef]int, len(w.consts))
 	for _, c := range w.consts {
+		// consts, atoms and facts key a constant by its name and its module, and a fact by its concept: a
+		// name the index cannot hold is an index defect of the tree, named here (checkName).
+		if err := checkName("the constant", c.Name, c.Module); err != nil {
+			return err
+		}
+		for _, a := range c.Atoms {
+			if err := checkName("the atom of "+c.Name, a); err != nil {
+				return err
+			}
+		}
+		for _, f := range c.Facts {
+			if err := checkName("the concept", f.Concept); err != nil {
+				return err
+			}
+		}
 		// binders is a JSON array, as the graph checks read it back (ConstantsIn).
 		binders, err := json.Marshal(nonNil(c.Binders))
 		if err != nil {
@@ -386,19 +401,29 @@ func (s *Store) writeCompiled(ctx context.Context, tx pgx.Tx, w compiledRead) er
 	}
 	formRows := make([][]any, 0, len(w.withoutForms))
 	written := map[clash]bool{}
-	add := func(c clash) {
+	add := func(c clash) error {
 		if written[c] {
-			return
+			return nil
 		}
 		written[c] = true
+		// The key of without_forms holds the module that read the clash, the name, and the module that
+		// declares it: an index defect names what to shorten (checkName).
+		if err := checkName("the clash of", c.name, c.module, c.declarer); err != nil {
+			return err
+		}
 		formRows = append(formRows, []any{c.module, c.name, c.declarer, c.forms})
+		return nil
 	}
 	for _, c := range w.withoutForms {
 		for _, d := range c.DeclaredIn {
-			add(clash{c.Module, c.Name, d, false})
+			if err := add(clash{c.Module, c.Name, d, false}); err != nil {
+				return err
+			}
 		}
 		for _, d := range c.FormsDeclaredIn {
-			add(clash{c.Module, c.Name, d, true})
+			if err := add(clash{c.Module, c.Name, d, true}); err != nil {
+				return err
+			}
 		}
 	}
 	// Each source below holds one row at a time: a project's compiled part is millions of rows.
