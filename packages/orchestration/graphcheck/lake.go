@@ -111,14 +111,17 @@ func (c *Candidate) builtModule(module string) bool {
 }
 
 // lakeLibraries reads the root package's `[[lean_lib]]` declarations once. known is false when the package's
-// configuration is one only Lake can evaluate (a `lakefile.lean`, or a `lakefile.toml` this reader does not
-// understand); a tree with no configuration at all builds nothing and declares no library.
+// configuration is one only Lake can evaluate: a `lakefile.lean`, which Lake prefers wherever it is beside a
+// `lakefile.toml`, or a `lakefile.toml` this reader does not understand. A tree with no configuration at all
+// builds nothing and declares no library.
 func (c *Candidate) lakeLibraries() ([]lakeLibrary, bool) {
 	c.librariesOnce.Do(func() {
+		if _, err := os.Stat(filepath.Join(c.icfg.Tree, "lakefile.lean")); err == nil {
+			return
+		}
 		raw, err := os.ReadFile(filepath.Join(c.icfg.Tree, "lakefile.toml"))
 		if errors.Is(err, fs.ErrNotExist) {
-			_, err := os.Stat(filepath.Join(c.icfg.Tree, "lakefile.lean"))
-			c.librariesKnown = errors.Is(err, fs.ErrNotExist)
+			c.librariesKnown = true
 			return
 		} else if err != nil {
 			return
@@ -157,6 +160,14 @@ func parseLakefile(text string) ([]lakeLibrary, bool) {
 			return nil, false
 		}
 		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		// A quoted or dotted key, and a library written anywhere but under its own header (an array of inline
+		// tables, say), are shapes this reader does not take: Lake reads them, so only it can answer.
+		if strings.ContainsAny(key, `".'`) || key == "" {
+			return nil, false
+		}
+		if table != "lean_lib" && (key == "lean_lib" || key == "lean_libs") {
+			return nil, false
+		}
 		// An array over several lines runs to the line that closes it.
 		for strings.HasPrefix(value, "[") && !strings.HasSuffix(value, "]") && i+1 < len(lines) {
 			i++
@@ -219,20 +230,28 @@ func unquoteName(name string) string {
 
 // stripTOMLComment drops a trailing comment, leaving a `#` inside a quoted value alone.
 func stripTOMLComment(line string) string {
-	quoted := false
+	var quote rune
 	for i, r := range line {
 		switch {
-		case r == '"':
-			quoted = !quoted
-		case r == '#' && !quoted:
+		case r == quote:
+			quote = 0
+		case quote != 0:
+		case r == '"' || r == '\'':
+			quote = r
+		case r == '#':
 			return line[:i]
 		}
 	}
 	return line
 }
 
-// tomlString reads one basic string, which may escape a quote or a backslash.
+// tomlString reads one string: a literal string, whose content is its own, or a basic string, which may escape a
+// quote or a backslash. A multi-line string of either kind is not read, and makes the caller refuse the file.
 func tomlString(value string) (string, bool) {
+	if literal, ok := strings.CutPrefix(value, "'"); ok {
+		body, ok := strings.CutSuffix(literal, "'")
+		return body, ok && !strings.Contains(body, "'")
+	}
 	if len(value) < 2 || value[0] != '"' || !strings.HasSuffix(value, `"`) {
 		return "", false
 	}

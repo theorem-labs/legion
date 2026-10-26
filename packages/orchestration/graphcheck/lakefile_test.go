@@ -44,22 +44,33 @@ root = "Tool"
 	}
 }
 
-// A name or a root written in guillemets names the module without them.
+// A name or a root written in guillemets names the module without them, and a literal string is a string.
 func TestParseLakefileReadsAQuotedName(t *testing.T) {
-	libraries, ok := parseLakefile("[[lean_lib]]\nname = \"«Odd»\"\nroots = [\"«Odd».Inner\"]\n")
-	if !ok || len(libraries) != 1 || libraries[0].Name != "Odd" || !slices.Equal(libraries[0].Roots, []string{"Odd.Inner"}) {
-		t.Fatalf("parseLakefile = %+v, %v", libraries, ok)
+	libraries, ok := parseLakefile("[[lean_lib]]\nname = \"«Odd»\"\nroots = [\"«Odd».Inner\"]\n\n[[lean_lib]]\nname = 'Lit'\nsrcDir = 'src#1'\n")
+	want := []lakeLibrary{
+		{Name: "Odd", Roots: []string{"Odd.Inner"}},
+		{Name: "Lit", SrcDir: "src#1", Roots: []string{"Lit"}},
+	}
+	if !ok || !slices.EqualFunc(libraries, want, func(a, b lakeLibrary) bool {
+		return a.Name == b.Name && a.SrcDir == b.SrcDir && slices.Equal(a.Roots, b.Roots)
+	}) {
+		t.Fatalf("parseLakefile = %+v, %v; want %+v", libraries, ok, want)
 	}
 }
 
-// A lakefile the reader cannot read is not guessed at.
+// A lakefile the reader cannot read is not guessed at: it says so, and the check is then unable.
 func TestParseLakefileRefusesWhatItCannotRead(t *testing.T) {
 	for name, text := range map[string]string{
-		"a library with no name":   "[[lean_lib]]\nsrcDir = \"src\"\n",
-		"an unterminated array":    "[[lean_lib]]\nname = \"Lib\"\nroots = [\"A\",\n",
-		"a root that is no string": "[[lean_lib]]\nname = \"Lib\"\nroots = [A]\n",
-		"a value that is no pair":  "[[lean_lib]]\nname\n",
-		"an inline table":          "[[lean_lib]]\nname = \"Lib\"\nsrcDir = { path = \"src\" }\n",
+		"a library with no name":      "[[lean_lib]]\nsrcDir = \"src\"\n",
+		"an unterminated array":       "[[lean_lib]]\nname = \"Lib\"\nroots = [\"A\",\n",
+		"a root that is no string":    "[[lean_lib]]\nname = \"Lib\"\nroots = [A]\n",
+		"a value that is no pair":     "[[lean_lib]]\nname\n",
+		"an inline table":             "[[lean_lib]]\nname = \"Lib\"\nsrcDir = { path = \"src\" }\n",
+		"an array of inline tables":   "lean_lib = [{ name = \"Lib\" }, { name = \"Extra\", srcDir = \"src\" }]\n",
+		"a quoted key":                "[[lean_lib]]\nname = \"Lib\"\n\"srcDir\" = \"src\"\n",
+		"a dotted key":                "lean_lib.name = \"Lib\"\n",
+		"a multi-line basic string":   "[[lean_lib]]\nname = \"\"\"Lib\n\"\"\"\n",
+		"a multi-line literal string": "[[lean_lib]]\nname = '''Lib\n'''\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if libraries, ok := parseLakefile(text); ok {
@@ -148,21 +159,27 @@ func TestLibraryOfReadsTheBuildsOwnLibraries(t *testing.T) {
 	}
 }
 
-// Only Lake can read a configuration it alone evaluates, so the check is told it does not know; a tree with no
+// Only Lake can read a configuration it alone evaluates, so the check is told it does not know. Lake prefers a
+// `lakefile.lean` wherever one sits beside a `lakefile.toml`, so that pair is unknown too. A tree with no
 // configuration builds nothing, and every file is free.
 func TestLibraryOfKnowsWhenItCannotRead(t *testing.T) {
 	for name, test := range map[string]struct {
-		file  string
+		files []string
 		known bool
 	}{
-		"a configuration only Lake evaluates": {"lakefile.lean", false},
-		"a configuration it cannot read":      {"lakefile.toml", false},
-		"no configuration at all":             {"", true},
+		"a configuration only Lake evaluates": {[]string{"lakefile.lean"}, false},
+		"a readable configuration beside it":  {[]string{"lakefile.lean", "lakefile.toml"}, false},
+		"a configuration it cannot read":      {[]string{"lakefile.toml"}, false},
+		"no configuration at all":             {nil, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			tree := t.TempDir()
-			if test.file != "" {
-				if err := os.WriteFile(filepath.Join(tree, test.file), []byte("[[lean_lib]]\nname\n"), 0o644); err != nil {
+			for _, file := range test.files {
+				text := "[[lean_lib]]\nname\n"
+				if file == "lakefile.toml" && len(test.files) > 1 {
+					text = "[[lean_lib]]\nname = \"Lib\"\n"
+				}
+				if err := os.WriteFile(filepath.Join(tree, file), []byte(text), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			}
