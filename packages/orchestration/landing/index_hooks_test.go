@@ -116,12 +116,13 @@ func newIndexFixture(t *testing.T) indexFixture {
 	return indexFixture{seed: seed, remote: remote, tree: tree, state: state, dsn: dsn, readerDSN: readerDSN, config: config, bin: bin, first: first, second: second}
 }
 
-// indexHooks is a landed batch of f.second whose refresh and ledger hooks run in real containers, with this
-// repository's modes: the refresh gets the state directory and the index tree read-write, the remote read-only and
-// the owner login's connection string; the ledger hook gets the state directory and the tree read-only and the reader
-// login's connection string, so it cannot write the index. Each reads its connection string's file, read-only, and
-// reaches the database on the host network, as the index-dsn and index-reader-dsn file mounts and network "host" give
-// them in the landing configuration. withRemote false leaves the remote out of the refresh's mounts.
+// indexHooks is a landed batch of f.second whose refresh and ledger hooks run in real containers, with the landing
+// configuration's modes (INFRA-136 decision 14): the refresh gets the state directory and the index tree read-write,
+// the remote read-only and the owner login's connection string; the ledger hook gets the state directory read-write,
+// the tree read-only and the reader login's connection string, so it cannot write the index. Each reads its
+// connection string's file, read-only, and reaches the database on the host network, as the index-dsn and
+// index-reader-dsn file mounts and network "host" give them. withRemote false leaves the remote out of the refresh's
+// mounts.
 func indexHooks(t *testing.T, f indexFixture, withRemote bool) (Runner, *effectLogFake, Batch) {
 	t.Helper()
 	user := testdocker.Require(t)
@@ -155,7 +156,7 @@ func indexHooks(t *testing.T, f indexFixture, withRemote bool) (Runner, *effectL
 		{Name: "ledger", Command: []string{f.bin, "--config", f.config, "--index-dsn-file", f.readerDSN,
 			"ledger", "--contracts-file", inputsPath + "/" + ContractsInput, "--emit", scratchPath + "/ops.jsonl"},
 			Apply: ApplyContracts, Outputs: []string{"ops.jsonl"}, Network: NetworkHost,
-			Mounts: map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index-reader-dsn": ReadOnly, "state": ReadOnly, "index-tree": ReadOnly}},
+			Mounts: map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index-reader-dsn": ReadOnly, "state": ReadWrite, "index-tree": ReadOnly}},
 	}
 	runner := Runner{
 		PostLanding:   PostLanding{Parts: []string{"slice"}, Hooks: hooks, TimeoutSeconds: 300, MaxOutputBytes: 1 << 20},
