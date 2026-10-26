@@ -60,11 +60,15 @@ producers:
   binder_files: ['Lib/Drv/**/*.lean']
 `
 
-// Variant changes the fixture project before its base is built: Lakefile is appended to lakefile.toml, and
-// Files are written (path relative to the project -> text), replacing a file of that path.
+// Variant changes the fixture project before its base is built: Lakefile is appended to lakefile.toml, or
+// WholeLakefile replaces it, and Files are written (path relative to the project -> text), replacing a file of
+// that path. A project whose library is precompiled needs WholeLakefile: Lean's loader drops a leading `lib`
+// from a shared library's name when it looks for the module's initializer, so a package named `lib` cannot
+// precompile one.
 type Variant struct {
-	Lakefile string
-	Files    map[string]string
+	Lakefile      string
+	WholeLakefile string
+	Files         map[string]string
 	// Pruned modules lose their object file after the build, keeping their reference file, so the index knows
 	// them and the base build has nothing to compile against: what pruning to the targets' closure leaves. The
 	// index of such a fixture is read without its compiled part, as the replay corpus's is.
@@ -223,6 +227,9 @@ func writeProject(t testing.TB, dir string, v Variant) {
 	if v.Lakefile != "" {
 		appendFile(t, filepath.Join(dir, "lakefile.toml"), v.Lakefile)
 	}
+	if v.WholeLakefile != "" {
+		write(t, filepath.Join(dir, "lakefile.toml"), v.WholeLakefile)
+	}
 	for rel, text := range v.Files {
 		write(t, filepath.Join(dir, filepath.FromSlash(rel)), text)
 	}
@@ -261,6 +268,11 @@ func baseBuild(t testing.TB, lean declindex.Lean, v Variant) (outputs, root stri
 	cmd.Env = []string{
 		"PATH=" + filepath.Join(lean.Prefix, "bin") + string(os.PathListSeparator) + "/usr/bin:/bin",
 		"LEAN_SYSROOT=" + lean.Prefix, "HOME=" + work, "TMPDIR=" + work, "ELAN_HOME=" + filepath.Join(work, "elan"),
+	}
+	// A precompiled library is compiled and linked by Lake with `cc`, or with LEAN_CC where the caller sets it, as
+	// Lake itself reads it: a machine whose `cc` cannot link the way Lake asks sets LEAN_CC to a compiler that can.
+	if cc := os.Getenv("LEAN_CC"); cc != "" {
+		cmd.Env = append(cmd.Env, "LEAN_CC="+cc)
 	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("lake build in %s: %v\n%s", project, err, out)

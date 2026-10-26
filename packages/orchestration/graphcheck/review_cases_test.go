@@ -257,6 +257,109 @@ func TestACandidateModuleCompilesUnderTheConfiguredArguments(t *testing.T) {
 	}
 }
 
+// precompiledFixture is the fixture project with one library precompiled. Its package is renamed: Lean's loader
+// drops a leading `lib` from a shared library's name when it looks for the module's initializer, so a package
+// named `lib` cannot precompile one.
+func precompiledFixture(t *testing.T, extra graphchecktest.Variant) *graphchecktest.Fixture {
+	t.Helper()
+	v := graphchecktest.Variant{
+		WholeLakefile: "name = \"proj\"\ndefaultTargets = [\"Lib\"]\n\n[[lean_lib]]\nname = \"Lib\"\nprecompileModules = true\n" + extra.Lakefile,
+		Files:         extra.Files,
+	}
+	return graphchecktest.NewVariant(t, v)
+}
+
+// A batch over a project whose library the build precompiles is decided as one over any other project: the
+// compile loads the shared libraries the build loads. Each case was measured against a real `lake build`, and
+// the check agrees with it: no false refusal, and no silent pass.
+func TestAPrecompiledLibraryIsCheckedAsAnyOther(t *testing.T) {
+	for name, test := range map[string]struct {
+		edits  map[string][2]string
+		refuse string // the declaration C1 must refuse, or empty for a decided check with no finding
+		unable bool
+	}{
+		"a leaf edit the build accepts": {
+			edits: map[string][2]string{"Lib/Open.lean": {"def viaOpen : Nat := helper 2", "def viaOpen : Nat := helper 3"}},
+		},
+		"a leaf error the build fails on": {
+			edits:  map[string][2]string{"Lib/Open.lean": {"def viaOpen : Nat := helper 2", "def viaOpen : Nat := Lib.Core.missing 2"}},
+			refuse: "missing",
+		},
+		"an addition the build accepts": {
+			edits: map[string][2]string{"Lib/Core.lean": {"def size : Nat := 3", "def size : Nat := 3\n\ndef size2 : Nat := 4"}},
+		},
+		"a removal in a precompiled module": {
+			edits:  map[string][2]string{"Lib/Core.lean": {"def helper", "private def helper"}},
+			unable: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := precompiledFixture(t, graphchecktest.Variant{})
+			tree := f.EditMany(t, test.edits)
+			c, idx, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, tree)
+			var hits []landing.Finding
+			if err == nil {
+				hits, err = graphcheck.Names(context.Background(), c, idx, f.Cfg)
+			}
+			switch {
+			case test.unable:
+				isUnable(t, err)
+			case err != nil:
+				t.Fatalf("Names = %v, %v; want a decided check", hits, err)
+			case test.refuse == "":
+				if len(hits) != 0 {
+					t.Fatalf("findings %v for a batch the build accepts", hits)
+				}
+			default:
+				found := false
+				for _, h := range ruleHits(hits, "C1") {
+					found = found || strings.Contains(h.Declaration, test.refuse)
+				}
+				if !found {
+					t.Fatalf("findings %v, want C1 to refuse a name holding %q", hits, test.refuse)
+				}
+			}
+		})
+	}
+}
+
+// A second library the build precompiles reaches its users as a shared library the compile must load: a module
+// that uses its macro is decided, and one that names what it does not declare is refused, as the build does.
+func TestASecondPrecompiledLibraryIsLoaded(t *testing.T) {
+	extra := graphchecktest.Variant{
+		Lakefile: "\n[[lean_lib]]\nname = \"Extra\"\nprecompileModules = true\n",
+		Files: map[string]string{
+			"Extra.lean":         "import Extra.Util\n",
+			"Extra/Util.lean":    "namespace Extra\n\ndef util : Nat := 7\n\nmacro \"twice! \" e:term : term => `($e + $e)\n\nend Extra\n",
+			"Lib/ExtraUser.lean": "import Extra.Util\n\nopen Extra in\ndef Lib.useExtra : Nat := util\n",
+			"Lib.lean":           libRoot + "import Lib.ExtraUser\n",
+		},
+	}
+	for name, test := range map[string]struct {
+		to     string
+		refuse bool
+	}{
+		"its macro used":         {"open Extra in\ndef Lib.useExtra : Nat := twice! util", false},
+		"a name it declares not": {"open Extra in\ndef Lib.useExtra : Nat := Extra.nope", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := precompiledFixture(t, extra)
+			tree := f.Edit(t, "Lib/ExtraUser.lean", "open Extra in\ndef Lib.useExtra : Nat := util", test.to)
+			c, idx, err := graphcheck.Open(context.Background(), f.Cfg, f.Base, tree)
+			var hits []landing.Finding
+			if err == nil {
+				hits, err = graphcheck.Names(context.Background(), c, idx, f.Cfg)
+			}
+			if err != nil {
+				t.Fatalf("Names = %v, %v; want a decided check", hits, err)
+			}
+			if refused := len(ruleHits(hits, "C1")) != 0; refused != test.refuse {
+				t.Fatalf("findings %v; want a refusal: %v", hits, test.refuse)
+			}
+		})
+	}
+}
+
 // A module whose name has a dot inside one component (`Lib.«Foo.Bar»`, file Lib/Foo.Bar.lean) is one graphcheck
 // cannot name as Lean and Lake do: the check is unable rather than compiling it under a wrong name.
 func TestADottedModuleNameIsUnable(t *testing.T) {
