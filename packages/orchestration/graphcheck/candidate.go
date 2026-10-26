@@ -122,6 +122,11 @@ type Candidate struct {
 	lakeOnce sync.Once
 	lake     *lakeState
 	lakeErr  error
+
+	// libraries are the root package's lean_lib declarations, read once from its configuration (lake.go).
+	librariesOnce  sync.Once
+	libraries      []lakeLibrary
+	librariesKnown bool
 }
 
 // Open checks the index against the base (D5), reads the candidate's changes, and compiles the changed modules that
@@ -600,14 +605,14 @@ func moduleOfOutput(rel string) string {
 }
 
 // checkOtherPackages refuses to decide a batch that changes a Lean file the check does not read but the build
-// builds: a module of another package of the project, or of another library of this package that `roots` does not
-// name. The build builds such a module before the modules that import it, and the check neither compiles it nor
-// sees its declarations, so compiling its importers against the base's build of it would refuse a change the
-// build accepts or miss one it refuses.
+// builds: a module of another package of the project, or of a library of this package that `roots` does not name.
+// The build builds such a module before the modules that import it, and the check neither compiles it nor sees
+// its declarations, so compiling its importers against the base's build of it would refuse a change the build
+// accepts or miss one it refuses.
 //
-// A changed Lean file that no library builds — a script beside the project, an archived tree — is not such a
-// module: it is outside the build as it is outside the check, and it costs the batch nothing. A file counts when
-// it lies under another package's directory, or when the base build has an output for its first name component.
+// Which files a library builds is Lake's own declaration, read from the package's configuration, never guessed
+// from a path: a library's source directory is its own, and a tree no library builds — a script beside the
+// project, an archived copy — costs the batch nothing. Where only Lake could answer, the check is unable.
 func (c *Candidate) checkOtherPackages(ctx context.Context) error {
 	if len(c.otherLean) == 0 {
 		return nil
@@ -620,9 +625,15 @@ func (c *Candidate) checkOtherPackages(ctx context.Context) error {
 			return unable("the batch changes %s, a Lean file of the package at %s, which the build builds before "+
 				"the modules that import it; the check does not read it", file, pkg)
 		}
-		if library, ok := c.builtLibraryOf(file); ok {
-			return unable("the batch changes %s, a Lean file of library %s, which the configured roots do not name; "+
-				"the build builds it before the modules that import it, and the check does not read it", file, library)
+		library, module, known := c.libraryOf(file)
+		switch {
+		case !known:
+			return unable("the batch changes %s, and only Lake can say whether the build builds it: the package's "+
+				"configuration is one this check does not read", file)
+		case library != "":
+			return unable("the batch changes %s, the module %s of library %s, which the configured roots do not "+
+				"name; the build builds it before the modules that import it, and the check does not read it",
+				file, module, library)
 		}
 	}
 	return nil
@@ -637,22 +648,6 @@ func (c *Candidate) packageDirOf(file string) (string, bool) {
 		}
 		if rel, err := filepath.Rel(pkg, file); err == nil && !strings.HasPrefix(rel, "..") {
 			return pkg, true
-		}
-	}
-	return "", false
-}
-
-// builtLibraryOf is the first name component of a file's module when the base build has an output for it: the
-// mark of a library this package builds. A component with neither an object file nor a directory of its own in
-// the base build is no library of the build.
-func (c *Candidate) builtLibraryOf(file string) (string, bool) {
-	first, _, _ := strings.Cut(filepath.ToSlash(strings.TrimSuffix(file, ".lean")), "/")
-	if first == "" {
-		return "", false
-	}
-	for _, name := range []string{first + ".olean", first} {
-		if _, err := os.Stat(filepath.Join(c.icfg.Lib, name)); err == nil {
-			return first, true
 		}
 	}
 	return "", false

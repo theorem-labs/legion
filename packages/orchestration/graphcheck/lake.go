@@ -2,6 +2,7 @@ package graphcheck
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,257 @@ type lakeSetup struct {
 	Plugins []struct {
 		Path string `json:"path"`
 	} `json:"plugins"`
+}
+
+// lakeLibrary is one `[[lean_lib]]` of the root package, as `lakefile.toml` declares it: where its sources are,
+// and which modules it builds.
+type lakeLibrary struct {
+	Name string
+	// SrcDir is where the library's modules live: the package's source directory joined with the library's own.
+	SrcDir string
+	// Roots are the module names the library builds; Lake defaults them to the library's name. A module is the
+	// library's when a root is a prefix of its name (Lake's isLocalModule), whatever the globs say.
+	Roots []string
+	// Globs are the library's globs, each a root (`Extra`), its submodules (`Extra.*`) or both (`Extra.+`).
+	Globs []string
+}
+
+// owns reports whether a library builds a module: one of its roots is the module or a prefix of it, or one of
+// its globs matches it.
+func (l lakeLibrary) owns(module string) bool {
+	for _, root := range l.Roots {
+		if module == root || strings.HasPrefix(module, root+".") {
+			return true
+		}
+	}
+	for _, glob := range l.Globs {
+		switch {
+		case strings.HasSuffix(glob, ".+"):
+			root := strings.TrimSuffix(glob, ".+")
+			if module == root || strings.HasPrefix(module, root+".") {
+				return true
+			}
+		case strings.HasSuffix(glob, ".*"):
+			if strings.HasPrefix(module, strings.TrimSuffix(glob, ".*")+".") {
+				return true
+			}
+		case module == glob:
+			return true
+		}
+	}
+	return false
+}
+
+// libraryOf is the library of the root package that builds a file, and the module name it builds it under. A
+// file counts only when a library's source directory holds it, the library owns the module, and the base build
+// has an output for it or for a module above it: a tree no library builds (a script, an archived copy) belongs
+// to no library, whatever its path looks like.
+//
+// It reads `lakefile.toml`, Lake's own declaration of the build, never Lean source. known is false where only
+// Lake could answer, and the caller is then unable rather than guessing.
+func (c *Candidate) libraryOf(file string) (library, module string, known bool) {
+	libraries, known := c.lakeLibraries()
+	if !known {
+		return "", "", false
+	}
+	file = filepath.ToSlash(file)
+	for _, lib := range libraries {
+		rel, err := filepath.Rel(cmp.Or(lib.SrcDir, "."), file)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		module := strings.ReplaceAll(strings.TrimSuffix(filepath.ToSlash(rel), ".lean"), "/", ".")
+		if lib.owns(module) && c.builtModule(module) {
+			return lib.Name, module, true
+		}
+	}
+	return "", "", true
+}
+
+// builtModule reports whether the base build has an output for a module or for one above it: an object file, or
+// a directory holding submodules.
+func (c *Candidate) builtModule(module string) bool {
+	for name := module; ; {
+		base := filepath.Join(c.icfg.Lib, filepath.Join(strings.Split(name, ".")...))
+		for _, path := range []string{base + ".olean", base} {
+			if _, err := os.Stat(path); err == nil {
+				return true
+			}
+		}
+		cut := strings.LastIndexByte(name, '.')
+		if cut < 0 {
+			return false
+		}
+		name = name[:cut]
+	}
+}
+
+// lakeLibraries reads the root package's `[[lean_lib]]` declarations once. known is false when the package's
+// configuration is one only Lake can evaluate (a `lakefile.lean`, or a `lakefile.toml` this reader does not
+// understand); a tree with no configuration at all builds nothing and declares no library.
+func (c *Candidate) lakeLibraries() ([]lakeLibrary, bool) {
+	c.librariesOnce.Do(func() {
+		raw, err := os.ReadFile(filepath.Join(c.icfg.Tree, "lakefile.toml"))
+		if errors.Is(err, fs.ErrNotExist) {
+			_, err := os.Stat(filepath.Join(c.icfg.Tree, "lakefile.lean"))
+			c.librariesKnown = errors.Is(err, fs.ErrNotExist)
+			return
+		} else if err != nil {
+			return
+		}
+		c.libraries, c.librariesKnown = parseLakefile(string(raw))
+	})
+	return c.libraries, c.librariesKnown
+}
+
+// parseLakefile reads the package's source directory and its `[[lean_lib]]` tables out of a `lakefile.toml`. It
+// understands what Lake's own configuration format holds — tables, array-of-table headers, and string, boolean,
+// numeric and string-array values over one or more lines — and reports false for anything else, so a
+// configuration it cannot read makes the caller unable rather than guess what the build builds.
+func parseLakefile(text string) ([]lakeLibrary, bool) {
+	var libraries []lakeLibrary
+	var packageSrcDir string
+	table, lines := "", strings.Split(text, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(stripTOMLComment(lines[i]))
+		if line == "" {
+			continue
+		}
+		if open := len(line) - len(strings.TrimLeft(line, "[")); open > 0 {
+			name, ok := strings.CutSuffix(line[open:], strings.Repeat("]", open))
+			if !ok || open > 2 {
+				return nil, false
+			}
+			table = strings.TrimSpace(name)
+			if open == 2 && table == "lean_lib" {
+				libraries = append(libraries, lakeLibrary{})
+			}
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, false
+		}
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		// An array over several lines runs to the line that closes it.
+		for strings.HasPrefix(value, "[") && !strings.HasSuffix(value, "]") && i+1 < len(lines) {
+			i++
+			value = strings.TrimSpace(value + " " + strings.TrimSpace(stripTOMLComment(lines[i])))
+		}
+		switch {
+		case table == "" && key == "srcDir":
+			if packageSrcDir, ok = tomlString(value); !ok {
+				return nil, false
+			}
+		case table != "lean_lib":
+			continue
+		case key == "name", key == "srcDir":
+			text, ok := tomlString(value)
+			if !ok {
+				return nil, false
+			}
+			if key == "name" {
+				libraries[len(libraries)-1].Name = text
+			} else {
+				libraries[len(libraries)-1].SrcDir = text
+			}
+		case key == "roots", key == "globs":
+			items, ok := tomlStrings(value)
+			if !ok {
+				return nil, false
+			}
+			if key == "roots" {
+				libraries[len(libraries)-1].Roots = items
+			} else {
+				libraries[len(libraries)-1].Globs = items
+			}
+		}
+	}
+	for i := range libraries {
+		if libraries[i].Name == "" {
+			return nil, false
+		}
+		// Lake joins the package's source directory with the library's own, and defaults the library's roots to
+		// its name. A name or a root may be written in guillemets, which are no part of the module's name.
+		libraries[i].SrcDir = filepath.Join(packageSrcDir, libraries[i].SrcDir)
+		libraries[i].Name = unquoteName(libraries[i].Name)
+		if len(libraries[i].Roots) == 0 {
+			libraries[i].Roots = []string{libraries[i].Name}
+		}
+		for j, root := range libraries[i].Roots {
+			libraries[i].Roots[j] = unquoteName(root)
+		}
+		for j, glob := range libraries[i].Globs {
+			libraries[i].Globs[j] = unquoteName(glob)
+		}
+	}
+	return libraries, true
+}
+
+// unquoteName drops the guillemets Lean allows around a name's components: «Lib».«Odd name» is Lib.Odd name.
+func unquoteName(name string) string {
+	return strings.NewReplacer("«", "", "»", "").Replace(name)
+}
+
+// stripTOMLComment drops a trailing comment, leaving a `#` inside a quoted value alone.
+func stripTOMLComment(line string) string {
+	quoted := false
+	for i, r := range line {
+		switch {
+		case r == '"':
+			quoted = !quoted
+		case r == '#' && !quoted:
+			return line[:i]
+		}
+	}
+	return line
+}
+
+// tomlString reads one basic string, which may escape a quote or a backslash.
+func tomlString(value string) (string, bool) {
+	if len(value) < 2 || value[0] != '"' || !strings.HasSuffix(value, `"`) {
+		return "", false
+	}
+	var b strings.Builder
+	body := value[1 : len(value)-1]
+	for i := 0; i < len(body); i++ {
+		switch {
+		case body[i] == '"':
+			return "", false
+		case body[i] == '\\' && i+1 < len(body) && (body[i+1] == '"' || body[i+1] == '\\'):
+			i++
+			b.WriteByte(body[i])
+		case body[i] == '\\':
+			return "", false
+		default:
+			b.WriteByte(body[i])
+		}
+	}
+	return b.String(), true
+}
+
+// tomlStrings reads an array of basic strings.
+func tomlStrings(value string) ([]string, bool) {
+	body, ok := strings.CutPrefix(value, "[")
+	if !ok {
+		return nil, false
+	}
+	body, ok = strings.CutSuffix(strings.TrimSpace(body), "]")
+	if !ok {
+		return nil, false
+	}
+	var out []string
+	for _, item := range strings.Split(body, ",") {
+		if item = strings.TrimSpace(item); item == "" {
+			continue
+		}
+		text, ok := tomlString(item)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, text)
+	}
+	return out, true
 }
 
 // lakeState is the candidate's view of the base build's setup files: each file read once, and each module's plugin
