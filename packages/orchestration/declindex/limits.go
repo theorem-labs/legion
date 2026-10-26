@@ -22,6 +22,13 @@ const indexEntryLimit = 2600
 // NameTooLongError is an index defect: the tree declares or uses a name that the index cannot hold in one entry
 // of its indexes. The refresh refuses the tree (exit 3) rather than fail inside the database, and names what to
 // shorten.
+//
+// Where the refusal leaves the index depends on which part found it. The reference part is measured before its
+// write, so a tree refused there leaves the index as it was. The compiled part is read after the reference part
+// has committed, as every compiled step is, so a tree refused there leaves the reference part written and the
+// index owing a compiled part: every reader of a fact refuses it (CompiledCommit) until a refresh of a tree
+// without the long name finishes. That is what a failed exporter already leaves, and the message names the
+// declaration either way.
 type NameTooLongError struct {
 	// What holds the names: "the declaration", "the use of", ...
 	What string

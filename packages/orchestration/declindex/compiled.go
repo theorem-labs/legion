@@ -381,6 +381,12 @@ func (s *Store) writeCompiled(ctx context.Context, tx pgx.Tx, w compiledRead) er
 				return err
 			}
 		}
+		// consts_conclusion indexes the head of a constant's conclusion, which is a name of the tree.
+		if err := checkName("the conclusion of "+c.Name, c.Conclusion); err != nil {
+			return err
+		}
+		// consts_cstmt indexes the compiled statement hash, which is of a fixed length, and the type is in
+		// no index.
 		// binders is a JSON array, as the graph checks read it back (ConstantsIn).
 		binders, err := json.Marshal(nonNil(c.Binders))
 		if err != nil {
