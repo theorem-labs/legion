@@ -61,22 +61,123 @@ func TestParseLakefileReadsAQuotedName(t *testing.T) {
 // A lakefile the reader cannot read is not guessed at: it says so, and the check is then unable.
 func TestParseLakefileRefusesWhatItCannotRead(t *testing.T) {
 	for name, text := range map[string]string{
-		"a library with no name":      "[[lean_lib]]\nsrcDir = \"src\"\n",
-		"an unterminated array":       "[[lean_lib]]\nname = \"Lib\"\nroots = [\"A\",\n",
-		"a root that is no string":    "[[lean_lib]]\nname = \"Lib\"\nroots = [A]\n",
-		"a value that is no pair":     "[[lean_lib]]\nname\n",
-		"an inline table":             "[[lean_lib]]\nname = \"Lib\"\nsrcDir = { path = \"src\" }\n",
-		"an array of inline tables":   "lean_lib = [{ name = \"Lib\" }, { name = \"Extra\", srcDir = \"src\" }]\n",
-		"a quoted key":                "[[lean_lib]]\nname = \"Lib\"\n\"srcDir\" = \"src\"\n",
-		"a dotted key":                "lean_lib.name = \"Lib\"\n",
-		"a multi-line basic string":   "[[lean_lib]]\nname = \"\"\"Lib\n\"\"\"\n",
-		"a multi-line literal string": "[[lean_lib]]\nname = '''Lib\n'''\n",
+		"a library with no name":         "[[lean_lib]]\nsrcDir = \"src\"\n",
+		"an unterminated array":          "[[lean_lib]]\nname = \"Lib\"\nroots = [\"A\",\n",
+		"a root that is no string":       "[[lean_lib]]\nname = \"Lib\"\nroots = [A]\n",
+		"a value that is no pair":        "[[lean_lib]]\nname\n",
+		"an inline table":                "[[lean_lib]]\nname = \"Lib\"\nsrcDir = { path = \"src\" }\n",
+		"an array of inline tables":      "lean_lib = [{ name = \"Lib\" }, { name = \"Extra\", srcDir = \"src\" }]\n",
+		"a quoted key":                   "[[lean_lib]]\nname = \"Lib\"\n\"srcDir\" = \"src\"\n",
+		"a dotted key":                   "lean_lib.name = \"Lib\"\n",
+		"a multi-line basic string":      "[[lean_lib]]\nname = \"\"\"Lib\n\"\"\"\n",
+		"a multi-line literal string":    "[[lean_lib]]\nname = '''Lib\n'''\n",
+		"a quoted header":                "[[\"lean_lib\"]]\nname = \"Lib\"\n",
+		"a quoted header after one":      "[[lean_lib]]\nname = \"Lib\"\n\n[[\"lean_lib\"]]\nname = \"Extra\"\nsrcDir = \"src\"\n",
+		"a dotted library key on top":    "lean_lib.name = \"Lib\"\n\n[[lean_lib]]\nname = \"Extra\"\n",
+		"a quoted package source":        "\"srcDir\" = \"src\"\n\n[[lean_lib]]\nname = \"Lib\"\n",
+		"a single-bracket library":       "[lean_lib]\nname = \"Lib\"\n",
+		"a single-bracket library after": "[[lean_lib]]\nname = \"Lib\"\n\n[lean_lib]\nname = \"Extra\"\n",
+		"a library subtable":             "[[lean_lib]]\nname = \"Lib\"\n\n[lean_lib.extra]\nname = \"Extra\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if libraries, ok := parseLakefile(text); ok {
 				t.Fatalf("parseLakefile = %+v, true; want false", libraries)
 			}
 		})
+	}
+}
+
+// A dotted key in an options table names an option, not a library: the reader passes over it and still gives
+// the libraries. A project whose options it refused would be unable on every batch.
+func TestParseLakefileReadsPastOptionTables(t *testing.T) {
+	for name, options := range map[string]string{
+		"a linter option":      "linter.unusedVariables = false",
+		"a backward option":    "backward.isDefEq.respectTransparency.types = false",
+		"a numeric option":     "maxRecDepth = 8192",
+		"an option that is 0":  "maxHeartbeats = 0",
+		"a quoted option name": "\"weak.option\" = true",
+	} {
+		t.Run(name, func(t *testing.T) {
+			libraries, ok := parseLakefile("name = \"proj\"\n\n[leanOptions]\n" + options +
+				"\n\n[[lean_lib]]\nname = \"Lib\"\n\n[[lean_lib]]\nname = \"Extra\"\nsrcDir = \"src\"\n")
+			want := []lakeLibrary{{Name: "Lib", Roots: []string{"Lib"}}, {Name: "Extra", SrcDir: "src", Roots: []string{"Extra"}}}
+			if !ok || !slices.EqualFunc(libraries, want, func(a, b lakeLibrary) bool {
+				return a.Name == b.Name && a.SrcDir == b.SrcDir && slices.Equal(a.Roots, b.Roots)
+			}) {
+				t.Fatalf("parseLakefile = %+v, %v; want %+v", libraries, ok, want)
+			}
+		})
+	}
+}
+
+// A dotted key of a table that is neither a library nor the package's own is a value the reader does not need.
+func TestParseLakefileSkipsADottedKeyElsewhere(t *testing.T) {
+	libraries, ok := parseLakefile("[[require]]\nname = \"dep\"\nsource.rev = \"v1\"\n\n[[lean_lib]]\nname = \"Lib\"\n")
+	if !ok || len(libraries) != 1 || libraries[0].Name != "Lib" {
+		t.Fatalf("parseLakefile = %+v, %v; want the library Lib", libraries, ok)
+	}
+}
+
+// The shape of a real project's configuration — a package with its options, required packages, several
+// libraries and an executable — reads as its libraries. This is the regression guard for a reader that refuses
+// a file it should read: such a project would be unable on every batch.
+func TestParseLakefileReadsAWholeProject(t *testing.T) {
+	libraries, ok := parseLakefile(`name = "proj"
+defaultTargets = ["Top"]
+testDriver = "test"
+
+[leanOptions]
+maxRecDepth = 8192
+maxHeartbeats = 64000000
+linter.unusedVariables = false
+linter.unusedSectionVars = false
+linter.unusedTactic = false
+backward.isDefEq.respectTransparency.types = false
+
+[[require]]
+name = "batteries"
+scope = "example"
+rev = "v4.36.0"
+
+[[require]]
+name = "iris"
+path = "vendor/iris"
+
+[[lean_lib]]
+name = "Meta"
+precompileModules = true
+
+[[lean_lib]]
+name = "Core"
+
+[[lean_lib]]
+name = "First"
+
+[[lean_lib]]
+name = "Second"
+
+[[lean_lib]]
+name = "Both"
+
+[[lean_lib]]
+name = "Top"
+
+[[lean_exe]]
+name = "tool"
+root = "Tool"
+`)
+	want := []string{"Meta", "Core", "First", "Second", "Both", "Top"}
+	var got []string
+	for _, lib := range libraries {
+		got = append(got, lib.Name)
+	}
+	if !ok || !slices.Equal(got, want) {
+		t.Fatalf("parseLakefile = %+v, %v; want the libraries %v", libraries, ok, want)
+	}
+	for _, lib := range libraries {
+		if lib.SrcDir != "" || !slices.Equal(lib.Roots, []string{lib.Name}) {
+			t.Fatalf("library %+v, want no source directory of its own and its name as its root", lib)
+		}
 	}
 }
 

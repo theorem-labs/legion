@@ -150,7 +150,16 @@ func parseLakefile(text string) ([]lakeLibrary, bool) {
 				return nil, false
 			}
 			table = strings.TrimSpace(name)
-			if open == 2 && table == "lean_lib" {
+			// A quoted or dotted header names a table this reader cannot place: Lake reads `[["lean_lib"]]` as
+			// a library and `[lean_lib.extra]` as a subtable, so only it can answer. A library is opened by the
+			// bare double form alone, and the single form of that name is one Lake refuses.
+			if strings.ContainsAny(table, `".'`) {
+				return nil, false
+			}
+			if table == "lean_lib" || table == "lean_libs" {
+				if open != 2 {
+					return nil, false
+				}
 				libraries = append(libraries, lakeLibrary{})
 			}
 			continue
@@ -160,12 +169,17 @@ func parseLakefile(text string) ([]lakeLibrary, bool) {
 			return nil, false
 		}
 		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
-		// A quoted or dotted key, and a library written anywhere but under its own header (an array of inline
-		// tables, say), are shapes this reader does not take: Lake reads them, so only it can answer.
-		if strings.ContainsAny(key, `".'`) || key == "" {
+		// A quoted or dotted key is a shape this reader does not take, and a library written anywhere but under
+		// its own header (an array of inline tables, say) is another: Lake reads them, so only it can answer.
+		// They matter only where a key could name a library or the package's source directory: inside a library,
+		// or at the top level when the key's first part is one of those names. Anywhere else a dotted key names a
+		// value the reader does not need (`linter.unusedVariables` in the options), and the switch below skips it.
+		odd := key == "" || strings.ContainsAny(key, `".'`)
+		first := strings.Trim(strings.SplitN(key, ".", 2)[0], `"' `)
+		switch {
+		case odd && table == "lean_lib":
 			return nil, false
-		}
-		if table != "lean_lib" && (key == "lean_lib" || key == "lean_libs") {
+		case table == "" && (first == "lean_lib" || first == "lean_libs" || (odd && first == "srcDir")):
 			return nil, false
 		}
 		// An array over several lines runs to the line that closes it.
