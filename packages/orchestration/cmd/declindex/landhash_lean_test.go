@@ -138,10 +138,8 @@ name = "LandHashFixture"
 	cache := filepath.Join(dir, "lake-cache")
 	runLake(t, repo, cache)
 	config := filepath.Join(dir, "index.yaml")
-	configText := "tree: " + repo + "\nlib: .lake/build/lib/lean\ndb: " + filepath.Join(dir, "index.sqlite") + "\nroots: [LandHashFixture]\n"
-	if err := os.WriteFile(config, []byte(configText), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	configText := "tree: " + repo + "\nlib: .lake/build/lib/lean\nindex: idx\nstate: " + filepath.Join(dir, "state") + "\nroots: [LandHashFixture]\n"
+	writeIndexConfig(t, config, configText)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh A: %+v", r)
 	}

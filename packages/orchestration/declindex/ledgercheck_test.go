@@ -203,10 +203,8 @@ func TestCheckLedgerReportsAmbiguousExactLedgerName(t *testing.T) {
 	if _, err := l.RegisterContract(ctx, "r", found[0].Name, "function:frame_at", found[0].StmtHash, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
-		VALUES (?, ?, ?, ?, ?, ?)`, found[0].Name, "Box", "Other.Module", found[0].Kind, 1, found[0].StmtHash); err != nil {
-		t.Fatal(err)
-	}
+	execIndex(t, s, `INSERT INTO decls (name, short, module, kind, line, stmt_hash)
+		VALUES ($1, $2, $3, $4, $5, $6)`, found[0].Name, "Box", "Other.Module", found[0].Kind, 1, found[0].StmtHash)
 	rule := ContractRule{Paths: []string{"NoContracts/**"}, Kinds: []string{"def", "structure"}}
 	r, err := s.CheckLedger(ctx, l, "r", rule, nil)
 	if err != nil {

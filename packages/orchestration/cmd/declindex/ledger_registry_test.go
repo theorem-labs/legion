@@ -48,7 +48,7 @@ func registryFixture(t *testing.T, extra string, concepts map[string]string) (co
 		t.Fatal(err)
 	}
 	body = append(body, []byte("repo: r\nregistry: registry\ncontracts:\n  paths: [\"Nowhere/**\"]\n  kinds: [def]\n"+extra)...)
-	writeTestFile(t, config, string(body))
+	writeIndexConfig(t, config, string(body))
 	writeTestFile(t, filepath.Join(tree, "registry", "registry.yaml"), "version: 2\n")
 	for key, c := range concepts {
 		writeTestFile(t, filepath.Join(tree, "registry", "concepts", key+".yaml"), c)
@@ -91,7 +91,7 @@ func checkRegistry(t *testing.T, config, landed string) registryCheck {
 	writeTestFile(t, contracts, "[]\n")
 	emit := filepath.Join(dir, "ops.jsonl")
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"--config", config, "ledger", "--contracts-file", contracts, "--emit", emit},
+	code := run(context.Background(), withIndexDSN([]string{"--config", config, "ledger", "--contracts-file", contracts, "--emit", emit}),
 		func(k string) string {
 			if k == "LAND_COMMIT" {
 				return landed
@@ -224,7 +224,7 @@ func TestARegistryAdditionInATreeBelowTheRepositoryRootIsRechecked(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, config, string(body)+"repo: r\nregistry: registry\ncontracts:\n  paths: [\"Nowhere/**\"]\n  kinds: [def]\n"+unavailableLean)
+	writeIndexConfig(t, config, string(body)+"repo: r\nregistry: registry\ncontracts:\n  paths: [\"Nowhere/**\"]\n  kinds: [def]\n"+unavailableLean)
 	writeTestFile(t, filepath.Join(proj, "registry", "registry.yaml"), "version: 2\n")
 	git(t, repo, "init", "-q")
 	git(t, repo, "add", "-A")
@@ -270,20 +270,23 @@ func TestALandingWithoutRegistryAdditionsReportsAnEmptyList(t *testing.T) {
 	}
 }
 
-// The landing hook mounts the index directory read-only: `ledger` writes nothing there (its registry snapshot and
-// proposal work go to the temporary directory) and still checks.
-func TestLedgerChecksWithAReadOnlyIndexDirectory(t *testing.T) {
+// The landing hook mounts the state directory beside the index read-only: `ledger` writes nothing there (its
+// registry snapshot and proposal work go to the temporary directory) and still checks.
+func TestLedgerChecksWithAReadOnlyStateDirectory(t *testing.T) {
 	config, tree := registryFixture(t, "", map[string]string{conceptKeyA: registryConcept("P.Old", conceptKeyA, "p1", "n < 3")})
 	writeTestFile(t, filepath.Join(tree, "notes.txt"), "unrelated\n")
 	landed := land(t, config, tree, "unrelated landing")
 	state := filepath.Join(filepath.Dir(config), "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(state, 0o555); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(state, 0o755) })
 	t.Setenv("TMPDIR", t.TempDir())
 	if r := checkRegistry(t, config, landed); r.code != 0 {
-		t.Fatalf("ledger with a read-only index directory: want exit 0, got %+v", r)
+		t.Fatalf("ledger with a read-only state directory: want exit 0, got %+v", r)
 	}
 }
 
@@ -312,7 +315,7 @@ func TestLandCommitMustBeLowercaseHex(t *testing.T) {
 	}
 	for _, args := range [][]string{{"refresh"}, {"ledger", "--contracts-file", filepath.Join(t.TempDir(), "c.json"), "--emit", filepath.Join(t.TempDir(), "o.jsonl")}} {
 		var out, errOut bytes.Buffer
-		if code := run(context.Background(), append([]string{"--config", config}, args...), env, &out, &errOut); code != 2 {
+		if code := run(context.Background(), withIndexDSN(append([]string{"--config", config}, args...)), env, &out, &errOut); code != 2 {
 			t.Errorf("%s with an uppercase LAND_COMMIT exited %d: %s", args[0], code, errOut.String())
 		}
 	}
@@ -352,7 +355,7 @@ func TestARetryAfterAFailedCompiledStepRunsItAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, f.config, string(body)+"lean:\n  export: true\n  toolchain: /nonexistent-lean-toolchain\n")
+	writeIndexConfig(t, f.config, string(body)+"lean:\n  export: true\n  toolchain: /nonexistent-lean-toolchain\n")
 	if r := f.refreshAt(t, f.second); r.code != 3 {
 		t.Fatalf("a landed refresh whose compiled step fails: %+v", r)
 	}

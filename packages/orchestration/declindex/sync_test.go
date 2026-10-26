@@ -2,6 +2,7 @@ package declindex
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -135,5 +136,33 @@ func TestSyncFetchesTheBranchesWhenTheRemoteRefusesAFetchByID(t *testing.T) {
 	}
 	if refs := gitIn(t, tree, "for-each-ref", "--format=%(refname)", "refs/declindex/"); refs != "" {
 		t.Errorf("the sync left refs:\n%s", strings.TrimSpace(refs))
+	}
+}
+
+// A refresh that is killed cannot delete the refs its fetch wrote, and a ref pins the objects it names for ever.
+// The next sync of that tree deletes what a run of a day ago or more left behind, and leaves the refs of a run
+// that may still be going.
+func TestSyncDeletesTheFetchedRefsAKilledRunLeftBehind(t *testing.T) {
+	seed, remote, tree := syncRemote(t)
+	writeSource(t, seed, "A.lean", "def a := 1\n")
+	gitIn(t, seed, "commit", "-q", "-am", "landed")
+	commit := gitIn(t, seed, "rev-parse", "HEAD")
+	gitIn(t, seed, "push", "-q", remote, "HEAD:refs/heads/main")
+	// What two killed runs left: one of today, one of three days ago. The dates are the commits' own, so the
+	// old one points at a commit written three days ago.
+	today := fmt.Sprintf("%s%d-111-today/landed", refNamespaceRoot, time.Now().Unix())
+	old := fmt.Sprintf("%s%d-222-old/landed", refNamespaceRoot, time.Now().Add(-72*time.Hour).Unix())
+	gitIn(t, tree, "fetch", "-q", "--no-tags", remote, "+"+commit+":"+today)
+	gitIn(t, tree, "fetch", "-q", "--no-tags", remote, "+"+commit+":"+old)
+	cfg := Config{Tree: tree, Remote: remote, Build: []string{"true"}, BuildTimeout: time.Minute}
+	if err := Sync(cfg, commit, io.Discard)(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	refs := strings.TrimSpace(gitIn(t, tree, "for-each-ref", "--format=%(refname)", refNamespaceRoot))
+	if strings.Contains(refs, "-old") {
+		t.Errorf("the sync kept the refs of a killed run of three days ago:\n%s", refs)
+	}
+	if !strings.Contains(refs, "-today") {
+		t.Errorf("the sync deleted the refs of a run that may still be going:\n%s", refs)
 	}
 }

@@ -21,7 +21,7 @@ func TestHashChangesWithTheWhiteSpaceOfAStringLiteral(t *testing.T) {
 	dir := t.TempDir()
 	tree := filepath.Join(dir, "tree")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [Fixture]\n")
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [Fixture]\n")
 	hashOf := func(source string) string {
 		t.Helper()
 		writeTestFile(t, filepath.Join(tree, "Fixture.lean"), source)

@@ -2,7 +2,6 @@ package declindex
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +9,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/sjawhar/legion/orchestration/ledger"
 )
@@ -133,9 +134,9 @@ func (s *Store) Contracts(ctx context.Context, rule ContractRule) ([]Found, erro
 		}
 	}
 	var out []Found
-	rows, err := s.q.QueryContext(ctx, `SELECT `+foundColumns+`, d.short`+foundFrom+` WHERE d.kind IN (`+
-		placeholders(len(rule.Kinds))+`) ORDER BY d.name, d.module`, anys(rule.Kinds)...)
-	err = eachRow(rows, err, func(r *sql.Rows) error {
+	rows, err := s.q.Query(ctx, `SELECT `+foundColumns+`, d.short`+foundFrom+
+		` WHERE d.kind = ANY($1) ORDER BY d.name, d.module`, rule.Kinds)
+	err = eachRow(rows, err, func(r pgx.Rows) error {
 		var short string
 		f, err := scanFound(r, &short)
 		if err != nil {

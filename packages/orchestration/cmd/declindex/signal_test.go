@@ -33,10 +33,8 @@ func TestSIGTERMDuringRefreshKillsTheBuild(t *testing.T) {
 	if text == string(body) {
 		t.Fatal("the landing fixture no longer sets the build")
 	}
-	if err := os.WriteFile(f.config, []byte(text), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(os.Args[0], "--config", f.config, "refresh")
+	writeIndexConfig(t, f.config, text)
+	cmd := exec.Command(os.Args[0], "--index-dsn-file", indexDSNFile(f.config), "--config", f.config, "refresh")
 	cmd.Env = append(os.Environ(), "DECLINDEX_TEST_MAIN=1", "LAND_COMMIT="+f.second)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -45,7 +43,7 @@ func formsClashTree(t *testing.T) (config, tree string, lean declindex.Lean) {
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config = filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, UseA, UseB, C, UseC]\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Home, UseA, UseB, C, UseC]\n"+
 		"registry: registry\nlean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")
@@ -165,7 +163,7 @@ func TestRefreshReadsWithTheFormsAModuleWhosePropositionAxiomTheFormsImportsDecl
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, UseB, Both]\nregistry: registry\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Home, UseB, Both]\nregistry: registry\n"+
 		"lean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")
@@ -219,7 +217,7 @@ func TestRefreshKeepsApartTwoAxiomsThatOnlyATheoremReconciles(t *testing.T) {
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Thm, Home]\nregistry: registry\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Thm, Home]\nregistry: registry\n"+
 		"lean:\n  export: true\n  jobs: 1\n")
 	r := invoke(t, "--config", config, "refresh")
 	if r.code != 0 || !strings.Contains(r.errOut, "declindex: index defect: 3 modules are read without the registry's forms") {
@@ -274,7 +272,7 @@ func TestRefreshReadsAgainWhenTheFormsImportsChange(t *testing.T) {
 	writeTestFile(t, filepath.Join(tree, "registry", "concepts", "Reflexive.yaml"), "name: Reflexive\nhome: Home.lean\n"+
 		"meaning: A natural number equals itself.\nforms:\n  - \"fun (n : Nat) => n = n\"\n")
 	config := filepath.Join(dir, "index.yaml")
-	writeTestFile(t, config, "tree: tree\nlib: .\ndb: state/index.sqlite\nroots: [A, B, Home, M]\nregistry: registry\n"+
+	writeIndexConfig(t, config, "tree: tree\nlib: .\nindex: idx\nstate: state\nroots: [A, B, Home, M]\nregistry: registry\n"+
 		"lean:\n  export: true\n  jobs: 1\n")
 	git(t, tree, "init", "-q")
 	git(t, tree, "add", "-A")
@@ -336,12 +334,7 @@ func TestRefreshReadsAgainWhenTheFormsImportsChange(t *testing.T) {
 // The gate reads the index's facts, so its verdict gives the count of the modules read without the registry's
 // forms, and its stderr names the index defect.
 func TestTheGateGivesTheCountOfModulesReadWithoutTheForms(t *testing.T) {
-	if os.Getenv("DECLINDEX_SANDBOX_TEST") != "1" {
-		t.Skip("sandboxed Lean tests run only with DECLINDEX_SANDBOX_TEST=1, in a disposable container or CI runner")
-	}
-	if _, err := exec.LookPath("lake"); err != nil {
-		t.Fatal("DECLINDEX_SANDBOX_TEST is set and lake is unavailable")
-	}
+	requireLake(t)
 	config, _, _ := formsClashTree(t)
 	if r := invoke(t, "--config", config, "refresh"); r.code != 0 {
 		t.Fatalf("refresh: %+v", r)

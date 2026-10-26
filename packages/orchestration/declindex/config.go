@@ -16,13 +16,24 @@ import (
 )
 
 // Config is one project's index configuration, a YAML file that the project keeps beside its proofs. `tree` and
-// `db` are relative to the file's directory; `lib`, `registry` and `owners` are relative to the tree.
+// `state` are relative to the file's directory; `lib`, `registry` and `owners` are relative to the tree.
 type Config struct {
 	Tree string `yaml:"tree"`
 	// LibRel is the configured library path below Tree; Lib is the resolved path.
-	LibRel    string   `yaml:"-"`
-	Lib       string   `yaml:"lib"`
-	DB        string   `yaml:"db"`
+	LibRel string `yaml:"-"`
+	Lib    string `yaml:"lib"`
+	// Index is the Postgres schema that holds this index (ValidIndexName). Every command that opens the index
+	// needs it.
+	Index string `yaml:"index"`
+	// State is the local directory of the exporter build and the forms module, relative to the configuration
+	// file's directory. It must resolve outside the tree; StateDir gives it, and its default.
+	State string `yaml:"state"`
+	// Reader is the read-only role that a refresh grants USAGE on the schema and SELECT on its tables; empty
+	// grants nothing.
+	Reader string `yaml:"reader"`
+	// DSN is the index's connection string. No configuration file names a secret: it comes from DECLINDEX_DSN or
+	// from the file that --index-dsn-file names.
+	DSN       string   `yaml:"-"`
 	Roots     []string `yaml:"roots"`
 	FileKinds []string `yaml:"file_kinds"`
 	Jobs      int      `yaml:"jobs"`
@@ -84,6 +95,14 @@ func LoadConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// db: named the SQLite file the index was. Its own message names what replaced it, because KnownFields would
+	// report it as an unknown key and leave its owner to guess.
+	var keys map[string]yaml.Node
+	if err := yaml.Unmarshal(raw, &keys); err == nil {
+		if _, ok := keys["db"]; ok {
+			return Config{}, fmt.Errorf("%s: %w", path, ErrDBRemoved)
+		}
+	}
 	// A build_timeout the file does not set keeps the default; one that it sets is checked below.
 	c := Config{BuildTimeout: defaultBuildTimeout}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
@@ -91,6 +110,8 @@ func LoadConfig(path string) (Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
+	// index: is checked where a command resolves the index it opens, not here: --index overrides the key, so a
+	// name this file gets wrong must not refuse a right one on the command line (P-1).
 	if c.Tree == "" {
 		return Config{}, fmt.Errorf("%s: tree is required", path)
 	}
@@ -118,7 +139,7 @@ func LoadConfig(path string) (Config, error) {
 		return filepath.Join(base, p)
 	}
 	c.Tree = rel(dir, c.Tree)
-	c.DB = rel(dir, c.DB)
+	c.State = rel(dir, c.State)
 	c.LibRel = cmp.Or(c.Lib, filepath.Join(".lake", "build", "lib", "lean"))
 	c.Lib = rel(c.Tree, c.LibRel)
 	c.Registry = rel(c.Tree, c.Registry)
@@ -138,21 +159,59 @@ func (c Config) GateRegistryDir() (string, error) {
 	return pathInside(c.Tree, c.Registry)
 }
 
-// GateIndexPath resolves the configured index path through symlinks and requires it to remain outside the tree.
-// A gate opens this existing file read-only, so neither the index nor its scratch work can dirty the tree.
-func (c Config) GateIndexPath() (string, error) {
+// Target is the index this configuration names: its schema, its connection string, its reader role and the file
+// whose lock guards the indexed tree on this machine. The lock file is in the state directory, which is outside
+// the tree; a configuration whose state cannot be resolved names no lock, and a command that writes the tree
+// resolves the state anyway (StateDir).
+func (c Config) Target() Target {
+	return Target{DSN: c.DSN, Index: c.Index, Reader: c.Reader}
+}
+
+// TreeTarget is the index of a command that also reads or writes the indexed tree: the target above, and the file
+// whose lock guards that tree on this machine, in the state directory, which is outside the tree. A state
+// directory this configuration cannot resolve is an error, not a reason to guard the tree with nothing: a refresh
+// under it would check out and build while a gate reads the tree. A command that reads the index alone (a query,
+// land-hash, a pod with no tree) takes Target instead, and needs no tree.
+func (c Config) TreeTarget() (Target, error) {
+	state, err := c.StateDir()
+	if err != nil {
+		return Target{}, err
+	}
+	t := c.Target()
+	t.TreeLock = filepath.Join(state, "tree.lock")
+	return t, nil
+}
+
+// StateDir resolves the local directory that holds this index's exporter build and forms module: the configured
+// state, or the user's cache directory under the index's name. It must resolve outside the tree, so that neither
+// a refresh nor the gate can dirty the tree with its scratch work.
+func (c Config) StateDir() (string, error) {
+	dir := c.State
+	if dir == "" {
+		if c.Index == "" {
+			return "", errors.New("no index state: set state in the configuration, or index, whose name names the default below the cache directory")
+		}
+		cache, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(cache, "declindex", c.Index)
+	}
 	tree, err := canonicalPath(c.Tree)
 	if err != nil {
 		return "", err
 	}
-	index, err := canonicalIndexPath(c.DB)
+	state, err := canonicalStatePath(dir)
 	if err != nil {
 		return "", err
 	}
-	if isInside(tree, index) {
-		return "", fmt.Errorf("the gate index state %s must be outside the tree %s", index, tree)
+	// The state holds the exporter's build and the forms module, which a gate writes: the tree itself is as
+	// wrong a place for them as a directory inside it, so equality is refused too (isInside allows it, which
+	// the registry, a strict subdirectory of the tree, relies on).
+	if state == tree || isInside(tree, state) {
+		return "", fmt.Errorf("the index state %s must be outside the tree %s", state, tree)
 	}
-	return index, nil
+	return state, nil
 }
 
 func pathInside(tree, path string) (string, error) {
@@ -178,7 +237,10 @@ func canonicalPath(path string) (string, error) {
 	return filepath.EvalSymlinks(absolute)
 }
 
-func canonicalIndexPath(path string) (string, error) {
+// canonicalStatePath resolves the symlinks of the existing part of a state directory, which need not exist yet,
+// and keeps the rest of the path as it is, so that a state directory is compared with the tree by where it will
+// be, not by the link that names it.
+func canonicalStatePath(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -212,8 +274,29 @@ func isInside(root, path string) bool {
 	return err == nil && filepath.IsLocal(rel) && rel != "."
 }
 
-// ErrNoDB is returned when no index path is configured.
-var ErrNoDB = errors.New("no index file: set db in the configuration or pass --db")
+// ErrDBRemoved refuses the key db: and the flag --db, which named the SQLite file the index was.
+var ErrDBRemoved = errors.New("db: was removed: the index is a Postgres schema; set index: and pass DECLINDEX_DSN or --index-dsn-file")
+
+// OpenReadOnlyConfig opens the index that c names read-only (OpenReadOnly), with scope the reads of its caller
+// besides the index. A program that only reads the index (graph checks) opens it through this one call, and needs
+// no knowledge of where or how the index is kept.
+func OpenReadOnlyConfig(ctx context.Context, c Config, scope ReadScope) (*Store, error) {
+	t := c.Target()
+	if scope == IndexAndTree {
+		// A reader of the tree holds its lock, so its state directory must resolve.
+		var err error
+		if t, err = c.TreeTarget(); err != nil {
+			return nil, err
+		}
+	}
+	switch {
+	case t.Index == "":
+		return nil, errors.New("index: is required: the index is a schema of a Postgres database")
+	case t.DSN == "":
+		return nil, errors.New("no connection string for the index: set DECLINDEX_DSN or pass the configuration one")
+	}
+	return OpenReadOnly(ctx, t, scope)
+}
 
 // TreeSpec is the configuration's Tree.
 func (c Config) TreeSpec() Tree {
@@ -225,19 +308,18 @@ func (c Config) TreeSpec() Tree {
 }
 
 // Compiled gives the options of the compiled part for this configuration: the tree's toolchain, the exporter
-// built with it below the index's directory, and the library directories of the tree and its Lake packages. The
-// index's directory is the one of the file it resolves to, as for its locks and graph (resolveIndex), so that every
-// path that names one index builds one exporter and one forms module.
+// built with it below the index's state directory, and the library directories of the tree and its Lake
+// packages. The state directory is resolved (StateDir), so that every path that names it builds one exporter and
+// one forms module.
 func (c Config) Compiled(ctx context.Context, forms FormsModule, log io.Writer) (*CompiledOptions, error) {
 	l, err := FindLean(ctx, c.Tree, c.Lean.Toolchain)
 	if err != nil {
 		return nil, err
 	}
-	db, err := resolveIndex(c.DB)
+	state, err := c.StateDir()
 	if err != nil {
 		return nil, err
 	}
-	state := filepath.Dir(db)
 	bin, err := BuildExporter(ctx, l, c.Lean.CC, filepath.Join(state, "exporter"))
 	if err != nil {
 		return nil, err
