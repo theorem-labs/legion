@@ -80,6 +80,12 @@ jobs:
           lean_version="$(lean --version)"
           printf '%s\n' "$lean_version"
           grep --fixed-strings "$LEAN_FORK_COMMIT" <<<"$lean_version"
+      # A library the build precompiles is linked with `cc` against the toolchain's C dependencies. The stage2
+      # build installs them, but it is skipped when the stage2 cache hits, so install them on every run.
+      - name: Install the C libraries a precompiled library links
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends libgmp-dev libuv1-dev libssl-dev
       - name: Test the declaration index, the similarity gate, the container image and the graph checks with Lean
         working-directory: packages/orchestration
         run: |
