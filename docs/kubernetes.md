@@ -3595,9 +3595,15 @@ bind: <devbox VPC IP>
 worker_stream_port: <worker stream port>
 ```
 
-**`--resume` keeps the same-agent invariant through the init container.** The tmux runtime `stat`s the
-recorded session file on the daemon host and refuses to spawn when it is missing (a silent fresh agent
-would lose the session). Under Kubernetes the file lives on the pod's volume (`/legion/sessions/…`, the
+The reverse, a project moved from pods onto one tmux host, keeps its store: the Go tmux daemon takes
+over the Kubernetes daemon's claims once every pod of the project is gone (docs/deployment.md,
+"Moving a project onto tmux").
+
+**`--resume` keeps the same-agent invariant through the init container.** The TypeScript tmux runtime
+`stat`s the recorded session file on the daemon host and refuses to spawn when it is missing (a silent
+fresh agent would lose the session); the Go tmux runtime looks for it in the other folders of the same
+sessions directory too, and a session found nowhere starts a fresh agent that registers its own.
+Under Kubernetes the file lives on the pod's volume (`/legion/sessions/…`, the
 OMP sessions `subPath`), which the daemon cannot see — and OMP itself does not refuse: verified against
 the pinned OMP build (`omp --resume=<missing path> --mode rpc`), it exits 0, answers `ready`, and runs
 as a fresh agent, with no error frame and no mention of the file. So when a spawn resumes a session, the
@@ -3758,9 +3764,10 @@ A 403 fails the spawn (or stop) naming the verb and resource, e.g. `create secre
 The controller is the one Legion session a person talks to. `controller` in `legion.yaml` says who
 launches it: `operator` (the default), a person running `legion controller start` on a machine of
 theirs ([Operator-launched controller](#operator-launched-controller)), or `daemon`, the daemon
-itself, as an Agent Sandbox pod it supervises ([Daemon-launched controller](#daemon-launched-controller)).
-`controller: daemon` needs `runtime: kubernetes`; the loader refuses it under tmux (`controller:
-daemon needs runtime: kubernetes, …`) and refuses any value but the two.
+itself, as an Agent Sandbox pod it supervises ([Daemon-launched controller](#daemon-launched-controller)),
+or under `runtime: tmux` as a pane in a window of its own (docs/deployment.md, "The `runtime.tmux`
+block"). `controller: daemon` needs `dispatch_url` (`controller: daemon needs dispatch_url: …`), and
+the loader refuses any value but the two.
 
 Under either mode a controller reads its daemon's resolved settings — `max_fix_attempts`,
 `worker_boot_timeout_seconds`, `admission_cap` and the rest of `legion.yaml`, with every credential,
