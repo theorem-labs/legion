@@ -52,8 +52,8 @@ func buildDeclindex(t *testing.T) string {
 // in the file dsn) refreshed at the first, a state directory, and a declindex configuration with absolute paths, as
 // the landing configuration passes it.
 type indexFixture struct {
-	seed, remote, tree, state, dsn, config, bin string
-	first, second                               string
+	seed, remote, tree, state, dsn, readerDSN, config, bin string
+	first, second                                          string
 }
 
 func newIndexFixture(t *testing.T) indexFixture {
@@ -98,23 +98,30 @@ func newIndexFixture(t *testing.T) indexFixture {
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The refresh writes the index with the login that owns its schema; the ledger reads it with the reader login
+	// that the refresh grants the schema's reads to, as the landing configuration's index-dsn and index-reader-dsn do.
+	owner := indextest.DSN(t)
+	role, reader := indextest.ReaderRole(t, owner)
 	dsn := filepath.Join(root, "secrets", "index-dsn")
-	writeFixture(t, dsn, indextest.DSN(t)+"\n")
+	writeFixture(t, dsn, owner+"\n")
+	readerDSN := filepath.Join(root, "secrets", "index-reader-dsn")
+	writeFixture(t, readerDSN, reader+"\n")
 	config := filepath.Join(root, "conf", "declindex.yaml")
-	writeFixture(t, config, "tree: "+tree+"\nlib: .\nindex: landing\nstate: "+state+"\nroots: [Golden, Sub]\nfile_kinds: [Spec, Link, Proof]\n"+
+	writeFixture(t, config, "tree: "+tree+"\nlib: .\nindex: landing\nstate: "+state+"\nreader: "+role+"\nroots: [Golden, Sub]\nfile_kinds: [Spec, Link, Proof]\n"+
 		"remote: "+remote+"\nbuild: [\"true\"]\nbuild_timeout: 30s\n"+
 		"repo: r\nowners: owners.json\nowners_format: cgraph/owners/v1\ncontracts:\n  paths: [\"Sub/**\"]\n  kinds: [def]\n  name: \"^[A-Z]\"\n")
 	if output, err := exec.Command(bin, "--config", config, "--index-dsn-file", dsn, "refresh").CombinedOutput(); err != nil {
 		t.Fatalf("initial refresh: %v: %s", err, output)
 	}
-	return indexFixture{seed: seed, remote: remote, tree: tree, state: state, dsn: dsn, config: config, bin: bin, first: first, second: second}
+	return indexFixture{seed: seed, remote: remote, tree: tree, state: state, dsn: dsn, readerDSN: readerDSN, config: config, bin: bin, first: first, second: second}
 }
 
 // indexHooks is a landed batch of f.second whose refresh and ledger hooks run in real containers, with this
-// repository's modes: the refresh gets the state directory and the index tree read-write and the remote read-only,
-// the ledger hook gets them read-only. Both read the connection string's file, read-only, and reach the database on
-// the host network, as the index-dsn file mount and network "host" give them in the landing configuration.
-// withRemote false leaves the remote out of the refresh's mounts.
+// repository's modes: the refresh gets the state directory and the index tree read-write, the remote read-only and
+// the owner login's connection string; the ledger hook gets the state directory and the tree read-only and the reader
+// login's connection string, so it cannot write the index. Each reads its connection string's file, read-only, and
+// reaches the database on the host network, as the index-dsn and index-reader-dsn file mounts and network "host" give
+// them in the landing configuration. withRemote false leaves the remote out of the refresh's mounts.
 func indexHooks(t *testing.T, f indexFixture, withRemote bool) (Runner, *effectLogFake, Batch) {
 	t.Helper()
 	user := testdocker.Require(t)
@@ -130,23 +137,25 @@ func indexHooks(t *testing.T, f indexFixture, withRemote bool) (Runner, *effectL
 		t.Fatal(err)
 	}
 	declared := map[string]Mount{
-		"tools":        {Name: "tools", HostPath: filepath.Dir(f.bin)},
-		"conf":         {Name: "conf", HostPath: filepath.Dir(f.config)},
-		"index-dsn":    {Name: "index-dsn", HostPath: f.dsn},
-		"state":        {Name: "state", HostPath: f.state},
-		"index-tree":   {Name: "index-tree", HostPath: f.tree},
-		"index-remote": {Name: "index-remote", HostPath: f.remote},
+		"tools":            {Name: "tools", HostPath: filepath.Dir(f.bin)},
+		"conf":             {Name: "conf", HostPath: filepath.Dir(f.config)},
+		"index-dsn":        {Name: "index-dsn", HostPath: f.dsn},
+		"index-reader-dsn": {Name: "index-reader-dsn", HostPath: f.readerDSN},
+		"state":            {Name: "state", HostPath: f.state},
+		"index-tree":       {Name: "index-tree", HostPath: f.tree},
+		"index-remote":     {Name: "index-remote", HostPath: f.remote},
 	}
 	refreshMounts := map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index-dsn": ReadOnly, "state": ReadWrite, "index-tree": ReadWrite}
 	if withRemote {
 		refreshMounts["index-remote"] = ReadOnly
 	}
-	declindex := []string{f.bin, "--config", f.config, "--index-dsn-file", f.dsn}
 	hooks := []HookConfig{
-		{Name: "refresh", Command: append(slices.Clone(declindex), "refresh"), Apply: ApplyNone, Mounts: refreshMounts, Network: NetworkHost},
-		{Name: "ledger", Command: append(slices.Clone(declindex), "ledger", "--contracts-file", inputsPath+"/"+ContractsInput, "--emit", scratchPath+"/ops.jsonl"),
+		{Name: "refresh", Command: []string{f.bin, "--config", f.config, "--index-dsn-file", f.dsn, "refresh"},
+			Apply: ApplyNone, Mounts: refreshMounts, Network: NetworkHost},
+		{Name: "ledger", Command: []string{f.bin, "--config", f.config, "--index-dsn-file", f.readerDSN,
+			"ledger", "--contracts-file", inputsPath + "/" + ContractsInput, "--emit", scratchPath + "/ops.jsonl"},
 			Apply: ApplyContracts, Outputs: []string{"ops.jsonl"}, Network: NetworkHost,
-			Mounts: map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index-dsn": ReadOnly, "state": ReadOnly, "index-tree": ReadOnly}},
+			Mounts: map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index-reader-dsn": ReadOnly, "state": ReadOnly, "index-tree": ReadOnly}},
 	}
 	runner := Runner{
 		PostLanding:   PostLanding{Parts: []string{"slice"}, Hooks: hooks, TimeoutSeconds: 300, MaxOutputBytes: 1 << 20},
@@ -174,7 +183,8 @@ func indexHooks(t *testing.T, f indexFixture, withRemote bool) (Runner, *effectL
 
 // The index moves, then the ledger hook applies. The refresh fetches the landed commit from the read-only remote,
 // checks it out in the read-write index tree and moves the index to it, writing only as the configured user; then
-// the ledger hook, with the tree and the index read-only, decides, and its operations apply once.
+// the ledger hook, with the tree read-only and the index through its reader login, decides, and its operations apply
+// once.
 func TestTheIndexMovesThenTheLedgerHookApplies(t *testing.T) {
 	f := newIndexFixture(t)
 	runner, effects, batch := indexHooks(t, f, true)
