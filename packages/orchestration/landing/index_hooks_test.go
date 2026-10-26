@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sjawhar/legion/orchestration/internal/indextest"
 	"github.com/sjawhar/legion/orchestration/internal/testdocker"
 )
 
@@ -47,11 +48,12 @@ func buildDeclindex(t *testing.T) string {
 }
 
 // indexFixture is the post-landing index of one repository: a seed repository with two commits, a bare remote that
-// holds both, an index tree cloned at the first, an index refreshed at the first, and a declindex configuration
-// with absolute paths, as the landing configuration passes it.
+// holds both, an index tree cloned at the first, an index (a schema of a test database whose connection string is
+// in the file dsn) refreshed at the first, a state directory, and a declindex configuration with absolute paths, as
+// the landing configuration passes it.
 type indexFixture struct {
-	seed, remote, tree, index, config, bin string
-	first, second                          string
+	seed, remote, tree, state, dsn, config, bin string
+	first, second                               string
 }
 
 func newIndexFixture(t *testing.T) indexFixture {
@@ -92,23 +94,27 @@ func newIndexFixture(t *testing.T) indexFixture {
 	gitIn(t, seed, "commit", "-qm", "second")
 	second := gitIn(t, seed, "rev-parse", "HEAD")
 	gitIn(t, seed, "push", "-q", remote, "HEAD:refs/heads/master")
-	index := filepath.Join(root, "index")
-	if err := os.MkdirAll(index, 0o755); err != nil {
+	state := filepath.Join(root, "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	dsn := filepath.Join(root, "secrets", "index-dsn")
+	writeFixture(t, dsn, indextest.DSN(t)+"\n")
 	config := filepath.Join(root, "conf", "declindex.yaml")
-	writeFixture(t, config, "tree: "+tree+"\nlib: .\ndb: "+filepath.Join(index, "index.sqlite")+"\nroots: [Golden, Sub]\nfile_kinds: [Spec, Link, Proof]\n"+
+	writeFixture(t, config, "tree: "+tree+"\nlib: .\nindex: landing\nstate: "+state+"\nroots: [Golden, Sub]\nfile_kinds: [Spec, Link, Proof]\n"+
 		"remote: "+remote+"\nbuild: [\"true\"]\nbuild_timeout: 30s\n"+
 		"repo: r\nowners: owners.json\nowners_format: cgraph/owners/v1\ncontracts:\n  paths: [\"Sub/**\"]\n  kinds: [def]\n  name: \"^[A-Z]\"\n")
-	if output, err := exec.Command(bin, "--config", config, "refresh").CombinedOutput(); err != nil {
+	if output, err := exec.Command(bin, "--config", config, "--index-dsn-file", dsn, "refresh").CombinedOutput(); err != nil {
 		t.Fatalf("initial refresh: %v: %s", err, output)
 	}
-	return indexFixture{seed: seed, remote: remote, tree: tree, index: index, config: config, bin: bin, first: first, second: second}
+	return indexFixture{seed: seed, remote: remote, tree: tree, state: state, dsn: dsn, config: config, bin: bin, first: first, second: second}
 }
 
 // indexHooks is a landed batch of f.second whose refresh and ledger hooks run in real containers, with this
-// repository's modes: the refresh gets the index and its tree read-write and the remote read-only, the ledger
-// hook gets the index and the tree read-only. withRemote false leaves the remote out of the refresh's mounts.
+// repository's modes: the refresh gets the state directory and the index tree read-write and the remote read-only,
+// the ledger hook gets them read-only. Both read the connection string's file, read-only, and reach the database on
+// the host network, as the index-dsn file mount and network "host" give them in the landing configuration.
+// withRemote false leaves the remote out of the refresh's mounts.
 func indexHooks(t *testing.T, f indexFixture, withRemote bool) (Runner, *effectLogFake, Batch) {
 	t.Helper()
 	user := testdocker.Require(t)
@@ -126,19 +132,21 @@ func indexHooks(t *testing.T, f indexFixture, withRemote bool) (Runner, *effectL
 	declared := map[string]Mount{
 		"tools":        {Name: "tools", HostPath: filepath.Dir(f.bin)},
 		"conf":         {Name: "conf", HostPath: filepath.Dir(f.config)},
-		"index":        {Name: "index", HostPath: f.index},
+		"index-dsn":    {Name: "index-dsn", HostPath: f.dsn},
+		"state":        {Name: "state", HostPath: f.state},
 		"index-tree":   {Name: "index-tree", HostPath: f.tree},
 		"index-remote": {Name: "index-remote", HostPath: f.remote},
 	}
-	refreshMounts := map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index": ReadWrite, "index-tree": ReadWrite}
+	refreshMounts := map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index-dsn": ReadOnly, "state": ReadWrite, "index-tree": ReadWrite}
 	if withRemote {
 		refreshMounts["index-remote"] = ReadOnly
 	}
+	declindex := []string{f.bin, "--config", f.config, "--index-dsn-file", f.dsn}
 	hooks := []HookConfig{
-		{Name: "refresh", Command: []string{f.bin, "--config", f.config, "refresh"}, Apply: ApplyNone, Mounts: refreshMounts},
-		{Name: "ledger", Command: []string{f.bin, "--config", f.config, "ledger", "--contracts-file", inputsPath + "/" + ContractsInput, "--emit", scratchPath + "/ops.jsonl"},
-			Apply: ApplyContracts, Outputs: []string{"ops.jsonl"},
-			Mounts: map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index": ReadOnly, "index-tree": ReadOnly}},
+		{Name: "refresh", Command: append(slices.Clone(declindex), "refresh"), Apply: ApplyNone, Mounts: refreshMounts, Network: NetworkHost},
+		{Name: "ledger", Command: append(slices.Clone(declindex), "ledger", "--contracts-file", inputsPath+"/"+ContractsInput, "--emit", scratchPath+"/ops.jsonl"),
+			Apply: ApplyContracts, Outputs: []string{"ops.jsonl"}, Network: NetworkHost,
+			Mounts: map[string]MountMode{"tools": ReadOnly, "conf": ReadOnly, "index-dsn": ReadOnly, "state": ReadOnly, "index-tree": ReadOnly}},
 	}
 	runner := Runner{
 		PostLanding:   PostLanding{Parts: []string{"slice"}, Hooks: hooks, TimeoutSeconds: 300, MaxOutputBytes: 1 << 20},
@@ -176,11 +184,11 @@ func TestTheIndexMovesThenTheLedgerHookApplies(t *testing.T) {
 	if head := gitIn(t, f.tree, "rev-parse", "HEAD"); head != f.second {
 		t.Fatalf("the index tree is at %s, want the landed commit %s", head, f.second)
 	}
-	status, err := exec.Command(f.bin, "--config", f.config, "--json", "status").CombinedOutput()
+	status, err := exec.Command(f.bin, "--config", f.config, "--index-dsn-file", f.dsn, "--json", "status").CombinedOutput()
 	if err != nil || !strings.Contains(string(status), f.second) {
 		t.Fatalf("declindex status: %v: %s; want the landed commit", err, status)
 	}
-	if err := filepath.WalkDir(f.index, func(path string, entry fs.DirEntry, err error) error {
+	if err := filepath.WalkDir(f.state, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
