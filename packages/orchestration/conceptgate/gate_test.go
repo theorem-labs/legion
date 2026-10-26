@@ -2,6 +2,7 @@ package conceptgate
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -389,6 +390,37 @@ func TestGateRefusesAProposalThatRunsCode(t *testing.T) {
 		v, err := g.Decide(context.Background(), proposal("evil", "Evil", "def Evil : Nat := 1\n"+body), DecideOptions{Proposer: "role"})
 		if err == nil {
 			t.Fatalf("%q decided %+v", body, v)
+		}
+		if _, err := os.Stat(target); err == nil {
+			t.Fatalf("%q wrote a file", body)
+		}
+	}
+	if len(lib.got) != 0 {
+		t.Fatal("the librarian got a refused proposal")
+	}
+}
+
+// A `#` command is a command that Lean's parser allow-list refuses (declindex.CheckSource, lean/DeclExport/Check.lean)
+// before anything compiles, wherever it stands: first on its line, indented, after a bracket or a proof, or after
+// a term on the same line. The text filter leaves `#` to Lean's parser, since no text pass tells a command from an
+// Iris proof-mode pattern (`#Hinv`) that goes on to a line of its own. The refusal is the parser's, the proposal
+// runs nothing, and the librarian gets nothing.
+func TestGateRefusesAHashCommandWithLeansParser(t *testing.T) {
+	g, lib := gateForTest(t)
+	target := filepath.Join(t.TempDir(), "written")
+	write := "IO.FS.writeFile \"" + target + "\" \"x\""
+	for _, body := range []string{
+		"#eval " + write,
+		"  #eval " + write,
+		"theorem t : True := by\n  trivial\n#eval " + write,
+		"def p : Nat × Nat := (1,\n  2)\n  #eval " + write,
+		"def two : Nat := 2 #eval " + write,
+		"#eval[" + write + "]",
+		"#print Nat",
+	} {
+		v, err := g.Decide(context.Background(), proposal("hash", "Hash", "def Hash : Nat := 1\n"+body), DecideOptions{Proposer: "role"})
+		if !errors.Is(err, declindex.ErrRefusedSource) || v.Outcome != "" {
+			t.Errorf("%q: %+v, %v; want Lean's parser allow-list to refuse it", body, v, err)
 		}
 		if _, err := os.Stat(target); err == nil {
 			t.Fatalf("%q wrote a file", body)

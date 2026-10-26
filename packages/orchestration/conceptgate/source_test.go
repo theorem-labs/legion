@@ -17,17 +17,15 @@ func TestCheckProposalSource(t *testing.T) {
 		"theorem t : True := by\n  iIntro \"#H\"\n  trivial\n",
 		// A literal whose syntax starts with `#` (a vector's `#v[…]`), first on a line where its term goes on.
 		"def v : Vector Nat 2 :=\n  #v[1, 2]\n",
+		// A bracketless pattern that goes on to a line that starts with `#`: no text pass tells it from a command, so
+		// `#` commands are Lean's parser allow-list's to refuse (TestGateRefusesAHashCommandWithLeansParser).
+		"theorem t : True := by\n  iintro #Hres Hk Hpc\n    #Hcp Hb #Hix\n  trivial\n",
 	} {
 		if err := checkProposalSource(ok); err != nil {
 			t.Errorf("refused %q: %v", ok, err)
 		}
 	}
 	for _, bad := range []string{
-		"#eval IO.println \"x\"\n",
-		"def a := 1\n  #print a\n",
-		// A command after a proof that uses Iris patterns, and one after a closed bracket.
-		"theorem t : True := by\n  iintro #H\n  trivial\n#eval IO.println \"x\"\n",
-		"def p := (1,\n  2)\n  #print p\n",
 		"run_cmd pure ()\n",
 		"run_meta pure ()\n",
 		"run_elab pure ()\n",

@@ -308,11 +308,12 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	if len(same) > 0 {
 		// The copies are the indexed declarations of this statement. --accepted-by gives the librarian's ruling that
 		// the proposal stands beside them (its own concept with an equal body, or the canonical name of copies that
-		// no concept registers), never beside a registered concept.
+		// no concept registers), never beside a registered concept: a copy that has a registered concept's name, in
+		// any module, may be that concept's, so the gate refuses it whatever the flags.
 		v.Duplicates = duplicateNames(same)
 		for _, name := range v.Duplicates {
 			if c, ok := reg.Find(name); ok {
-				return decided(Refused, c.Name, c.Home, "the compiled statement equals the declaration of the registered concept "+c.Name+", and --accepted-by admits no copy of a registered concept")
+				return decided(Refused, c.Name, c.Home, "the compiled statement equals a declaration named "+c.Name+", a registered concept's name, and --accepted-by admits no copy of a registered concept")
 			}
 		}
 		if options.AcceptedBy == "" {
