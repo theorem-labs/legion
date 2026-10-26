@@ -164,8 +164,9 @@ func cmdSame(ctx context.Context, e *env, args []string) int {
 	return rc
 }
 
-// cmdGate decides one proposal. Exit codes: 0 added, 1 refused (an exact duplicate), 4 near (sent to the
-// librarian), 5 the name is taken, 3 unable to decide.
+// cmdGate decides one proposal. Exit codes: 0 added (with --accepted-by, also an exact duplicate of declarations
+// that no concept registers), 1 refused (an exact duplicate), 4 near (sent to the librarian), 5 the name is taken,
+// 3 unable to decide.
 func cmdGate(ctx context.Context, e *env, args []string) int {
 	var proposer, acceptedBy string
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {

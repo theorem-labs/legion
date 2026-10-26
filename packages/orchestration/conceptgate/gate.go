@@ -31,7 +31,8 @@ type Proposal struct {
 type Outcome string
 
 const (
-	// Refused: an exact duplicate of a registered concept or an existing declaration; Existing names it.
+	// Refused: an exact duplicate of a registered concept or an existing declaration; Existing names it. With
+	// --accepted-by (DecideOptions.AcceptedBy), an exact duplicate of declarations that no concept registers is added.
 	Refused Outcome = "refused"
 	// Near: the proposal restates a registered concept's fact; the librarian decides.
 	Near Outcome = "near"
@@ -68,10 +69,13 @@ type Verdict struct {
 	CompiledHash string    `json:"compiled_hash,omitempty"`
 	VerdictID    string    `json:"verdict_id"`
 	Addition     *Addition `json:"addition,omitempty"`
+	// Duplicates are the names of the indexed declarations whose compiled statement equals the proposal's, sorted:
+	// every copy that a refusal names, or that an addition admitted by --accepted-by records.
+	Duplicates []string `json:"duplicates,omitempty"`
 	// Defects are the registry's defects at this decision: every defect that Load reports (a concept file that it
 	// refused and left out, a duplicate name or compiled hash, a wrongly keyed file, an extends of a concept that is
-	// not registered), and each pending concept whose stored source no longer compiles, which the decision leaves
-	// out of the forms.
+	// not registered, an accepted duplicate that is a registered concept), and each pending concept whose stored
+	// source no longer compiles, which the decision leaves out of the forms.
 	Defects []Defect `json:"defects,omitempty"`
 	// WithoutForms counts the modules that the index's compiled part read without the registry's forms
 	// (declindex.FormsClash), an index defect: no fact of a written form is known in them, so `states` and the
@@ -302,7 +306,32 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 		return v, err
 	}
 	if len(same) > 0 {
-		return decided(Refused, same[0].Name, same[0].At(), "the compiled statement equals an existing declaration's")
+		// The copies are the indexed declarations of this statement. --accepted-by gives the librarian's ruling that
+		// the proposal stands beside them (its own concept with an equal body, or the canonical name of copies that
+		// no concept registers), never beside a registered concept.
+		v.Duplicates = duplicateNames(same)
+		for _, name := range v.Duplicates {
+			if c, ok := reg.Find(name); ok {
+				return decided(Refused, c.Name, c.Home, "the compiled statement equals the declaration of the registered concept "+c.Name+", and --accepted-by admits no copy of a registered concept")
+			}
+		}
+		if options.AcceptedBy == "" {
+			return decided(Refused, same[0].Name, same[0].At(), "the compiled statement equals an existing declaration's")
+		}
+		// A refused concept file that holds a copy's name may be that copy's concept, which the gate cannot read.
+		for _, refused := range reg.Refused {
+			name := refused.Name
+			if !slices.Contains(v.Duplicates, name) {
+				name = refused.Key()
+			}
+			if slices.Contains(v.Duplicates, name) {
+				at, err := g.additionPath(refused.Key())
+				if err != nil {
+					return v, err
+				}
+				return v, fmt.Errorf("the concept file %s holds the name of %s, an exact duplicate of the proposal, but the loader refused it (%s): repair or remove that file, then propose again", at, name, refused.Defect.Message)
+			}
+		}
 	}
 	// A refused concept file that holds this statement, as its key or as the compiled hash it records, is a concept
 	// that the gate cannot read: an addition would replace that file or restate it.
@@ -345,20 +374,24 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 	c.CompiledHash = decl.Hash
 	c.Declarations = landedNames(own, home)
 	c.Source = p.Source
-	// accepted_by and accepted_near record the librarian's decision: never the proposal's own.
-	c.AcceptedBy, c.AcceptedNear = options.AcceptedBy, nil
+	// accepted_by, accepted_near and accepted_duplicates record the librarian's decision: never the proposal's own.
+	c.AcceptedBy, c.AcceptedNear, c.AcceptedDuplicates = options.AcceptedBy, nil, nil
 	if options.AcceptedBy != "" {
 		seen := map[string]bool{}
 		for _, m := range v.Matches {
 			seen[m.Concept] = true
 		}
 		c.AcceptedNear = slices.Sorted(maps.Keys(seen))
+		c.AcceptedDuplicates = v.Duplicates
 	}
 	content, err := Render(c)
 	if err != nil {
 		return v, err
 	}
 	v.Outcome, v.Reason = Added, "no registered concept or existing declaration states it"
+	if len(c.AcceptedDuplicates) > 0 {
+		v.Reason = "an exact duplicate of unregistered declarations " + strings.Join(c.AcceptedDuplicates, ", ") + ", admitted by " + options.AcceptedBy
+	}
 	addition, err := g.additionPath(Key(c))
 	if err != nil {
 		return v, err
@@ -378,6 +411,17 @@ func ownConstants(consts []declindex.Constant, name string) (map[string]bool, *d
 		}
 	}
 	return own, decl
+}
+
+// duplicateNames are the names of the declarations same, sorted, each once: a name that two modules declare is one
+// copy's name.
+func duplicateNames(same []declindex.Found) []string {
+	names := make([]string, 0, len(same))
+	for _, f := range same {
+		names = append(names, f.Name)
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
 }
 
 // statesOwnFact says whether a fact that a proposal's constant states, as how, is the proposal's own statement:

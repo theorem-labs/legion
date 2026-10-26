@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -456,6 +457,164 @@ func TestGateDropsAProposalsOwnAcceptedNear(t *testing.T) {
 	}
 	if strings.Contains(v.Addition.Content, "accepted_near") {
 		t.Fatalf("the addition keeps the proposal's accepted_near:\n%s", v.Addition.Content)
+	}
+}
+
+// decideAccepted is a decision on p with the librarian's acceptance given as acceptedBy ("" for none).
+func decideAccepted(t *testing.T, g *Gate, p Proposal, acceptedBy string) (Verdict, error) {
+	t.Helper()
+	return g.Decide(context.Background(), p, DecideOptions{Proposer: "role", AcceptedBy: acceptedBy})
+}
+
+// landAddition writes v's addition file into the gate's registry and commits it, as an owner lands it.
+func landAddition(t *testing.T, g *Gate, v Verdict) {
+	t.Helper()
+	file := filepath.Join(g.Tree.Source, filepath.FromSlash(v.Addition.Path))
+	if err := os.WriteFile(file, []byte(v.Addition.Content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, g.Tree.Source, "add", "registry")
+	runGit(t, g.Tree.Source, "commit", "-qm", "land "+v.Name)
+}
+
+// An exact duplicate of a declaration that no concept registers is refused, and the verdict lists every copy. When
+// the librarian ruled the new name its own concept or the canonical one, --accepted-by admits it: the addition
+// records the ruling and the copies, and is keyed and stored like any other. Once it lands, a further copy is a copy
+// of the new concept, which --accepted-by does not admit.
+func TestGateAdmitsADuplicateOfUnregisteredDeclarationsOnlyWithAcceptedBy(t *testing.T) {
+	g, _ := gateForTest(t)
+	wrap := proposal("d1", "MyWrap", "def MyWrap (y : BitVec 64) : Prop := Fx.Frame y 16")
+	refused, err := decideAccepted(t, g, wrap, "")
+	if err != nil || refused.Outcome != Refused || refused.Existing != "Fx.Wrap" || !slices.Equal(refused.Duplicates, []string{"Fx.Wrap"}) || refused.Addition != nil {
+		t.Fatalf("no --accepted-by: %+v, %v; want refused naming Fx.Wrap with duplicates [Fx.Wrap]", refused, err)
+	}
+	added, err := decideAccepted(t, g, wrap, "librarian")
+	if err != nil || added.Outcome != Added || added.Addition == nil || !slices.Equal(added.Duplicates, []string{"Fx.Wrap"}) {
+		t.Fatalf("--accepted-by librarian: %+v, %v; want added with duplicates [Fx.Wrap]", added, err)
+	}
+	if !strings.Contains(added.Reason, "Fx.Wrap") || !strings.Contains(added.Reason, "librarian") {
+		t.Errorf("reason %q names neither the copy nor the acceptance", added.Reason)
+	}
+	if want := "registry/concepts/" + added.CompiledHash + ".yaml"; added.CompiledHash == "" || added.Addition.Path != want {
+		t.Errorf("addition path %q, want %q", added.Addition.Path, want)
+	}
+	c, err := decodeConcept([]byte(added.Addition.Content))
+	if err != nil {
+		t.Fatalf("the addition does not load: %v\n%s", err, added.Addition.Content)
+	}
+	if c.AcceptedBy != "librarian" || !slices.Equal(c.AcceptedDuplicates, []string{"Fx.Wrap"}) || c.CompiledHash != added.CompiledHash || c.Source != wrap.Source {
+		t.Errorf("addition %+v: want accepted_by librarian, accepted_duplicates [Fx.Wrap], the compiled hash and the source", c)
+	}
+	if !strings.Contains(added.Addition.Content, "accepted_duplicates:\n    - Fx.Wrap\n") {
+		t.Errorf("addition content:\n%s", added.Addition.Content)
+	}
+	landAddition(t, g, added)
+	if _, defects, err := Load(g.Registry); err != nil || len(defects) != 0 {
+		t.Fatalf("the landed addition: %v, defects %v", err, defects)
+	}
+	third, err := decideAccepted(t, g, proposal("d3", "ThirdWrap", "def ThirdWrap (z : BitVec 64) : Prop := Fx.Frame z 16"), "librarian")
+	if err != nil || third.Outcome != Refused || third.Existing != "MyWrap" || third.Addition != nil {
+		t.Fatalf("a copy after the landing: %+v, %v; want refused naming MyWrap", third, err)
+	}
+}
+
+// --accepted-by admits no copy of a registered concept: one declared in its home file (refused by its compiled
+// statement), a pending addition (by its stored source), or one whose declaration the index holds outside its home
+// file, which only the exact-duplicate check finds.
+func TestGateNeverAdmitsADuplicateOfARegisteredConcept(t *testing.T) {
+	g, _ := gateForTest(t)
+	if v, err := decideAccepted(t, g, proposal("r1", "MySp", "def MySp (Q : BitVec 5 → BitVec 64) : Prop := Q 2#5 &&& 7#64 = 0#64"), "librarian"); err != nil || v.Outcome != Refused || v.Existing != "Fx.SpAligned" || v.Addition != nil {
+		t.Errorf("a copy of the registered Fx.SpAligned: %+v, %v; want refused naming Fx.SpAligned", v, err)
+	}
+	fresh, err := decideAccepted(t, g, proposal("p7", "Fresh", "def Fresh (x : Nat) : Prop := x < 3 ∧ x ≠ 1"), "")
+	if err != nil || fresh.Outcome != Added {
+		t.Fatalf("control: %+v, %v", fresh, err)
+	}
+	landAddition(t, g, fresh)
+	if v, err := decideAccepted(t, g, proposal("p9", "FreshCopy", "def FreshCopy (y : Nat) : Prop := y < 3 ∧ y ≠ 1"), "librarian"); err != nil || v.Outcome != Refused || v.Existing != "Fresh" || v.Addition != nil {
+		t.Errorf("a copy of the pending Fresh: %+v, %v; want refused naming Fresh", v, err)
+	}
+	indexModule(t, g, "Held", "def Held.Word (x : Nat) : Prop := x < 7 ∧ x ≠ 4\n")
+	if err := os.WriteFile(filepath.Join(g.Registry, "concepts", "Held.Word.yaml"), []byte("name: Held.Word\nhome: Elsewhere.lean\nmeaning: A concept declared outside its home file.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := decideAccepted(t, g, proposal("r6", "MyHeldWord", "def MyHeldWord (y : Nat) : Prop := y < 7 ∧ y ≠ 4"), "librarian"); err != nil || v.Outcome != Refused || v.Existing != "Held.Word" || v.Addition != nil || !strings.Contains(v.Reason, "registered") {
+		t.Errorf("a copy of the registered Held.Word, declared outside its home: %+v, %v; want refused naming Held.Word", v, err)
+	}
+}
+
+// A concept file that the loader refused may be the concept of a copy: the gate cannot tell whether --accepted-by
+// may admit it until the file is repaired, so with the flag it is unable to decide and names the file. Without the
+// flag the copy is refused, whatever the file says.
+func TestGateIsUnableWhenARefusedConceptFileHoldsADuplicatesName(t *testing.T) {
+	g, lib := gateForTest(t)
+	indexModule(t, g, "Kept", "def Kept.Word (x : Nat) : Prop := x < 9 ∧ x ≠ 5\n")
+	copied := proposal("r7", "MyKeptWord", "def MyKeptWord (y : Nat) : Prop := y < 9 ∧ y ≠ 5")
+	for _, c := range []struct{ file, body string }{
+		{"Kept.Word.yaml", "name: [broken\n"},
+		{"Elsewhere.yaml", "name: Kept.Word\nhome: Kept.lean\nmeaning: A concept. It has two sentences.\n"},
+	} {
+		path := filepath.Join(g.Registry, "concepts", c.file)
+		if err := os.WriteFile(path, []byte(c.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		at := "registry/concepts/" + c.file
+		if v, err := decideAccepted(t, g, copied, "librarian"); err == nil || !strings.Contains(err.Error(), at) || v.Addition != nil {
+			t.Errorf("%s with --accepted-by: %+v, %v; want unable, naming %s", c.file, v, err, at)
+		}
+		if v, err := decideAccepted(t, g, copied, ""); err != nil || v.Outcome != Refused || v.Existing != "Kept.Word" {
+			t.Errorf("%s without --accepted-by: %+v, %v; want refused naming Kept.Word", c.file, v, err)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(lib.got) != 0 {
+		t.Fatalf("the librarian got %+v", lib.got)
+	}
+}
+
+// One --accepted-by admits every copy, sorted, and the near matches of the same proposal together: the ruling
+// covers both. Without it the copy is refused before any near match goes to the librarian.
+func TestGateAcceptsCopiesAndNearMatchesWithOneAcceptedBy(t *testing.T) {
+	g, lib := gateForTest(t)
+	indexModule(t, g, "Copies", "namespace Dup\ndef b (x : Nat) : Prop := x < 11 ∧ x ≠ 6\ndef a (y : Nat) : Prop := y < 11 ∧ y ≠ 6\nend Dup\n")
+	both, err := decideAccepted(t, g, proposal("r5", "MyCopy", "def MyCopy (z : Nat) : Prop := z < 11 ∧ z ≠ 6"), "librarian")
+	if err != nil || both.Outcome != Added || both.Addition == nil || !slices.Equal(both.Duplicates, []string{"Dup.a", "Dup.b"}) ||
+		!strings.Contains(both.Addition.Content, "accepted_duplicates:\n    - Dup.a\n    - Dup.b\n") {
+		t.Fatalf("two indexed copies: %+v, %v; want added with duplicates [Dup.a Dup.b]", both, err)
+	}
+	nearCopy := proposal("r8", "MyNearSp", "def MyNearSp (Q : BitVec 5 → BitVec 64) (m : Nat) : Prop := m > 0 ∧ Q 2#5 &&& 7#64 = 0#64")
+	if v, err := decideAccepted(t, g, nearCopy, ""); err != nil || v.Outcome != Refused || v.Existing != "Fx.NearSp" || len(lib.got) != 0 {
+		t.Fatalf("a copy of Fx.NearSp that restates Fx.SpAligned, no --accepted-by: %+v, %v, librarian %+v; want refused naming Fx.NearSp", v, err, lib.got)
+	}
+	v, err := decideAccepted(t, g, nearCopy, "librarian")
+	if err != nil || v.Outcome != Added || v.Addition == nil || len(v.Matches) == 0 {
+		t.Fatalf("with --accepted-by: %+v, %v; want added, with its near matches", v, err)
+	}
+	c, err := decodeConcept([]byte(v.Addition.Content))
+	if err != nil || !slices.Equal(c.AcceptedNear, []string{"Fx.SpAligned"}) || !slices.Equal(c.AcceptedDuplicates, []string{"Fx.NearSp"}) {
+		t.Fatalf("addition %+v, %v; want accepted_near [Fx.SpAligned] and accepted_duplicates [Fx.NearSp]", c, err)
+	}
+	if len(lib.got) != 0 {
+		t.Fatalf("the librarian got %+v", lib.got)
+	}
+}
+
+// accepted_duplicates records a librarian's decision, as accepted_near does: the addition never keeps the
+// proposal's own, with or without --accepted-by.
+func TestGateDropsAProposalsOwnAcceptedDuplicates(t *testing.T) {
+	g, _ := gateForTest(t)
+	p := proposal("p9d", "Fresh9", "def Fresh9 (x : Nat) : Prop := x < 13 ∧ x ≠ 2")
+	p.Concept.AcceptedDuplicates = []string{"Fx.Wrap"}
+	for _, acceptedBy := range []string{"", "librarian"} {
+		v, err := decideAccepted(t, g, p, acceptedBy)
+		if err != nil || v.Outcome != Added || v.Addition == nil {
+			t.Fatalf("accepted by %q: %+v, %v", acceptedBy, v, err)
+		}
+		if strings.Contains(v.Addition.Content, "accepted_duplicates") || len(v.Duplicates) != 0 {
+			t.Fatalf("accepted by %q: the addition keeps the proposal's accepted_duplicates:\n%s", acceptedBy, v.Addition.Content)
+		}
 	}
 }
 

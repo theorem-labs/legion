@@ -54,7 +54,9 @@ Commands:
   gate --proposer OWNER [--accepted-by OWNER] PROPOSAL.json
                                the similarity gate: refuse an exact duplicate, send a near match to the librarian,
                                refuse a taken name, or print an addition; the proposal is JSON
-                               {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>}
+                               {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>};
+                               --accepted-by gives the librarian's ruling, which admits the near matches and the
+                               exact duplicates of declarations that no concept registers
   ledger [--dsn-file PATH | --contracts-file FILE --emit FILE]
                                check the ledger and newly landed registry concepts; file mode emits registrations
                                and near pairs for the landing program and never connects to the ledger
@@ -71,7 +73,8 @@ Exit codes:
   hash: 0 answered; 1 name not found; 2 usage; 3 unable; 75 retry
   states: 0 answered; 1 name not found; 2 usage; 3 unable; 75 retry
   same: 0 answered; 1 name not found; 2 usage; 3 unable; 75 retry
-  gate: 0 added; 1 duplicate; 2 usage; 3 unable; 4 near; 5 name taken; 75 retry
+  gate: 0 added; 1 duplicate (without --accepted-by, or of a registered concept); 2 usage; 3 unable; 4 near;
+        5 name taken; 75 retry
   ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry (also when the registry recheck of a landing cannot run)
   land-hash: 0 answered; 2 usage; 3 unable; 75 retry
 75 is a failed connection to the index's database: the command can be run again.`

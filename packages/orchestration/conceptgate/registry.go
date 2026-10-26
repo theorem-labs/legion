@@ -32,6 +32,10 @@ type Concept struct {
 	CompiledHash string   `yaml:"compiled_hash,omitempty" json:"compiled_hash,omitempty"`
 	AcceptedBy   string   `yaml:"accepted_by,omitempty" json:"accepted_by,omitempty"`
 	AcceptedNear []string `yaml:"accepted_near,omitempty" json:"accepted_near,omitempty"`
+	// AcceptedDuplicates are the indexed declarations, none a registered concept, whose compiled statement equals
+	// this concept's: the copies that the librarian's ruling (AcceptedBy) admitted it beside, as the gate recorded
+	// them, sorted.
+	AcceptedDuplicates []string `yaml:"accepted_duplicates,omitempty" json:"accepted_duplicates,omitempty"`
 	// Declarations are the constants that Source declares, as the gate compiled it: the concept's own, and its
 	// proposal's helpers and their parts, each named as it is once it lands in the module of the home file, where
 	// the post-landing recheck reads them.
@@ -86,7 +90,7 @@ var (
 
 func (c Concept) check() error {
 	switch {
-	case strings.TrimSpace(c.Name) == "" || strings.ContainsAny(c.Name, " \t\n"):
+	case !oneName(c.Name):
 		return fmt.Errorf("concept %q: the name is one Lean declaration name", c.Name)
 	case strings.TrimSpace(c.Home) == "":
 		return fmt.Errorf("concept %s has no home file", c.Name)
@@ -98,6 +102,35 @@ func (c Concept) check() error {
 		return fmt.Errorf("concept %s: its meaning is one sentence", c.Name)
 	case c.CompiledHash != "" && !compiledHash.MatchString(c.CompiledHash):
 		return fmt.Errorf("concept %s: compiled hash is not 32 lowercase hexadecimal characters", c.Name)
+	}
+	return nil
+}
+
+// oneName says whether name is one Lean declaration name: not blank, and with no space, tab or newline.
+func oneName(name string) bool {
+	return strings.TrimSpace(name) != "" && !strings.ContainsAny(name, " \t\n")
+}
+
+// checkAcceptedDuplicates refuses an accepted_duplicates list that is not the gate's record of an exact duplicate
+// that --accepted-by admitted: sorted, unique Lean names other than the concept's own, in a file that holds the
+// acceptance, the compiled hash and the source that the gate wrote. A proposal's own list is no file: the gate
+// replaces it (Gate.Decide), so check, which a proposal passes too, does not hold this.
+func (c Concept) checkAcceptedDuplicates() error {
+	if len(c.AcceptedDuplicates) == 0 {
+		return nil
+	}
+	if c.AcceptedBy == "" || c.CompiledHash == "" || c.Source == "" {
+		return fmt.Errorf("concept %s: accepted_duplicates is the gate's record, in a file with its accepted_by, compiled_hash and source", c.Name)
+	}
+	for i, d := range c.AcceptedDuplicates {
+		switch {
+		case !oneName(d):
+			return fmt.Errorf("concept %s: accepted duplicate %q is not one Lean declaration name", c.Name, d)
+		case d == c.Name:
+			return fmt.Errorf("concept %s: accepted_duplicates names the concept itself", c.Name)
+		case i > 0 && d <= c.AcceptedDuplicates[i-1]:
+			return fmt.Errorf("concept %s: accepted_duplicates is not sorted and unique", c.Name)
+		}
 	}
 	return nil
 }
@@ -140,12 +173,20 @@ func (c Concept) checkForms() error {
 	return declindex.FormsModule{Concepts: []declindex.ConceptForms{{Concept: c.Name, Forms: c.Forms}}}.Check()
 }
 
-// Render returns the canonical YAML for one concept file.
-func Render(c Concept) ([]byte, error) {
+// checkFile is the check of one concept file: the concept's own, its forms', and its accepted duplicates'.
+func (c Concept) checkFile() error {
 	if err := c.check(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := c.checkForms(); err != nil {
+		return err
+	}
+	return c.checkAcceptedDuplicates()
+}
+
+// Render returns the canonical YAML for one concept file.
+func Render(c Concept) ([]byte, error) {
+	if err := c.checkFile(); err != nil {
 		return nil, err
 	}
 	return yaml.Marshal(c)
@@ -159,10 +200,7 @@ func decodeConcept(raw []byte) (Concept, error) {
 	if err := dec.Decode(&c); err != nil {
 		return Concept{}, err
 	}
-	if err := c.check(); err != nil {
-		return Concept{}, err
-	}
-	if err := c.checkForms(); err != nil {
+	if err := c.checkFile(); err != nil {
 		return Concept{}, err
 	}
 	return c, nil
@@ -170,9 +208,9 @@ func decodeConcept(raw []byte) (Concept, error) {
 
 // Load reads a format-2 registry directory. Defects describe the concept files that the loader refuses (YAML that
 // does not decode, an unknown key, a concept that fails its checks), which it leaves out, and duplicate names and
-// compiled hashes, wrongly keyed files and extends of concepts that are not registered; they do not stop callers
-// from checking the valid entries. Only a registry.yaml that is missing, malformed or of another format, or a file
-// that cannot be read, is an error.
+// compiled hashes, wrongly keyed files, extends of concepts that are not registered, and accepted duplicates that
+// are registered concepts; they do not stop callers from checking the valid entries. Only a registry.yaml that is
+// missing, malformed or of another format, or a file that cannot be read, is an error.
 func Load(dir string) (Registry, []Defect, error) {
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -256,6 +294,13 @@ func Load(dir string) (Registry, []Defect, error) {
 		if c.Extends != "" {
 			if _, ok := names[c.Extends]; !ok {
 				defects = append(defects, Defect{Path: conceptFile(c), Message: "concept " + c.Name + " extends " + c.Extends + ", which is not registered"})
+			}
+		}
+		// The gate admits no copy of a registered concept (Gate.Decide); one registered since is for the librarian
+		// to reconcile, and the record stays.
+		for _, d := range c.AcceptedDuplicates {
+			if _, ok := names[d]; ok {
+				defects = append(defects, Defect{Path: conceptFile(c), Message: "concept " + c.Name + " was admitted as a duplicate of " + d + ", which is a registered concept"})
 			}
 		}
 	}

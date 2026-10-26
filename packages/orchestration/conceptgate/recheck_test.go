@@ -94,6 +94,34 @@ func TestRecheckAcceptedNearSuppressesLibrarian(t *testing.T) {
 	}
 }
 
+// A file that the gate wrote for an exact duplicate that --accepted-by admitted holds its source and its compiled
+// hash, so the post-landing recheck finds nothing in it, pending or landed with its declaration. The copies that it
+// records are the librarian's dated record, which the recheck does not compare again.
+func TestRecheckAcceptsAnAdmittedDuplicate(t *testing.T) {
+	g, lib := gateForTest(t)
+	ctx := context.Background()
+	p := proposal("d1", "MyWrap", "def MyWrap (y : BitVec 64) : Prop := Fx.Frame y 16")
+	v, err := g.Decide(ctx, p, DecideOptions{Proposer: "role", AcceptedBy: "librarian"})
+	if err != nil || v.Outcome != Added || v.Addition == nil {
+		t.Fatalf("decide: %+v, %v", v, err)
+	}
+	landAddition(t, g, v)
+	path := filepath.Join(g.Tree.Source, filepath.FromSlash(v.Addition.Path))
+	for _, landed := range []bool{false, true} {
+		if landed {
+			indexModule(t, g, "New", p.Source)
+		}
+		reg, defects, err := Load(g.Registry)
+		if err != nil || len(defects) != 0 {
+			t.Fatalf("landed %v: registry %v, defects %v", landed, err, defects)
+		}
+		report, err := Recheck(ctx, g, reg, []string{path})
+		if err != nil || len(report.Defects) != 0 || len(report.Near) != 0 || len(lib.got) != 0 {
+			t.Fatalf("landed %v: %+v, %v, librarian %+v; want no defect and no near pair", landed, report, err, lib.got)
+		}
+	}
+}
+
 func TestRecheckRejectsAnInvalidStoredProposer(t *testing.T) {
 	g, lib := gateForTest(t)
 	reg, _, err := Load(g.Registry)

@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeRegistry(t *testing.T, root string, concepts map[string]string) string {
@@ -91,6 +93,82 @@ func TestRenderRoundTripsGateAddition(t *testing.T) {
 	got, defects, err := Load(dir)
 	if err != nil || len(defects) != 0 || len(got.Concepts) != 1 || !reflect.DeepEqual(got.Concepts[0], concept) {
 		t.Fatalf("round trip: %+v, defects %v, err %v", got, defects, err)
+	}
+}
+
+// An addition that --accepted-by admitted as an exact duplicate records the copies it was admitted over, and loads
+// back as it was rendered.
+func TestRenderRoundTripsAcceptedDuplicates(t *testing.T) {
+	concept := Concept{
+		Name: "Fx.New", Home: "New.lean", Meaning: "A newly proposed fact.", Proposal: "p1", Proposer: "function:open_file",
+		CompiledHash: "0123456789abcdef0123456789abcdef", AcceptedBy: "legion-linux-linux-32-architect",
+		AcceptedDuplicates: []string{"Fx.Copy", "Other.copy"}, Source: "import Fixture\n\ndef Fx.New : Prop := True\n",
+	}
+	body, err := Render(concept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "accepted_duplicates:\n    - Fx.Copy\n    - Other.copy\n") {
+		t.Errorf("rendered:\n%s", body)
+	}
+	dir := writeRegistry(t, t.TempDir(), map[string]string{Key(concept) + ".yaml": string(body)})
+	got, defects, err := Load(dir)
+	if err != nil || len(defects) != 0 || len(got.Concepts) != 1 || !reflect.DeepEqual(got.Concepts[0], concept) {
+		t.Fatalf("round trip: %+v, defects %v, err %v", got, defects, err)
+	}
+}
+
+// accepted_duplicates is the gate's record of an admitted duplicate: sorted, unique Lean names other than the
+// concept's own, in a file that holds the acceptance, the compiled hash and the source that the gate wrote. Any
+// other list refuses the file, and Render refuses to write it.
+func TestLoadRefusesAnAcceptedDuplicatesListThatTheGateDidNotWrite(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef"
+	gate := Concept{Name: "Fx.New", Home: "New.lean", Meaning: "A newly proposed fact.", Proposer: "role", CompiledHash: hash,
+		AcceptedBy: "librarian", AcceptedDuplicates: []string{"Fx.Copy"}, Source: "def Fx.New : Prop := True\n"}
+	for name, change := range map[string]func(*Concept){
+		"no accepted_by":   func(c *Concept) { c.AcceptedBy = "" },
+		"no source":        func(c *Concept) { c.Source = "" },
+		"no compiled_hash": func(c *Concept) { c.CompiledHash = "" },
+		"unsorted":         func(c *Concept) { c.AcceptedDuplicates = []string{"Fx.B", "Fx.A"} },
+		"repeated":         func(c *Concept) { c.AcceptedDuplicates = []string{"Fx.A", "Fx.A"} },
+		"its own name":     func(c *Concept) { c.AcceptedDuplicates = []string{"Fx.Copy", "Fx.New"} },
+		"not one name":     func(c *Concept) { c.AcceptedDuplicates = []string{"Fx.A B"} },
+		"empty name":       func(c *Concept) { c.AcceptedDuplicates = []string{""} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := gate
+			change(&c)
+			if body, err := Render(c); err == nil {
+				t.Errorf("Render wrote:\n%s", body)
+			}
+			body, err := yaml.Marshal(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			file := Key(c) + ".yaml"
+			r, defects, err := Load(writeRegistry(t, t.TempDir(), map[string]string{file: string(body)}))
+			if err != nil || len(defects) != 1 || defects[0].Path != "concepts/"+file || !strings.Contains(defects[0].Message, "accepted") || len(r.Concepts) != 0 {
+				t.Fatalf("concepts %+v, defects %v, %v; want concepts/%s refused for its accepted duplicates", r.Concepts, defects, err, file)
+			}
+		})
+	}
+}
+
+// A copy that a concept accepted and that is registered since is a registry defect, not a reason to refuse the file:
+// the record stays, and the defect asks the librarian to reconcile the two.
+func TestLoadReportsAnAcceptedDuplicateThatIsARegisteredConcept(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef"
+	added := "name: Fx.New\nhome: New.lean\nmeaning: A newly proposed fact.\nproposer: role\ncompiled_hash: " + hash +
+		"\naccepted_by: librarian\naccepted_duplicates:\n    - Fx.Frame\nsource: |\n    def Fx.New : Prop := True\n"
+	r, defects, err := Load(writeRegistry(t, t.TempDir(), map[string]string{
+		"Fx.Frame.yaml": "name: Fx.Frame\nhome: Fixture.lean\nmeaning: A window of n bytes below an aligned word.\n",
+		hash + ".yaml":  added,
+	}))
+	if err != nil || len(r.Concepts) != 2 {
+		t.Fatalf("load: concepts %+v, %v; want both concepts", r.Concepts, err)
+	}
+	if len(defects) != 1 || defects[0].Path != "concepts/"+hash+".yaml" || !strings.Contains(defects[0].Message, "Fx.Frame") {
+		t.Fatalf("defects %v, want one on concepts/%s.yaml naming Fx.Frame", defects, hash)
 	}
 }
 

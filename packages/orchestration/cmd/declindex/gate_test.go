@@ -345,3 +345,43 @@ func TestGateAddsANumeralConstantThatAnUnrelatedConstantsValueEquals(t *testing.
 		t.Fatalf("a numeral constant equal in value to Fx.Q.base: want exit 0 and an addition, got %+v (%v)", r, err)
 	}
 }
+
+// An exact duplicate of a declaration that no concept registers (Fixture's Fx.Wrap) as an owner meets it: refused
+// with exit 1 and every copy listed, unless --accepted-by gives the librarian's ruling, which adds it with exit 0. A
+// ruling's link is not an owner id: exit 2.
+func TestGateExitCodesForADuplicateOfAnUnregisteredDeclaration(t *testing.T) {
+	dir, _, config := leanGateFixture(t, nil)
+	proposal := filepath.Join(dir, "proposal.json")
+	writeTestFile(t, proposal, `{"id":"p-wrap","concept":{"name":"MyWrap","home":"MyWrap.lean","meaning":"An aligned window of 16 bytes."},"source":"import Fixture\n\ndef MyWrap (y : BitVec 64) : Prop := Fx.Frame y 16\n"}`)
+	type verdict struct {
+		Outcome    string   `json:"outcome"`
+		Existing   string   `json:"existing"`
+		Duplicates []string `json:"duplicates"`
+		Addition   *struct {
+			Content string `json:"content"`
+		} `json:"addition"`
+	}
+	gate := func(args ...string) (result, verdict) {
+		t.Helper()
+		r := invoke(t, append([]string{"--config", config, "gate", "--proposer", "function:open_file"}, append(args, proposal)...)...)
+		var v verdict
+		if r.code == 0 || r.code == 1 {
+			if err := json.Unmarshal([]byte(r.out), &v); err != nil {
+				t.Fatalf("%v: %v in %+v", args, err, r)
+			}
+		}
+		return r, v
+	}
+	r, v := gate("--accepted-by", "legion-linux-linux-32-architect")
+	if r.code != 0 || v.Outcome != "added" || v.Addition == nil || len(v.Duplicates) != 1 || v.Duplicates[0] != "Fx.Wrap" ||
+		!strings.Contains(v.Addition.Content, "accepted_by: legion-linux-linux-32-architect\naccepted_duplicates:\n    - Fx.Wrap\n") {
+		t.Errorf("--accepted-by legion-linux-linux-32-architect: want exit 0 and an addition with accepted_duplicates [Fx.Wrap], got %+v, %+v", r, v)
+	}
+	r, v = gate()
+	if r.code != 1 || v.Outcome != "refused" || v.Existing != "Fx.Wrap" || len(v.Duplicates) != 1 || v.Duplicates[0] != "Fx.Wrap" || v.Addition != nil {
+		t.Errorf("no --accepted-by: want exit 1, refused naming Fx.Wrap with duplicates [Fx.Wrap], got %+v, %+v", r, v)
+	}
+	if r, _ := gate("--accepted-by", "dispatch://LINUX-32/comment/x"); r.code != 2 || !strings.Contains(r.errOut, "owner id") {
+		t.Errorf("--accepted-by a Dispatch link: want exit 2 naming the owner id, got %+v", r)
+	}
+}
