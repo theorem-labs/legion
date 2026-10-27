@@ -390,8 +390,15 @@ func (g *Gate) Decide(ctx context.Context, p Proposal, options DecideOptions) (V
 		return v, err
 	}
 	v.Outcome, v.Reason = Added, "no registered concept or existing declaration states it"
+	var admitted []string
 	if len(c.AcceptedDuplicates) > 0 {
-		v.Reason = "an exact duplicate of unregistered declarations " + strings.Join(c.AcceptedDuplicates, ", ") + ", admitted by " + options.AcceptedBy
+		admitted = append(admitted, "an exact duplicate of unregistered declarations "+strings.Join(c.AcceptedDuplicates, ", "))
+	}
+	if len(c.AcceptedNear) > 0 {
+		admitted = append(admitted, "a restatement of the registered concepts' facts "+strings.Join(c.AcceptedNear, ", "))
+	}
+	if len(admitted) > 0 {
+		v.Reason = strings.Join(admitted, ", and ") + ", admitted by " + options.AcceptedBy
 	}
 	addition, err := g.additionPath(Key(c))
 	if err != nil {

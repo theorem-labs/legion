@@ -327,6 +327,10 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 		"namespace Fx\nopen Fx\n/-- doc -/\n@[simp] def MySp (R : BitVec 5 → BitVec 64) : Prop := R 2#5 &&& 7#64 = 0#64\nend Fx\n",
 		"structure B where\n  pre : Nat\ntheorem t : True := by trivial\n",
 		"attribute [local instance] Fx.SpAligned\nattribute [-simp] Fx.inline\n",
+		// The options that proofs set inside a term or a tactic, with a numeral or true/false.
+		"theorem t : True := by\n  set_option maxRecDepth 2000 in\n  set_option maxHeartbeats 400000 in\n  set_option simprocs false in trivial\n",
+		"def n : Nat := set_option synthInstance.maxHeartbeats 2000000 in set_option synthInstance.maxSize 1024 in 1\n",
+		"theorem t : True := by\n  set_option pp.all true in\n  set_option linter.unusedVariables false in trivial\n",
 	} {
 		if err := check(ok); err != nil {
 			t.Errorf("refused %q: %v", ok, err)
@@ -345,6 +349,15 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 		"initialize counter : IO.Ref Nat ← IO.mkRef 0\n",
 		"builtin_initialize pure ()\n",
 		"set_option maxHeartbeats 0\n",
+		// An option set inside a term or a tactic that names a program or a path, lifts the heartbeat limit, or is
+		// not on the allow list.
+		"theorem t : True := by\n  set_option sat.solver \"/usr/bin/env\" in trivial\n",
+		"def n : Nat := set_option sat.solver \"/usr/bin/env\" in 1\n",
+		"theorem t : True := by\n  set_option trace.profiler.output \"/tmp/p\" in trivial\n",
+		"theorem t : True := by\n  set_option maxHeartbeats 0 in trivial\n",
+		"def n : Nat := set_option synthInstance.maxHeartbeats 0 in 1\n",
+		"theorem t : True := by\n  set_option maxRecDepth \"9\" in trivial\n",
+		"theorem t : True := by\n  set_option debug.skipKernelTC true in trivial\n",
 		"macro \"m\" : term => `(1)\n",
 	} {
 		if err := check(bad); !errors.Is(err, ErrRefusedSource) {

@@ -10,7 +10,9 @@ scoping commands `namespace`, `section`, `end` and `open`. Only the scoping comm
 the notation they bring into scope parses; they run no code of the proposal's. Every other command is refused
 (`#eval`, `run_cmd`, `initialize`, `macro`, `syntax`, `notation`, `elab`, `set_option`, `open … in`, …). Inside
 the allowed commands, the attributes must be on an allow list, `unsafe` is refused, and so are the term and
-tactic forms that run code while elaborating: `by_elab`, `run_tac`, `native_decide` and `decide +native`. -/
+tactic forms that run code while elaborating: `by_elab`, `run_tac`, `native_decide` and `decide +native`. A
+`set_option … in` inside a term or a tactic may set only an option on a short list, to a numeral or `true`/`false`,
+and never lift the heartbeat limit: `set_option sat.solver "<path>" in bv_decide` runs the program at that path. -/
 
 namespace DeclExport
 
@@ -30,6 +32,36 @@ def allowedAttributes : List String :=
 /-- Syntax kinds whose elaboration evaluates code of the proposal's. -/
 def runningKinds : List String := ["byElab", "runTac", "runElab", "runMeta", "runCmd", "nativeDecide", "evalTac"]
 
+/-- Options that a proposal may set inside a term or a tactic (`set_option … in`), as the project's proofs do: none
+names a program or a path, and none but the heartbeat limits (`heartbeatOptions`) can make the compile run without
+a bound. -/
+def allowedOptions : List String :=
+  ["maxRecDepth", "maxHeartbeats", "synthInstance.maxHeartbeats", "synthInstance.maxSize", "simprocs"]
+
+/-- Prefixes of allowed option names: printing and linting, which only change messages. -/
+def allowedOptionPrefixes : List String := ["pp.", "linter."]
+
+/-- Options whose value 0 lifts the heartbeat limit. -/
+def heartbeatOptions : List String := ["maxHeartbeats", "synthInstance.maxHeartbeats"]
+
+/-- Why a proposal may not run `set_option name value in …` inside a term or a tactic, or `none`. value is the
+value's syntax: an atom `true` or `false`, or a `num` or `str` literal node. -/
+def badOption (name : String) (value : Syntax) : Option String :=
+  if !(allowedOptions.contains name || allowedOptionPrefixes.any (name.startsWith ·)) then
+    some s!"the option `{name}` is not on the proposal allow list"
+  else match value with
+    | .atom _ "true" | .atom _ "false" => none
+    | _ => match value.isNatLit? with
+      | some 0 => if heartbeatOptions.contains name then some s!"`set_option {name} 0` lifts the heartbeat limit" else none
+      | some _ => none
+      | none => some s!"the option `{name}` takes a numeral or true/false in a proposal"
+
+/-- The value of a `set_option` node's arguments: the one before its `in` (the ident's partial trailing dot sits
+between the name and the value). -/
+def optionValueOf (args : Array Syntax) : Syntax :=
+  ((List.range args.size).findSome? fun i =>
+    if i > 0 && args[i]! matches .atom _ "in" then some args[i - 1]! else none).getD .missing
+
 partial def hasIdent (stx : Syntax) (n : String) : Bool :=
   match stx with
   | .ident _ _ v _ => v.toString == n
@@ -42,6 +74,10 @@ partial def badSyntax (stx : Syntax) : Option String :=
   | .node _ kind args =>
     let last := match kind with | .str _ s => s | _ => ""
     if runningKinds.contains last then some s!"`{kind}` runs code while it elaborates"
+    else if last == "set_option" && args.size ≥ 2 then
+      match badOption args[1]!.getId.toString (optionValueOf args) with
+      | some why => some why
+      | none => args.findSome? badSyntax
     else if last == "decide" && hasIdent stx "native" then some "`decide +native` runs compiled code"
     else if kind == ``Parser.Term.attrInstance then
       let attr := args[1]!

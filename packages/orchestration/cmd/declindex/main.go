@@ -52,8 +52,9 @@ Commands:
                                definition they apply (via:<definition>), or by using the concept (uses)
   same NAME...                 the declarations whose statements share a relation atom with NAME's statement
   gate --proposer OWNER [--accepted-by OWNER] PROPOSAL.json
-                               the similarity gate: refuse an exact duplicate, send a near match to the librarian,
-                               refuse a taken name, or print an addition; the proposal is JSON
+                               the similarity gate: refuse an exact duplicate (unless --accepted-by admits it),
+                               send a near match to the librarian, refuse a taken name, or print an addition; the
+                               proposal is JSON
                                {"id", "concept": {name, home, meaning, extends}, "source": <Lean module>};
                                --accepted-by gives the librarian's ruling, which admits the near matches and the
                                exact duplicates of declarations that no concept registers

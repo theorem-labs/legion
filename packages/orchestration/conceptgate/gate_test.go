@@ -431,6 +431,46 @@ func TestGateRefusesAHashCommandWithLeansParser(t *testing.T) {
 	}
 }
 
+// A proposal may set an option inside a term or a tactic only from Lean's parser allow-list's short list, with a
+// numeral or true/false, and never lift the heartbeat limit. `set_option sat.solver <path> in bv_decide` would make
+// the compile run the program at that path: the parser refuses it before anything compiles, so the program never
+// runs. An option on the list still compiles and is added.
+func TestGateRefusesAnOptionThatNamesAProgramOrLiftsTheHeartbeatLimit(t *testing.T) {
+	g, lib := gateForTest(t)
+	dir := t.TempDir()
+	witness := filepath.Join(dir, "ran")
+	solver := filepath.Join(dir, "solver.sh")
+	if err := os.WriteFile(solver, []byte("#!/bin/sh\necho ran > "+witness+"\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	decide := func(name, body string) (Verdict, error) {
+		t.Helper()
+		p := Proposal{ID: name, Concept: Concept{Name: name, Home: "New.lean", Meaning: "A proposed concept."},
+			Source: "import Fixture\nimport Std.Tactic.BVDecide\n\n" + body + "\n"}
+		return g.Decide(context.Background(), p, DecideOptions{Proposer: "role"})
+	}
+	for _, c := range []struct{ name, body string }{
+		{"SatProbe", "theorem SatProbe (x y : BitVec 16) : x * y = y * x := by\n  set_option sat.solver \"" + solver + "\" in\n  bv_decide"},
+		{"Spin", "theorem Spin (x : Nat) (_h : x < 3) : x < 7 := by\n  set_option maxHeartbeats 0 in\n  omega"},
+		{"SpinInst", "def SpinInst : Nat := set_option synthInstance.maxHeartbeats 0 in 1"},
+	} {
+		v, err := decide(c.name, c.body)
+		if !errors.Is(err, declindex.ErrRefusedSource) || v.Outcome != "" || !strings.Contains(err.Error(), "option") {
+			t.Errorf("%s: %+v, %v; want Lean's parser allow-list to refuse the option", c.name, v, err)
+		}
+	}
+	if _, err := os.Stat(witness); err == nil {
+		t.Fatal("the compile ran the SAT solver that the proposal named")
+	}
+	v, err := decide("Bounded", "theorem Bounded (x : Nat) (_h : x < 3) : x < 7 := by\n  set_option maxRecDepth 2000 in\n  set_option maxHeartbeats 400000 in\n  omega")
+	if err != nil || v.Outcome != Added {
+		t.Fatalf("an option on the allow list: %+v, %v; want added", v, err)
+	}
+	if len(lib.got) != 0 {
+		t.Fatal("the librarian got a refused proposal")
+	}
+}
+
 // A proposal's home is the path of a .lean file relative to the tree, where its declaration lands: the gate refuses
 // any other home before it compiles anything, and the error names it. The gate has no index, so a decision that went
 // past the home would fail on it.
@@ -627,6 +667,9 @@ func TestGateAcceptsCopiesAndNearMatchesWithOneAcceptedBy(t *testing.T) {
 	c, err := decodeConcept([]byte(v.Addition.Content))
 	if err != nil || !slices.Equal(c.AcceptedNear, []string{"Fx.SpAligned"}) || !slices.Equal(c.AcceptedDuplicates, []string{"Fx.NearSp"}) {
 		t.Fatalf("addition %+v, %v; want accepted_near [Fx.SpAligned] and accepted_duplicates [Fx.NearSp]", c, err)
+	}
+	if !strings.Contains(v.Reason, "Fx.NearSp") || !strings.Contains(v.Reason, "Fx.SpAligned") || !strings.Contains(v.Reason, "librarian") {
+		t.Errorf("reason %q: want the copy Fx.NearSp, the near match Fx.SpAligned and the acceptance named", v.Reason)
 	}
 	if len(lib.got) != 0 {
 		t.Fatalf("the librarian got %+v", lib.got)
