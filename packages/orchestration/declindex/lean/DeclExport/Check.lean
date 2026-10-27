@@ -34,9 +34,11 @@ def runningKinds : List String := ["byElab", "runTac", "runElab", "runMeta", "ru
 
 /-- Options that a proposal may set inside a term or a tactic (`set_option … in`), as the project's proofs do: none
 names a program or a path, and none but the heartbeat limits (`heartbeatOptions`) can make the compile run without
-a bound. -/
+a bound. `machcsl.omegaMax` is the Verified Linux project's own option for its `omega`, which one of its proofs
+sets. -/
 def allowedOptions : List String :=
-  ["maxRecDepth", "maxHeartbeats", "synthInstance.maxHeartbeats", "synthInstance.maxSize", "simprocs"]
+  ["maxRecDepth", "maxHeartbeats", "synthInstance.maxHeartbeats", "synthInstance.maxSize", "simprocs",
+   "machcsl.omegaMax"]
 
 /-- Prefixes of allowed option names: printing and linting, which only change messages. -/
 def allowedOptionPrefixes : List String := ["pp.", "linter."]

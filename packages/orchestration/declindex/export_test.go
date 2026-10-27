@@ -331,6 +331,8 @@ func TestCheckSourceAcceptsOnlyDeclarations(t *testing.T) {
 		"theorem t : True := by\n  set_option maxRecDepth 2000 in\n  set_option maxHeartbeats 400000 in\n  set_option simprocs false in trivial\n",
 		"def n : Nat := set_option synthInstance.maxHeartbeats 2000000 in set_option synthInstance.maxSize 1024 in 1\n",
 		"theorem t : True := by\n  set_option pp.all true in\n  set_option linter.unusedVariables false in trivial\n",
+		// The Verified Linux project's own option, as one of its proofs sets it.
+		"theorem t : True := by\n  set_option machcsl.omegaMax false in\n  set_option machcsl.omegaMax 2 in trivial\n",
 	} {
 		if err := check(ok); err != nil {
 			t.Errorf("refused %q: %v", ok, err)
