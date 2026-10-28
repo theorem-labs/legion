@@ -178,9 +178,13 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 					}
 					// Lean records the whole command as the selection range of a declaration that the command
 					// makes without writing its name (a command macro's, a simproc, a computed field): there is no
-					// written name to compare, as for a name Lean made.
-					if (sel == a && selEnd == e) || selectionHolds(s.text, name, sel, selEnd) {
-						d.StmtHash = StatementHash(StatementText(s.text, a, e, selEnd, d.Kind))
+					// written name to compare, as for a name Lean made. Both ranges come from the reference file,
+					// so they are equal whatever the source holds now: such a declaration holds only where the
+					// current source still has a command at the recorded range.
+					stmt := StatementText(s.text, a, e, selEnd, d.Kind)
+					if selectionHolds(s.text, name, sel, selEnd) ||
+						(sel == a && selEnd == e && stmt != "" && s.commandAt(r[0], r[1], r[2], r[3])) {
+						d.StmtHash = StatementHash(stmt)
 					} else {
 						md.Stale++
 					}

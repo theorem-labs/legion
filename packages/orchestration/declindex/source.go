@@ -96,6 +96,52 @@ func (s *source) offset(l, c int) (int, bool) {
 	return s.starts[l] + b, true
 }
 
+// commandAt reports whether the source has a command at a range recorded in 0-based lines and UTF-16 columns: the
+// range starts at its line's first non-blank character and ends after a non-blank one, at its line's end or before
+// only blanks and a `--` comment. A line shorter than the recorded end fails, as does a range over lines that are
+// gone. Two lines of the same length can still fool it; it is no hash of the source.
+func (s *source) commandAt(l0, c0, l1, c1 int) bool {
+	if l0 < 0 || l1 < l0 || l1 >= len(s.starts) {
+		return false
+	}
+	first := s.line(l0)
+	b0, _ := u16Col(first, c0)
+	if b0 >= len(first) || strings.TrimFunc(first[:b0], isSpace) != "" {
+		return false
+	}
+	if r, _ := utf8.DecodeRuneInString(first[b0:]); isSpace(r) {
+		return false
+	}
+	last := s.line(l1)
+	if u16Len(last) < c1 {
+		return false
+	}
+	b1, _ := u16Col(last, c1)
+	if b1 == 0 {
+		return false
+	}
+	if r, _ := utf8.DecodeLastRuneInString(last[:b1]); isSpace(r) {
+		return false
+	}
+	rest := strings.TrimLeftFunc(last[b1:], isSpace)
+	return rest == "" || strings.HasPrefix(rest, "--")
+}
+
+// u16Len is the length of line in UTF-16 code units.
+func u16Len(line string) int {
+	if isASCII(line) {
+		return len(line)
+	}
+	n := 0
+	for _, r := range line {
+		n++
+		if r > 0xFFFF {
+			n++
+		}
+	}
+	return n
+}
+
 // position is the 0-based line and code point column of a byte offset.
 func (s *source) position(off int) (int, int) {
 	lo, hi := 0, len(s.starts)-1

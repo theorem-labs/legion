@@ -210,9 +210,81 @@ func TestASelectionOfTheWholeCommandHolds(t *testing.T) {
 	if md.Stale != 0 {
 		t.Fatalf("%d declarations taken for moved: a command's own selection is not evidence that the source moved", md.Stale)
 	}
+	if len(md.Decls) != 3 {
+		t.Fatalf("%d declarations read, want 3", len(md.Decls))
+	}
 	for _, d := range md.Decls {
 		if d.StmtHash == "" {
 			t.Errorf("%s has no statement hash", d.Name)
+		}
+	}
+}
+
+// A whole-command selection says nothing of the current source, since both of its ranges come from the reference
+// file: a source newer than its build still fails where the recorded range no longer holds a command, also when no
+// declaration that writes its name sits at or below the edit.
+func TestAWholeCommandSelectionInASourceNewerThanItsBuildFails(t *testing.T) {
+	command := "declare_decidable_uint_quantifiers UInt8 8\n"
+	theorem := "theorem A.a : True := trivial\n"
+	ilean := func(decls string) []byte {
+		return []byte(`{"version":5,"module":"M","decls":{` + decls + `},"references":{}}`)
+	}
+	onlyCommand := ilean(`"UInt8.forall_iff_forall_ofBitVec":[0,0,0,42,0,0,0,42]`)
+	withTheorem := ilean(`"A.a":[0,0,0,29,0,8,0,11],"UInt8.forall_iff_forall_ofBitVec":[1,0,1,42,1,0,1,42]`)
+	for _, c := range []struct {
+		name  string
+		ilean []byte
+		built string
+		now   string
+	}{
+		{"a line added above a module of one command", onlyCommand, command, "-- a line added after the build\n" + command},
+		{"a code line added above a module of one command", onlyCommand, command, "def A.b : Nat := 1\n" + command},
+		{"the command changed below an unmoved theorem", withTheorem, theorem + command,
+			theorem + "declare_decidable_uint_quantifiers UInt16 16\n"},
+		{"a comment added between the theorem and the command", withTheorem, theorem + command,
+			theorem + "-- a comment added after the build\n" + command},
+		{"a blank line added between the theorem and the command", withTheorem, theorem + command,
+			theorem + "\n" + command},
+		{"the command removed", withTheorem, theorem + command, theorem},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			built, err := ParseModule("M", c.ilean, []byte(c.built), Roots{"M": true})
+			if err != nil || built.Stale != 0 {
+				t.Fatalf("the built source is stale: %d %v", built.Stale, err)
+			}
+			md, err := ParseModule("M", c.ilean, []byte(c.now), Roots{"M": true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if md.Stale == 0 {
+				t.Fatal("a source newer than its build was read as current")
+			}
+			for _, d := range md.Decls {
+				if d.Name == "UInt8.forall_iff_forall_ofBitVec" && d.StmtHash != "" {
+					t.Errorf("the command's declaration has hash %s from a source newer than its build", d.StmtHash)
+				}
+			}
+		})
+	}
+}
+
+func TestCommandAt(t *testing.T) {
+	s := newSource("  cmd x -- note\n/-- doc -/\nstructure N where\nlet 𝔸 := 1\n")
+	for _, c := range []struct {
+		l0, c0, l1, c1 int
+		want           bool
+	}{
+		{0, 2, 0, 7, true},   // a trailing `--` comment
+		{0, 0, 0, 7, false},  // starts before the first non-blank character
+		{0, 2, 0, 5, false},  // ends inside the line
+		{1, 0, 2, 17, true},  // over lines, from the doc comment on
+		{1, 0, 2, 18, false}, // past the line's end
+		{3, 0, 3, 11, true},  // UTF-16 columns: 𝔸 is two units
+		{3, 0, 3, 10, false}, // ends inside the line
+		{3, 0, 4, 1, false},  // the line is gone
+	} {
+		if got := s.commandAt(c.l0, c.c0, c.l1, c.c1); got != c.want {
+			t.Errorf("commandAt(%d, %d, %d, %d) = %v, want %v", c.l0, c.c0, c.l1, c.c1, got, c.want)
 		}
 	}
 }
