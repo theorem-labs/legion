@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -33,10 +35,14 @@ type Config struct {
 	Reader string `yaml:"reader"`
 	// DSN is the index's connection string. No configuration file names a secret: it comes from DECLINDEX_DSN or
 	// from the file that --index-dsn-file names.
-	DSN       string   `yaml:"-"`
-	Roots     []string `yaml:"roots"`
-	FileKinds []string `yaml:"file_kinds"`
-	Jobs      int      `yaml:"jobs"`
+	DSN   string   `yaml:"-"`
+	Roots []string `yaml:"roots"`
+	// ReferenceRoots are the first components of the module names of packages the project builds on (a Lake
+	// dependency) whose constants' uses the index keeps, though it indexes none of their declarations: the uses
+	// table and the edges then answer which of the project's declarations use a dependency's constant.
+	ReferenceRoots []string `yaml:"reference_roots"`
+	FileKinds      []string `yaml:"file_kinds"`
+	Jobs           int      `yaml:"jobs"`
 	// Registry is the concept registry directory (see package conceptgate), relative to Tree.
 	Registry string `yaml:"registry"`
 	// Build runs in Tree after a landed refresh (Sync) has moved it to LAND_COMMIT.
@@ -117,6 +123,11 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if len(c.Roots) == 0 {
 		return Config{}, fmt.Errorf("%s: roots are required: the first components of the project's module names", path)
+	}
+	for _, r := range c.ReferenceRoots {
+		if r == "" || strings.Contains(r, ".") || slices.Contains(c.Roots, r) {
+			return Config{}, fmt.Errorf("%s: reference_roots %q: each must be a module root (no dot) that roots does not name", path, r)
+		}
 	}
 	if c.Registry != "" {
 		// IsLocal accepts "." (the tree itself), which is no registry directory below it.
@@ -300,11 +311,14 @@ func OpenReadOnlyConfig(ctx context.Context, c Config, scope ReadScope) (*Store,
 
 // TreeSpec is the configuration's Tree.
 func (c Config) TreeSpec() Tree {
-	roots := Roots{}
+	roots, refs := Roots{}, Roots{}
 	for _, r := range c.Roots {
 		roots[r] = true
 	}
-	return Tree{Source: c.Tree, Lib: c.Lib, Roots: roots}
+	for _, r := range c.ReferenceRoots {
+		refs[r] = true
+	}
+	return Tree{Source: c.Tree, Lib: c.Lib, Roots: roots, ReferenceRoots: refs}
 }
 
 // Compiled gives the options of the compiled part for this configuration: the tree's toolchain, the exporter

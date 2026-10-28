@@ -90,6 +90,25 @@ func TestConfigRefusesMissingTreeAndRoots(t *testing.T) {
 	}
 }
 
+// reference_roots names the dependencies whose constants' uses the index keeps: module roots, none of them one of
+// roots.
+func TestConfigReadsReferenceRoots(t *testing.T) {
+	c, err := LoadConfig(writeConfig(t, "tree: x\nroots: [A]\nreference_roots: [Dep, Lib]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.TreeSpec(); !reflect.DeepEqual(got.ReferenceRoots, Roots{"Dep": true, "Lib": true}) ||
+		!reflect.DeepEqual(got.Roots, Roots{"A": true}) {
+		t.Fatalf("tree spec %+v", got)
+	}
+	for _, refs := range []string{"[A]", "[Dep.Defs]", `[""]`} {
+		body := "tree: x\nroots: [A]\nreference_roots: " + refs + "\n"
+		if _, err := LoadConfig(writeConfig(t, body)); err == nil {
+			t.Errorf("config %q accepted", body)
+		}
+	}
+}
+
 // The index is one schema of a Postgres database: index: names it, state: is the local directory of the exporter
 // build and the forms module, and reader: is the read-only role a refresh grants. No key holds a connection
 // string: Config.DSN comes from DECLINDEX_DSN or --index-dsn-file (P-1, P-2, P-7, P-8).
