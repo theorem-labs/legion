@@ -21,7 +21,8 @@ func TestMain(m *testing.M) {
 }
 
 // A hook timeout or retry sends SIGTERM to `declindex refresh`; the build it started, and the build's children,
-// must not outlive it.
+// must not outlive it. The run says that a signal stopped it, not that the index's database is unreachable, and
+// exits 75 so that it is run again.
 func TestSIGTERMDuringRefreshKillsTheBuild(t *testing.T) {
 	f := newLandingFixture(t)
 	body, err := os.ReadFile(f.config)
@@ -36,6 +37,8 @@ func TestSIGTERMDuringRefreshKillsTheBuild(t *testing.T) {
 	writeIndexConfig(t, f.config, text)
 	cmd := exec.Command(os.Args[0], "--index-dsn-file", indexDSNFile(f.config), "--config", f.config, "refresh")
 	cmd.Env = append(os.Environ(), "DECLINDEX_TEST_MAIN=1", "LAND_COMMIT="+f.second)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -62,4 +65,8 @@ func TestSIGTERMDuringRefreshKillsTheBuild(t *testing.T) {
 		t.Fatalf("refresh after SIGTERM: %v, want exit 75", err)
 	}
 	assertProcessGone(t, pid)
+	if got := stderr.String(); !strings.Contains(got, "declindex: the run was stopped by a signal (terminated)") ||
+		strings.Contains(got, "unreachable") {
+		t.Errorf("refresh after SIGTERM says %q; want that a signal stopped it, and nothing of an unreachable database", got)
+	}
 }

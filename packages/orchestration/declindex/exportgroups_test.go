@@ -126,6 +126,35 @@ func TestExportGroupsAsksLeanWhetherTwoAxiomsImportTogether(t *testing.T) {
 	}
 }
 
+// A module joins a group only when every name both declare loads together, so the planner stops at the first name
+// that does not, and asks Lean about no pair of the others: each question is an exporter run. It asks in the order of
+// the names, the same on every run. X is declared in XA and XB, Y in YA and YB, and Lean imports neither pair
+// together. M1 imports XA and YA, M2 imports XB and YB: M2 does not join M1's group, and on every run the planner asks
+// Lean only about XA and XB, never about YA and YB.
+func TestExportGroupsAsksLeanAboutTheSamePairsOnEveryRun(t *testing.T) {
+	ctx := context.Background()
+	s := indexWith(t,
+		[][3]string{{"X", "XA", "theorem"}, {"X", "XB", "theorem"}, {"Y", "YA", "theorem"}, {"Y", "YB", "theorem"}},
+		[][2]string{{"M1", "XA"}, {"M1", "YA"}, {"M2", "XB"}, {"M2", "YB"}})
+	for run := range 30 {
+		var asked [][]string
+		loads := func(_ context.Context, pair []string) (bool, error) {
+			asked = append(asked, slices.Clone(pair))
+			return false, nil
+		}
+		plan, err := exportGroups(ctx, s.q, []string{"M1", "M2"}, nil, loads)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := [][]string{{"M1"}, {"M2"}}; !slices.EqualFunc(plan.groups, want, slices.Equal) {
+			t.Fatalf("run %d: groups %v, want %v", run, plan.groups, want)
+		}
+		if want := [][]string{{"XA", "XB"}}; !slices.EqualFunc(asked, want, slices.Equal) {
+			t.Fatalf("run %d: the planner asked Lean about %v, want only %v", run, asked, want)
+		}
+	}
+}
+
 // A module whose reference file can no longer be read leaves the index with its compiled rows and its clashes with
 // the forms, so that no later refresh reports a module that the index no longer holds.
 func TestAModuleThatBecomesUnreadableLeavesNoCompiledRows(t *testing.T) {

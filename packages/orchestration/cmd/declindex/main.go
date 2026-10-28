@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/sjawhar/legion/orchestration/declindex"
@@ -74,7 +75,7 @@ Exit codes:
   gate: 0 added; 1 duplicate; 2 usage; 3 unable; 4 near; 5 name taken; 75 retry
   ledger: 0 clean; 1 defect; 2 usage; 3 unable; 75 retry (also when the registry recheck of a landing cannot run)
   land-hash: 0 answered; 2 usage; 3 unable; 75 retry
-75 is a failed connection to the index's database: the command can be run again.`
+75 is a failed connection to the index's database, or a run that a signal stopped: the command can be run again.`
 
 type usageError struct{ msg string }
 
@@ -86,12 +87,26 @@ type unableError struct{ err error }
 func (e *unableError) Error() string { return e.err.Error() }
 func (e *unableError) Unwrap() error { return e.err }
 
+// stoppedBy holds the signal that stopped this run, once one has. fail then says that the run was stopped, not that
+// the database is unreachable, which is how the end of the command's context reaches its database connection.
+var stoppedBy atomic.Value
+
 // main cancels the command on SIGTERM, SIGINT or SIGHUP, so that the build and the toolchain processes it started
-// are killed with their process groups before it exits, rather than left running without it.
+// are killed with their process groups before it exits, rather than left running without it. A second signal ends
+// the process at once.
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		s := <-signals
+		stoppedBy.Store(s)
+		signal.Stop(signals)
+		cancel()
+	}()
 	code := run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr)
-	stop()
+	signal.Stop(signals)
+	cancel()
 	os.Exit(code)
 }
 
@@ -302,6 +317,12 @@ func fail(w io.Writer, err error) int {
 	var u *usageError
 	var nf *declindex.NotFoundError
 	var temporary *declindex.TempError
+	// A run that a signal stopped failed because it was stopped, whatever error the end of its context left (its
+	// database connection reports itself unreachable): it says so, and exits 75, as a run can be started again.
+	if s, ok := stoppedBy.Load().(os.Signal); ok {
+		fmt.Fprintf(w, "declindex: the run was stopped by a signal (%v) before it finished: %v\n", s, err)
+		return 75
+	}
 	// A failed connection to the index's database leaves every question unanswered, and another run can answer
 	// it: the landing program retries 75 and escalates 3 (P-11).
 	if declindex.Unreachable(err) {
