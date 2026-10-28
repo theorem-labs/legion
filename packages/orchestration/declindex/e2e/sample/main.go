@@ -160,9 +160,12 @@ func draw(ctx context.Context, dsn, schema string, seed float64, random, used in
 	}
 	if used > 0 {
 		// edges.owner is the declaration that a used constant belongs to, and edges.stmt marks a use in the
-		// user's statement: these are the declarations that most statements use.
+		// user's statement: these are the declarations that most statements use. A dependency's constant
+		// (reference_roots) is its own owner, of a module the index did not read: declindex declares no such name.
 		if err := add(tx.Query(ctx,
-			`SELECT owner FROM edges WHERE stmt AND owner <> '' GROUP BY owner ORDER BY count(*) DESC, owner LIMIT $1`,
+			`SELECT e.owner FROM edges e WHERE e.stmt AND e.owner <> ''
+			   AND EXISTS (SELECT 1 FROM modules m WHERE m.module = e.owner_module)
+			 GROUP BY e.owner ORDER BY count(*) DESC, e.owner LIMIT $1`,
 			used)); err != nil {
 			return nil, err
 		}

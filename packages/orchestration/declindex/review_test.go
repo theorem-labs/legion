@@ -338,7 +338,7 @@ func TestABuildTraceDecidesAWholeCommandSelection(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			md, err := readModule(Tree{Source: dir, Lib: dir, Roots: Roots{"M": true}}, "M")
+			md, err := readModule(Tree{Source: dir, Lib: dir, Roots: Roots{"M": true}}, Roots{"M": true}, "M")
 			if md.Commands != 1 {
 				t.Fatalf("%d declarations held by their command, want 1", md.Commands)
 			}
