@@ -428,10 +428,12 @@ func (g *declGroup) add(c declSets) {
 	}
 }
 
-// fits reports whether every declaration set of c joins the group's (loadRule.joins).
-func (g *declGroup) fits(r *loadRule, c declSets) bool {
-	for n, ms := range c {
-		if have, ok := g.sets[n]; ok && !r.joins(n, have, ms) {
+// fits reports whether every declaration set of c joins the group's (loadRule.joins). It checks the names in the
+// order of names, c's names sorted, and stops at the first that does not join, so the pairs it asks Lean about, each
+// an exporter run, are the same on every run: in a map's order a refresh asked 6 such pairs one time and 7 the next.
+func (g *declGroup) fits(r *loadRule, c declSets, names []string) bool {
+	for _, n := range names {
+		if have, ok := g.sets[n]; ok && !r.joins(n, have, c[n]) {
 			return false
 		}
 	}
@@ -540,8 +542,9 @@ func exportGroups(ctx context.Context, q querier, modules, base []string, loads 
 	baseGroup := newDeclGroup(baseClaims)
 	var with, without []*declGroup
 	place := func(gs []*declGroup, seed declSets, m string, c declSets) []*declGroup {
+		names := slices.Sorted(maps.Keys(c))
 		for _, g := range gs {
-			if g.fits(rule, c) {
+			if g.fits(rule, c, names) {
 				g.add(c)
 				g.modules = append(g.modules, m)
 				return gs
