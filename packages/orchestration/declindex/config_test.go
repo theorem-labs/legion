@@ -101,11 +101,24 @@ func TestConfigReadsReferenceRoots(t *testing.T) {
 		!reflect.DeepEqual(got.Roots, Roots{"A": true}) {
 		t.Fatalf("tree spec %+v", got)
 	}
-	for _, refs := range []string{"[A]", "[Dep.Defs]", `[""]`} {
+	for _, refs := range []string{"[A]", "[Dep.Defs]", `[""]`, `["Dep,Lib"]`} {
 		body := "tree: x\nroots: [A]\nreference_roots: " + refs + "\n"
 		if _, err := LoadConfig(writeConfig(t, body)); err == nil {
 			t.Errorf("config %q accepted", body)
 		}
+	}
+}
+
+// The index records each set of roots joined by commas: a root that holds a comma would let two sets record one
+// value, so that a change between them re-reads no module.
+func TestConfigRefusesARootWithAComma(t *testing.T) {
+	for _, body := range []string{"tree: x\nroots: [\"A,B\"]\n", "tree: x\nroots: [A]\nreference_roots: [\"Dep,Lib\"]\n"} {
+		if _, err := LoadConfig(writeConfig(t, body)); err == nil {
+			t.Errorf("config %q accepted", body)
+		}
+	}
+	if _, err := LoadConfig(writeConfig(t, "tree: x\nroots: [A, B]\nreference_roots: [Dep, Lib]\n")); err != nil {
+		t.Fatalf("roots and reference_roots without a comma: %v", err)
 	}
 }
 

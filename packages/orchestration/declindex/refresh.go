@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,8 @@ func (t Tree) keptUses() Roots {
 }
 
 // rootsKey is the meta value that records a set of roots (writeMeta): their names, sorted, joined by commas.
+// LoadConfig refuses a root that holds a comma, no roots at all and an empty reference root, so two sets of a
+// configuration never share a value.
 func rootsKey(r Roots) string {
 	return strings.Join(slices.Sorted(maps.Keys(r)), ",")
 }
@@ -263,7 +266,7 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 func (s *Store) refreshLocked(ctx context.Context, tree Tree, generation int64, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	st := RefreshStats{WithoutForms: []FormsClash{}}
-	r, err := s.readReference(ctx, tree, opt.jobs())
+	r, err := s.readReference(ctx, tree, opt.jobs(), generation)
 	if err != nil {
 		return st, err
 	}
@@ -358,8 +361,9 @@ type reference struct {
 }
 
 // readReference reads the tree's sources and build, and the index's sources and modules, and re-reads the modules
-// whose reference file or source changed, on jobs goroutines.
-func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (reference, error) {
+// whose reference file or source changed, on jobs goroutines. generation is the index's generation before this
+// refresh read anything of it.
+func (s *Store) readReference(ctx context.Context, tree Tree, jobs int, generation int64) (reference, error) {
 	var r reference
 	var err error
 	r.roots, r.referenceRoots = tree.Roots, tree.ReferenceRoots
@@ -369,10 +373,15 @@ func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (referen
 	if r.previousCommit, err = s.Meta(ctx, "commit"); err != nil {
 		return r, err
 	}
-	// A module whose reference file is unchanged keeps the uses its last read kept: when the roots or the reference
-	// roots differ from that read's, every module is read again. An index that a declindex older than these meta
-	// keys wrote records neither: its reference roots were none, and its roots are taken to be the configuration's,
-	// so the first refresh by this one re-reads no module for want of them.
+	// A module whose reference file is unchanged keeps the uses its last read kept, so every module is read again
+	// when that read may have kept other uses: when the roots or the reference roots differ from those the index
+	// records, and when the last write of the index was not this declindex's (roots_generation, writeTxFrom). A
+	// declindex older than these meta keys writes the index of the same schema, keeping only its own roots' uses,
+	// and raises the generation without touching the keys; an index it wrote last records them stale or not at all.
+	stamp, err := s.Meta(ctx, "roots_generation")
+	if err != nil {
+		return r, err
+	}
 	storedRoots, err := s.Meta(ctx, "roots")
 	if err != nil {
 		return r, err
@@ -381,7 +390,8 @@ func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (referen
 	if err != nil {
 		return r, err
 	}
-	rereadAll := (storedRoots != "" && storedRoots != rootsKey(r.roots)) || storedRefs != rootsKey(r.referenceRoots)
+	rereadAll := stamp != strconv.FormatInt(generation, 10) || storedRoots != rootsKey(r.roots) ||
+		storedRefs != rootsKey(r.referenceRoots)
 	if r.files, err = scan(tree, jobs); err != nil {
 		return r, fmt.Errorf("scan %s: %w", tree.Lib, err)
 	}

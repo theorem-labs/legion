@@ -430,8 +430,14 @@ func (s *Store) writeTxFrom(ctx context.Context, generation int64, f func(pgx.Tx
 	if err := f(tx); err != nil {
 		return unreachable(conn.Conn(), err)
 	}
+	// roots_generation is the generation the last write of a declindex that records roots and reference_roots left
+	// (readReference). A declindex older than those keys raises the generation alone.
 	if _, err := tx.Exec(ctx, `INSERT INTO meta (k, v) VALUES ('generation', '1')
 		ON CONFLICT (k) DO UPDATE SET v = (meta.v::bigint + 1)::text`); err != nil {
+		return unreachable(conn.Conn(), err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO meta (k, v) SELECT 'roots_generation', v FROM meta WHERE k = 'generation'
+		ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`); err != nil {
 		return unreachable(conn.Conn(), err)
 	}
 	return unreachable(conn.Conn(), tx.Commit(ctx))

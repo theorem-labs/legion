@@ -148,10 +148,10 @@ func TestReferenceRootsKeepProjectUsesAndRecordASortedSet(t *testing.T) {
 	}
 }
 
-// An index that an older declindex wrote records no roots: the first refresh by this one re-reads no module for
-// want of them, and records them. With reference_roots in the configuration it re-reads every module, so that the
-// dependency's uses it records as kept are kept.
-func TestAnIndexWithoutRecordedRootsIsNotReread(t *testing.T) {
+// An index that an older declindex wrote records no roots: the read that kept its uses may have had other roots, so
+// the first refresh by this one re-reads every module, also with the same roots and no reference roots, and records
+// them; the next re-reads nothing.
+func TestAnIndexWithoutRecordedRootsIsReread(t *testing.T) {
 	dir := t.TempDir()
 	tree := leanTree(t, dir,
 		leanModule{name: "App", decls: []string{"App.g"}, src: "def App.g : Nat := App.h + Dep.c\n",
@@ -162,20 +162,89 @@ func TestAnIndexWithoutRecordedRootsIsNotReread(t *testing.T) {
 	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
 		t.Fatal(err)
 	}
-	execIndex(t, s, `DELETE FROM meta WHERE k IN ('roots', 'reference_roots')`)
-	if st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil || st.Reread != 0 {
-		t.Fatalf("the first refresh of an index without recorded roots re-read %d modules, %v; want none", st.Reread, err)
+	execIndex(t, s, `DELETE FROM meta WHERE k IN ('roots', 'reference_roots', 'roots_generation')`)
+	if st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil || st.Reread != 1 {
+		t.Fatalf("the first refresh of an index without recorded roots re-read %d modules, %v; want App", st.Reread, err)
 	}
 	if v, err := s.Meta(ctx, "roots"); err != nil || v != "App" {
 		t.Fatalf("meta roots = %q, %v; want App", v, err)
 	}
+	if st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil || st.Reread != 0 {
+		t.Fatalf("the refresh after it re-read %d modules, %v; want none", st.Reread, err)
+	}
 
-	execIndex(t, s, `DELETE FROM meta WHERE k IN ('roots', 'reference_roots')`)
+	execIndex(t, s, `DELETE FROM meta WHERE k IN ('roots', 'reference_roots', 'roots_generation')`)
 	tree.ReferenceRoots = Roots{"Dep": true}
 	if st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil || st.Reread != 1 {
 		t.Fatalf("the first refresh with reference_roots of an index without recorded roots re-read %d modules, %v; want App", st.Reread, err)
 	}
 	if got := usesOfTarget(t, s, "Dep.c"); !slices.Equal(got, []string{"App.g of App: proof"}) {
 		t.Fatalf("uses of Dep.c after the upgrade: %v", got)
+	}
+}
+
+// A declindex older than reference_roots refuses a configuration that names them, but it opens an index of the
+// same schema with a configuration that does not, re-reads a changed module keeping only its roots' uses, and
+// leaves the meta keys as they were. The next refresh by this one finds that another writer wrote the index since
+// its own last write and re-reads every module, so the dependency's uses come back.
+func TestARefreshAfterAnOlderWriterRereadsEveryModule(t *testing.T) {
+	dir := t.TempDir()
+	app := leanModule{name: "App", decls: []string{"App.f"},
+		src:  "theorem App.f (h : Dep.T.mk = Dep.T.mk) : True := trivial\n",
+		uses: []leanUse{{"Dep.T.mk", "Dep.Defs", "Dep.T.mk"}}}
+	tree := leanTree(t, dir, app,
+		leanModule{name: "Other", decls: []string{"Other.k"}, src: "theorem Other.k (h : Dep.c = Dep.c) : True := trivial\n",
+			uses: []leanUse{{"Dep.c", "Dep.Defs", "Dep.c"}}})
+	tree.ReferenceRoots = Roots{"Dep": true}
+	ctx := context.Background()
+	s := openStore(t)
+	if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil || st.Reread != 0 {
+		t.Fatalf("a second refresh by this declindex re-read %d modules, %v; want none", st.Reread, err)
+	}
+	before := map[string]string{}
+	for _, k := range []string{"roots", "reference_roots", "roots_generation"} {
+		v, err := s.Meta(ctx, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[k] = v
+	}
+
+	// The older writer: App's build changed, and its refresh re-reads App alone and keeps no use of Dep's
+	// constants. This declindex stands in for it: the reference_roots it would not compare are made its own
+	// beforehand, and the meta keys it would not write are put back afterwards, so that only the generation
+	// records its write.
+	app.src = "theorem App.f (h : Dep.T.mk = Dep.T.mk) : True := True.intro\n"
+	app.write(t, dir)
+	older := tree
+	older.ReferenceRoots = nil
+	execIndex(t, s, `UPDATE meta SET v = '' WHERE k = 'reference_roots'`)
+	if st, err := s.Refresh(ctx, older, RefreshOptions{Commit: "two"}); err != nil || st.Reread != 1 {
+		t.Fatalf("the older writer's refresh re-read %d modules, %v; want App", st.Reread, err)
+	}
+	for k, v := range before {
+		execIndex(t, s, `UPDATE meta SET v = $2 WHERE k = $1`, k, v)
+	}
+	if got := usesOfTarget(t, s, "Dep.T.mk"); len(got) != 0 {
+		t.Fatalf("the older writer kept uses of Dep.T.mk: %v", got)
+	}
+	if got := usesOfTarget(t, s, "Dep.c"); len(got) != 1 {
+		t.Fatalf("the older writer re-read Other: uses of Dep.c %v", got)
+	}
+
+	if st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); err != nil || st.Reread != 2 {
+		t.Fatalf("the refresh after the older writer re-read %d modules, %v; want App and Other", st.Reread, err)
+	}
+	if got := usesOfTarget(t, s, "Dep.T.mk"); !slices.Equal(got, []string{"App.f of App: stmt"}) {
+		t.Fatalf("uses of Dep.T.mk after the older writer: %v", got)
+	}
+	if got := usesOfTarget(t, s, "Dep.c"); !slices.Equal(got, []string{"Other.k of Other: stmt"}) {
+		t.Fatalf("uses of Dep.c after the older writer: %v", got)
+	}
+	if st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); err != nil || st.Reread != 0 {
+		t.Fatalf("the refresh after that re-read %d modules, %v; want none", st.Reread, err)
 	}
 }

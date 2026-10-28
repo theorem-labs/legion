@@ -124,9 +124,15 @@ func LoadConfig(path string) (Config, error) {
 	if len(c.Roots) == 0 {
 		return Config{}, fmt.Errorf("%s: roots are required: the first components of the project's module names", path)
 	}
+	// The index records each set joined by commas (rootsKey): a root with a comma would make two sets one value.
+	for _, r := range c.Roots {
+		if strings.Contains(r, ",") {
+			return Config{}, fmt.Errorf("%s: roots %q: a module root has no comma", path, r)
+		}
+	}
 	for _, r := range c.ReferenceRoots {
-		if r == "" || strings.Contains(r, ".") || slices.Contains(c.Roots, r) {
-			return Config{}, fmt.Errorf("%s: reference_roots %q: each must be a module root (no dot) that roots does not name", path, r)
+		if r == "" || strings.ContainsAny(r, ".,") || slices.Contains(c.Roots, r) {
+			return Config{}, fmt.Errorf("%s: reference_roots %q: each must be a module root (no dot, no comma) that roots does not name", path, r)
 		}
 	}
 	if c.Registry != "" {
