@@ -97,6 +97,11 @@ func (s *source) offset(l, c int) (int, bool) {
 	return s.starts[l] + b, true
 }
 
+// has reports whether the source has a 0-based line and UTF-16 column: the line exists and is at least that long.
+func (s *source) has(l, c int) bool {
+	return l >= 0 && l < len(s.starts) && c >= 0 && c <= u16Len(s.line(l))
+}
+
 // commandAt reports whether the source has a command at a range recorded in 0-based lines and UTF-16 columns: the
 // range starts at its line's first non-blank character and ends after a non-blank one, at its line's end or before
 // only blanks and a `--` comment. A line shorter than the recorded end fails, as does a range over lines that are

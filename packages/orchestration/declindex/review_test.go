@@ -117,7 +117,7 @@ func TestLoadOwnersChecksTheConfiguredFormat(t *testing.T) {
 // same name, is a use of the declaration it belongs to: an edge from A.f to A.f.go.
 func TestAUseOfItsOwnUndeclaredParentIsAnEdgeFromItsOwner(t *testing.T) {
 	dir := t.TempDir()
-	writeModule(t, dir, "A", `{"version":5,"module":"A","decls":{"A.f":[0,0,0,15,0,4,0,7]},`+
+	writeModule(t, dir, "A", `{"version":5,"module":"A","decls":{"A.f":[0,0,0,13,0,4,0,7]},`+
 		`"references":{"{\"c\":{\"m\":\"A\",\"n\":\"A.f.go\"}}":{"definition":null,"usages":[[0,11,0,13,"A.f.go"]]}}}`,
 		"def A.f := go\n")
 	s := refreshed(t, Tree{Source: dir, Lib: dir, Roots: Roots{"A": true}})
@@ -221,23 +221,36 @@ func TestASelectionOfTheWholeCommandHolds(t *testing.T) {
 	}
 }
 
-// A declaration whose recorded range lies past the end of a source that lost its lines is stale, and reading it
-// slices no text outside the source; nor does a name Lean made, which passes without a written name to compare.
+// A declaration whose recorded range the source no longer has (its line is gone or shorter) is stale, with no hash,
+// and reading it slices no text outside the source. So is a name Lean made, which has no written name to compare:
+// it holds only while its range is in the source and selects text. Each module holds one declaration, so that no
+// other one's count hides it.
 func TestADeclarationPastTheEndOfANewerSourceIsStale(t *testing.T) {
-	ilean := []byte(`{"version":5,"module":"M","decls":{"T.t":[0,4,0,32,0,12,0,15],` +
-		`"M._aux_M___elabRules_1":[0,4,0,32,0,4,0,32]},"references":{}}`)
-	built, err := ParseModule("M", ilean, []byte("    theorem T.t : True := trivial\n"), Roots{"M": true})
-	if err != nil || built.Stale != 0 {
-		t.Fatalf("the built source is stale: %d %v", built.Stale, err)
-	}
-	md, err := ParseModule("M", ilean, []byte("\n"), Roots{"M": true})
-	if err != nil || md.Stale != 1 {
-		t.Fatalf("a declaration past the end of the source: stale %d, %v; want 1", md.Stale, err)
-	}
-	for _, d := range md.Decls {
-		if d.Name == "T.t" && d.StmtHash != "" {
-			t.Errorf("T.t has hash %s from a source that lost its line", d.StmtHash)
-		}
+	built := "    theorem T.t : True := trivial\n"
+	for _, c := range []struct{ name, decl, now string }{
+		{"a theorem whose line is gone", `"T.t":[0,4,0,32,0,12,0,15]`, "\n"},
+		{"a theorem whose line is shorter", `"T.t":[0,4,0,32,0,12,0,15]`, "    theorem T.t\n"},
+		{"a name Lean made whose line is gone", `"M._aux_M___elabRules_1":[0,4,0,32,0,4,0,32]`, "\n"},
+		{"a name Lean made whose line is shorter", `"M._aux_M___elabRules_1":[0,4,0,32,0,4,0,32]`, "    theorem T.t\n"},
+		{"a name Lean made over blanks", `"M._aux_M___elabRules_1":[0,4,0,32,0,4,0,32]`, strings.Repeat(" ", 40) + "\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ilean := `{"version":5,"module":"M","decls":{` + c.decl + `},"references":{}}`
+			dir := t.TempDir()
+			writeModule(t, dir, "M", ilean, built)
+			tree := Tree{Source: dir, Lib: dir, Roots: Roots{"M": true}}
+			if md, err := readModule(tree, tree.Roots, "M"); err != nil || md.Stale != 0 {
+				t.Fatalf("the built source: stale %d, %v", md.Stale, err)
+			}
+			writeModule(t, dir, "M", ilean, c.now)
+			md, err := readModule(tree, tree.Roots, "M")
+			if err == nil || md.Stale != 1 {
+				t.Fatalf("stale %d, %v; want the module unreadable", md.Stale, err)
+			}
+			if h := md.Decls[0].StmtHash; h != "" {
+				t.Errorf("hash %s from a source newer than its build", h)
+			}
+		})
 	}
 }
 

@@ -164,40 +164,40 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 			return ModuleData{}, fmt.Errorf("%s.ilean: declaration %s has a range of %d numbers", rel, name, len(r))
 		}
 		d := Decl{Name: name, Short: name[strings.LastIndexByte(name, '.')+1:], Module: md.Module, Line: r[0] + 1}
-		if s != nil {
-			a, okA := s.offset(r[0], r[1])
-			sel, okS := s.offset(r[4], r[5])
-			selEnd, okSE := s.offset(r[6], r[7])
-			e, okE := s.offset(r[2], r[3])
-			if okA && okS {
-				d.Kind = "other"
-				if sel >= a {
-					d.Kind = declKind(s.text, a, min(next(s.text, sel), len(s.text)))
+		switch {
+		case s == nil:
+		case !s.has(r[0], r[1]) || !s.has(r[2], r[3]) || !s.has(r[4], r[5]) || !s.has(r[6], r[7]):
+			// The source no longer has the recorded range: it is newer than its reference file.
+			md.Stale++
+		default:
+			a, _ := s.offset(r[0], r[1])
+			sel, _ := s.offset(r[4], r[5])
+			selEnd, _ := s.offset(r[6], r[7])
+			e, _ := s.offset(r[2], r[3])
+			d.Kind = "other"
+			if sel >= a {
+				d.Kind = declKind(s.text, a, min(next(s.text, sel), len(s.text)))
+			}
+			if b, ok := bodyStart(s.text, selEnd, next(s.text, e)); ok {
+				l, c := s.position(b)
+				sigends[name] = sigEnd{l, c}
+			}
+			// Lean records the whole command as the selection range of a declaration that the command makes
+			// without writing its name (a command macro's, a simproc, a computed field): there is no written name
+			// to compare, as for a name Lean made. Both ranges come from the reference file, so they are equal
+			// whatever the source holds now: such a declaration holds only where the current source still has a
+			// command at the recorded range.
+			holds := selectionHolds(s.text, name, sel, selEnd)
+			if !holds && sel == a && selEnd == e && s.commandAt(r[0], r[1], r[2], r[3]) {
+				holds = StatementText(s.text, a, e, selEnd, d.Kind) != ""
+				if holds {
+					md.Commands++
 				}
-				if okSE && okE {
-					if b, ok := bodyStart(s.text, selEnd, next(s.text, e)); ok {
-						l, c := s.position(b)
-						sigends[name] = sigEnd{l, c}
-					}
-					// Lean records the whole command as the selection range of a declaration that the command
-					// makes without writing its name (a command macro's, a simproc, a computed field): there is no
-					// written name to compare, as for a name Lean made. Both ranges come from the reference file,
-					// so they are equal whatever the source holds now: such a declaration holds only where the
-					// current source still has a command at the recorded range. The statement is read only from a
-					// range that one of the two checks found in the source.
-					holds := selectionHolds(s.text, name, sel, selEnd)
-					if !holds && sel == a && selEnd == e && s.commandAt(r[0], r[1], r[2], r[3]) {
-						holds = StatementText(s.text, a, e, selEnd, d.Kind) != ""
-						if holds {
-							md.Commands++
-						}
-					}
-					if holds {
-						d.StmtHash = StatementHash(StatementText(s.text, a, e, selEnd, d.Kind))
-					} else {
-						md.Stale++
-					}
-				}
+			}
+			if holds {
+				d.StmtHash = StatementHash(StatementText(s.text, a, e, selEnd, d.Kind))
+			} else {
+				md.Stale++
 			}
 		}
 		md.Decls = append(md.Decls, d)
@@ -309,12 +309,12 @@ var unquote = strings.NewReplacer("«", "", "»", "")
 
 // selectionHolds reports whether the source still holds the declaration at the position its reference file
 // recorded: the selection range is its name (or a dotted suffix of it, or the name written from `_root_`), or the
-// command of a declaration Lean names itself. A name Lean made has no written name to compare and passes. A
-// source newer than its build fails it.
+// command of a declaration Lean names itself. A name Lean made has no written name to compare: it passes where the
+// selection still holds text. A source newer than its build fails it.
 func selectionHolds(text, name string, sel, selEnd int) bool {
 	want := userName(name)
 	if madeByLean(want) {
-		return true
+		return sel >= 0 && sel <= selEnd && selEnd <= len(text) && strings.TrimFunc(text[sel:selEnd], isSpace) != ""
 	}
 	if sel < 0 || sel > len(text) {
 		return false
