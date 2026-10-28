@@ -347,7 +347,7 @@ func TestAManyNamesLandingProbesTheEdgesOfEachName(t *testing.T) {
 	}
 	rewritten := []string{"New"}
 	var plan string
-	if err := s.q.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+edgesAtOrBelowNames, changed, rewritten).Scan(&plan); err != nil {
+	if err := s.q.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+edgesAtOrBelowNames, changed, rewritten, rangeNames(changed)).Scan(&plan); err != nil {
 		t.Fatal(err)
 	}
 	// planNode is one node of the plan, with the fields the test reads.
@@ -396,6 +396,62 @@ func TestAManyNamesLandingProbesTheEdgesOfEachName(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("the edges at or below %d names: got %d constants, want %d", names, len(got), len(want))
+	}
+}
+
+// A landing of a declaration that many modules use sends each constant and owner once, not once for each use, and
+// not once more for each changed name it lies below. Two hundred modules use A.X.eq_1 and A.X.Y.eq_1, and each also
+// uses A.X itself. A landing changes A.X alone, then ten names: A.X, A.X.Y below it, and eight others. The query
+// gives each (constant, owner) once, and the names below another changed name are not probed again.
+func TestALandingOfAWidelyUsedNameReadsEachConstantOnce(t *testing.T) {
+	ctx := context.Background()
+	tg := indexTarget(t)
+	s := openAt(t, tg)
+	var rows [][]any
+	for i := range 200 {
+		user := fmt.Sprintf("U%03d", i)
+		for _, target := range []string{"A.X", "A.X.eq_1", "A.X.Y.eq_1"} {
+			rows = append(rows, []any{target, "A", user + ".u", user, true, "theorem", "A.X", "A", false})
+		}
+	}
+	conn, err := pgx.Connect(ctx, tg.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.CopyFrom(ctx, pgx.Identifier{tg.Index, "edges"}, edgeColumns, pgx.CopyFromRows(rows)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "ANALYZE "+pgx.Identifier{tg.Index, "edges"}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	ten := []string{"A.X", "A.X.Y", "B.a", "B.b", "B.c", "B.c.d", "C", "C.e", "D", "E"}
+	for _, c := range []struct {
+		names, ranged []string
+	}{
+		{[]string{"A.X"}, []string{"A.X"}},
+		{ten, []string{"A.X", "B.a", "B.b", "B.c", "C", "D", "E"}},
+	} {
+		if got := rangeNames(c.names); !slices.Equal(got, c.ranged) {
+			t.Errorf("the names of %v probed by their range: %v, want %v", c.names, got, c.ranged)
+		}
+		var got []string
+		res, err := s.q.Query(ctx, edgesAtOrBelowNames, c.names, []string{"New"}, rangeNames(c.names))
+		if err := eachRow(res, err, func(r pgx.Rows) error {
+			var target, tmodule, owner, ownerModule string
+			var byClosure bool
+			if err := r.Scan(&target, &tmodule, &owner, &ownerModule, &byClosure); err != nil {
+				return err
+			}
+			got = append(got, target)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		slices.Sort(got)
+		if want := []string{"A.X", "A.X.Y.eq_1", "A.X.eq_1"}; !slices.Equal(got, want) {
+			t.Errorf("a landing of %d names over 600 uses gives the rows %v, want each constant once: %v", len(c.names), got, want)
+		}
 	}
 }
 
