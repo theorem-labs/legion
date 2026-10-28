@@ -189,3 +189,30 @@ func TestSelectionHoldsForQuotedNamesLeanMade(t *testing.T) {
 		t.Error("madeByLean misreads quoted components")
 	}
 }
+
+// Lean records the whole command as the selection range of a declaration that the command makes without writing
+// its name: one a command macro makes (Init.Data.UInt.Decidable), a simproc (Iris.HeapLang.ProofMode), a computed
+// field (Init.Prelude's Lean.Name.hash, from its doc comment on). The source and the build agree, so the module is
+// read, and each declaration gets its statement hash.
+func TestASelectionOfTheWholeCommandHolds(t *testing.T) {
+	src := "declare_decidable_uint_quantifiers UInt8 8\n" +
+		"simproc [wp_expr_simp] String.reduceEq_copy (( _ : String) = _) := String.reduceEq\n" +
+		"/-- The hash of a name. -/\n" +
+		"structure N where\n"
+	ilean := `{"version":5,"module":"M","decls":{` +
+		`"UInt8.forall_iff_forall_ofBitVec":[0,0,0,42,0,0,0,42],` +
+		`"Iris.ProofMode.String.reduceEq_copy":[1,0,1,82,1,0,1,82],` +
+		`"Lean.Name.hash":[2,0,3,17,2,0,3,17]},"references":{}}`
+	md, err := ParseModule("M", []byte(ilean), []byte(src), Roots{"M": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md.Stale != 0 {
+		t.Fatalf("%d declarations taken for moved: a command's own selection is not evidence that the source moved", md.Stale)
+	}
+	for _, d := range md.Decls {
+		if d.StmtHash == "" {
+			t.Errorf("%s has no statement hash", d.Name)
+		}
+	}
+}

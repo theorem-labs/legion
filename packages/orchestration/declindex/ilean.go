@@ -176,7 +176,10 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 						l, c := s.position(b)
 						sigends[name] = sigEnd{l, c}
 					}
-					if selectionHolds(s.text, name, sel, selEnd) {
+					// Lean records the whole command as the selection range of a declaration that the command
+					// makes without writing its name (a command macro's, a simproc, a computed field): there is no
+					// written name to compare, as for a name Lean made.
+					if (sel == a && selEnd == e) || selectionHolds(s.text, name, sel, selEnd) {
 						d.StmtHash = StatementHash(StatementText(s.text, a, e, selEnd, d.Kind))
 					} else {
 						md.Stale++
