@@ -11,8 +11,8 @@ import (
 // understands. A file of another version is refused, never guessed at.
 const IleanVersion = 5
 
-// Roots are the first components of the module names whose declarations the index follows: the project's own
-// modules, not the toolchain's or a dependency's.
+// Roots are first components of module names: the project's own modules (Tree.Roots), whose declarations the index
+// follows, or those of the modules whose constants' uses a reader keeps (ParseModule's roots, Tree.keptUses).
 type Roots map[string]bool
 
 // Has reports whether module belongs to the roots.
@@ -34,7 +34,7 @@ type Decl struct {
 	StmtHash string
 }
 
-// Use is one reference that elaboration recorded to a declaration of the roots.
+// Use is one reference that elaboration recorded to a constant of the roots ParseModule was given.
 type Use struct {
 	Target string
 	// TargetModule is the module that Lean recorded for Target: the one that declares it, or for a constant that
@@ -129,7 +129,7 @@ type sigEnd struct{ line, col int }
 
 // ParseModule reads one module's reference file (.ilean) and its source text. src is nil when the source file is
 // missing: declarations then have no kind and no hash, and uses stay unclassified. Only references to
-// declarations of roots modules are kept.
+// constants of roots modules are kept (a refresh passes Tree.keptUses: the project's and its reference roots).
 func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error) {
 	var f ileanFile
 	if err := json.Unmarshal(ilean, &f); err != nil {

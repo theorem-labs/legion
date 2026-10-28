@@ -21,8 +21,9 @@ var edgeColumns = []string{"target", "tmodule", "dst", "module", "stmt", "kind",
 //
 // Which declaration a target belongs to (`X.wp` is X's field while its module declares no `X.wp`) also depends on
 // the declarations and imports of modules this refresh does not re-read, so a later landing can move it:
-// reresolveOwners updates the rows that one moved.
-func insertEdges(ctx context.Context, tx pgx.Tx, results []ModuleData, errs []error) error {
+// reresolveOwners updates the rows that one moved. A target of a module outside roots is a dependency's constant
+// (Tree.ReferenceRoots): the index holds no declaration of it, so it is its own owner, and no landing moves that.
+func insertEdges(ctx context.Context, tx pgx.Tx, results []ModuleData, errs []error, roots Roots) error {
 	type pair struct{ target, tmodule, dst string }
 	type edge struct {
 		pair
@@ -54,8 +55,10 @@ func insertEdges(ctx context.Context, tx pgx.Tx, results []ModuleData, errs []er
 		}
 		for _, p := range order {
 			edges = append(edges, edge{p, md.Module, kind[p.dst], agg[p]})
-			names[p.target] = true
-			consts[declRef{p.tmodule, p.target}] = true
+			if roots.Has(p.tmodule) {
+				names[p.target] = true
+				consts[declRef{p.tmodule, p.target}] = true
+			}
 		}
 	}
 	if len(edges) == 0 {
@@ -65,13 +68,16 @@ func insertEdges(ctx context.Context, tx pgx.Tx, results []ModuleData, errs []er
 	if err != nil {
 		return err
 	}
-	owned, err := owners.all(consts)
+	resolved, err := owners.all(consts)
 	if err != nil {
 		return err
 	}
 	rows := make([][]any, len(edges))
 	for i, e := range edges {
-		o := owned[declRef{e.tmodule, e.target}]
+		o := owned{ref: declRef{e.tmodule, e.target}} // a dependency's constant is its own owner
+		if roots.Has(e.tmodule) {
+			o = resolved[o.ref]
+		}
 		// A row that does not fit one entry of edges_owner is an index defect of the tree, named here, and
 		// never a failure inside the database (NameTooLongError).
 		if err := checkEdge(o.ref.module, o.ref.name, e.dst, e.module, e.kind); err != nil {
@@ -168,8 +174,14 @@ func reresolveOwners(ctx context.Context, tx pgx.Tx, r reference, before indexBe
 		return err
 	}
 	rows, err := ownersToCheck(ctx, tx, names, modules, rewritten)
-	if err != nil || len(rows) == 0 {
+	if err != nil {
 		return err
+	}
+	// A dependency's constant is its own owner whatever the index declares (insertEdges): a changed name of the
+	// project that its target lies below must not give it the owner the project's declarations would.
+	maps.DeleteFunc(rows, func(c constOwner, _ bool) bool { return !r.roots.Has(c.ref.module) })
+	if len(rows) == 0 {
+		return nil
 	}
 	targets := map[string]bool{}
 	consts := map[declRef]bool{}

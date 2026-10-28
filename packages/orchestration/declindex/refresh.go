@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +25,26 @@ type Tree struct {
 	// Lib is the build's library directory for the project's own modules (Lake's .lake/build/lib/lean): their
 	// .ilean, .olean and Lake's .hash files.
 	Lib string
-	// Roots are the project's module roots; only uses of their declarations are kept.
+	// Roots are the project's module roots; uses of their declarations are kept.
 	Roots Roots
+	// ReferenceRoots are the module roots of dependencies whose constants' uses are kept too (Config.ReferenceRoots).
+	// The index holds none of their declarations: such a constant belongs to no declaration of the index.
+	ReferenceRoots Roots
+}
+
+// keptUses are the roots whose constants' uses the index keeps.
+func (t Tree) keptUses() Roots {
+	out := Roots{}
+	maps.Copy(out, t.Roots)
+	maps.Copy(out, t.ReferenceRoots)
+	return out
+}
+
+// rootsKey is the meta value that records a set of roots (writeMeta): their names, sorted, joined by commas.
+// LoadConfig refuses a root that holds a comma, no roots at all and an empty reference root, so two sets of a
+// configuration never share a value.
+func rootsKey(r Roots) string {
+	return strings.Join(slices.Sorted(maps.Keys(r)), ",")
 }
 
 // RefreshOptions control one refresh.
@@ -247,7 +266,7 @@ func (s *Store) Refresh(ctx context.Context, tree Tree, opt RefreshOptions) (Ref
 func (s *Store) refreshLocked(ctx context.Context, tree Tree, generation int64, opt RefreshOptions) (RefreshStats, error) {
 	t0 := time.Now()
 	st := RefreshStats{WithoutForms: []FormsClash{}}
-	r, err := s.readReference(ctx, tree, opt.jobs())
+	r, err := s.readReference(ctx, tree, opt.jobs(), generation)
 	if err != nil {
 		return st, err
 	}
@@ -336,19 +355,43 @@ type reference struct {
 	gone                   []string
 	results                []ModuleData
 	errs                   []error
+	// roots are the tree's own module roots: a use of a constant outside them is a dependency's (insertEdges). This
+	// read kept the uses of the constants of roots and of referenceRoots, and writeMeta records both.
+	roots, referenceRoots Roots
 }
 
 // readReference reads the tree's sources and build, and the index's sources and modules, and re-reads the modules
-// whose reference file or source changed, on jobs goroutines.
-func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (reference, error) {
+// whose reference file or source changed, on jobs goroutines. generation is the index's generation before this
+// refresh read anything of it.
+func (s *Store) readReference(ctx context.Context, tree Tree, jobs int, generation int64) (reference, error) {
 	var r reference
 	var err error
+	r.roots, r.referenceRoots = tree.Roots, tree.ReferenceRoots
 	if r.sources, r.sourcePrefix, err = readSources(tree); err != nil {
 		return r, err
 	}
 	if r.previousCommit, err = s.Meta(ctx, "commit"); err != nil {
 		return r, err
 	}
+	// A module whose reference file is unchanged keeps the uses its last read kept, so every module is read again
+	// when that read may have kept other uses: when the roots or the reference roots differ from those the index
+	// records, and when the last write of the index was not this declindex's (roots_generation, writeTxFrom). A
+	// declindex older than these meta keys writes the index of the same schema, keeping only its own roots' uses,
+	// and raises the generation without touching the keys; an index it wrote last records them stale or not at all.
+	stamp, err := s.Meta(ctx, "roots_generation")
+	if err != nil {
+		return r, err
+	}
+	storedRoots, err := s.Meta(ctx, "roots")
+	if err != nil {
+		return r, err
+	}
+	storedRefs, err := s.Meta(ctx, "reference_roots")
+	if err != nil {
+		return r, err
+	}
+	rereadAll := stamp != strconv.FormatInt(generation, 10) || storedRoots != rootsKey(r.roots) ||
+		storedRefs != rootsKey(r.referenceRoots)
 	if r.files, err = scan(tree, jobs); err != nil {
 		return r, fmt.Errorf("scan %s: %w", tree.Lib, err)
 	}
@@ -362,7 +405,7 @@ func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (referen
 	for _, f := range r.files {
 		seen[f.rel] = true
 		sourceChanged := r.sources != nil && r.sources[f.rel+".lean"] != r.storedSources[f.rel+".lean"]
-		if o, ok := r.old[f.rel]; !ok || o.ileanKey != f.ileanKey || sourceChanged {
+		if o, ok := r.old[f.rel]; !ok || o.ileanKey != f.ileanKey || sourceChanged || rereadAll {
 			r.changed = append(r.changed, f)
 		}
 	}
@@ -373,8 +416,9 @@ func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (referen
 	}
 	r.results = make([]ModuleData, len(r.changed))
 	r.errs = make([]error, len(r.changed))
+	kept := tree.keptUses()
 	parallel(len(r.changed), jobs, func(i int) {
-		r.results[i], r.errs[i] = readModule(tree, r.changed[i].rel)
+		r.results[i], r.errs[i] = readModule(tree, kept, r.changed[i].rel)
 	})
 	return r, nil
 }
@@ -509,16 +553,18 @@ func writeModules(ctx context.Context, tx pgx.Tx, r reference) error {
 			return fmt.Errorf("write the index's %s: %w", c.table, err)
 		}
 	}
-	return insertEdges(ctx, tx, r.results, r.errs)
+	return insertEdges(ctx, tx, r.results, r.errs, r.roots)
 }
 
 // writeMeta records the refresh in the meta table, and a change of commit as a landing.
 func (s *Store) writeMeta(ctx context.Context, tx pgx.Tx, r reference, commit string, unreadable int) error {
 	meta := map[string]string{
-		"commit":  commit,
-		"built":   time.Now().UTC().Format("2006-01-02T15:04Z"),
-		"errors":  fmt.Sprint(unreadable),
-		"sources": "",
+		"commit":          commit,
+		"roots":           rootsKey(r.roots),
+		"reference_roots": rootsKey(r.referenceRoots),
+		"built":           time.Now().UTC().Format("2006-01-02T15:04Z"),
+		"errors":          fmt.Sprint(unreadable),
+		"sources":         "",
 		// The tree's path below the root of its repository: land-hash reads LAND_TREE below it.
 		"source_prefix": r.sourcePrefix,
 	}
@@ -570,7 +616,8 @@ func relsOf(files []moduleFile) []string {
 	return out
 }
 
-func readModule(tree Tree, rel string) (ModuleData, error) {
+// readModule reads one module of the tree, keeping the uses of the constants of kept (Tree.keptUses).
+func readModule(tree Tree, kept Roots, rel string) (ModuleData, error) {
 	ilean, err := os.ReadFile(filepath.Join(tree.Lib, filepath.FromSlash(rel)+".ilean"))
 	if err != nil {
 		return ModuleData{}, err
@@ -584,7 +631,7 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 	} else if src == nil {
 		src = []byte{}
 	}
-	md, err := ParseModule(rel, ilean, src, tree.Roots)
+	md, err := ParseModule(rel, ilean, src, kept)
 	if err == nil && md.Stale > 0 {
 		return md, fmt.Errorf("%s.lean is newer than its build: %d declarations are not where its reference file records them", rel, md.Stale)
 	}

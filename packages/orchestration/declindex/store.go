@@ -51,9 +51,10 @@ CREATE TABLE uses (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NO
 CREATE INDEX uses_target ON uses (target);
 CREATE INDEX uses_module ON uses (module);
 -- target, tmodule: the used constant as Lean recorded it; dst, module: the user. owner, owner_module: the declaration
--- that the used constant belongs to (ownerResolver), resolved when the row is written and again when it changes;
--- by_closure: the index's imports decided that resolution: it went through the import closure of tmodule, or found
--- no declaration of the constant's names, so that a change of tmodule's closure can move the owner.
+-- that the used constant belongs to (ownerResolver), resolved when the row is written and again when it changes; a
+-- constant of a reference root (a dependency, Tree.ReferenceRoots) is its own owner. by_closure: the index's imports
+-- decided that resolution: it went through the import closure of tmodule, or found no declaration of the constant's
+-- names, so that a change of tmodule's closure can move the owner.
 CREATE TABLE edges (target text COLLATE "C" NOT NULL, tmodule text COLLATE "C" NOT NULL, dst text COLLATE "C" NOT NULL, module text COLLATE "C" NOT NULL, stmt boolean NOT NULL, kind text COLLATE "C" NOT NULL, owner text COLLATE "C" NOT NULL, owner_module text COLLATE "C" NOT NULL, by_closure boolean NOT NULL);
 CREATE INDEX edges_module ON edges (module);
 -- edges_owner is the index the reach walk reads: it visits a row for each edge out of its closure, and carries
@@ -429,8 +430,14 @@ func (s *Store) writeTxFrom(ctx context.Context, generation int64, f func(pgx.Tx
 	if err := f(tx); err != nil {
 		return unreachable(conn.Conn(), err)
 	}
+	// roots_generation is the generation the last write of a declindex that records roots and reference_roots left
+	// (readReference). A declindex older than those keys raises the generation alone.
 	if _, err := tx.Exec(ctx, `INSERT INTO meta (k, v) VALUES ('generation', '1')
 		ON CONFLICT (k) DO UPDATE SET v = (meta.v::bigint + 1)::text`); err != nil {
+		return unreachable(conn.Conn(), err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO meta (k, v) SELECT 'roots_generation', v FROM meta WHERE k = 'generation'
+		ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`); err != nil {
 		return unreachable(conn.Conn(), err)
 	}
 	return unreachable(conn.Conn(), tx.Commit(ctx))
