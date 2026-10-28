@@ -70,6 +70,7 @@ func isASCII(s string) bool {
 // point index within line. Past the end it gives the line's length.
 func u16Col(line string, c int) (byteIdx, cp int) {
 	if isASCII(line) {
+		c = min(c, len(line))
 		return c, c
 	}
 	n := 0

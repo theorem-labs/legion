@@ -220,6 +220,26 @@ func TestASelectionOfTheWholeCommandHolds(t *testing.T) {
 	}
 }
 
+// A declaration whose recorded range lies past the end of a source that lost its lines is stale, and reading it
+// slices no text outside the source; nor does a name Lean made, which passes without a written name to compare.
+func TestADeclarationPastTheEndOfANewerSourceIsStale(t *testing.T) {
+	ilean := []byte(`{"version":5,"module":"M","decls":{"T.t":[0,4,0,32,0,12,0,15],` +
+		`"M._aux_M___elabRules_1":[0,4,0,32,0,4,0,32]},"references":{}}`)
+	built, err := ParseModule("M", ilean, []byte("    theorem T.t : True := trivial\n"), Roots{"M": true})
+	if err != nil || built.Stale != 0 {
+		t.Fatalf("the built source is stale: %d %v", built.Stale, err)
+	}
+	md, err := ParseModule("M", ilean, []byte("\n"), Roots{"M": true})
+	if err != nil || md.Stale != 1 {
+		t.Fatalf("a declaration past the end of the source: stale %d, %v; want 1", md.Stale, err)
+	}
+	for _, d := range md.Decls {
+		if d.Name == "T.t" && d.StmtHash != "" {
+			t.Errorf("T.t has hash %s from a source that lost its line", d.StmtHash)
+		}
+	}
+}
+
 // A whole-command selection says nothing of the current source, since both of its ranges come from the reference
 // file: a source newer than its build still fails where the recorded range no longer holds a command, also when no
 // declaration that writes its name sits at or below the edit.
@@ -286,5 +306,45 @@ func TestCommandAt(t *testing.T) {
 		if got := s.commandAt(c.l0, c.c0, c.l1, c.c1); got != c.want {
 			t.Errorf("commandAt(%d, %d, %d, %d) = %v, want %v", c.l0, c.c0, c.l1, c.c1, got, c.want)
 		}
+	}
+}
+
+// commandAt cannot tell a command from another of the same length at the same place. Where Lake's build trace
+// records the source's hash, the refresh reads it for a module that has such a declaration: the trace of another
+// source makes the module unreadable. A fetch trace binds the source by age alone and decides nothing, nor does a
+// tree without traces.
+func TestABuildTraceDecidesAWholeCommandSelection(t *testing.T) {
+	built := "declare_decidable_uint_quantifiers UInt8 8\n"
+	changed := "declare_decidable_uint_quantifiers UInt8 9\n"
+	ilean := `{"version":5,"module":"M","decls":{"UInt8.forall_iff_forall_ofBitVec":[0,0,0,42,0,0,0,42]},"references":{}}`
+	trace := func(synthetic bool) string {
+		return `{"schemaVersion":"2025-09-10","inputs":[["M.lean","` + LakeTextHash([]byte(built)) + `"]],` +
+			`"outputs":{"i":"` + LakeTextHash([]byte(ilean)) + `.ilean"},"synthetic":` + map[bool]string{true: "true", false: "false"}[synthetic] + `}`
+	}
+	for _, c := range []struct {
+		name, src, trace string
+		unreadable       bool
+	}{
+		{"the built source", built, trace(false), false},
+		{"a changed command of the same length", changed, trace(false), true},
+		{"the change with a fetch trace", changed, trace(true), false},
+		{"the change without a trace", changed, "", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeModule(t, dir, "M", ilean, c.src)
+			if c.trace != "" {
+				if err := os.WriteFile(filepath.Join(dir, "M.trace"), []byte(c.trace), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			md, err := readModule(Tree{Source: dir, Lib: dir, Roots: Roots{"M": true}}, "M")
+			if md.Commands != 1 {
+				t.Fatalf("%d declarations held by their command, want 1", md.Commands)
+			}
+			if (err != nil) != c.unreadable {
+				t.Fatalf("readModule: %v; want unreadable %v", err, c.unreadable)
+			}
+		})
 	}
 }

@@ -62,6 +62,9 @@ type ModuleData struct {
 	// Stale counts the declarations whose recorded position does not hold their name in the source: the source is
 	// newer than the reference file. Their statement hashes are left empty.
 	Stale int
+	// Commands counts the declarations that hold only because the source still has a command at their whole-command
+	// selection (source.commandAt). That check compares no hash; readModule asks the module's build trace too.
+	Commands int
 }
 
 type ileanFile struct {
@@ -180,11 +183,17 @@ func ParseModule(rel string, ilean, src []byte, roots Roots) (ModuleData, error)
 					// makes without writing its name (a command macro's, a simproc, a computed field): there is no
 					// written name to compare, as for a name Lean made. Both ranges come from the reference file,
 					// so they are equal whatever the source holds now: such a declaration holds only where the
-					// current source still has a command at the recorded range.
-					stmt := StatementText(s.text, a, e, selEnd, d.Kind)
-					if selectionHolds(s.text, name, sel, selEnd) ||
-						(sel == a && selEnd == e && stmt != "" && s.commandAt(r[0], r[1], r[2], r[3])) {
-						d.StmtHash = StatementHash(stmt)
+					// current source still has a command at the recorded range. The statement is read only from a
+					// range that one of the two checks found in the source.
+					holds := selectionHolds(s.text, name, sel, selEnd)
+					if !holds && sel == a && selEnd == e && s.commandAt(r[0], r[1], r[2], r[3]) {
+						holds = StatementText(s.text, a, e, selEnd, d.Kind) != ""
+						if holds {
+							md.Commands++
+						}
+					}
+					if holds {
+						d.StmtHash = StatementHash(StatementText(s.text, a, e, selEnd, d.Kind))
 					} else {
 						md.Stale++
 					}

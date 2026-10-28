@@ -575,7 +575,8 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 	if err != nil {
 		return ModuleData{}, err
 	}
-	src, err := os.ReadFile(filepath.Join(tree.Source, filepath.FromSlash(rel)+".lean"))
+	sourcePath := filepath.Join(tree.Source, filepath.FromSlash(rel)+".lean")
+	src, err := os.ReadFile(sourcePath)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return ModuleData{}, err
@@ -587,6 +588,17 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 	md, err := ParseModule(rel, ilean, src, tree.Roots)
 	if err == nil && md.Stale > 0 {
 		return md, fmt.Errorf("%s.lean is newer than its build: %d declarations are not where its reference file records them", rel, md.Stale)
+	}
+	// A declaration held by its whole-command selection alone was checked against the source's text, not its hash:
+	// where Lake's build trace records the source's hash, it decides.
+	if err == nil && md.Commands > 0 {
+		differs, traceErr := traceSourceDiffers(tree.Lib, rel, sourcePath, src)
+		if traceErr != nil {
+			return md, traceErr
+		}
+		if differs {
+			return md, fmt.Errorf("%s.lean is newer than its build: its build trace records another source", rel)
+		}
 	}
 	return md, err
 }

@@ -207,6 +207,26 @@ func staleFreshness(reason string) Freshness {
 	return Freshness{State: FreshnessStale, Reason: reason}
 }
 
+// traceSourceDiffers reports whether the Lake build trace beside the reference file lib/rel.ilean records a hash of
+// the source sourcePath other than src's. Only a build trace binds the source by its hash, so no trace, a fetch
+// trace (which binds it by age alone), a trace of another schema or one that names no such source shows nothing.
+func traceSourceDiffers(lib, rel, sourcePath string, src []byte) (bool, error) {
+	raw, err := os.ReadFile(filepath.Join(lib, filepath.FromSlash(rel)+".trace"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var metadata lakeTraceMetadata
+	if json.Unmarshal(raw, &metadata) != nil || metadata.SchemaVersion != lakeTraceSchemaVersion ||
+		metadata.Synthetic == nil || *metadata.Synthetic {
+		return false, nil
+	}
+	hash, ok := sourceTraceHash(metadata.Inputs, sourcePath, rel+".lean")
+	return ok && hash != LakeTextHash(src), nil
+}
+
 func fileExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
