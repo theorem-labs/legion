@@ -39,10 +39,9 @@ func (t Tree) keptUses() Roots {
 	return out
 }
 
-// referenceRootsKey is the meta value that records the reference roots a refresh kept uses of: a change of it
-// re-reads every module, whose reference file is the same and whose kept uses are not.
-func (t Tree) referenceRootsKey() string {
-	return strings.Join(slices.Sorted(maps.Keys(t.ReferenceRoots)), ",")
+// rootsKey is the meta value that records a set of roots (writeMeta): their names, sorted, joined by commas.
+func rootsKey(r Roots) string {
+	return strings.Join(slices.Sorted(maps.Keys(r)), ",")
 }
 
 // RefreshOptions control one refresh.
@@ -353,10 +352,9 @@ type reference struct {
 	gone                   []string
 	results                []ModuleData
 	errs                   []error
-	// roots are the tree's own module roots: a use of a constant outside them is a dependency's (insertEdges).
-	roots Roots
-	// referenceRoots is the tree's referenceRootsKey, which writeMeta records.
-	referenceRoots string
+	// roots are the tree's own module roots: a use of a constant outside them is a dependency's (insertEdges). This
+	// read kept the uses of the constants of roots and of referenceRoots, and writeMeta records both.
+	roots, referenceRoots Roots
 }
 
 // readReference reads the tree's sources and build, and the index's sources and modules, and re-reads the modules
@@ -364,18 +362,31 @@ type reference struct {
 func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (reference, error) {
 	var r reference
 	var err error
-	r.roots, r.referenceRoots = tree.Roots, tree.referenceRootsKey()
+	r.roots, r.referenceRoots = tree.Roots, tree.ReferenceRoots
 	if r.sources, r.sourcePrefix, err = readSources(tree); err != nil {
 		return r, err
 	}
 	if r.previousCommit, err = s.Meta(ctx, "commit"); err != nil {
 		return r, err
 	}
-	storedRefs, err := s.Meta(ctx, "reference_roots")
-	if err != nil {
-		return r, err
+	// A module whose reference file is unchanged keeps the uses its last read kept: when the roots or the reference
+	// roots differ from that read's, every module is read again. An index that a declindex older than these meta
+	// keys wrote records neither: its reference roots were none, and its roots are taken to be the configuration's,
+	// so the first refresh by this one re-reads no module for want of them.
+	rereadAll := false
+	for _, m := range []struct {
+		key   string
+		roots Roots
+	}{{"roots", r.roots}, {"reference_roots", r.referenceRoots}} {
+		stored, err := s.Meta(ctx, m.key)
+		if err != nil {
+			return r, err
+		}
+		if m.key == "roots" && stored == "" {
+			continue
+		}
+		rereadAll = rereadAll || stored != rootsKey(m.roots)
 	}
-	rereadAll := storedRefs != r.referenceRoots
 	if r.files, err = scan(tree, jobs); err != nil {
 		return r, fmt.Errorf("scan %s: %w", tree.Lib, err)
 	}
@@ -400,8 +411,9 @@ func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (referen
 	}
 	r.results = make([]ModuleData, len(r.changed))
 	r.errs = make([]error, len(r.changed))
+	kept := tree.keptUses()
 	parallel(len(r.changed), jobs, func(i int) {
-		r.results[i], r.errs[i] = readModule(tree, r.changed[i].rel)
+		r.results[i], r.errs[i] = readModule(tree, kept, r.changed[i].rel)
 	})
 	return r, nil
 }
@@ -543,7 +555,8 @@ func writeModules(ctx context.Context, tx pgx.Tx, r reference) error {
 func (s *Store) writeMeta(ctx context.Context, tx pgx.Tx, r reference, commit string, unreadable int) error {
 	meta := map[string]string{
 		"commit":          commit,
-		"reference_roots": r.referenceRoots,
+		"roots":           rootsKey(r.roots),
+		"reference_roots": rootsKey(r.referenceRoots),
 		"built":           time.Now().UTC().Format("2006-01-02T15:04Z"),
 		"errors":          fmt.Sprint(unreadable),
 		"sources":         "",
@@ -598,7 +611,8 @@ func relsOf(files []moduleFile) []string {
 	return out
 }
 
-func readModule(tree Tree, rel string) (ModuleData, error) {
+// readModule reads one module of the tree, keeping the uses of the constants of kept (Tree.keptUses).
+func readModule(tree Tree, kept Roots, rel string) (ModuleData, error) {
 	ilean, err := os.ReadFile(filepath.Join(tree.Lib, filepath.FromSlash(rel)+".ilean"))
 	if err != nil {
 		return ModuleData{}, err
@@ -612,7 +626,7 @@ func readModule(tree Tree, rel string) (ModuleData, error) {
 	} else if src == nil {
 		src = []byte{}
 	}
-	md, err := ParseModule(rel, ilean, src, tree.keptUses())
+	md, err := ParseModule(rel, ilean, src, kept)
 	if err == nil && md.Stale > 0 {
 		return md, fmt.Errorf("%s.lean is newer than its build: %d declarations are not where its reference file records them", rel, md.Stale)
 	}
