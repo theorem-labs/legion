@@ -92,16 +92,14 @@ func (e *unableError) Unwrap() error { return e.err }
 var stoppedBy atomic.Value
 
 // main cancels the command on SIGTERM, SIGINT or SIGHUP, so that the build and the toolchain processes it started
-// are killed with their process groups before it exits, rather than left running without it. A second signal ends
-// the process at once.
+// are killed with their process groups before it exits, rather than left running without it. It keeps catching
+// those signals until the command returns, so a later one changes nothing.
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	go func() {
-		s := <-signals
-		stoppedBy.Store(s)
-		signal.Stop(signals)
+		stoppedBy.Store(<-signals)
 		cancel()
 	}()
 	code := run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr)
