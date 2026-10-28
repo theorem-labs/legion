@@ -3,6 +3,7 @@ package declindex
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"slices"
 	"sort"
@@ -290,9 +291,118 @@ func TestARefreshFromNothingReadsNoEdgeBack(t *testing.T) {
 	}
 }
 
+// A landing that adds many declaration names (a new root's thousands of modules) reads the edges of the other modules
+// at or below each name by a probe of edges_target for that name, not by a join filter over every row of edges
+// (edgesAtOrBelowNames). With 20,000 names against 220,000 edges, Postgres 17 planned that join filter for the query
+// as it was before, a plain join under UNION, and the query ran for 277 s. Postgres 16 probed edges_target for that
+// query, so only a run on Postgres 17, the version the index runs on and orchestration-lean.yaml tests with, fails
+// on it. The plan is read first, so that a join filter fails the test before the query runs. Then the query must
+// find the rows of the other modules at and below each name, none of the rewritten module's and none merely next to
+// a name, on either side of the range below it.
+func TestAManyNamesLandingProbesTheEdgesOfEachName(t *testing.T) {
+	ctx := context.Background()
+	tg := indexTarget(t)
+	s := openAt(t, tg)
+	const names, filler = 20000, 200000
+	var changed []string
+	var rows [][]any
+	want := map[constOwner]bool{}
+	// edge adds a row of module that uses target, a constant of tmodule that is its own owner.
+	edge := func(target, tmodule, module string) {
+		rows = append(rows, []any{target, tmodule, "Old.d", module, true, "theorem", target, tmodule, false})
+	}
+	found := func(target string) {
+		edge(target, "New", "Old")
+		want[constOwner{declRef{"New", target}, owned{declRef{"New", target}, false}}] = true
+	}
+	for i := range filler {
+		edge(fmt.Sprintf("Old.c%06d", i), "Old", "Old")
+	}
+	for j := range names {
+		n := fmt.Sprintf("New.n%05d", j)
+		changed = append(changed, n)
+		switch j % 5 {
+		case 0:
+			found(n) // the name itself
+		case 1:
+			found(n + ".eq_1") // below the name
+		case 2:
+			edge(n+".eq_1", "New", "New") // below it, in the module the landing rewrote
+		case 3:
+			edge(n+"-z", "New", "Old") // next to the name, not below it: '-' sorts before '.'
+		case 4:
+			edge(n+"0.eq_1", "New", "Old") // past the range below it: '0' sorts after '/'
+		}
+	}
+	conn, err := pgx.Connect(ctx, tg.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.CopyFrom(ctx, pgx.Identifier{tg.Index, "edges"}, edgeColumns, pgx.CopyFromRows(rows)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "ANALYZE "+pgx.Identifier{tg.Index, "edges"}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	rewritten := []string{"New"}
+	var plan string
+	if err := s.q.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+edgesAtOrBelowNames, changed, rewritten).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	// planNode is one node of the plan, with the fields the test reads.
+	type planNode struct {
+		NodeType           string     `json:"Node Type"`
+		ParentRelationship string     `json:"Parent Relationship"`
+		IndexName          string     `json:"Index Name"`
+		IndexCond          string     `json:"Index Cond"`
+		JoinFilter         string     `json:"Join Filter"`
+		Plans              []planNode `json:"Plans"`
+	}
+	var nodes []struct{ Plan planNode }
+	if err := json.Unmarshal([]byte(plan), &nodes); err != nil {
+		t.Fatalf("read the plan %q: %v", plan, err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("the plan holds %d statements, want 1:\n%s", len(nodes), plan)
+	}
+	// The inner side of a nested loop runs once for each row of its outer side, here once for each name. A
+	// sequential scan there reads every row of a table for each name, as a join filter does, so the plan must read
+	// edges_target there instead.
+	probed := false
+	var walk func(p planNode, inLoop bool)
+	walk = func(p planNode, inLoop bool) {
+		if p.JoinFilter != "" {
+			t.Fatalf("the plan's %s joins rows under the join filter %s instead of probing edges_target:\n%s",
+				p.NodeType, p.JoinFilter, plan)
+		}
+		if inLoop && p.NodeType == "Seq Scan" {
+			t.Fatalf("the plan scans a whole table for each name instead of probing edges_target:\n%s", plan)
+		}
+		if inLoop && p.IndexName == "edges_target" && strings.Contains(p.IndexCond, ">=") {
+			probed = true
+		}
+		for _, c := range p.Plans {
+			walk(c, inLoop || p.NodeType == "Nested Loop" && c.ParentRelationship == "Inner")
+		}
+	}
+	walk(nodes[0].Plan, false)
+	if !probed {
+		t.Fatalf("the plan probes edges_target with the range below a name for no name:\n%s", plan)
+	}
+	got, err := ownersToCheck(ctx, s.q, changed, nil, rewritten)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("the edges at or below %d names: got %d constants, want %d", names, len(got), len(want))
+	}
+}
+
 // An index that landings built answers reach as one built from nothing, whatever a landing changed about the
 // declaration a constant belongs to: a declaration added where the use names it, one added where the use cannot
-// see it, and the imports of a module in the user's import closure, which no declaration change accompanies.
+// see it, the imports of a module in the user's import closure, which no declaration change accompanies, and a
+// declaration added above the constant's name and removed again.
 func TestAnIncrementalRefreshAnswersReachAsAFullOne(t *testing.T) {
 	ctx := context.Background()
 	t.Run("a landing declares the constant the earlier use names", func(t *testing.T) {
@@ -417,5 +527,40 @@ func TestAnIncrementalRefreshAnswersReachAsAFullOne(t *testing.T) {
 			t.Errorf("a change to A.X changes %d statements; want V.v", got)
 		}
 		sameAsFullRefresh(t, s, tree, declRef{"A", "A.X"}, declRef{"V", "V.v"})
+	})
+
+	t.Run("a landing declares, then removes, a declaration above the constant the use names", func(t *testing.T) {
+		dir := t.TempDir()
+		use := leanModule{name: "U", imports: []string{"A"}, decls: []string{"U.u"},
+			src:  "theorem U.u (h : A.X.Y.eq_1) : True := trivial\n",
+			uses: []leanUse{{"A.X.Y.eq_1", "A", "A.X.Y.eq_1"}}}
+		a := leanModule{name: "A", decls: []string{"A.X"}, src: "def A.X : Prop := True\n"}
+		tree := leanTree(t, dir, a, use)
+		s := openStore(t)
+		if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := reachOf(t, s, declRef{"A", "A.X"}); got != 1 {
+			t.Fatalf("a change to A.X changes %d statements; want U.u, whose A.X.Y.eq_1 belongs to it", got)
+		}
+		// A declares A.X.Y: U's A.X.Y.eq_1 lies below it, and belongs to it, though U was not read again.
+		leanModule{name: "A", decls: []string{"A.X", "A.X.Y"},
+			src: "def A.X : Prop := True\ntheorem A.X.Y : True := trivial\n"}.write(t, dir)
+		if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "two"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := reachOf(t, s, declRef{"A", "A.X.Y"}); got != 1 {
+			t.Errorf("after A declares A.X.Y, a change to it changes %d statements; want U.u", got)
+		}
+		sameAsFullRefresh(t, s, tree, declRef{"A", "A.X"}, declRef{"A", "A.X.Y"}, declRef{"U", "U.u"})
+		// A no longer declares A.X.Y: the constant belongs to A.X again.
+		a.write(t, dir)
+		if _, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "three"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := reachOf(t, s, declRef{"A", "A.X"}); got != 1 {
+			t.Errorf("after A.X.Y is gone, a change to A.X changes %d statements; want U.u", got)
+		}
+		sameAsFullRefresh(t, s, tree, declRef{"A", "A.X"}, declRef{"U", "U.u"})
 	})
 }

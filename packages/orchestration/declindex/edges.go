@@ -247,6 +247,26 @@ func refreshedModules(r reference) []string {
 	return slices.Sorted(maps.Keys(set))
 }
 
+// edgesAtOrBelowNames reads the rows of the modules other than $2 whose target is one of the names $1 or lies below
+// one. The columns are COLLATE "C", so the names below n are those between n + "." and n + "/". The planner cannot
+// know how few rows such a range holds: it counts 0.5 % of the table for each name. The query was a plain join of
+// the names with edges under UNION, which drops duplicate rows. Postgres 17 drops them by merging the two halves in
+// sorted order, and for that it read every row of edges once, sorted by target, and tested each row against every
+// name under a join filter instead of probing edges_target for each name: 37,360 names against 5.1 million edges
+// stalled a refresh for more than 22 minutes. Postgres 16, and the same join under UNION ALL, probed edges_target.
+// A lateral subquery, which OFFSET 0 keeps from being pulled up into a plain join, runs once for each name, so no
+// plan can test the names under a join filter, and its cheapest plan is a range scan of edges_target. UNION ALL keeps
+// the duplicates: a constant comes back once for each row that uses it, and from the second part once more for each
+// name it lies below. The caller keeps each constant and owner once.
+const edgesAtOrBelowNames = `
+	SELECT target, tmodule, owner, owner_module, by_closure FROM edges
+	 WHERE target = ANY($1::text[]) AND module <> ALL($2::text[])
+	UNION ALL
+	SELECT e.*
+	  FROM unnest($1::text[]) AS n, LATERAL (
+		SELECT target, tmodule, owner, owner_module, by_closure FROM edges
+		 WHERE target >= n || '.' AND target < n || '/' AND module <> ALL($2::text[]) OFFSET 0) e`
+
 // ownersToCheck reads the constants whose owner this refresh may have moved, as the rows of the modules it did not
 // write (rewritten) hold them: those at or below one of the changed declaration names (edges_target), and those
 // whose owner the imports decided in a module whose closure changed (edges_closure). It gives each (constant,
@@ -262,14 +282,7 @@ func ownersToCheck(ctx context.Context, q querier, names, modules, rewritten []s
 		return nil
 	}
 	if len(names) > 0 {
-		// The columns are COLLATE "C", so the names below n are those between n + "." and n + "/".
-		rows, err := q.Query(ctx, `
-			SELECT target, tmodule, owner, owner_module, by_closure FROM edges
-			 WHERE target = ANY($1::text[]) AND module <> ALL($2::text[])
-			UNION
-			SELECT e.target, e.tmodule, e.owner, e.owner_module, e.by_closure
-			  FROM unnest($1::text[]) AS n JOIN edges e ON e.target >= n || '.' AND e.target < n || '/'
-			 WHERE e.module <> ALL($2::text[])`, names, rewritten)
+		rows, err := q.Query(ctx, edgesAtOrBelowNames, names, rewritten)
 		if err := eachRow(rows, err, scan); err != nil {
 			return nil, err
 		}
