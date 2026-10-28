@@ -373,20 +373,15 @@ func (s *Store) readReference(ctx context.Context, tree Tree, jobs int) (referen
 	// roots differ from that read's, every module is read again. An index that a declindex older than these meta
 	// keys wrote records neither: its reference roots were none, and its roots are taken to be the configuration's,
 	// so the first refresh by this one re-reads no module for want of them.
-	rereadAll := false
-	for _, m := range []struct {
-		key   string
-		roots Roots
-	}{{"roots", r.roots}, {"reference_roots", r.referenceRoots}} {
-		stored, err := s.Meta(ctx, m.key)
-		if err != nil {
-			return r, err
-		}
-		if m.key == "roots" && stored == "" {
-			continue
-		}
-		rereadAll = rereadAll || stored != rootsKey(m.roots)
+	storedRoots, err := s.Meta(ctx, "roots")
+	if err != nil {
+		return r, err
 	}
+	storedRefs, err := s.Meta(ctx, "reference_roots")
+	if err != nil {
+		return r, err
+	}
+	rereadAll := (storedRoots != "" && storedRoots != rootsKey(r.roots)) || storedRefs != rootsKey(r.referenceRoots)
 	if r.files, err = scan(tree, jobs); err != nil {
 		return r, fmt.Errorf("scan %s: %w", tree.Lib, err)
 	}

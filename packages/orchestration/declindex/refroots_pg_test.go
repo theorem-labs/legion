@@ -149,12 +149,13 @@ func TestReferenceRootsKeepProjectUsesAndRecordASortedSet(t *testing.T) {
 }
 
 // An index that an older declindex wrote records no roots: the first refresh by this one re-reads no module for
-// want of them, and records them.
+// want of them, and records them. With reference_roots in the configuration it re-reads every module, so that the
+// dependency's uses it records as kept are kept.
 func TestAnIndexWithoutRecordedRootsIsNotReread(t *testing.T) {
 	dir := t.TempDir()
 	tree := leanTree(t, dir,
-		leanModule{name: "App", decls: []string{"App.g"}, src: "def App.g : Nat := App.h\n",
-			uses: []leanUse{{"App.h", "App", "App.h"}}},
+		leanModule{name: "App", decls: []string{"App.g"}, src: "def App.g : Nat := App.h + Dep.c\n",
+			uses: []leanUse{{"App.h", "App", "App.h"}, {"Dep.c", "Dep.Defs", "Dep.c"}}},
 	)
 	ctx := context.Background()
 	s := openStore(t)
@@ -167,5 +168,14 @@ func TestAnIndexWithoutRecordedRootsIsNotReread(t *testing.T) {
 	}
 	if v, err := s.Meta(ctx, "roots"); err != nil || v != "App" {
 		t.Fatalf("meta roots = %q, %v; want App", v, err)
+	}
+
+	execIndex(t, s, `DELETE FROM meta WHERE k IN ('roots', 'reference_roots')`)
+	tree.ReferenceRoots = Roots{"Dep": true}
+	if st, err := s.Refresh(ctx, tree, RefreshOptions{Commit: "one"}); err != nil || st.Reread != 1 {
+		t.Fatalf("the first refresh with reference_roots of an index without recorded roots re-read %d modules, %v; want App", st.Reread, err)
+	}
+	if got := usesOfTarget(t, s, "Dep.c"); !slices.Equal(got, []string{"App.g of App: proof"}) {
+		t.Fatalf("uses of Dep.c after the upgrade: %v", got)
 	}
 }
