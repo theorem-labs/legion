@@ -207,11 +207,13 @@ func staleFreshness(reason string) Freshness {
 	return Freshness{State: FreshnessStale, Reason: reason}
 }
 
-// traceSourceDiffers reports whether the Lake build trace beside the reference file lib/rel.ilean records a hash of
-// the source sourcePath other than src's. Only a build trace binds the source by its hash, so no trace, a fetch
-// trace (which binds it by age alone), a trace of another schema or one that names no such source shows nothing.
-func traceSourceDiffers(lib, rel, sourcePath string, src []byte) (bool, error) {
-	raw, err := os.ReadFile(filepath.Join(lib, filepath.FromSlash(rel)+".trace"))
+// traceShowsNewerSource reports whether the Lake trace beside the reference file lib/rel.ilean shows that the source
+// sourcePath, src, changed after the build, as Fresh reads it: a build trace that records another hash of that
+// source, or a fetch trace (an artifact-cache hit, which binds the source by age alone) older than the source. No
+// trace, a trace of another schema, or a build trace that names no such source shows nothing.
+func traceShowsNewerSource(lib, rel, sourcePath string, src []byte) (bool, error) {
+	tracePath := filepath.Join(lib, filepath.FromSlash(rel)+".trace")
+	raw, err := os.ReadFile(tracePath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
@@ -219,9 +221,19 @@ func traceSourceDiffers(lib, rel, sourcePath string, src []byte) (bool, error) {
 		return false, err
 	}
 	var metadata lakeTraceMetadata
-	if json.Unmarshal(raw, &metadata) != nil || metadata.SchemaVersion != lakeTraceSchemaVersion ||
-		metadata.Synthetic == nil || *metadata.Synthetic {
+	if json.Unmarshal(raw, &metadata) != nil || metadata.SchemaVersion != lakeTraceSchemaVersion || metadata.Synthetic == nil {
 		return false, nil
+	}
+	if *metadata.Synthetic {
+		traceInfo, err := os.Stat(tracePath)
+		if err != nil {
+			return false, err
+		}
+		sourceInfo, err := os.Stat(sourcePath)
+		if err != nil {
+			return false, err
+		}
+		return traceInfo.ModTime().Before(sourceInfo.ModTime()), nil
 	}
 	hash, ok := sourceTraceHash(metadata.Inputs, sourcePath, rel+".lean")
 	return ok && hash != LakeTextHash(src), nil

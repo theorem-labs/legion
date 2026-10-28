@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeModule writes a hand-made reference file and its source below dir.
@@ -309,32 +310,42 @@ func TestCommandAt(t *testing.T) {
 	}
 }
 
-// commandAt cannot tell a command from another of the same length at the same place. Where Lake's build trace
-// records the source's hash, the refresh reads it for a module that has such a declaration: the trace of another
-// source makes the module unreadable. A fetch trace binds the source by age alone and decides nothing, nor does a
-// tree without traces.
-func TestABuildTraceDecidesAWholeCommandSelection(t *testing.T) {
+// commandAt cannot tell a command from another of the same length at the same place. For a module that has such a
+// declaration, the refresh reads Lake's trace as Fresh does: a build trace of another source hash, or a fetch trace
+// (an artifact-cache hit, bound to the source by age alone) older than the source, makes the module unreadable. A
+// tree without traces keeps the text check alone.
+func TestALakeTraceDecidesAWholeCommandSelection(t *testing.T) {
 	built := "declare_decidable_uint_quantifiers UInt8 8\n"
 	changed := "declare_decidable_uint_quantifiers UInt8 9\n"
 	ilean := `{"version":5,"module":"M","decls":{"UInt8.forall_iff_forall_ofBitVec":[0,0,0,42,0,0,0,42]},"references":{}}`
-	trace := func(synthetic bool) string {
-		return `{"schemaVersion":"2025-09-10","inputs":[["M.lean","` + LakeTextHash([]byte(built)) + `"]],` +
-			`"outputs":{"i":"` + LakeTextHash([]byte(ilean)) + `.ilean"},"synthetic":` + map[bool]string{true: "true", false: "false"}[synthetic] + `}`
-	}
+	buildTrace := `{"schemaVersion":"2025-09-10","inputs":[["M.lean","` + LakeTextHash([]byte(built)) + `"]],` +
+		`"outputs":{"i":"` + LakeTextHash([]byte(ilean)) + `.ilean"},"synthetic":false}`
+	fetchTrace := `{"schemaVersion":"2025-09-10","inputs":[],"outputs":{"i":"` + LakeTextHash([]byte(ilean)) +
+		`.ilean"},"synthetic":true}`
 	for _, c := range []struct {
 		name, src, trace string
+		sourceAge        time.Duration // the source's modification time after the trace's
 		unreadable       bool
 	}{
-		{"the built source", built, trace(false), false},
-		{"a changed command of the same length", changed, trace(false), true},
-		{"the change with a fetch trace", changed, trace(true), false},
-		{"the change without a trace", changed, "", false},
+		{"the built source", built, buildTrace, time.Hour, false},
+		{"a changed command of the same length", changed, buildTrace, -time.Hour, true},
+		{"a fetch trace newer than the source", built, fetchTrace, -time.Hour, false},
+		{"the change after a fetch", changed, fetchTrace, time.Hour, true},
+		{"the change without a trace", changed, "", 0, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
 			writeModule(t, dir, "M", ilean, c.src)
 			if c.trace != "" {
-				if err := os.WriteFile(filepath.Join(dir, "M.trace"), []byte(c.trace), 0o644); err != nil {
+				tracePath := filepath.Join(dir, "M.trace")
+				if err := os.WriteFile(tracePath, []byte(c.trace), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				at := time.Now().Add(-2 * time.Hour)
+				if err := os.Chtimes(tracePath, at, at); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(filepath.Join(dir, "M.lean"), at.Add(c.sourceAge), at.Add(c.sourceAge)); err != nil {
 					t.Fatal(err)
 				}
 			}

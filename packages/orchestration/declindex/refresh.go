@@ -637,14 +637,14 @@ func readModule(tree Tree, kept Roots, rel string) (ModuleData, error) {
 		return md, fmt.Errorf("%s.lean is newer than its build: %d declarations are not where its reference file records them", rel, md.Stale)
 	}
 	// A declaration held by its whole-command selection alone was checked against the source's text, not its hash:
-	// where Lake's build trace records the source's hash, it decides.
+	// where Lake's trace shows the source changed after the build, it decides.
 	if err == nil && md.Commands > 0 {
-		differs, traceErr := traceSourceDiffers(tree.Lib, rel, sourcePath, src)
+		newer, traceErr := traceShowsNewerSource(tree.Lib, rel, sourcePath, src)
 		if traceErr != nil {
 			return md, traceErr
 		}
-		if differs {
-			return md, fmt.Errorf("%s.lean is newer than its build: its build trace records another source", rel)
+		if newer {
+			return md, fmt.Errorf("%s.lean is newer than its build: its Lake trace records another source or an older build", rel)
 		}
 	}
 	return md, err
