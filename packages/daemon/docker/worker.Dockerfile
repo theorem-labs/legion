@@ -215,9 +215,9 @@ RUN --mount=type=secret,id=github_token \
 
 # ------------------------------------------------------------------------------------------------
 # go: the Go coordinator's `legion`, built as the repository builds it — `go build ./cmd/legion` in
-# packages/daemon under go.work, whose other modules (packages/envoy and packages/orchestration) contribute only
-# their go.mod and go.sum files to dependency selection — static, so it runs on any base. LEGION_REVISION is the
-# commit the workflow builds; it is linked in so `legion version` names it, and the build refuses without it.
+# packages/daemon under go.work, whose other module (packages/envoy) contributes only its go.mod and
+# go.sum to dependency selection — static, so it runs on any base. LEGION_REVISION is the commit the
+# workflow builds; it is linked in so `legion version` names it, and the build refuses without it.
 # The same toolchain builds gopls (static too) for the runtime stage's /usr/local/bin/gopls.
 FROM mirror.gcr.io/library/golang:${GO_VERSION}-alpine AS go
 WORKDIR /src
@@ -235,11 +235,9 @@ RUN set -eu; \
 COPY go.work go.work.sum ./
 COPY packages/daemon/go.mod packages/daemon/go.sum packages/daemon/
 COPY packages/envoy/go.mod packages/envoy/go.sum packages/envoy/
-COPY packages/orchestration/go.mod packages/orchestration/go.sum packages/orchestration/
 RUN go mod download
 COPY packages/daemon packages/daemon
 COPY packages/envoy packages/envoy
-COPY packages/orchestration packages/orchestration
 WORKDIR /src/packages/daemon
 # The licenses of the Go modules `legion` and `agent-secrets` compile in, with the build's CGO_ENABLED
 # (which decides them, with the GOARCH this stage builds for); fails the build when one's license

@@ -22,7 +22,6 @@ on:
       - "go.work"
       - "go.work.sum"
       - "packages/envoy/**"
-      - "packages/orchestration/**"
       - "packages/envoy-plugin/**"
       - "packages/envoy-client/**"
       - "packages/contracts/**"
@@ -145,16 +144,15 @@ jobs:
           base: ${{ steps.base.outputs.sha }}
           filters: |
             # The Go `legion` the legion_build and legion_publish jobs release and worker.Dockerfile's go
-            # stage compiles: its module and the other go.work module manifests that influence its resolved graph.
-            # packages/envoy is also copied whole into the image for the agent-secrets binary it builds. The notices
-            # scripts change its archives or worker image, and the target list names its release archives.
+            # stage compiles: its module, which embeds the role prompts, the modules go.work binds it to
+            # (packages/envoy is also copied whole into the image for the agent-secrets binary it
+            # builds), the notices scripts that change its archives or worker image, and the list of
+            # the targets it builds.
             legion:
               - 'packages/daemon/**'
               - 'go.work'
               - 'go.work.sum'
               - 'packages/envoy/**'
-              - 'packages/orchestration/go.mod'
-              - 'packages/orchestration/go.sum'
               - 'scripts/go-third-party-notices.sh'
               - 'scripts/assemble-third-party-notices.sh'
               - '.github/go-release-targets.json'
@@ -219,7 +217,6 @@ jobs:
               - '.omp-pin'
               - '.dockerignore'
               - '.github/workflows/worker-image.yaml'
-              - 'packages/orchestration/**'
 
   # The Go `legion`: linux and darwin archives of the binary, which embeds its role prompts, with
   # its THIRD_PARTY_NOTICES, on a legion-v* tag of the commit the run checked out. Nothing is
