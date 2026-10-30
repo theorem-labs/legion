@@ -1,5 +1,0 @@
-name: Fx.SpAligned
-home: Fixture.lean
-meaning: Register x2 of a register file is 8-aligned.
-forms:
-  - "fun (R : BitVec 5 → BitVec 64) => R 2#5 &&& 7#64 = 0#64"

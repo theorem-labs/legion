@@ -1,10 +1,7 @@
 name: Tests
 
 # lint, typecheck and test are the checks main's ruleset requires, so they run on every pull request
-# with no path filter, and each covers the shipped daemon (packages/daemon, the Go `legion`). Each
-# job runs .github/actions/tests-scope first and skips only the steps a pull request's changes
-# cannot reach (.github/scripts/tests-scope.sh lists which paths reach which steps); the job itself
-# still runs and reports at every head, and a push to main or a merge-queue run skips nothing.
+# with no path filter, and each covers the shipped daemon (packages/daemon, the Go `legion`).
 on:
   push:
     branches:
@@ -38,14 +35,9 @@ jobs:
       issues: read
       pull-requests: read
     steps:
-      # Depth 2: the pull request's merge commit and both its parents, which tests-scope diffs.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 2
-
-      - id: scope
-        uses: ./.github/actions/tests-scope
 
       # This workflow runs on every pull request with no path filter, so the pin check runs on
       # every change rather than only on one that touches a package.
@@ -97,9 +89,9 @@ jobs:
 
       # The skill-scenario rig's daemon-pane.go belongs to no module (it runs with `go run -overlay`
       # inside packages/daemon), so it is formatted here with the daemon.
-      - name: Check Go formatting
+      - name: Check the Go daemon's formatting
         run: |
-          unformatted=$(gofmt -l packages/daemon packages/orchestration packages/pi-legion/scripts/skill-scenarios/daemon-pane.go)
+          unformatted=$(gofmt -l packages/daemon packages/pi-legion/scripts/skill-scenarios/daemon-pane.go)
           if [ -n "$unformatted" ]; then
             echo "::error::gofmt -l lists files that are not gofmt-formatted; run gofmt -w on them:"
             echo "$unformatted"
@@ -119,10 +111,8 @@ jobs:
         run: bunx biome check .
 
       # The notices step below builds go-licenses and loads every release binary's modules. It
-      # keeps them under a key of its own, apart from the one setup-go above leaves unsaved. Both
-      # read no file of the orchestration module but its go.mod and go.sum, which select them.
-      - if: steps.scope.outputs.other == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # keeps them under a key of its own, apart from the one setup-go above leaves unsaved.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/go/pkg/mod
@@ -141,7 +131,6 @@ jobs:
       # compiled here, with their release builds' CGO_ENABLED and -buildvcs: a compile error on one
       # platform only fails the pull request rather than the release after the merge.
       - name: Check every Go release archive's third-party notices can be written and the cross-built commands compile
-        if: steps.scope.outputs.other == 'true'
         run: |
           notices="$RUNNER_TEMP/notices"
           mkdir -p "$notices"
@@ -184,13 +173,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 2
 
-      - id: scope
-        uses: ./.github/actions/tests-scope
-
-      - if: steps.scope.outputs.orchestration == 'true'
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: packages/daemon/go.mod
           cache-dependency-path: packages/daemon/go.sum
@@ -198,29 +182,8 @@ jobs:
       # With the e2e tag, vet also compiles the live proofs behind it (the Stage 4a harness,
       # sandbox/live*_test.go), which run on the devbox against a real cluster.
       - name: Vet the Go daemon, its e2e-tagged live proofs included
-        if: steps.scope.outputs.other == 'true'
         run: go vet -tags e2e ./...
         working-directory: packages/daemon
-
-      - name: Vet the orchestration ledger
-        if: steps.scope.outputs.orchestration == 'true'
-        run: go vet ./...
-        working-directory: packages/orchestration
-
-      # Every workspace module's dependency graph, resolved and verified against go.work.sum and
-      # each module's go.sum, with nothing compiled. It runs for every change but one to the
-      # orchestration-only workflows (tests-scope.sh), because envoy-and-contracts.yaml no longer
-      # starts its Go jobs for a diff that only touches go.work.sum: a wrong hash fails here in
-      # seconds instead of an hour of tests, and a missing one shows up as a manifest the
-      # resolution rewrote. The envoy module's test graph is the one that reads the workspace
-      # checksum file, so it is the reason this step exists.
-      - name: Verify every workspace module's dependencies against the checksums
-        if: steps.scope.outputs.orchestration == 'true'
-        run: |
-          for module in packages/daemon packages/envoy packages/orchestration; do
-            (cd "$module" && go list -deps -test ./... > /dev/null)
-          done
-          git diff --exit-code -- go.work.sum packages/daemon/go.sum packages/envoy/go.sum packages/orchestration/go.sum
 
 
   test:
@@ -253,106 +216,70 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 2
 
-      - id: scope
-        uses: ./.github/actions/tests-scope
-
-      # Both run at every head: together they are what decides which of the steps below run.
-      - name: Test the Tests workflow's scope selection
-        run: .github/scripts/tests-scope.test.sh
-
-      - name: Test the scope action's outputs
-        run: .github/scripts/tests-scope-action.test.sh
-
-      # No step gated on `other` compiles or reads a file of packages/orchestration but its go.mod
-      # and go.sum, which select `other` themselves; the one gated test that does scan the whole
-      # tree (check-plugin-names.test.sh) is covered by the lint job's own run of the same checker
-      # (.github/scripts/tests-scope.sh says how).
       - name: Setup Bun
-        if: steps.scope.outputs.other == 'true'
         uses: ./.github/actions/setup-bun
 
       - name: Install dependencies
-        if: steps.scope.outputs.other == 'true'
         run: bun install --frozen-lockfile
 
       - name: Test release scripts
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/release-push.test.sh
 
       - name: Test the release version bump
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/release-bump.test.sh
 
       - name: Test third-party notices
-        if: steps.scope.outputs.other == 'true'
         run: bun test scripts/third-party-notices.test.ts
 
       - name: Test the Bun pin check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-bun-version.test.sh
 
       - name: Test the frozen Bun workspace manifest check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-bun-workspace-manifests.test.sh
 
       - name: Test the zod version check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-zod-version.test.sh
 
       - name: Test the gh version check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-gh-version.test.sh
 
       - name: Test the image trigger path check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-image-trigger-paths.test.sh
 
       - name: Test the action pin check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-action-pins.test.sh
 
       - name: Test the private-name check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-private-names.test.sh
 
       - name: Test the plugin-name check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-plugin-names.test.sh
 
       - name: Test the release credential check
-        if: steps.scope.outputs.other == 'true'
         run: .github/scripts/check-release-credentials.test.sh
 
       - name: Test the session import pods script (a stand-in kubectl)
-        if: steps.scope.outputs.other == 'true'
         run: bash scripts/sessions-import-pods.test.sh
 
       - name: Test the live proofs' libraries (the GitHub ingress bridge, the proof human's check, the model gateway key command, the design-gate verdict)
-        if: steps.scope.outputs.other == 'true'
         run: bun test scripts/e2e/lib
 
       - name: Lint the Dispatch census script
-        if: steps.scope.outputs.other == 'true'
         run: bunx biome check --error-on-warnings scripts/dispatch
 
       # scripts/dispatch is no workspace; the root package pins its TypeScript and Bun types.
       - name: Typecheck the Dispatch census script
-        if: steps.scope.outputs.other == 'true'
         run: bunx tsc --noEmit -p scripts/dispatch
 
       - name: Test the Dispatch census script
-        if: steps.scope.outputs.other == 'true'
         run: bun test scripts/dispatch
 
       - name: Lint the GitHub App registration script
-        if: steps.scope.outputs.other == 'true'
         run: bunx biome check --error-on-warnings scripts/github-apps
 
       # scripts/github-apps is no workspace either; the root package pins its TypeScript and Bun types.
       - name: Typecheck the GitHub App registration script
-        if: steps.scope.outputs.other == 'true'
         run: bunx tsc --noEmit -p scripts/github-apps
 
       # setup-go's own cache is not used here. Its key is the daemon's go.sum alone, and the first
@@ -364,51 +291,44 @@ jobs:
       # step), after testing everything: a pull request's cache is visible to that pull request
       # alone, and main's is restored by every pull request, so one save per manifest set is enough.
       - id: go
-        if: steps.scope.outputs.orchestration == 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: packages/daemon/go.mod
           cache: false
 
       - id: go-cache
-        if: steps.scope.outputs.orchestration == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-test-${{ runner.os }}-go${{ steps.go.outputs.go-version }}-${{ hashFiles('go.work', 'go.work.sum', 'packages/daemon/go.mod', 'packages/daemon/go.sum', 'packages/envoy/go.mod', 'packages/envoy/go.sum', 'packages/orchestration/go.mod', 'packages/orchestration/go.sum') }}
+          key: go-test-${{ runner.os }}-go${{ steps.go.outputs.go-version }}-${{ hashFiles('go.work', 'go.work.sum', 'packages/daemon/go.mod', 'packages/daemon/go.sum', 'packages/envoy/go.mod', 'packages/envoy/go.sum') }}
           restore-keys: go-test-${{ runner.os }}-go${{ steps.go.outputs.go-version }}-
 
       # The tmux runtime's tests drive a real tmux server and skip without one, and the daemon
       # supervises under tmux and refuses to start without it.
       - name: Install tmux
-        if: steps.scope.outputs.other == 'true'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
 
       # The workspace and boundary tests drive a real jj, the one the worker image ships (its
       # working-copy filters are among what they plant), and the daemon resolves jj at boot and
       # refuses to start without it.
-      - if: steps.scope.outputs.other == 'true'
-        uses: ./.github/actions/install-jj
+      - uses: ./.github/actions/install-jj
 
       # internal/podsafety's baseline test and the pod agent's argv test run the Oh My Pi the worker
       # image ships, and refuse on GitHub Actions without one. The pin is read from
       # .omp-pin, the repository's one copy of it, installed through the mise above
       # (.github/actions/install-omp).
-      - if: steps.scope.outputs.other == 'true'
-        uses: ./.github/actions/install-omp
+      - uses: ./.github/actions/install-omp
 
       # internal/runtime/sandbox's uv link-mode test installs a wheel with the uv the worker image
       # ships (ARG UV_VERSION, checked against ARG UV_SHA256), and refuses on GitHub Actions
       # without one (.github/actions/install-uv).
-      - if: steps.scope.outputs.other == 'true'
-        uses: ./.github/actions/install-uv
+      - uses: ./.github/actions/install-uv
 
       # The daemon's NATS tests start testnats.Image and, for its grant test, Envoy's HubImage
       # (packages/envoy/testnatsimages), pulled first for the reason the action gives.
       - name: Pull the NATS test container images
-        if: steps.scope.outputs.other == 'true'
         uses: ./.github/actions/pull-test-images
         with:
           consts: |
@@ -422,7 +342,6 @@ jobs:
       # the first, and internal/daemon is the slowest package of the module. The check fails if
       # either package is renamed, which would otherwise drop it from both steps.
       - name: Test the Go daemon, but for the packages the race-detector step runs
-        if: steps.scope.outputs.other == 'true'
         working-directory: packages/daemon
         run: |
           all=$(go list ./...)
@@ -441,20 +360,10 @@ jobs:
       # runners have gcc for and the pod a worker runs in does not, so this is the one place it
       # runs. The lane tests hold a fake clock, so they are deterministic under it.
       - name: Test the outbox's lanes and store under the race detector
-        if: steps.scope.outputs.other == 'true'
         run: go test -count=1 -race ./internal/daemon/ ./internal/record/
         working-directory: packages/daemon
 
-      # The whole module runs once, under the race detector, and not first without it: its packages
-      # compile from the same files in both builds, as the daemon's two above do, so the run
-      # without the detector repeated this one.
-      - name: Test the orchestration ledger under the race detector
-        if: steps.scope.outputs.orchestration == 'true'
-        run: go test -count=1 -race ./...
-        working-directory: packages/orchestration
-
       - name: Stage 1 live proof
-        if: steps.scope.outputs.other == 'true'
         run: bash scripts/e2e/stage1-skeleton.sh
 
       - if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
